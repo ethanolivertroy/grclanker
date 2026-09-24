@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   symlinkSync,
@@ -9,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import {
   SUMOLOGIC_CONTROLS,
@@ -22,11 +25,16 @@ import {
   collectionOf,
   exportSumologicAuditBundle,
   failedCollection,
+  redactSnapshot,
+  registerSumologicTools,
   resolveSecureOutputPath,
   resolveSumologicBaseUrl,
   resolveSumologicConfiguration,
+  scrubDataText,
+  scrubErrorText,
 } from "../dist/extensions/grc-tools/sumologic.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00Z");
 const FRESH = "2026-09-01T00:00:00Z";
@@ -36,10 +44,13 @@ function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/** The configured access key: random alphanumerics so every 6 to 24 character window of it is a leak signal. */
+const SAMPLE_ACCESS_KEY = "TTmF84rGQ5FKybBUS7CJkEnq";
+
 function sampleConfig(overrides = {}) {
   return {
     accessId: "suABCDEF",
-    accessKey: "secret-access-key-value",
+    accessKey: SAMPLE_ACCESS_KEY,
     baseUrl: "https://api.us2.sumologic.com/api",
     deployment: "us2",
     timeoutMs: 30000,
@@ -271,6 +282,138 @@ test("resolveSumologicConfiguration prefers args over env over config file and m
   assert.throws(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: join(dir, "missing.yaml") }), /SUMOLOGIC_ACCESS_ID/);
 });
 
+/** Canaries planted on malformed config lines: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value or in another canary. */
+const CONFIG_CANARIES = {
+  nestedKey: "Qv7ZkT3mR9pXw2Lc",
+  nestedValue: "Hj4NsB8yF6dGa1Ue",
+  alias: "Wm2PxK9rT5vLq7Zb",
+  unterminated: "Lf9BwD4sN7hVe3Ky",
+  indent: "Tn3XcM6zP8gQb5Rw",
+  duplicate: "Rk8VqL2tY7jCn4Fs",
+  readable: "Zx4HnV7qK2mYt9Pw",
+};
+const LIBRARY_ERROR_WORDING = [
+  "Nested mappings", "is not valid JSON", "Unresolved alias", "illegal operation", "permission denied", "no such file",
+  "not a directory", "Unexpected token", "Missing closing", "Map keys must be unique", "must start at the same column",
+];
+
+/** Every substring of a planted credential at lengths 6 through 24 (sliding windows), so a partial echo such as a JSON.parse window or a truncated token cannot pass a leak assertion. */
+function windowsOf(value, { min = 6, max = 24 } = {}) {
+  const windows = new Set();
+  for (let size = Math.min(min, value.length); size <= Math.min(max, value.length); size += 1) {
+    for (let index = 0; index + size <= value.length; index += 1) windows.add(value.slice(index, index + size));
+  }
+  return [...windows];
+}
+
+/** The window set of every planted secret, for bundle, zip, and payload scans through assertSecretsAbsent. */
+function leakWindows(secrets) {
+  return [...new Set(secrets.flatMap((secret) => windowsOf(secret)))];
+}
+
+function assertNoWindowOf(text, secret, label) {
+  for (const window of windowsOf(secret)) assert.ok(!text.includes(window), `${label} carries a window (${window}) of the planted credential: ${text.slice(0, 300)}`);
+}
+
+/**
+ * Fixture self-check: the legitimate values of a fixture (everything it serves
+ * with the planted canaries themselves removed, longest first) contain no
+ * 6-character window of any canary, so a window hit in an output can only be a leak.
+ */
+function assertFixtureFreeOfCanaryWindows(legitimateText, canaries, label) {
+  let legitimate = legitimateText;
+  for (const canary of [...canaries].sort((a, b) => b.length - a.length)) legitimate = legitimate.split(canary).join("");
+  for (const canary of canaries) {
+    for (const window of windowsOf(canary, { min: 6, max: 6 })) {
+      assert.ok(!legitimate.includes(window), `${label}: legitimate fixture text contains the window ${window} of canary ${canary}`);
+    }
+  }
+}
+
+function assertConfigErrorText(text, { path, code, line, column, canaries }, label) {
+  for (const canary of canaries) assertNoWindowOf(text, canary, `${label} (${canary})`);
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!text.includes(wording), `${label} repeats library wording "${wording}": ${text}`);
+  assert.ok(text.includes(path), `${label} names the path ${path}: ${text}`);
+  assert.ok(text.includes(`(${code})`), `${label} carries the code ${code}: ${text}`);
+  if (line) assert.ok(text.includes(` at line ${line}${column ? `, column ${column}` : ""}`), `${label} carries the position line ${line}: ${text}`);
+  else assert.doesNotMatch(text, / at line \d+/, `${label} invents no line: ${text}`);
+}
+
+function thrownBy(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  assert.fail("expected the call to throw");
+}
+
+test("rule 9: Sumo Logic config loader errors carry only the path, position, and code, never a config line or library wording", async () => {
+  const dir = createTempBase("grclanker-sumo-config-errors-");
+  const registered = [];
+  registerSumologicTools({ registerTool: (tool) => registered.push(tool) });
+  const checkAccess = registered.find((tool) => tool.name === "sumologic_check_access");
+  const exportBundle = registered.find((tool) => tool.name === "sumologic_export_audit_bundle");
+  const allCanaries = Object.values(CONFIG_CANARIES);
+
+  const parseCases = [
+    { name: "nested mapping", file: "nested.yaml", text: `access_id: suABCDEF\naccess_key: ${CONFIG_CANARIES.nestedKey}: Bearer ${CONFIG_CANARIES.nestedValue}\n`, leaks: [CONFIG_CANARIES.nestedKey, CONFIG_CANARIES.nestedValue], control: /Nested mappings/, code: "BLOCK_AS_IMPLICIT_KEY", line: 2, column: 13 },
+    { name: "alias", file: "alias.yaml", text: `access_id: suABCDEF\naccess_key: *${CONFIG_CANARIES.alias}\n`, leaks: [CONFIG_CANARIES.alias], control: /Unresolved alias/, code: "INVALID_YAML" },
+    { name: "unterminated quote", file: "quote.yaml", text: `access_id: suABCDEF\naccess_key: "${CONFIG_CANARIES.unterminated}\n`, leaks: [CONFIG_CANARIES.unterminated], control: /Missing closing/, code: "MISSING_CHAR", line: 3, column: 1 },
+    { name: "bad indent", file: "indent.yaml", text: `sumo:\n  access_id: suABCDEF\n access_key: ${CONFIG_CANARIES.indent}\n`, leaks: [CONFIG_CANARIES.indent], control: /same column/, code: "BAD_INDENT", line: 3, column: 1 },
+    { name: "duplicate key", file: "duplicate.yaml", text: `access_key: one\naccess_key: ${CONFIG_CANARIES.duplicate}\n`, leaks: [CONFIG_CANARIES.duplicate], control: /Map keys must be unique/, code: "DUPLICATE_KEY", line: 2, column: 1 },
+  ];
+  for (const testCase of parseCases) {
+    const configFile = join(dir, testCase.file);
+    writeFileSync(configFile, testCase.text);
+    const library = thrownBy(() => parseYaml(testCase.text));
+    assert.match(library.message, testCase.control, `${testCase.name}: positive control uses the library message`);
+    assert.ok(testCase.leaks.some((canary) => windowsOf(canary).some((window) => library.message.includes(window))), `${testCase.name}: positive control, the library message quotes the canary`);
+    assertFixtureFreeOfCanaryWindows(testCase.text, allCanaries, `${testCase.name} config fixture`);
+
+    const expected = { path: configFile, code: testCase.code, line: testCase.line, column: testCase.column, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: configFile }));
+    assert.match(thrown.message, /^Unable to parse Sumo Logic config file: invalid YAML in /, testCase.name);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const fromArgs = thrownBy(() => resolveSumologicConfiguration({ config_file: configFile, access_id: "a", access_key: "b" }, {}));
+    assertConfigErrorText(fromArgs.message, expected, `${testCase.name} resolver error with credentials in arguments`);
+
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: configFile }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const outputRoot = join(dir, "export");
+  const exported = await exportBundle.execute("call", exportBundle.prepareArguments({ config_file: join(dir, "nested.yaml"), output_dir: outputRoot }));
+  assertConfigErrorText(JSON.stringify(exported), { path: join(dir, "nested.yaml"), code: "BLOCK_AS_IMPLICIT_KEY", line: 2, column: 13, canaries: allCanaries }, "export payload");
+  assert.equal(existsSync(outputRoot), false, "a config error writes no bundle");
+
+  const readCases = [
+    { name: "EISDIR", path: join(dir, "directory.yaml"), setup: (path) => mkdirSync(path), control: /illegal operation/ },
+    { name: "ENOTDIR", path: join(dir, "plain-file", "config.yaml"), setup: (path) => writeFileSync(join(dir, "plain-file"), `access_key: ${CONFIG_CANARIES.readable}\n`), control: /not a directory/ },
+  ];
+  if (process.getuid?.() !== 0) {
+    readCases.push({ name: "EACCES", path: join(dir, "locked.yaml"), setup: (path) => { writeFileSync(path, `access_key: ${CONFIG_CANARIES.readable}\n`); chmodSync(path, 0o000); }, control: /permission denied/ });
+  }
+  for (const testCase of readCases) {
+    testCase.setup(testCase.path);
+    assert.match(thrownBy(() => readFileSync(testCase.path, "utf8")).message, testCase.control, `${testCase.name}: positive control uses the filesystem message`);
+    const expected = { path: testCase.path, code: testCase.name, canaries: allCanaries };
+    const thrown = thrownBy(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: testCase.path }));
+    assert.equal(thrown.message, `Unable to read Sumo Logic config file ${testCase.path} (${testCase.name})`);
+    assertConfigErrorText(thrown.message, expected, `${testCase.name} resolver error`);
+    const result = await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: testCase.path }));
+    assertConfigErrorText(JSON.stringify(result), expected, `${testCase.name} check_access payload`);
+  }
+
+  const missing = join(dir, "missing.yaml");
+  const absent = thrownBy(() => resolveSumologicConfiguration({}, { SUMOLOGIC_CONFIG_FILE: missing }));
+  assert.match(absent.message, /SUMOLOGIC_ACCESS_ID/, "a missing config file is absent, not a read failure");
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absent.message.includes(wording));
+  const absentResult = JSON.stringify(await checkAccess.execute("call", checkAccess.prepareArguments({ config_file: missing })));
+  assert.ok(absentResult.includes("SUMOLOGIC_ACCESS_ID"));
+  for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!absentResult.includes(wording));
+});
+
 test("resolveSumologicBaseUrl maps every documented deployment and normalizes URLs", () => {
   const expected = {
     au: "https://api.au.sumologic.com/api",
@@ -311,7 +454,7 @@ test("SumologicApiClient sends basic auth, follows token pagination, retries 429
       return jsonResponse({ data: [{ id: "u2" }], next: null });
     }
     if (url.pathname === "/api/v1/roles") {
-      return jsonResponse({ errors: [{ code: "forbidden", message: "secret-access-key-value should not leak" }] }, { status: 403 });
+      return jsonResponse({ errors: [{ code: "forbidden", message: `${SAMPLE_ACCESS_KEY} should not leak` }] }, { status: 403 });
     }
     return jsonResponse({});
   };
@@ -321,7 +464,7 @@ test("SumologicApiClient sends basic auth, follows token pagination, retries 429
   assert.equal(users.ok, true);
   assert.equal(users.complete, true);
   assert.deepEqual(users.data.map((user) => user.id), ["u1", "u2"]);
-  assert.equal(seen[0].auth, `Basic ${Buffer.from("suABCDEF:secret-access-key-value").toString("base64")}`);
+  assert.equal(seen[0].auth, `Basic ${Buffer.from(`suABCDEF:${SAMPLE_ACCESS_KEY}`).toString("base64")}`);
   assert.deepEqual(sleeps.slice(0, 2), [1000, 500]);
   assert.ok(seen.some((item) => item.search.includes("token=page-2")));
   assert.ok(seen.every((item) => item.pathname !== "/api/v1/users" || item.search.includes("limit=1000")));
@@ -329,7 +472,7 @@ test("SumologicApiClient sends basic auth, follows token pagination, retries 429
   const roles = await client.listRoles();
   assert.equal(roles.ok, false);
   assert.equal(roles.httpStatus, 403);
-  assert.doesNotMatch(roles.error, /secret-access-key-value/);
+  assertNoWindowOf(roles.error, SAMPLE_ACCESS_KEY, "403 error string");
   assert.match(roles.error, /\[REDACTED\]/);
 });
 
@@ -746,6 +889,43 @@ test("control 10 resolves connection hosts from url only and flags connections w
   assert.equal(byId(approved, "SUMO-10").status, "pass");
 });
 
+test("control 10 never passes the approved-domain check on an empty connection list while forwarding destinations remain", async () => {
+  const options = { now: NOW, approvedDestinationDomains: ["example.com"] };
+
+  const forwarding = healthyData();
+  forwarding.connections = [];
+  forwarding.partitions[0].dataForwardingId = "fwd-1";
+  forwarding.scheduledViews[0].dataForwardingId = "fwd-2";
+  const remaining = byId(await assessSumologicDataGovernance(readerFrom(forwarding), options), "SUMO-10");
+  assert.equal(remaining.status, "manual", remaining.summary);
+  assert.match(remaining.summary, /^No outbound connections were found to check against the approved destination domains; 2 data forwarding destination\(s\) on 1 partition\(s\) and 1 scheduled view\(s\) remain unchecked against the approved domains, so a human must confirm each forwarding destination is approved\.$/);
+  assert.doesNotMatch(remaining.summary, /All 0 connections/);
+  assert.equal(remaining.evidence.connections_seen, 0);
+  assert.deepEqual(remaining.evidence.partitions_forwarding, ["sumologic_default"]);
+  assert.deepEqual(remaining.evidence.scheduled_views_forwarding, ["errors"]);
+
+  const emptyPartitions = healthyData();
+  emptyPartitions.connections = [];
+  emptyPartitions.partitions = [];
+  emptyPartitions.scheduledViews = [];
+  const unconfirmed = byId(await assessSumologicDataGovernance(readerFrom(emptyPartitions), options), "SUMO-10");
+  assert.equal(unconfirmed.status, "manual", unconfirmed.summary);
+  assert.match(unconfirmed.summary, /no data forwarding destination was seen but the partition inventory is empty, so that absence cannot be confirmed/);
+
+  const nothingConfigured = healthyData();
+  nothingConfigured.connections = [];
+  const compliantEmptiness = byId(await assessSumologicDataGovernance(readerFrom(nothingConfigured), options), "SUMO-10");
+  assert.equal(compliantEmptiness.status, "pass", "zero connections and zero forwarding destinations on readable, non-empty inventories still pass");
+  assert.match(compliantEmptiness.summary, /^Zero outbound connections and zero data forwarding destinations/);
+
+  const approvedWithForwarding = healthyData();
+  approvedWithForwarding.connections = [{ id: "c1", name: "approved-hook", type: "WebhookConnection", url: "https://hooks.example.com/x" }];
+  approvedWithForwarding.partitions[0].dataForwardingId = "fwd-1";
+  const checked = byId(await assessSumologicDataGovernance(readerFrom(approvedWithForwarding), options), "SUMO-10");
+  assert.equal(checked.status, "pass");
+  assert.match(checked.summary, /^All 1 connections resolve to approved destination domains; 1 data forwarding destination\(s\) still require owner review\.$/);
+});
+
 test("approved_email_domains drives control 20 when org domains cannot be derived from the user list", async () => {
   const data = healthyData();
   data.monitors[0].notifications = [{ notification: { connectionType: "Email", recipients: ["soc@partner.example.org"] }, runForTriggerTypes: ["Critical"] }];
@@ -755,9 +935,13 @@ test("approved_email_domains drives control 20 when org domains cannot be derive
   assert.equal(byId(noDomains, "SUMO-20").status, "manual");
   assert.match(byId(noDomains, "SUMO-20").summary, /no org email domains could be derived/);
 
+  // Rule 1 corollary: approved domains let the recipients be judged, but the
+  // unreadable user list still caps the verdict at warn and is named.
   const approved = await assessSumologicContentSharing(readerFrom(data, usersUnreadable), { now: NOW, approvedEmailDomains: ["partner.example.org"] });
-  assert.equal(byId(approved, "SUMO-20").status, "pass");
+  assert.equal(byId(approved, "SUMO-20").status, "warn");
+  assert.match(byId(approved, "SUMO-20").summary, /Not checked: the user list could not be read because the access key lacks the role capability \(403\)/);
   assert.deepEqual(byId(approved, "SUMO-20").evidence.org_email_domains, ["partner.example.org"]);
+  assert.deepEqual(byId(approved, "SUMO-20").evidence.unreadable_inventories, ["user list"]);
 
   const mismatch = await assessSumologicContentSharing(readerFrom(data, usersUnreadable), { now: NOW, approvedEmailDomains: ["example.com"] });
   assert.equal(byId(mismatch, "SUMO-20").status, "fail");
@@ -888,7 +1072,7 @@ test("exportSumologicAuditBundle writes the bundle layout, zip, and error log, a
   assert.equal(metadata.deployment, "us2");
   assert.equal(metadata.access_id_prefix, "suAB");
   const bundleText = readFileSync(join(first.outputDir, "core_data", "access-control.json"), "utf8");
-  assert.doesNotMatch(bundleText, /secret-access-key-value/);
+  assertNoWindowOf(bundleText, SAMPLE_ACCESS_KEY, "core_data/access-control.json");
   assert.match(readFileSync(join(first.outputDir, "_errors.log"), "utf8"), /collectors/);
   const findings = JSON.parse(readFileSync(join(first.outputDir, "analysis", "findings.json"), "utf8"));
   assert.equal(findings.find((item) => item.id === "SUMO-12").status, "manual");
@@ -900,6 +1084,842 @@ test("exportSumologicAuditBundle writes the bundle layout, zip, and error log, a
   assert.equal(second.errorCount, 0);
   assert.ok(!existsSync(join(second.outputDir, "_errors.log")));
   assert.ok(existsSync(first.zipPath));
+});
+
+/** Planted secrets for every credential-capable record: random alphanumerics, so no 6-character window of one occurs in a legitimate fixture value. */
+const CARRIER = {
+  webhookPathToken: "WLfKnscQU649TkVynC",
+  webhookQueryToken: "kUkFvcpgZrvBNHV7BL",
+  headerSecret: "uG8dhJSjYWYbStMXmJ",
+  customHeaderSecret: "GS5CL3ytUXgqZSKXgn",
+  routingKey: "FmEP7cQrCjqKDbBCpd",
+  resolutionKey: "mLngURgY387cwCdzVN",
+  snowUsername: "wwjh6rn7AsBB2VRJ8A",
+  payloadOverride: "FRJXxnhkLKwZZhbP9X",
+  resolutionOverride: "W4KfHSa7U9UU4AcSza",
+  emailBodySecret: "WncUw2Cm8x2LECdwny",
+  accessIdTail: "mkG5MhpSyKcnGS6yMw",
+  x509Cert: "hX2twH7S4Sxg69PxqJ",
+  spCert: "TWZw7cVFdCdgYs3NVg",
+  dashboardQuery: "4HALeAXa7dmLqyGBbC",
+  collectorField: "YZrCrYKnGMTHpg5bdm",
+  folderDescription: "8GqWwDdtBBCjVFfkq6",
+  policyLeaf: "LHKdcnVjcv57K5Z5mq",
+};
+
+function secretCarrierData() {
+  const data = healthyData();
+  data.connections = [
+    {
+      id: "c1",
+      name: "pagerduty-hook",
+      type: "WebhookConnection",
+      webhookType: "PagerDuty",
+      url: `https://hooks.example.com/services/${CARRIER.webhookPathToken}?token=${CARRIER.webhookQueryToken}`,
+      headers: [{ name: "Authorization", value: `Bearer ${CARRIER.headerSecret}` }],
+      customHeaders: [{ name: "X-Api-Key", value: CARRIER.customHeaderSecret }],
+      defaultPayload: `{"routing_key":"${CARRIER.routingKey}"}`,
+      resolutionPayload: `{"routing_key":"${CARRIER.resolutionKey}"}`,
+    },
+    { id: "c2", name: "servicenow", type: "ServiceNowConnection", url: "https://example.service-now.com/api", username: CARRIER.snowUsername },
+  ];
+  data.monitors[0].notifications.push({
+    notification: { connectionType: "PagerDuty", connectionId: "c1", payloadOverride: `{"routing_key":"${CARRIER.payloadOverride}"}`, resolutionPayloadOverride: CARRIER.resolutionOverride },
+    runForTriggerTypes: ["Critical"],
+  });
+  data.monitors[0].notifications[0].notification.messageBody = CARRIER.emailBodySecret;
+  data.accessKeys = [{ id: `suAK${CARRIER.accessIdTail}`, label: "ci-key", disabled: false, createdAt: FRESH, lastUsed: FRESH, corsHeaders: ["https://app.example.com"] }];
+  data.identityProviders[0].x509cert1 = CARRIER.x509Cert;
+  data.identityProviders[0].certificate = CARRIER.spCert;
+  data.dashboards[0].panels = [{ queryString: CARRIER.dashboardQuery }];
+  data.collectors[0].fields = { token: CARRIER.collectorField };
+  data.personalFolder.children[0].description = CARRIER.folderDescription;
+  data.passwordPolicy.futureSecretSetting = CARRIER.policyLeaf;
+  return data;
+}
+
+const CARRIER_SECRETS = [...Object.values(CARRIER), SAMPLE_ACCESS_KEY];
+
+test("rule 9: the exported bundle, the zip, and the assess tool payloads never carry connection, monitor, key, or configuration secrets", async () => {
+  const base = createTempBase("grclanker-sumo-secrets-");
+  const data = secretCarrierData();
+  const reader = readerFrom(data);
+  assertFixtureFreeOfCanaryWindows(JSON.stringify({ data, config: sampleConfig() }), CARRIER_SECRETS, "secret carrier fixture");
+  const secrets = leakWindows(CARRIER_SECRETS);
+
+  const result = await exportSumologicAuditBundle(reader, sampleConfig(), base, { now: NOW, approvedDestinationDomains: ["example.com", "service-now.com"] });
+  const files = readBundleFiles(result.outputDir);
+  assert.ok(files.has(join("core_data", "data-governance.json")));
+  assert.ok(files.has(join("core_data", "content-sharing.json")));
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  const zipEntries = readZipEntries(result.zipPath);
+  assert.equal(zipEntries.size, files.size, "the zip carries exactly the written files");
+  assert.ok(zipEntries.has("core_data/data-governance.json"));
+  assertSecretsAbsent(assert, zipEntries, secrets, "zip archive");
+
+  // Evidence stays legible: field names survive with markers, hosts survive without paths.
+  const governance = JSON.parse(files.get(join("core_data", "data-governance.json")));
+  const [hook, snow] = governance.connections.data;
+  assert.equal(hook.url_host, "hooks.example.com");
+  assert.equal(hook.url, "[REDACTED]");
+  assert.deepEqual(hook.headers, [{ name: "Authorization", value: "[REDACTED]" }]);
+  assert.deepEqual(hook.customHeaders, [{ name: "X-Api-Key", value: "[REDACTED]" }]);
+  assert.equal(hook.defaultPayload, "[REDACTED]");
+  assert.equal(hook.resolutionPayload, "[REDACTED]");
+  assert.equal(snow.username, "[REDACTED]");
+  assert.equal(governance.connections.count, 2);
+  const accessControl = JSON.parse(files.get(join("core_data", "access-control.json")));
+  assert.deepEqual(accessControl.access_keys.data, [{ label: "ci-key", disabled: false, createdAt: FRESH, lastUsed: FRESH, id_prefix: "suAK", cors_header_count: 1 }]);
+  const content = JSON.parse(files.get(join("core_data", "content-sharing.json")));
+  const pagerduty = content.monitors.data[0].notifications[1].notification;
+  assert.equal(pagerduty.connectionId, "c1");
+  assert.equal(pagerduty.payloadOverride, "[REDACTED]");
+  assert.equal(pagerduty.resolutionPayloadOverride, "[REDACTED]");
+  const identity = JSON.parse(files.get(join("core_data", "identity.json")));
+  assert.equal(identity.saml_identity_providers.data[0].x509cert1, "[REDACTED]");
+  assert.equal(identity.saml_identity_providers.data[0].configurationName, "Okta");
+  assert.equal(identity.password_policy.data.minLength, 14);
+  assert.equal(identity.password_policy.data.futureSecretSetting, undefined);
+
+  // The assess tool payloads spread the same rawData, so they must be clean too,
+  // while the verdicts still read the in-memory records (SUMO-10 resolves the host).
+  const [identityResult, accessResult, governanceResult, contentResult] = [
+    await assessSumologicIdentity(reader, { now: NOW }),
+    await assessSumologicAccessControl(reader, { now: NOW }),
+    await assessSumologicDataGovernance(reader, { now: NOW, approvedDestinationDomains: ["example.com", "service-now.com"] }),
+    await assessSumologicContentSharing(reader, { now: NOW }),
+  ];
+  const payloads = new Map([
+    ["identity", JSON.stringify(identityResult)],
+    ["access-control", JSON.stringify(accessResult)],
+    ["data-governance", JSON.stringify(governanceResult)],
+    ["content-sharing", JSON.stringify(contentResult)],
+  ]);
+  assertSecretsAbsent(assert, payloads, secrets, "assess tool payload");
+  assert.equal(byId(governanceResult, "SUMO-10").status, "pass");
+  assert.deepEqual(byId(governanceResult, "SUMO-10").evidence.destinations.map((item) => item.host), ["hooks.example.com", "example.service-now.com"]);
+  assert.equal(byId(contentResult, "SUMO-20").status, "pass");
+});
+
+/** Canaries planted in error bodies, each inside a carrier: random alphanumerics (the JWT keeps its eyJ header prefix and dotted shape). */
+const ERROR_BODY = {
+  bearerHtml: "tx4FsTaeQaHcbpGqB8",
+  sessionHtml: "Ac89VDAd87GTPyz6Kr",
+  apiKeyHtml: "hCddmrYzWJjBh9vUZq",
+  urlToken: "G9zQNG7PXy37LgyAxr",
+  html200: "mhBvKXUqmGBFpj6sAv",
+  bearerJson: "PGvs3cKbU67hQtJcQU",
+  apiKeyJson: "yc9gR8yHAwPbKEwkuA",
+  sessionJson: "WVm4VnFUkDndLbNWGY",
+  jwtHeader: "PkX7AwSVwuqDhutSUs",
+  jwtPayload: "L9ZwDpETBGnMMZ8CZV",
+  jwtSignature: "dN3pEfdd6jrnCd5RRM",
+};
+const ERROR_BODY_CANARIES = Object.values(ERROR_BODY);
+const ERROR_BODY_HTML = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${ERROR_BODY.bearerHtml}</p><p>Set-Cookie: JSESSIONID=${ERROR_BODY.sessionHtml}; Path=/</p><p>api_key=${ERROR_BODY.apiKeyHtml}</p><p>Retry at https://api.example.com/v1/x?token=${ERROR_BODY.urlToken} later.</p></body></html>`;
+const ERROR_BODY_JSON = {
+  errors: [{
+    code: "forbidden",
+    message: `Denied while fetching https://api.example.com/v1/x?token=${ERROR_BODY.urlToken} for this key, sent with Authorization: Bearer ${ERROR_BODY.bearerJson}, api_key=${ERROR_BODY.apiKeyJson} (session_id: ${ERROR_BODY.sessionJson}) and eyJ${ERROR_BODY.jwtHeader}.${ERROR_BODY.jwtPayload}.${ERROR_BODY.jwtSignature}`,
+  }],
+};
+const ERROR_BODY_HTML_200 = `<html><body>Sign in. session=${ERROR_BODY.html200}</body></html>`;
+
+function errorBodyFetch() {
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/api/v1/connections") {
+      return new Response(ERROR_BODY_HTML, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+    if (url.pathname === "/api/v1/roles") return jsonResponse(ERROR_BODY_JSON, { status: 403 });
+    if (url.pathname === "/api/v1/collectors") {
+      return new Response(ERROR_BODY_HTML_200, { status: 200, statusText: "OK", headers: { "content-type": "text/html" } });
+    }
+    if (url.pathname === "/api/v1/users") return jsonResponse({ data: healthyData().users });
+    return jsonResponse({ data: [] });
+  };
+}
+
+test("rule 9: error bodies and vendor messages are scrubbed at the record point, so a 502 HTML page or a URL with a token never reaches the bundle, the zip, the assess payloads, or the access check", async () => {
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl: errorBodyFetch(), sleepImpl: async () => {}, maxRetries: 1 });
+  assertFixtureFreeOfCanaryWindows(
+    JSON.stringify({ data: healthyData(), config: sampleConfig(), bodies: [ERROR_BODY_HTML, ERROR_BODY_JSON, ERROR_BODY_HTML_200] }),
+    ERROR_BODY_CANARIES,
+    "error body fixture",
+  );
+  const secrets = leakWindows(ERROR_BODY_CANARIES);
+
+  const connections = await client.listConnections();
+  assert.equal(connections.ok, false);
+  assert.equal(connections.httpStatus, 502);
+  assert.match(connections.error, /^Sumo Logic request to \/v1\/connections failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)$/);
+  const roles = await client.listRoles();
+  assert.equal(roles.ok, false);
+  assert.match(roles.error, /failed \(403 forbidden\): Denied while fetching https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key, sent with Authorization: Bearer \[REDACTED\], api_key=\[REDACTED\] \(session_id: \[REDACTED\]\) and \[REDACTED\]$/);
+  const collectors = await client.listCollectors();
+  assert.equal(collectors.ok, false, "a 200 with a non-JSON body is an unreadable surface, not an empty inventory");
+  assert.match(collectors.error, /returned an unreadable response \(200 OK\): non-JSON body \(text\/html, \d+ bytes\)$/);
+
+  const access = await checkSumologicAccess(client);
+  const connectionSurface = access.surfaces.find((surface) => surface.name === "connections");
+  assert.equal(connectionSurface.status, "not_readable");
+  assert.match(connectionSurface.error, /502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
+  assertSecretsAbsent(assert, new Map([["check_access", JSON.stringify(access)]]), secrets, "access check result");
+
+  const results = await allAssessments(client);
+  const payloads = new Map(results.map((result) => [result.area, JSON.stringify(result)]));
+  assertSecretsAbsent(assert, payloads, secrets, "assess tool payload");
+  const governance = results[2];
+  assert.equal(byId(governance, "SUMO-10").status, "manual");
+  assert.match(byId(governance, "SUMO-10").summary, /non-JSON body \(text\/html, \d+ bytes\)/, "the finding carries the status-and-length note instead of the body");
+  assert.match(byId(results[1], "SUMO-06").evidence.endpoint_error, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key/, "the URL keeps scheme, host, and path so the error stays legible, and its query collapses to a marker");
+
+  const base = createTempBase("grclanker-sumo-error-bodies-");
+  const exported = await exportSumologicAuditBundle(client, sampleConfig(), base, { now: NOW });
+  const files = readBundleFiles(exported.outputDir);
+  assert.ok(files.has("_errors.log"));
+  assert.match(files.get("_errors.log"), /connections: Sumo Logic request to \/v1\/connections failed \(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/);
+  assert.match(files.get("_errors.log"), /collectors: Sumo Logic request to \/v1\/collectors returned an unreadable response \(200 OK\): non-JSON body/);
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretsAbsent(assert, readZipEntries(exported.zipPath), secrets, "zip archive");
+});
+
+/** Canaries planted in the failing surface's body, each inside a carrier: random alphanumerics. */
+const SURFACE = { bearer: "rK4xXESacBR3fCZe6q", session: "3LJPkrKeAW4cNBHswF", apiKey: "hFUY8WTsSwjWGwETqw", urlToken: "DNEFcZkeyYdm3WhqWS" };
+const SURFACE_CANARIES = Object.values(SURFACE);
+const SURFACE_HTML_BODY = `<html><body><h1>502 Bad Gateway</h1><p>Authorization: Bearer ${SURFACE.bearer}</p><p>Set-Cookie: JSESSIONID=${SURFACE.session}; Path=/</p><p>api_key=${SURFACE.apiKey}</p><p>Retry at https://api.example.com/v1/x?token=${SURFACE.urlToken} later.</p></body></html>`;
+const SURFACE_JSON_BODY = {
+  errors: [{
+    code: "forbidden",
+    message: `Denied while fetching https://api.example.com/v1/x?token=${SURFACE.urlToken} for this key; Authorization: Bearer ${SURFACE.bearer}; api_key=${SURFACE.apiKey}; session_id=${SURFACE.session}`,
+  }],
+};
+
+// Every path the client reads: the access check probes plus the collectors the
+// assessments call outside the access check (the remaining policies and the
+// content permission lookup). The access key inventory falls back to the
+// personal endpoint on 403, so both endpoints belong to that surface.
+const SUMOLOGIC_SURFACES = [
+  ["account_status", ["/api/v1/account/status"]],
+  ["users", ["/api/v1/users"]],
+  ["roles", ["/api/v1/roles"]],
+  ["access_keys", ["/api/v1/accessKeys", "/api/v1/accessKeys/personal"]],
+  ["saml_identity_providers", ["/api/v1/saml/identityProviders"]],
+  ["saml_allowlisted_users", ["/api/v1/saml/allowlistedUsers"]],
+  ["password_policy", ["/api/v1/passwordPolicy"]],
+  ["service_allowlist_status", ["/api/v1/serviceAllowlist/status"]],
+  ["service_allowlist_addresses", ["/api/v1/serviceAllowlist/addresses"]],
+  ["audit_policy", ["/api/v1/policies/audit"]],
+  ["search_audit_policy", ["/api/v1/policies/searchAudit"]],
+  ["share_dashboards_policy", ["/api/v1/policies/shareDashboardsOutsideOrganization"]],
+  ["data_access_level_policy", ["/api/v1/policies/dataAccessLevel"]],
+  ["concurrent_sessions_policy", ["/api/v1/policies/userConcurrentSessionsLimit"]],
+  ["session_timeout_policy", ["/api/v1/policies/maxUserSessionTimeout"]],
+  ["access_keys_lifetime_policy", ["/api/v1/policies/accessKeysLifetime"]],
+  ["partitions", ["/api/v1/partitions"]],
+  ["scheduled_views", ["/api/v1/scheduledViews"]],
+  ["ingest_budgets", ["/api/v2/ingestBudgets"]],
+  ["connections", ["/api/v1/connections"]],
+  ["collectors", ["/api/v1/collectors"]],
+  ["monitors", ["/api/v1/monitors/search"]],
+  ["personal_folder", ["/api/v2/content/folders/personal"]],
+  ["dashboards", ["/api/v2/dashboards"]],
+  ["content_permissions", ["/api/v2/content/c1/permissions"]],
+];
+
+function healthyRoutes(data = healthyData()) {
+  const routes = {
+    "/api/v1/account/status": data.accountStatus,
+    "/api/v1/users": { data: data.users },
+    "/api/v1/roles": { data: data.roles },
+    "/api/v1/accessKeys": { data: data.accessKeys },
+    "/api/v1/accessKeys/personal": { data: data.accessKeys },
+    "/api/v1/saml/identityProviders": data.identityProviders,
+    "/api/v1/saml/allowlistedUsers": data.allowlistedUsers,
+    "/api/v1/passwordPolicy": data.passwordPolicy,
+    "/api/v1/serviceAllowlist/status": data.allowlistStatus,
+    "/api/v1/serviceAllowlist/addresses": { data: data.allowlistAddresses },
+    "/api/v1/partitions": { data: data.partitions },
+    "/api/v1/scheduledViews": { data: data.scheduledViews },
+    "/api/v2/ingestBudgets": { data: data.ingestBudgets },
+    "/api/v1/connections": { data: data.connections },
+    "/api/v1/collectors": { collectors: data.collectors },
+    "/api/v1/monitors/search": data.monitors.map((item) => ({ item, path: `/Monitor/${item.name}` })),
+    "/api/v2/content/folders/personal": data.personalFolder,
+    "/api/v2/dashboards": { dashboards: data.dashboards },
+    "/api/v2/content/c1/permissions": data.permissions,
+  };
+  for (const [name, policy] of Object.entries(data.policies)) routes[`/api/v1/policies/${name}`] = policy;
+  return routes;
+}
+
+function surfaceCanaryFetch(failingPaths, variant) {
+  const routes = healthyRoutes();
+  return async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (failingPaths.includes(url.pathname)) {
+      return variant === "html"
+        ? new Response(SURFACE_HTML_BODY, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } })
+        : jsonResponse(SURFACE_JSON_BODY, { status: 403, statusText: "Forbidden" });
+    }
+    assert.ok(url.pathname in routes, `unexpected request to ${url.pathname}`);
+    return jsonResponse(routes[url.pathname]);
+  };
+}
+
+test("rule 9: every Sumo Logic surface that fails with a 502 HTML page or a JSON error embedding a token URL records only a scrubbed error, on every output", async () => {
+  const base = createTempBase("grclanker-sumo-surface-canaries-");
+  const healthy = await checkSumologicAccess(new SumologicApiClient(sampleConfig(), { fetchImpl: surfaceCanaryFetch([], "html"), maxRetries: 0 }));
+  assert.equal(healthy.surfaces.filter((surface) => surface.status !== "readable").length, 0, "the healthy route table serves every probe");
+  assertFixtureFreeOfCanaryWindows(
+    JSON.stringify({ routes: healthyRoutes(), config: sampleConfig(), bodies: [SURFACE_HTML_BODY, SURFACE_JSON_BODY] }),
+    SURFACE_CANARIES,
+    "surface canary fixture",
+  );
+  const secrets = leakWindows(SURFACE_CANARIES);
+
+  for (const [surface, paths] of SUMOLOGIC_SURFACES) {
+    for (const variant of ["html", "json"]) {
+      const label = `${surface} (${variant})`;
+      const client = new SumologicApiClient(sampleConfig(), { fetchImpl: surfaceCanaryFetch(paths, variant), sleepImpl: async () => {}, maxRetries: 0 });
+      const access = await checkSumologicAccess(client);
+      const results = await allAssessments(client);
+      const exported = await exportSumologicAuditBundle(client, sampleConfig(), join(base, `${surface}-${variant}`), { now: NOW });
+      const files = readBundleFiles(exported.outputDir);
+
+      const outputs = new Map([
+        [`${label} check_access`, JSON.stringify(access)],
+        ...results.map((result) => [`${label} assess ${result.area}`, JSON.stringify(result)]),
+        ...[...files].map(([name, content]) => [`${label} bundle ${name}`, content]),
+        ...[...readZipEntries(exported.zipPath)].map(([name, content]) => [`${label} zip ${name}`, content]),
+      ]);
+      assertSecretsAbsent(assert, outputs, secrets, label);
+
+      const errorStrings = [
+        ...access.surfaces.filter((item) => item.status === "not_readable").map((item) => item.error),
+        ...results.flatMap((result) => result.errors),
+        ...results.flatMap((result) => result.findings.map((item) => item.summary)).filter((summary) => /non-JSON body|api\.example\.com/.test(summary)),
+      ];
+      assert.ok(errorStrings.length >= 1, `${label}: the failing surface is recorded as an error`);
+      for (const text of errorStrings) {
+        if (variant === "html") {
+          assert.match(text, /\(502 Bad Gateway\): non-JSON body \(text\/html, \d+ bytes\)/, `${label}: the error carries the status-and-length note, got ${text}`);
+        } else {
+          assert.match(text, /https:\/\/api\.example\.com\/v1\/x\?\[REDACTED\] for this key/, `${label}: the URL keeps scheme, host, and path and its query collapses to a marker, got ${text}`);
+          assert.match(text, /Authorization: Bearer \[REDACTED\]/, `${label}: the authorization scheme stays and its value is redacted, got ${text}`);
+        }
+      }
+    }
+  }
+});
+
+// The list datasets the assessments collect, the API path each one reads, and
+// the core_data file the collection is written to.
+const SUMOLOGIC_LIST_DATASETS = [
+  ["users", ["/api/v1/users"], "identity.json"],
+  ["saml_identity_providers", ["/api/v1/saml/identityProviders"], "identity.json"],
+  ["saml_allowlisted_users", ["/api/v1/saml/allowlistedUsers"], "identity.json"],
+  ["roles", ["/api/v1/roles"], "access-control.json"],
+  ["access_keys", ["/api/v1/accessKeys", "/api/v1/accessKeys/personal"], "access-control.json"],
+  ["service_allowlist_addresses", ["/api/v1/serviceAllowlist/addresses"], "access-control.json"],
+  ["partitions", ["/api/v1/partitions"], "data-governance.json"],
+  ["scheduled_views", ["/api/v1/scheduledViews"], "data-governance.json"],
+  ["connections", ["/api/v1/connections"], "data-governance.json"],
+  ["ingest_budgets", ["/api/v2/ingestBudgets"], "data-governance.json"],
+  ["collectors", ["/api/v1/collectors"], "data-governance.json"],
+  ["monitors", ["/api/v1/monitors/search"], "content-sharing.json"],
+  ["dashboards", ["/api/v2/dashboards"], "content-sharing.json"],
+];
+
+/**
+ * Serves the healthy route table, denies `deniedPaths` with a 403 JSON body,
+ * serves `emptyPaths` as readable empty lists, and records every request it
+ * answered so the outputs can be checked against what the run observed.
+ */
+function recordingFetch({ deniedPaths = [], emptyPaths = [] } = {}) {
+  const routes = healthyRoutes();
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const method = init.method ?? "GET";
+    let response;
+    if (deniedPaths.includes(url.pathname)) {
+      response = jsonResponse({ errors: [{ code: "forbidden", message: "The access key lacks the capability for this endpoint" }] }, { status: 403, statusText: "Forbidden" });
+    } else if (emptyPaths.includes(url.pathname)) {
+      response = jsonResponse(url.pathname === "/api/v1/collectors" ? { collectors: [] } : url.pathname === "/api/v2/dashboards" ? { dashboards: [] } : url.pathname === "/api/v1/monitors/search" ? [] : { data: [] });
+    } else {
+      assert.ok(url.pathname in routes, `unexpected request to ${url.pathname}`);
+      response = jsonResponse(routes[url.pathname]);
+    }
+    requests.push({ method, path: url.pathname, status: response.status });
+    return response;
+  };
+  return { fetchImpl, requests };
+}
+
+const MENTIONED_STATUS_PATTERNS = [
+  /\((\d{3})(?: [A-Za-z][A-Za-z ]*)?\)/g,
+  /"(?:http_status|httpStatus|status)":\s*(\d{3})\b/g,
+  /\b(?:HTTP|status|returned)\s+(\d{3})\b/gi,
+];
+const MENTIONED_ENDPOINT_PATTERN = /\/(?:api\/)?v[123]\/[A-Za-z0-9_./{}-]*[A-Za-z0-9}]/g;
+
+/**
+ * Every 4xx or 5xx status code and every API path named anywhere in the
+ * outputs must belong to a request the fixture actually served: a code or
+ * endpoint that never appears in the request log is a claim the run did not
+ * observe.
+ */
+function assertOutputsNameOnlyObservedRequests(outputs, requests, label) {
+  const observedStatuses = new Set(requests.map((request) => request.status));
+  const observedPaths = requests.map((request) => request.path);
+  for (const [name, text] of outputs) {
+    for (const pattern of MENTIONED_STATUS_PATTERNS) {
+      for (const match of text.matchAll(pattern)) {
+        const status = Number(match[1]);
+        if (status < 400 || status > 599) continue;
+        assert.ok(observedStatuses.has(status), `${label} ${name}: mentions status ${status} but the run observed only ${[...observedStatuses].join(", ")} (in: ${match[0]})`);
+      }
+    }
+    for (const match of text.matchAll(MENTIONED_ENDPOINT_PATTERN)) {
+      const mention = match[0].replace(/[.)]+$/, "");
+      const template = new RegExp(`${mention.replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\\{[^}]*\\\}|\{[^}]*\}/g, "[^/]+")}$`);
+      assert.ok(observedPaths.some((path) => template.test(path)), `${label} ${name}: names endpoint ${mention} but the run requested only ${[...new Set(observedPaths)].join(", ")}`);
+    }
+  }
+}
+
+function sumologicOutputs(access, results, exported) {
+  return new Map([
+    ["check_access", JSON.stringify(access)],
+    ...results.map((result) => [`assess ${result.area}`, JSON.stringify(result)]),
+    ...[...readBundleFiles(exported.outputDir)].map(([name, content]) => [`bundle ${name}`, content]),
+  ]);
+}
+
+test("collection status: a denied list dataset is written to core_data and the assess payload as a not-collected marker with null flags, and every status code and endpoint named in any output was actually observed", async () => {
+  const base = createTempBase("grclanker-sumo-denied-markers-");
+
+  for (const [dataset, paths, areaFile] of SUMOLOGIC_LIST_DATASETS) {
+    const { fetchImpl, requests } = recordingFetch({ deniedPaths: paths });
+    const client = new SumologicApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+    const access = await checkSumologicAccess(client);
+    const results = await allAssessments(client);
+    const exported = await exportSumologicAuditBundle(client, sampleConfig(), join(base, dataset), { now: NOW });
+
+    const snapshot = JSON.parse(readFileSync(join(exported.outputDir, "core_data", areaFile), "utf8"));
+    const entry = snapshot[dataset];
+    assert.ok(entry, `${dataset}: written to core_data/${areaFile}`);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.complete, null, `${dataset}: complete is null, not false, when nothing was read`);
+    assert.equal(entry.scope, null, `${dataset}: scope is null, not org, when nothing was read`);
+    assert.equal(entry.count, null);
+    assert.equal(entry.http_status, 403);
+    assert.ok(!Array.isArray(entry.data), `${dataset}: a denied list is never written as an array`);
+    assert.deepEqual(entry.data, { collected: false, status: 403, endpoint: entry.endpoint, error: entry.error });
+    assert.ok(paths.some((path) => path.endsWith(entry.data.endpoint)), `${dataset}: the marker names the denied endpoint, got ${entry.data.endpoint}`);
+    assert.match(entry.data.error, /failed \(403 forbidden\)/);
+
+    const rawEntry = results.find((result) => result.rawData[dataset])?.rawData[dataset];
+    assert.deepEqual(rawEntry.data, entry.data, `${dataset}: the assess payload carries the same marker`);
+
+    const surface = access.surfaces.find((item) => item.name === dataset);
+    assert.equal(surface.status, "not_readable");
+    assert.equal(surface.count, null, `${dataset}: access check count is null when the probe failed`);
+    assert.equal(surface.complete, null, `${dataset}: access check complete is null when the probe failed`);
+    assert.equal(surface.httpStatus, 403);
+    assert.ok(paths.some((path) => path.endsWith(surface.endpoint)), `${dataset}: the surface names the endpoint that failed, got ${surface.endpoint}`);
+
+    assertOutputsNameOnlyObservedRequests(sumologicOutputs(access, results, exported), requests, `${dataset} denied`);
+  }
+
+  const { fetchImpl, requests } = recordingFetch({ emptyPaths: ["/api/v1/connections", "/api/v1/scheduledViews", "/api/v1/collectors", "/api/v2/dashboards", "/api/v1/monitors/search"] });
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const access = await checkSumologicAccess(client);
+  const results = await allAssessments(client);
+  const exported = await exportSumologicAuditBundle(client, sampleConfig(), join(base, "empty"), { now: NOW });
+  const governance = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "data-governance.json"), "utf8"));
+  const sharing = JSON.parse(readFileSync(join(exported.outputDir, "core_data", "content-sharing.json"), "utf8"));
+  for (const entry of [governance.connections, governance.scheduled_views, governance.collectors, sharing.dashboards, sharing.monitors]) {
+    assert.deepEqual(entry.data, [], "a readable empty list stays []");
+    assert.equal(entry.ok, true);
+    assert.equal(entry.complete, true);
+    assert.equal(entry.count, 0);
+    assert.equal(entry.http_status, null);
+  }
+  for (const surface of access.surfaces) {
+    assert.equal(surface.status, "readable");
+    assert.equal(typeof surface.count, "number");
+    assert.equal(surface.complete, true);
+    assert.equal(surface.httpStatus, null);
+  }
+  assertOutputsNameOnlyObservedRequests(sumologicOutputs(access, results, exported), requests, "healthy with empty lists");
+});
+
+test("rule 10: token pagination stops on a repeated cursor or an empty page with a next token and reports the inventory incomplete", async () => {
+  let repeatedRequests = 0;
+  let emptyRequests = 0;
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/api/v1/roles") {
+      repeatedRequests += 1;
+      return jsonResponse({ data: [{ id: `r${repeatedRequests}`, name: `Role ${repeatedRequests}` }], next: "stuck-cursor" });
+    }
+    if (url.pathname === "/api/v2/ingestBudgets") {
+      emptyRequests += 1;
+      return jsonResponse({ data: emptyRequests === 1 ? [{ id: "b1", name: "budget" }] : [], next: `page-${emptyRequests + 1}` });
+    }
+    if (url.pathname === "/api/v1/collectors") return jsonResponse({ collectors: Array.from({ length: 1000 }, (_, index) => ({ id: index, name: `c${index}` })) });
+    return jsonResponse({});
+  };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, maxPages: 50, maxRetries: 0 });
+
+  const roles = await client.listRoles();
+  assert.equal(roles.ok, true);
+  assert.equal(roles.complete, false, "a repeated next token must not report a complete inventory");
+  assert.equal(repeatedRequests, 2, "the repeated cursor is detected on the second page, not at the page cap");
+  assert.equal(roles.data.length, 2);
+
+  const budgets = await client.listIngestBudgets();
+  assert.equal(budgets.complete, false, "an empty page with a next token must not report a complete inventory");
+  assert.equal(emptyRequests, 2);
+  assert.equal(budgets.data.length, 1);
+
+  const capped = new SumologicApiClient(sampleConfig(), { fetchImpl, maxPages: 2, maxRetries: 0 });
+  const collectors = await capped.listCollectors();
+  assert.equal(collectors.complete, false, "offset pagination that hits the page cap on a full page is incomplete");
+  assert.equal(collectors.data.length, 2000);
+
+  const governance = await assessSumologicDataGovernance(readerFrom(healthyData(), { listRoles: async () => roles, listCollectors: async () => collectors }), { now: NOW });
+  assert.equal(byId(governance, "SUMO-12").status, "warn");
+  assert.match(byId(governance, "SUMO-12").summary, /Pagination stopped before the last page, so only 2000 items were seen/);
+});
+
+test("foreign-origin next link: a URL-shaped next cursor is only ever a token query value on the configured base, so no request leaves for it and the Basic credential stays on the configured origin", async () => {
+  const foreignParts = { host: "collector.evil-example.net", path: "/harvest/sumo-basic", query: "sink=basic&page=2" };
+  const foreign = `https://${foreignParts.host}${foreignParts.path}?${foreignParts.query}`;
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    requests.push({ url, authorization: headerValue(init.headers, "authorization") });
+    if (url.pathname !== "/api/v1/roles") return jsonResponse({});
+    if (!url.searchParams.get("token")) return jsonResponse({ data: [{ id: "r1", name: "Role 1" }], next: foreign });
+    return jsonResponse({ data: [{ id: "r2", name: "Role 2" }], next: null });
+  };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, maxPages: 50, maxRetries: 0 });
+
+  const roles = await client.listRoles();
+  assert.equal(roles.ok, true);
+  assert.equal(roles.complete, true);
+  assert.equal(roles.data.length, 2);
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.url.origin === "https://api.us2.sumologic.com"), "every request went to the configured base origin");
+  assert.ok(requests.every((request) => request.url.pathname === "/api/v1/roles"), "the walk never left the declared path");
+  assert.equal(requests[1].url.searchParams.get("token"), foreign, "the server's next value travels back only as the token query value");
+  assert.ok(requests.every((request) => request.authorization.startsWith("Basic ")), "the credential went to the configured origin only");
+  for (const part of Object.values(foreignParts)) assert.ok(!JSON.stringify(roles).includes(part), `the collection carries no ${part}`);
+});
+
+test("rule 10: control 10 names each capped forwarding inventory and never passes on a truncated partition or scheduled view list", async () => {
+  const data = healthyData();
+  const partial = (items) => collectionOf(items, { complete: false });
+
+  const viewsCapped = await assessSumologicDataGovernance(readerFrom(data, { listScheduledViews: async () => partial(data.scheduledViews) }), { now: NOW });
+  assert.equal(byId(viewsCapped, "SUMO-10").status, "warn");
+  assert.match(byId(viewsCapped, "SUMO-10").summary, /Pagination of the scheduled view list stopped before the last page, so only 1 were seen/);
+  assert.deepEqual(byId(viewsCapped, "SUMO-10").evidence.incomplete_inventories, ["scheduled view list"]);
+  assert.equal(byId(viewsCapped, "SUMO-10").evidence.scheduled_views_complete, false);
+  assert.equal(byId(viewsCapped, "SUMO-10").evidence.partitions_complete, true);
+
+  const partitionsCapped = await assessSumologicDataGovernance(readerFrom(data, { listPartitions: async () => partial(data.partitions) }), { now: NOW, approvedDestinationDomains: ["example.com"] });
+  assert.equal(byId(partitionsCapped, "SUMO-10").status, "warn");
+  assert.match(byId(partitionsCapped, "SUMO-10").summary, /Pagination of the partition list stopped before the last page, so only 2 were seen/);
+  assert.equal(byId(partitionsCapped, "SUMO-09").status, "warn", "SUMO-09 never passes on a page-capped partition list");
+  assert.match(byId(partitionsCapped, "SUMO-09").summary, /active audit index partition\(s\) exist .* Pagination stopped before the last page, so only 2 items were seen and the population is incomplete\.$/);
+  assert.equal(byId(partitionsCapped, "SUMO-09").evidence.partitions_complete, false);
+  assert.equal(byId(partitionsCapped, "SUMO-09").evidence.partitions_seen, 2);
+  const partitionsComplete = await assessSumologicDataGovernance(readerFrom(data), { now: NOW });
+  assert.equal(byId(partitionsComplete, "SUMO-09").status, "pass");
+  assert.doesNotMatch(byId(partitionsComplete, "SUMO-09").summary, /Pagination stopped/);
+
+  const allCapped = await assessSumologicDataGovernance(readerFrom(data, {
+    listPartitions: async () => partial(data.partitions),
+    listScheduledViews: async () => partial(data.scheduledViews),
+    listConnections: async () => partial(data.connections),
+  }), { now: NOW });
+  assert.equal(byId(allCapped, "SUMO-10").status, "warn");
+  assert.deepEqual(byId(allCapped, "SUMO-10").evidence.incomplete_inventories, ["connection list", "partition list", "scheduled view list"]);
+});
+
+/** Every number and boolean leaf of a value by dotted path, so a hiding cap can be diffed against the complete read. */
+function scalarLeaves(value, prefix = "") {
+  const leaves = new Map();
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => { for (const [path, leaf] of scalarLeaves(item, `${prefix}[${index}]`)) leaves.set(path, leaf); });
+  } else if (value !== null && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) for (const [path, leaf] of scalarLeaves(item, prefix ? `${prefix}.${key}` : key)) leaves.set(path, leaf);
+  } else if (typeof value === "number" || typeof value === "boolean") {
+    leaves.set(prefix, value);
+  }
+  return leaves;
+}
+
+test("reviewer C final verdict, item I: a count judged over a partially read inventory renders null in the assessment summary and the evidence, never the count of the part read, and SUMO-09 calls a hidden audit index unread rather than absent", async () => {
+  const data = healthyData();
+  data.users.push({ id: "u4", email: "dormant@example.com", isActive: true, isMfaEnabled: true, isLocked: false, lastLoginTimestamp: STALE });
+  data.monitors[0].notifications = [{ notification: { connectionType: "Email", recipients: ["someone@gmail.com"] }, runForTriggerTypes: ["Critical"] }];
+  // The reviewer's hiding cap: the first item only, with the walk reported incomplete, so the truncation hides real entries.
+  const hiding = (items) => collectionOf(items.slice(0, 1), { complete: false });
+
+  const identity = await assessSumologicIdentity(readerFrom(data), { now: NOW });
+  assert.equal(identity.summary.users_complete, true);
+  assert.equal(identity.summary.dormant_active_users, 1);
+  const identityHidden = await assessSumologicIdentity(readerFrom(data, { listUsers: async () => hiding(data.users) }), { now: NOW });
+  assert.equal(identityHidden.summary.users_seen, 1);
+  assert.equal(identityHidden.summary.users_complete, false);
+  for (const leaf of ["active_users_without_mfa", "locked_users", "dormant_active_users", "active_users_without_last_login"]) {
+    assert.equal(identityHidden.summary[leaf], null, `${leaf} over a partial user list is null, not the count of the part read`);
+  }
+  assert.equal(identityHidden.summary.identity_providers, 1, "a count over a completely read inventory keeps its value");
+
+  const governance = await assessSumologicDataGovernance(readerFrom(data), { now: NOW });
+  assert.equal(byId(governance, "SUMO-09").evidence.active_audit_index_partitions, 1);
+  assert.equal(governance.summary.active_audit_indexes, 1);
+  assert.equal(governance.summary.partitions_complete, true);
+  const governanceHidden = await assessSumologicDataGovernance(readerFrom(data, { listPartitions: async () => hiding(data.partitions) }), { now: NOW });
+  const audit = byId(governanceHidden, "SUMO-09");
+  assert.equal(audit.status, "manual", audit.summary);
+  assert.equal(audit.summary, "The audit policy is enabled but no active AuditIndex partition was among the 1 partitions seen before pagination stopped, so the audit index is unread rather than absent. Read the full partition list and run `_index=sumologic_audit_events` to confirm events are received. Pagination stopped before the last page, so only 1 items were seen and the population is incomplete.");
+  assert.doesNotMatch(audit.summary, /may be unavailable on this plan/);
+  assert.equal(audit.evidence.active_audit_index_partitions, null);
+  assert.equal(audit.evidence.partitions_seen, 1);
+  assert.equal(audit.evidence.partitions_complete, false);
+  assert.deepEqual(audit.evidence.audit_index_partitions, []);
+  assert.equal(governanceHidden.summary.active_audit_indexes, null);
+  assert.equal(governanceHidden.summary.partitions_complete, false);
+  assert.equal(governanceHidden.summary.partitions_seen, 1);
+  // The completely read list without an audit index is the real absence and keeps its wording.
+  const noAudit = await assessSumologicDataGovernance(readerFrom({ ...data, partitions: data.partitions.slice(0, 1) }), { now: NOW });
+  assert.match(byId(noAudit, "SUMO-09").summary, /no active AuditIndex partition was visible \(plan Paid\); the audit index may be unavailable on this plan/);
+  assert.equal(byId(noAudit, "SUMO-09").evidence.active_audit_index_partitions, 0);
+
+  const sharing = await assessSumologicContentSharing(readerFrom(data), { now: NOW });
+  assert.equal(sharing.summary.external_email_recipients, 1);
+  assert.equal(sharing.summary.monitors_complete, true);
+  const sharingHidden = await assessSumologicContentSharing(readerFrom(data, { listMonitors: async () => collectionOf([], { complete: false }) }), { now: NOW });
+  assert.equal(sharingHidden.summary.external_email_recipients, null);
+  assert.equal(sharingHidden.summary.monitors_complete, false);
+  assert.equal(sharingHidden.summary.monitors_seen, 0);
+
+  // Under every hiding cap, no finding evidence or assessment summary leaf that the complete read rendered as a positive count or true renders 0 or false: it is null, or a seen count that is still positive.
+  const complete = await allAssessments(readerFrom(data));
+  const listReaders = { listUsers: "users", listRoles: "roles", listAccessKeys: "accessKeys", listPartitions: "partitions", listScheduledViews: "scheduledViews", listIngestBudgets: "ingestBudgets", listConnections: "connections", listCollectors: "collectors", listMonitors: "monitors", listDashboards: "dashboards" };
+  for (const [reader, key] of Object.entries(listReaders)) {
+    const items = data[key];
+    assert.ok(Array.isArray(items), `${reader} reads a fixture list`);
+    const capped = await allAssessments(readerFrom(data, { [reader]: async () => hiding(items) }));
+    for (const [index, area] of complete.entries()) {
+      const before = new Map([...scalarLeaves(area.summary, "summary"), ...area.findings.flatMap((item) => [...scalarLeaves(item.evidence, `${item.id}.evidence`)])]);
+      const after = new Map([...scalarLeaves(capped[index].summary, "summary"), ...capped[index].findings.flatMap((item) => [...scalarLeaves(item.evidence, `${item.id}.evidence`)])]);
+      for (const [leaf, value] of before) {
+        const cappedValue = after.get(leaf);
+        if (typeof value === "number" && value > 0 && !/^summary\.(pass|warn|fail|manual)$/.test(leaf)) assert.notEqual(cappedValue, 0, `${reader} hidden: ${area.area} ${leaf} defaulted ${value} -> 0`);
+        if (value === true && !/_complete$/.test(leaf)) assert.notEqual(cappedValue, false, `${reader} hidden: ${area.area} ${leaf} defaulted true -> false`);
+      }
+    }
+  }
+});
+
+// `unread` names the evidence fields derived from the denied inventory; each
+// must render null (never 0 or []) when that inventory returns 403.
+const MULTI_INVENTORY_FINDINGS = [
+  { id: "SUMO-02", area: "identity", secondary: "listSamlIdentityProviders", names: /the SAML identity provider list could not be read/, unread: ["identity_providers"] },
+  { id: "SUMO-05", area: "identity", secondary: "listUsers", names: /user list was unreadable/, unread: ["users_seen", "active_users", "active_users_without_mfa", "locked_users", "dormant_active_users"] },
+  { id: "SUMO-06", area: "access", secondary: "listUsers", names: /user list was unreadable/, unread: ["admin_members_seen_in_user_list", "dormant_admin_members", "locked_users"] },
+  { id: "SUMO-07", area: "access", secondary: "getPolicy:accessKeysLifetime", names: /lifetime policy was unreadable/, unread: ["access_keys_lifetime_policy_days"] },
+  { id: "SUMO-13", area: "access", secondary: "listServiceAllowlistAddresses", names: /CIDR list was unreadable/, unread: ["addresses_seen", "cidrs"] },
+  { id: "SUMO-14", area: "access", secondary: "getPolicy:userConcurrentSessionsLimit", names: /the concurrent sessions limit policy could not be read/, unread: ["concurrent_sessions_limit_enabled", "max_concurrent_sessions"] },
+  { id: "SUMO-09", area: "governance", secondary: "listPartitions", names: /partition list was unreadable/, unread: ["partitions_seen", "active_audit_index_partitions", "audit_index_partitions"] },
+  { id: "SUMO-09", area: "governance", secondary: "getPolicy:searchAudit", names: /the search audit policy could not be read/, unread: ["search_audit_enabled"] },
+  { id: "SUMO-10", area: "governance", secondary: "listPartitions", names: /the partition list could not be read/, options: { approvedDestinationDomains: ["example.com"] }, unread: ["partitions_seen", "partitions_forwarding"] },
+  { id: "SUMO-10", area: "governance", secondary: "listScheduledViews", names: /the scheduled view list could not be read/, options: { approvedDestinationDomains: ["example.com"] }, unread: ["scheduled_views_seen", "scheduled_views_forwarding"] },
+  { id: "SUMO-11", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, unread: ["personal_folder_items_total", "personal_folder_items_sampled", "org_shared_items"] },
+  { id: "SUMO-11", area: "content", secondary: "getContentPermissions", names: /1 content permission lookup\(s\) failed/, recorded: { permission_lookups_failed: 1 } },
+  { id: "SUMO-15", area: "content", secondary: "listMonitors", names: /the monitor list could not be read/, baseline: "manual", unread: ["monitors_seen", "monitors_with_run_as"] },
+  { id: "SUMO-15", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual", unread: ["personal_folder_items_total", "scheduled_searches_in_sampled_folder"] },
+  { id: "SUMO-18", area: "content", secondary: "getPersonalFolder", names: /the personal folder could not be read/, baseline: "manual", unread: ["personal_folder_items_total", "lookup_tables_in_sampled_folder"] },
+  { id: "SUMO-19", area: "content", secondary: "listDashboards", names: /dashboard list was unreadable/, unread: ["dashboards_seen", "public_dashboards"] },
+  { id: "SUMO-20", area: "content", secondary: "listUsers", names: /the user list could not be read/, options: { approvedEmailDomains: ["example.com"] }, unread: ["users_seen"] },
+  { id: "SUMO-20", area: "content", secondary: "listConnections", names: /the connection list could not be read/, options: { approvedEmailDomains: ["example.com"] }, unread: ["connections_seen", "notifications_to_unknown_connections"] },
+];
+
+async function assessArea(area, reader, options) {
+  switch (area) {
+    case "identity":
+      return assessSumologicIdentity(reader, { now: NOW, ...options });
+    case "access":
+      return assessSumologicAccessControl(reader, { now: NOW, ...options });
+    case "governance":
+      return assessSumologicDataGovernance(reader, { now: NOW, ...options });
+    default:
+      return assessSumologicContentSharing(reader, { now: NOW, ...options });
+  }
+}
+
+test("rule 1 corollary: every multi-inventory finding drops below pass and names the inventory when one secondary inventory returns 403", async () => {
+  const forbidden = () => failedCollection("Sumo Logic request failed (403 forbidden)", 403);
+  for (const scenario of MULTI_INVENTORY_FINDINGS) {
+    const data = healthyData();
+    data.monitors[0].notifications.push({ notification: { connectionType: "Webhook", connectionId: "c1" }, runForTriggerTypes: ["Critical"] });
+    data.connections = [{ id: "c1", name: "hook", type: "WebhookConnection", url: "https://hooks.example.com/x" }];
+    const label = `${scenario.id} with ${scenario.secondary} forbidden`;
+
+    const healthy = await assessArea(scenario.area, readerFrom(data), scenario.options);
+    assert.equal(byId(healthy, scenario.id).status, scenario.baseline ?? "pass", `${label}: baseline must be ${scenario.baseline ?? "pass"} so the demotion is meaningful`);
+
+    const [method, policyName] = scenario.secondary.split(":");
+    const override = policyName
+      ? { getPolicy: async (name) => (name === policyName ? forbidden() : collectionOf(data.policies[name] ?? {})) }
+      : { [method]: async () => forbidden() };
+    const result = await assessArea(scenario.area, readerFrom(data, override), scenario.options);
+    const item = byId(result, scenario.id);
+    assert.notEqual(item.status, "pass", `${label}: must not pass (got ${item.status}: ${item.summary})`);
+    assert.match(item.summary, scenario.names, `${label}: summary names the unreadable inventory`);
+    assert.match(item.summary, /403|unreadable|could not be read|failed/, `${label}: summary states the cause`);
+    for (const field of scenario.unread ?? []) {
+      assert.ok(field in item.evidence, `${label}: evidence carries ${field}`);
+      assert.equal(item.evidence[field], null, `${label}: ${field} renders null for the unreadable inventory, not ${JSON.stringify(item.evidence[field])}`);
+    }
+    for (const [field, value] of Object.entries(scenario.recorded ?? {})) {
+      assert.equal(item.evidence[field], value, `${label}: ${field} records the failed lookup`);
+    }
+    assert.doesNotMatch(item.summary, /\b0\/0\b|\b0 (?:monitor|dashboard|user|partition|item)s? (?:seen|were seen|returned)/, `${label}: summary does not render a zero count for the unreadable inventory`);
+  }
+
+  // Spot checks on the verdict each fix settles on.
+  const data = healthyData();
+  data.monitors[0].notifications.push({ notification: { connectionType: "Webhook", connectionId: "c1" }, runForTriggerTypes: ["Critical"] });
+  data.connections = [{ id: "c1", name: "hook", type: "WebhookConnection", url: "https://hooks.example.com/x" }];
+  const noConnections = await assessSumologicContentSharing(readerFrom(data, { listConnections: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(noConnections, "SUMO-20").status, "manual", "webhook notifications cannot be validated without the connection list");
+  assert.deepEqual(byId(noConnections, "SUMO-20").evidence.unreadable_inventories, ["connection list"]);
+  const emailOnly = healthyData();
+  const noConnectionsEmailOnly = await assessSumologicContentSharing(readerFrom(emailOnly, { listConnections: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(noConnectionsEmailOnly, "SUMO-20").status, "warn", "email-only routing can still be judged, so the missing connection list caps at warn");
+  const noViews = await assessSumologicDataGovernance(readerFrom(healthyData(), { listScheduledViews: async () => forbidden() }), { now: NOW, approvedDestinationDomains: ["example.com"] });
+  assert.equal(byId(noViews, "SUMO-10").status, "manual");
+  assert.equal(byId(noViews, "SUMO-10").evidence.scheduled_views_readable, false);
+  const noSearchAudit = await assessSumologicDataGovernance(readerFrom(healthyData(), { getPolicy: async (name) => (name === "searchAudit" ? forbidden() : collectionOf(healthyData().policies[name] ?? {})) }), { now: NOW });
+  assert.equal(byId(noSearchAudit, "SUMO-09").status, "warn");
+  assert.doesNotMatch(byId(noSearchAudit, "SUMO-09").summary, /search audit policies are enabled/);
+  const noIdps = await assessSumologicIdentity(readerFrom(healthyData(), { listSamlIdentityProviders: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(noIdps, "SUMO-02").status, "warn");
+  const noConcurrent = await assessSumologicAccessControl(readerFrom(healthyData(), { getPolicy: async (name) => (name === "userConcurrentSessionsLimit" ? forbidden() : collectionOf(healthyData().policies[name] ?? {})) }), { now: NOW });
+  assert.equal(byId(noConcurrent, "SUMO-14").status, "warn");
+  assert.doesNotMatch(byId(noConcurrent, "SUMO-14").summary, /policy is not enabled/);
+  assert.equal(byId(noConcurrent, "SUMO-14").evidence.concurrent_sessions_limit_enabled, null);
+
+  // Uniform null rendering reaches the assessment summaries too.
+  const noUsersIdentity = await assessSumologicIdentity(readerFrom(healthyData(), { listUsers: async () => forbidden() }), { now: NOW });
+  assert.equal(noUsersIdentity.summary.users_seen, null);
+  assert.equal(noUsersIdentity.summary.active_users_without_mfa, null);
+  assert.equal(noUsersIdentity.summary.identity_providers, 1);
+  const noMfaPolicyUsers = healthyData();
+  noMfaPolicyUsers.passwordPolicy.requireMfa = false;
+  const failNoUsers = await assessSumologicIdentity(readerFrom(noMfaPolicyUsers, { listUsers: async () => forbidden() }), { now: NOW });
+  assert.equal(byId(failNoUsers, "SUMO-05").status, "fail");
+  assert.match(byId(failNoUsers, "SUMO-05").summary, /per-user MFA status is unknown because the user list could not be read/);
+  assert.doesNotMatch(byId(failNoUsers, "SUMO-05").summary, /0\/0/);
+  const noPartitions = await assessSumologicDataGovernance(readerFrom(healthyData(), { listPartitions: async () => forbidden() }), { now: NOW });
+  assert.equal(noPartitions.summary.partitions_seen, null);
+  assert.equal(noPartitions.summary.active_audit_indexes, null);
+  assert.equal(noPartitions.summary.collectors_seen, 2);
+  const noFolder = await assessSumologicContentSharing(readerFrom(healthyData(), { getPersonalFolder: async () => forbidden(), listDashboards: async () => forbidden() }), { now: NOW });
+  assert.equal(noFolder.summary.personal_folder_items_total, null);
+  assert.equal(noFolder.summary.org_shared_items, null);
+  assert.equal(noFolder.summary.dashboards_seen, null);
+  assert.match(byId(noFolder, "SUMO-15").summary, /the personal folder could not be read so no scheduled searches were sampled/);
+  const noKeys = await assessSumologicAccessControl(readerFrom(healthyData(), { listAccessKeys: async () => forbidden() }), { now: NOW });
+  assert.equal(noKeys.summary.access_keys_seen, null);
+  assert.equal(noKeys.summary.access_key_scope, null);
+});
+
+test("content permissions: never requested when the personal folder is unreadable, not collected when every lookup failed, and counted only from the lookups that succeeded", async () => {
+  const base = createTempBase("grclanker-sumo-content-permissions-");
+  const marker = (entry) => entry.data;
+
+  const folderDenied = recordingFetch({ deniedPaths: ["/api/v2/content/folders/personal"] });
+  const folderClient = new SumologicApiClient(sampleConfig(), { fetchImpl: folderDenied.fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const folderAccess = await checkSumologicAccess(folderClient);
+  const folderResults = await allAssessments(folderClient);
+  const folderExport = await exportSumologicAuditBundle(folderClient, sampleConfig(), join(base, "folder-denied"), { now: NOW });
+  assert.ok(folderDenied.requests.every((request) => !/\/permissions$/.test(request.path)), "no permission lookup is issued when the folder listing failed");
+  const folderSharing = folderResults.find((result) => result.area === "content-sharing");
+  for (const [label, entry] of [
+    ["core_data", JSON.parse(readFileSync(join(folderExport.outputDir, "core_data", "content-sharing.json"), "utf8")).content_permissions],
+    ["rawData", folderSharing.rawData.content_permissions],
+  ]) {
+    assert.equal(entry.ok, false, `${label}: content_permissions is not collected`);
+    assert.equal(entry.complete, null, label);
+    assert.equal(entry.scope, null, label);
+    assert.equal(entry.count, null, `${label}: count is null, not 0`);
+    assert.equal(entry.http_status, null, `${label}: no status is invented for lookups that were never issued`);
+    assert.equal(entry.endpoint, null, `${label}: no endpoint is invented for lookups that were never issued`);
+    assert.match(entry.error, /^Not requested: no content permission lookups were issued because the personal folder could not be read \(.*\(403 forbidden\).*\)\.$/, label);
+    assert.deepEqual(marker(entry), { collected: false, status: null, endpoint: null, error: entry.error }, `${label}: the marker, not []`);
+  }
+  assert.ok(folderSharing.errors.some((line) => /^content_permissions: Not requested: /.test(line)));
+  assert.equal(byId(folderSharing, "SUMO-11").evidence.org_shared_items, null);
+  assertOutputsNameOnlyObservedRequests(sumologicOutputs(folderAccess, folderResults, folderExport), folderDenied.requests, "personal folder denied");
+
+  const lookupsDenied = recordingFetch({ deniedPaths: ["/api/v2/content/c1/permissions"] });
+  const lookupClient = new SumologicApiClient(sampleConfig(), { fetchImpl: lookupsDenied.fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const lookupAccess = await checkSumologicAccess(lookupClient);
+  const lookupResults = await allAssessments(lookupClient);
+  const lookupExport = await exportSumologicAuditBundle(lookupClient, sampleConfig(), join(base, "lookups-denied"), { now: NOW });
+  assert.ok(lookupsDenied.requests.some((request) => request.path === "/api/v2/content/c1/permissions" && request.status === 403), "the lookup was issued and denied");
+  const lookupSharing = lookupResults.find((result) => result.area === "content-sharing");
+  for (const [label, entry] of [
+    ["core_data", JSON.parse(readFileSync(join(lookupExport.outputDir, "core_data", "content-sharing.json"), "utf8")).content_permissions],
+    ["rawData", lookupSharing.rawData.content_permissions],
+  ]) {
+    assert.equal(entry.ok, false, `${label}: a set of lookups that all failed is not collected`);
+    assert.equal(entry.count, null, `${label}: count is null, not the number of items whose lookups failed`);
+    assert.equal(entry.complete, null, label);
+    assert.equal(entry.http_status, null, `${label}: no single status stands for the whole set`);
+    assert.equal(entry.endpoint, null, label);
+    assert.match(entry.error, /^every content permission lookup failed \(1 of 1\): .*\(403 forbidden\)/, label);
+    assert.deepEqual(marker(entry), { collected: false, status: null, endpoint: null, error: entry.error }, label);
+  }
+  assert.equal(lookupSharing.summary.org_shared_items, null, "org-wide shares are unknown when every lookup failed");
+  const sharingFinding = byId(lookupSharing, "SUMO-11");
+  assert.equal(sharingFinding.status, "manual");
+  assert.equal(sharingFinding.evidence.org_shared_items, null, "never [] from lookups that all failed");
+  assert.equal(sharingFinding.evidence.permission_lookups_failed, 1);
+  assert.equal(sharingFinding.evidence.personal_folder_items_sampled, 1, "the folder itself was read, so its counts are real");
+  assert.equal(byId(lookupSharing, "SUMO-18").evidence.lookup_tables_shared_org_wide, null);
+  assertOutputsNameOnlyObservedRequests(sumologicOutputs(lookupAccess, lookupResults, lookupExport), lookupsDenied.requests, "permission lookups denied");
+
+  const twoItems = healthyData();
+  twoItems.personalFolder.children = [
+    { id: "c1", name: "Shared search", itemType: "Search" },
+    { id: "c2", name: "Private lookup", itemType: "Lookups" },
+  ];
+  const partial = await assessSumologicContentSharing(
+    readerFrom(twoItems, {
+      getContentPermissions: async (id) => (id === "c2" ? failedCollection("Sumo Logic request failed (403 forbidden)", 403, "/v2/content/c2/permissions") : collectionOf(twoItems.permissions)),
+    }),
+    { now: NOW },
+  );
+  const partialEntry = partial.rawData.content_permissions;
+  assert.equal(partialEntry.ok, true, "one successful lookup makes the set collected");
+  assert.equal(partialEntry.complete, false, "a failed lookup makes it incomplete");
+  assert.equal(partialEntry.count, 2);
+  assert.deepEqual(partialEntry.data.map((row) => [row.id, row.ok]), [["c1", true], ["c2", false]]);
+  assert.equal(partial.summary.org_shared_items, byId(partial, "SUMO-11").evidence.org_shared_items.length, "the count covers the lookups that succeeded");
+  assert.equal(byId(partial, "SUMO-11").evidence.permission_lookups_failed, 1);
+  assert.notEqual(byId(partial, "SUMO-11").status, "pass");
+  assert.match(byId(partial, "SUMO-11").summary, /1 content permission lookup\(s\) failed \(Private lookup: /);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
@@ -929,4 +1949,1189 @@ test("Sumo Logic tools are registered in the tool catalog under the Sumo Logic g
   const exportTool = tools.find((tool) => tool.name === "sumologic_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "endpoint"));
+});
+
+test("rule 9: scrub boundary: a name-shaped value stays bare in prose and is removed inside every carrier, as a configured secret in every encoding, and whenever it has a real token shape", () => {
+  const name = "prod-us-east-2026";
+  const bare = `Sumo Logic request failed for tenant ${name} owned by sess-canary-COOKIE-31415926535897`;
+  assert.equal(scrubErrorText(bare), bare, "a name-shaped value bare in prose is indistinguishable from a resource name");
+  assert.equal(scrubErrorText(bare, [name]), "Sumo Logic request failed for tenant [REDACTED] owned by sess-canary-COOKIE-31415926535897", "the same value registered as a configured secret is removed");
+  const carriers = [
+    [`Cookie: sid=${name}; Path=/`, "Cookie: [REDACTED]"],
+    [`Set-Cookie: session=${name}; HttpOnly`, "Set-Cookie: [REDACTED]"],
+    [`X-Api-Key: ${name} rejected`, "X-Api-Key: [REDACTED] rejected"],
+    [`Authorization: Basic ${name} rejected`, "Authorization: Basic [REDACTED] rejected"],
+    [`token=${name} rejected`, "token=[REDACTED] rejected"],
+    [`{"client_secret": "${name}"} rejected`, '{"client_secret": "[REDACTED]"} rejected'],
+    [`(session_id: ${name}) rejected`, "(session_id: [REDACTED]) rejected"],
+    [`https://svc:${name}@host/p?k=${name} rejected`, "https://host/p?[REDACTED] rejected"],
+    [`Bearer ${name} rejected`, "Bearer [REDACTED] rejected"],
+    [`SSWS ${name} rejected`, "SSWS [REDACTED] rejected"],
+    ["Basic authentication is required", "Basic authentication is required"],
+    // Reviewer C, item G: the word after a credential-named "key:" is the pair's value whatever its shape, prose included.
+    ["InvalidAuthenticationToken: Access token has expired", "InvalidAuthenticationToken: [REDACTED] token has expired"],
+  ];
+  for (const [input, expected] of carriers) {
+    const scrubbed = scrubErrorText(input);
+    assert.equal(scrubbed, expected, input);
+    if (input.includes(name) && !expected.includes(name)) assertNoWindowOf(scrubbed, name, `carrier ${input}`);
+  }
+  assertNoWindowOf(scrubErrorText(bare, [name]), name, "configured secret in prose");
+
+  // Quoted header values (the Codex P1 carrier class): the value goes whatever its quote style (plain, single, JSON-escaped), separator, or frame; the quote and any scheme word stay; quoted non-credential headers come back unchanged.
+  const quotedExpectations = [
+    [`Cookie: sid="${name}"; Path=/`, "Cookie: [REDACTED]"],
+    [`Cookie: sid=\\"${name}\\"`, "Cookie: [REDACTED]"],
+    [`Set-Cookie: session='${name}'; HttpOnly`, "Set-Cookie: [REDACTED]"],
+    [`Authorization: Bearer "${name}" rejected`, 'Authorization: Bearer "[REDACTED]" rejected'],
+    [`Authorization: Basic '${name}' rejected`, "Authorization: Basic '[REDACTED]' rejected"],
+    [`Authorization: "Bearer ${name}" rejected`, 'Authorization: "Bearer [REDACTED]" rejected'],
+    [`\\"Authorization\\": \\"Bearer ${name}\\"`, '\\"Authorization\\": \\"Bearer [REDACTED]\\"'],
+    [`X-Api-Key: \\"Ab3dEf9hIj2k\\", next`, 'X-Api-Key: \\"[REDACTED]\\", next'],
+    [`X-Auth-Token: "Ab3dEf9hIj2k"`, 'X-Auth-Token: "[REDACTED]"'],
+    [`Bearer "${name}" rejected`, 'Bearer "[REDACTED]" rejected'],
+  ];
+  for (const [input, expected] of quotedExpectations) assert.equal(scrubErrorText(input), expected, input);
+  // Compound header lines (reviewer B's shape): a quoted value ends at its closing quote, an unquoted cookie or header value ends at ";" or "," before the next "Name:" token or at the end of the line, and the following header keeps its name and gets its own carrier treatment.
+  const requestId = "3f2b6a1e-9c4d-4e8f-b1a2-6d7c8e9f0a1b";
+  const compoundExpectations = [
+    [`Cookie: sid="${name}"; X-Api-Key: "${name}"; Content-Type: "application/json"`, 'Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'],
+    [`Cookie: sid=${name}; X-Api-Key: ${name}; Content-Type: application/json`, "Cookie: [REDACTED]; X-Api-Key: [REDACTED]; Content-Type: application/json"],
+    [`Cookie: "sid=${name}; Path=/"; X-Api-Key: "${name}"; Content-Type: "application/json"`, 'Cookie: "[REDACTED]"; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'],
+    [`Set-Cookie: session=${name}; Path=/; HttpOnly, X-Api-Key: ${name}, Content-Type: text/html`, "Set-Cookie: [REDACTED], X-Api-Key: [REDACTED], Content-Type: text/html"],
+    [`X-Api-Key: "${name}"; X-Auth-Token: "${name}"`, 'X-Api-Key: "[REDACTED]"; X-Auth-Token: "[REDACTED]"'],
+    [`X-Api-Key: ${name}; X-Auth-Token: ${name}; Content-Type: application/json`, "X-Api-Key: [REDACTED]; X-Auth-Token: [REDACTED]; Content-Type: application/json"],
+    [`Authorization: Bearer "${name}", X-Api-Key: "${name}", Content-Type: "application/json"`, 'Authorization: Bearer "[REDACTED]", X-Api-Key: "[REDACTED]", Content-Type: "application/json"'],
+    [`Cookie: sid=${name}; {"error": "invalid_token", "client_secret": "${name}", "request_id": "${requestId}"}`, `Cookie: [REDACTED]; {"error": "invalid_token", "client_secret": "[REDACTED]", "request_id": "${requestId}"}`],
+    [`Cookie: sid="${name}" {"error": "invalid_token", "request_id": "${requestId}"}`, `Cookie: [REDACTED] {"error": "invalid_token", "request_id": "${requestId}"}`],
+    [`Cookie: sid=\\"${name}\\"; X-Api-Key: \\"${name}\\"; Content-Type: \\"application/json\\"`, 'Cookie: [REDACTED]; X-Api-Key: \\"[REDACTED]\\"; Content-Type: \\"application/json\\"'],
+    [`{\\"Cookie\\": \\"sid=${name}; Path=/\\", \\"X-Api-Key\\": \\"${name}\\", \\"Content-Type\\": \\"application/json\\"}`, '{\\"Cookie\\": \\"[REDACTED]\\", \\"X-Api-Key\\": \\"[REDACTED]\\", \\"Content-Type\\": \\"application/json\\"}'],
+  ];
+  const gatewayBody = (line) => `Sumo Logic request to /api/v1/users failed (502 Bad Gateway): <html><body><h1>502 Bad Gateway</h1><p>upstream headers: ${line}</p></body></html>`;
+  for (const [input, expected] of compoundExpectations) {
+    for (const [label, rendered, expectedRendered] of [["bare", input, expected], ["502 body", gatewayBody(input), gatewayBody(expected)]]) {
+      const scrubbed = scrubErrorText(rendered);
+      assert.equal(scrubbed, expectedRendered, `${label}: ${rendered}`);
+      assertNoWindowOf(scrubbed, name, `compound ${label} ${rendered}`);
+      for (const following of ["X-Api-Key", "X-Auth-Token", "Content-Type"]) {
+        if (rendered.includes(`${following}`)) assert.ok(scrubbed.includes(following), `${following} keeps its name in ${scrubbed}`);
+      }
+      if (rendered.includes("application/json")) assert.ok(scrubbed.includes("application/json"), `Content-Type keeps its value in ${scrubbed}`);
+      if (rendered.includes(requestId)) assert.ok(scrubbed.includes(requestId), `the request id stays in ${scrubbed}`);
+      assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${rendered}`);
+    }
+  }
+  const quotedCarriers = [
+    (value, separator) => `Cookie${separator}sid=${value}; Path=/`,
+    (value, separator) => `Cookie${separator}sid = ${value}`,
+    (value, separator) => `Set-Cookie${separator}session=${value}; HttpOnly`,
+    (value, separator) => `X-Api-Key${separator}${value}`,
+    (value, separator) => `X-Auth-Token${separator}${value}`,
+    (value, separator) => `Authorization${separator}${value}`,
+    (value, separator) => `Authorization${separator}Bearer ${value}`,
+    (value, separator) => `Authorization${separator}Basic ${value}`,
+    (value, separator, raw, quote) => `Authorization${separator}${quote}Basic ${raw}${quote}`,
+    (value, separator) => `Proxy-Authorization${separator}Bearer ${value}`,
+    (value, separator, raw, quote) => `Authorization${separator}${quote}Bearer ${raw}${quote}`,
+  ];
+  const quotedFrames = [
+    (line) => line,
+    (line) => `Sumo Logic request to /api/v1/users failed (401 Unauthorized): the request carried ${line} and was rejected`,
+    (line) => `{"id":"ABCDE-12345","errors":[{"code":"unauthorized","message":"Invalid header: ${line}"}]}`,
+  ];
+  for (const raw of [name, "Ab3dEf9hIj2k"]) {
+    for (const carrier of quotedCarriers) {
+      for (const separator of [": ", ":", " : ", " :"]) {
+        for (const frame of quotedFrames) {
+          for (const quote of ['"', "'", '\\"']) {
+            const input = frame(carrier(`${quote}${raw}${quote}`, separator, raw, quote));
+            assertNoWindowOf(scrubErrorText(input), raw, `quoted carrier ${input}`);
+          }
+          const control = frame(carrier(raw, separator, raw, ""));
+          assertNoWindowOf(scrubErrorText(control), raw, `unquoted carrier ${control}`);
+        }
+      }
+    }
+  }
+  for (const header of SUMOLOGIC_QUOTED_HEADERS_KEPT) {
+    assert.equal(scrubErrorText(header), header, `must keep quoted header: ${header}`);
+    const sentence = `Sumo Logic request to /api/v1/users failed (400 Bad Request): the response carried ${header}`;
+    assert.equal(scrubErrorText(sentence), sentence, `must keep quoted header in a sentence: ${sentence}`);
+  }
+  const secret = 'top secret/value+1"x';
+  const forms = {
+    raw: secret,
+    json: JSON.stringify(secret).slice(1, -1),
+    url: encodeURIComponent(secret),
+    base64: Buffer.from(secret).toString("base64"),
+    base64url: Buffer.from(secret).toString("base64url"),
+  };
+  const encoded = Object.entries(forms).map(([label, form]) => `${label}=${form}`).join(" ");
+  assert.equal(scrubErrorText(encoded, [secret]), "raw=[REDACTED] json=[REDACTED] url=[REDACTED] base64=[REDACTED] base64url=[REDACTED]");
+  assert.equal(
+    scrubErrorText("bare shapes eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.c2lnbmF0dXJl 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 QmFzZTY0K1N5bWJvbHM= aB3xZ9qL2mN8pR4tV7wY1 ABCD-EFGH-1234-5678 xKqZvBnMwLpRtYsHdG stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND"),
+    "bare shapes [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] stay-01 name_with_words-2026 ERR_MODULE_NOT_FOUND",
+    "a JWT, a hex digest, a padded base64 run, scattered digits, a second numeric segment, and token casing are removed bare; short runs, names, and uppercase codes stay",
+  );
+  assert.equal(
+    scrubErrorText("failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/aB3xZ9qL2mN8pR4tV7wY1"),
+    "failed for /api/v1/users/aB3xZ9qL2mN8pR4tV7wY1/factors from /tmp/run-9b6rz9m4l55zg7/config.yaml and https://hooks.example.com/services/T0/[REDACTED]",
+    "a token-shaped segment of a bare request target or file path is an identifier the run named; inside a URL it is a webhook token",
+  );
+  assert.equal(
+    scrubErrorText("key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY beside /v2/content/folders/personal/children/000000000ABCDEF1/permissions"),
+    "key [REDACTED] beside /v2/content/folders/personal/children/000000000ABCDEF1/permissions",
+    "a random 40-character base64 run is an AWS secret access key; a bare path of word segments is a request target",
+  );
+
+  // Must-keep table (addendum 7): every identifying string a summary may carry survives alone and inside a realistic sentence.
+  for (const value of SUMOLOGIC_MUST_KEEP) {
+    assert.equal(scrubErrorText(value), value, `must keep bare: ${value}`);
+    for (const sentence of sumologicSummarySentences(value)) assert.equal(scrubErrorText(sentence), sentence, `must keep in a sentence: ${sentence}`);
+  }
+});
+
+/** Every request target the Sumo Logic client names in an error (the paths the probes and collectors request) plus the same paths as the route table sees them. */
+/** Reviewer C's 15 value shape classes (item G): the plain words that no shape rule catches are the point of the pair rule. */
+const PAIR_VALUE_SHAPES = [
+  "hunter2", "Summer2026!", "correcthorsebatterystaple", "letmein2024", "monkey", "qwerty", "letmein", "iloveyou",
+  "football", "Sunshine", "starwarsfan", "footballteam", "abc12", "p@ss", "guest",
+];
+/** The pair forms of item G: "=", ": ", ":", compact JSON, and spaced JSON. */
+const PAIR_FORMS = [
+  (key, value) => `${key}=${value}`,
+  (key, value) => `${key}: ${value}`,
+  (key, value) => `${key}:${value}`,
+  (key, value) => `{"${key}":"${value}"}`,
+  (key, value) => `{"${key}": "${value}"}`,
+];
+/** The frames of item G: a bare line, prose, a colon-terminated banner with the pair on the next line, a JSON string member, a 502 JSON body, and a double-escaped raw member. */
+const PAIR_FRAMES = [
+  ["line", (pair) => pair],
+  ["sentence", (pair) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: upstream echoed ${pair} while proxying`],
+  ["502-text", (pair) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\n${pair}`],
+  ["json-escaped", (pair) => `{"message":${JSON.stringify(pair)}}`],
+  ["502-json", (pair) => `{"status":502,"error":"Bad Gateway","message":${JSON.stringify(`The upstream rejected the request; environment: ${pair}`)},"request":{"env":${JSON.stringify(pair)}}}`],
+  ["502-json-raw", (pair) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ env: [pair] }))}}`],
+];
+const SAMPLE_UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+test("reviewer C final verdict, item G: the value under a credential-named key is removed whatever its shape in every pair form and frame; settings, identifiers, bearer ids, and webhooks follow the key classes", () => {
+  const credentialKeys = [
+    "DB_PASSWORD", "API_KEY", "client_secret", "access_token", "password", "AUTH_TOKEN",
+    "SUMOLOGIC_ACCESS_KEY", "OKTA_CLIENT_TOKEN", "OKTA_CLIENT_PRIVATEKEY", "SPLUNK_PASSWORD", "SPLUNK_ACS_TOKEN", "VERACODE_API_KEY_SECRET", "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+  ];
+  for (const key of credentialKeys) {
+    for (const value of PAIR_VALUE_SHAPES) {
+      for (const form of PAIR_FORMS) {
+        const pair = form(key, value);
+        for (const [frameName, frame] of PAIR_FRAMES) {
+          const input = frame(pair);
+          const scrubbed = scrubErrorText(input);
+          const label = `${frameName}: ${input}`;
+          assertNoWindowOf(scrubbed, value, label);
+          assert.ok(scrubbed.includes(key), `the key name stays in ${label} -> ${scrubbed}`);
+          assert.ok(scrubbed.includes("[REDACTED]"), `the value is replaced by the marker in ${label} -> ${scrubbed}`);
+          if (frameName === "sentence") assert.ok(scrubbed.endsWith(" while proxying"), `the prose after the pair stays in ${label} -> ${scrubbed}`);
+          assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${label}`);
+        }
+      }
+      assert.equal(scrubErrorText(`${key}=${value}`), `${key}=[REDACTED]`);
+      assert.equal(scrubErrorText(`${key}: ${value}`), `${key}: [REDACTED]`);
+      assert.equal(scrubErrorText(`{"${key}": "${value}"}`), `{"${key}": "[REDACTED]"}`);
+    }
+  }
+
+  // Bearer ids: a key ending in secret_id or naming a session id loses its value whatever the shape, a UUID included, in every form.
+  for (const key of ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "secretId", "secret-id", "session_id", "sessionId", "sid", "JSESSIONID", "PHPSESSID"]) {
+    for (const value of [SAMPLE_UUID, "xKqZvBnMwLpRtYsHdG", "monkey", "hunter2"]) {
+      for (const form of PAIR_FORMS) {
+        const scrubbed = scrubErrorText(form(key, value));
+        assertNoWindowOf(scrubbed, value, `bearer id ${form(key, value)}`);
+        assert.ok(scrubbed.includes(key), `bearer id key stays: ${scrubbed}`);
+      }
+    }
+  }
+
+  // Identifiers: a key without a credential word is not a pair under the rule; its value is judged by shape alone, so a UUID or a name stays.
+  for (const key of ["OKTA_CLIENT_ID", "OKTA_CLIENT_CLIENTID", "client_id", "SUMO_ACCESS_ID", "SUMOLOGIC_ACCESS_ID", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SPLUNK_USERNAME", "X-Request-Id", "request_id", "user_id", "kid"]) {
+    for (const value of [SAMPLE_UUID, "acme-prod-2026", "audit.bot"]) {
+      for (const form of PAIR_FORMS) assert.equal(scrubErrorText(form(key, value)), form(key, value), `identifier kept: ${form(key, value)}`);
+    }
+  }
+
+  // Settings: a credential-named key whose final segment names a setting keeps a value that is not token-shaped, in every form; a token-shaped value still goes.
+  const settingPairs = [
+    ["token_endpoint", "https://example.okta.com/oauth2/v1/token"],
+    ["token_uri", "https://example.okta.com/oauth2/v1/token"],
+    ["auth_method", "private_key_jwt"],
+    ["token_endpoint_auth_method", "private_key_jwt"],
+    ["signing_algorithm", "RS256"],
+    ["token_audience", "api://default"],
+    ["token_issuer", "https://example.okta.com/oauth2/default"],
+    ["key_shape", "rsa"],
+    ["token_type", "Bearer"],
+    ["SNOWFLAKE_TOKEN_TYPE", "KEYPAIR_JWT"],
+    ["X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT"],
+    ["credential_mode", "PrivateKey"],
+    ["token_limit", "200"],
+    ["token_count", "3"],
+    ["api_key_id", SAMPLE_UUID],
+    ["VERACODE_API_KEY_ID", SAMPLE_UUID],
+    ["OKTA_CLIENT_PRIVATEKEYID", "kid-2026-primary"],
+    ["token_name", "audit-token"],
+    ["api_key_name", "primary-key-2026"],
+  ];
+  for (const [key, value] of settingPairs) {
+    for (const form of PAIR_FORMS) assert.equal(scrubErrorText(form(key, value)), form(key, value), `setting kept: ${form(key, value)}`);
+    for (const shape of PAIR_VALUE_SHAPES) assert.equal(scrubErrorText(`${key}=${shape}`), `${key}=${shape}`, `a plain setting value stays: ${key}=${shape}`);
+  }
+  for (const [key, value] of [["token_type", "QmFzZTY0K1N5bWJvbHM="], ["api_key_id", "xKqZvBnMwLpRtYsHdG"], ["token_name", "aB3xZ9qL2mN8pR4tV7wY1"]]) {
+    for (const form of PAIR_FORMS) assertNoWindowOf(scrubErrorText(form(key, value)), value, `token-shaped setting value ${form(key, value)}`);
+  }
+
+  // Webhooks: webhook*, *hook_url, and callback_url keep the origin and lose the path and query; a webhook secret goes whole.
+  const webhookPath = "services/T0AB12CD/B0EF34GH/xKqZvBnMwLpRtYsHdG";
+  assert.equal(scrubErrorText(`webhook_url=https://hooks.example.com/${webhookPath}`), "webhook_url=https://hooks.example.com/[REDACTED]");
+  assert.equal(scrubErrorText(`webhookUrl: https://hooks.example.com/${webhookPath}?token=abc`), "webhookUrl: https://hooks.example.com/[REDACTED]");
+  assert.equal(scrubErrorText(`slack_hook_url: "https://hooks.example.com/${webhookPath}"`), 'slack_hook_url: "https://hooks.example.com/[REDACTED]"');
+  assert.equal(scrubErrorText("callback_url: https://app.example.com/oauth/callback?code=abc123def456"), "callback_url: https://app.example.com/[REDACTED]");
+  assert.equal(scrubErrorText("webhook_secret=monkey"), "webhook_secret=[REDACTED]");
+  for (const line of ["webhook_url=https://hooks.example.com/[REDACTED]", "callback_url: https://app.example.com/[REDACTED]"]) assert.equal(scrubErrorText(line), line, `second pass over ${line}`);
+});
+
+/** Reviewer C's literal escapes (item H): the two- and six-character sequences as they sit inside error text, not the control characters. */
+const LITERAL_ESCAPES = ["\\n", "\\r\\n", "\\t", "\\b", "\\f", "\\/", "\\u000a", "\\u0009", "\\u000d\\u000a"];
+/** The header lines of rows (b) and (ii) glued to an escape; each gives the line and its expected rendering, or null where the scrubber's HMAC rendering differs by integration. */
+const ESCAPED_HEADER_LINES = [
+  (value) => [`api_key=${value}`, "api_key=[REDACTED]"],
+  (value) => [`password: ${value}`, "password: [REDACTED]"],
+  (value) => [`X-Api-Key: ${value}`, "X-Api-Key: [REDACTED]"],
+  (value) => [`Cookie: sid=${value}`, "Cookie: [REDACTED]"],
+  (value) => [`Authorization: Bearer ${value}`, "Authorization: Bearer [REDACTED]"],
+  (value) => [`Authorization: SSWS ${value}`, "Authorization: SSWS [REDACTED]"],
+  (value) => [`Authorization: Splunk ${value}`, "Authorization: Splunk [REDACTED]"],
+  (value) => [`Authorization: Basic ${value}`, "Authorization: Basic [REDACTED]"],
+  (value) => [`Authorization: VERACODE-HMAC-SHA-256 id=${value},ts=1758560000000,nonce=${value},sig=${value}`, null],
+  (value) => [`X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT\\u000aAuthorization: Bearer ${value}`, "X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT\\u000aAuthorization: Bearer [REDACTED]"],
+];
+/** The text before the escape: a colon-terminated word is the case that used to swallow the header line as its value. */
+const ESCAPE_PREFIXES = ["request failed", "request headers:"];
+/** The frames of item H: a bare line, a 502 banner ending in a colon, a JSON string member holding the literal escapes, and a double-escaped raw member (each with the encoding the frame applies to its inner text). */
+const ESCAPE_FRAMES = [
+  ["line", (text) => text, (text) => text],
+  ["502-text", (text) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:${text}`, (text) => text],
+  ["json-member", (text) => `{"message":"${text}"}`, (text) => text],
+  ["502-json-raw", (text) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ env: [text] }))}}`, (text) => JSON.stringify(JSON.stringify(text).slice(1, -1)).slice(1, -1)],
+];
+
+test("reviewer C final verdict, item H: a literal JSON escape is a boundary before every carrier opener, so a header line glued to an escape is scrubbed as a header line and never as the value of the word before it", () => {
+  for (const escape of LITERAL_ESCAPES) {
+    for (const prefix of ESCAPE_PREFIXES) {
+      for (const value of PAIR_VALUE_SHAPES) {
+        for (const headerLine of ESCAPED_HEADER_LINES) {
+          const [line, expectedLine] = headerLine(value);
+          for (const [frameName, frame, encode] of ESCAPE_FRAMES) {
+            const input = frame(`${prefix}${escape}${line}`);
+            const scrubbed = scrubErrorText(input);
+            const label = `${frameName}: ${input}`;
+            assertNoWindowOf(scrubbed, value, label);
+            assert.ok(scrubbed.includes("[REDACTED]"), `the value is replaced by the marker in ${label} -> ${scrubbed}`);
+            assert.ok(scrubbed.includes(encode(`${prefix}${escape}${line.split(/[ =]/)[0]}`)), `the prefix, the escape, and the header name stay in ${label} -> ${scrubbed}`);
+            if (expectedLine !== null) assert.equal(scrubbed, frame(`${prefix}${escape}${expectedLine}`), label);
+            else assert.ok(scrubbed.includes("Authorization: VERACODE-HMAC-SHA-256 "), `the HMAC scheme word stays in ${label} -> ${scrubbed}`);
+            assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${label}`);
+          }
+        }
+      }
+    }
+  }
+
+  // The reviewer's literal rows (b) and (ii).
+  assert.equal(scrubErrorText("request headers:\\u000aAuthorization: Splunk abcdefghijklmnop"), "request headers:\\u000aAuthorization: Splunk [REDACTED]");
+  assert.equal(scrubErrorText('{"message":"request headers:\\u000aAuthorization: Splunk abcdefghijklmnop"}'), '{"message":"request headers:\\u000aAuthorization: Splunk [REDACTED]"}');
+  assert.equal(scrubErrorText("request headers:\\u0009X-Api-Key: hunter2"), "request headers:\\u0009X-Api-Key: [REDACTED]");
+  assert.equal(scrubErrorText("request headers:\\u000aAuthorization: SSWS p@ss"), "request headers:\\u000aAuthorization: SSWS [REDACTED]");
+  assert.equal(scrubErrorText("request headers:\\u000d\\u000aAuthorization: Bearer abc12"), "request headers:\\u000d\\u000aAuthorization: Bearer [REDACTED]");
+  assert.equal(
+    scrubErrorText("Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\\tpassword: hunter2"),
+    "Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\\tpassword: [REDACTED]",
+  );
+  for (const banner of ["proxy:", "proxy.", "proxy"]) assert.equal(scrubErrorText(`${banner}\\n\\nX-Api-Key: hunter2`), `${banner}\\n\\nX-Api-Key: [REDACTED]`);
+  assert.equal(scrubErrorText("upstream said\\nAuthorization: Bearer hunter2"), "upstream said\\nAuthorization: Bearer [REDACTED]");
+  assert.equal(scrubErrorText('{\\n  \\"password\\": \\"monkey\\"\\n}'), '{\\n  \\"password\\": \\"[REDACTED]\\"\\n}');
+
+  // Every anchored token shape starts after the escape and never on its letter; a value, URL, or query pair ends at the backslash of the next escape.
+  const shapes = [
+    ["eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.c2lnbmF0dXJl", "a JWT"],
+    ["AKIAIOSFODNN7EXAMPLE", "an AWS access key id"],
+    ["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "an AWS secret access key"],
+    ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "a hex digest"],
+    ["xKqZvBnMwLpRtYsHdG", "a run with token casing"],
+    ["sk_live_abcdefghij1234567890", "a vendor-prefixed token"],
+    ["ghp_abcdefghijklmnopqrstuvwxyz0123", "a GitHub token"],
+  ];
+  for (const escape of LITERAL_ESCAPES) {
+    for (const [shape, description] of shapes) {
+      assert.equal(scrubErrorText(`trace${escape}${shape} end`), `trace${escape}[REDACTED] end`, `${description} after ${escape}`);
+      assert.equal(scrubErrorText(`{"message":"trace${escape}${shape}${escape}end"}`), `{"message":"trace${escape}[REDACTED]${escape}end"}`, `${description} between two ${escape}`);
+    }
+    assert.equal(scrubErrorText(`trace${escape}name_with_words-2026 and${escape}ERR_MODULE_NOT_FOUND`), `trace${escape}name_with_words-2026 and${escape}ERR_MODULE_NOT_FOUND`, `a name after ${escape} stays whole`);
+    assert.equal(scrubErrorText(`note${escape}https://example.com/a?token=abc123def456${escape}next`), `note${escape}https://example.com/a?[REDACTED]${escape}next`, `a URL after ${escape}`);
+    assert.equal(scrubErrorText(`Bearer abcdefghijklmnop${escape}X-Api-Key: guest`), `Bearer [REDACTED]${escape}X-Api-Key: [REDACTED]`, `a scheme value ends at ${escape}`);
+    assert.equal(scrubErrorText(`Cookie: sid=hunter2${escape}X-Api-Key: guest`), `Cookie: [REDACTED]${escape}X-Api-Key: [REDACTED]`, `a cookie value ends at ${escape}`);
+  }
+  // A "\/" escape is a boundary rather than a path separator: a key or token after it is judged on its own, while a plain "/" still names a bare path segment.
+  assert.equal(scrubErrorText("path \\/api\\/v1\\/users\\/00u1abcd2EFGH3ijk4x5\\/factors"), "path \\/api\\/v1\\/users\\/[REDACTED]\\/factors");
+  assert.equal(scrubErrorText("path /api/v1/users/00u1abcd2EFGH3ijk4x5/factors"), "path /api/v1/users/00u1abcd2EFGH3ijk4x5/factors");
+  // A lone backslash is not an opening quote and does not hide the value after it.
+  assert.equal(scrubErrorText("password: \\hunter2"), "password: [REDACTED]");
+  assert.equal(scrubErrorText("Authorization: Bearer \\hunter2"), "Authorization: Bearer [REDACTED]");
+});
+
+/** Reviewer C's compound header lines (items F and L): several carriers on one line. Each builder takes distinct planted values and gives the line, its credential slots, the header names that must survive as often as they appeared, and the fragments that must survive verbatim. */
+const COMPOUND_HEADER_LINES = [
+  (a, b) => [`Cookie: sid="${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid=${a}; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid="${a}", X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid=${a}, X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: theme=light; sid=${a}; lang=en; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Set-Cookie: sid="${a}"; Path=/; HttpOnly, X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Set-Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Cookie: sid='${a}'; X-Api-Key: '${b}'; Content-Type: 'application/json'`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Authorization: Bearer "${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`X-Api-Key: "${a}", Authorization: "Bearer ${b}", Content-Type: "application/json"`, [a, b], ["X-Api-Key", "Authorization", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`X-Api-Key: "${a}"; Cookie: sid="${b}"; Content-Type: "application/json"`, [a, b], ["X-Api-Key", "Cookie", "Content-Type"], ["application/json"]],
+  (a, b, c) => [`Cookie: sid="${a}", Authorization: Bearer "${b}", X-Api-Key: "${c}", Content-Type: "application/json"`, [a, b, c], ["Cookie", "Authorization", "X-Api-Key", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`Cookie: sid="${a}" {"X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Authorization: Bearer "${a}" {"Cookie": "sid=${b}", "Content-Type": "application/json"}`, [a, b], ["Authorization", "Cookie", "Content-Type"], ["Bearer", "application/json"]],
+  (a, b) => [`{"Cookie": "sid=${a}"} X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`Authorization: SSWS "${a}"; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["SSWS", "application/json"]],
+  (a, b) => [`Authorization: Splunk "${a}"; Cookie: sid=${b}; Content-Type: "application/json"`, [a, b], ["Authorization", "Cookie", "Content-Type"], ["Splunk", "application/json"]],
+  (a, b) => [`Authorization: Snowflake Token="${a}", X-Api-Key: "${b}", Content-Type: "application/json"`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b, c) => [`Authorization: VERACODE-HMAC-SHA-256 id=${a},ts=1700000000,nonce=${b},sig=${c}; Content-Type: "application/json"`, [a, b, c], ["Authorization", "Content-Type"], ["VERACODE-HMAC-SHA-256", "ts=1700000000", "application/json"]],
+  (a, b) => [`Authorization: Basic "${a}"; Cookie: AWSALB="${b}"; Content-Type: "application/json"`, [a, b], ["Authorization", "Cookie", "Content-Type"], ["Basic", "application/json"]],
+  // An unterminated quote ends before the next "Name:" token, which keeps its name (item F).
+  (a, b) => [`Cookie: sid="${a}; X-Api-Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`X-Api-Key: "${a}; Cookie: sid=${b}; Content-Type: "application/json"`, [a, b], ["X-Api-Key", "Cookie", "Content-Type"], ["application/json"]],
+  // A JSON-object header whose value carries escaped inner quotes (item F).
+  (a, b) => [`{"Cookie": "sid=\\"${a}\\"", "X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Cookie", "X-Api-Key", "Content-Type"], ["application/json"]],
+  (a, b) => [`{"X-Api-Key": "\\"${a}\\"", "Cookie": "sid=${b}", "Content-Type": "application/json"}`, [a, b], ["X-Api-Key", "Cookie", "Content-Type"], ["application/json"]],
+  (a, b) => [`{"Authorization": "Bearer \\"${a}\\"", "X-Api-Key": "${b}", "Content-Type": "application/json"}`, [a, b], ["Authorization", "X-Api-Key", "Content-Type"], ["Bearer", "application/json"]],
+  // A following header whose name carries RFC 7230 token punctuation is recognised as the next header (item L).
+  (a, b) => [`Cookie: theme=dark; my.sid=${a}; X.Api.Key: "${b}"`, [a, b], ["Cookie", "X.Api.Key"], []],
+  (a, b) => [`Cookie: sid=${a}; X_Api_Key: "${b}"; Content-Type: "application/json"`, [a, b], ["Cookie", "X_Api_Key", "Content-Type"], ["application/json"]],
+];
+/** The two value shapes of the compound matrix: pairwise distinct canaries sharing no 6-character window with any line or frame text. */
+const COMPOUND_VALUE_SHAPES = [
+  ["name-shaped", ["prod-iidsre-itdpqey", "prod-yzrupn-efussqe", "prod-hnxttf-anwlqzo"]],
+  ["token-shaped", ["K7pQz2VxN9mR4tYw8LbC1dFgH6jS==", "Wq3Zt8Hv5Nc2Xf9Lm4Rp7Bd1Gk6Ty==", "Jx5Cn2Vb8Mq4Wz7Rt1Hp9Kf3Ld6Sg=="]],
+];
+/** The frames of the compound matrix: a bare line, a sentence, a 502 banner, a JSON string member, a 502 JSON body, and a double-escaped raw member. */
+const COMPOUND_FRAMES = [
+  ["line", (text) => text],
+  ["sentence", (text) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: ${text} while proxying`],
+  ["502-text", (text) => `Vendor request failed (502 Bad Gateway) for /api/v1/items: Environment as echoed by the proxy:\n${text}`],
+  ["json-escaped", (text) => `{"message":${JSON.stringify(text)}}`],
+  ["502-json", (text) => `{"status":502,"error":"Bad Gateway","message":${JSON.stringify(`The upstream rejected the request; ${text}`)}}`],
+  ["502-json-raw", (text) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ headers: text }))}}`],
+];
+
+/** How often `fragment` occurs in `text`. */
+function occurrencesOf(text, fragment) {
+  return text.split(fragment).length - 1;
+}
+
+test("reviewer C final verdict, items F and L: on a compound header line every carrier value goes at every JSON depth, an escaped inner quote is inner content, an unterminated quote ends before the next header token, and every following header keeps its name", () => {
+  for (const [shapeName, values] of COMPOUND_VALUE_SHAPES) {
+    for (const build of COMPOUND_HEADER_LINES) {
+      const [line, credentials, names, keeps] = build(...values);
+      for (const [frameName, frame] of COMPOUND_FRAMES) {
+        const input = frame(line);
+        const scrubbed = scrubErrorText(input);
+        const label = `${shapeName} ${frameName}: ${input}`;
+        for (const credential of credentials) assertNoWindowOf(scrubbed, credential, label);
+        for (const name of names) assert.ok(occurrencesOf(scrubbed, name) >= occurrencesOf(input, name), `the header name ${name} survives in ${label} -> ${scrubbed}`);
+        for (const keep of keeps) assert.ok(occurrencesOf(scrubbed, keep) >= occurrencesOf(input, keep), `${keep} survives in ${label} -> ${scrubbed}`);
+        assert.equal(scrubErrorText(scrubbed), scrubbed, `second pass over ${label}`);
+      }
+    }
+  }
+
+  // The reviewer's edge rows, rendered: the following header keeps its name and its own carrier treatment.
+  assert.equal(scrubErrorText('Cookie: sid="prod-iidsre-itdpqey; X-Api-Key: "prod-yzrupn-efussqe"; Content-Type: "application/json"'), 'Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"');
+  assert.equal(scrubErrorText('X-Api-Key: "prod-iidsre-itdpqey; Cookie: sid=prod-yzrupn-efussqe; Content-Type: "application/json"'), 'X-Api-Key: "[REDACTED]; Cookie: [REDACTED]; Content-Type: "application/json"');
+  assert.equal(scrubErrorText('{"Cookie": "sid=\\"prod-iidsre-itdpqey\\"", "X-Api-Key": "prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"Cookie": "[REDACTED]", "X-Api-Key": "[REDACTED]", "Content-Type": "application/json"}');
+  assert.equal(scrubErrorText('{"X-Api-Key": "\\"prod-iidsre-itdpqey\\"", "Cookie": "sid=prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"X-Api-Key": "[REDACTED]", "Cookie": "[REDACTED]", "Content-Type": "application/json"}');
+  assert.equal(scrubErrorText('{"Authorization": "Bearer \\"prod-iidsre-itdpqey\\"", "X-Api-Key": "prod-yzrupn-efussqe", "Content-Type": "application/json"}'), '{"Authorization": "Bearer [REDACTED]", "X-Api-Key": "[REDACTED]", "Content-Type": "application/json"}');
+  assert.equal(scrubErrorText('Cookie: theme=dark; my.sid=prod-iidsre-itdpqey; X.Api.Key: "prod-yzrupn-efussqe"'), 'Cookie: [REDACTED]; X.Api.Key: "[REDACTED]"');
+  // Inside a double-escaped raw JSON string every quoted carrier goes and the quote units at that depth stay.
+  const rawMember = (headers) => `{"status":502,"raw":${JSON.stringify(JSON.stringify({ headers }))}}`;
+  assert.equal(
+    scrubErrorText(rawMember('Cookie: sid="prod-iidsre-itdpqey"; X-Api-Key: "prod-yzrupn-efussqe"; Content-Type: "application/json"')),
+    rawMember('Cookie: [REDACTED]; X-Api-Key: "[REDACTED]"; Content-Type: "application/json"'),
+  );
+  assert.equal(
+    scrubErrorText(rawMember('{"Cookie": "sid=\\"prod-iidsre-itdpqey\\"", "X-Api-Key": "\\"prod-yzrupn-efussqe\\""}')),
+    rawMember('{"Cookie": "[REDACTED]", "X-Api-Key": "[REDACTED]"}'),
+  );
+  // Reading to the matching closer keeps a quoted value whole: spaces, "=", and ";" inside the quotes go with it.
+  assert.equal(scrubErrorText('"password": "correct horse battery staple"'), '"password": "[REDACTED]"');
+  assert.equal(scrubErrorText('Cookie: "sid=a=b; theme=dark"; X-Api-Key: guest'), 'Cookie: "[REDACTED]"; X-Api-Key: [REDACTED]');
+});
+
+const SUMOLOGIC_REQUESTED_PATHS = [
+  ...SUMOLOGIC_SURFACES.flatMap(([, paths]) => paths),
+  ...SUMOLOGIC_SURFACES.flatMap(([, paths]) => paths.map((path) => path.replace(/^\/api/, ""))),
+  "/v1/users?limit=1000",
+  "/v1/policies/searchAudit",
+  "/v1/policies/shareDashboardsOutsideOrganization",
+  "/v1/policies/dataAccessLevel",
+  "/v1/policies/userConcurrentSessionsLimit",
+  "/v1/policies/maxUserSessionTimeout",
+  "/v1/policies/accessKeysLifetime",
+  "/v2/dashboards?limit=100",
+  "/v2/content/000000000ABCDEF1/permissions",
+];
+/** Quoted non-credential headers (the Codex P1 must-keep rows): a quote alone never makes a header value a credential. */
+const SUMOLOGIC_QUOTED_HEADERS_KEPT = [
+  'Content-Type: "application/json"',
+  'Content-Type:"application/json; charset=utf-8"',
+  "Accept: 'application/json'",
+  'Content-Length: "42"',
+  'X-Request-Id: "3f2b6a1e-9c4d-4e8f-b1a2-6d7c8e9f0a1b"',
+  'X-Rate-Limit-Remaining: "599"',
+  'User-Agent: "grclanker-cli/0.4.1"',
+  'Cache-Control: "no-store"',
+  'Location: "/api/v1/users"',
+  '{"Content-Type": "application/json", "Accept": "application/json"}',
+  '{\\"Content-Type\\": \\"application/json\\", \\"Accept\\": \\"application/json\\"}',
+];
+
+const SUMOLOGIC_MUST_KEEP = [
+  ...SUMOLOGIC_REQUESTED_PATHS,
+  ...SUMOLOGIC_REQUESTED_PATHS.map((path) => `GET ${path}`),
+  "api.us2.sumologic.com",
+  "https://api.us2.sumologic.com/api",
+  "https://api.fed.sumologic.com/api",
+  "acme-prod.us2.sumologic.com",
+  "https://acme-prod.us2.sumologic.com/api",
+  "prod-us-east-2026",
+  "us2",
+  "fed",
+  "admin@example.com",
+  "secops@example.com",
+  "jane.doe@acme-prod.example.gov",
+  "Administrator",
+  "Analyst",
+  "manageUsersAndRoles",
+  "manageAccessKeys (falls back to createAccessKeys for personal keys)",
+  "viewMonitorsV2",
+  "suAB...",
+  "sumologic_audit_events",
+  "_index=sumologic_audit_events",
+  "_sourceCategory=prod",
+  "200 OK",
+  "401 Unauthorized",
+  "403 Forbidden",
+  "404 Not Found",
+  "429 Too Many Requests",
+  "500 Internal Server Error",
+  "502 Bad Gateway",
+  "503 Service Unavailable",
+  ...Array.from({ length: 20 }, (_, index) => `SUMO-${String(index + 1).padStart(2, "0")}`),
+  "environment-access-id",
+  "environment-access-key",
+  "config-file-endpoint",
+  "default-endpoint",
+  "/home/auditor/.sumologic/config.yaml",
+  "BLOCK_AS_IMPLICIT_KEY",
+  "EACCES",
+];
+
+/** Realistic Sumo Logic summary and error sentences with an identifying value in the slot such a value occupies. */
+function sumologicSummarySentences(value) {
+  return [
+    `Sumo Logic request to ${value} failed (403 Forbidden forbidden): the access key lacks the role capability`,
+    `Unknown: ${value} could not be read because the endpoint returned an error (Sumo Logic request to ${value} failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)). Collect manually: export ${value} with created dates.`,
+    `Not requested: no content permission lookups were issued because the personal folder could not be read (Sumo Logic request to ${value} failed (403 forbidden)).`,
+    `Access ID suAB... resolved from ${value}, default-endpoint.`,
+    `Sumo Logic access check: limited\n\n| Surface | Status | Count | Capability |\n| access_keys | not_readable | - | needs ${value} |\n\nNext: Grant the access key owner a role with: ${value}. Unreadable surfaces render as manual findings, never as passes.`,
+  ];
+}
+
+/** Every fixed text the Sumo Logic integration emits, with sample paths and names, passes its scrubber unchanged (GWS note 1). */
+const SUMOLOGIC_FIXED_TEXTS = [
+  "Unable to read Sumo Logic config file /home/auditor/.sumologic/config.yaml (EACCES)",
+  "Unable to read Sumo Logic config file /home/auditor/.sumologic/config.yaml (UNREADABLE)",
+  "Unable to parse Sumo Logic config file: invalid YAML in /home/auditor/.sumologic/config.yaml at line 2, column 13 (BLOCK_AS_IMPLICIT_KEY)",
+  "Unable to parse Sumo Logic config file: invalid YAML in /home/auditor/.sumologic/config.yaml (INVALID_YAML)",
+  "SUMOLOGIC_ACCESS_ID and SUMOLOGIC_ACCESS_KEY (or access_id and access_key arguments, or a config file) are required.",
+  "Unknown Sumo Logic deployment: mars",
+  "Sumo Logic request to /v1/connections failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)",
+  "Sumo Logic request to /v1/collectors returned an unreadable response (200 OK): non-JSON body (text/html, 5120 bytes)",
+  "Sumo Logic request to /v1/collectors returned an unreadable response (200 OK): non-JSON body (unknown content type, 0 bytes)",
+  "Sumo Logic request to /v1/roles failed (403 Forbidden forbidden): the access key lacks the role capability",
+  "Sumo Logic request to /v1/users failed (401 Unauthorized): credentials were rejected",
+  "Sumo Logic request to /v1/users failed: fetch failed",
+  "Sumo Logic request to /v1/users failed: The operation was aborted due to timeout",
+  "Not requested: no content permission lookups were issued because the personal folder could not be read (Sumo Logic request to /v2/content/folders/personal failed (403 Forbidden forbidden)).",
+  "every content permission lookup failed (2 of 2): Search A: Sumo Logic request to /v2/content/c1/permissions failed (403 Forbidden forbidden); Search B: Sumo Logic request to /v2/content/c2/permissions failed (403 Forbidden forbidden)",
+  "Unknown: SAML identity providers could not be read because the access key lacks the role capability (403). Collect manually: export Administration > Security > SAML and confirm 'Require SAML sign-in' is enabled.",
+  "Unknown: the password policy could not be read because credentials were rejected (401). Collect manually: screenshot Administration > Security > Password Policy showing length, complexity, and lockout settings.",
+  "Unknown: the role list could not be read because the endpoint returned an error (Sumo Logic request to /v1/roles failed (502 Bad Gateway): non-JSON body (text/html, 5120 bytes)). Collect manually: export Administration > Users and Roles > Roles with capabilities and member counts.",
+  "Unknown: the access key inventory could not be read because the access key lacks the role capability (403). Collect manually: export Administration > Security > Access Keys with created dates.",
+  "Unknown: the audit policy could not be read because the access key lacks the role capability (403). Collect manually: screenshot Administration > Security > Policies > Audit and run `_index=sumologic_audit_events` for the last 24 hours.",
+  "Unknown: the monitor and content inventories could not be read because the access key lacks the role capability (403). Collect manually: list scheduled searches and monitors with their owners and runAs identities, and confirm none run under shared administrator accounts.",
+  "Role least privilege holds for 2 roles. Not checked: the user list could not be read because the access key lacks the role capability (403); collect manually: export the user list with last login dates",
+  "The access key lifetime policy was unreadable (Sumo Logic request to /v1/policies/accessKeysLifetime failed (403 Forbidden forbidden)).",
+  "Pagination stopped before the last page, so only 100 items were seen and the population is incomplete.",
+  "The audit policy is enabled but no active AuditIndex partition was among the 1 partitions seen before pagination stopped, so the audit index is unread rather than absent. Read the full partition list and run `_index=sumologic_audit_events` to confirm events are received. Pagination stopped before the last page, so only 1 items were seen and the population is incomplete.",
+  "per-user MFA status is unknown because the user list could not be read (the access key lacks the role capability (403))",
+  "The password policy was unreadable, so org-wide MFA enforcement is unknown; per-user MFA status is unknown because the user list could not be read (the access key lacks the role capability (403)). Confirm Require MFA in Administration > Security > Password Policy.",
+  "Require MFA is enabled, but the user list was unreadable (Sumo Logic request to /v1/users failed (403 Forbidden forbidden)), so per-user coverage cannot be confirmed; export the user list with MFA status.",
+  "Require MFA is enabled, but zero users were returned, which indicates a capability-limited key; export the user list with MFA status.",
+  "the user list was unreadable, so admin member activity could not be checked",
+  "Login allowlisting is enabled but the CIDR list was unreadable (Sumo Logic request to /v1/serviceAllowlist/addresses failed (403 Forbidden forbidden)); export the allowlist entries manually.",
+  "The maxUserSessionTimeout policy did not return a parsable value, so session timeout is unknown; confirm it in Administration > Security > Policies.",
+  "The audit policy is enabled but the partition list was unreadable (Sumo Logic request to /v1/partitions failed (403 Forbidden forbidden)), so the audit index state is unverified; run `_index=sumologic_audit_events` for the last 24 hours to prove events flow.",
+  "the personal folder could not be read, so no items were sampled",
+  "The Data Access Level policy is enabled, but content permissions could not be sampled because the personal folder could not be read; review Library sharing for org-wide shares manually.",
+  "The Data Access Level policy is enabled, but content permissions could not be sampled (2 lookups failed, 2 items sampled); review Library sharing for org-wide shares manually. 2 content permission lookup(s) failed (Search A: Sumo Logic request to /v2/content/c1/permissions failed (403 Forbidden forbidden); Search B: Sumo Logic request to /v2/content/c2/permissions failed (403 Forbidden forbidden)), so those items were not checked.",
+  "the monitor list could not be read",
+  "the personal folder could not be read so no scheduled searches were sampled",
+  "the personal folder could not be read, so no lookup tables were sampled",
+  "the dashboard list could not be read (the access key lacks the role capability (403)), so per-dashboard exposure is unknown",
+  "External dashboard sharing is disabled at the policy level, but the dashboard list was unreadable (Sumo Logic request to /v2/dashboards failed (403 Forbidden forbidden)); review dashboard sharing in the Library manually.",
+  "External dashboard sharing is disabled at the policy level, but zero dashboards were viewable by the key owner, so per-dashboard sharing could not be sampled; review Library dashboards manually.",
+  "3 notification(s) across 1 monitors were seen, but no org email domains could be derived (user list unreadable and no approved_email_domains supplied), so recipient review is manual.",
+  "Using Sumo Logic API https://api.us2.sumologic.com/api (deployment us2).",
+  "Access ID suAB... resolved from environment-access-id, environment-access-key, config-file-endpoint.",
+  "17/24 Sumo Logic audit surfaces are readable.",
+  "Run sumologic_assess_identity, sumologic_assess_access_control, sumologic_assess_data_governance, sumologic_assess_content_sharing, or sumologic_export_audit_bundle.",
+  "Grant the access key owner a role with: manageUsersAndRoles, manageSaml, manageAccessKeys (falls back to createAccessKeys for personal keys). Unreadable surfaces render as manual findings, never as passes.",
+  "needs manageUsersAndRoles",
+  "- `_errors.log`: present only when some API surfaces could not be collected",
+  "- MANUAL: unreadable endpoint, not applicable, or outside API scope; the summary names the evidence to collect",
+];
+
+const SUMOLOGIC_SOURCE_URL = new URL("../extensions/grc-tools/sumologic.ts", import.meta.url);
+
+/**
+ * The static segments of every `new Error(...)` template inside the named top-level functions of
+ * the integration source, so a reworded or added resolver message fails the fixed-text test until a
+ * fixed text or a live rendering covers it.
+ */
+function errorTemplateSegments(sourceUrl, functionNames) {
+  const source = readFileSync(sourceUrl, "utf8");
+  const segments = [];
+  for (const name of functionNames) {
+    const start = source.search(new RegExp(`^(?:export )?(?:async )?function ${name}\\(`, "m"));
+    assert.notEqual(start, -1, `${name} is a top-level function of the integration source`);
+    const body = source.slice(start, source.indexOf("\n}\n", start) + 2);
+    for (const match of body.matchAll(/new Error\(/g)) {
+      let depth = 1;
+      let end = match.index + match[0].length;
+      while (depth > 0 && end < body.length) {
+        if (body[end] === "(") depth += 1;
+        else if (body[end] === ")") depth -= 1;
+        end += 1;
+      }
+      const argument = body.slice(match.index + match[0].length, end - 1);
+      for (const literal of argument.matchAll(/"((?:[^"\\]|\\.)*)"/g)) segments.push(literal[1].replace(/\\"/g, '"'));
+      for (const template of argument.matchAll(/`((?:[^`\\]|\\.)*)`/g)) segments.push(...template[1].split(/\$\{(?:[^{}]|\{[^{}]*\})*\}/));
+    }
+  }
+  return [...new Set(segments.map((segment) => segment.trim()).filter((segment) => segment.length >= 8))];
+}
+
+/**
+ * The resolver messages rendered live for the no credentials, partial credentials, and config file
+ * failure cases (Sumo Logic has a single auth mode, the access ID and key pair), each against a real
+ * temp path; the malformed file carries a config canary so the message proves it holds the path,
+ * position, and code only.
+ */
+function liveSumologicResolverMessages() {
+  const base = createTempBase("grclanker-sumo-live-resolver-");
+  const missingConfig = join(base, "missing.yaml");
+  const directoryConfig = join(base, "directory.yaml");
+  mkdirSync(directoryConfig);
+  const malformedConfig = join(base, "malformed.yaml");
+  writeFileSync(malformedConfig, `access_id: suABCDEF\naccess_key: "${CONFIG_CANARIES.unterminated}\n`);
+  const resolve = (input, env) => thrownBy(() => resolveSumologicConfiguration({ config_file: missingConfig, ...input }, env)).message;
+  return {
+    paths: { directoryConfig, malformedConfig },
+    messages: {
+      "no credentials": resolve({}, {}),
+      "partial credentials: access ID without a key": resolve({}, { SUMOLOGIC_ACCESS_ID: "suENVID1" }),
+      "partial credentials: access key without an ID": resolve({ access_key: SAMPLE_ACCESS_KEY }, {}),
+      "config file failure: directory at the path": resolve({ config_file: directoryConfig }, {}),
+      "config file failure: malformed YAML": resolve({ config_file: malformedConfig }, {}),
+    },
+  };
+}
+
+test("rule 9: every fixed text the Sumo Logic integration emits, including the live resolver messages, passes its scrubber unchanged", () => {
+  const live = liveSumologicResolverMessages();
+  const credentialsRequired = "SUMOLOGIC_ACCESS_ID and SUMOLOGIC_ACCESS_KEY (or access_id and access_key arguments, or a config file) are required.";
+  const expected = {
+    "no credentials": credentialsRequired,
+    "partial credentials: access ID without a key": credentialsRequired,
+    "partial credentials: access key without an ID": credentialsRequired,
+    "config file failure: directory at the path": `Unable to read Sumo Logic config file ${live.paths.directoryConfig} (EISDIR)`,
+    "config file failure: malformed YAML": `Unable to parse Sumo Logic config file: invalid YAML in ${live.paths.malformedConfig} at line 3, column 1 (MISSING_CHAR)`,
+  };
+  assert.deepEqual(Object.keys(live.messages), Object.keys(expected));
+  for (const [label, message] of Object.entries(live.messages)) {
+    assert.equal(message, expected[label], label);
+    for (const canary of Object.values(CONFIG_CANARIES)) assertNoWindowOf(message, canary, `live resolver message (${label})`);
+    for (const wording of LIBRARY_ERROR_WORDING) assert.ok(!message.includes(wording), `${label} repeats library wording "${wording}": ${message}`);
+    assert.equal(scrubErrorText(message), message, `live resolver message survives the scrubber (${label})`);
+    assert.equal(scrubErrorText(message, [SAMPLE_ACCESS_KEY, "suABCDEF"]), message, `live resolver message survives with the configured credentials registered (${label})`);
+  }
+
+  // Every message template the resolver and its loaders can throw is pinned by a fixed text or a live rendering, so a reworded message fails here until the set is updated.
+  const corpus = [...SUMOLOGIC_FIXED_TEXTS, ...Object.values(live.messages)];
+  const segments = errorTemplateSegments(SUMOLOGIC_SOURCE_URL, ["resolveSumologicConfiguration", "readConfigFileText", "configFileParseError"]);
+  assert.ok(segments.length >= 3, `the template scan found the resolver message and the two loader messages (${segments.length})`);
+  for (const segment of segments) assert.ok(corpus.some((text) => text.includes(segment)), `resolver template segment is pinned by a fixed text or a live rendering: ${segment}`);
+
+  for (const text of SUMOLOGIC_FIXED_TEXTS) assert.equal(scrubErrorText(text), text, text);
+  for (const text of SUMOLOGIC_FIXED_TEXTS) assert.equal(scrubErrorText(text, [SAMPLE_ACCESS_KEY, "suABCDEF"]), text, `${text} (with the configured credentials registered)`);
+});
+
+test("resolveSumologicConfiguration keeps environment credentials when an unrelated argument is passed (GWS note 2)", () => {
+  const dir = createTempBase("grclanker-sumo-env-args-");
+  const configFile = join(dir, "config.yaml");
+  writeFileSync(configFile, "endpoint: eu\n");
+  const env = { SUMOLOGIC_CONFIG_FILE: configFile, SUMOLOGIC_ACCESS_ID: "suENVID1", SUMOLOGIC_ACCESS_KEY: SAMPLE_ACCESS_KEY };
+
+  const resolved = resolveSumologicConfiguration({ timeout_seconds: 9 }, env);
+  assert.equal(resolved.accessId, "suENVID1", "the environment access id survives an argument overlay that names no credential");
+  assert.equal(resolved.accessKey, SAMPLE_ACCESS_KEY, "the environment access key survives an argument overlay that names no credential");
+  assert.equal(resolved.baseUrl, "https://api.eu.sumologic.com/api", "the config file named through the environment still supplies the endpoint");
+  assert.equal(resolved.timeoutMs, 9000);
+  assert.deepEqual(resolved.sourceChain, ["environment-access-id", "environment-access-key", "config-file-endpoint"]);
+
+  const withUndefinedArguments = resolveSumologicConfiguration({ access_id: undefined, access_key: undefined, endpoint: undefined }, env);
+  assert.equal(withUndefinedArguments.accessId, "suENVID1", "an argument overlay whose credential keys are undefined does not shadow the environment");
+  assert.equal(withUndefinedArguments.accessKey, SAMPLE_ACCESS_KEY);
+  assert.deepEqual(withUndefinedArguments.sourceChain, ["environment-access-id", "environment-access-key", "config-file-endpoint"]);
+});
+
+/** A 32-character random run: any 6 to 24 character window of it in an output is a leak. */
+const PLANTED_TOKEN = "Xq7Vw2Lm9Tp4Rb8Kd3Fh6Jn1Zs5Yc0Ag";
+/** A Stripe-shaped live key: the vendor prefix makes it an unambiguous credential shape on both sides. */
+const PLANTED_STRIPE_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc";
+/** The distinctive segments of the planted JWT; the header is the common RS256 prefix and is not a canary. */
+const PLANTED_JWT_PAYLOAD = "Zm9vYmFyLXByb2JlLXBheWxvYWQtOTgxMjM0NTY3ODkw";
+const PLANTED_JWT_SIGNATURE = "c2lnbmF0dXJlLXBhcnQtb2YtdGhlLWpvdC1nb2VzLWhlcmU";
+const PLANTED_JWT = `eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.${PLANTED_JWT_PAYLOAD}.${PLANTED_JWT_SIGNATURE}`;
+const PLANTED_PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----";
+/** The name-shaped proof of the CodeRabbit #81 auth-param extension (discussion_r4081776771): no shape rule removes it, so only the proof rule can, and it is a canary of the data-side probe. */
+const PROOF_VALUE = "proof-lumen-vexar";
+const PLANTED_CANARIES = [PLANTED_TOKEN, PLANTED_STRIPE_KEY, PLANTED_JWT_PAYLOAD, PLANTED_JWT_SIGNATURE, PROOF_VALUE];
+const BEARER_ID_UUID = "6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+/** The free-text note planted in the export probe: two unambiguous shapes, a header carrier, and an identifier that must survive. */
+const PLANTED_NOTE = `Runbook: key ${PLANTED_STRIPE_KEY} end; bearer ${PLANTED_JWT}; Authorization: Bearer ${PLANTED_TOKEN}; cluster prod-us-east-2026-cluster was read; challenge realm="api", nonce="n", response="${PROOF_VALUE}"`;
+const REDACTED_NOTE = "Runbook: key [REDACTED] end; bearer [REDACTED]; Authorization: Bearer [REDACTED]; cluster prod-us-east-2026-cluster was read; challenge realm=\"api\", nonce=\"[REDACTED]\", response=\"[REDACTED]\"";
+
+/**
+ * Scheme-word order (CodeRabbit r4078025849): a credential-named key loses its value before any
+ * scheme word is read, so "SUMOLOGIC_ACCESS_KEY=Basic rejected" is a key whose value starts with a
+ * scheme name, not a Basic header. Scheme words act under Authorization-style keys and bare in
+ * prose; auth-params and prose mentions of a scheme stay.
+ */
+const SCHEME_ORDER_ROWS = [
+  ["sslPassword=splunk rejected", "sslPassword=[REDACTED] rejected"],
+  ["db_password: token", "db_password: [REDACTED]"],
+  ['sslPassword="splunk rejected"', 'sslPassword="[REDACTED]"'],
+  ['"db_password": "token"', '"db_password": "[REDACTED]"'],
+  ["SPLUNK_PASSWORD=bearer expired", "SPLUNK_PASSWORD=[REDACTED] expired"],
+  ["SUMOLOGIC_ACCESS_KEY=Basic rejected", "SUMOLOGIC_ACCESS_KEY=[REDACTED] rejected"],
+  ["SUMOLOGIC_ACCESS_KEY: Basic rejected", "SUMOLOGIC_ACCESS_KEY: [REDACTED] rejected"],
+  ['SUMOLOGIC_ACCESS_KEY="Basic rejected"', 'SUMOLOGIC_ACCESS_KEY="[REDACTED]"'],
+  ['"SUMOLOGIC_ACCESS_KEY": "Basic"', '"SUMOLOGIC_ACCESS_KEY": "[REDACTED]"'],
+  [`Authorization: Basic ${PLANTED_TOKEN}`, "Authorization: Basic [REDACTED]"],
+  ["Authorization: Splunk 4eC39HqLyjWDarjtT1zdp7dc", "Authorization: Splunk [REDACTED]"],
+  [`Proxy-Authorization: Basic ${PLANTED_TOKEN}==`, "Proxy-Authorization: Basic [REDACTED]"],
+  [`Authorization: bearer ${PLANTED_TOKEN}`, "Authorization: bearer [REDACTED]"],
+  [`Authorization: sNoWfLaKe ${PLANTED_TOKEN}`, "Authorization: sNoWfLaKe [REDACTED]"],
+  ["Authorization: SSWS prod-us-east-2026", "Authorization: SSWS [REDACTED]"],
+  [`replayed BASIC ${PLANTED_TOKEN} upstream`, "replayed BASIC [REDACTED] upstream"],
+  [`replayed splunk ${PLANTED_TOKEN} upstream`, "replayed splunk [REDACTED] upstream"],
+  ["Bearer abcdefghijkl rejected", "Bearer [REDACTED] rejected"],
+  ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+  ['Bearer realm="api", error="invalid_token"', 'Bearer realm="api", error="invalid_token"'],
+  ["Snowflake statement failed", "Snowflake statement failed"],
+  ["Splunk Enterprise rejected the request", "Splunk Enterprise rejected the request"],
+  ["the bearer presented an expired token", "the bearer presented an expired token"],
+  ["Basic authentication failed", "Basic authentication failed"],
+  ["OAuth 2.0 introspection", "OAuth 2.0 introspection"],
+  ["token_type=Bearer", "token_type=Bearer"],
+];
+
+/** The key audit: bearer ids go whatever their shape, setting suffixes and URL-valued webhook keys keep their values, identifiers are judged by shape. */
+const KEY_AUDIT_ROWS = [
+  [`token_id=${BEARER_ID_UUID}`, "token_id=[REDACTED]"],
+  [`tokenId: ${BEARER_ID_UUID}`, "tokenId: [REDACTED]"],
+  [`role_secret_id=${BEARER_ID_UUID}`, "role_secret_id=[REDACTED]"],
+  ["secret_id_ttl=3600 secret_id_num_uses=5 token_max_ttl=7200 token_bound_cidrs=10.0.0.0/8", "secret_id_ttl=3600 secret_id_num_uses=5 token_max_ttl=7200 token_bound_cidrs=10.0.0.0/8"],
+  [`secret_id_accessor=${BEARER_ID_UUID}`, `secret_id_accessor=${BEARER_ID_UUID}`],
+  ["webhook_count=3", "webhook_count=3"],
+  [`webhook_url=https://hooks.example.com/services/T/B/${PLANTED_TOKEN}?ts=1`, "webhook_url=https://hooks.example.com/[REDACTED]"],
+  [`client_id=svc-audit-2026 tenant_id=${BEARER_ID_UUID}`, `client_id=svc-audit-2026 tenant_id=${BEARER_ID_UUID}`],
+  ["access_key_id=svc-audit-2026 key_id=kid-primary private_key_id=kid-primary secret_name=db-credentials-prod", "access_key_id=svc-audit-2026 key_id=kid-primary private_key_id=kid-primary secret_name=db-credentials-prod"],
+  [`token_type=${PLANTED_TOKEN}`, "token_type=[REDACTED]"],
+  ["client_id=0oa1audit key_id=key-2024-01 api_key_id=a1b2c3d4 private_key_id=kid-2026-01", "client_id=0oa1audit key_id=key-2024-01 api_key_id=a1b2c3d4 private_key_id=kid-2026-01"],
+  [`api_key_id=${PLANTED_TOKEN}`, "api_key_id=[REDACTED]"],
+  ["OKTA_CLIENT_AUTHORIZATIONMODE=ccg", "OKTA_CLIENT_AUTHORIZATIONMODE=ccg"],
+  ["OKTA_CLIENT_AUTHORIZATIONMODE: RS256", "OKTA_CLIENT_AUTHORIZATIONMODE: RS256"],
+  ['{"OKTA_CLIENT_AUTHORIZATIONMODE":"https://api.example.com/oauth2/token"}', '{"OKTA_CLIENT_AUTHORIZATIONMODE":"https://api.example.com/oauth2/token"}'],
+  ["export OKTA_CLIENT_AUTHORIZATIONMODE=privatekey", "export OKTA_CLIENT_AUTHORIZATIONMODE=privatekey"],
+  [`OKTA_CLIENT_AUTHORIZATIONMODE=${PLANTED_TOKEN}`, "OKTA_CLIENT_AUTHORIZATIONMODE=[REDACTED]"],
+  ["private_key_file=/x/y.pem credentials_file=/x/c.json --private-key-file=/x", "private_key_file=/x/y.pem credentials_file=/x/c.json --private-key-file=/x"],
+  ["OKTA_CLIENT_ORGURL= https://tenant.okta.gov", "OKTA_CLIENT_ORGURL= https://tenant.okta.gov"],
+  ["SPLUNK_BASE_URL_OVERRIDE=/opt/splunk", "SPLUNK_BASE_URL_OVERRIDE=/opt/splunk"],
+  ["export_output_dir=./export snowflake_account_name=", "export_output_dir=./export snowflake_account_name="],
+  ["QmFzZTY0K1N5bWJvbHM= stays a token", "[REDACTED] stays a token"],
+];
+
+/** Flag, path-label, slash-escaped URL, and cookie carriers: the value goes and the prose around it stays. */
+const CARRIER_ROWS = [
+  [`psql --password ${PLANTED_TOKEN} -h db`, "psql --password [REDACTED] -h db"],
+  [`mysql --password=${PLANTED_TOKEN} -h db`, "mysql --password=[REDACTED] -h db"],
+  [`java -Dspring.datasource.password=${PLANTED_TOKEN} -jar app.jar`, "java -Dspring.datasource.password=[REDACTED] -jar app.jar"],
+  [`helm --set db.password=${PLANTED_TOKEN} upgrade`, "helm --set db.password=[REDACTED] upgrade"],
+  [`kv/password: ${PLANTED_TOKEN}`, "kv/password: [REDACTED]"],
+  ["/oauth/token-request: invalid_client", "/oauth/token-request: invalid_client"],
+  ["/api/v1/api-tokens: request failed with 403", "/api/v1/api-tokens: request failed with 403"],
+  [`kv/password: ${PLANTED_TOKEN} [code 003001, sqlState 42501]`, "kv/password: [REDACTED] [code 003001, sqlState 42501]"],
+  [`kv/password: ${PLANTED_TOKEN} (requestId abc-123)`, "kv/password: [REDACTED] (requestId abc-123)"],
+  ["config/prod/password: hunter2 was echoed by the proxy", "config/prod/password: [REDACTED] was echoed by the proxy"],
+  [`secrets/data/api_key: ${PLANTED_TOKEN}, then retried`, "secrets/data/api_key: [REDACTED], then retried"],
+  ["/api/v1/secrets: request failed with 403", "/api/v1/secrets: request failed with 403"],
+  ["/v1/auth/approle/passwords: listing denied", "/v1/auth/approle/passwords: listing denied"],
+  [`kv/client_assertion: ${PLANTED_TOKEN}`, "kv/client_assertion: [REDACTED]"],
+  ["kv/client_assertion: svc-reporting-2026 rejected", "kv/client_assertion: [REDACTED] rejected"],
+  [`kv/OKTA_CLIENT_CLIENTASSERTION: ${PLANTED_TOKEN}`, "kv/OKTA_CLIENT_CLIENTASSERTION: [REDACTED]"],
+  ["kv/OKTA_CLIENT_CLIENTASSERTION: svc-reporting-2026", "kv/OKTA_CLIENT_CLIENTASSERTION: [REDACTED]"],
+  [`kv/privateKeyPem: ${PLANTED_TOKEN}`, "kv/privateKeyPem: [REDACTED]"],
+  ["kv/privateKeyPem: svc-reporting-2026 rejected", "kv/privateKeyPem: [REDACTED] rejected"],
+  [`secrets/private_key_base64: ${PLANTED_TOKEN}`, "secrets/private_key_base64: [REDACTED]"],
+  ["kv/private_key_file: /x/y.pem was unreadable", "kv/private_key_file: /x/y.pem was unreadable"],
+  ["kv/tls_cert_pem: cert-2026-primary was rotated", "kv/tls_cert_pem: cert-2026-primary was rotated"],
+  [`client_assertion=${PLANTED_JWT}`, "client_assertion=[REDACTED]"],
+  ["OKTA_CLIENT_CLIENTASSERTION: svc-reporting-2026", "OKTA_CLIENT_CLIENTASSERTION: [REDACTED]"],
+  ['{"client_assertion":"svc-reporting-2026"}', '{"client_assertion":"[REDACTED]"}'],
+  ["client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer", "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer"],
+  [`/api_key=${PLANTED_TOKEN}`, "/api_key=[REDACTED]"],
+  [`SPLUNK_ACS_TOKEN='${PLANTED_TOKEN}'`, "SPLUNK_ACS_TOKEN='[REDACTED]'"],
+  [`httpEventCollectorToken="${PLANTED_TOKEN}"`, 'httpEventCollectorToken="[REDACTED]"'],
+  [`X-Api-Key: "${PLANTED_TOKEN}"`, 'X-Api-Key: "[REDACTED]"'],
+  [`note https:\\/\\/hooks.example.com\\/a?token=${PLANTED_TOKEN} next`, "note https:\\/\\/hooks.example.com\\/a?[REDACTED] next"],
+  [`Cookie: theme=dark; my'pref=${PLANTED_TOKEN}`, "Cookie: [REDACTED]"],
+  [`Cookie: sid=O'${PLANTED_TOKEN}; X-Api-Key: ${PLANTED_TOKEN}`, "Cookie: [REDACTED]; X-Api-Key: [REDACTED]"],
+  [`Cookie: my&sid=${PLANTED_TOKEN}; Content-Type: application/json`, "Cookie: [REDACTED]; Content-Type: application/json"],
+];
+
+/** The data side: unambiguous shapes and carriers go, identifiers and bare runs survive (the generic long-run rule is off there). */
+const DATA_SIDE_ROWS = [
+  [`key ${PLANTED_STRIPE_KEY} end`, "key [REDACTED] end"],
+  [`note ${PLANTED_JWT} end`, "note [REDACTED] end"],
+  [`Authorization: Bearer ${PLANTED_TOKEN}`, "Authorization: Bearer [REDACTED]"],
+  [`pem ${PLANTED_PEM} end`, "pem [REDACTED] end"],
+  ["xoxb-1234567890-abcdefghijklmnop", "[REDACTED]"],
+  ["AKIAIOSFODNN7EXAMPLE", "[REDACTED]"],
+  ["ghp_16C7e42F292c6912E7710c838347Ae178B4a", "[REDACTED]"],
+  ["cluster prod-us-east-2026-cluster was read", "cluster prod-us-east-2026-cluster was read"],
+  [`run ${PLANTED_TOKEN} end`, `run ${PLANTED_TOKEN} end`],
+];
+
+function assertRows(scrub, rows, label) {
+  for (const [input, expected] of rows) {
+    const scrubbed = scrub(input);
+    assert.equal(scrubbed, expected, `${label}: ${input}`);
+    assert.equal(scrub(scrubbed), scrubbed, `${label}, second pass: ${input}`);
+    for (const canary of PLANTED_CANARIES) {
+      if (input.includes(canary) && !expected.includes(canary)) assertNoWindowOf(scrubbed, canary, `${label}: ${input}`);
+    }
+  }
+}
+
+/**
+ * CodeRabbit finding on #76: the userinfo of a URL ends at the first "/", "?", or "#", so an "@" inside a
+ * query or fragment never turns the query into the host. Before the fix "https://h?e=a@x.com&token=s3cr3t"
+ * read "h?e=a@" as userinfo and kept "x.com&token=..." as the host, which the query scrub never saw.
+ */
+const URL_USERINFO_ROWS = [
+  ["https://h?e=a@x.com&token=s3cr3t", "https://h?[REDACTED]"],
+  ["https://h#f@x.com", "https://h#[REDACTED]"],
+  ["https://h?e=a@x.com&q=s3cr3t", "https://h?[REDACTED]"],
+  ["https://h?e=a@x.com&code=s3cr3t#f@y.com", "https://h?[REDACTED]#[REDACTED]"],
+  ["https:\\/\\/h?e=a@x.com&token=s3cr3t", "https:\\/\\/h?[REDACTED]"],
+  ["https:\\/\\/h#f@x.com", "https:\\/\\/h#[REDACTED]"],
+  ["request to https://h?e=a@x.com&token=s3cr3t failed", "request to https://h?[REDACTED] failed"],
+  ["request to https://h#f@x.com failed", "request to https://h#[REDACTED] failed"],
+  ["https://user:s3cr3t@h/p?q=1#frag", "https://h/p?[REDACTED]#[REDACTED]"],
+  ["https://h/p@q?x=s3cr3t", "https://h/p@q?[REDACTED]"],
+  ["https://h:8443/p?u=a@x.com&sig=s3cr3t", "https://h:8443/p?[REDACTED]"],
+];
+
+test("CodeRabbit #76 userinfo: the userinfo of a URL ends at the first slash, question mark, or hash, so an @ inside a query or fragment never turns the query into the host, in the error scrubber, the data scrubber, and redactSnapshot, spelled plain and slash-escaped", () => {
+  assertRows(scrubErrorText, URL_USERINFO_ROWS, "userinfo, error side");
+  assertRows(scrubDataText, URL_USERINFO_ROWS, "userinfo, data side");
+  assertRows((text) => redactSnapshot({ note: text }).note, URL_USERINFO_ROWS.filter(([input]) => input.startsWith("request to ")), "userinfo, redactSnapshot leaf");
+  for (const [input, expected] of URL_USERINFO_ROWS) {
+    for (const piece of ["s3cr3t", "x.com", "y.com"]) {
+      if (input.includes(piece)) assert.ok(!scrubErrorText(input).includes(piece) && !scrubDataText(input).includes(piece), `${piece} left in the output of ${input}: ${expected}`);
+    }
+  }
+});
+
+/**
+ * Codex P1 on #81: a ";" inside a URL query value is part of the value (URLSearchParams semantics), so
+ * "?token=hunter2;restofsecret" loses the whole value with no tail, in the relative, absolute, JSON-escaped,
+ * and slash-escaped spellings. The ";" separator belongs to Cookie and Set-Cookie parsing alone, and the
+ * cookie reader runs before the query pass, so "Cookie: &sid=a; pref=b" still reads as one cookie header.
+ */
+const QUERY_SEMICOLON_ROWS = [
+  ["GET /api/v1/things?token=hunter2;restofsecret failed", "GET /api/v1/things?token=[REDACTED] failed"],
+  ["/api/v1/things?token=hunter2;restofsecret", "/api/v1/things?token=[REDACTED]"],
+  ["GET https://h.example/api/v1/things?token=hunter2;restofsecret failed", "GET https://h.example/api/v1/things?[REDACTED] failed"],
+  ['{"url":"\\/api\\/v1\\/things?token=hunter2;restofsecret"}', '{"url":"\\/api\\/v1\\/things?token=[REDACTED]"}'],
+  ['{"url":"https:\\/\\/h.example\\/api\\/v1\\/things?token=hunter2;restofsecret"}', '{"url":"https:\\/\\/h.example\\/api\\/v1\\/things?[REDACTED]"}'],
+  ['{"body":"{\\"url\\":\\"/api/v1/things?token=hunter2;restofsecret\\"}"}', '{"body":"{\\"url\\":\\"/api/v1/things?token=[REDACTED]\\"}"}'],
+  ['{"body":"{\\"url\\":\\"https://h.example/api/v1/things?token=hunter2;restofsecret\\"}"}', '{"body":"{\\"url\\":\\"https://h.example/api/v1/things?[REDACTED]\\"}"}'],
+  ["/api/v1/things?page=2&token=hunter2;restofsecret&limit=5", "/api/v1/things?page=2&token=[REDACTED]&limit=5"],
+  [`/api/v1/things?token=${PLANTED_TOKEN};tail=2&page=3`, "/api/v1/things?token=[REDACTED]&page=3"],
+  ["Cookie: &sid=a; pref=b", "Cookie: [REDACTED]"],
+  ["Cookie: sid=hunter2;restofsecret; pref=b", "Cookie: [REDACTED]"],
+  ["Set-Cookie: sid=hunter2;restofsecret; Path=/; HttpOnly", "Set-Cookie: [REDACTED]"],
+  [`Cookie: my&sid=${PLANTED_TOKEN}; Content-Type: application/json`, "Cookie: [REDACTED]; Content-Type: application/json"],
+];
+const QUERY_SEMICOLON_PIECES = ["hunter2", "restofsecret", "tail=2", "sid=a", "pref=b", "Path=/"];
+
+test("Codex P1 on #81: a semicolon inside a URL query value is part of the value, so the whole value goes with no tail, relative, absolute, JSON-escaped, and slash-escaped, through the error scrubber, the data scrubber, and redactSnapshot, while the semicolon still separates cookie pairs", () => {
+  assertRows(scrubErrorText, QUERY_SEMICOLON_ROWS, "query semicolon, error side");
+  assertRows(scrubDataText, QUERY_SEMICOLON_ROWS, "query semicolon, data side");
+  assertRows((text) => redactSnapshot({ note: text, nested: [{ deeper: text }] }).nested[0].deeper, QUERY_SEMICOLON_ROWS, "query semicolon, redactSnapshot leaf");
+  for (const [input] of QUERY_SEMICOLON_ROWS) {
+    for (const output of [scrubErrorText(input), scrubDataText(input), redactSnapshot({ note: input }).note]) {
+      for (const piece of QUERY_SEMICOLON_PIECES) assert.ok(!output.includes(piece), `${piece} left in the output of ${input}: ${output}`);
+    }
+  }
+});
+
+/** The short token CodeRabbit quoted on #81 (discussion_r4081238237); it is not a planted canary, so its rows check for a window of it by hand. */
+const QUOTED_TOKEN = "skvclmtirehs";
+/**
+ * CodeRabbit on #81: after a scheme word under Authorization or Proxy-Authorization a pair list is the
+ * credential. A quoted value goes whatever its key (Snowflake's own `Token="..."`, any `<Scheme> <Key>="..."`,
+ * Digest's `username`, `nonce`, `uri`, `cnonce`, `response`, and `opaque`) unless the key is a descriptive
+ * parameter (realm, qop, algorithm, charset, error, error_description, error_uri, scope), and a bare value
+ * follows its key's own rule (`qop=auth` and `nc=00000001` stay). The same list rule reads a WWW-Authenticate
+ * challenge and a pair list in prose, so `realm="api"` stays everywhere. Before the fix a quoted value under an
+ * unknown key stayed, a JSON-object header kept the token beside a consumed key, and Digest's params survived.
+ */
+const QUOTED_AUTH_PARAM_ROWS = [
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}"`, 'Authorization: Snowflake Token="[REDACTED]"'],
+  [`Authorization: Snowflake Token="${PLANTED_TOKEN}"`, 'Authorization: Snowflake Token="[REDACTED]"'],
+  [`Authorization: Snowflake Token='${QUOTED_TOKEN}'`, "Authorization: Snowflake Token='[REDACTED]'"],
+  [`Authorization: Snowflake Token=${QUOTED_TOKEN}`, "Authorization: Snowflake [REDACTED]"],
+  [`Proxy-Authorization: Snowflake Token="${QUOTED_TOKEN}"`, 'Proxy-Authorization: Snowflake Token="[REDACTED]"'],
+  [`Authorization: Bearer blob="${QUOTED_TOKEN}"`, 'Authorization: Bearer blob="[REDACTED]"'],
+  [`Authorization: Digest username="auditor", realm="api", nonce="${QUOTED_TOKEN}", uri="/api/v1/things", qop=auth, nc=00000001, cnonce="${QUOTED_TOKEN}", response="${QUOTED_TOKEN}", opaque="opaque-state-1"`, 'Authorization: Digest username="[REDACTED]", realm="api", nonce="[REDACTED]", uri="[REDACTED]", qop=auth, nc=00000001, cnonce="[REDACTED]", response="[REDACTED]", opaque="[REDACTED]"'],
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}"; Content-Type: application/json`, 'Authorization: Snowflake Token="[REDACTED]"; Content-Type: application/json'],
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}" and X-Next: v`, 'Authorization: Snowflake Token="[REDACTED]" and X-Next: v'],
+  [`Authorization: Snowflake Token="${QUOTED_TOKEN}\nX-Next: v`, 'Authorization: Snowflake Token="[REDACTED]\nX-Next: v'],
+  [`{"headers":{"Authorization":"Snowflake Token=\\"${QUOTED_TOKEN}\\""}}`, '{"headers":{"Authorization":"Snowflake Token=\\"[REDACTED]\\""}}'],
+  [`{"headers":{"Authorization":"Digest username=\\"auditor\\", realm=\\"api\\", response=\\"${QUOTED_TOKEN}\\""}}`, '{"headers":{"Authorization":"Digest username=\\"[REDACTED]\\", realm=\\"api\\", response=\\"[REDACTED]\\""}}'],
+  [`{"body":"{\\"headers\\":{\\"Authorization\\":\\"Snowflake Token=\\\\\\"${QUOTED_TOKEN}\\\\\\"\\"}}"}`, '{"body":"{\\"headers\\":{\\"Authorization\\":\\"Snowflake Token=\\\\\\"[REDACTED]\\\\\\"\\"}}"}'],
+  [`request headers:\\nAuthorization: Snowflake Token=\\"${QUOTED_TOKEN}\\"\\nAccept: application/json`, 'request headers:\\nAuthorization: Snowflake Token=\\"[REDACTED]\\"\\nAccept: application/json'],
+  [`upstream said Bearer blob="${QUOTED_TOKEN}" and moved on`, 'upstream said Bearer blob="[REDACTED]" and moved on'],
+  [`upstream said Digest username="auditor", response="${QUOTED_TOKEN}" and moved on`, 'upstream said Digest username="[REDACTED]", response="[REDACTED]" and moved on'],
+  [`Snowflake Token="${QUOTED_TOKEN}" was rejected`, 'Snowflake Token="[REDACTED]" was rejected'],
+  ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+  ['WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"', 'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"'],
+  [`WWW-Authenticate: Digest realm="api", qop="auth", algorithm=MD5, nonce="${QUOTED_TOKEN}", opaque="opaque-state-1"`, 'WWW-Authenticate: Digest realm="api", qop="auth", algorithm=MD5, nonce="[REDACTED]", opaque="[REDACTED]"'],
+  ['WWW-Authenticate: Snowflake realm="api"', 'WWW-Authenticate: Snowflake realm="api"'],
+  ["Authorization: VERACODE-HMAC-SHA-256 id=abcdef1234567890,ts=1700000000000,nonce=0123456789abcdef,sig=deadbeefdeadbeef", "Authorization: VERACODE-HMAC-SHA-256 [REDACTED],ts=1700000000000,nonce=[REDACTED],sig=[REDACTED]"],
+  [`Authorization: VERACODE-HMAC-SHA-256 id="abcdef1234567890",ts="1700000000000",nonce="${QUOTED_TOKEN}",sig="${QUOTED_TOKEN}"`, 'Authorization: VERACODE-HMAC-SHA-256 id="[REDACTED]",ts="[REDACTED]",nonce="[REDACTED]",sig="[REDACTED]"'],
+  ['index="main" sourcetype="okta:system" earliest=-24h', 'index="main" sourcetype="okta:system" earliest=-24h'],
+];
+/** The Authorization header a 401 body echoes in the end-to-end probe, bare and inside a JSON object (the form that leaked before the fix), and how it must reach the caller. */
+const ECHOED_HEADER = `request headers: Authorization: Snowflake Token="${QUOTED_TOKEN}"; Accept: application/json; request: {"headers":{"Authorization":"Snowflake Token=\\"${QUOTED_TOKEN}\\""}}`;
+const ECHOED_HEADER_REDACTED = 'request headers: Authorization: Snowflake Token="[REDACTED]"; Accept: application/json; request: {"headers":{"Authorization":"Snowflake Token=\\"[REDACTED]\\""}}';
+
+test("CodeRabbit #81 quoted auth-params: a quoted value in the pair list after a scheme word goes whatever its key, bare, JSON-escaped, and inside a JSON string, through the error scrubber, the data scrubber, and redactSnapshot, while a challenge's realm and the other descriptive parameters stay", () => {
+  assertRows(scrubErrorText, QUOTED_AUTH_PARAM_ROWS, "quoted auth-param, error side");
+  assertRows(scrubDataText, QUOTED_AUTH_PARAM_ROWS, "quoted auth-param, data side");
+  assertRows((text) => redactSnapshot({ note: text, nested: [{ deeper: text }] }).nested[0].deeper, QUOTED_AUTH_PARAM_ROWS, "quoted auth-param, redactSnapshot leaf");
+  for (const [input, expected] of QUOTED_AUTH_PARAM_ROWS) {
+    if (!input.includes(QUOTED_TOKEN)) continue;
+    for (const output of [scrubErrorText(input), scrubDataText(input), redactSnapshot({ note: input }).note]) assertNoWindowOf(output, QUOTED_TOKEN, `quoted auth-param: ${input} -> ${expected}`);
+  }
+});
+
+test("CodeRabbit #81 quoted auth-params, end to end: a 401 body that echoes the request's Authorization header reaches the caller with the quoted token removed and no window of it", async () => {
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ errors: [{ code: "unauthorized", message: `Credential could not be verified. ${ECHOED_HEADER}` }] }, { status: 401 }), sleepImpl: async () => {}, maxRetries: 1 });
+  const result = await client.listRoles();
+  assert.equal(result.ok, false);
+  assert.equal(result.httpStatus, 401);
+  assert.match(result.error, /^Sumo Logic request to \/v1\/roles failed \(401[^)]*\): Credential could not be verified\. /);
+  assert.ok(result.error.endsWith(ECHOED_HEADER_REDACTED), `the echoed header reaches the caller redacted: ${result.error}`);
+  assertNoWindowOf(result.error, QUOTED_TOKEN, "Sumo Logic 401 body");
+});
+
+/**
+ * CodeRabbit on #81 (discussion_r4081776771): a challenge-shaped pair list is not exempt when a later
+ * parameter is a proof. A proof parameter (`response`, `signature`, `oauth_signature`, `mac`, `sig`) loses its
+ * value wherever its pair sits in a list with a challenge parameter (`realm`, `nonce`, `cnonce`, `opaque`, `qop`,
+ * an `oauth_*` name), with or without a scheme word or a header in front of the list and whatever the value's
+ * shape, and a bare proof inside a scheme word's list goes whatever its neighbours. A proof-free challenge keeps
+ * its descriptive values (its nonce goes as a credential-named pair does everywhere), and a pair list of another
+ * kind keeps its values. Before the fix `response` and `mac` survived as a bare data value, after a literal
+ * escape, inside a JSON string, and as a bare value inside a Digest, MAC, or Hawk header's list.
+ */
+const PROOF_PARAM_ROWS = [
+  [`realm="api", nonce="n", response="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`realm=api, nonce=n, response=${PROOF_VALUE}`, "realm=api, nonce=[REDACTED], response=[REDACTED]"],
+  [`realm="api", nonce="n", signature="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", signature="[REDACTED]"'],
+  [`realm="api", nonce="n", oauth_signature="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", oauth_signature="[REDACTED]"'],
+  [`realm="api", nonce="n", mac="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", mac="[REDACTED]"'],
+  [`realm=api, nonce=n, mac=${PROOF_VALUE}`, "realm=api, nonce=[REDACTED], mac=[REDACTED]"],
+  [`realm="api", nonce="n", sig="${PROOF_VALUE}"`, 'realm="api", nonce="[REDACTED]", sig="[REDACTED]"'],
+  [`realm="api", response="${PROOF_VALUE}"`, 'realm="api", response="[REDACTED]"'],
+  [`request failed\\nrealm=\\"api\\", nonce=\\"n\\", response=\\"${PROOF_VALUE}\\"`, 'request failed\\nrealm=\\"api\\", nonce=\\"[REDACTED]\\", response=\\"[REDACTED]\\"'],
+  [`request failed\\u000arealm="api", nonce="n", response="${PROOF_VALUE}"`, 'request failed\\u000arealm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`{"note":"realm=\\"api\\", nonce=\\"n\\", response=\\"${PROOF_VALUE}\\""}`, '{"note":"realm=\\"api\\", nonce=\\"[REDACTED]\\", response=\\"[REDACTED]\\""}'],
+  [`{"note":"id=\\"h480djs93hd8\\", ts=\\"1336363200\\", nonce=\\"dj83hs9s\\", mac=\\"${PROOF_VALUE}\\""}`, '{"note":"id=\\"h480djs93hd8\\", ts=\\"1336363200\\", nonce=\\"[REDACTED]\\", mac=\\"[REDACTED]\\""}'],
+  [`upstream said Digest realm="api", nonce="n", response="${PROOF_VALUE}" and moved on`, 'upstream said Digest realm="api", nonce="[REDACTED]", response="[REDACTED]" and moved on'],
+  [`upstream said Digest realm=api, nonce=n, response=${PROOF_VALUE} and moved on`, "upstream said Digest realm=api, nonce=[REDACTED], response=[REDACTED] and moved on"],
+  [`Bearer realm=api, response=${PROOF_VALUE}`, "Bearer realm=api, response=[REDACTED]"],
+  [`WWW-Authenticate: Digest realm="api", nonce="n", response="${PROOF_VALUE}"`, 'WWW-Authenticate: Digest realm="api", nonce="[REDACTED]", response="[REDACTED]"'],
+  [`WWW-Authenticate: Digest realm=api, nonce=n, response=${PROOF_VALUE}`, "WWW-Authenticate: Digest realm=api, nonce=[REDACTED], response=[REDACTED]"],
+  [`Authorization: Digest username="auditor", realm="api", nonce="n", uri="/api/v1/things", response=${PROOF_VALUE}`, 'Authorization: Digest username="[REDACTED]", realm="api", nonce="[REDACTED]", uri="[REDACTED]", response=[REDACTED]'],
+  [`Authorization: Digest realm=api, nonce=n, response=${PROOF_VALUE}`, "Authorization: Digest [REDACTED], nonce=[REDACTED], response=[REDACTED]"],
+  [`Authorization: Digest username="auditor", response=${PROOF_VALUE}`, 'Authorization: Digest username="[REDACTED]", response=[REDACTED]'],
+  [`Authorization: MAC id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", mac="${PROOF_VALUE}"`, 'Authorization: [REDACTED] id="h480djs93hd8", ts="1336363200", nonce="[REDACTED]", mac="[REDACTED]"'],
+  [`Authorization: Hawk id="dh37fgj492je", ts="1353832234", nonce="j4h3g2", ext="some-app-ext-data", mac="${PROOF_VALUE}"`, 'Authorization: [REDACTED] id="dh37fgj492je", ts="1353832234", nonce="[REDACTED]", ext="some-app-ext-data", mac="[REDACTED]"'],
+  ['WWW-Authenticate: Bearer realm="api"', 'WWW-Authenticate: Bearer realm="api"'],
+  ['WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"', 'WWW-Authenticate: Digest realm="api", qop="auth", nonce="[REDACTED]"'],
+  ['Digest realm="api", qop="auth", nonce="n"', 'Digest realm="api", qop="auth", nonce="[REDACTED]"'],
+  ['realm="api", qop="auth", nonce="n"', 'realm="api", qop="auth", nonce="[REDACTED]"'],
+  ["unexpected response: 502 Bad Gateway from upstream", "unexpected response: 502 Bad Gateway from upstream"],
+  ["API response=200 in 30ms", "API response=200 in 30ms"],
+  ['index=web status=500 response=slow host="edge-01"', 'index=web status=500 response=slow host="edge-01"'],
+  ["device mac=00:11:22:33:44:55 joined vlan=10", "device mac=00:11:22:33:44:55 joined vlan=10"],
+];
+/** The Digest header and the challenge-shaped list a 401 body echoes in the end-to-end probe, with a bare proof and a quoted one, and how they must reach the caller. */
+const ECHOED_PROOF = `request headers: Authorization: Digest username="auditor", realm="api", nonce="n", uri="/api/v1/things", response=${PROOF_VALUE}; challenge: realm="api", nonce="n", response="${PROOF_VALUE}"`;
+const ECHOED_PROOF_REDACTED = 'request headers: Authorization: Digest username="[REDACTED]", realm="api", nonce="[REDACTED]", uri="[REDACTED]", response=[REDACTED]; challenge: realm="api", nonce="[REDACTED]", response="[REDACTED]"';
+
+test("CodeRabbit #81 proof parameters: a proof parameter in a challenge-shaped pair list loses its value bare, unquoted, after a JSON escape, inside a JSON string, in prose after a scheme word, and under a header, through the error scrubber, the data scrubber, and redactSnapshot, while a proof-free challenge keeps its descriptive values and an unrelated pair list stays", () => {
+  assertRows(scrubErrorText, PROOF_PARAM_ROWS, "proof parameter, error side");
+  assertRows(scrubDataText, PROOF_PARAM_ROWS, "proof parameter, data side");
+  assertRows((text) => redactSnapshot({ note: text, nested: [{ deeper: text }] }).nested[0].deeper, PROOF_PARAM_ROWS, "proof parameter, redactSnapshot leaf");
+  for (const [input, expected] of PROOF_PARAM_ROWS) {
+    if (!input.includes(PROOF_VALUE)) continue;
+    for (const output of [scrubErrorText(input), scrubDataText(input), redactSnapshot({ note: input }).note]) assertNoWindowOf(output, PROOF_VALUE, `proof parameter: ${input} -> ${expected}`);
+  }
+});
+
+test("CodeRabbit #81 proof parameters, end to end: a 401 body that echoes a Digest header with a bare proof and a challenge-shaped list with a quoted one reaches the caller with both proofs removed and no window of them", async () => {
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ errors: [{ code: "unauthorized", message: `Credential could not be verified. ${ECHOED_PROOF}` }] }, { status: 401 }), sleepImpl: async () => {}, maxRetries: 1 });
+  const result = await client.listRoles();
+  assert.equal(result.ok, false);
+  assert.equal(result.httpStatus, 401);
+  assert.match(result.error, /^Sumo Logic request to \/v1\/roles failed \(401[^)]*\): Credential could not be verified\. /);
+  assert.ok(result.error.endsWith(ECHOED_PROOF_REDACTED), `the echoed proofs reach the caller redacted: ${result.error}`);
+  assertNoWindowOf(result.error, PROOF_VALUE, "Sumo Logic 401 body");
+});
+
+test("reviewer C final verdict, scheme-word order (r4078025849) and the key audit: a credential-named key loses its value before any scheme word is read in both spellings, scheme words act only under Authorization-style keys and bare in prose, bearer ids go, setting suffixes and URL-valued webhook keys keep their values, and the flag, path, escaped-URL, and cookie carriers are read", () => {
+  assertRows(scrubErrorText, SCHEME_ORDER_ROWS, "scheme-word order");
+  assertRows(scrubErrorText, KEY_AUDIT_ROWS, "key audit");
+  assertRows(scrubErrorText, CARRIER_ROWS, "carrier");
+  assert.equal(scrubErrorText(`run ${PLANTED_TOKEN} end`), "run [REDACTED] end", "the error side keeps the generic long-run rule");
+});
+
+test("data-side ruling: vendor-prefixed tokens, JWTs, PEM blocks, and credential carriers are removed on the data side while identifiers and bare runs survive, in scrubDataText, in redactSnapshot, and in the exported Sumo Logic bundle", async () => {
+  assertRows(scrubDataText, DATA_SIDE_ROWS, "data side");
+
+  const record = {
+    id: "rec-1",
+    description: `note: key ${PLANTED_STRIPE_KEY} end`,
+    tags: [{ notes: [`also ${PLANTED_JWT}`] }],
+    webhook_url: `https://hooks.example.com/services/T/B/${PLANTED_TOKEN}?ts=1`,
+    password: PLANTED_TOKEN,
+    name: "benign",
+    count: 3,
+    enabled: true,
+    empty: null,
+  };
+  const walked = redactSnapshot(record);
+  assert.deepEqual(walked, {
+    id: "rec-1",
+    description: "note: key [REDACTED] end",
+    tags: [{ notes: ["also [REDACTED]"] }],
+    webhook_url: "https://hooks.example.com/[REDACTED]",
+    password: "[REDACTED]",
+    name: "benign",
+    count: 3,
+    enabled: true,
+    empty: null,
+  }, "the walker reaches every string leaf and keeps the origin of a webhook URL");
+  assert.deepEqual(redactSnapshot(walked), walked, "second pass over the walked record");
+
+  const data = healthyData();
+  data.roles[0].description = PLANTED_NOTE;
+  assertFixtureFreeOfCanaryWindows(JSON.stringify({ data, config: sampleConfig() }), PLANTED_CANARIES, "data-side probe fixture");
+  const secrets = leakWindows(PLANTED_CANARIES);
+  const reader = readerFrom(data);
+  const base = createTempBase("grclanker-sumo-data-side-");
+  const result = await exportSumologicAuditBundle(reader, sampleConfig(), base, { now: NOW });
+  const files = readBundleFiles(result.outputDir);
+  assertSecretsAbsent(assert, files, secrets, "bundle directory");
+  assertSecretsAbsent(assert, readZipEntries(result.zipPath), secrets, "zip archive");
+  assertSecretsAbsent(assert, new Map([["assess results", JSON.stringify(await allAssessments(reader))]]), secrets, "tool payloads");
+  const accessControl = JSON.parse(files.get("core_data/access-control.json"));
+  assert.equal(accessControl.roles.data[0].description, REDACTED_NOTE, "the role description keeps its prose and the cluster name around the removed shapes");
+});
+
+const REGISTERED_SECRET = "registry-passphrase-2026-echo";
+
+const HANDED_SHORT_SECRET = "hunter2";
+/** A handed-in value glued into a longer run: the whole-token needle rule passes over it, the literal pass does not. */
+const HANDED_SHORT_ROWS = [
+  [`x${HANDED_SHORT_SECRET}y`, "x[REDACTED]y"],
+  [`{"detail":"id${HANDED_SHORT_SECRET}99"}`, '{"detail":"id[REDACTED]99"}'],
+  [`${HANDED_SHORT_SECRET}${HANDED_SHORT_SECRET}`, "[REDACTED][REDACTED]"],
+  [`the value ${HANDED_SHORT_SECRET} was echoed by the proxy`, "the value [REDACTED] was echoed by the proxy"],
+];
+
+test("merge bar: a secret handed to the call goes wherever it stands, glued into a longer run included, on both sides; the marker is never a needle, a value under the minimum is ignored, and a second pass changes nothing", () => {
+  for (const [input, expected] of HANDED_SHORT_ROWS) {
+    for (const [name, scrub] of [["scrubErrorText", scrubErrorText], ["scrubDataText", scrubDataText]]) {
+      const output = scrub(input, [HANDED_SHORT_SECRET]);
+      assert.equal(output, expected, `${name}: ${input}`);
+      assert.equal(scrub(output, [HANDED_SHORT_SECRET]), output, `${name} second pass: ${input}`);
+    }
+  }
+  assert.equal(scrubErrorText("[REDACTED] stays", ["DACT"]), "[REDACTED] stays");
+  assert.equal(scrubErrorText("[REDACTED] stays", ["[REDACTED]"]), "[REDACTED] stays");
+  assert.equal(scrubErrorText("abc stays", ["abc"]), "abc stays");
+});
+
+test("item 7: once a client is constructed its configured access key and the Basic credential built from it are removed by redactSnapshot on a string leaf and by scrubDataText and scrubErrorText called without them, in every encoded form", () => {
+  const leaf = `the value ${REGISTERED_SECRET} was echoed by the proxy`;
+  const basic = Buffer.from(`suREGISTRY:${REGISTERED_SECRET}`).toString("base64");
+  assert.equal(redactSnapshot(leaf), leaf, "before any client carries the value, the data side keeps a word-shaped run");
+  assert.equal(redactSnapshot(`credential ${basic} echoed`), `credential ${basic} echoed`, "before any client carries the value, the data side keeps a bare base64 run");
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), `auth_method=${REGISTERED_SECRET}`, "before any client carries the value, a setting keeps a word-shaped run");
+
+  new SumologicApiClient(sampleConfig({ accessId: "suREGISTRY", accessKey: REGISTERED_SECRET }), { fetchImpl: async () => jsonResponse({}) });
+  assert.equal(redactSnapshot(leaf), "the value [REDACTED] was echoed by the proxy");
+  assert.equal(redactSnapshot(`credential ${basic} echoed`), "credential [REDACTED] echoed", "the Basic credential is registered beside the access key");
+  assert.equal(scrubDataText(`{"detail":"${REGISTERED_SECRET}"}`), '{"detail":"[REDACTED]"}');
+  assert.equal(scrubErrorText(`auth_method=${REGISTERED_SECRET}`), "auth_method=[REDACTED]");
+  assert.deepEqual(
+    redactSnapshot({ note: leaf, nested: [{ text: `b64 ${Buffer.from(REGISTERED_SECRET).toString("base64")} end` }], count: 2 }),
+    { note: "the value [REDACTED] was echoed by the proxy", nested: [{ text: "b64 [REDACTED] end" }], count: 2 },
+  );
+  assert.equal(redactSnapshot("access id suREGISTRY is an identifier"), "access id suREGISTRY is an identifier", "the access id is not registered");
+});
+
+const FOREIGN_BODY_CANARY = "yln2bVNl4tE9Cyp1B18V2mX7";
+const FOREIGN_BEARER_CANARY = "Qw8Zr2Lm5Pk1Vt7Xy3Nb6Hd9";
+const FOREIGN_JSON_BODY = { foo: FOREIGN_BODY_CANARY, items: [{ password: FOREIGN_BODY_CANARY, description: `Authorization: Bearer ${FOREIGN_BEARER_CANARY}` }] };
+/** Every single-object surface by its rawData name, the core_data file that carries it, and the finding that reads it (null when no finding is gated on it alone). */
+const SUMOLOGIC_OBJECT_SURFACES = [
+  ["account_status", "/api/v1/account/status", "data-governance.json", null],
+  ["password_policy", "/api/v1/passwordPolicy", "identity.json", "SUMO-03"],
+  ["service_allowlist_status", "/api/v1/serviceAllowlist/status", "access-control.json", "SUMO-13"],
+  ["audit_policy", "/api/v1/policies/audit", "data-governance.json", "SUMO-09"],
+  ["search_audit_policy", "/api/v1/policies/searchAudit", "data-governance.json", null],
+  ["share_dashboards_outside_organization_policy", "/api/v1/policies/shareDashboardsOutsideOrganization", "content-sharing.json", "SUMO-19"],
+  ["data_access_level_policy", "/api/v1/policies/dataAccessLevel", "content-sharing.json", "SUMO-11"],
+  ["user_concurrent_sessions_limit_policy", "/api/v1/policies/userConcurrentSessionsLimit", "access-control.json", null],
+  ["max_user_session_timeout_policy", "/api/v1/policies/maxUserSessionTimeout", "access-control.json", "SUMO-14"],
+  ["access_keys_lifetime_policy", "/api/v1/policies/accessKeysLifetime", "access-control.json", null],
+  ["personal_folder", "/api/v2/content/folders/personal", "content-sharing.json", null],
+];
+
+/** Serves the foreign JSON document with a 200 at the given paths and the healthy fixtures everywhere else. */
+function foreignJsonFetch(paths) {
+  const routes = healthyRoutes();
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    const foreign = paths.includes(url.pathname);
+    if (!foreign) assert.ok(url.pathname in routes, `unexpected request to ${url.pathname}`);
+    const response = jsonResponse(foreign ? FOREIGN_JSON_BODY : routes[url.pathname]);
+    requests.push({ method: init.method ?? "GET", path: url.pathname, status: response.status });
+    return response;
+  };
+  return { fetchImpl, requests };
+}
+
+test("class 10: a 200 body that is not the expected object is a not-collected marker in core_data, the assess payload, and the access check, its findings render manual, and no part of the body reaches any output", async () => {
+  const { fetchImpl, requests } = foreignJsonFetch([...SUMOLOGIC_OBJECT_SURFACES.map(([, path]) => path), "/api/v2/content/c1/permissions"]);
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 });
+  const access = await checkSumologicAccess(client);
+  const results = await allAssessments(client);
+  const exported = await exportSumologicAuditBundle(client, sampleConfig(), createTempBase("grclanker-sumo-foreign-"), { now: NOW });
+  const outputs = sumologicOutputs(access, results, exported);
+  for (const [name, text] of readZipEntries(exported.zipPath)) outputs.set(`zip ${name}`, text);
+
+  const shapeError = /^Sumo Logic request to \/v[12]\/[A-Za-z/]+ returned a 200 body that is not the expected object \(none of [A-Za-z, ]+ present\), so the response was not recorded$/;
+  for (const [dataset, path, areaFile, findingId] of SUMOLOGIC_OBJECT_SURFACES) {
+    const entry = JSON.parse(readFileSync(join(exported.outputDir, "core_data", areaFile), "utf8"))[dataset];
+    assert.ok(entry, `${dataset}: written to core_data/${areaFile}`);
+    assert.equal(entry.ok, false, `${dataset}: a body that is not the resource is not ok`);
+    assert.equal(entry.complete, null, dataset);
+    assert.equal(entry.count, null, dataset);
+    assert.equal(entry.http_status, 200, `${dataset}: the marker keeps the observed status`);
+    assert.equal(entry.endpoint, path.replace(/^\/api/, ""), dataset);
+    assert.deepEqual(entry.data, { collected: false, status: 200, endpoint: entry.endpoint, error: entry.error }, `${dataset}: the data slot is the marker, never the body`);
+    assert.match(entry.error, shapeError, dataset);
+    const rawEntry = results.find((result) => result.rawData[dataset])?.rawData[dataset];
+    assert.deepEqual(rawEntry.data, entry.data, `${dataset}: the assess payload carries the same marker`);
+    const surface = access.surfaces.find((item) => item.name === dataset);
+    if (surface) {
+      assert.equal(surface.status, "not_readable", dataset);
+      assert.equal(surface.count, null, dataset);
+      assert.equal(surface.complete, null, dataset);
+      assert.equal(surface.httpStatus, 200, dataset);
+      assert.match(surface.error, shapeError, dataset);
+    }
+    if (findingId) {
+      const finding = results.flatMap((result) => result.findings).find((item) => item.id === findingId);
+      assert.equal(finding.status, "manual", `${findingId} is manual, never pass or fail, over a body that is not the resource`);
+      assert.match(finding.summary, /could not be read because the endpoint returned a 200 body that is not the expected object/, findingId);
+      assert.equal(finding.evidence.http_status, 200, findingId);
+    }
+  }
+  assert.equal(access.surfaces.filter((surface) => surface.status === "not_readable").length, 5, "the five probed object surfaces read not_readable");
+  const permissions = results.find((result) => result.area === "content-sharing").rawData.content_permissions;
+  assert.ok(JSON.stringify(permissions).includes("returned a 200 body that is not the expected object"), "a permission lookup body that is not the resource is a failed lookup");
+
+  for (const [name, text] of outputs) {
+    assert.ok(!text.includes(FOREIGN_BODY_CANARY), `${name}: the foreign body's member value never reaches an output`);
+    assert.ok(!text.includes(FOREIGN_BEARER_CANARY), `${name}: the foreign body's bearer token never reaches an output`);
+    assert.ok(!/TypeError|ReferenceError|Cannot read properties|is not a function/.test(text), `${name}: a foreign body never surfaces as a runtime error`);
+  }
+  assertOutputsNameOnlyObservedRequests(outputs, requests, "foreign JSON");
+});
+
+test("class 10: a single object carrying a documented member is kept whatever else it carries", async () => {
+  const routes = healthyRoutes();
+  routes["/api/v1/policies/audit"] = { enabled: true, foo: FOREIGN_BODY_CANARY };
+  const client = new SumologicApiClient(sampleConfig(), { fetchImpl: async (input) => jsonResponse(routes[new URL(input.toString()).pathname]), sleepImpl: async () => {}, maxRetries: 0 });
+  const audit = await client.getPolicy("audit");
+  assert.equal(audit.ok, true, "a body with the documented member is the resource");
+  assert.equal(audit.data.enabled, true);
+  const governance = await assessSumologicDataGovernance(client, { now: NOW });
+  assert.equal(byId(governance, "SUMO-09").status, "pass");
+  assert.ok(!JSON.stringify(governance.findings).includes(FOREIGN_BODY_CANARY), "an undocumented member never reaches a finding");
 });

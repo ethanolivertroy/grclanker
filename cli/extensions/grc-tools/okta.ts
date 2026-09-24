@@ -5,7 +5,7 @@
  * older okta-inspector project while staying aligned with the official
  * okta-cli-client configuration model and Okta Management API coverage.
  */
-import { createHash, createPrivateKey, randomUUID, sign as signData } from "node:crypto";
+import { createHash, createPrivateKey, randomUUID, sign as signData, type KeyObject } from "node:crypto";
 import {
   createWriteStream,
   existsSync,
@@ -18,7 +18,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -42,8 +43,12 @@ const DEFAULT_RATE_LIMIT_RETRIES = 4;
 const DAYS_90_MS = 90 * 24 * 60 * 60 * 1000;
 const DAYS_30_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_USER_PAGES = 50;
+const MAX_LIST_PAGES = 50;
+const MAX_SYSTEM_LOG_PAGES = 5;
 const MAX_PRIVILEGED_FACTOR_LOOKUPS = 50;
 const MAX_PRIVILEGED_GROUP_LOOKUPS = 25;
+const TOKEN_ENDPOINT_PATH = "/oauth2/v1/token";
+const REDACTED = "[REDACTED]";
 const FEDERAL_ORG_HOST_PATTERN = /\.(okta-gov\.com|okta\.gov|okta\.mil)$/i;
 const RESTRICTED_AUTHENTICATOR_KEYS = new Set(["phone_number", "security_question", "okta_email"]);
 const OSCAL_VERSION = "1.1.2";
@@ -128,6 +133,953 @@ export interface OktaAccessProbe {
   path: string;
   status: OktaEndpointStatus;
   detail: string;
+  /** HTTP status of the failed probe request; null when the probe was readable or failed without an HTTP status. */
+  httpStatus: number | null;
+}
+
+/** What core_data carries in place of a dataset that was denied, errored, or never requested, so a denial is never mistaken for an empty inventory. */
+export interface OktaNotCollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string | null;
+  error: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Error-text hygiene (rule 9). Every error string this module records passes through
+// scrubErrorText when the API error is constructed and again where the error is recorded. Two
+// guards are construction requirements: a value inside any carrier (Authorization, Cookie,
+// Set-Cookie, x-api-key and similar headers, cookie or session assignments, URL userinfo and query
+// pairs, the Bearer, Basic, SSWS, Token, and ApiKey schemes, credential-named pairs) is removed
+// whatever its shape, and a configured secret is removed whatever its shape in its raw,
+// JSON-escaped, URL-encoded, base64, and base64url forms. Real token shapes (JWTs, PEM blocks, vendor
+// prefixes, hex digests, runs of 16 or more token characters with base64 symbols, scattered digits,
+// or token casing) are removed bare. A bare value shaped like a name (words joined by hyphens or
+// underscores with at most one digit group, such as prod-us-east-2026) is indistinguishable from a
+// resource name and stays; it is caught only inside a carrier or as a configured secret. A
+// token-shaped segment of a bare path (preceded by "/" outside a URL: a request target such as
+// /api/v1/users/<id>/factors or a config file path) is an identifier the run itself named and stays
+// so the endpoint reported is the one requested; inside a URL with a scheme every path segment keeps
+// the rule because webhook URLs carry their token there.
+//
+// The pair rule (reviewer C, item G): the value under a credential-named key (a credential word
+// anywhere in the name, compound and vendor environment names included: DB_PASSWORD,
+// SPLUNK_PASSWORD, OKTA_CLIENT_TOKEN) is removed whatever its shape and length in the "key=value",
+// "key: value", "key:value", and JSON forms, in prose and inside a JSON string alike; no plain-word
+// shape exempts it. Three key classes refine that:
+// - bearer ids: a key ending in "secret_id" (VAULT_SECRET_ID, role_secret_id, secretId) or naming a
+//   session id (session_id, sid, jsessionid, phpsessid, sessid) carries a bearer credential, so its
+//   value goes whatever the shape, a UUID included; this is decided before the setting test;
+// - settings: a credential-named key whose final segment is url, uri, endpoint, method, algorithm,
+//   audience, issuer, shape, type, mode, path, file, dir, limit, count, id, name, policy, or policies
+//   (token_endpoint, auth_method, token_type, api_key_id, password_policies,
+//   X-Snowflake-Authorization-Token-Type) names a setting, and
+//   its value stays unless it is token-shaped or a configured secret;
+// - webhooks: webhook*, *hook_url, and callback_url values lose their path and query and keep the
+//   origin, because the token of a webhook URL sits in its path.
+// Identifier keys without a credential word (OKTA_CLIENT_ID, SUMO_ACCESS_ID, SNOWFLAKE_ACCOUNT,
+// X-Request-Id) are not pairs under this rule; their values are judged by shape only.
+//
+// The escape rule (reviewer C, item H): a literal JSON escape is a boundary before every carrier
+// opener, so a header line that begins after one ("request headers:\u000aAuthorization: Splunk
+// <key>", "proxy:\n\tpassword: hunter2") is scrubbed as a header line, never as the value of the
+// word before the escape; see the note above ESCAPE_LETTER.
+//
+// The quote rule (reviewer C, items F and L): a quoted carrier value is read to the closing quote that
+// matches its opener (the same quote character behind the same backslash run), so an escaped inner
+// quote at any JSON depth is inner content and goes with the value; an unterminated quote and an
+// unquoted value end at a ";" or "," before the next header token, whose name may carry any RFC 7230
+// token character, so the following header keeps its name and its own treatment; see
+// readQuotedContent and scrubCookieHeaders.
+// ---------------------------------------------------------------------------------------------
+
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+const LONG_TOKEN_MIN_LENGTH = 16;
+const MIN_LETTERS_FOR_CASING = 6;
+
+// A literal JSON escape ("\n", "\r", "\t", "\b", "\f", "\/", "\uXXXX": the two- or six-character
+// sequence, not the control character) is a boundary before every carrier opener. A header name,
+// scheme word, pair key, URL, or token that begins right after one is read on its own, never as the
+// value of the word before the escape and never with the escape letter as its first character, and
+// a value, URL, or query pair ends at the backslash that opens the next escape. A backslash joins a
+// quote only as its escape, so a lone backslash is never read as an opening quote.
+const ESCAPE_LETTER = String.raw`(?:[nrtbf/]|u[0-9A-Fa-f]{4})`;
+/** The start of a carrier or token: outside a word (none of `wordCharacters` before it) or right after a literal escape, and not on an escape letter. */
+function carrierStart(wordCharacters: string): string {
+  return String.raw`(?:(?<![${wordCharacters}])|(?<=\\[nrtbf/]|\\u[0-9A-Fa-f]{4}))(?!(?<=\\)${ESCAPE_LETTER})`;
+}
+const CARRIER_START = carrierStart("A-Za-z0-9_");
+/** A quote unit at any JSON depth: the quote character and the backslashes that escape it (`"`, `\"`, `\\\"`). */
+const QUOTE_UNIT = String.raw`(?:\\*["'])`;
+
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
+// A URL wherever it sits in the text, spelled with "://" or with the JSON-escaped slashes a serialized
+// body carries ("https:\/\/host\/path"). In the escaped spelling "\/" is the URL's own path separator
+// and goes with it; after "://" it is the boundary every literal escape is, and the URL ends there.
+// The escaped form is unescaped for reading and written back escaped.
+const ESCAPED_SLASH = "\\/";
+const EMBEDDED_URL_PATTERN = new RegExp(String.raw`${CARRIER_START}[a-z][a-z0-9+.-]*:(?:\/\/[^\s"'<>()[\]{}\\]+|\\\/\\\/(?:\\\/|[^\s"'<>()[\]{}\\])+)`, "gi");
+// The userinfo ends at the first "/", "?", or "#": an "@" inside a query or fragment ("https://h?e=a@x.com&q=v") never turns the query into the host.
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+// A ";" inside a query value is part of the value (URLSearchParams semantics), so "?token=<v>;<rest>"
+// loses the whole value with no tail. The ";" separator belongs to Cookie and Set-Cookie parsing alone,
+// and the cookie reader runs before this pass, so a pair inside a cookie header is already gone. A pair
+// whose value is already the marker is left alone, so a second pass never grows it to "[REDACTED]]".
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>)\]}\\]+)/g;
+// The authorization scheme words, matched in any casing on both sides: a peer's error text may spell
+// "bearer" or "BASIC", and an Authorization carrier may carry "sNoWfLaKe". In prose, a scheme word
+// followed by a run of 8 or more token characters is a credential unless the run is prose: a mechanism
+// word ("Basic authentication"), a dotted version ("OAuth 2.0"), an auth-param of a challenge
+// (`Bearer realm="api"`), or one plain word or hyphenated lowercase compound after a spelling that is
+// as often an English word or a product name as a scheme: a lowercase spelling ("token provided", "the
+// bearer presented") or a product name in any casing ("Splunk Enterprise", "Snowflake statement
+// failed", "HMAC signature"). After a header-cased or upper-cased authorization scheme ("Bearer",
+// "BASIC", "SSWS") the run is the credential whatever its shape. A run with a digit, a symbol, or mixed
+// casing inside a word is never prose. The token after a scheme word may be quoted (plain, single, or
+// JSON-escaped); the quote is kept and the token removed.
+const SCHEME_WORDS = "bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|splunk|snowflake|hmac|aws4-hmac-sha256|veracode-hmac-sha-256";
+const SCHEME_VALUE_PATTERN = new RegExp(String.raw`${CARRIER_START}(${SCHEME_WORDS})\s+(${QUOTE_UNIT}?)([A-Za-z0-9._~+/=-]{8,})`, "gi");
+const SCHEME_PROSE_WORDS = new Set(["authentication", "authorization", "authenticated", "authorized", "credential", "credentials", "challenge"]);
+const PRODUCT_SCHEME_WORDS = new Set(["splunk", "snowflake", "hmac"]);
+const SCHEME_WORD_PATTERN = new RegExp(`^(?:${SCHEME_WORDS})$`, "i");
+const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+(?:-[a-z]+)*|[A-Z]+)$/;
+const VERSION_PATTERN = /^\d+(?:\.\d+)+$/;
+const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|charset|algorithm|qop|stale|domain|opaque|title|resource|client_id|authorization_uri|as_uri|ticket)=/i;
+// A value may begin with backslashes that open no escape and no quote (a Windows path, a stray
+// backslash); they go with the value rather than hiding it.
+const STRAY_BACKSLASHES = String.raw`(?:\\+(?![nrtbf/u"']))?`;
+const SCHEME_TOKEN_PATTERN = new RegExp(String.raw`^(\s+)(?!\[REDACTED\])(${QUOTE_UNIT}?)(${STRAY_BACKSLASHES}[^\s"'<>;,()[\]{}\\]+)`);
+// A pair key or value may sit in plain, single, or JSON-escaped quotes at any depth; the value ends at a quote or the escaping backslash.
+const ASSIGNMENT_KEY_PATTERN = new RegExp(String.raw`(${QUOTE_UNIT}?)${CARRIER_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(${QUOTE_UNIT}?\s*([:=])\s*(${QUOTE_UNIT}?))`, "g");
+const ASSIGNMENT_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])${STRAY_BACKSLASHES}[^\s"'<>;,&()[\]{}\\]+`, "y");
+const URL_ORIGIN_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/[^\s/?#@"'<>]+(?=[/?#]|$)/i;
+const SINGLE_RUN_PATTERN = /^[A-Za-z0-9+=_-]+$/;
+const BEARER_ID_KEY_PATTERN = /(?:secret|session|token)[_.-]?id$/i;
+const BEARER_ID_KEY_SEGMENTS = new Set(["sid", "jsessionid", "phpsessid", "sessid"]);
+const BEARER_ID_KEY_TAILS = new Set(["secret_id", "session_id", "token_id"]);
+// The final segments that name a setting rather than a credential, the AppRole settings an assessment
+// reports included (secret_id_ttl, token_max_ttl, secret_id_num_uses, token_bound_cidrs, token_accessor).
+const SETTING_KEY_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "policy", "policies", "ttl", "uses", "cidrs", "accessor"]);
+// A webhook key is URL-valued: the bare word, or a *_url, *_uri, or *_endpoint key with a hook word
+// before the suffix (webhook_url, slack_hook_uri, callback_url). webhook_count and webhook_secret are
+// not URLs and follow the pair rule for their own final segment.
+const WEBHOOK_KEYS = new Set(["webhook", "webhooks", "hook", "hooks"]);
+const WEBHOOK_URL_WORDS = new Set(["webhook", "webhooks", "hook", "hooks", "callback"]);
+const URL_KEY_SUFFIXES = new Set(["url", "uri", "endpoint"]);
+// Every token shape starts at a carrier start, so a token glued to a literal escape ("\neyJ...",
+// "\u000aAKIA...") is read after the escape and never with the escape letter as its first character.
+const JWT_IN_TEXT_PATTERN = new RegExp(String.raw`${CARRIER_START}eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*`, "g");
+const AWS_ACCESS_KEY_ID_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b`, "g");
+const AWS_SECRET_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9/+=")}[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Fa-f0-9]{32,}\b`, "g");
+const VENDOR_TOKEN_SHAPES: readonly string[] = [
+  String.raw`00[A-Za-z0-9_-]{40}\b`,
+  String.raw`xox[abopers]-[A-Za-z0-9-]{10,}`,
+  String.raw`gh[pousr]_[A-Za-z0-9]{20,}`,
+  String.raw`github_pat_[A-Za-z0-9_]{20,}`,
+  String.raw`glpat-[A-Za-z0-9_-]{20,}`,
+  String.raw`AIza[0-9A-Za-z_-]{35}\b`,
+  String.raw`ya29\.[0-9A-Za-z._-]{20,}`,
+  String.raw`sk_(?:live|test)_[A-Za-z0-9]{10,}`,
+  String.raw`SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}`,
+];
+const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = VENDOR_TOKEN_SHAPES.map((shape) => new RegExp(`${CARRIER_START}${shape}`, "g"));
+// "/", ".", ":", "@", "=", "\", and whitespace end a run, so URL path segments, dotted hostnames, the
+// two sides of a pair, and the text on either side of a literal escape are judged on their own; "="
+// joins a run only as trailing base64 padding that no value follows, so a key whose value was already
+// replaced or is quoted ("httpEventCollectorToken=[REDACTED]", "SPLUNK_ACS_TOKEN='[REDACTED]'") keeps its name.
+const LONG_TOKEN_RUN_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9+_-")}[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&\["'\\]))?`, "g");
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Trailing base64 padding is judged apart from the run it follows: `private_key_file=` is a setting
+// key whose value starts with a symbol, not a padded token.
+const BASE64_PADDING_PATTERN = /={1,2}$/;
+// A setting suffix concatenated onto another word (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID) still names the setting.
+const SETTING_KEY_SUFFIX_PATTERN = new RegExp(`(?:${[...SETTING_KEY_SUFFIXES].join("|")})$`);
+const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
+const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "sessid", "phpsessid", "auth", "nonce", "sas"]);
+// "session" carries a credential only as the final segment (session=, user_session=); session_context and session_policy name settings.
+const FINAL_CREDENTIAL_KEY_SEGMENTS = new Set(["session"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-amz-signature", "x-amz-credential", "x-amz-security-token", "x-goog-signature", "x-goog-credential", "oauth_signature", "oauth_token", "oauth_verifier", "proxy-authorization"]);
+
+function keySegments(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/** True when a header, query parameter, or pair name carries a credential; thresholds and file references are exempt. */
+function isCredentialCarrierKey(key: string): boolean {
+  if (isSensitiveArgumentKey(key)) return true;
+  if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
+  if (EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  const segments = keySegments(key);
+  if (FINAL_CREDENTIAL_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "")) return true;
+  return segments.some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+}
+
+type PairRule = "credential" | "setting" | "webhook" | "none";
+
+/** A key ending in "secret_id", "token_id", or a session id name carries a bearer credential whatever the value's shape: a Vault secret id is a UUID, a token id is the token, a session id is the session. */
+function isBearerIdKey(key: string, segments: readonly string[]): boolean {
+  if (BEARER_ID_KEY_PATTERN.test(key)) return true;
+  return BEARER_ID_KEY_TAILS.has(segments.slice(-2).join("_")) || BEARER_ID_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "");
+}
+
+/** A URL-valued webhook key (webhook, webhook_url, slack_hook_uri, callback_url) whose path carries the token; see WEBHOOK_KEYS. */
+function isWebhookKey(segments: readonly string[]): boolean {
+  if (segments.length === 1) return WEBHOOK_KEYS.has(segments[0] ?? "");
+  return URL_KEY_SUFFIXES.has(segments[segments.length - 1] ?? "") && segments.slice(0, -1).some((segment) => WEBHOOK_URL_WORDS.has(segment));
+}
+
+/** Whether a key's last word is a credential noun or the key is a bearer id: the test a bare path label must pass to be read as a pair. */
+function namesCredential(key: string): boolean {
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1] ?? "";
+  const noun = CREDENTIAL_ENCODING_WORDS.has(last) ? segments[segments.length - 2] ?? "" : last;
+  return CREDENTIAL_NOUN_PATTERN.test(noun) || isBearerIdKey(key, segments);
+}
+
+/** Authorization, Proxy-Authorization, and WWW-Authenticate carry a scheme word in front of the credential; every other key's value goes whatever word it starts with. */
+function isAuthorizationStyleKey(segments: readonly string[]): boolean {
+  return segments[segments.length - 1] === "authorization" || segments.slice(-2).join("_") === "www_authenticate";
+}
+
+/** The final segment names a setting, as its own word or concatenated onto another (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID); a bearer id is read before this test. */
+function isSettingSegment(segment: string): boolean {
+  return SETTING_KEY_SUFFIXES.has(segment) || SETTING_KEY_SUFFIX_PATTERN.test(segment);
+}
+
+/** How the value of a `key=value` or `key: value` pair is treated; see the pair rule above. */
+function pairRuleFor(key: string): PairRule {
+  const segments = keySegments(key);
+  if (isBearerIdKey(key, segments)) return "credential";
+  if (isWebhookKey(segments)) return "webhook";
+  if (!isCredentialCarrierKey(key)) return "none";
+  return isSettingSegment(segments[segments.length - 1] ?? "") ? "setting" : "credential";
+}
+
+/** A setting value is removed only when it is a single run of 16 or more characters with a real token shape (base64 symbols, scattered digits, or token casing); an identifier (0oa1audit, key-2024-01), a UUID, a scheme word, a mode name, or a URL stays for the later shape rules to judge. */
+function isTokenShapedValue(value: string): boolean {
+  return value.length >= LONG_TOKEN_MIN_LENGTH && SINGLE_RUN_PATTERN.test(value) && looksLikeToken(value);
+}
+
+/** A webhook value keeps its origin and loses its path and query; a value that is not a URL goes whole. */
+function webhookReplacement(value: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(value)?.[0];
+  return origin === undefined ? REDACTED : `${origin}/${REDACTED}`;
+}
+
+/** A 40-character base64 run is an AWS secret access key when it is random-looking; a bare path of word segments ("/api/v1/users/<id>/roles") that happens to span 40 characters is a request target and stays. */
+function looksLikeAwsSecret(run: string): boolean {
+  if (run.startsWith("/") || run.split("/").some((segment) => /^(?:[a-z]+|v\d+)$/.test(segment))) return false;
+  if (/[/+]/.test(run)) return true;
+  return /\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run);
+}
+
+/** MD5, SHA-1, and SHA-256 digests and hex-encoded keys: 32 or more hex characters mixing letters and digits. */
+function looksLikeHexDigest(run: string): boolean {
+  return /[A-Fa-f]/.test(run) && /\d/.test(run);
+}
+
+// camelCase and PascalCase identifiers: an optional lowercase head, capitalized words, and at most a
+// short trailing acronym ("frozenTimePeriodInSecs", "maxTotalDataSizeMB").
+const CAMEL_CASE_PATTERN = /^[a-z]*(?:[A-Z][a-z]+)*[A-Z]{0,4}$/;
+
+/**
+ * Token casing changes more often than once every three letters. Words and acronyms change at word
+ * boundaries only, and a camelCase identifier whose words average three or more letters is a name
+ * even when its case changes often ("frozenTimePeriodInSecs"); an alternating run of capitalized
+ * one- or two-letter fragments ("xKqZvBnMwLpRtYsHdG") has no such word structure and is a token.
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
+  }
+  if (changes * 3 <= letters.length) return false;
+  if (!CAMEL_CASE_PATTERN.test(letters)) return true;
+  const words = (letters.match(/[A-Z]/g) ?? []).length + (/^[a-z]/.test(letters) ? 1 : 0);
+  return words * 3 > letters.length;
+}
+
+/** The long-token rule: a UUID is an identifier; a base64 symbol, a second digit group anywhere in the run, or a "-" or "_" separated segment with token casing makes a token; words joined by "-" or "_" with at most one digit group are a name. */
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  if ((run.match(DIGIT_GROUP_PATTERN) ?? []).length > 1) return true;
+  return run.split(/[-_]/).some((segment) => hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, "")));
+}
+
+/** True when the run at `index` is a segment of a bare path: preceded by a path separator ("/" or a lone "\"; the escape "\/" is a boundary, not a separator) and not inside a URL that carries a scheme. */
+function isBarePathSegment(text: string, index: number, urlSpans: ReadonlyArray<readonly [number, number]>): boolean {
+  const before = text[index - 1];
+  if (before === "/" ? text[index - 2] === "\\" : before !== "\\") return false;
+  return !urlSpans.some(([start, end]) => index >= start && index < end);
+}
+
+/** The long-token rule over the text; a scheme word that happens to carry digits ("aws4-hmac-sha256") names a mechanism and stays. */
+function scrubBareTokens(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string, offset: number) =>
+    looksLikeToken(run.replace(BASE64_PADDING_PATTERN, "")) && !SCHEME_WORD_PATTERN.test(run) && !isBarePathSegment(text, offset, urlSpans) ? REDACTED : run,
+  );
+}
+
+// The credentials this process has configured or minted (a client's token, private key, client
+// assertion, and the access token or session it obtained), so every scrub pass removes them without
+// being handed the client: redactSnapshot on a string leaf, an error text built outside the client.
+// Each entry keeps its encoded forms, lower-cased, so a leaf that carries none of them is passed over
+// with a substring check; bounded so a long-lived process that mints tokens does not grow it without limit.
+const REGISTERED_SECRET_LIMIT = 64;
+interface RegisteredSecret {
+  readonly value: string;
+  readonly forms: readonly string[];
+}
+const registeredSecrets: RegisteredSecret[] = [];
+
+/** Registers the credentials a client was configured with or minted; a value under the configured-secret minimum is ignored. */
+export function registerConfiguredSecrets(values: ReadonlyArray<string | undefined>): void {
+  for (const value of values) {
+    if (typeof value !== "string" || value.length < MIN_CONFIGURED_SECRET_LENGTH || registeredSecrets.some((entry) => entry.value === value)) continue;
+    const forms = [...new Set(scrubbedFormsOf(value).map((form) => form.toLowerCase()))].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+    registeredSecrets.push({ value, forms });
+    if (registeredSecrets.length > REGISTERED_SECRET_LIMIT) registeredSecrets.shift();
+  }
+}
+
+/** The registered credentials whose encoded forms may occur in the text; a text that carries none skips the full pass. */
+function registeredSecretsIn(text: string): string[] {
+  if (registeredSecrets.length === 0) return [];
+  const lower = text.toLowerCase();
+  if (lower.length !== text.length) return registeredSecrets.map((entry) => entry.value);
+  return registeredSecrets.filter((entry) => entry.forms.some((form) => lower.includes(form))).map((entry) => entry.value);
+}
+
+/** Removes the secrets handed in and every registered credential in each encoded form; a handed-in value also goes wherever it stands. */
+function scrubConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const handed = [...new Set(secrets)].filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  const values = [...new Set([...handed, ...registeredSecretsIn(text)])];
+  if (values.length === 0) return text;
+  return scrubLiteralSecrets(scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED), handed);
+}
+
+/**
+ * The shared needle rule matches a form under eight characters only as a whole token, so a short
+ * passphrase glued into a longer run ("xhunter2y") would survive it. A value handed to the call is
+ * this client's own credential wherever it stands, so it goes literally as well, longest first; a
+ * value that is part of the marker itself is skipped so a second pass changes nothing.
+ */
+function scrubLiteralSecrets(text: string, values: readonly string[]): string {
+  let output = text;
+  for (const value of [...values].sort((left, right) => right.length - left.length)) {
+    if (!REDACTED.includes(value) && output.includes(value)) output = output.split(value).join(REDACTED);
+  }
+  return output;
+}
+
+/** A URL keeps its scheme, host, and path and loses its userinfo, query, and fragment; a slash-escaped URL is written back with its slashes escaped. */
+function scrubEmbeddedUrl(match: string): string {
+  const escaped = match.includes(ESCAPED_SLASH);
+  const spelled = escaped ? match.split(ESCAPED_SLASH).join("/") : match;
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(spelled)?.[0] ?? "";
+  const url = spelled.slice(0, spelled.length - trailing.length);
+  const parts = URL_PARTS_PATTERN.exec(url);
+  if (!parts) return match;
+  const [, scheme, hostAndPath, query, fragment] = parts;
+  const kept = `${scheme}${hostAndPath}`;
+  return `${escaped ? kept.split("/").join(ESCAPED_SLASH) : kept}${redactedUrlPart(query)}${redactedUrlPart(fragment)}${trailing}`;
+}
+
+/** A query or fragment with content becomes its delimiter and the marker; a bare delimiter (what an earlier pass left before its marker) carries nothing and stays, so a second pass adds no second marker. */
+function redactedUrlPart(part: string | undefined): string {
+  if (!part) return "";
+  return part.length > 1 ? `${part[0]}${REDACTED}` : part;
+}
+
+function scrubQueryPair(match: string, separator: string, key: string): string {
+  return isCredentialCarrierKey(key) ? `${separator}${key}=${REDACTED}` : match;
+}
+
+/** The word after a scheme word in prose is prose, not a credential, when it is a mechanism word, a dotted version, an auth-param, or one plain word after a lowercase spelling or a product name. */
+function isSchemeProse(scheme: string, word: string): boolean {
+  if (SCHEME_PROSE_WORDS.has(word.toLowerCase())) return true;
+  if (PLAIN_WORD_PATTERN.test(word) && (scheme === scheme.toLowerCase() || PRODUCT_SCHEME_WORDS.has(scheme.toLowerCase()))) return true;
+  return VERSION_PATTERN.test(word) || AUTH_PARAM_PATTERN.test(word);
+}
+
+function scrubSchemeValue(match: string, scheme: string, quote: string, value: string, offset: number, text: string): string {
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(value)?.[0] ?? "";
+  const word = value.slice(0, value.length - trailing.length);
+  if (isSchemeProse(scheme, word) || isRedactedPairKey(word, text, offset + match.length)) return match;
+  return `${scheme} ${quote}${REDACTED}${trailing}`;
+}
+
+/** A run that is a bare pair key with the marker right after it (`username="[REDACTED]"`, `access_token=[REDACTED]`) names a pair whose value an earlier pass removed, and keeps its name. */
+function isRedactedPairKey(word: string, text: string, index: number): boolean {
+  if (!PAIR_KEY_ONLY_PATTERN.test(word)) return false;
+  REDACTED_PAIR_VALUE_PATTERN.lastIndex = index;
+  return REDACTED_PAIR_VALUE_PATTERN.test(text);
+}
+
+// The RFC 7230 token characters, so a following header whose name carries a "." or other token
+// punctuation (X.Api.Key) is recognised as the next header rather than swallowed (item L).
+const NEXT_HEADER_NAME = "[!#$%&'*+.^_`|~0-9A-Za-z-]+";
+// A ";" or "," ends a carrier value when the text after it (past optional spaces) opens the next
+// header "Name:" token or a JSON fragment.
+const NEXT_HEADER_AFTER_SEPARATOR = new RegExp(String.raw`^[ \t]*(?:[{[]|${QUOTE_UNIT}?${NEXT_HEADER_NAME}${QUOTE_UNIT}?[ \t]*:)`);
+// A quoted value that opens with a scheme word keeps the scheme and its gap and loses the rest, except
+// that a scheme followed by a pair list is read pair by pair. The pairs are the credential: a quoted
+// value goes whatever its key (`Snowflake Token="<v>"`, `Digest response="<v>"`, `Bearer blob="<v>"`)
+// unless the key is a descriptive parameter (realm, qop, algorithm, ...), and a bare value follows its
+// key's own rule, so an HMAC header's "id=...,ts=...,nonce=...,sig=..." keeps its timestamp. A
+// challenge header (WWW-Authenticate) is read the same way, so its `realm="api"` stays and its nonce goes.
+const LEADING_SCHEME_IN_VALUE = /^([A-Za-z][A-Za-z0-9-]*)(\s+)(\S[\s\S]*)$/;
+const PAIR_LIST_START = /^[A-Za-z][A-Za-z0-9_.-]*=/;
+// The run after the scheme is a bare key ("Token=", "username=") whose value follows it.
+const PAIR_KEY_ONLY_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]*=$/;
+// The pairs of a request credential's list: a key up to its "=", a bare value, and the separator before
+// the next pair ("," with optional spaces, or spaces alone).
+const LIST_PAIR_KEY_PATTERN = /[A-Za-z][A-Za-z0-9_.-]*=/y;
+// A bare value that is already the marker reads as one value, so the list goes on past a pair an earlier pass removed.
+const LIST_BARE_VALUE_PATTERN = /\[REDACTED\]|[^\s"'<>;,()[\]{}\\]*/y;
+const LIST_PAIR_SEPARATOR_PATTERN = /[ \t]*,[ \t]*|[ \t]+/y;
+// The descriptive parameters of a credential's pair list, whose quoted value stays (`realm="api"`,
+// `qop="auth"`, `algorithm="SHA-256"`, a challenge's `error="invalid_token"`); every other quoted value
+// in the list is the credential.
+const LIST_KEPT_PARAM_PATTERN = /^(?:realm|qop|algorithm|charset|error|error_description|error_uri|scope)$/i;
+// The proof parameters of an authentication exchange: Digest's `response`, an HTTP Signatures or
+// OAuth 1.0 `signature` and `oauth_signature`, the MAC and Hawk schemes' `mac`, and an HMAC header's
+// `sig`. A proof's value is the credential wherever its pair sits in a list with a challenge parameter
+// (realm, nonce, cnonce, opaque, qop, or an oauth_* name), with or without a scheme word or a header in
+// front of the list, so `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge;
+// a proof-free challenge (`realm="api", qop="auth"`) and a pair list of another kind (`status=500
+// response=slow`) keep their values. Inside a scheme word's list a bare proof goes whatever its neighbours.
+const PROOF_PARAM_PATTERN = /^(?:response|signature|oauth_signature|mac|sig)$/i;
+const CHALLENGE_PARAM_PATTERN = /^(?:realm|nonce|cnonce|opaque|qop|oauth_[a-z0-9_]+)$/i;
+// The first key of a pair list, at a carrier start; the keys after it are read past the list separator.
+const PAIR_LIST_KEY_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Za-z][A-Za-z0-9_.-]*=`, "g");
+// The marker, in quotes or bare, where a pair's value stood before an earlier pass removed it.
+const REDACTED_PAIR_VALUE_PATTERN = new RegExp(String.raw`${QUOTE_UNIT}?\[REDACTED\]`, "y");
+// In prose, an authorization scheme word followed by a quoted pair opens a credential's pair list
+// ("Digest username="...", response="..."", "Bearer blob="..."") and the list rule applies; a product
+// name (Splunk, Snowflake, HMAC) followed by a quoted pair is prose about the product.
+const SCHEME_PAIR_LIST_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|aws4-hmac-sha256|veracode-hmac-sha-256)\s+(?=[A-Za-z][A-Za-z0-9_.-]*=${QUOTE_UNIT})`, "gi");
+// After a bare path label the text is prose ("/api/v1/api-tokens: request failed with 403",
+// "/oauth/token-request: invalid_client") and stays, unless the segment itself names a credential
+// in the singular (its last word is password, key, secret, token, passphrase, or assertion, alone
+// or followed by an encoding word such as pem or base64, or it is a bearer id): then the next token
+// is the value whatever its shape and whatever follows it ("kv/password: <value> [code 003001]",
+// "kv/privateKeyPem: <value>"), while a plural label ("api-tokens", "secrets") names a collection
+// and its colon continues as prose, and so does a label whose last word names a file or path
+// ("kv/private_key_file: /x/y.pem").
+const CREDENTIAL_NOUN_PATTERN = /(?:password|passwd|passphrase|pwd|secret|token|key|assertion)$/;
+const CREDENTIAL_ENCODING_WORDS = new Set(["pem", "der", "b64", "base64", "jwk"]);
+// A credential-named flag whose value is the next argument (`psql --password <value> -h db`), as a
+// spawned CLI echoes its command line; `--name=value` is a pair and is read by the pair rule.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)(?!\[REDACTED\])(?!-)([^\s"'<>;,&()[\]{}\\]+)`, "g");
+
+/** The number of backslashes in the run ending immediately before `index`. */
+function backslashRunBefore(text: string, index: number): number {
+  let count = 0;
+  while (index - count - 1 >= 0 && text[index - count - 1] === "\\") count += 1;
+  return count;
+}
+
+/** True when a ";" or "," at `index` precedes the next header "Name:" token or a JSON fragment. */
+function endsAtNextHeader(text: string, index: number): boolean {
+  const ch = text[index];
+  if (ch !== ";" && ch !== ",") return false;
+  return NEXT_HEADER_AFTER_SEPARATOR.test(text.slice(index + 1));
+}
+
+interface QuotedRead {
+  /** The value content between the opener and the closer (or the unterminated stop), to be redacted. */
+  content: string;
+  /** The index just past the value: past the closing quote unit when terminated, at the stop otherwise. */
+  end: number;
+  /** True when a matching closer was found; false when a raw newline, an outer string, or the next header token ended the value. */
+  terminated: boolean;
+}
+
+/** A quote unit opening a value at `start`: its leading backslash run and quote character, or undefined when `start` is not on a quote unit. */
+function openingQuoteUnit(text: string, start: number): { backslashes: number; quoteChar: string; contentStart: number } | undefined {
+  let backslashes = 0;
+  while (text[start + backslashes] === "\\") backslashes += 1;
+  const quoteChar = text[start + backslashes];
+  if (quoteChar !== '"' && quoteChar !== "'") return undefined;
+  return { backslashes, quoteChar, contentStart: start + backslashes + 1 };
+}
+
+/**
+ * Reads the content of a quoted value that opened with `openBackslashes` backslashes and quote char
+ * `quoteChar`. A quote of the same char preceded by the same backslash run closes it, so a deeper
+ * quote (more backslashes: an escaped inner quote at any JSON depth) is inner content; a raw newline,
+ * a shallower quote (an outer string closing), or a ";"/"," before the next header token ends it
+ * unterminated so the following header keeps its name.
+ */
+function readQuotedContent(text: string, contentStart: number, openBackslashes: number, quoteChar: string): QuotedRead {
+  let i = contentStart;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\n" || ch === "\r") return { content: text.slice(contentStart, i), end: i, terminated: false };
+    if (ch === quoteChar) {
+      const run = backslashRunBefore(text, i);
+      if (run === openBackslashes) return { content: text.slice(contentStart, i - run), end: i + 1, terminated: true };
+      if (run < openBackslashes) return { content: text.slice(contentStart, i - run), end: i - run, terminated: false };
+    }
+    if (endsAtNextHeader(text, i)) return { content: text.slice(contentStart, i), end: i, terminated: false };
+    i += 1;
+  }
+  return { content: text.slice(contentStart, i), end: i, terminated: false };
+}
+
+// A cookie header value that is not wholly quoted runs across ";"/"," separated pairs; these are the
+// characters that make up a bare pair name or value (everything but the delimiters handled below). An
+// apostrophe is an RFC 6265 token character ("my'pref=", "sid=O'..."), so it is content, not a quote.
+const COOKIE_PLAIN_CHAR = /[^\r\n\t <>"\\;,=]/;
+const SPACE_BEFORE_JSON = /^[ \t]*[{[]/;
+
+/**
+ * Reads an unquoted cookie header value from `start`: it runs across ";"/"," separated pairs whose
+ * values may themselves be quoted, and ends before a ";"/"," or a space that precedes the next header
+ * token or a JSON fragment, at a raw newline or tab, at a literal escape, or at a bare quote. A pair
+ * value opened with a quote is read quote-aware, and an unterminated one ends the whole value there so
+ * the following header keeps its name. Returns the index just past the value.
+ */
+function readUnquotedCookieValue(text: string, start: number): number {
+  if (!COOKIE_PLAIN_CHAR.test(text[start] ?? "")) return start;
+  let i = start + 1;
+  while (i < text.length) {
+    const ch = text[i];
+    if (COOKIE_PLAIN_CHAR.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (ch === "=") {
+      i += 1;
+      while (text[i] === " " || text[i] === "\t") i += 1;
+      const opener = openingQuoteUnit(text, i);
+      if (opener) {
+        const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+        if (!read.terminated) return read.end;
+        i = read.end;
+      }
+      continue;
+    }
+    if (ch === ";" || ch === ",") {
+      if (endsAtNextHeader(text, i)) break;
+      i += 1;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (SPACE_BEFORE_JSON.test(text.slice(i + 1))) break;
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+// A cookie or session header at a carrier start, up to the separator; the value is read procedurally.
+const COOKIE_HEADER_START = new RegExp(String.raw`${CARRIER_START}(set-cookie|cookies?)(${QUOTE_UNIT}?\s*[:=]\s*)`, "gi");
+
+/**
+ * Removes the value of every Cookie and Set-Cookie header. A wholly quoted value is read to its
+ * matching closer (an escaped inner quote at any JSON depth is inner content); an unquoted value runs
+ * across its pairs and ends before the next header token, so the following header keeps its name. The
+ * marker `[REDACTED]` is left untouched so the pass is idempotent.
+ */
+function scrubCookieHeaders(text: string): string {
+  COOKIE_HEADER_START.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = COOKIE_HEADER_START.exec(text)) !== null) {
+    const [whole, header, separator] = match;
+    if (whole.length === 0) {
+      COOKIE_HEADER_START.lastIndex += 1;
+      continue;
+    }
+    const valueStart = match.index + whole.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    let prefix: string;
+    let redacted: string;
+    let end: number;
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      if (read.content.length === 0 || read.content === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      const openerText = text.slice(valueStart, opener.contentStart);
+      const closerText = read.terminated ? text.slice(read.end - (opener.backslashes + 1), read.end) : "";
+      prefix = openerText;
+      redacted = `${REDACTED}${closerText}`;
+      end = read.end;
+    } else {
+      const valueEnd = readUnquotedCookieValue(text, valueStart);
+      if (valueEnd === valueStart) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      let contentEnd = valueEnd;
+      while (contentEnd > valueStart && (text[contentEnd - 1] === " " || text[contentEnd - 1] === "\t")) contentEnd -= 1;
+      if (text.slice(valueStart, contentEnd) === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      prefix = "";
+      redacted = `${REDACTED}${text.slice(contentEnd, valueEnd)}`;
+      end = valueEnd;
+    }
+    out += `${text.slice(last, match.index)}${header}${separator}${prefix}${redacted}`;
+    last = end;
+    COOKIE_HEADER_START.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+interface ListRead {
+  /** The text written in place of the list, from its first key to `end`. */
+  replacement: string;
+  /** The index just past the last pair read. */
+  end: number;
+}
+
+/** The bare value of a pair in a request credential's list follows its key's own rule: a credential or proof key loses it, a setting key loses a token-shaped one, a webhook key keeps its origin, and any other key keeps it. */
+function scrubBareListValue(key: string, value: string): string {
+  if (value.length === 0 || value === REDACTED) return value;
+  if (PROOF_PARAM_PATTERN.test(key)) return REDACTED;
+  const rule = pairRuleFor(key);
+  switch (rule) {
+    case "credential":
+      return REDACTED;
+    case "setting":
+      return isTokenShapedValue(value) ? REDACTED : value;
+    case "webhook":
+      return webhookReplacement(value);
+    case "none":
+      return value;
+    default: {
+      const unhandled: never = rule;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Reads one pair's value at `valueStart`, up to `limit`. The pairs of a credential's list are the
+ * credential, so a quoted value is removed whatever its key (`Snowflake Token="<v>"`, `Digest
+ * response="<v>"`, `Bearer blob="<v>"`) unless the key is a descriptive parameter (`realm="api"`),
+ * while a bare value follows its key's own rule so `qop=auth`, `nc=00000001`, and an HMAC header's
+ * timestamp stay legible and a bare proof (`response=<v>`, `sig=<v>`) goes. `terminated` is false when a
+ * quoted value never closed, which ends the list there.
+ */
+function readListPairValue(text: string, valueStart: number, key: string, limit: number): ListRead & { terminated: boolean } {
+  const opener = openingQuoteUnit(text, valueStart);
+  if (!opener) {
+    LIST_BARE_VALUE_PATTERN.lastIndex = valueStart;
+    const run = LIST_BARE_VALUE_PATTERN.exec(text)?.[0] ?? "";
+    const value = text.slice(valueStart, Math.min(valueStart + run.length, limit));
+    return { replacement: scrubBareListValue(key, value), end: valueStart + value.length, terminated: true };
+  }
+  const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+  const terminated = read.terminated && read.end <= limit;
+  const end = Math.min(read.end, limit);
+  const content = terminated ? read.content : text.slice(opener.contentStart, end);
+  const closer = terminated ? text.slice(read.end - opener.backslashes - 1, read.end) : "";
+  const value = content.length === 0 || content === REDACTED || LIST_KEPT_PARAM_PATTERN.test(key) ? content : REDACTED;
+  return { replacement: `${text.slice(valueStart, opener.contentStart)}${value}${closer}`, end, terminated };
+}
+
+/** Reads a credential's pair list from `start`, its first key, up to `limit`; the list ends at the first text that is not another pair. */
+function scrubRequestPairList(text: string, start: number, limit: number): ListRead {
+  let replacement = "";
+  let end = start;
+  let position = start;
+  while (position < limit) {
+    LIST_PAIR_KEY_PATTERN.lastIndex = position;
+    const key = LIST_PAIR_KEY_PATTERN.exec(text)?.[0];
+    if (key === undefined || position + key.length > limit) break;
+    const pair = readListPairValue(text, position + key.length, key.slice(0, -1), limit);
+    replacement += `${text.slice(end, position)}${key}${pair.replacement}`;
+    end = pair.end;
+    if (!pair.terminated) break;
+    LIST_PAIR_SEPARATOR_PATTERN.lastIndex = end;
+    const separator = LIST_PAIR_SEPARATOR_PATTERN.exec(text)?.[0];
+    if (separator === undefined) break;
+    position = end + separator.length;
+  }
+  return { replacement, end };
+}
+
+/**
+ * The run after a scheme word under an Authorization-style key, when it is a bare key whose value
+ * follows ("Token=", "username="). A quoted value opens the credential's pair list, read with the list
+ * rule under a request header and a challenge header alike. A key whose value is already the
+ * marker stays as it is, so a second pass adds nothing. Undefined when the run is the credential
+ * itself, which goes whole.
+ */
+function readSchemePairList(text: string, start: number, run: string, limit: number): ListRead | undefined {
+  if (!PAIR_KEY_ONLY_PATTERN.test(run)) return undefined;
+  const valueStart = start + run.length;
+  if (valueStart < limit && openingQuoteUnit(text, valueStart)) return scrubRequestPairList(text, start, limit);
+  if (text.startsWith(REDACTED, valueStart)) return { replacement: `${run}${REDACTED}`, end: valueStart + REDACTED.length };
+  return undefined;
+}
+
+/** Reads the quoted pair list after every authorization scheme word in prose (see SCHEME_PAIR_LIST_PATTERN) with the list rule; a list under a header was read by the assignment pass and reads the same a second time. */
+function scrubSchemePairLists(text: string): string {
+  SCHEME_PAIR_LIST_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SCHEME_PAIR_LIST_PATTERN.exec(text)) !== null) {
+    if (match[0].length === 0) {
+      SCHEME_PAIR_LIST_PATTERN.lastIndex += 1;
+      continue;
+    }
+    const list = scrubRequestPairList(text, match.index + match[0].length, text.length);
+    out += `${text.slice(last, match.index + match[0].length)}${list.replacement}`;
+    last = list.end;
+    SCHEME_PAIR_LIST_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+interface ListPair {
+  /** The pair's key, without its "=". */
+  key: string;
+  /** The value's content: between the quote units when quoted, the bare run otherwise. */
+  content: string;
+  /** The index of the content's first character. */
+  contentStart: number;
+}
+
+/**
+ * Reads the pair list whose first key starts at `start`: pairs separated by "," or spaces, with values
+ * quoted at any depth or bare. The list ends at the first text that is not another pair, and an
+ * unterminated quoted value ends it there.
+ */
+function readPairList(text: string, start: number): { pairs: ListPair[]; end: number } {
+  const pairs: ListPair[] = [];
+  let position = start;
+  let end = start;
+  while (position < text.length) {
+    LIST_PAIR_KEY_PATTERN.lastIndex = position;
+    const key = LIST_PAIR_KEY_PATTERN.exec(text)?.[0];
+    if (key === undefined) break;
+    const valueStart = position + key.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      pairs.push({ key: key.slice(0, -1), content: read.content, contentStart: opener.contentStart });
+      end = read.end;
+      if (!read.terminated) break;
+    } else {
+      LIST_BARE_VALUE_PATTERN.lastIndex = valueStart;
+      const content = LIST_BARE_VALUE_PATTERN.exec(text)?.[0] ?? "";
+      pairs.push({ key: key.slice(0, -1), content, contentStart: valueStart });
+      end = valueStart + content.length;
+    }
+    LIST_PAIR_SEPARATOR_PATTERN.lastIndex = end;
+    const separator = LIST_PAIR_SEPARATOR_PATTERN.exec(text)?.[0];
+    if (separator === undefined) break;
+    position = end + separator.length;
+  }
+  return { pairs, end };
+}
+
+/**
+ * Removes the value of every proof parameter (see PROOF_PARAM_PATTERN) in a pair list that also carries
+ * a challenge parameter, whatever the value's shape and whether or not a scheme word or a header
+ * precedes the list: `realm="api", nonce="n", response="<proof>"` as a data value, after a literal
+ * escape, or inside a JSON string. The other pairs keep their own rule, so `realm="api"` stays.
+ */
+function scrubProofPairLists(text: string): string {
+  PAIR_LIST_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = PAIR_LIST_KEY_PATTERN.exec(text)) !== null) {
+    const list = readPairList(text, match.index);
+    if (list.pairs.some((pair) => CHALLENGE_PARAM_PATTERN.test(pair.key))) {
+      for (const pair of list.pairs) {
+        if (!PROOF_PARAM_PATTERN.test(pair.key) || pair.content.length === 0 || pair.content === REDACTED) continue;
+        out += `${text.slice(last, pair.contentStart)}${REDACTED}`;
+        last = pair.contentStart + pair.content.length;
+      }
+    }
+    PAIR_LIST_KEY_PATTERN.lastIndex = list.end;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/**
+ * Replaces the value of every credential-named pair: `key=value`, `key: value`, `"key": "value"`,
+ * and `Header-Name: value`. The value goes whatever its shape (an `=` pair, a quoted value, a header
+ * value, a plain word in prose, or a word that happens to be a scheme word: `sslPassword=splunk
+ * rejected` and `db_password: token` lose their value). Only an Authorization-style key
+ * (Authorization, Proxy-Authorization, WWW-Authenticate) carries a scheme word in front of its
+ * credential, where the scheme is kept and the token removed (`Authorization: Bearer <token>`); a
+ * pair list after the scheme is read pair by pair, see LEADING_SCHEME_IN_VALUE. A setting key keeps
+ * a value that is not token-shaped, a bearer-id key loses a UUID, and a webhook key keeps only the
+ * origin. The last segment of a bare path used as a label
+ * ("/api/authn/v2/api_credentials: <detail>") is a request target, not a pair key, so the prose
+ * after it is kept, unless the segment names a credential in the singular ("kv/password: <value>"),
+ * whose next token is the value; inside a URL with a scheme the pair rule still applies.
+ */
+function replaceCredentialAssignments(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, separatorChar, valueOpenQuote] = match;
+    if (whole.length === 0) {
+      ASSIGNMENT_KEY_PATTERN.lastIndex += 1;
+      continue;
+    }
+    const rule = pairRuleFor(key);
+    if (rule === "none") continue;
+    const valueStart = match.index + whole.length;
+    const barePathLabel = openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans);
+    if (barePathLabel && !namesCredential(key)) continue;
+    const schemeCarrier = isAuthorizationStyleKey(keySegments(key));
+    let kept = "";
+    let consumed: number;
+    let replacement = REDACTED;
+    if (valueOpenQuote !== "") {
+      // The value is quoted; read to its matching closer so an escaped inner quote at any JSON depth stays inner content and the value never ends early.
+      const { content } = readQuotedContent(text, valueStart, valueOpenQuote.length - 1, valueOpenQuote[valueOpenQuote.length - 1] ?? '"');
+      if (content.length === 0 || content === REDACTED) {
+        ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+        continue;
+      }
+      consumed = content.length;
+      const lead = LEADING_SCHEME_IN_VALUE.exec(content);
+      if (schemeCarrier && lead && SCHEME_WORD_PATTERN.test(lead[1])) {
+        if (lead[3].startsWith(REDACTED)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+        kept = `${lead[1]}${lead[2]}`;
+        const firstPair = PAIR_LIST_START.test(lead[3]) ? SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + lead[1].length)) : null;
+        if (firstPair) {
+          const list = readSchemePairList(text, valueStart + lead[1].length + firstPair[1].length, firstPair[3], valueStart + content.length);
+          kept = `${lead[1]}${firstPair[1]}${firstPair[2]}`;
+          if (list) {
+            replacement = list.replacement;
+            consumed = list.end - valueStart;
+          } else {
+            consumed = lead[1].length + firstPair[0].length;
+          }
+        }
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(content)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(content);
+      }
+    } else {
+      ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
+      const value = ASSIGNMENT_VALUE_PATTERN.exec(text)?.[0];
+      if (value === undefined) continue;
+      consumed = value.length;
+      if (schemeCarrier && SCHEME_WORD_PATTERN.test(value)) {
+        const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
+        if (!token) continue;
+        const list = token[2] === "" ? readSchemePairList(text, valueStart + value.length + token[1].length, token[3], text.length) : undefined;
+        kept = `${value}${token[1]}${token[2]}`;
+        if (list) {
+          replacement = list.replacement;
+          consumed = list.end - valueStart;
+        } else {
+          consumed += token[0].length;
+        }
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(value)) continue;
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(value);
+        if (text.startsWith(REDACTED, valueStart + consumed)) consumed += REDACTED.length;
+      }
+    }
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${kept}${replacement}`;
+    last = valueStart + consumed;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/** Replaces the value argument of every credential-named flag (`--password <value>`); a setting flag (`--token-type bearer`) keeps its value. */
+function replaceFlagValues(text: string): string {
+  return text.replace(FLAG_VALUE_PATTERN, (match: string, name: string, gap: string) => (pairRuleFor(name) === "credential" ? `--${name}${gap}${REDACTED}` : match));
+}
+
+/**
+ * The carrier and shape rules shared by the error and data passes: PEM blocks, configured secrets,
+ * cookie headers, URLs, query pairs, the proof parameters of a pair list, credential pairs and flags,
+ * pair lists and scheme words in prose, JWTs, AWS keys, and vendor-prefixed tokens. `longTokens` adds the
+ * generic long-token and hex-digest rules, which the error pass runs and the data pass leaves off so
+ * identifiers survive in evidence.
+ */
+function scrubText(text: string, secrets: ReadonlyArray<string | undefined>, longTokens: boolean): string {
+  let scrubbed = text.replace(PEM_BLOCK_PATTERN, REDACTED).replace(PEM_OPEN_PATTERN, REDACTED);
+  scrubbed = scrubCookieHeaders(scrubConfiguredSecrets(scrubbed, secrets))
+    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
+    .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
+  scrubbed = scrubSchemePairLists(replaceFlagValues(replaceCredentialAssignments(scrubProofPairLists(scrubbed))))
+    .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
+    .replace(JWT_IN_TEXT_PATTERN, REDACTED)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
+    .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));
+  if (longTokens) scrubbed = scrubbed.replace(HEX_DIGEST_PATTERN, (run) => (looksLikeHexDigest(run) ? REDACTED : run));
+  for (const pattern of VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, REDACTED);
+  return longTokens ? scrubBareTokens(scrubbed) : scrubbed;
+}
+
+/**
+ * The single redaction pass for error text. Idempotent: text that has been scrubbed once comes
+ * back unchanged because `[REDACTED]` matches none of the patterns.
+ */
+export function scrubErrorText(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  return scrubText(text, secrets, true);
+}
+
+/**
+ * The redaction pass for data-side text: every string a snapshot walker visits. A credential carrier
+ * (`Authorization: Bearer <token>`, `password=<value>`, a webhook URL) or an unambiguous credential
+ * shape (a vendor-prefixed token, a JWT, a PEM block, an AWS key) inside a free-text field is
+ * removed on the data side too, while the generic long-token rule stays off so a name or an id that
+ * merely looks random survives. Idempotent like the error pass.
+ */
+export function scrubDataText(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  return scrubText(text, secrets, false);
+}
+
+/** Carries the HTTP status and the request target so collectors can name the request that actually failed. */
+export class OktaApiError extends Error {
+  readonly status: number | null;
+  readonly endpoint: string;
+
+  constructor(message: string, status: number | null, endpoint: string) {
+    super(scrubErrorText(message));
+    this.name = "OktaApiError";
+    this.status = status;
+    this.endpoint = endpoint;
+  }
 }
 
 export interface OktaAccessCheckResult {
@@ -176,21 +1128,31 @@ export interface OktaAssessmentResult {
   findings: OktaFinding[];
   summary: Record<OktaFindingStatus, number>;
   text: string;
-  snapshotSummary: Record<string, number | string>;
+  /** Counts read from a dataset that was not collected render null, never 0. */
+  snapshotSummary: Record<string, number | string | null>;
 }
 
 interface CollectedDataset<T = unknown> {
   data: T;
   error?: string;
-  truncated?: boolean;
+  /** false when the walk finished, true when it stopped early, null when the dataset was not collected. */
+  truncated?: boolean | null;
   truncationNote?: string;
+  /** Set when nothing was collected (denied, errored, unavailable, or not requested): what core_data carries instead of `data`. */
+  notCollected?: OktaNotCollectedMarker;
+  /** Markers for the children of a per-parent collection that were denied or errored, keyed by parent id. */
+  childMarkers?: Record<string, OktaNotCollectedMarker>;
 }
 
 interface PaginatedList {
   items: JsonRecord[];
   truncated: boolean;
   pagesFetched: number;
+  truncationNote?: string;
 }
+
+/** Collectors accept a bare array from lightweight test clients or the metadata-carrying page from OktaAuditorClient. */
+type ListResult = JsonRecord[] | PaginatedList;
 
 interface OktaAuthenticationData {
   signOnPolicies: CollectedDataset<JsonRecord[]>;
@@ -783,6 +1745,170 @@ function parseLinkHeaderNext(linkHeader: string | null): string | null {
   return match?.[1] ?? null;
 }
 
+/**
+ * Rule 9 deny list for every record kept in memory or written to core_data:
+ * matched on the lowercased key with dots, underscores, and hyphens removed,
+ * so client_secret, clientSecret, secret_hash, sharedSecret, secretKey (Duo),
+ * settings.token (log streams), and recovery_question.answer all match while
+ * authenticator `key`, `tokenWindow`, and `credentialId` stay legible.
+ */
+const CREDENTIAL_KEY_PATTERN =
+  /(password|passwd|passphrase|secret|token|apikey|privatekey|secretkey|secrethash|clientassertion|authorization|answer)$/;
+const JWT_PATTERN = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./;
+const SSWS_TOKEN_PATTERN = /^00[A-Za-z0-9_-]{40}$/;
+
+function normalizeKeyName(key: string): string {
+  return key.toLowerCase().replace(/[._-]/g, "");
+}
+
+function isCredentialKey(key: string): boolean {
+  return CREDENTIAL_KEY_PATTERN.test(normalizeKeyName(key));
+}
+
+/** Password policies carry settings.password.{complexity, age, lockout}, which the verdicts read; every other password member is a credential. */
+function isPasswordPolicySettings(key: string, value: unknown): boolean {
+  if (!/^(password|passwd)$/.test(normalizeKeyName(key))) return false;
+  const record = asRecord(value);
+  return "complexity" in record || "age" in record || "lockout" in record;
+}
+
+/** Rewrites only URLs whose userinfo or query string could carry a token (webhook URIs, System Log request URLs with sessionToken). */
+function scrubUrlValue(value: string): string {
+  const match = /^[a-z][a-z0-9+.-]*:\/\/(.*)$/i.exec(value);
+  if (!match || !/[@?]/.test(match[1])) return value;
+  try {
+    const url = new URL(value);
+    const userinfo = url.username || url.password ? `${REDACTED}@` : "";
+    const query = url.search.length > 1 ? `?${REDACTED}` : "";
+    return `${url.protocol}//${userinfo}${url.host}${url.pathname}${query}`;
+  } catch {
+    return value.replace(/\/\/[^/@]*@/, `//${REDACTED}@`).replace(/\?.*$/, `?${REDACTED}`);
+  }
+}
+
+/** A string leaf: a JWT or SSWS token goes whole; any other string loses URL userinfo and query, then every credential carrier and unambiguous credential shape it carries (scrubDataText). */
+function redactString(value: string): string {
+  return JWT_PATTERN.test(value) || SSWS_TOKEN_PATTERN.test(value) ? REDACTED : scrubDataText(scrubUrlValue(value));
+}
+
+/**
+ * Applied to every collected record and again to every JSON document written
+ * into the bundle: redacts the value of every credential-named key (including
+ * {key, value} and {name, value} pair shapes), every JWT or SSWS token shaped
+ * string, and the userinfo and query string of every URL; a webhook-named key
+ * keeps only its URL's origin, and every other string leaf goes through the
+ * data-side text pass, so a vendor-prefixed token, a JWT, a PEM block, or a
+ * credential carrier inside a free-text field (a description, a serialized
+ * snapshot) is removed there too. Key names are kept so the evidence stays
+ * legible.
+ */
+export function redactSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSnapshot);
+  if (typeof value === "string") return redactString(value);
+  if (!value || typeof value !== "object") return value;
+  const record = value as JsonRecord;
+  const pairName = asString(record.name) ?? asString(record.key);
+  const output: JsonRecord = {};
+  for (const [key, item] of Object.entries(record)) {
+    const credentialPair = key === "value" && pairName !== undefined && isCredentialKey(pairName);
+    if ((isCredentialKey(key) && !isPasswordPolicySettings(key, item)) || credentialPair) {
+      output[key] = item === null || item === undefined ? item : REDACTED;
+    } else if (typeof item === "string" && pairRuleFor(key) === "webhook") {
+      output[key] = webhookReplacement(item);
+    } else {
+      output[key] = redactSnapshot(item);
+    }
+  }
+  return output;
+}
+
+function redactRecord(record: JsonRecord): JsonRecord {
+  return asRecord(redactSnapshot(record));
+}
+
+function redactRecordMap(map: Record<string, JsonRecord[]>): Record<string, JsonRecord[]> {
+  return Object.fromEntries(Object.entries(map).map(([key, items]) => [key, items.map(redactRecord)]));
+}
+
+function urlOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return REDACTED;
+  }
+}
+
+/**
+ * Event hooks keep id, name, status, events, and channel type and version;
+ * the destination URI drops to scheme and host because SIEM and workflow
+ * receivers embed tokens in the path or query, and every header value and the
+ * authScheme value are replaced since operators put shared secrets there.
+ */
+function projectEventHook(hook: JsonRecord): JsonRecord {
+  const channel = asRecord(hook.channel);
+  const config = asRecord(channel.config);
+  const authScheme = asRecord(config.authScheme);
+  const headers = asArray(config.headers).map((entry) => asRecord(entry));
+  const projectedConfig: JsonRecord = {
+    uri: urlOrigin(asString(config.uri)) ?? null,
+    method: config.method ?? null,
+    headers: headers.map((header) => ({
+      key: header.key ?? null,
+      value: header.value === undefined || header.value === null ? header.value ?? null : REDACTED,
+    })),
+  };
+  if (Object.keys(authScheme).length > 0) {
+    projectedConfig.authScheme = {
+      type: authScheme.type ?? null,
+      key: authScheme.key ?? null,
+      ...("value" in authScheme ? { value: REDACTED } : {}),
+    };
+  }
+  return {
+    ...hook,
+    channel: { ...channel, config: projectedConfig },
+  };
+}
+
+/**
+ * System Log events keep the fields OKTA-MON-002 reads plus the actor and
+ * client identity; debugContext.debugData (request URLs that can carry a
+ * one-time sessionToken), request, target, and securityContext are dropped.
+ */
+function projectSystemLogEvent(event: JsonRecord): JsonRecord {
+  const actor = asRecord(event.actor);
+  const client = asRecord(event.client);
+  const outcome = asRecord(event.outcome);
+  return {
+    uuid: event.uuid ?? null,
+    published: event.published ?? null,
+    eventType: event.eventType ?? null,
+    displayMessage: event.displayMessage ?? null,
+    severity: event.severity ?? null,
+    outcome: { result: outcome.result ?? null, reason: outcome.reason ?? null },
+    actor: {
+      id: actor.id ?? null,
+      type: actor.type ?? null,
+      alternateId: actor.alternateId ?? null,
+      displayName: actor.displayName ?? null,
+    },
+    client: { ipAddress: client.ipAddress ?? null },
+  };
+}
+
+/** Error text names the request path and query without the opaque `after` cursor of follow-up pages. */
+function describeRequestTarget(config: OktaResolvedConfig, pathOrUrl: string): string {
+  try {
+    const url = new URL(pathOrUrl, config.orgUrl);
+    url.searchParams.delete("after");
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return pathOrUrl;
+  }
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
@@ -819,7 +1945,14 @@ function buildClientAssertion(config: OktaResolvedConfig): string {
     );
   }
 
-  const privateKey = createPrivateKey(decodePemEscapes(config.privateKey));
+  let privateKey: KeyObject;
+  try {
+    privateKey = createPrivateKey(decodePemEscapes(config.privateKey));
+  } catch (error) {
+    throw new Error(
+      `Okta PrivateKey auth could not load the configured private key (${thrownCode(error, CRYPTO_ERROR_CODE_PATTERN) ?? "INVALID_PRIVATE_KEY"}). Provide an unencrypted RSA private key in PEM form.`,
+    );
+  }
   if (privateKey.asymmetricKeyType !== "rsa") {
     throw new Error(
       "Okta PrivateKey auth currently supports RSA private keys directly. For other key types, pass client_assertion explicitly.",
@@ -898,11 +2031,70 @@ function overlayFromEnv(env: NodeJS.ProcessEnv): OktaConfigOverlay {
   };
 }
 
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const YAML_ERROR_CODE_PATTERN = /^[A-Z_]+$/;
+const CRYPTO_ERROR_CODE_PATTERN = /^ERR_[A-Z0-9_]{1,60}$/;
+
+interface ConfigFilePosition {
+  line: number;
+  column?: number;
+}
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the config loader: a missing file is simply absent, every
+ * other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+async function readConfigFileText(pathname: string): Promise<string | undefined> {
+  try {
+    return await readFile(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Okta config file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
+}
+
+/** Parse step: fixed text plus path, position, and validated code; nothing the parser said, quoted, or named. */
+function configFileParseError(pathname: string, code: string, position: ConfigFilePosition | undefined): Error {
+  const where = position ? ` at line ${position.line}${position.column ? `, column ${position.column}` : ""}` : "";
+  return new Error(`Unable to parse Okta config file: invalid YAML in ${pathname}${where} (${code})`);
+}
+
+/** The yaml package's own error code when the thrown value is a YAMLError (an unresolved alias throws a plain ReferenceError), otherwise a fixed code. */
+function yamlErrorCode(error: unknown): string {
+  return error instanceof YAMLError && YAML_ERROR_CODE_PATTERN.test(error.code) ? error.code : "INVALID_YAML";
+}
+
+function yamlErrorPosition(error: unknown): ConfigFilePosition | undefined {
+  if (!(error instanceof YAMLError)) return undefined;
+  const start = error.linePos?.[0];
+  if (!start || !Number.isInteger(start.line) || start.line < 1) return undefined;
+  return { line: start.line, column: Number.isInteger(start.col) && start.col > 0 ? start.col : undefined };
+}
+
+/** Parses config YAML without logging warnings (their pretty text quotes the source line) and throws the document's first error. */
+function parseConfigYaml(text: string): unknown {
+  const document = parseYamlDocument(text);
+  if (document.errors.length > 0) throw document.errors[0];
+  return document.toJS();
+}
+
 async function readOktaYamlOverlay(location: string): Promise<OktaConfigOverlay | undefined> {
-  if (!existsSync(location)) return undefined;
-  const raw = await readFile(location, "utf8");
-  const parsed = parseYaml(raw) as JsonRecord;
-  const client = asRecord(asRecord(parsed.okta).client);
+  const raw = await readConfigFileText(location);
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = parseConfigYaml(raw);
+  } catch (error) {
+    throw configFileParseError(location, yamlErrorCode(error), yamlErrorPosition(error));
+  }
+  const client = asRecord(asRecord(asRecord(parsed).okta).client);
   return {
     orgUrl: asString(client.orgUrl),
     authMode: normalizeAuthMode(asString(client.authorizationMode)),
@@ -1057,13 +2249,70 @@ function normalizeExportArgs(args: unknown): ExportArgs {
   return base;
 }
 
-function makeUrl(config: OktaResolvedConfig, pathOrUrl: string): string {
-  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
-    return pathOrUrl;
-  }
-  return `${config.orgUrl}${pathOrUrl}`;
+/** A URL resolved onto the configured org origin, or the fixed reason it was refused before any request. */
+type OriginResolution = { url: string; refusal?: undefined } | { url?: undefined; refusal: string };
+
+/** A root path (`/...` but not `//...` or `/\...`); any other slash or backslash form is a protocol-relative or relative reference. */
+const ROOT_PATH_PATTERN = /^\/(?![/\\])/;
+/** An absolute URL: a scheme (any casing) followed by a colon. */
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
+/** Fixed endpoint label for a refused request; the URL itself is never recorded. */
+const REFUSED_ENDPOINT = "(refused: not on the configured org origin)";
+
+/**
+ * The origin a URL names, spelled as scheme and host (`https://host:8443`) or,
+ * for a URL without a host (`javascript:`, `data:`, `file:`, `blob:`), as its
+ * bare scheme. `URL.origin` would spell the first three as the opaque string
+ * "null" and a blob: URL as the origin of the URL inside it, so a blob: link
+ * carrying the configured host would compare equal to it.
+ */
+function originLabel(url: URL): string {
+  return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
 }
 
+/**
+ * Where a URL may lead, decided before any request is sent. A client-built
+ * path or a server-supplied Link rel="next" URL is followed only when it is a
+ * root path on the configured org origin or an absolute URL that resolves, as
+ * a browser would, onto that origin (scheme and host compared after URL
+ * normalization, so casing never matters) and carries no userinfo. A
+ * protocol-relative (`//host`) or backslash (`\\host`) form is refused whatever
+ * host it names, since concatenating it onto the org URL would request a path
+ * the server never meant while a browser would leave for that host; a link on
+ * a hostless scheme (`javascript:`, `data:`, `blob:`, `file:`) is refused by
+ * its scheme. Each refusal is fixed text naming only the configured origin and
+ * the rejected origin: no path, query, fragment, or userinfo of the link
+ * reaches any text, so the SSWS token or bearer credential never leaves for
+ * another host and no window of the link is echoed.
+ */
+function resolveOnConfiguredOrigin(config: OktaResolvedConfig, pathOrUrl: string): OriginResolution {
+  const configured = originLabel(new URL(config.orgUrl));
+  let resolved: URL;
+  try {
+    resolved = new URL(pathOrUrl, config.orgUrl);
+  } catch {
+    return { refusal: `could not be parsed against the configured org origin ${configured}` };
+  }
+  const origin = originLabel(resolved);
+  if (resolved.username !== "" || resolved.password !== "") {
+    return { refusal: `carries userinfo for origin ${origin} (configured org origin ${configured})` };
+  }
+  if (origin !== configured) {
+    return { refusal: `is on origin ${origin}, not the configured org origin ${configured}` };
+  }
+  if (!ROOT_PATH_PATTERN.test(pathOrUrl) && !ABSOLUTE_URL_PATTERN.test(pathOrUrl)) {
+    return { refusal: `is a protocol-relative or relative reference rather than a root path on the configured org origin ${configured} or an absolute URL on it` };
+  }
+  return { url: resolved.href };
+}
+
+/** Describes a response body that is not JSON by content type and size without copying any of it. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
+}
+
+/** Keeps only the vendor's error summary fields; a body without them is described by content type and size so a token echoed by a proxy never lands in an error string. */
 async function readErrorDetail(response: Response): Promise<string> {
   const text = await response.text();
   if (!text) return "";
@@ -1075,9 +2324,23 @@ async function readErrorDetail(response: Response): Promise<string> {
       asString(parsed.error_description) ??
       asString(parsed.errorSummary) ??
       (summaries.length > 0 ? summaries.join("; ") : undefined);
-    return detail ?? text;
+    return detail ?? `JSON error body without errorSummary (${Buffer.byteLength(text)} bytes)`;
   } catch {
-    return text;
+    return describeNonJsonBody(response, text);
+  }
+}
+
+/** Parses a successful body as JSON; a body that is not JSON is described by content type and size only, so no fragment of it (which V8 would quote) reaches an error string. */
+async function readJsonBody(response: Response, target: string): Promise<unknown> {
+  const text = await response.text();
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new OktaApiError(
+      `Okta API response from ${target} (${response.status}) was unreadable: ${describeNonJsonBody(response, text)}`,
+      response.status,
+      target,
+    );
   }
 }
 
@@ -1109,6 +2372,7 @@ export class OktaAuditorClient {
   constructor(config: OktaResolvedConfig, options?: { fetchImpl?: FetchImpl }) {
     this.config = config;
     this.fetchImpl = options?.fetchImpl ?? fetch;
+    registerConfiguredSecrets([config.token, config.privateKey, config.clientAssertion]);
   }
 
   private async getAccessToken(): Promise<string> {
@@ -1136,7 +2400,7 @@ export class OktaAuditorClient {
         client_assertion: clientAssertion,
       });
 
-      const response = await this.fetchImpl(`${this.config.orgUrl}/oauth2/v1/token`, {
+      const response = await this.fetchImpl(`${this.config.orgUrl}${TOKEN_ENDPOINT_PATH}`, {
         method: "POST",
         headers: {
           "content-type": "application/x-www-form-urlencoded",
@@ -1147,16 +2411,21 @@ export class OktaAuditorClient {
 
       if (!response.ok) {
         const detail = await readErrorDetail(response);
-        throw new Error(
-          `Okta OAuth token request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+        throw new OktaApiError(
+          this.redactSecrets(
+            `Okta OAuth token request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+          ),
+          response.status,
+          TOKEN_ENDPOINT_PATH,
         );
       }
 
-      const payload = (await response.json()) as JsonRecord;
+      const payload = asRecord(await readJsonBody(response, TOKEN_ENDPOINT_PATH));
       const accessToken = asString(payload.access_token);
       if (!accessToken) {
         throw new Error("Okta OAuth token response did not include access_token.");
       }
+      registerConfiguredSecrets([accessToken]);
 
       const expiresIn = asNumber(payload.expires_in) ?? 3600;
       tokenCache.set(cacheKey, {
@@ -1191,16 +2460,30 @@ export class OktaAuditorClient {
     init: RequestInit = {},
     attempt = 0,
   ): Promise<Response> {
+    const resolution = resolveOnConfiguredOrigin(this.config, pathOrUrl);
+    if (resolution.url === undefined) {
+      throw new OktaApiError(`Okta API request refused: the request URL ${resolution.refusal}, so no request was sent.`, null, REFUSED_ENDPOINT);
+    }
     const headers = new Headers(init.headers ?? {});
     headers.set("accept", "application/json");
     if (!headers.has("authorization")) {
       headers.set("authorization", await this.authHeader());
     }
 
-    const response = await this.fetchImpl(makeUrl(this.config, pathOrUrl), {
-      ...init,
-      headers,
-    });
+    const target = describeRequestTarget(this.config, pathOrUrl);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(resolution.url, {
+        ...init,
+        headers,
+      });
+    } catch (error) {
+      throw new OktaApiError(
+        this.redactSecrets(`Okta API request failed for ${target}: ${errorText(error)}`),
+        null,
+        target,
+      );
+    }
 
     if (response.status === 429 && attempt < DEFAULT_RATE_LIMIT_RETRIES) {
       await delay(retryDelayFromResponse(response));
@@ -1215,17 +2498,27 @@ export class OktaAuditorClient {
 
     if (!response.ok) {
       const detail = await readErrorDetail(response);
-      throw new Error(
-        `Okta API request failed for ${pathOrUrl} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+      throw new OktaApiError(
+        this.redactSecrets(
+          `Okta API request failed for ${target} (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`,
+        ),
+        response.status,
+        target,
       );
     }
 
     return response;
   }
 
+  /** Removes the configured secrets (API token, cached access token, private key, client assertion) in every encoded form, then applies the shape rules. */
+  private redactSecrets(text: string): string {
+    const cached = tokenCache.get(buildTokenCacheKey(this.config));
+    return scrubErrorText(text, [this.config.token, cached?.token, this.config.privateKey, this.config.clientAssertion]);
+  }
+
   async getJson<T>(pathOrUrl: string): Promise<T> {
     const response = await this.request(pathOrUrl);
-    return (await response.json()) as T;
+    return (await readJsonBody(response, describeRequestTarget(this.config, pathOrUrl))) as T;
   }
 
   async tryGetJson<T>(pathOrUrl: string): Promise<T | null> {
@@ -1239,48 +2532,72 @@ export class OktaAuditorClient {
     }
   }
 
-  async listPaginatedWithMeta(pathOrUrl: string, maxPages?: number): Promise<PaginatedList> {
+  /**
+   * Walks Link rel="next" pages up to maxPages. Every early exit (page cap, a
+   * next URL already visited, an empty page that still advertises a next
+   * link, or a next URL refused by resolveOnConfiguredOrigin, which is never
+   * requested) returns truncated: true with a note stating pages and items
+   * seen, the reason, and that the total is unknown, so the partial-inventory
+   * demotion applies.
+   */
+  async listPaginatedWithMeta(pathOrUrl: string, maxPages: number = MAX_LIST_PAGES): Promise<PaginatedList> {
     const items: JsonRecord[] = [];
+    const visited = new Set<string>();
+    const target = describeRequestTarget(this.config, pathOrUrl);
     let nextUrl: string | null = pathOrUrl;
     let pagesFetched = 0;
 
+    const truncatedList = (reason: string): PaginatedList => ({
+      items,
+      truncated: true,
+      pagesFetched,
+      truncationNote: `GET ${target} stopped after ${pagesFetched} pages (${items.length} items): ${reason}, total unknown.`,
+    });
+
     while (nextUrl) {
-      if (maxPages !== undefined && pagesFetched >= maxPages) {
-        return { items, truncated: true, pagesFetched };
+      if (pagesFetched >= maxPages) {
+        return truncatedList(`the ${maxPages}-page cap was reached with a Link rel="next" page unread`);
       }
+      visited.add(resolveOnConfiguredOrigin(this.config, nextUrl).url ?? nextUrl);
       const response = await this.request(nextUrl);
-      const payload = (await response.json()) as unknown;
-      if (Array.isArray(payload)) {
-        items.push(...payload.map((entry) => asRecord(entry)));
-      } else {
-        throw new Error(`Expected array response from ${pathOrUrl}`);
+      const payload = await readJsonBody(response, target);
+      if (!Array.isArray(payload)) {
+        throw new OktaApiError(`Expected array response from ${target}`, null, target);
       }
+      items.push(...payload.map((entry) => asRecord(entry)));
       pagesFetched += 1;
-      nextUrl = parseLinkHeaderNext(response.headers.get("link"));
+      const next = parseLinkHeaderNext(response.headers.get("link"));
+      if (!next) break;
+      const resolution = resolveOnConfiguredOrigin(this.config, next);
+      if (resolution.url === undefined) {
+        return truncatedList(`the Link rel="next" URL ${resolution.refusal} and was not followed`);
+      }
+      if (visited.has(resolution.url)) {
+        return truncatedList('the Link rel="next" cursor repeated a page already read');
+      }
+      if (payload.length === 0) {
+        return truncatedList('an empty page still advertised a Link rel="next" cursor');
+      }
+      nextUrl = resolution.url;
     }
 
     return { items, truncated: false, pagesFetched };
   }
 
-  async listPaginated(pathOrUrl: string): Promise<JsonRecord[]> {
-    const page = await this.listPaginatedWithMeta(pathOrUrl);
-    return page.items;
+  async listPolicies(type: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/policies?type=${encodeURIComponent(type)}&limit=${PAGE_LIMIT}`);
   }
 
-  async listPolicies(type: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/policies?type=${encodeURIComponent(type)}&limit=${PAGE_LIMIT}`);
+  async listPolicyRules(policyId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/policies/${encodeURIComponent(policyId)}/rules?limit=${PAGE_LIMIT}`);
   }
 
-  async listPolicyRules(policyId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/policies/${encodeURIComponent(policyId)}/rules?limit=${PAGE_LIMIT}`);
+  async listAuthenticators(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta("/api/v1/authenticators");
   }
 
-  async listAuthenticators(): Promise<JsonRecord[]> {
-    return this.listPaginated("/api/v1/authenticators");
-  }
-
-  async listUsers(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/users?limit=${PAGE_LIMIT}`);
+  async listUsers(): Promise<PaginatedList> {
+    return this.listUsersWithMeta();
   }
 
   async listUsersWithMeta(): Promise<PaginatedList> {
@@ -1291,16 +2608,16 @@ export class OktaAuditorClient {
     return this.tryGetJson<JsonRecord>(`/api/v1/users/${encodeURIComponent(userId)}`);
   }
 
-  async listUserFactors(userId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/users/${encodeURIComponent(userId)}/factors`);
+  async listUserFactors(userId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/users/${encodeURIComponent(userId)}/factors`);
   }
 
-  async listGroupRules(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups/rules?limit=${PAGE_LIMIT}`);
+  async listGroupRules(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups/rules?limit=${PAGE_LIMIT}`);
   }
 
-  async listOrgContacts(): Promise<JsonRecord[]> {
-    return this.listPaginated("/api/v1/org/contacts");
+  async listOrgContacts(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta("/api/v1/org/contacts");
   }
 
   async getOrgContactUser(contactType: string): Promise<JsonRecord | null> {
@@ -1315,128 +2632,386 @@ export class OktaAuditorClient {
     return this.getJson<JsonRecord>("/api/v1/org/orgSettings/thirdPartyAdminSetting");
   }
 
-  async listGroups(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups?limit=${PAGE_LIMIT}`);
+  async listGroups(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups?limit=${PAGE_LIMIT}`);
   }
 
-  async listGroupUsers(groupId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups/${encodeURIComponent(groupId)}/users?limit=${PAGE_LIMIT}`);
+  async listGroupUsers(groupId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups/${encodeURIComponent(groupId)}/users?limit=${PAGE_LIMIT}`);
   }
 
-  async listGroupRoles(groupId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/groups/${encodeURIComponent(groupId)}/roles?limit=${PAGE_LIMIT}`);
+  async listGroupRoles(groupId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/groups/${encodeURIComponent(groupId)}/roles?limit=${PAGE_LIMIT}`);
   }
 
-  async listApps(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/apps?limit=${PAGE_LIMIT}`);
+  async listApps(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/apps?limit=${PAGE_LIMIT}`);
   }
 
-  async listIdps(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/idps?limit=${PAGE_LIMIT}`);
+  async listIdps(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/idps?limit=${PAGE_LIMIT}`);
   }
 
-  async listTrustedOrigins(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/trustedOrigins?limit=${PAGE_LIMIT}`);
+  async listTrustedOrigins(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/trustedOrigins?limit=${PAGE_LIMIT}`);
   }
 
-  async listNetworkZones(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/zones?limit=${PAGE_LIMIT}`);
+  async listNetworkZones(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/zones?limit=${PAGE_LIMIT}`);
   }
 
-  async listAuthorizationServers(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/authorizationServers?limit=${PAGE_LIMIT}`);
+  async listAuthorizationServers(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/authorizationServers?limit=${PAGE_LIMIT}`);
   }
 
   async getDefaultAuthorizationServer(): Promise<JsonRecord | null> {
     return this.tryGetJson<JsonRecord>("/api/v1/authorizationServers/default");
   }
 
-  async listOrgFactors(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/org/factors?limit=${PAGE_LIMIT}`);
+  async listOrgFactors(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/org/factors?limit=${PAGE_LIMIT}`);
   }
 
-  async listEventHooks(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/eventHooks?limit=${PAGE_LIMIT}`);
+  async listEventHooks(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/eventHooks?limit=${PAGE_LIMIT}`);
   }
 
-  async listLogStreams(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/logStreams?limit=${PAGE_LIMIT}`);
+  async listLogStreams(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/logStreams?limit=${PAGE_LIMIT}`);
   }
 
-  async listSystemLogs(): Promise<JsonRecord[]> {
+  /**
+   * A bounded query (since and until) so the System Log API returns a finite
+   * window instead of a polling stream, capped at MAX_SYSTEM_LOG_PAGES because
+   * OKTA-MON-002 only needs a recent sample; the cap exit reports truncated.
+   */
+  async listSystemLogs(): Promise<PaginatedList> {
     const since = encodeURIComponent(daysAgoIso(LOOKBACK_DAYS));
-    return this.listPaginated(`/api/v1/logs?since=${since}&limit=${PAGE_LIMIT}`);
+    const until = encodeURIComponent(new Date().toISOString());
+    return this.listPaginatedWithMeta(
+      `/api/v1/logs?since=${since}&until=${until}&limit=${PAGE_LIMIT}`,
+      MAX_SYSTEM_LOG_PAGES,
+    );
   }
 
-  async listBehaviors(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/behaviors?limit=${PAGE_LIMIT}`);
+  async listBehaviors(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/behaviors?limit=${PAGE_LIMIT}`);
   }
 
   async getThreatInsight(): Promise<JsonRecord | null> {
     return this.tryGetJson<JsonRecord>("/api/v1/threats/configuration");
   }
 
-  async listApiTokens(): Promise<JsonRecord[]> {
-    return this.listPaginated("/api/v1/api-tokens");
+  async listApiTokens(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta("/api/v1/api-tokens");
   }
 
-  async listDeviceAssurancePolicies(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/device-assurances?limit=${PAGE_LIMIT}`);
+  async listDeviceAssurancePolicies(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/device-assurances?limit=${PAGE_LIMIT}`);
   }
 
-  async listUsersWithRoleAssignments(): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/iam/assignees/users?limit=${PAGE_LIMIT}`);
+  async listUsersWithRoleAssignments(): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/iam/assignees/users?limit=${PAGE_LIMIT}`);
   }
 
-  async listUserRoles(userId: string): Promise<JsonRecord[]> {
-    return this.listPaginated(`/api/v1/users/${encodeURIComponent(userId)}/roles?limit=${PAGE_LIMIT}`);
+  async listUserRoles(userId: string): Promise<PaginatedList> {
+    return this.listPaginatedWithMeta(`/api/v1/users/${encodeURIComponent(userId)}/roles?limit=${PAGE_LIMIT}`);
   }
 }
 
+function toPaginatedList(result: ListResult): PaginatedList {
+  return Array.isArray(result) ? { items: result, truncated: false, pagesFetched: 1 } : result;
+}
+
+function truncationNoteOf(page: PaginatedList): string | undefined {
+  if (!page.truncated) return undefined;
+  return page.truncationNote ?? `Listing stopped after ${page.pagesFetched} pages (${page.items.length} items); total unknown.`;
+}
+
+function joinNotes(notes: Array<string | undefined>): string | undefined {
+  const present = notes.filter((note): note is string => Boolean(note));
+  return present.length > 0 ? present.join(" | ") : undefined;
+}
+
+/** The record point for every error string a dataset, marker, probe, or _errors.log keeps: scrubbed here as well as in the OktaApiError constructor, so errors from other sources (the fetch implementation, a JSON parser, a lightweight client) get the same pass. */
+function errorText(error: unknown): string {
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
+}
+
+/** The HTTP status the failed request observed: carried by OktaApiError, otherwise read from the "(403 Forbidden)" text a lightweight client's error names. */
+function errorStatus(error: unknown): number | null {
+  if (error instanceof OktaApiError) return error.status;
+  const match = /\((\d{3}) /.exec(errorText(error));
+  return match ? Number(match[1]) : null;
+}
+
+/** The request target the failure names, so a marker never carries an endpoint the run did not request. */
+function errorEndpoint(error: unknown): string | null {
+  if (error instanceof OktaApiError) return error.endpoint;
+  const text = errorText(error);
+  const match = /request failed for (\S+) \(\d{3} /.exec(text) ?? /request failed for (\S+?): /.exec(text);
+  return match ? match[1] : null;
+}
+
+function notCollectedMarker(error: unknown): OktaNotCollectedMarker {
+  return { collected: false, status: errorStatus(error), endpoint: errorEndpoint(error), error: errorText(error) };
+}
+
+/** A dataset whose request failed: the fallback stays in memory for the verdicts, the marker is what the bundle writes, and truncated is null because no walk ran. */
+function failedDataset<T>(fallback: T, error: unknown): CollectedDataset<T> {
+  return { data: fallback, error: errorText(error), truncated: null, notCollected: notCollectedMarker(error) };
+}
+
+/** A dataset this client cannot read at all (the method is not exposed): recorded as an error the verdicts treat as unreadable, with no HTTP status or endpoint invented. */
+function unavailableDataset<T>(fallback: T, reason: string): CollectedDataset<T> {
+  return { data: fallback, error: reason, truncated: null, notCollected: { collected: false, status: null, endpoint: null, error: reason } };
+}
+
+/** A dataset whose requests were never issued because the inventory it hangs off was not collected: the error names the parent's real failure, and no HTTP status or endpoint of its own is invented. */
+function skippedDataset<T>(fallback: T, reason: string): CollectedDataset<T> {
+  const error = `Not requested: ${reason}`;
+  return { data: fallback, error, truncated: null, notCollected: { collected: false, status: null, endpoint: null, error } };
+}
+
+/**
+ * A per-parent collection in which every child lookup failed: nothing was
+ * collected, so the dataset is not collected (its count and truncated flag
+ * render null, never 0 or false), the error says every lookup failed, and the
+ * child markers keep each failed request for the bundle. No single status or
+ * endpoint is invented for the whole map; each child marker carries its own.
+ */
+function allChildrenFailedDataset<T>(
+  fallback: T,
+  childLabel: string,
+  errors: string[],
+  childMarkers: Record<string, OktaNotCollectedMarker>,
+): CollectedDataset<T> {
+  const error = `every lookup of the ${childLabel} failed (${errors.length} of ${errors.length}): ${errors.join("; ")}`;
+  return {
+    data: fallback,
+    error,
+    truncated: null,
+    notCollected: { collected: false, status: null, endpoint: null, error },
+    childMarkers,
+  };
+}
+
+const ALL_CHILDREN_FAILED_PATTERN = /^every lookup of the (.+?) failed \((\d+) of \2\): ([\s\S]*)$/;
+
+/** Every list lands here: records are redacted (or projected) before they are kept, and a page-capped walk forwards truncated plus its note. */
 async function collectArrayDataset(
-  fetcher: () => Promise<JsonRecord[]>,
+  fetcher: () => Promise<ListResult>,
+  project: (record: JsonRecord) => JsonRecord = redactRecord,
 ): Promise<CollectedDataset<JsonRecord[]>> {
   try {
-    const data = await fetcher();
-    return { data };
+    const page = toPaginatedList(await fetcher());
+    const truncationNote = truncationNoteOf(page);
+    return {
+      data: page.items.map(project),
+      truncated: page.truncated,
+      truncationNote,
+    };
   } catch (error) {
-    return { data: [], error: error instanceof Error ? error.message : String(error) };
+    return failedDataset([], error);
   }
 }
 
-async function collectObjectDataset<T>(
+/** The members the documented resource carries; a 200 body with none of them is another document (a proxy page, a foreign API's JSON), not the resource. */
+interface ObjectEnvelope {
+  readonly target: string;
+  readonly members: readonly string[];
+}
+
+const OKTA_SUPPORT_ENVELOPE: ObjectEnvelope = { target: "/api/v1/org/privacy/oktaSupport", members: ["support", "expiration"] };
+const THIRD_PARTY_ADMIN_ENVELOPE: ObjectEnvelope = { target: "/api/v1/org/orgSettings/thirdPartyAdminSetting", members: ["thirdPartyAdmin"] };
+const DEFAULT_AUTHORIZATION_SERVER_ENVELOPE: ObjectEnvelope = { target: "/api/v1/authorizationServers/default", members: ["id", "issuer", "audiences"] };
+const THREAT_INSIGHT_ENVELOPE: ObjectEnvelope = { target: "/api/v1/threats/configuration", members: ["action", "mode", "settings", "excludeZones"] };
+const ORG_CONTACT_USER_MEMBERS: readonly string[] = ["userId"];
+
+function carriesExpectedMember(data: unknown, members: readonly string[]): boolean {
+  const record = asRecord(data);
+  return members.some((member) => member in record);
+}
+
+function unexpectedShapeError(target: string, members: readonly string[]): string {
+  return `GET ${target} returned a 200 body that is not the expected object (none of ${members.join(", ")} present), so the response was not recorded`;
+}
+
+const UNEXPECTED_SHAPE_PATTERN = /returned a 200 body that is not the expected object/;
+
+/** A 200 body that is not the resource is a marker, never evidence: the fallback stays in memory, the verdicts read the error as they do for a failed request, and no part of the body is kept. */
+function unexpectedShapeDataset<T>(fallback: T, envelope: ObjectEnvelope): CollectedDataset<T> {
+  const error = unexpectedShapeError(envelope.target, envelope.members);
+  return { data: fallback, error, truncated: null, notCollected: { collected: false, status: 200, endpoint: envelope.target, error } };
+}
+
+/** A single object lands here: a null (404) stays null, a body carrying none of the documented members becomes a marker, and the resource is redacted before it is kept. */
+async function collectObjectDataset<T extends JsonRecord | null>(
   fetcher: () => Promise<T>,
   fallback: T,
+  envelope: ObjectEnvelope,
 ): Promise<CollectedDataset<T>> {
   try {
     const data = await fetcher();
-    return { data };
+    if (data !== null && !carriesExpectedMember(data, envelope.members)) return unexpectedShapeDataset(fallback, envelope);
+    return { data: redactSnapshot(data) as T };
   } catch (error) {
-    return { data: fallback, error: error instanceof Error ? error.message : String(error) };
+    return failedDataset(fallback, error);
   }
 }
 
-async function collectPolicyRuleMap(
-  client: Pick<OktaAuditorClient, "listPolicyRules">,
-  policies: JsonRecord[],
+/**
+ * Per-parent list loops (rules per policy, roles per user, members per group,
+ * factors per user): each child list is normalized, redacted, and its
+ * truncation note kept so the consumer can demote. A child that was denied or
+ * errored is left out of the map (consumers read a missing key as unread, never
+ * as an empty list) and keeps a marker under its parent id for the bundle; when
+ * the parent inventory itself was not collected no child request is issued and
+ * the whole map carries a not-requested marker.
+ */
+async function collectRecordMap(
+  childLabel: string,
+  parents: CollectedDataset<JsonRecord[]>,
+  fetcher: (parentId: string) => Promise<ListResult>,
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
+  if (parents.notCollected) {
+    return skippedDataset({}, `no ${childLabel} were requested because the parent list was not collected (${parents.notCollected.error}).`);
+  }
   const data: Record<string, JsonRecord[]> = {};
   const errors: string[] = [];
+  const notes: string[] = [];
+  const childMarkers: Record<string, OktaNotCollectedMarker> = {};
+  let attempted = 0;
 
-  for (const policy of policies) {
-    const policyId = asString(policy.id);
-    if (!policyId) continue;
+  for (const parent of parents.data) {
+    const parentId = asString(parent.id);
+    if (!parentId) continue;
+    attempted += 1;
     try {
-      data[policyId] = await client.listPolicyRules(policyId);
+      const page = toPaginatedList(await fetcher(parentId));
+      data[parentId] = page.items.map(redactRecord);
+      const note = truncationNoteOf(page);
+      if (note) notes.push(`${parentId}: ${note}`);
     } catch (error) {
-      errors.push(`${policyId}: ${error instanceof Error ? error.message : String(error)}`);
-      data[policyId] = [];
+      errors.push(`${parentId}: ${errorText(error)}`);
+      childMarkers[parentId] = notCollectedMarker(error);
     }
+  }
+
+  if (attempted > 0 && errors.length === attempted) {
+    return allChildrenFailedDataset({}, childLabel, errors, childMarkers);
   }
 
   return {
     data,
     error: errors.length > 0 ? errors.join("; ") : undefined,
+    truncated: notes.length > 0,
+    truncationNote: joinNotes(notes),
+    ...(errors.length > 0 ? { childMarkers } : {}),
+  };
+}
+
+async function collectPolicyRuleMap(
+  client: Pick<OktaAuditorClient, "listPolicyRules">,
+  policies: CollectedDataset<JsonRecord[]>,
+  policyLabel: string,
+): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
+  return collectRecordMap(`${policyLabel} rules`, policies, (policyId) => client.listPolicyRules(policyId));
+}
+
+/**
+ * What core_data carries for a dataset: the data when it was collected, its
+ * marker when nothing was, and, for a per-parent collection, the collected
+ * children plus a marker for every child that failed (array datasets append
+ * the markers with the child key as `id`); when every child failed the file
+ * holds only those per-child markers.
+ */
+function coreDataSnapshot(dataset: CollectedDataset<unknown>): unknown {
+  if (!dataset.childMarkers) return dataset.notCollected ?? dataset.data;
+  if (Array.isArray(dataset.data)) {
+    return [...dataset.data, ...Object.entries(dataset.childMarkers).map(([id, marker]) => ({ id, ...marker }))];
+  }
+  return { ...asRecord(dataset.data), ...dataset.childMarkers };
+}
+
+/** True when the dataset's request ran and returned, so its counts are real rather than defaults. */
+function wasCollected(dataset: CollectedDataset<unknown>): boolean {
+  return dataset.notCollected === undefined;
+}
+
+/** True when the dataset was collected and its walk ran to completion, so a count over it describes the whole inventory. */
+function wasFullyRead(dataset: CollectedDataset<unknown>): boolean {
+  return wasCollected(dataset) && dataset.truncated !== true;
+}
+
+/** A count derived from a dataset: null, never 0, when the dataset was not collected or only partially read (a count of the part read would stand for the whole; the seen count is in the truncation note). */
+function countIfCollected(count: number, ...datasets: Array<CollectedDataset<unknown>>): number | null {
+  return datasets.every(wasFullyRead) ? count : null;
+}
+
+/** A label derived from a dataset: "not collected" when the dataset was not collected. */
+function labelIfCollected(label: string, ...datasets: Array<CollectedDataset<unknown>>): string {
+  return datasets.every(wasCollected) ? label : "not collected";
+}
+
+function countNotCollected(datasets: Array<CollectedDataset<unknown>>): number {
+  return datasets.filter((dataset) => !wasCollected(dataset)).length;
+}
+
+/** How a core_data file is shaped: a list of records, a per-parent map of lists, or a single object. */
+type OktaCoreDataShape = "list" | "map" | "object";
+
+type OktaCoreDataFile = [file: string, dataset: CollectedDataset<unknown>, shape: OktaCoreDataShape];
+
+export interface OktaCollectionStatusEntry {
+  file: string;
+  shape: OktaCoreDataShape;
+  /** True when the dataset's own request ran and returned; false when it was denied, errored, unavailable, or never requested. */
+  collected: boolean;
+  /** True when the walk finished and every child request succeeded; null when the dataset was not collected. */
+  complete: boolean | null;
+  /** Items for a list, parents read for a map; null for a single object and whenever the dataset was not collected. */
+  count: number | null;
+  truncated: boolean | null;
+  truncation_note: string | null;
+  /** HTTP status and target of the request that failed; null when the dataset was collected or the failure carried none. */
+  status: number | null;
+  endpoint: string | null;
+  error: string | null;
+}
+
+export interface OktaCollectionStatus {
+  datasets: OktaCollectionStatusEntry[];
+  not_collected: string[];
+  truncated: string[];
+}
+
+/**
+ * core_data/collection_status.json: one row per core_data file. A dataset that
+ * was not collected renders null for every flag and counter (never 0 or false)
+ * and names the HTTP status and endpoint of the request that actually failed.
+ */
+function buildCollectionStatus(files: OktaCoreDataFile[]): OktaCollectionStatus {
+  const datasets = files.map(([file, dataset, shape]): OktaCollectionStatusEntry => {
+    const collected = wasCollected(dataset);
+    const counted = collected && shape !== "object";
+    return {
+      file,
+      shape,
+      collected,
+      complete: collected ? !dataset.error && !dataset.truncated : null,
+      count: counted ? (Array.isArray(dataset.data) ? dataset.data.length : Object.keys(asRecord(dataset.data)).length) : null,
+      truncated: counted ? Boolean(dataset.truncated) : null,
+      truncation_note: collected ? dataset.truncationNote ?? null : null,
+      status: dataset.notCollected?.status ?? null,
+      endpoint: dataset.notCollected?.endpoint ?? null,
+      error: dataset.error ?? null,
+    };
+  });
+  return {
+    datasets,
+    not_collected: datasets.filter((entry) => !entry.collected).map((entry) => entry.file),
+    truncated: datasets.filter((entry) => entry.truncated === true).map((entry) => entry.file),
   };
 }
 
@@ -1457,9 +3032,9 @@ export async function collectOktaAuthenticationData(
   const mfaPolicies = await collectArrayDataset(() => client.listPolicies("MFA_ENROLL"));
   const accessPolicies = await collectArrayDataset(() => client.listPolicies("ACCESS_POLICY"));
 
-  const signOnPolicyRules = await collectPolicyRuleMap(client, signOnPolicies.data);
-  const passwordPolicyRules = await collectPolicyRuleMap(client, passwordPolicies.data);
-  const accessPolicyRules = await collectPolicyRuleMap(client, accessPolicies.data);
+  const signOnPolicyRules = await collectPolicyRuleMap(client, signOnPolicies, "sign-on policy");
+  const passwordPolicyRules = await collectPolicyRuleMap(client, passwordPolicies, "password policy");
+  const accessPolicyRules = await collectPolicyRuleMap(client, accessPolicies, "access policy");
 
   return {
     signOnPolicies,
@@ -1475,6 +3050,7 @@ export async function collectOktaAuthenticationData(
     defaultAuthorizationServer: await collectObjectDataset(
       () => client.getDefaultAuthorizationServer(),
       null,
+      DEFAULT_AUTHORIZATION_SERVER_ENVELOPE,
     ),
     orgFactors: await collectArrayDataset(() => client.listOrgFactors()),
   };
@@ -1499,52 +3075,43 @@ async function collectUsersDataset(
   client: OktaAdminAccessClient,
 ): Promise<CollectedDataset<JsonRecord[]>> {
   if (!client.listUsersWithMeta) {
-    return {
-      data: [],
-      error: "User population listing is not available on this client.",
-    };
+    return unavailableDataset([], "User population listing is not available on this client.");
   }
   try {
-    const page = await client.listUsersWithMeta();
+    const page = toPaginatedList(await client.listUsersWithMeta());
     return {
-      data: page.items,
+      data: page.items.map(redactRecord),
       truncated: page.truncated,
       truncationNote: page.truncated
-        ? `User listing stopped after ${page.pagesFetched} pages (${page.items.length} users); a Link rel="next" page remained unread.`
+        ? page.truncationNote ??
+          `User listing stopped after ${page.pagesFetched} pages (${page.items.length} users); a Link rel="next" page remained unread, total unknown.`
         : undefined,
     };
   } catch (error) {
-    return { data: [], error: error instanceof Error ? error.message : String(error) };
+    return failedDataset([], error);
   }
 }
 
 async function collectPrivilegedUserFactors(
   client: OktaAdminAccessClient,
-  privilegedUsers: JsonRecord[],
+  privilegedUsers: CollectedDataset<JsonRecord[]>,
 ): Promise<CollectedDataset<Record<string, JsonRecord[]>>> {
-  const data: Record<string, JsonRecord[]> = {};
   if (!client.listUserFactors) {
-    return { data, error: "Per-user factor listing is not available on this client." };
+    return unavailableDataset({}, "Per-user factor listing is not available on this client.");
   }
-  const errors: string[] = [];
-  const scoped = privilegedUsers.slice(0, MAX_PRIVILEGED_FACTOR_LOOKUPS);
-  for (const user of scoped) {
-    const userId = asString(user.id);
-    if (!userId) continue;
-    try {
-      data[userId] = await client.listUserFactors(userId);
-    } catch (error) {
-      errors.push(`${userId}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  const truncated = privilegedUsers.length > scoped.length;
+  const scoped = privilegedUsers.data.slice(0, MAX_PRIVILEGED_FACTOR_LOOKUPS);
+  const factors = await collectRecordMap("privileged user factor lists", { ...privilegedUsers, data: scoped }, (userId) => client.listUserFactors!(userId));
+  if (factors.notCollected) return factors;
+  const truncated = privilegedUsers.data.length > scoped.length;
   return {
-    data,
-    error: errors.length > 0 ? errors.join("; ") : undefined,
-    truncated,
-    truncationNote: truncated
-      ? `Factor enrollment was read for ${scoped.length} of ${privilegedUsers.length} privileged users.`
-      : undefined,
+    ...factors,
+    truncated: truncated || factors.truncated,
+    truncationNote: joinNotes([
+      truncated
+        ? `Factor enrollment was read for ${scoped.length} of ${privilegedUsers.data.length} privileged users.`
+        : undefined,
+      factors.truncationNote,
+    ]),
   };
 }
 
@@ -1552,19 +3119,7 @@ export async function collectOktaAdminAccessData(
   client: OktaAdminAccessClient,
 ): Promise<OktaAdminAccessData> {
   const usersWithRoleAssignments = await collectArrayDataset(() => client.listUsersWithRoleAssignments());
-  const userRoles: Record<string, JsonRecord[]> = {};
-  const userRoleErrors: string[] = [];
-
-  for (const user of usersWithRoleAssignments.data) {
-    const userId = asString(user.id);
-    if (!userId) continue;
-    try {
-      userRoles[userId] = await client.listUserRoles(userId);
-    } catch (error) {
-      userRoleErrors.push(`${userId}: ${error instanceof Error ? error.message : String(error)}`);
-      userRoles[userId] = [];
-    }
-  }
+  const userRoles = await collectRecordMap("per-user role lists", usersWithRoleAssignments, (userId) => client.listUserRoles(userId));
 
   const groups = await collectArrayDataset(() => client.listGroups());
   const privilegedGroups = groups.data.filter((group) =>
@@ -1573,60 +3128,38 @@ export async function collectOktaAdminAccessData(
     ),
   );
 
-  const privilegedGroupRoles: Record<string, JsonRecord[]> = {};
-  const privilegedGroupMembers: Record<string, JsonRecord[]> = {};
-  const groupRoleErrors: string[] = [];
-  const groupMemberErrors: string[] = [];
   const groupsTruncated = privilegedGroups.length > MAX_PRIVILEGED_GROUP_LOOKUPS;
-
-  for (const group of privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS)) {
-    const groupId = asString(group.id);
-    if (!groupId) continue;
-    try {
-      privilegedGroupRoles[groupId] = await client.listGroupRoles(groupId);
-    } catch (error) {
-      groupRoleErrors.push(`${groupId}: ${error instanceof Error ? error.message : String(error)}`);
-      privilegedGroupRoles[groupId] = [];
-    }
-    try {
-      privilegedGroupMembers[groupId] = await client.listGroupUsers(groupId);
-    } catch (error) {
-      groupMemberErrors.push(`${groupId}: ${error instanceof Error ? error.message : String(error)}`);
-      privilegedGroupMembers[groupId] = [];
-    }
-  }
+  const expandedGroups: CollectedDataset<JsonRecord[]> = { ...groups, data: privilegedGroups.slice(0, MAX_PRIVILEGED_GROUP_LOOKUPS) };
+  const privilegedGroupRoles = await collectRecordMap("privileged group role lists", expandedGroups, (groupId) => client.listGroupRoles(groupId));
+  const privilegedGroupMembers = await collectRecordMap("privileged group member lists", expandedGroups, (groupId) => client.listGroupUsers(groupId));
 
   const users = await collectUsersDataset(client);
-  const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments.data);
+  const privilegedUserFactors = await collectPrivilegedUserFactors(client, usersWithRoleAssignments);
   const oktaSupportAccess = client.getOktaSupportSettings
-    ? await collectObjectDataset(() => client.getOktaSupportSettings!(), null)
-    : { data: null, error: "Okta Support access settings are not available on this client." };
+    ? await collectObjectDataset(() => client.getOktaSupportSettings!(), null, OKTA_SUPPORT_ENVELOPE)
+    : unavailableDataset<JsonRecord | null>(null, "Okta Support access settings are not available on this client.");
   const thirdPartyAdminSetting = client.getThirdPartyAdminSetting
-    ? await collectObjectDataset(() => client.getThirdPartyAdminSetting!(), null)
-    : { data: null, error: "Third-party admin setting is not available on this client." };
+    ? await collectObjectDataset(() => client.getThirdPartyAdminSetting!(), null, THIRD_PARTY_ADMIN_ENVELOPE)
+    : unavailableDataset<JsonRecord | null>(null, "Third-party admin setting is not available on this client.");
 
   return {
     usersWithRoleAssignments,
-    userRoles: {
-      data: userRoles,
-      error: userRoleErrors.length > 0 ? userRoleErrors.join("; ") : undefined,
-    },
+    userRoles,
     groups,
-    privilegedGroups: {
-      data: privilegedGroups,
-      truncated: groupsTruncated,
-      truncationNote: groupsTruncated
-        ? `Only the first ${MAX_PRIVILEGED_GROUP_LOOKUPS} of ${privilegedGroups.length} admin-like groups were expanded.`
-        : undefined,
-    },
-    privilegedGroupRoles: {
-      data: privilegedGroupRoles,
-      error: groupRoleErrors.length > 0 ? groupRoleErrors.join("; ") : undefined,
-    },
-    privilegedGroupMembers: {
-      data: privilegedGroupMembers,
-      error: groupMemberErrors.length > 0 ? groupMemberErrors.join("; ") : undefined,
-    },
+    privilegedGroups: groups.notCollected
+      ? { ...groups, data: privilegedGroups }
+      : {
+          data: privilegedGroups,
+          truncated: groupsTruncated || groups.truncated,
+          truncationNote: joinNotes([
+            groupsTruncated
+              ? `Only the first ${MAX_PRIVILEGED_GROUP_LOOKUPS} of ${privilegedGroups.length} admin-like groups were expanded.`
+              : undefined,
+            groups.truncationNote,
+          ]),
+        },
+    privilegedGroupRoles,
+    privilegedGroupMembers,
     users,
     privilegedUserFactors,
     oktaSupportAccess,
@@ -1657,14 +3190,14 @@ export async function collectOktaIntegrationData(
     trustedOrigins: await collectArrayDataset(() => client.listTrustedOrigins()),
     networkZones: await collectArrayDataset(() => client.listNetworkZones()),
     accessPolicies,
-    accessPolicyRules: await collectPolicyRuleMap(client, accessPolicies.data),
+    accessPolicyRules: await collectPolicyRuleMap(client, accessPolicies, "access policy"),
     signOnPolicies,
-    signOnPolicyRules: await collectPolicyRuleMap(client, signOnPolicies.data),
+    signOnPolicyRules: await collectPolicyRuleMap(client, signOnPolicies, "sign-on policy"),
     idps: await collectArrayDataset(() => client.listIdps()),
     authorizationServers: await collectArrayDataset(() => client.listAuthorizationServers()),
     groupRules: client.listGroupRules
       ? await collectArrayDataset(() => client.listGroupRules!())
-      : { data: [], error: "Group rule listing is not available on this client." },
+      : unavailableDataset<JsonRecord[]>([], "Group rule listing is not available on this client."),
   };
 }
 
@@ -1684,17 +3217,27 @@ async function collectOrgContacts(
   client: OktaMonitoringClient,
 ): Promise<CollectedDataset<JsonRecord[]>> {
   if (!client.listOrgContacts || !client.getOrgContactUser) {
-    return { data: [], error: "Org contact listing is not available on this client." };
+    return unavailableDataset<JsonRecord[]>([], "Org contact listing is not available on this client.");
   }
   try {
-    const contactTypes = await client.listOrgContacts();
+    const contactTypes = toPaginatedList(await client.listOrgContacts());
     const resolved: JsonRecord[] = [];
     const errors: string[] = [];
-    for (const contact of contactTypes) {
+    const childMarkers: Record<string, OktaNotCollectedMarker> = {};
+    let attempted = 0;
+    for (const contact of contactTypes.items) {
       const contactType = asString(contact.contactType);
       if (!contactType) continue;
+      attempted += 1;
       try {
         const assignment = await client.getOrgContactUser(contactType);
+        if (assignment !== null && !carriesExpectedMember(assignment, ORG_CONTACT_USER_MEMBERS)) {
+          const endpoint = `/api/v1/org/contacts/${encodeURIComponent(contactType)}`;
+          const error = unexpectedShapeError(endpoint, ORG_CONTACT_USER_MEMBERS);
+          errors.push(`${contactType}: ${error}`);
+          childMarkers[contactType] = { collected: false, status: 200, endpoint, error };
+          continue;
+        }
         const userId = asString(asRecord(assignment).userId);
         const user = userId && client.getUser ? await client.getUser(userId) : null;
         resolved.push({
@@ -1704,12 +3247,22 @@ async function collectOrgContacts(
           userLogin: user ? asString(asRecord(user.profile).login) ?? null : null,
         });
       } catch (error) {
-        errors.push(`${contactType}: ${error instanceof Error ? error.message : String(error)}`);
+        errors.push(`${contactType}: ${errorText(error)}`);
+        childMarkers[contactType] = notCollectedMarker(error);
       }
     }
-    return { data: resolved, error: errors.length > 0 ? errors.join("; ") : undefined };
+    if (attempted > 0 && errors.length === attempted) {
+      return allChildrenFailedDataset<JsonRecord[]>([], "org contact assignments", errors, childMarkers);
+    }
+    return {
+      data: resolved,
+      error: errors.length > 0 ? errors.join("; ") : undefined,
+      truncated: contactTypes.truncated,
+      truncationNote: truncationNoteOf(contactTypes),
+      ...(errors.length > 0 ? { childMarkers } : {}),
+    };
   } catch (error) {
-    return { data: [], error: error instanceof Error ? error.message : String(error) };
+    return failedDataset<JsonRecord[]>([], error);
   }
 }
 
@@ -1717,11 +3270,17 @@ export async function collectOktaMonitoringData(
   client: OktaMonitoringClient,
 ): Promise<OktaMonitoringData> {
   return {
-    eventHooks: await collectArrayDataset(() => client.listEventHooks()),
+    eventHooks: await collectArrayDataset(
+      () => client.listEventHooks(),
+      (hook) => redactRecord(projectEventHook(hook)),
+    ),
     logStreams: await collectArrayDataset(() => client.listLogStreams()),
-    systemLogs: await collectArrayDataset(() => client.listSystemLogs()),
+    systemLogs: await collectArrayDataset(
+      () => client.listSystemLogs(),
+      (event) => redactRecord(projectSystemLogEvent(event)),
+    ),
     behaviors: await collectArrayDataset(() => client.listBehaviors()),
-    threatInsight: await collectObjectDataset(() => client.getThreatInsight(), null),
+    threatInsight: await collectObjectDataset(() => client.getThreatInsight(), null, THREAT_INSIGHT_ENVELOPE),
     apiTokens: await collectArrayDataset(() => client.listApiTokens()),
     deviceAssurance: await collectArrayDataset(() => client.listDeviceAssurancePolicies()),
     orgContacts: await collectOrgContacts(client),
@@ -1768,7 +3327,7 @@ function buildAssessmentText(
   title: string,
   organization: string,
   findings: OktaFinding[],
-  snapshotSummary: Record<string, number | string>,
+  snapshotSummary: Record<string, number | string | null>,
 ): string {
   const summary = summarizeFindings(findings);
   const header = [
@@ -1778,7 +3337,7 @@ function buildAssessmentText(
 
   const summaryLines = Object.entries(snapshotSummary).map(([key, value]) => {
     const label = key.replace(/_/g, " ");
-    return `${label}: ${value}`;
+    return `${label}: ${value ?? "not collected"}`;
   });
 
   const rows = findings.map((finding) => [
@@ -1940,9 +3499,15 @@ function userLogin(user: JsonRecord): string {
 }
 
 function describeEndpointError(error: string): string {
+  const allChildrenFailed = ALL_CHILDREN_FAILED_PATTERN.exec(error);
+  if (allChildrenFailed) {
+    return `every lookup of the ${allChildrenFailed[1]} failed (${allChildrenFailed[2]} of ${allChildrenFailed[2]}): ${describeEndpointError(allChildrenFailed[3])}`;
+  }
+  if (/^Not requested: /.test(error)) return "the inventory it depends on was not collected, so its request was never issued";
   if (/\(403 /.test(error)) return "the endpoint returned 403 Forbidden (missing scope or admin role)";
   if (/\(401 /.test(error)) return "the endpoint returned 401 Unauthorized (credential rejected)";
   if (/\(404 /.test(error)) return "the endpoint returned 404 Not Found (feature not enabled on this org edition)";
+  if (UNEXPECTED_SHAPE_PATTERN.test(error)) return "the endpoint returned a 200 body that is not the expected object (unexpected response shape)";
   if (/not available on this client/i.test(error)) return "the collector did not expose this endpoint";
   return "the endpoint request failed";
 }
@@ -1982,6 +3547,74 @@ function manualForDataset(
 
 function capAtPartial(status: OktaFindingStatus): OktaFindingStatus {
   return status === "Pass" ? "Partial" : status;
+}
+
+const AUTHENTICATION_FINDING_SOURCES: Record<string, Array<keyof OktaAuthenticationData>> = {
+  "OKTA-AUTH-001": ["authenticators", "orgFactors"],
+  "OKTA-AUTH-002": ["signOnPolicies", "signOnPolicyRules", "accessPolicies", "accessPolicyRules", "authenticators", "mfaPolicies"],
+  "OKTA-AUTH-003": ["passwordPolicies"],
+  "OKTA-AUTH-004": ["passwordPolicies"],
+  "OKTA-AUTH-005": ["passwordPolicies"],
+  "OKTA-AUTH-006": ["signOnPolicies", "signOnPolicyRules"],
+  "OKTA-AUTH-007": ["signOnPolicies", "signOnPolicyRules"],
+  "OKTA-AUTH-008": ["idps", "authenticators"],
+  "OKTA-AUTH-009": ["authenticators", "orgFactors"],
+};
+
+const ADMIN_ACCESS_FINDING_SOURCES: Record<string, Array<keyof OktaAdminAccessData>> = {
+  "OKTA-ADMIN-001": ["usersWithRoleAssignments", "userRoles"],
+  "OKTA-ADMIN-002": ["usersWithRoleAssignments", "userRoles"],
+  "OKTA-ADMIN-003": ["groups", "privilegedGroups", "privilegedGroupRoles", "privilegedGroupMembers"],
+  "OKTA-ADMIN-004": ["usersWithRoleAssignments", "privilegedUserFactors"],
+  "OKTA-ADMIN-005": ["users"],
+};
+
+const INTEGRATION_FINDING_SOURCES: Record<string, Array<keyof OktaIntegrationData>> = {
+  "OKTA-INTEG-001": ["trustedOrigins"],
+  "OKTA-INTEG-002": ["networkZones"],
+  "OKTA-INTEG-003": ["apps"],
+  "OKTA-INTEG-004": ["signOnPolicies", "signOnPolicyRules", "accessPolicies", "accessPolicyRules", "networkZones"],
+  "OKTA-INTEG-005": ["apps"],
+  "OKTA-INTEG-006": ["apps", "groupRules"],
+};
+
+const MONITORING_FINDING_SOURCES: Record<string, Array<keyof OktaMonitoringData>> = {
+  "OKTA-MON-001": ["eventHooks", "logStreams"],
+  "OKTA-MON-002": ["systemLogs"],
+  "OKTA-MON-004": ["behaviors"],
+  "OKTA-MON-005": ["apiTokens"],
+  "OKTA-MON-006": ["deviceAssurance"],
+  "OKTA-MON-007": ["apiTokens"],
+  "OKTA-MON-008": ["orgContacts"],
+};
+
+/**
+ * Rule 5 and rule 10: a finding whose evidence comes from a page-capped,
+ * sampled, or cursor-stalled inventory never stays at Pass. The status caps at
+ * Partial and the truncation note (pages and items seen, total unknown) is
+ * appended to the summary and evidence unless the finding already states it.
+ */
+function applyTruncationDemotions<TData extends { [K in keyof TData]: CollectedDataset<unknown> }>(
+  findings: OktaFinding[],
+  data: TData,
+  sources: Record<string, Array<keyof TData>>,
+): OktaFinding[] {
+  return findings.map((finding) => {
+    const notes = (sources[finding.id] ?? [])
+      .map((key): CollectedDataset<unknown> => data[key])
+      .filter((dataset) => dataset.truncated)
+      .map((dataset) => dataset.truncationNote ?? "an inventory this finding reads was truncated, total unknown");
+    if (notes.length === 0) return finding;
+    const unstated = notes.filter((note) => !finding.evidence.some((line) => line.includes(note)));
+    const status = capAtPartial(finding.status);
+    if (status === finding.status && unstated.length === 0) return finding;
+    return {
+      ...finding,
+      status,
+      summary: unstated.length > 0 ? `${finding.summary} Inventory truncated: ${unstated.join(" | ")}` : finding.summary,
+      evidence: [...finding.evidence, ...unstated.map((note) => `Partial data: ${note}`)],
+    };
+  });
 }
 
 function ruleRequiresMfa(rule: JsonRecord): boolean {
@@ -2087,7 +3720,10 @@ export function assessOktaAuthentication(
         "OKTA-AUTH-001",
         "Pass",
         `${phishingResistantAuthenticators.length} phishing-resistant authenticators are ACTIVE (${strongAuthenticators.length} strong authenticators total).`,
-        strongAuthenticators.map((auth) => `Active: ${authenticatorLabel(auth)}`),
+        [
+          ...strongAuthenticators.map((auth) => `Active: ${authenticatorLabel(auth)}`),
+          ...(data.orgFactors.error ? [`Org factors were unreadable (not consulted because authenticators were returned): ${data.orgFactors.error}`] : []),
+        ],
         "Keep phishing-resistant authenticators enabled and verify enrollment policy coverage.",
       ),
     );
@@ -2159,12 +3795,15 @@ export function assessOktaAuthentication(
         "Partial",
         adminMfaRules.length === 0
           ? "Admin or dashboard policies exist, but no ACTIVE rule under them explicitly requires MFA."
-          : "Admin MFA rules exist, but strong authenticators or complete policy data were missing.",
+          : data.authenticators.error
+            ? "Admin MFA rules exist, but the authenticator list was unreadable, so strong authenticator coverage could not be confirmed."
+            : "Admin MFA rules exist, but strong authenticators or complete policy data were missing.",
         [
           ...adminPolicies.map((policy) => `Policy: ${asString(policy.name)} (${asString(policy.status)})`),
           `ACTIVE rules under admin policies: ${adminRules.length}`,
           `Rules requiring MFA: ${adminMfaRules.length}`,
-          `Strong authenticators: ${strongAuthenticators.length}`,
+          `Strong authenticators: ${data.authenticators.error ? "unknown (authenticator list unreadable)" : strongAuthenticators.length}`,
+          ...(data.authenticators.error ? [`Authenticator error: ${data.authenticators.error}`] : []),
           ...(policyErrors.length > 0 ? [`Partial policy data: ${policyErrors.join(" | ")}`] : []),
         ],
         "Ensure at least one ACTIVE rule on the Okta Admin Console and Dashboard policies requires MFA (requireFactor or factorMode 2FA).",
@@ -2384,16 +4023,35 @@ export function assessOktaAuthentication(
       ),
     );
   } else if (certIdps.length > 0 || certAuthenticators.length > 0) {
+    const unreadList = data.idps.error ? "identity provider" : data.authenticators.error ? "authenticator" : undefined;
+    const detected = `Detected ${certIdps.length + certAuthenticators.length} ACTIVE certificate-oriented IdP or authenticator entries`;
     findings.push(
       buildFinding(
         "OKTA-AUTH-008",
-        "Pass",
-        `Detected ${certIdps.length + certAuthenticators.length} ACTIVE certificate-oriented IdP or authenticator entries.`,
+        unreadList ? "Partial" : "Pass",
+        unreadList
+          ? `${detected}, but the ${unreadList} list was unreadable, so the other half of the certificate inventory could not be verified.`
+          : `${detected}.`,
         [
           ...certIdps.map((idp) => `IdP: ${recordName(idp)} (${asString(idp.status)})`),
           ...certAuthenticators.map((auth) => `Authenticator: ${authenticatorLabel(auth)}`),
+          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
+          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
         ],
         "Keep certificate-based and smart-card options documented for scoped federal or DoD use cases.",
+      ),
+    );
+  } else if (data.idps.error || data.authenticators.error) {
+    const unreadList = data.idps.error ? "identity provider" : "authenticator";
+    const readList = data.idps.error ? "authenticator" : "identity provider";
+    const unreadError = data.idps.error ?? data.authenticators.error ?? "unknown error";
+    findings.push(
+      manualFinding(
+        "OKTA-AUTH-008",
+        "Certificate or PIV/CAC authentication",
+        `no ACTIVE certificate-oriented entry was found in the ${readList} list while the ${unreadList} list was unreadable (${describeEndpointError(unreadError)}), so ${isFederalTenant ? "this federal-domain tenant" : "the tenant"} cannot be judged on half of the certificate inventory`,
+        "Record whether a Smart Card IdP or certificate authenticator is ACTIVE under Security > Identity Providers and Security > Authenticators.",
+        `Org URL: ${config.orgUrl} | ${data.idps.error ? "IdP" : "Authenticator"} data unavailable: ${unreadError}`,
       ),
     );
   } else if (isFederalTenant) {
@@ -2402,11 +4060,7 @@ export function assessOktaAuthentication(
         "OKTA-AUTH-008",
         "Fail",
         "No ACTIVE certificate-oriented authentication method was detected for a federal-domain tenant.",
-        [
-          `Org URL: ${config.orgUrl}`,
-          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
-          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
-        ],
+        [`Org URL: ${config.orgUrl}`],
         "Validate whether PIV/CAC or certificate-based authentication is required for this tenant and configure it if so.",
       ),
     );
@@ -2416,11 +4070,7 @@ export function assessOktaAuthentication(
         "OKTA-AUTH-008",
         "Manual",
         "No ACTIVE certificate-oriented authentication method was detected.",
-        [
-          `Org URL: ${config.orgUrl}`,
-          ...(data.idps.error ? [`IdP data unavailable: ${data.idps.error}`] : []),
-          ...(data.authenticators.error ? [`Authenticator data unavailable: ${data.authenticators.error}`] : []),
-        ],
+        [`Org URL: ${config.orgUrl}`],
         "If this Okta tenant supports federal or smart-card requirements, verify whether certificate-based authentication should be added.",
         {
           manualNote:
@@ -2511,42 +4161,45 @@ export function assessOktaAuthentication(
     );
   }
 
+  const authenticationDatasets = [
+    data.signOnPolicies,
+    data.signOnPolicyRules,
+    data.passwordPolicies,
+    data.passwordPolicyRules,
+    data.mfaPolicies,
+    data.accessPolicies,
+    data.accessPolicyRules,
+    data.authenticators,
+    data.idps,
+    data.authorizationServers,
+    data.defaultAuthorizationServer,
+    data.orgFactors,
+  ];
   const snapshotSummary = {
-    active_authenticators: activeAuthenticators.length,
-    strong_authenticators: strongAuthenticators.length,
-    phishing_resistant_authenticators: phishingResistantAuthenticators.length,
-    restricted_authenticators: restrictedAuthenticators.length,
-    okta_verify_fips_mode: fipsMode ?? "not reported",
-    password_policies: passwordPolicies.length,
-    sign_on_policies: data.signOnPolicies.data.length,
-    access_policies: data.accessPolicies.data.length,
-    admin_dashboard_policies: adminPolicyCount,
-    admin_mfa_rules: adminMfaRules.length,
+    active_authenticators: countIfCollected(activeAuthenticators.length, data.authenticators),
+    strong_authenticators: countIfCollected(strongAuthenticators.length, data.authenticators),
+    phishing_resistant_authenticators: countIfCollected(phishingResistantAuthenticators.length, data.authenticators),
+    restricted_authenticators: countIfCollected(restrictedAuthenticators.length, data.authenticators),
+    okta_verify_fips_mode: labelIfCollected(fipsMode ?? "not reported", data.authenticators),
+    password_policies: countIfCollected(passwordPolicies.length, data.passwordPolicies),
+    sign_on_policies: countIfCollected(data.signOnPolicies.data.length, data.signOnPolicies),
+    access_policies: countIfCollected(data.accessPolicies.data.length, data.accessPolicies),
+    admin_dashboard_policies: countIfCollected(adminPolicyCount, data.signOnPolicies, data.accessPolicies),
+    admin_mfa_rules: countIfCollected(adminMfaRules.length, data.signOnPolicies, data.signOnPolicyRules, data.accessPolicies, data.accessPolicyRules),
     federal_domain: String(isFederalTenant),
-    dataset_errors: listErrors([
-      data.signOnPolicies,
-      data.signOnPolicyRules,
-      data.passwordPolicies,
-      data.passwordPolicyRules,
-      data.mfaPolicies,
-      data.accessPolicies,
-      data.accessPolicyRules,
-      data.authenticators,
-      data.idps,
-      data.authorizationServers,
-      data.defaultAuthorizationServer,
-      data.orgFactors,
-    ]).length,
+    dataset_errors: listErrors(authenticationDatasets).length,
+    datasets_not_collected: countNotCollected(authenticationDatasets),
   };
 
+  const demoted = applyTruncationDemotions(findings, data, AUTHENTICATION_FINDING_SOURCES);
   return {
     category: "authentication",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta authentication assessment",
       hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -2582,6 +4235,8 @@ export function assessOktaAdminAccess(
     );
   } else if (privilegedUsers.length === 0) {
     findings.push(manualFinding("OKTA-ADMIN-001", "Super admin concentration", emptyPrivilegedCause, roleAssigneeExport));
+  } else if (data.userRoles.notCollected) {
+    findings.push(manualForDataset("OKTA-ADMIN-001", "Super admin concentration", data.userRoles, roleAssigneeExport));
   } else {
     const baseStatus: OktaFindingStatus =
       superAdmins.length <= 2 ? "Pass" : superAdmins.length <= 5 ? "Partial" : "Fail";
@@ -2628,7 +4283,7 @@ export function assessOktaAdminAccess(
           ? `${stalePrivileged.length} privileged accounts are stale or non-active.`
           : unknownActivityPrivileged.length > 0
             ? `${unknownActivityPrivileged.length} privileged accounts have no lastLogin timestamp, so their activity cannot be confirmed.`
-            : `All ${privilegedUsers.length} privileged accounts are ACTIVE with a sign-in within 90 days${data.userRoles.error ? " (role lookups were incomplete)" : ""}.`,
+            : `All ${privilegedUsers.length} privileged accounts are ACTIVE with a sign-in within 90 days${data.userRoles.notCollected ? " (every role lookup failed)" : data.userRoles.error ? " (role lookups were incomplete)" : ""}.`,
         [
           ...(data.userRoles.error ? [`Partial data: ${data.userRoles.error}`] : []),
           ...stalePrivileged.map(
@@ -2902,39 +4557,42 @@ export function assessOktaAdminAccess(
     );
   }
 
+  const adminDatasets = [
+    data.usersWithRoleAssignments,
+    data.userRoles,
+    data.groups,
+    data.privilegedGroupRoles,
+    data.privilegedGroupMembers,
+    data.users,
+    data.privilegedUserFactors,
+    data.oktaSupportAccess,
+    data.thirdPartyAdminSetting,
+  ];
   const snapshotSummary = {
-    privileged_users: privilegedUsers.length,
-    super_admins: superAdmins.length,
-    stale_privileged_users: stalePrivileged.length,
-    privileged_users_without_last_login: unknownActivityPrivileged.length,
-    privileged_users_factor_checked: factorsReadCount,
-    privileged_groups_reviewed: privilegedGroups.length,
-    users_listed: users.length,
-    users_listing_truncated: String(Boolean(data.users.truncated)),
-    stale_active_users: staleActiveUsers.length,
-    never_activated_users: neverActivatedUsers.length,
-    okta_support_access: supportState ?? "unknown",
-    dataset_errors: listErrors([
-      data.usersWithRoleAssignments,
-      data.userRoles,
-      data.groups,
-      data.privilegedGroupRoles,
-      data.privilegedGroupMembers,
-      data.users,
-      data.privilegedUserFactors,
-      data.oktaSupportAccess,
-      data.thirdPartyAdminSetting,
-    ]).length,
+    privileged_users: countIfCollected(privilegedUsers.length, data.usersWithRoleAssignments),
+    super_admins: countIfCollected(superAdmins.length, data.usersWithRoleAssignments, data.userRoles),
+    stale_privileged_users: countIfCollected(stalePrivileged.length, data.usersWithRoleAssignments),
+    privileged_users_without_last_login: countIfCollected(unknownActivityPrivileged.length, data.usersWithRoleAssignments),
+    privileged_users_factor_checked: countIfCollected(factorsReadCount, data.privilegedUserFactors),
+    privileged_groups_reviewed: countIfCollected(privilegedGroups.length, data.groups),
+    users_listed: countIfCollected(users.length, data.users),
+    users_listing_truncated: labelIfCollected(String(Boolean(data.users.truncated)), data.users),
+    stale_active_users: countIfCollected(staleActiveUsers.length, data.users),
+    never_activated_users: countIfCollected(neverActivatedUsers.length, data.users),
+    okta_support_access: labelIfCollected(supportState ?? "unknown", data.oktaSupportAccess),
+    dataset_errors: listErrors(adminDatasets).length,
+    datasets_not_collected: countNotCollected(adminDatasets),
   };
 
+  const demoted = applyTruncationDemotions(findings, data, ADMIN_ACCESS_FINDING_SOURCES);
   return {
     category: "admin_access",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta admin-access assessment",
       new URL(config.orgUrl).hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -3119,6 +4777,7 @@ export function assessOktaIntegrations(
             ? riskAwareRules.map((rule) => recordName(rule))
             : ["No ACTIVE sign-on or access rules with risk, device, or network conditions were returned."]),
           ...policyErrors.map((error) => `Partial policy data: ${error}`),
+          ...(data.networkZones.error ? [`Network zones unreadable (custom zone count unknown): ${data.networkZones.error}`] : []),
         ],
         "Use contextual access rules that incorporate risk, device, or network conditions for higher assurance scenarios.",
       ),
@@ -3181,15 +4840,16 @@ export function assessOktaIntegrations(
       ),
     );
   } else {
-    const status: OktaFindingStatus =
+    const baseStatus: OktaFindingStatus =
       deactivationApps.length > 0 ? "Pass" : provisioningApps.length > 0 ? "Fail" : "Partial";
+    const status = data.groupRules.error ? capAtPartial(baseStatus) : baseStatus;
     findings.push(
       buildFinding(
         "OKTA-INTEG-006",
         status,
-        status === "Pass"
-          ? `${deactivationApps.length} ACTIVE apps push user deactivation downstream (${provisioningApps.length} apps have provisioning features).`
-          : status === "Fail"
+        baseStatus === "Pass"
+          ? `${deactivationApps.length} ACTIVE apps push user deactivation downstream (${provisioningApps.length} apps have provisioning features)${data.groupRules.error ? "; group rules were unreadable, so rule-driven assignment automation could not be confirmed" : ""}.`
+          : baseStatus === "Fail"
             ? `${provisioningApps.length} ACTIVE apps have provisioning features but none push user deactivation.`
             : "No ACTIVE app exposes provisioning features; deprovisioning automation could not be observed through the Management API.",
         [
@@ -3204,40 +4864,43 @@ export function assessOktaIntegrations(
     );
   }
 
+  const integrationDatasets = [
+    data.apps,
+    data.trustedOrigins,
+    data.networkZones,
+    data.accessPolicies,
+    data.accessPolicyRules,
+    data.signOnPolicies,
+    data.signOnPolicyRules,
+    data.idps,
+    data.authorizationServers,
+    data.groupRules,
+  ];
   const snapshotSummary = {
-    applications: apps.length,
-    active_applications: activeApps.length,
-    risky_oidc_apps: riskyApps.length,
-    trusted_origins: trustedOrigins.length,
-    insecure_trusted_origins: insecureOrigins.length,
-    custom_network_zones: customZones.length,
-    contextual_rules: riskAwareRules.length,
-    inactive_apps: inactiveApps.length,
-    provisioning_apps: provisioningApps.length,
-    deactivation_push_apps: deactivationApps.length,
-    active_group_rules: activeGroupRules.length,
-    dataset_errors: listErrors([
-      data.apps,
-      data.trustedOrigins,
-      data.networkZones,
-      data.accessPolicies,
-      data.accessPolicyRules,
-      data.signOnPolicies,
-      data.signOnPolicyRules,
-      data.idps,
-      data.authorizationServers,
-      data.groupRules,
-    ]).length,
+    applications: countIfCollected(apps.length, data.apps),
+    active_applications: countIfCollected(activeApps.length, data.apps),
+    risky_oidc_apps: countIfCollected(riskyApps.length, data.apps),
+    trusted_origins: countIfCollected(trustedOrigins.length, data.trustedOrigins),
+    insecure_trusted_origins: countIfCollected(insecureOrigins.length, data.trustedOrigins),
+    custom_network_zones: countIfCollected(customZones.length, data.networkZones),
+    contextual_rules: countIfCollected(riskAwareRules.length, data.signOnPolicies, data.signOnPolicyRules, data.accessPolicies, data.accessPolicyRules),
+    inactive_apps: countIfCollected(inactiveApps.length, data.apps),
+    provisioning_apps: countIfCollected(provisioningApps.length, data.apps),
+    deactivation_push_apps: countIfCollected(deactivationApps.length, data.apps),
+    active_group_rules: countIfCollected(activeGroupRules.length, data.groupRules),
+    dataset_errors: listErrors(integrationDatasets).length,
+    datasets_not_collected: countNotCollected(integrationDatasets),
   };
 
+  const demoted = applyTruncationDemotions(findings, data, INTEGRATION_FINDING_SOURCES);
   return {
     category: "integrations",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta integration assessment",
       new URL(config.orgUrl).hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -3318,18 +4981,27 @@ export function assessOktaMonitoring(
       ),
     );
   } else {
+    const events = data.systemLogs.data;
+    const logsTruncated = Boolean(data.systemLogs.truncated);
+    const logsNote = data.systemLogs.truncationNote ?? "the System Log walk stopped before the window was exhausted, total unknown.";
+    const baseStatus: OktaFindingStatus = events.length > 0 ? "Pass" : "Partial";
     findings.push(
       buildFinding(
         "OKTA-MON-002",
-        data.systemLogs.data.length > 0 ? "Pass" : "Partial",
-        data.systemLogs.data.length > 0
-          ? `Retrieved ${data.systemLogs.data.length} system log events from the last ${LOOKBACK_DAYS} days.`
+        logsTruncated ? capAtPartial(baseStatus) : baseStatus,
+        events.length > 0
+          ? logsTruncated
+            ? `Retrieved at least ${events.length} system log events from the last ${LOOKBACK_DAYS} days (page-capped sample, total unknown): ${logsNote}`
+            : `Retrieved ${events.length} system log events from the last ${LOOKBACK_DAYS} days.`
           : "System log access succeeded but no recent events were returned, which is unexpected for an active org.",
-        data.systemLogs.data.slice(0, 5).map((entry) => {
-          const published = asString(entry.published) ?? "unknown";
-          const eventType = asString(entry.eventType) ?? "unknown";
-          return `${published}: ${eventType}`;
-        }),
+        [
+          ...events.slice(0, 5).map((entry) => {
+            const published = asString(entry.published) ?? "unknown";
+            const eventType = asString(entry.eventType) ?? "unknown";
+            return `${published}: ${eventType}`;
+          }),
+          ...(logsTruncated ? [`Partial data: ${logsNote}`] : []),
+        ],
         "Ensure the System Log API remains readable and that audit records are retained or forwarded to a downstream store.",
       ),
     );
@@ -3362,7 +5034,10 @@ export function assessOktaMonitoring(
         "OKTA-MON-003",
         threatStatus,
         `ThreatInsight mode: ${insightMode}.`,
-        [JSON.stringify(data.threatInsight.data)],
+        [
+          `ThreatInsight action: ${insightMode}; excluded zones: ${asArray(data.threatInsight.data.excludeZones).length}`,
+          ...(asString(data.threatInsight.data.lastUpdated) ? [`Last updated: ${asString(data.threatInsight.data.lastUpdated)}`] : []),
+        ],
         "Use Okta ThreatInsight in at least audit mode, and prefer block mode when the deployment model supports it.",
       ),
     );
@@ -3419,7 +5094,7 @@ export function assessOktaMonitoring(
         "OKTA-MON-005",
         "Pass",
         "Zero SSWS API tokens exist while auditing through an OAuth service app; an empty token inventory is compliant by intent because no long-lived static tokens remain.",
-        [`Auth mode: ${config.authMode}`, "Token inventory: empty with no error"],
+        [`Auth mode: ${config.authMode}`, "API token inventory: empty with no error"],
         "Keep using OAuth service apps with scoped short-lived access tokens instead of SSWS tokens.",
       ),
     );
@@ -3505,7 +5180,7 @@ export function assessOktaMonitoring(
         "OKTA-MON-007",
         "Pass",
         "Zero SSWS API tokens exist while auditing through an OAuth service app; an empty token inventory is compliant by intent.",
-        [`Auth mode: ${config.authMode}`, "Token inventory: empty with no error"],
+        [`Auth mode: ${config.authMode}`, "API token inventory: empty with no error"],
         "Keep SSWS token creation restricted and prefer OAuth service apps.",
       ),
     );
@@ -3554,24 +5229,30 @@ export function assessOktaMonitoring(
   } else {
     const technicalStatus = (asString(technicalContact?.userStatus) ?? "").toUpperCase();
     const technicalUserId = asString(technicalContact?.userId);
-    const baseStatus: OktaFindingStatus = !technicalContact || !technicalUserId
-      ? "Fail"
-      : technicalStatus === "ACTIVE"
-        ? "Pass"
-        : technicalStatus === ""
-          ? "Partial"
-          : "Fail";
+    // A failed TECHNICAL lookup drops the contact from the resolved list, which is a permission gap, not a missing assignment.
+    const technicalLookupFailed = !technicalContact && /\bTECHNICAL\b/.test(data.orgContacts.error ?? "");
+    const baseStatus: OktaFindingStatus = technicalLookupFailed
+      ? "Partial"
+      : !technicalContact || !technicalUserId
+        ? "Fail"
+        : technicalStatus === "ACTIVE"
+          ? "Pass"
+          : technicalStatus === ""
+            ? "Partial"
+            : "Fail";
     findings.push(
       buildFinding(
         "OKTA-MON-008",
         data.orgContacts.error ? capAtPartial(baseStatus) : baseStatus,
         baseStatus === "Pass"
           ? "The technical contact resolves to an ACTIVE Okta user."
-          : baseStatus === "Partial"
-            ? "A technical contact is assigned, but the contact user's status could not be read."
-            : technicalContact && technicalUserId
-              ? `The technical contact user is ${technicalStatus || "unknown"}, so security notifications may not reach an active administrator.`
-              : "No technical contact user is assigned for the org.",
+          : technicalLookupFailed
+            ? "The technical contact lookup failed, so the assignment could not be verified (see the contact resolution error in evidence)."
+            : baseStatus === "Partial"
+              ? "A technical contact is assigned, but the contact user's status could not be read."
+              : technicalContact && technicalUserId
+                ? `The technical contact user is ${technicalStatus || "unknown"}, so security notifications may not reach an active administrator.`
+                : "No technical contact user is assigned for the org.",
         [
           ...contacts.map(
             (contact) =>
@@ -3601,39 +5282,42 @@ export function assessOktaMonitoring(
     ),
   );
 
+  const monitoringDatasets = [
+    data.eventHooks,
+    data.logStreams,
+    data.systemLogs,
+    data.behaviors,
+    data.threatInsight,
+    data.apiTokens,
+    data.deviceAssurance,
+    data.orgContacts,
+  ];
   const snapshotSummary = {
-    active_event_hooks: activeHooks.length,
-    active_log_streams: activeStreams.length,
-    system_log_events: data.systemLogs.data.length,
-    behaviors: data.behaviors.data.length,
-    threat_insight_mode: insightMode,
-    api_tokens: tokens.length,
-    stale_api_tokens: staleTokens.length,
-    undated_api_tokens: undatedTokens.length,
-    unrestricted_api_tokens: unrestrictedTokens.length,
-    expired_api_tokens: expiredTokens.length,
-    device_assurance_policies: data.deviceAssurance.data.length,
-    org_contacts_resolved: contacts.length,
-    dataset_errors: listErrors([
-      data.eventHooks,
-      data.logStreams,
-      data.systemLogs,
-      data.behaviors,
-      data.threatInsight,
-      data.apiTokens,
-      data.deviceAssurance,
-      data.orgContacts,
-    ]).length,
+    active_event_hooks: countIfCollected(activeHooks.length, data.eventHooks),
+    active_log_streams: countIfCollected(activeStreams.length, data.logStreams),
+    system_log_events: countIfCollected(data.systemLogs.data.length, data.systemLogs),
+    behaviors: countIfCollected(data.behaviors.data.length, data.behaviors),
+    threat_insight_mode: labelIfCollected(insightMode, data.threatInsight),
+    api_tokens: countIfCollected(tokens.length, data.apiTokens),
+    stale_api_tokens: countIfCollected(staleTokens.length, data.apiTokens),
+    undated_api_tokens: countIfCollected(undatedTokens.length, data.apiTokens),
+    unrestricted_api_tokens: countIfCollected(unrestrictedTokens.length, data.apiTokens),
+    expired_api_tokens: countIfCollected(expiredTokens.length, data.apiTokens),
+    device_assurance_policies: countIfCollected(data.deviceAssurance.data.length, data.deviceAssurance),
+    org_contacts_resolved: countIfCollected(contacts.length, data.orgContacts),
+    dataset_errors: listErrors(monitoringDatasets).length,
+    datasets_not_collected: countNotCollected(monitoringDatasets),
   };
 
+  const demoted = applyTruncationDemotions(findings, data, MONITORING_FINDING_SOURCES);
   return {
     category: "monitoring",
-    findings,
-    summary: summarizeFindings(findings),
+    findings: demoted,
+    summary: summarizeFindings(demoted),
     text: buildAssessmentText(
       "Okta monitoring assessment",
       new URL(config.orgUrl).hostname,
-      findings,
+      demoted,
       snapshotSummary,
     ),
     snapshotSummary,
@@ -3666,18 +5350,16 @@ export async function runOktaAccessCheck(
         path: probe.path,
         status: "ok",
         detail: "readable",
+        httpStatus: null,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const httpStatus = errorStatus(error);
       probes.push({
         key: probe.key,
         path: probe.path,
-        status: /\(403 /.test(message)
-          ? "forbidden"
-          : /\(401 /.test(message)
-            ? "unauthorized"
-            : "error",
-        detail: message,
+        status: httpStatus === 403 ? "forbidden" : httpStatus === 401 ? "unauthorized" : "error",
+        detail: errorText(error),
+        httpStatus,
       });
     }
   }
@@ -3699,8 +5381,9 @@ export async function runOktaAccessCheck(
   };
 }
 
+/** Every JSON document in the bundle passes through the rule 9 scrubber once more, so a value that bypassed collection-time redaction still never lands on disk. */
 function serializeJson(value: unknown): string {
-  return JSON.stringify(value, null, 2);
+  return JSON.stringify(redactSnapshot(value), null, 2);
 }
 
 function markdownEscapePipes(value: string): string {
@@ -3817,7 +5500,9 @@ function buildQuickReference(): string {
   return [
     "# Okta Audit Bundle Quick Reference",
     "",
-    "- `core_data/` contains raw Okta API responses used during this assessment.",
+    "- `core_data/` contains the Okta API responses used during this assessment with credential-bearing fields (client secrets, passwords, header values, tokens) replaced by [REDACTED], event hook URIs reduced to scheme and host, and System Log events projected to identity and outcome fields.",
+    "- A core_data file for a dataset that was denied, errored, or never requested holds a marker object ({ collected: false, status, endpoint, error }) rather than an empty list; a readable inventory with no records is written as []. Per-parent files carry a marker under the id of every child list that failed.",
+    "- `core_data/collection_status.json` lists every core_data file with collected, complete, count, truncated, and the failed request's status and endpoint; flags of a dataset that was not collected are null.",
     "- `analysis/` contains normalized findings and category summaries.",
     "- `compliance/` contains the executive summary, unified matrix, and per-framework reports.",
     "- `compliance/fedramp/oscal_assessment_results.json` is an OSCAL 1.1.2 assessment-results document keyed by NIST SP 800-53 objective ids.",
@@ -4069,52 +5754,58 @@ export async function exportOktaAuditBundle(
     ...listErrors(Object.values(adminAccess)),
     ...listErrors(Object.values(integrations)),
     ...listErrors(Object.values(monitoring)),
-    ...listTruncations(Object.values(adminAccess)).map((note) => `Truncated inventory: ${note}`),
+    ...listTruncations([
+      ...Object.values(authentication),
+      ...Object.values(adminAccess),
+      ...Object.values(integrations),
+      ...Object.values(monitoring),
+    ]).map((note) => `Truncated inventory: ${note}`),
   ];
 
   const outputDir = await nextAvailableAuditDir(
     outputRoot,
     safeDirName(`${new URL(config.orgUrl).hostname}-audit-bundle`),
   );
-  const coreDataFiles: Array<[string, unknown]> = [
-    ["core_data/sign_on_policies.json", authentication.signOnPolicies.data],
-    ["core_data/sign_on_policy_rules.json", authentication.signOnPolicyRules.data],
-    ["core_data/password_policies.json", authentication.passwordPolicies.data],
-    ["core_data/password_policy_rules.json", authentication.passwordPolicyRules.data],
-    ["core_data/mfa_enrollment_policies.json", authentication.mfaPolicies.data],
-    ["core_data/access_policies.json", authentication.accessPolicies.data],
-    ["core_data/access_policy_rules.json", authentication.accessPolicyRules.data],
-    ["core_data/authenticators.json", authentication.authenticators.data],
-    ["core_data/idps.json", authentication.idps.data],
-    ["core_data/authorization_servers.json", authentication.authorizationServers.data],
-    ["core_data/default_authorization_server.json", authentication.defaultAuthorizationServer.data],
-    ["core_data/org_factors.json", authentication.orgFactors.data],
-    ["core_data/users_with_role_assignments.json", adminAccess.usersWithRoleAssignments.data],
-    ["core_data/user_roles.json", adminAccess.userRoles.data],
-    ["core_data/groups.json", adminAccess.groups.data],
-    ["core_data/privileged_group_roles.json", adminAccess.privilegedGroupRoles.data],
-    ["core_data/privileged_group_members.json", adminAccess.privilegedGroupMembers.data],
-    ["core_data/users.json", adminAccess.users.data],
-    ["core_data/privileged_user_factors.json", adminAccess.privilegedUserFactors.data],
-    ["core_data/okta_support_access.json", adminAccess.oktaSupportAccess.data],
-    ["core_data/third_party_admin_setting.json", adminAccess.thirdPartyAdminSetting.data],
-    ["core_data/apps.json", integrations.apps.data],
-    ["core_data/trusted_origins.json", integrations.trustedOrigins.data],
-    ["core_data/network_zones.json", integrations.networkZones.data],
-    ["core_data/group_rules.json", integrations.groupRules.data],
-    ["core_data/event_hooks.json", monitoring.eventHooks.data],
-    ["core_data/log_streams.json", monitoring.logStreams.data],
-    ["core_data/system_logs_recent.json", monitoring.systemLogs.data],
-    ["core_data/behaviors.json", monitoring.behaviors.data],
-    ["core_data/threat_insight.json", monitoring.threatInsight.data],
-    ["core_data/api_tokens.json", monitoring.apiTokens.data],
-    ["core_data/device_assurance.json", monitoring.deviceAssurance.data],
-    ["core_data/org_contacts.json", monitoring.orgContacts.data],
+  const coreDataFiles: OktaCoreDataFile[] = [
+    ["core_data/sign_on_policies.json", authentication.signOnPolicies, "list"],
+    ["core_data/sign_on_policy_rules.json", authentication.signOnPolicyRules, "map"],
+    ["core_data/password_policies.json", authentication.passwordPolicies, "list"],
+    ["core_data/password_policy_rules.json", authentication.passwordPolicyRules, "map"],
+    ["core_data/mfa_enrollment_policies.json", authentication.mfaPolicies, "list"],
+    ["core_data/access_policies.json", authentication.accessPolicies, "list"],
+    ["core_data/access_policy_rules.json", authentication.accessPolicyRules, "map"],
+    ["core_data/authenticators.json", authentication.authenticators, "list"],
+    ["core_data/idps.json", authentication.idps, "list"],
+    ["core_data/authorization_servers.json", authentication.authorizationServers, "list"],
+    ["core_data/default_authorization_server.json", authentication.defaultAuthorizationServer, "object"],
+    ["core_data/org_factors.json", authentication.orgFactors, "list"],
+    ["core_data/users_with_role_assignments.json", adminAccess.usersWithRoleAssignments, "list"],
+    ["core_data/user_roles.json", adminAccess.userRoles, "map"],
+    ["core_data/groups.json", adminAccess.groups, "list"],
+    ["core_data/privileged_group_roles.json", adminAccess.privilegedGroupRoles, "map"],
+    ["core_data/privileged_group_members.json", adminAccess.privilegedGroupMembers, "map"],
+    ["core_data/users.json", adminAccess.users, "list"],
+    ["core_data/privileged_user_factors.json", adminAccess.privilegedUserFactors, "map"],
+    ["core_data/okta_support_access.json", adminAccess.oktaSupportAccess, "object"],
+    ["core_data/third_party_admin_setting.json", adminAccess.thirdPartyAdminSetting, "object"],
+    ["core_data/apps.json", integrations.apps, "list"],
+    ["core_data/trusted_origins.json", integrations.trustedOrigins, "list"],
+    ["core_data/network_zones.json", integrations.networkZones, "list"],
+    ["core_data/group_rules.json", integrations.groupRules, "list"],
+    ["core_data/event_hooks.json", monitoring.eventHooks, "list"],
+    ["core_data/log_streams.json", monitoring.logStreams, "list"],
+    ["core_data/system_logs_recent.json", monitoring.systemLogs, "list"],
+    ["core_data/behaviors.json", monitoring.behaviors, "list"],
+    ["core_data/threat_insight.json", monitoring.threatInsight, "object"],
+    ["core_data/api_tokens.json", monitoring.apiTokens, "list"],
+    ["core_data/device_assurance.json", monitoring.deviceAssurance, "list"],
+    ["core_data/org_contacts.json", monitoring.orgContacts, "list"],
   ];
 
-  for (const [pathName, value] of coreDataFiles) {
-    await writeSecureTextFile(outputDir, pathName, serializeJson(value));
+  for (const [pathName, dataset] of coreDataFiles) {
+    await writeSecureTextFile(outputDir, pathName, serializeJson(coreDataSnapshot(dataset)));
   }
+  await writeSecureTextFile(outputDir, "core_data/collection_status.json", serializeJson(buildCollectionStatus(coreDataFiles)));
 
   for (const assessment of assessments) {
     await writeSecureTextFile(
@@ -4315,7 +6006,7 @@ export function registerOktaTools(pi: any): void {
         return renderAccessCheck(result);
       } catch (error) {
         return errorResult(
-          `Okta access check failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Okta access check failed: ${errorText(error)}`,
           { tool: "okta_check_access" },
         );
       }
@@ -4337,7 +6028,7 @@ export function registerOktaTools(pi: any): void {
         return renderAssessmentToolResult(assessOktaAuthentication(data, config));
       } catch (error) {
         return errorResult(
-          `Okta authentication assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Okta authentication assessment failed: ${errorText(error)}`,
           { tool: "okta_assess_authentication" },
         );
       }
@@ -4359,7 +6050,7 @@ export function registerOktaTools(pi: any): void {
         return renderAssessmentToolResult(assessOktaAdminAccess(data, config));
       } catch (error) {
         return errorResult(
-          `Okta admin-access assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Okta admin-access assessment failed: ${errorText(error)}`,
           { tool: "okta_assess_admin_access" },
         );
       }
@@ -4381,7 +6072,7 @@ export function registerOktaTools(pi: any): void {
         return renderAssessmentToolResult(assessOktaIntegrations(data, config));
       } catch (error) {
         return errorResult(
-          `Okta integration assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Okta integration assessment failed: ${errorText(error)}`,
           { tool: "okta_assess_integrations" },
         );
       }
@@ -4403,7 +6094,7 @@ export function registerOktaTools(pi: any): void {
         return renderAssessmentToolResult(assessOktaMonitoring(data, config));
       } catch (error) {
         return errorResult(
-          `Okta monitoring assessment failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Okta monitoring assessment failed: ${errorText(error)}`,
           { tool: "okta_assess_monitoring" },
         );
       }
@@ -4440,7 +6131,7 @@ export function registerOktaTools(pi: any): void {
         });
       } catch (error) {
         return errorResult(
-          `Okta audit export failed: ${error instanceof Error ? error.message : String(error)}`,
+          `Okta audit export failed: ${errorText(error)}`,
           { tool: "okta_export_audit_bundle" },
         );
       }

@@ -17,11 +17,65 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { parse as parseYaml } from "yaml";
+import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
+
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const YAML_ERROR_CODE_PATTERN = /^[A-Z_]+$/;
+
+interface ConfigFilePosition {
+  line: number;
+  column?: number;
+}
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the config loader: a missing file is simply absent, every
+ * other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+function readConfigFileText(pathname: string): string | undefined {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Sumo Logic config file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
+}
+
+/** Parse step: fixed text plus path, position, and validated code; nothing the parser said, quoted, or named. */
+function configFileParseError(pathname: string, code: string, position: ConfigFilePosition | undefined): Error {
+  const where = position ? ` at line ${position.line}${position.column ? `, column ${position.column}` : ""}` : "";
+  return new Error(`Unable to parse Sumo Logic config file: invalid YAML in ${pathname}${where} (${code})`);
+}
+
+/** The yaml package's own error code when the thrown value is a YAMLError (an unresolved alias throws a plain ReferenceError), otherwise a fixed code. */
+function yamlErrorCode(error: unknown): string {
+  return error instanceof YAMLError && YAML_ERROR_CODE_PATTERN.test(error.code) ? error.code : "INVALID_YAML";
+}
+
+function yamlErrorPosition(error: unknown): ConfigFilePosition | undefined {
+  if (!(error instanceof YAMLError)) return undefined;
+  const start = error.linePos?.[0];
+  if (!start || !Number.isInteger(start.line) || start.line < 1) return undefined;
+  return { line: start.line, column: Number.isInteger(start.col) && start.col > 0 ? start.col : undefined };
+}
+
+/** Parses config YAML without logging warnings (their pretty text quotes the source line) and throws the document's first error. */
+function parseConfigYaml(text: string): unknown {
+  const document = parseYamlDocument(text);
+  if (document.errors.length > 0) throw document.errors[0];
+  return document.toJS();
+}
 
 const DEFAULT_OUTPUT_DIR = "./export/sumologic";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -116,14 +170,29 @@ export interface SumologicResolvedConfig {
   sourceChain: string[];
 }
 
+/**
+ * One collected dataset. `complete` and `scope` describe a read that
+ * happened, so they are null (not false or "org") when the read failed;
+ * `endpoint` names the path whose request failed so the bundle can carry a
+ * not-collected marker instead of an empty inventory.
+ */
 export interface SumologicCollection<T> {
   ok: boolean;
   data?: T;
   error?: string;
   httpStatus?: number;
-  complete: boolean;
-  scope: "org" | "personal";
+  endpoint?: string;
+  complete: boolean | null;
+  scope: "org" | "personal" | null;
   count?: number;
+}
+
+/** What a bundle consumer reads in place of a list that was never collected. */
+export interface SumologicNotCollectedMarker {
+  collected: false;
+  status: number | null;
+  endpoint: string | null;
+  error: string | null;
 }
 
 export type SumologicPolicyName =
@@ -134,6 +203,26 @@ export type SumologicPolicyName =
   | "userConcurrentSessionsLimit"
   | "maxUserSessionTimeout"
   | "accessKeysLifetime";
+
+/**
+ * The members each documented object resource carries. A 200 body with none
+ * of them is not the resource (a proxy page, a foreign API's JSON) and is
+ * recorded as a not-collected marker rather than read as evidence.
+ */
+const POLICY_MEMBERS: Readonly<Record<SumologicPolicyName, readonly string[]>> = {
+  audit: ["enabled"],
+  searchAudit: ["enabled"],
+  shareDashboardsOutsideOrganization: ["enabled"],
+  dataAccessLevel: ["enabled"],
+  userConcurrentSessionsLimit: ["enabled", "maxConcurrentSessions"],
+  maxUserSessionTimeout: ["maxUserSessionTimeout"],
+  accessKeysLifetime: ["accessKeysLifetimeInDays"],
+};
+const ACCOUNT_STATUS_MEMBERS: readonly string[] = ["pricingModel", "planType", "applicationUse", "canUpdatePlan"];
+const PASSWORD_POLICY_MEMBERS: readonly string[] = ["minLength", "maxLength", "requireMfa", "maxPasswordAgeInDays"];
+const SERVICE_ALLOWLIST_STATUS_MEMBERS: readonly string[] = ["loginEnabled", "contentEnabled"];
+const FOLDER_MEMBERS: readonly string[] = ["id", "itemType", "children"];
+const CONTENT_PERMISSIONS_MEMBERS: readonly string[] = ["explicitPermissions", "implicitPermissions"];
 
 export interface SumologicReader {
   getResolvedConfig(): SumologicResolvedConfig;
@@ -162,8 +251,12 @@ export interface SumologicAccessSurface {
   name: string;
   endpoint: string;
   status: "readable" | "not_readable";
-  count?: number;
-  complete?: boolean;
+  /** Items seen on a readable surface; null when the probe did not succeed. */
+  count: number | null;
+  /** Whether pagination finished on a readable surface; null when the probe did not succeed. */
+  complete: boolean | null;
+  /** The observed HTTP status of a failed probe; null when the probe succeeded or failed before a response. */
+  httpStatus: number | null;
   error?: string;
   capabilityHint: string;
 }
@@ -417,9 +510,953 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
-function redactSecret(text: string, secret: string | undefined): string {
-  if (!secret || secret.length < 4) return text;
-  return text.split(secret).join("[REDACTED]");
+// ---------------------------------------------------------------------------------------------
+// Error-text hygiene (rule 9). Every error string this module records passes through
+// scrubErrorText when the API error is constructed and again where the error is recorded. Two
+// guards are construction requirements: a value inside any carrier (Authorization, Cookie,
+// Set-Cookie, x-api-key and similar headers, cookie or session assignments, URL userinfo and query
+// pairs, the Bearer, Basic, SSWS, Token, and ApiKey schemes, credential-named pairs) is removed
+// whatever its shape, and a configured secret is removed whatever its shape in its raw,
+// JSON-escaped, URL-encoded, base64, and base64url forms. Real token shapes (JWTs, PEM blocks, vendor
+// prefixes, hex digests, runs of 16 or more token characters with base64 symbols, scattered digits,
+// or token casing) are removed bare. A bare value shaped like a name (words joined by hyphens or
+// underscores with at most one digit group, such as prod-us-east-2026) is indistinguishable from a
+// resource name and stays; it is caught only inside a carrier or as a configured secret. A
+// token-shaped segment of a bare path (preceded by "/" outside a URL: a request target such as
+// /api/v1/users/<id>/factors or a config file path) is an identifier the run itself named and stays
+// so the endpoint reported is the one requested; inside a URL with a scheme every path segment keeps
+// the rule because webhook URLs carry their token there.
+//
+// The pair rule (reviewer C, item G): the value under a credential-named key (a credential word
+// anywhere in the name, compound and vendor environment names included: DB_PASSWORD,
+// SPLUNK_PASSWORD, OKTA_CLIENT_TOKEN) is removed whatever its shape and length in the "key=value",
+// "key: value", "key:value", and JSON forms, in prose and inside a JSON string alike; no plain-word
+// shape exempts it. Three key classes refine that:
+// - bearer ids: a key ending in "secret_id" (VAULT_SECRET_ID, role_secret_id, secretId) or naming a
+//   session id (session_id, sid, jsessionid, phpsessid, sessid) carries a bearer credential, so its
+//   value goes whatever the shape, a UUID included; this is decided before the setting test;
+// - settings: a credential-named key whose final segment is url, uri, endpoint, method, algorithm,
+//   audience, issuer, shape, type, mode, path, file, dir, limit, count, id, name, policy, or policies
+//   (token_endpoint, auth_method, token_type, api_key_id, password_policies,
+//   X-Snowflake-Authorization-Token-Type) names a setting, and
+//   its value stays unless it is token-shaped or a configured secret;
+// - webhooks: webhook*, *hook_url, and callback_url values lose their path and query and keep the
+//   origin, because the token of a webhook URL sits in its path.
+// Identifier keys without a credential word (OKTA_CLIENT_ID, SUMO_ACCESS_ID, SNOWFLAKE_ACCOUNT,
+// X-Request-Id) are not pairs under this rule; their values are judged by shape only.
+//
+// The escape rule (reviewer C, item H): a literal JSON escape is a boundary before every carrier
+// opener, so a header line that begins after one ("request headers:\u000aAuthorization: Splunk
+// <key>", "proxy:\n\tpassword: hunter2") is scrubbed as a header line, never as the value of the
+// word before the escape; see the note above ESCAPE_LETTER.
+//
+// The quote rule (reviewer C, items F and L): a quoted carrier value is read to the closing quote that
+// matches its opener (the same quote character behind the same backslash run), so an escaped inner
+// quote at any JSON depth is inner content and goes with the value; an unterminated quote and an
+// unquoted value end at a ";" or "," before the next header token, whose name may carry any RFC 7230
+// token character, so the following header keeps its name and its own treatment; see
+// readQuotedContent and scrubCookieHeaders.
+// ---------------------------------------------------------------------------------------------
+
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+const LONG_TOKEN_MIN_LENGTH = 16;
+const MIN_LETTERS_FOR_CASING = 6;
+
+// A literal JSON escape ("\n", "\r", "\t", "\b", "\f", "\/", "\uXXXX": the two- or six-character
+// sequence, not the control character) is a boundary before every carrier opener. A header name,
+// scheme word, pair key, URL, or token that begins right after one is read on its own, never as the
+// value of the word before the escape and never with the escape letter as its first character, and
+// a value, URL, or query pair ends at the backslash that opens the next escape. A backslash joins a
+// quote only as its escape, so a lone backslash is never read as an opening quote.
+const ESCAPE_LETTER = String.raw`(?:[nrtbf/]|u[0-9A-Fa-f]{4})`;
+/** The start of a carrier or token: outside a word (none of `wordCharacters` before it) or right after a literal escape, and not on an escape letter. */
+function carrierStart(wordCharacters: string): string {
+  return String.raw`(?:(?<![${wordCharacters}])|(?<=\\[nrtbf/]|\\u[0-9A-Fa-f]{4}))(?!(?<=\\)${ESCAPE_LETTER})`;
+}
+const CARRIER_START = carrierStart("A-Za-z0-9_");
+/** A quote unit at any JSON depth: the quote character and the backslashes that escape it (`"`, `\"`, `\\\"`). */
+const QUOTE_UNIT = String.raw`(?:\\*["'])`;
+
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
+// A URL wherever it sits in the text, spelled with "://" or with the JSON-escaped slashes a serialized
+// body carries ("https:\/\/host\/path"). In the escaped spelling "\/" is the URL's own path separator
+// and goes with it; after "://" it is the boundary every literal escape is, and the URL ends there.
+// The escaped form is unescaped for reading and written back escaped.
+const ESCAPED_SLASH = "\\/";
+const EMBEDDED_URL_PATTERN = new RegExp(String.raw`${CARRIER_START}[a-z][a-z0-9+.-]*:(?:\/\/[^\s"'<>()[\]{}\\]+|\\\/\\\/(?:\\\/|[^\s"'<>()[\]{}\\])+)`, "gi");
+// The userinfo ends at the first "/", "?", or "#": an "@" inside a query or fragment ("https://h?e=a@x.com&q=v") never turns the query into the host.
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+// A ";" inside a query value is part of the value (URLSearchParams semantics), so "?token=<v>;<rest>"
+// loses the whole value with no tail. The ";" separator belongs to Cookie and Set-Cookie parsing alone,
+// and the cookie reader runs before this pass, so a pair inside a cookie header is already gone. A pair
+// whose value is already the marker is left alone, so a second pass never grows it to "[REDACTED]]".
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>)\]}\\]+)/g;
+// The authorization scheme words, matched in any casing on both sides: a peer's error text may spell
+// "bearer" or "BASIC", and an Authorization carrier may carry "sNoWfLaKe". In prose, a scheme word
+// followed by a run of 8 or more token characters is a credential unless the run is prose: a mechanism
+// word ("Basic authentication"), a dotted version ("OAuth 2.0"), an auth-param of a challenge
+// (`Bearer realm="api"`), or one plain word or hyphenated lowercase compound after a spelling that is
+// as often an English word or a product name as a scheme: a lowercase spelling ("token provided", "the
+// bearer presented") or a product name in any casing ("Splunk Enterprise", "Snowflake statement
+// failed", "HMAC signature"). After a header-cased or upper-cased authorization scheme ("Bearer",
+// "BASIC", "SSWS") the run is the credential whatever its shape. A run with a digit, a symbol, or mixed
+// casing inside a word is never prose. The token after a scheme word may be quoted (plain, single, or
+// JSON-escaped); the quote is kept and the token removed.
+const SCHEME_WORDS = "bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|splunk|snowflake|hmac|aws4-hmac-sha256|veracode-hmac-sha-256";
+const SCHEME_VALUE_PATTERN = new RegExp(String.raw`${CARRIER_START}(${SCHEME_WORDS})\s+(${QUOTE_UNIT}?)([A-Za-z0-9._~+/=-]{8,})`, "gi");
+const SCHEME_PROSE_WORDS = new Set(["authentication", "authorization", "authenticated", "authorized", "credential", "credentials", "challenge"]);
+const PRODUCT_SCHEME_WORDS = new Set(["splunk", "snowflake", "hmac"]);
+const SCHEME_WORD_PATTERN = new RegExp(`^(?:${SCHEME_WORDS})$`, "i");
+const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+(?:-[a-z]+)*|[A-Z]+)$/;
+const VERSION_PATTERN = /^\d+(?:\.\d+)+$/;
+const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|charset|algorithm|qop|stale|domain|opaque|title|resource|client_id|authorization_uri|as_uri|ticket)=/i;
+// A value may begin with backslashes that open no escape and no quote (a Windows path, a stray
+// backslash); they go with the value rather than hiding it.
+const STRAY_BACKSLASHES = String.raw`(?:\\+(?![nrtbf/u"']))?`;
+const SCHEME_TOKEN_PATTERN = new RegExp(String.raw`^(\s+)(?!\[REDACTED\])(${QUOTE_UNIT}?)(${STRAY_BACKSLASHES}[^\s"'<>;,()[\]{}\\]+)`);
+// A pair key or value may sit in plain, single, or JSON-escaped quotes at any depth; the value ends at a quote or the escaping backslash.
+const ASSIGNMENT_KEY_PATTERN = new RegExp(String.raw`(${QUOTE_UNIT}?)${CARRIER_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(${QUOTE_UNIT}?\s*([:=])\s*(${QUOTE_UNIT}?))`, "g");
+const ASSIGNMENT_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])${STRAY_BACKSLASHES}[^\s"'<>;,&()[\]{}\\]+`, "y");
+const URL_ORIGIN_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/[^\s/?#@"'<>]+(?=[/?#]|$)/i;
+const SINGLE_RUN_PATTERN = /^[A-Za-z0-9+=_-]+$/;
+const BEARER_ID_KEY_PATTERN = /(?:secret|session|token)[_.-]?id$/i;
+const BEARER_ID_KEY_SEGMENTS = new Set(["sid", "jsessionid", "phpsessid", "sessid"]);
+const BEARER_ID_KEY_TAILS = new Set(["secret_id", "session_id", "token_id"]);
+// The final segments that name a setting rather than a credential, the AppRole settings an assessment
+// reports included (secret_id_ttl, token_max_ttl, secret_id_num_uses, token_bound_cidrs, token_accessor).
+const SETTING_KEY_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "policy", "policies", "ttl", "uses", "cidrs", "accessor"]);
+// A webhook key is URL-valued: the bare word, or a *_url, *_uri, or *_endpoint key with a hook word
+// before the suffix (webhook_url, slack_hook_uri, callback_url). webhook_count and webhook_secret are
+// not URLs and follow the pair rule for their own final segment.
+const WEBHOOK_KEYS = new Set(["webhook", "webhooks", "hook", "hooks"]);
+const WEBHOOK_URL_WORDS = new Set(["webhook", "webhooks", "hook", "hooks", "callback"]);
+const URL_KEY_SUFFIXES = new Set(["url", "uri", "endpoint"]);
+// Every token shape starts at a carrier start, so a token glued to a literal escape ("\neyJ...",
+// "\u000aAKIA...") is read after the escape and never with the escape letter as its first character.
+const JWT_IN_TEXT_PATTERN = new RegExp(String.raw`${CARRIER_START}eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*`, "g");
+const AWS_ACCESS_KEY_ID_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b`, "g");
+const AWS_SECRET_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9/+=")}[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Fa-f0-9]{32,}\b`, "g");
+const VENDOR_TOKEN_SHAPES: readonly string[] = [
+  String.raw`00[A-Za-z0-9_-]{40}\b`,
+  String.raw`xox[abopers]-[A-Za-z0-9-]{10,}`,
+  String.raw`gh[pousr]_[A-Za-z0-9]{20,}`,
+  String.raw`github_pat_[A-Za-z0-9_]{20,}`,
+  String.raw`glpat-[A-Za-z0-9_-]{20,}`,
+  String.raw`AIza[0-9A-Za-z_-]{35}\b`,
+  String.raw`ya29\.[0-9A-Za-z._-]{20,}`,
+  String.raw`sk_(?:live|test)_[A-Za-z0-9]{10,}`,
+  String.raw`SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}`,
+];
+const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = VENDOR_TOKEN_SHAPES.map((shape) => new RegExp(`${CARRIER_START}${shape}`, "g"));
+// "/", ".", ":", "@", "=", "\", and whitespace end a run, so URL path segments, dotted hostnames, the
+// two sides of a pair, and the text on either side of a literal escape are judged on their own; "="
+// joins a run only as trailing base64 padding that no value follows, so a key whose value was already
+// replaced or is quoted ("httpEventCollectorToken=[REDACTED]", "SPLUNK_ACS_TOKEN='[REDACTED]'") keeps its name.
+const LONG_TOKEN_RUN_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9+_-")}[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&\["'\\]))?`, "g");
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Trailing base64 padding is judged apart from the run it follows: `private_key_file=` is a setting
+// key whose value starts with a symbol, not a padded token.
+const BASE64_PADDING_PATTERN = /={1,2}$/;
+// A setting suffix concatenated onto another word (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID) still names the setting.
+const SETTING_KEY_SUFFIX_PATTERN = new RegExp(`(?:${[...SETTING_KEY_SUFFIXES].join("|")})$`);
+const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
+const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "sessid", "phpsessid", "auth", "nonce", "sas"]);
+// "session" carries a credential only as the final segment (session=, user_session=); session_context and session_policy name settings.
+const FINAL_CREDENTIAL_KEY_SEGMENTS = new Set(["session"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-amz-signature", "x-amz-credential", "x-amz-security-token", "x-goog-signature", "x-goog-credential", "oauth_signature", "oauth_token", "oauth_verifier", "proxy-authorization"]);
+
+function keySegments(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/** True when a header, query parameter, or pair name carries a credential; thresholds and file references are exempt. */
+function isCredentialCarrierKey(key: string): boolean {
+  if (isSensitiveArgumentKey(key)) return true;
+  if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
+  if (EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  const segments = keySegments(key);
+  if (FINAL_CREDENTIAL_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "")) return true;
+  return segments.some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+}
+
+type PairRule = "credential" | "setting" | "webhook" | "none";
+
+/** A key ending in "secret_id", "token_id", or a session id name carries a bearer credential whatever the value's shape: a Vault secret id is a UUID, a token id is the token, a session id is the session. */
+function isBearerIdKey(key: string, segments: readonly string[]): boolean {
+  if (BEARER_ID_KEY_PATTERN.test(key)) return true;
+  return BEARER_ID_KEY_TAILS.has(segments.slice(-2).join("_")) || BEARER_ID_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "");
+}
+
+/** A URL-valued webhook key (webhook, webhook_url, slack_hook_uri, callback_url) whose path carries the token; see WEBHOOK_KEYS. */
+function isWebhookKey(segments: readonly string[]): boolean {
+  if (segments.length === 1) return WEBHOOK_KEYS.has(segments[0] ?? "");
+  return URL_KEY_SUFFIXES.has(segments[segments.length - 1] ?? "") && segments.slice(0, -1).some((segment) => WEBHOOK_URL_WORDS.has(segment));
+}
+
+/** Whether a key's last word is a credential noun or the key is a bearer id: the test a bare path label must pass to be read as a pair. */
+function namesCredential(key: string): boolean {
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1] ?? "";
+  const noun = CREDENTIAL_ENCODING_WORDS.has(last) ? segments[segments.length - 2] ?? "" : last;
+  return CREDENTIAL_NOUN_PATTERN.test(noun) || isBearerIdKey(key, segments);
+}
+
+/** Authorization, Proxy-Authorization, and WWW-Authenticate carry a scheme word in front of the credential; every other key's value goes whatever word it starts with. */
+function isAuthorizationStyleKey(segments: readonly string[]): boolean {
+  return segments[segments.length - 1] === "authorization" || segments.slice(-2).join("_") === "www_authenticate";
+}
+
+/** The final segment names a setting, as its own word or concatenated onto another (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID); a bearer id is read before this test. */
+function isSettingSegment(segment: string): boolean {
+  return SETTING_KEY_SUFFIXES.has(segment) || SETTING_KEY_SUFFIX_PATTERN.test(segment);
+}
+
+/** How the value of a `key=value` or `key: value` pair is treated; see the pair rule above. */
+function pairRuleFor(key: string): PairRule {
+  const segments = keySegments(key);
+  if (isBearerIdKey(key, segments)) return "credential";
+  if (isWebhookKey(segments)) return "webhook";
+  if (!isCredentialCarrierKey(key)) return "none";
+  return isSettingSegment(segments[segments.length - 1] ?? "") ? "setting" : "credential";
+}
+
+/** A setting value is removed only when it is a single run of 16 or more characters with a real token shape (base64 symbols, scattered digits, or token casing); an identifier (0oa1audit, key-2024-01), a UUID, a scheme word, a mode name, or a URL stays for the later shape rules to judge. */
+function isTokenShapedValue(value: string): boolean {
+  return value.length >= LONG_TOKEN_MIN_LENGTH && SINGLE_RUN_PATTERN.test(value) && looksLikeToken(value);
+}
+
+/** A webhook value keeps its origin and loses its path and query; a value that is not a URL goes whole. */
+function webhookReplacement(value: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(value)?.[0];
+  return origin === undefined ? REDACTED : `${origin}/${REDACTED}`;
+}
+
+/** A 40-character base64 run is an AWS secret access key when it is random-looking; a bare path of word segments ("/api/v1/users/<id>/roles") that happens to span 40 characters is a request target and stays. */
+function looksLikeAwsSecret(run: string): boolean {
+  if (run.startsWith("/") || run.split("/").some((segment) => /^(?:[a-z]+|v\d+)$/.test(segment))) return false;
+  if (/[/+]/.test(run)) return true;
+  return /\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run);
+}
+
+/** MD5, SHA-1, and SHA-256 digests and hex-encoded keys: 32 or more hex characters mixing letters and digits. */
+function looksLikeHexDigest(run: string): boolean {
+  return /[A-Fa-f]/.test(run) && /\d/.test(run);
+}
+
+// camelCase and PascalCase identifiers: an optional lowercase head, capitalized words, and at most a
+// short trailing acronym ("frozenTimePeriodInSecs", "maxTotalDataSizeMB").
+const CAMEL_CASE_PATTERN = /^[a-z]*(?:[A-Z][a-z]+)*[A-Z]{0,4}$/;
+
+/**
+ * Token casing changes more often than once every three letters. Words and acronyms change at word
+ * boundaries only, and a camelCase identifier whose words average three or more letters is a name
+ * even when its case changes often ("frozenTimePeriodInSecs"); an alternating run of capitalized
+ * one- or two-letter fragments ("xKqZvBnMwLpRtYsHdG") has no such word structure and is a token.
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
+  }
+  if (changes * 3 <= letters.length) return false;
+  if (!CAMEL_CASE_PATTERN.test(letters)) return true;
+  const words = (letters.match(/[A-Z]/g) ?? []).length + (/^[a-z]/.test(letters) ? 1 : 0);
+  return words * 3 > letters.length;
+}
+
+/** The long-token rule: a UUID is an identifier; a base64 symbol, a second digit group anywhere in the run, or a "-" or "_" separated segment with token casing makes a token; words joined by "-" or "_" with at most one digit group are a name. */
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  if ((run.match(DIGIT_GROUP_PATTERN) ?? []).length > 1) return true;
+  return run.split(/[-_]/).some((segment) => hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, "")));
+}
+
+/** True when the run at `index` is a segment of a bare path: preceded by a path separator ("/" or a lone "\"; the escape "\/" is a boundary, not a separator) and not inside a URL that carries a scheme. */
+function isBarePathSegment(text: string, index: number, urlSpans: ReadonlyArray<readonly [number, number]>): boolean {
+  const before = text[index - 1];
+  if (before === "/" ? text[index - 2] === "\\" : before !== "\\") return false;
+  return !urlSpans.some(([start, end]) => index >= start && index < end);
+}
+
+/** The long-token rule over the text; a scheme word that happens to carry digits ("aws4-hmac-sha256") names a mechanism and stays. */
+function scrubBareTokens(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string, offset: number) =>
+    looksLikeToken(run.replace(BASE64_PADDING_PATTERN, "")) && !SCHEME_WORD_PATTERN.test(run) && !isBarePathSegment(text, offset, urlSpans) ? REDACTED : run,
+  );
+}
+
+// The credentials this process has configured or minted (a client's token, private key, client
+// assertion, and the access token or session it obtained), so every scrub pass removes them without
+// being handed the client: redactSnapshot on a string leaf, an error text built outside the client.
+// Each entry keeps its encoded forms, lower-cased, so a leaf that carries none of them is passed over
+// with a substring check; bounded so a long-lived process that mints tokens does not grow it without limit.
+const REGISTERED_SECRET_LIMIT = 64;
+interface RegisteredSecret {
+  readonly value: string;
+  readonly forms: readonly string[];
+}
+const registeredSecrets: RegisteredSecret[] = [];
+
+/** Registers the credentials a client was configured with or minted; a value under the configured-secret minimum is ignored. */
+export function registerConfiguredSecrets(values: ReadonlyArray<string | undefined>): void {
+  for (const value of values) {
+    if (typeof value !== "string" || value.length < MIN_CONFIGURED_SECRET_LENGTH || registeredSecrets.some((entry) => entry.value === value)) continue;
+    const forms = [...new Set(scrubbedFormsOf(value).map((form) => form.toLowerCase()))].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+    registeredSecrets.push({ value, forms });
+    if (registeredSecrets.length > REGISTERED_SECRET_LIMIT) registeredSecrets.shift();
+  }
+}
+
+/** The registered credentials whose encoded forms may occur in the text; a text that carries none skips the full pass. */
+function registeredSecretsIn(text: string): string[] {
+  if (registeredSecrets.length === 0) return [];
+  const lower = text.toLowerCase();
+  if (lower.length !== text.length) return registeredSecrets.map((entry) => entry.value);
+  return registeredSecrets.filter((entry) => entry.forms.some((form) => lower.includes(form))).map((entry) => entry.value);
+}
+
+/** Removes the secrets handed in and every registered credential in each encoded form; a handed-in value also goes wherever it stands. */
+function scrubConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const handed = [...new Set(secrets)].filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  const values = [...new Set([...handed, ...registeredSecretsIn(text)])];
+  if (values.length === 0) return text;
+  return scrubLiteralSecrets(scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED), handed);
+}
+
+/**
+ * The shared needle rule matches a form under eight characters only as a whole token, so a short
+ * passphrase glued into a longer run ("xhunter2y") would survive it. A value handed to the call is
+ * this client's own credential wherever it stands, so it goes literally as well, longest first; a
+ * value that is part of the marker itself is skipped so a second pass changes nothing.
+ */
+function scrubLiteralSecrets(text: string, values: readonly string[]): string {
+  let output = text;
+  for (const value of [...values].sort((left, right) => right.length - left.length)) {
+    if (!REDACTED.includes(value) && output.includes(value)) output = output.split(value).join(REDACTED);
+  }
+  return output;
+}
+
+/** A URL keeps its scheme, host, and path and loses its userinfo, query, and fragment; a slash-escaped URL is written back with its slashes escaped. */
+function scrubEmbeddedUrl(match: string): string {
+  const escaped = match.includes(ESCAPED_SLASH);
+  const spelled = escaped ? match.split(ESCAPED_SLASH).join("/") : match;
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(spelled)?.[0] ?? "";
+  const url = spelled.slice(0, spelled.length - trailing.length);
+  const parts = URL_PARTS_PATTERN.exec(url);
+  if (!parts) return match;
+  const [, scheme, hostAndPath, query, fragment] = parts;
+  const kept = `${scheme}${hostAndPath}`;
+  return `${escaped ? kept.split("/").join(ESCAPED_SLASH) : kept}${redactedUrlPart(query)}${redactedUrlPart(fragment)}${trailing}`;
+}
+
+/** A query or fragment with content becomes its delimiter and the marker; a bare delimiter (what an earlier pass left before its marker) carries nothing and stays, so a second pass adds no second marker. */
+function redactedUrlPart(part: string | undefined): string {
+  if (!part) return "";
+  return part.length > 1 ? `${part[0]}${REDACTED}` : part;
+}
+
+function scrubQueryPair(match: string, separator: string, key: string): string {
+  return isCredentialCarrierKey(key) ? `${separator}${key}=${REDACTED}` : match;
+}
+
+/** The word after a scheme word in prose is prose, not a credential, when it is a mechanism word, a dotted version, an auth-param, or one plain word after a lowercase spelling or a product name. */
+function isSchemeProse(scheme: string, word: string): boolean {
+  if (SCHEME_PROSE_WORDS.has(word.toLowerCase())) return true;
+  if (PLAIN_WORD_PATTERN.test(word) && (scheme === scheme.toLowerCase() || PRODUCT_SCHEME_WORDS.has(scheme.toLowerCase()))) return true;
+  return VERSION_PATTERN.test(word) || AUTH_PARAM_PATTERN.test(word);
+}
+
+function scrubSchemeValue(match: string, scheme: string, quote: string, value: string, offset: number, text: string): string {
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(value)?.[0] ?? "";
+  const word = value.slice(0, value.length - trailing.length);
+  if (isSchemeProse(scheme, word) || isRedactedPairKey(word, text, offset + match.length)) return match;
+  return `${scheme} ${quote}${REDACTED}${trailing}`;
+}
+
+/** A run that is a bare pair key with the marker right after it (`username="[REDACTED]"`, `access_token=[REDACTED]`) names a pair whose value an earlier pass removed, and keeps its name. */
+function isRedactedPairKey(word: string, text: string, index: number): boolean {
+  if (!PAIR_KEY_ONLY_PATTERN.test(word)) return false;
+  REDACTED_PAIR_VALUE_PATTERN.lastIndex = index;
+  return REDACTED_PAIR_VALUE_PATTERN.test(text);
+}
+
+// The RFC 7230 token characters, so a following header whose name carries a "." or other token
+// punctuation (X.Api.Key) is recognised as the next header rather than swallowed (item L).
+const NEXT_HEADER_NAME = "[!#$%&'*+.^_`|~0-9A-Za-z-]+";
+// A ";" or "," ends a carrier value when the text after it (past optional spaces) opens the next
+// header "Name:" token or a JSON fragment.
+const NEXT_HEADER_AFTER_SEPARATOR = new RegExp(String.raw`^[ \t]*(?:[{[]|${QUOTE_UNIT}?${NEXT_HEADER_NAME}${QUOTE_UNIT}?[ \t]*:)`);
+// A quoted value that opens with a scheme word keeps the scheme and its gap and loses the rest, except
+// that a scheme followed by a pair list is read pair by pair. The pairs are the credential: a quoted
+// value goes whatever its key (`Snowflake Token="<v>"`, `Digest response="<v>"`, `Bearer blob="<v>"`)
+// unless the key is a descriptive parameter (realm, qop, algorithm, ...), and a bare value follows its
+// key's own rule, so an HMAC header's "id=...,ts=...,nonce=...,sig=..." keeps its timestamp. A
+// challenge header (WWW-Authenticate) is read the same way, so its `realm="api"` stays and its nonce goes.
+const LEADING_SCHEME_IN_VALUE = /^([A-Za-z][A-Za-z0-9-]*)(\s+)(\S[\s\S]*)$/;
+const PAIR_LIST_START = /^[A-Za-z][A-Za-z0-9_.-]*=/;
+// The run after the scheme is a bare key ("Token=", "username=") whose value follows it.
+const PAIR_KEY_ONLY_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]*=$/;
+// The pairs of a request credential's list: a key up to its "=", a bare value, and the separator before
+// the next pair ("," with optional spaces, or spaces alone).
+const LIST_PAIR_KEY_PATTERN = /[A-Za-z][A-Za-z0-9_.-]*=/y;
+// A bare value that is already the marker reads as one value, so the list goes on past a pair an earlier pass removed.
+const LIST_BARE_VALUE_PATTERN = /\[REDACTED\]|[^\s"'<>;,()[\]{}\\]*/y;
+const LIST_PAIR_SEPARATOR_PATTERN = /[ \t]*,[ \t]*|[ \t]+/y;
+// The descriptive parameters of a credential's pair list, whose quoted value stays (`realm="api"`,
+// `qop="auth"`, `algorithm="SHA-256"`, a challenge's `error="invalid_token"`); every other quoted value
+// in the list is the credential.
+const LIST_KEPT_PARAM_PATTERN = /^(?:realm|qop|algorithm|charset|error|error_description|error_uri|scope)$/i;
+// The proof parameters of an authentication exchange: Digest's `response`, an HTTP Signatures or
+// OAuth 1.0 `signature` and `oauth_signature`, the MAC and Hawk schemes' `mac`, and an HMAC header's
+// `sig`. A proof's value is the credential wherever its pair sits in a list with a challenge parameter
+// (realm, nonce, cnonce, opaque, qop, or an oauth_* name), with or without a scheme word or a header in
+// front of the list, so `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge;
+// a proof-free challenge (`realm="api", qop="auth"`) and a pair list of another kind (`status=500
+// response=slow`) keep their values. Inside a scheme word's list a bare proof goes whatever its neighbours.
+const PROOF_PARAM_PATTERN = /^(?:response|signature|oauth_signature|mac|sig)$/i;
+const CHALLENGE_PARAM_PATTERN = /^(?:realm|nonce|cnonce|opaque|qop|oauth_[a-z0-9_]+)$/i;
+// The first key of a pair list, at a carrier start; the keys after it are read past the list separator.
+const PAIR_LIST_KEY_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Za-z][A-Za-z0-9_.-]*=`, "g");
+// The marker, in quotes or bare, where a pair's value stood before an earlier pass removed it.
+const REDACTED_PAIR_VALUE_PATTERN = new RegExp(String.raw`${QUOTE_UNIT}?\[REDACTED\]`, "y");
+// In prose, an authorization scheme word followed by a quoted pair opens a credential's pair list
+// ("Digest username="...", response="..."", "Bearer blob="..."") and the list rule applies; a product
+// name (Splunk, Snowflake, HMAC) followed by a quoted pair is prose about the product.
+const SCHEME_PAIR_LIST_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|aws4-hmac-sha256|veracode-hmac-sha-256)\s+(?=[A-Za-z][A-Za-z0-9_.-]*=${QUOTE_UNIT})`, "gi");
+// After a bare path label the text is prose ("/api/v1/api-tokens: request failed with 403",
+// "/oauth/token-request: invalid_client") and stays, unless the segment itself names a credential
+// in the singular (its last word is password, key, secret, token, passphrase, or assertion, alone
+// or followed by an encoding word such as pem or base64, or it is a bearer id): then the next token
+// is the value whatever its shape and whatever follows it ("kv/password: <value> [code 003001]",
+// "kv/privateKeyPem: <value>"), while a plural label ("api-tokens", "secrets") names a collection
+// and its colon continues as prose, and so does a label whose last word names a file or path
+// ("kv/private_key_file: /x/y.pem").
+const CREDENTIAL_NOUN_PATTERN = /(?:password|passwd|passphrase|pwd|secret|token|key|assertion)$/;
+const CREDENTIAL_ENCODING_WORDS = new Set(["pem", "der", "b64", "base64", "jwk"]);
+// A credential-named flag whose value is the next argument (`psql --password <value> -h db`), as a
+// spawned CLI echoes its command line; `--name=value` is a pair and is read by the pair rule.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)(?!\[REDACTED\])(?!-)([^\s"'<>;,&()[\]{}\\]+)`, "g");
+
+/** The number of backslashes in the run ending immediately before `index`. */
+function backslashRunBefore(text: string, index: number): number {
+  let count = 0;
+  while (index - count - 1 >= 0 && text[index - count - 1] === "\\") count += 1;
+  return count;
+}
+
+/** True when a ";" or "," at `index` precedes the next header "Name:" token or a JSON fragment. */
+function endsAtNextHeader(text: string, index: number): boolean {
+  const ch = text[index];
+  if (ch !== ";" && ch !== ",") return false;
+  return NEXT_HEADER_AFTER_SEPARATOR.test(text.slice(index + 1));
+}
+
+interface QuotedRead {
+  /** The value content between the opener and the closer (or the unterminated stop), to be redacted. */
+  content: string;
+  /** The index just past the value: past the closing quote unit when terminated, at the stop otherwise. */
+  end: number;
+  /** True when a matching closer was found; false when a raw newline, an outer string, or the next header token ended the value. */
+  terminated: boolean;
+}
+
+/** A quote unit opening a value at `start`: its leading backslash run and quote character, or undefined when `start` is not on a quote unit. */
+function openingQuoteUnit(text: string, start: number): { backslashes: number; quoteChar: string; contentStart: number } | undefined {
+  let backslashes = 0;
+  while (text[start + backslashes] === "\\") backslashes += 1;
+  const quoteChar = text[start + backslashes];
+  if (quoteChar !== '"' && quoteChar !== "'") return undefined;
+  return { backslashes, quoteChar, contentStart: start + backslashes + 1 };
+}
+
+/**
+ * Reads the content of a quoted value that opened with `openBackslashes` backslashes and quote char
+ * `quoteChar`. A quote of the same char preceded by the same backslash run closes it, so a deeper
+ * quote (more backslashes: an escaped inner quote at any JSON depth) is inner content; a raw newline,
+ * a shallower quote (an outer string closing), or a ";"/"," before the next header token ends it
+ * unterminated so the following header keeps its name.
+ */
+function readQuotedContent(text: string, contentStart: number, openBackslashes: number, quoteChar: string): QuotedRead {
+  let i = contentStart;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\n" || ch === "\r") return { content: text.slice(contentStart, i), end: i, terminated: false };
+    if (ch === quoteChar) {
+      const run = backslashRunBefore(text, i);
+      if (run === openBackslashes) return { content: text.slice(contentStart, i - run), end: i + 1, terminated: true };
+      if (run < openBackslashes) return { content: text.slice(contentStart, i - run), end: i - run, terminated: false };
+    }
+    if (endsAtNextHeader(text, i)) return { content: text.slice(contentStart, i), end: i, terminated: false };
+    i += 1;
+  }
+  return { content: text.slice(contentStart, i), end: i, terminated: false };
+}
+
+// A cookie header value that is not wholly quoted runs across ";"/"," separated pairs; these are the
+// characters that make up a bare pair name or value (everything but the delimiters handled below). An
+// apostrophe is an RFC 6265 token character ("my'pref=", "sid=O'..."), so it is content, not a quote.
+const COOKIE_PLAIN_CHAR = /[^\r\n\t <>"\\;,=]/;
+const SPACE_BEFORE_JSON = /^[ \t]*[{[]/;
+
+/**
+ * Reads an unquoted cookie header value from `start`: it runs across ";"/"," separated pairs whose
+ * values may themselves be quoted, and ends before a ";"/"," or a space that precedes the next header
+ * token or a JSON fragment, at a raw newline or tab, at a literal escape, or at a bare quote. A pair
+ * value opened with a quote is read quote-aware, and an unterminated one ends the whole value there so
+ * the following header keeps its name. Returns the index just past the value.
+ */
+function readUnquotedCookieValue(text: string, start: number): number {
+  if (!COOKIE_PLAIN_CHAR.test(text[start] ?? "")) return start;
+  let i = start + 1;
+  while (i < text.length) {
+    const ch = text[i];
+    if (COOKIE_PLAIN_CHAR.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (ch === "=") {
+      i += 1;
+      while (text[i] === " " || text[i] === "\t") i += 1;
+      const opener = openingQuoteUnit(text, i);
+      if (opener) {
+        const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+        if (!read.terminated) return read.end;
+        i = read.end;
+      }
+      continue;
+    }
+    if (ch === ";" || ch === ",") {
+      if (endsAtNextHeader(text, i)) break;
+      i += 1;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (SPACE_BEFORE_JSON.test(text.slice(i + 1))) break;
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+// A cookie or session header at a carrier start, up to the separator; the value is read procedurally.
+const COOKIE_HEADER_START = new RegExp(String.raw`${CARRIER_START}(set-cookie|cookies?)(${QUOTE_UNIT}?\s*[:=]\s*)`, "gi");
+
+/**
+ * Removes the value of every Cookie and Set-Cookie header. A wholly quoted value is read to its
+ * matching closer (an escaped inner quote at any JSON depth is inner content); an unquoted value runs
+ * across its pairs and ends before the next header token, so the following header keeps its name. The
+ * marker `[REDACTED]` is left untouched so the pass is idempotent.
+ */
+function scrubCookieHeaders(text: string): string {
+  COOKIE_HEADER_START.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = COOKIE_HEADER_START.exec(text)) !== null) {
+    const [whole, header, separator] = match;
+    if (whole.length === 0) {
+      COOKIE_HEADER_START.lastIndex += 1;
+      continue;
+    }
+    const valueStart = match.index + whole.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    let prefix: string;
+    let redacted: string;
+    let end: number;
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      if (read.content.length === 0 || read.content === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      const openerText = text.slice(valueStart, opener.contentStart);
+      const closerText = read.terminated ? text.slice(read.end - (opener.backslashes + 1), read.end) : "";
+      prefix = openerText;
+      redacted = `${REDACTED}${closerText}`;
+      end = read.end;
+    } else {
+      const valueEnd = readUnquotedCookieValue(text, valueStart);
+      if (valueEnd === valueStart) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      let contentEnd = valueEnd;
+      while (contentEnd > valueStart && (text[contentEnd - 1] === " " || text[contentEnd - 1] === "\t")) contentEnd -= 1;
+      if (text.slice(valueStart, contentEnd) === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      prefix = "";
+      redacted = `${REDACTED}${text.slice(contentEnd, valueEnd)}`;
+      end = valueEnd;
+    }
+    out += `${text.slice(last, match.index)}${header}${separator}${prefix}${redacted}`;
+    last = end;
+    COOKIE_HEADER_START.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+interface ListRead {
+  /** The text written in place of the list, from its first key to `end`. */
+  replacement: string;
+  /** The index just past the last pair read. */
+  end: number;
+}
+
+/** The bare value of a pair in a request credential's list follows its key's own rule: a credential or proof key loses it, a setting key loses a token-shaped one, a webhook key keeps its origin, and any other key keeps it. */
+function scrubBareListValue(key: string, value: string): string {
+  if (value.length === 0 || value === REDACTED) return value;
+  if (PROOF_PARAM_PATTERN.test(key)) return REDACTED;
+  const rule = pairRuleFor(key);
+  switch (rule) {
+    case "credential":
+      return REDACTED;
+    case "setting":
+      return isTokenShapedValue(value) ? REDACTED : value;
+    case "webhook":
+      return webhookReplacement(value);
+    case "none":
+      return value;
+    default: {
+      const unhandled: never = rule;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Reads one pair's value at `valueStart`, up to `limit`. The pairs of a credential's list are the
+ * credential, so a quoted value is removed whatever its key (`Snowflake Token="<v>"`, `Digest
+ * response="<v>"`, `Bearer blob="<v>"`) unless the key is a descriptive parameter (`realm="api"`),
+ * while a bare value follows its key's own rule so `qop=auth`, `nc=00000001`, and an HMAC header's
+ * timestamp stay legible and a bare proof (`response=<v>`, `sig=<v>`) goes. `terminated` is false when a
+ * quoted value never closed, which ends the list there.
+ */
+function readListPairValue(text: string, valueStart: number, key: string, limit: number): ListRead & { terminated: boolean } {
+  const opener = openingQuoteUnit(text, valueStart);
+  if (!opener) {
+    LIST_BARE_VALUE_PATTERN.lastIndex = valueStart;
+    const run = LIST_BARE_VALUE_PATTERN.exec(text)?.[0] ?? "";
+    const value = text.slice(valueStart, Math.min(valueStart + run.length, limit));
+    return { replacement: scrubBareListValue(key, value), end: valueStart + value.length, terminated: true };
+  }
+  const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+  const terminated = read.terminated && read.end <= limit;
+  const end = Math.min(read.end, limit);
+  const content = terminated ? read.content : text.slice(opener.contentStart, end);
+  const closer = terminated ? text.slice(read.end - opener.backslashes - 1, read.end) : "";
+  const value = content.length === 0 || content === REDACTED || LIST_KEPT_PARAM_PATTERN.test(key) ? content : REDACTED;
+  return { replacement: `${text.slice(valueStart, opener.contentStart)}${value}${closer}`, end, terminated };
+}
+
+/** Reads a credential's pair list from `start`, its first key, up to `limit`; the list ends at the first text that is not another pair. */
+function scrubRequestPairList(text: string, start: number, limit: number): ListRead {
+  let replacement = "";
+  let end = start;
+  let position = start;
+  while (position < limit) {
+    LIST_PAIR_KEY_PATTERN.lastIndex = position;
+    const key = LIST_PAIR_KEY_PATTERN.exec(text)?.[0];
+    if (key === undefined || position + key.length > limit) break;
+    const pair = readListPairValue(text, position + key.length, key.slice(0, -1), limit);
+    replacement += `${text.slice(end, position)}${key}${pair.replacement}`;
+    end = pair.end;
+    if (!pair.terminated) break;
+    LIST_PAIR_SEPARATOR_PATTERN.lastIndex = end;
+    const separator = LIST_PAIR_SEPARATOR_PATTERN.exec(text)?.[0];
+    if (separator === undefined) break;
+    position = end + separator.length;
+  }
+  return { replacement, end };
+}
+
+/**
+ * The run after a scheme word under an Authorization-style key, when it is a bare key whose value
+ * follows ("Token=", "username="). A quoted value opens the credential's pair list, read with the list
+ * rule under a request header and a challenge header alike. A key whose value is already the
+ * marker stays as it is, so a second pass adds nothing. Undefined when the run is the credential
+ * itself, which goes whole.
+ */
+function readSchemePairList(text: string, start: number, run: string, limit: number): ListRead | undefined {
+  if (!PAIR_KEY_ONLY_PATTERN.test(run)) return undefined;
+  const valueStart = start + run.length;
+  if (valueStart < limit && openingQuoteUnit(text, valueStart)) return scrubRequestPairList(text, start, limit);
+  if (text.startsWith(REDACTED, valueStart)) return { replacement: `${run}${REDACTED}`, end: valueStart + REDACTED.length };
+  return undefined;
+}
+
+/** Reads the quoted pair list after every authorization scheme word in prose (see SCHEME_PAIR_LIST_PATTERN) with the list rule; a list under a header was read by the assignment pass and reads the same a second time. */
+function scrubSchemePairLists(text: string): string {
+  SCHEME_PAIR_LIST_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SCHEME_PAIR_LIST_PATTERN.exec(text)) !== null) {
+    if (match[0].length === 0) {
+      SCHEME_PAIR_LIST_PATTERN.lastIndex += 1;
+      continue;
+    }
+    const list = scrubRequestPairList(text, match.index + match[0].length, text.length);
+    out += `${text.slice(last, match.index + match[0].length)}${list.replacement}`;
+    last = list.end;
+    SCHEME_PAIR_LIST_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+interface ListPair {
+  /** The pair's key, without its "=". */
+  key: string;
+  /** The value's content: between the quote units when quoted, the bare run otherwise. */
+  content: string;
+  /** The index of the content's first character. */
+  contentStart: number;
+}
+
+/**
+ * Reads the pair list whose first key starts at `start`: pairs separated by "," or spaces, with values
+ * quoted at any depth or bare. The list ends at the first text that is not another pair, and an
+ * unterminated quoted value ends it there.
+ */
+function readPairList(text: string, start: number): { pairs: ListPair[]; end: number } {
+  const pairs: ListPair[] = [];
+  let position = start;
+  let end = start;
+  while (position < text.length) {
+    LIST_PAIR_KEY_PATTERN.lastIndex = position;
+    const key = LIST_PAIR_KEY_PATTERN.exec(text)?.[0];
+    if (key === undefined) break;
+    const valueStart = position + key.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      pairs.push({ key: key.slice(0, -1), content: read.content, contentStart: opener.contentStart });
+      end = read.end;
+      if (!read.terminated) break;
+    } else {
+      LIST_BARE_VALUE_PATTERN.lastIndex = valueStart;
+      const content = LIST_BARE_VALUE_PATTERN.exec(text)?.[0] ?? "";
+      pairs.push({ key: key.slice(0, -1), content, contentStart: valueStart });
+      end = valueStart + content.length;
+    }
+    LIST_PAIR_SEPARATOR_PATTERN.lastIndex = end;
+    const separator = LIST_PAIR_SEPARATOR_PATTERN.exec(text)?.[0];
+    if (separator === undefined) break;
+    position = end + separator.length;
+  }
+  return { pairs, end };
+}
+
+/**
+ * Removes the value of every proof parameter (see PROOF_PARAM_PATTERN) in a pair list that also carries
+ * a challenge parameter, whatever the value's shape and whether or not a scheme word or a header
+ * precedes the list: `realm="api", nonce="n", response="<proof>"` as a data value, after a literal
+ * escape, or inside a JSON string. The other pairs keep their own rule, so `realm="api"` stays.
+ */
+function scrubProofPairLists(text: string): string {
+  PAIR_LIST_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = PAIR_LIST_KEY_PATTERN.exec(text)) !== null) {
+    const list = readPairList(text, match.index);
+    if (list.pairs.some((pair) => CHALLENGE_PARAM_PATTERN.test(pair.key))) {
+      for (const pair of list.pairs) {
+        if (!PROOF_PARAM_PATTERN.test(pair.key) || pair.content.length === 0 || pair.content === REDACTED) continue;
+        out += `${text.slice(last, pair.contentStart)}${REDACTED}`;
+        last = pair.contentStart + pair.content.length;
+      }
+    }
+    PAIR_LIST_KEY_PATTERN.lastIndex = list.end;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/**
+ * Replaces the value of every credential-named pair: `key=value`, `key: value`, `"key": "value"`,
+ * and `Header-Name: value`. The value goes whatever its shape (an `=` pair, a quoted value, a header
+ * value, a plain word in prose, or a word that happens to be a scheme word: `sslPassword=splunk
+ * rejected` and `db_password: token` lose their value). Only an Authorization-style key
+ * (Authorization, Proxy-Authorization, WWW-Authenticate) carries a scheme word in front of its
+ * credential, where the scheme is kept and the token removed (`Authorization: Bearer <token>`); a
+ * pair list after the scheme is read pair by pair, see LEADING_SCHEME_IN_VALUE. A setting key keeps
+ * a value that is not token-shaped, a bearer-id key loses a UUID, and a webhook key keeps only the
+ * origin. The last segment of a bare path used as a label
+ * ("/api/authn/v2/api_credentials: <detail>") is a request target, not a pair key, so the prose
+ * after it is kept, unless the segment names a credential in the singular ("kv/password: <value>"),
+ * whose next token is the value; inside a URL with a scheme the pair rule still applies.
+ */
+function replaceCredentialAssignments(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, separatorChar, valueOpenQuote] = match;
+    if (whole.length === 0) {
+      ASSIGNMENT_KEY_PATTERN.lastIndex += 1;
+      continue;
+    }
+    const rule = pairRuleFor(key);
+    if (rule === "none") continue;
+    const valueStart = match.index + whole.length;
+    const barePathLabel = openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans);
+    if (barePathLabel && !namesCredential(key)) continue;
+    const schemeCarrier = isAuthorizationStyleKey(keySegments(key));
+    let kept = "";
+    let consumed: number;
+    let replacement = REDACTED;
+    if (valueOpenQuote !== "") {
+      // The value is quoted; read to its matching closer so an escaped inner quote at any JSON depth stays inner content and the value never ends early.
+      const { content } = readQuotedContent(text, valueStart, valueOpenQuote.length - 1, valueOpenQuote[valueOpenQuote.length - 1] ?? '"');
+      if (content.length === 0 || content === REDACTED) {
+        ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+        continue;
+      }
+      consumed = content.length;
+      const lead = LEADING_SCHEME_IN_VALUE.exec(content);
+      if (schemeCarrier && lead && SCHEME_WORD_PATTERN.test(lead[1])) {
+        if (lead[3].startsWith(REDACTED)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+        kept = `${lead[1]}${lead[2]}`;
+        const firstPair = PAIR_LIST_START.test(lead[3]) ? SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + lead[1].length)) : null;
+        if (firstPair) {
+          const list = readSchemePairList(text, valueStart + lead[1].length + firstPair[1].length, firstPair[3], valueStart + content.length);
+          kept = `${lead[1]}${firstPair[1]}${firstPair[2]}`;
+          if (list) {
+            replacement = list.replacement;
+            consumed = list.end - valueStart;
+          } else {
+            consumed = lead[1].length + firstPair[0].length;
+          }
+        }
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(content)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(content);
+      }
+    } else {
+      ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
+      const value = ASSIGNMENT_VALUE_PATTERN.exec(text)?.[0];
+      if (value === undefined) continue;
+      consumed = value.length;
+      if (schemeCarrier && SCHEME_WORD_PATTERN.test(value)) {
+        const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
+        if (!token) continue;
+        const list = token[2] === "" ? readSchemePairList(text, valueStart + value.length + token[1].length, token[3], text.length) : undefined;
+        kept = `${value}${token[1]}${token[2]}`;
+        if (list) {
+          replacement = list.replacement;
+          consumed = list.end - valueStart;
+        } else {
+          consumed += token[0].length;
+        }
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(value)) continue;
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(value);
+        if (text.startsWith(REDACTED, valueStart + consumed)) consumed += REDACTED.length;
+      }
+    }
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${kept}${replacement}`;
+    last = valueStart + consumed;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/** Replaces the value argument of every credential-named flag (`--password <value>`); a setting flag (`--token-type bearer`) keeps its value. */
+function replaceFlagValues(text: string): string {
+  return text.replace(FLAG_VALUE_PATTERN, (match: string, name: string, gap: string) => (pairRuleFor(name) === "credential" ? `--${name}${gap}${REDACTED}` : match));
+}
+
+/**
+ * The carrier and shape rules shared by the error and data passes: PEM blocks, configured secrets,
+ * cookie headers, URLs, query pairs, the proof parameters of a pair list, credential pairs and flags,
+ * pair lists and scheme words in prose, JWTs, AWS keys, and vendor-prefixed tokens. `longTokens` adds the
+ * generic long-token and hex-digest rules, which the error pass runs and the data pass leaves off so
+ * identifiers survive in evidence.
+ */
+function scrubText(text: string, secrets: ReadonlyArray<string | undefined>, longTokens: boolean): string {
+  let scrubbed = text.replace(PEM_BLOCK_PATTERN, REDACTED).replace(PEM_OPEN_PATTERN, REDACTED);
+  scrubbed = scrubCookieHeaders(scrubConfiguredSecrets(scrubbed, secrets))
+    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
+    .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
+  scrubbed = scrubSchemePairLists(replaceFlagValues(replaceCredentialAssignments(scrubProofPairLists(scrubbed))))
+    .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
+    .replace(JWT_IN_TEXT_PATTERN, REDACTED)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
+    .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));
+  if (longTokens) scrubbed = scrubbed.replace(HEX_DIGEST_PATTERN, (run) => (looksLikeHexDigest(run) ? REDACTED : run));
+  for (const pattern of VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, REDACTED);
+  return longTokens ? scrubBareTokens(scrubbed) : scrubbed;
+}
+
+/**
+ * The single redaction pass for error text. Idempotent: text that has been scrubbed once comes
+ * back unchanged because `[REDACTED]` matches none of the patterns.
+ */
+export function scrubErrorText(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  return scrubText(text, secrets, true);
+}
+
+/**
+ * The redaction pass for data-side text: every string a snapshot walker visits. A credential carrier
+ * (`Authorization: Bearer <token>`, `password=<value>`, a webhook URL) or an unambiguous credential
+ * shape (a vendor-prefixed token, a JWT, a PEM block, an AWS key) inside a free-text field is
+ * removed on the data side too, while the generic long-token rule stays off so a name or an id that
+ * merely looks random survives. Idempotent like the error pass.
+ */
+export function scrubDataText(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  return scrubText(text, secrets, false);
+}
+
+/** Describes a response body that is not JSON without copying any of it. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
+}
+
+function statusLine(response: Response): string {
+  return `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+}
+
+interface ParsedResponseBody {
+  payload: unknown;
+  /** Set when the body was not JSON; the text itself is never kept. */
+  nonJsonBody?: string;
+}
+
+function parseResponseBody(response: Response, rawText: string): ParsedResponseBody {
+  if (rawText.length === 0) return { payload: {} };
+  try {
+    return { payload: JSON.parse(rawText) as unknown };
+  } catch {
+    return { payload: {}, nonJsonBody: describeNonJsonBody(response, rawText) };
+  }
 }
 
 export function resolveSumologicBaseUrl(endpointOrDeployment: string): { baseUrl: string; deployment?: string } {
@@ -447,13 +1484,15 @@ export function resolveSumologicBaseUrl(endpointOrDeployment: string): { baseUrl
 
 function readConfigFile(pathname: string | undefined): JsonRecord {
   const target = pathname ?? DEFAULT_CONFIG_FILE;
-  if (!existsSync(target)) return {};
+  const text = readConfigFileText(target);
+  if (text === undefined) return {};
+  let parsed: unknown;
   try {
-    const parsed = parseYaml(readFileSync(target, "utf8")) as unknown;
-    return asObject(parsed) ?? {};
+    parsed = parseConfigYaml(text);
   } catch (error) {
-    throw new Error(`Unable to parse Sumo Logic config file ${target}: ${error instanceof Error ? error.message : String(error)}`);
+    throw configFileParseError(target, yamlErrorCode(error), yamlErrorPosition(error));
   }
+  return asObject(parsed) ?? {};
 }
 
 function configFileValue(file: JsonRecord, keys: string[]): string | undefined {
@@ -513,12 +1552,48 @@ export function resolveSumologicConfiguration(
 export class SumologicApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  readonly endpoint?: string;
 
-  constructor(message: string, status: number, code?: string) {
-    super(message);
+  /**
+   * The message and code are scrubbed in the constructor as well as at the
+   * record point, so an error built anywhere in the client never carries a
+   * credential even if a caller stores error.message directly.
+   */
+  constructor(message: string, status: number, code?: string, endpoint?: string) {
+    super(scrubErrorText(message));
     this.name = "SumologicApiError";
     this.status = status;
-    this.code = code;
+    this.code = code === undefined ? undefined : scrubErrorText(code);
+    this.endpoint = endpoint;
+  }
+
+  /**
+   * Builds the error for a response that cannot be used: a body that is not
+   * JSON becomes a status-and-length note whatever its content type, a JSON
+   * body contributes only the documented message, detail, and code fields,
+   * and the configured secrets are removed before the pattern pass runs.
+   */
+  static fromResponse(path: string, response: Response, body: ParsedResponseBody, secrets: Array<string | undefined>): SumologicApiError {
+    const { message, code } = body.nonJsonBody === undefined ? sumologicErrorSummary(body.payload) : {};
+    const detail = body.nonJsonBody ?? message;
+    const outcome = response.ok ? "returned an unreadable response" : "failed";
+    return new SumologicApiError(
+      scrubErrorText(`Sumo Logic request to ${path} ${outcome} (${statusLine(response)}${code ? ` ${code}` : ""})${detail ? `: ${detail}` : ""}`, secrets),
+      response.status,
+      code,
+      path,
+    );
+  }
+}
+
+/** A request that never produced a response (network failure, timeout); it still names its endpoint. */
+export class SumologicTransportError extends Error {
+  readonly endpoint: string;
+
+  constructor(message: string, endpoint: string) {
+    super(scrubErrorText(message));
+    this.name = "SumologicTransportError";
+    this.endpoint = endpoint;
   }
 }
 
@@ -572,6 +1647,7 @@ export class SumologicApiClient implements SumologicReader {
     this.sleepImpl = options.sleepImpl ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
     this.maxRetries = clampNumber(options.maxRetries, DEFAULT_MAX_RETRIES, 0, 10);
     this.maxPages = clampNumber(options.maxPages, DEFAULT_MAX_PAGES, 1, 1000);
+    registerConfiguredSecrets([config.accessKey, this.basicCredential()]);
   }
 
   getResolvedConfig(): SumologicResolvedConfig {
@@ -587,8 +1663,21 @@ export class SumologicApiClient implements SumologicReader {
     return url.toString();
   }
 
+  private basicCredential(): string {
+    return Buffer.from(`${this.config.accessId}:${this.config.accessKey}`).toString("base64");
+  }
+
   private authorizationHeader(): string {
-    return `Basic ${Buffer.from(`${this.config.accessId}:${this.config.accessKey}`).toString("base64")}`;
+    return `Basic ${this.basicCredential()}`;
+  }
+
+  /** The caller's access key pair and the Basic credential built from it; every form of each is removed from error text. */
+  private configuredSecrets(): string[] {
+    return [this.config.accessId, this.config.accessKey, this.basicCredential()];
+  }
+
+  private scrubError(error: unknown): string {
+    return scrubErrorText(error instanceof Error ? error.message : String(error), this.configuredSecrets());
   }
 
   async get(path: string, query: JsonRecord = {}): Promise<unknown> {
@@ -608,44 +1697,40 @@ export class SumologicApiClient implements SumologicReader {
         });
       } catch (error) {
         clearTimeout(timeout);
-        const message = redactSecret(error instanceof Error ? error.message : String(error), this.config.accessKey);
         if (attempt < this.maxRetries) {
           await this.sleepImpl(Math.min(250 * 2 ** attempt, 8_000));
           continue;
         }
-        throw new Error(`Sumo Logic request to ${path} failed: ${message}`);
+        throw new SumologicTransportError(`Sumo Logic request to ${path} failed: ${this.scrubError(error)}`, path);
       }
       clearTimeout(timeout);
 
-      const rawText = await response.text();
-      let payload: unknown = {};
-      if (rawText.length > 0) {
-        try {
-          payload = JSON.parse(rawText) as unknown;
-        } catch {
-          payload = { message: rawText.slice(0, 240) };
-        }
-      }
+      // A body that is not JSON (a proxy error page, an HTML sign-in form) is
+      // never copied into an error string: SumologicApiError.fromResponse
+      // describes it by content type and size only, because such pages can
+      // echo the request credentials, and a 2xx non-JSON body is an
+      // unreadable surface rather than an empty inventory.
+      const body = parseResponseBody(response, await response.text());
+      if (response.ok && body.nonJsonBody === undefined) return body.payload;
 
-      if (response.ok) return payload;
-
-      const retryable = response.status === 429 || response.status >= 500;
+      const retryable = !response.ok && (response.status === 429 || response.status >= 500);
       if (retryable && attempt < this.maxRetries) {
         await this.sleepImpl(retryDelayMs(response, attempt));
         continue;
       }
-
-      const { message, code } = sumologicErrorSummary(payload);
-      const detail = redactSecret(message ?? rawText.slice(0, 240), this.config.accessKey);
-      throw new SumologicApiError(
-        `Sumo Logic request to ${path} failed (${response.status}${code ? ` ${code}` : ""})${detail ? `: ${detail}` : ""}`,
-        response.status,
-        code,
-      );
+      throw SumologicApiError.fromResponse(path, response, body, this.configuredSecrets());
     }
   }
 
+  /**
+   * `endpoint` is the path the collector reads; a failed collection records
+   * the endpoint the error actually came from when the error names one (the
+   * access key fallback reads a second path), and this declared path
+   * otherwise. Pagination and scope flags are null on failure because no
+   * read happened that they could describe.
+   */
   private async collect<T>(
+    endpoint: string,
     load: () => Promise<{ data: T; complete: boolean; count?: number; scope?: "org" | "personal" }>,
   ): Promise<SumologicCollection<T>> {
     try {
@@ -658,12 +1743,15 @@ export class SumologicApiClient implements SumologicReader {
         count: result.count ?? (Array.isArray(result.data) ? result.data.length : 1),
       };
     } catch (error) {
+      // Every dataset error is recorded here and nowhere else, so this is the
+      // one place the redaction pass has to run for findings and the bundle.
       return {
         ok: false,
-        error: redactSecret(error instanceof Error ? error.message : String(error), this.config.accessKey),
+        error: this.scrubError(error),
         httpStatus: error instanceof SumologicApiError ? error.status : undefined,
-        complete: false,
-        scope: "org",
+        endpoint: error instanceof SumologicApiError || error instanceof SumologicTransportError ? error.endpoint ?? endpoint : endpoint,
+        complete: null,
+        scope: null,
       };
     }
   }
@@ -678,9 +1766,15 @@ export class SumologicApiClient implements SumologicReader {
     let token: string | undefined;
     for (let page = 0; page < this.maxPages; page += 1) {
       const payload = asObject(await this.get(path, { ...query, limit: pageSize, token })) ?? {};
-      items.push(...asRecords(payload[collectionKey]));
-      token = asString(payload.next);
-      if (!token) return { data: items, complete: true };
+      const pageItems = asRecords(payload[collectionKey]);
+      items.push(...pageItems);
+      const nextToken = asString(payload.next);
+      if (!nextToken) return { data: items, complete: true };
+      // A repeated cursor or an empty page that still advertises a next page
+      // means the server is not advancing; stop and report the inventory as
+      // incomplete instead of spending the page budget on identical requests.
+      if (nextToken === token || pageItems.length === 0) return { data: items, complete: false };
+      token = nextToken;
     }
     return { data: items, complete: false };
   }
@@ -700,8 +1794,24 @@ export class SumologicApiClient implements SumologicReader {
     return { data: items, complete: false };
   }
 
-  private async getObject(path: string, query: JsonRecord = {}): Promise<{ data: JsonRecord; complete: boolean }> {
-    return { data: asObject(await this.get(path, query)) ?? {}, complete: true };
+  /**
+   * A single object is kept only when it carries at least one member the
+   * documented resource has; a 200 body with none of them is another document
+   * (a proxy page, a foreign API's JSON) and is recorded as a not-collected
+   * marker naming the endpoint, never as evidence, so the verdicts that read it
+   * render manual.
+   */
+  private async getObject(path: string, members: readonly string[], query: JsonRecord = {}): Promise<{ data: JsonRecord; complete: boolean }> {
+    const data = asObject(await this.get(path, query));
+    if (!data || !members.some((member) => member in data)) {
+      throw new SumologicApiError(
+        `Sumo Logic request to ${path} returned a 200 body that is not the expected object (none of ${members.join(", ")} present), so the response was not recorded`,
+        200,
+        undefined,
+        path,
+      );
+    }
+    return { data, complete: true };
   }
 
   private async getArray(path: string): Promise<{ data: JsonRecord[]; complete: boolean }> {
@@ -709,19 +1819,19 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getAccountStatus() {
-    return this.collect(() => this.getObject("/v1/account/status"));
+    return this.collect("/v1/account/status", () => this.getObject("/v1/account/status", ACCOUNT_STATUS_MEMBERS));
   }
 
   listUsers() {
-    return this.collect(() => this.listWithToken("/v1/users", { includeServiceAccounts: false }));
+    return this.collect("/v1/users", () => this.listWithToken("/v1/users", { includeServiceAccounts: false }));
   }
 
   listRoles() {
-    return this.collect(() => this.listWithToken("/v1/roles"));
+    return this.collect("/v1/roles", () => this.listWithToken("/v1/roles"));
   }
 
   listAccessKeys() {
-    return this.collect(async () => {
+    return this.collect("/v1/accessKeys", async () => {
       try {
         return await this.listWithToken("/v1/accessKeys");
       } catch (error) {
@@ -733,54 +1843,54 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   listSamlIdentityProviders() {
-    return this.collect(() => this.getArray("/v1/saml/identityProviders"));
+    return this.collect("/v1/saml/identityProviders", () => this.getArray("/v1/saml/identityProviders"));
   }
 
   listSamlAllowlistedUsers() {
-    return this.collect(() => this.getArray("/v1/saml/allowlistedUsers"));
+    return this.collect("/v1/saml/allowlistedUsers", () => this.getArray("/v1/saml/allowlistedUsers"));
   }
 
   getPasswordPolicy() {
-    return this.collect(() => this.getObject("/v1/passwordPolicy"));
+    return this.collect("/v1/passwordPolicy", () => this.getObject("/v1/passwordPolicy", PASSWORD_POLICY_MEMBERS));
   }
 
   getServiceAllowlistStatus() {
-    return this.collect(() => this.getObject("/v1/serviceAllowlist/status"));
+    return this.collect("/v1/serviceAllowlist/status", () => this.getObject("/v1/serviceAllowlist/status", SERVICE_ALLOWLIST_STATUS_MEMBERS));
   }
 
   listServiceAllowlistAddresses() {
-    return this.collect(async () => ({
+    return this.collect("/v1/serviceAllowlist/addresses", async () => ({
       data: asRecords(asObject(await this.get("/v1/serviceAllowlist/addresses"))?.data),
       complete: true,
     }));
   }
 
   getPolicy(name: SumologicPolicyName) {
-    return this.collect(() => this.getObject(`/v1/policies/${name}`));
+    return this.collect(`/v1/policies/${name}`, () => this.getObject(`/v1/policies/${name}`, POLICY_MEMBERS[name]));
   }
 
   listPartitions() {
-    return this.collect(() => this.listWithToken("/v1/partitions", { viewTypes: "DefaultView,Partition,AuditIndex" }));
+    return this.collect("/v1/partitions", () => this.listWithToken("/v1/partitions", { viewTypes: "DefaultView,Partition,AuditIndex" }));
   }
 
   listScheduledViews() {
-    return this.collect(() => this.listWithToken("/v1/scheduledViews"));
+    return this.collect("/v1/scheduledViews", () => this.listWithToken("/v1/scheduledViews"));
   }
 
   listIngestBudgets() {
-    return this.collect(() => this.listWithToken("/v2/ingestBudgets"));
+    return this.collect("/v2/ingestBudgets", () => this.listWithToken("/v2/ingestBudgets"));
   }
 
   listConnections() {
-    return this.collect(() => this.listWithToken("/v1/connections"));
+    return this.collect("/v1/connections", () => this.listWithToken("/v1/connections"));
   }
 
   listCollectors() {
-    return this.collect(() => this.listWithOffset("/v1/collectors", {}, (payload) => asRecords(asObject(payload)?.collectors)));
+    return this.collect("/v1/collectors", () => this.listWithOffset("/v1/collectors", {}, (payload) => asRecords(asObject(payload)?.collectors)));
   }
 
   listMonitors() {
-    return this.collect(() => this.listWithOffset(
+    return this.collect("/v1/monitors/search", () => this.listWithOffset(
       "/v1/monitors/search",
       { query: "type:monitor" },
       (payload) => asRecords(payload).map((entry) => ({ ...(asObject(entry.item) ?? {}), path: entry.path })),
@@ -788,15 +1898,16 @@ export class SumologicApiClient implements SumologicReader {
   }
 
   getPersonalFolder() {
-    return this.collect(() => this.getObject("/v2/content/folders/personal"));
+    return this.collect("/v2/content/folders/personal", () => this.getObject("/v2/content/folders/personal", FOLDER_MEMBERS));
   }
 
   listDashboards() {
-    return this.collect(() => this.listWithToken("/v2/dashboards", { mode: "allViewableByUser" }, "dashboards", DASHBOARDS_PAGE_SIZE));
+    return this.collect("/v2/dashboards", () => this.listWithToken("/v2/dashboards", { mode: "allViewableByUser" }, "dashboards", DASHBOARDS_PAGE_SIZE));
   }
 
   getContentPermissions(contentId: string) {
-    return this.collect(() => this.getObject(`/v2/content/${encodeURIComponent(contentId)}/permissions`, { explicitOnly: false }));
+    const path = `/v2/content/${encodeURIComponent(contentId)}/permissions`;
+    return this.collect(path, () => this.getObject(path, CONTENT_PERMISSIONS_MEMBERS, { explicitOnly: false }));
   }
 }
 
@@ -811,8 +1922,53 @@ export function collectionOf<T>(data: T, options: Partial<SumologicCollection<T>
   };
 }
 
-export function failedCollection<T>(error: string, httpStatus?: number): SumologicCollection<T> {
-  return { ok: false, error, httpStatus, complete: false, scope: "org" };
+export function failedCollection<T>(error: string, httpStatus?: number, endpoint?: string): SumologicCollection<T> {
+  return { ok: false, error, httpStatus, endpoint, complete: null, scope: null };
+}
+
+interface ContentPermissionLookup {
+  item: JsonRecord;
+  permissions: SumologicCollection<JsonRecord>;
+}
+
+/**
+ * The content_permissions dataset hangs off the personal folder listing. When
+ * that listing could not be read no lookup is issued and the dataset is a
+ * not-requested marker naming the folder's failure; when every issued lookup
+ * failed it is not collected either (the error names each failed request, and
+ * no single status or endpoint is invented for the set); otherwise it carries
+ * one row per sampled item and is complete only when every lookup succeeded.
+ */
+function contentPermissionsCollection(
+  personalFolder: SumologicCollection<JsonRecord>,
+  lookups: ContentPermissionLookup[],
+  failed: ContentPermissionLookup[],
+): SumologicCollection<JsonRecord[]> {
+  if (!personalFolder.ok) {
+    return failedCollection(`Not requested: no content permission lookups were issued because the personal folder could not be read (${personalFolder.error ?? "unknown error"}).`);
+  }
+  const describe = (entry: ContentPermissionLookup): string => `${asString(entry.item.name) ?? asString(entry.item.id) ?? "item"}: ${entry.permissions.error ?? "unknown error"}`;
+  if (lookups.length > 0 && failed.length === lookups.length) {
+    return failedCollection(`every content permission lookup failed (${failed.length} of ${lookups.length}): ${failed.map(describe).join("; ")}`);
+  }
+  return collectionOf(
+    lookups.map((entry) => ({ id: entry.item.id, name: entry.item.name, itemType: entry.item.itemType, ok: entry.permissions.ok, permissions: entry.permissions.data ?? null })),
+    { complete: failed.length === 0 },
+  );
+}
+
+/**
+ * The object written in place of a dataset that was never collected, so a
+ * bundle consumer cannot mistake a denied or failed read for an empty
+ * inventory: readable-but-empty lists stay [].
+ */
+export function notCollectedMarker(collection: SumologicCollection<unknown>): SumologicNotCollectedMarker {
+  return {
+    collected: false,
+    status: collection.httpStatus ?? null,
+    endpoint: collection.endpoint ?? null,
+    error: collection.error ?? null,
+  };
 }
 
 function controlById(number: number): ControlDefinition {
@@ -836,29 +1992,102 @@ function finding(
   return { id: definition.id, title: definition.title, severity, status, summary, evidence, mappings: mappingsFor(definition) };
 }
 
-function unreadableSummary(what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): string {
-  const cause = collection.httpStatus === 401
+const UNEXPECTED_SHAPE_PATTERN = /returned a 200 body that is not the expected object/;
+
+function unreadableCause(collection: SumologicCollection<unknown>): string {
+  return collection.httpStatus === 401
     ? "credentials were rejected (401)"
     : collection.httpStatus === 403
       ? "the access key lacks the role capability (403)"
-      : `the endpoint returned an error (${collection.error ?? "unknown error"})`;
-  return `Unknown: ${what} could not be read because ${cause}. Collect manually: ${evidenceToCollect}`;
+      : UNEXPECTED_SHAPE_PATTERN.test(collection.error ?? "")
+        ? `the endpoint returned a 200 body that is not the expected object (${collection.error})`
+        : `the endpoint returned an error (${collection.error ?? "unknown error"})`;
+}
+
+function unreadableSummary(what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): string {
+  return `Unknown: ${what} could not be read because ${unreadableCause(collection)}. Collect manually: ${evidenceToCollect}`;
 }
 
 function unreadable(number: number, severity: SumologicFinding["severity"], what: string, collection: SumologicCollection<unknown>, evidenceToCollect: string): SumologicFinding {
   return finding(number, severity, "manual", unreadableSummary(what, collection, evidenceToCollect), {
+    endpoint: collection.endpoint ?? null,
     endpoint_error: collection.error ?? null,
     http_status: collection.httpStatus ?? null,
   });
 }
 
 function partialNote(collection: SumologicCollection<unknown[]>): string {
-  return collection.complete ? "" : ` Pagination stopped before the last page, so only ${collection.data?.length ?? 0} items were seen and the population is incomplete.`;
+  if (!collection.ok || collection.complete) return "";
+  return ` Pagination stopped before the last page, so only ${collection.data?.length ?? 0} items were seen and the population is incomplete.`;
 }
 
 function withPartialDowngrade(item: SumologicFinding, collection: SumologicCollection<unknown[]>): SumologicFinding {
-  if (collection.complete || item.status !== "pass") return item;
+  if (!collection.ok || collection.complete || item.status !== "pass") return item;
   return { ...item, status: "warn", summary: `${item.summary}${partialNote(collection)}` };
+}
+
+/**
+ * Uniform null rendering: a count or list derived from an unreadable
+ * collection is rendered as null, never as 0 or [], so evidence cannot read
+ * as "nothing found" when nothing could be read.
+ */
+function whenReadable<T>(collection: SumologicCollection<unknown>, value: T): T | null {
+  return collection.ok ? value : null;
+}
+
+/**
+ * A count judged over a paginated collection describes the whole inventory only when the walk
+ * was complete: under a partial walk it renders null rather than the count of the part read,
+ * since a 0 there would claim an absence from the unread part (reviewer C, item I). The seen
+ * count and the completeness flag sit beside it.
+ */
+function whenComplete<T>(collection: SumologicCollection<unknown>, value: T): T | null {
+  return collection.ok && collection.complete !== false ? value : null;
+}
+
+/**
+ * Rule 10 for findings that read several paginated inventories: every
+ * inventory whose pagination stopped early is named in the summary, and a
+ * pass becomes warn because the population it was judged on is incomplete.
+ */
+function withPartialDowngrades(item: SumologicFinding, inventories: Array<[string, SumologicCollection<unknown[]>]>): SumologicFinding {
+  const incomplete = inventories.filter(([, collection]) => collection.ok && !collection.complete);
+  if (incomplete.length === 0) return item;
+  const notes = incomplete
+    .map(([label, collection]) => ` Pagination of the ${label} stopped before the last page, so only ${collection.data?.length ?? 0} were seen and that population is incomplete.`)
+    .join("");
+  return {
+    ...item,
+    status: item.status === "pass" ? "warn" : item.status,
+    summary: `${item.summary}${notes}`,
+    evidence: { ...item.evidence, incomplete_inventories: incomplete.map(([label]) => label) },
+  };
+}
+
+/**
+ * Rule 1 corollary: a finding that reads several inventories never passes when
+ * one of them was unreadable, even if the primary inventory supports pass. The
+ * summary names the unreadable inventory and the evidence a human must collect;
+ * `status` is the verdict a pass drops to (manual when the inventory is
+ * essential to the control, warn when the control can still be judged from
+ * the readable inventories). Existing warn/fail/manual verdicts keep their
+ * status and only gain the note.
+ */
+function withUnreadableDowngrade(
+  item: SumologicFinding,
+  label: string,
+  collection: SumologicCollection<unknown>,
+  evidenceToCollect: string,
+  status: "warn" | "manual" = "warn",
+): SumologicFinding {
+  if (collection.ok) return item;
+  const previous = asArray(item.evidence?.unreadable_inventories).map((entry) => String(entry));
+  return {
+    ...item,
+    status: item.status === "pass" ? status : item.status,
+    summary: `${item.summary} Not checked: the ${label} could not be read because ${unreadableCause(collection)}; collect manually: ${evidenceToCollect}`,
+    evidence: { ...item.evidence, unreadable_inventories: [...previous, label] },
+  };
 }
 
 function names(items: JsonRecord[], key = "name", limit = 25): string[] {
@@ -913,15 +2142,158 @@ function collectErrors(collections: Array<[string, SumologicCollection<unknown>]
   return collections.filter(([, item]) => !item.ok).map(([name, item]) => `${name}: ${item.error ?? "unknown error"}`);
 }
 
+const REDACTED = "[REDACTED]";
+
+function pick(record: JsonRecord, keys: readonly string[]): JsonRecord {
+  return Object.fromEntries(keys.filter((key) => record[key] !== undefined).map((key) => [key, record[key]]));
+}
+
+function redactionMarker(value: unknown): string | undefined {
+  return value === undefined || value === null ? undefined : REDACTED;
+}
+
+function redactedHeaderPairs(value: unknown): JsonRecord[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  return asRecords(value).map((pair) => ({ name: asString(pair.name) ?? null, value: REDACTED }));
+}
+
+function withoutUndefined(record: JsonRecord): JsonRecord {
+  return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+}
+
+type SnapshotProjector = (record: JsonRecord) => JsonRecord;
+
+/**
+ * Rule 9 allowlist projections applied to every raw snapshot before it is
+ * written to core_data or echoed in a tool payload. Each projector keeps the
+ * fields the verdicts read plus identifying metadata, and replaces every
+ * credential-bearing or free-text field with a marker so the evidence stays
+ * legible without carrying the value.
+ */
+const SNAPSHOT_PROJECTIONS: Readonly<Record<string, SnapshotProjector>> = {
+  connections: (connection) => withoutUndefined({
+    ...pick(connection, ["id", "name", "type", "webhookType", "connectionSubtype", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+    url_host: hostOf(asString(connection.url)) ?? null,
+    url: redactionMarker(connection.url),
+    username: redactionMarker(connection.username),
+    headers: redactedHeaderPairs(connection.headers),
+    customHeaders: redactedHeaderPairs(connection.customHeaders),
+    defaultPayload: redactionMarker(connection.defaultPayload),
+    resolutionPayload: redactionMarker(connection.resolutionPayload),
+  }),
+  monitors: (monitor) => withoutUndefined({
+    ...pick(monitor, ["id", "name", "path", "type", "monitorType", "contentType", "isDisabled", "isSystem", "isMutable", "status", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+    runAs: monitor.runAs === undefined ? undefined : { runAsId: asString(asObject(monitor.runAs)?.runAsId) ?? null },
+    notifications: monitor.notifications === undefined ? undefined : asRecords(monitor.notifications).map((entry) => {
+      const notification = asObject(entry.notification) ?? {};
+      return withoutUndefined({
+        runForTriggerTypes: entry.runForTriggerTypes,
+        notification: withoutUndefined({
+          ...pick(notification, ["connectionType", "connectionId", "recipients"]),
+          subject: redactionMarker(notification.subject),
+          messageBody: redactionMarker(notification.messageBody),
+          payloadOverride: redactionMarker(notification.payloadOverride),
+          resolutionPayloadOverride: redactionMarker(notification.resolutionPayloadOverride),
+        }),
+      });
+    }),
+  }),
+  access_keys: (key) => ({
+    ...pick(key, ["label", "disabled", "createdAt", "createdBy", "modifiedAt", "lastUsed", "scopes"]),
+    id_prefix: asString(key.id)?.slice(0, 4) ?? null,
+    cors_header_count: asArray(key.corsHeaders).length,
+  }),
+  saml_identity_providers: (idp) => withoutUndefined({
+    ...pick(idp, [
+      "id", "configurationName", "issuer", "authnRequestUrl", "spInitiatedLoginEnabled", "spInitiatedLoginPath", "signAuthnRequest",
+      "disableRequestedAuthnContext", "debugMode", "isRedirectBinding", "rolesAttribute", "emailAttribute", "logoutEnabled", "logoutUrl",
+      "onDemandProvisioningEnabled", "createdBy", "createdAt", "modifiedBy", "modifiedAt",
+    ]),
+    x509cert1: redactionMarker(idp.x509cert1),
+    x509cert2: redactionMarker(idp.x509cert2),
+    x509cert3: redactionMarker(idp.x509cert3),
+    certificate: redactionMarker(idp.certificate),
+  }),
+  password_policy: (policy) => pick(policy, [
+    "minLength", "maxLength", "mustContainLowercase", "mustContainUppercase", "mustContainDigits", "mustContainSpecialChars",
+    "maxPasswordAgeInDays", "minUniquePasswords", "accountLockoutThreshold", "failedLoginResetDurationInMins", "accountLockoutDurationInMins",
+    "requireMfa", "rememberMfa", "disallowWeakPasswords",
+  ]),
+  users: (user) => pick(user, ["id", "email", "firstName", "lastName", "isActive", "isLocked", "isMfaEnabled", "lastLoginTimestamp", "createdAt", "createdBy", "modifiedAt", "roleIds"]),
+  collectors: (collector) => pick(collector, [
+    "id", "name", "collectorType", "alive", "ephemeral", "collectorVersion", "lastSeenAlive", "hostName", "osName", "osVersion", "category", "timeZone", "sourceSyncMode",
+  ]),
+  dashboards: (dashboard) => pick(dashboard, ["id", "title", "folderId", "contentId", "isPublic", "domain", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+  personal_folder: (folder) => withoutUndefined({
+    ...pick(folder, ["id", "name", "itemType", "parentId", "createdBy", "createdAt", "modifiedBy", "modifiedAt"]),
+    children: folder.children === undefined ? undefined : asRecords(folder.children).map((child) => pick(child, ["id", "name", "itemType", "parentId", "isScheduled", "permissions", "createdBy", "createdAt", "modifiedBy", "modifiedAt"])),
+  }),
+};
+
+function projectSnapshotData(name: string, data: unknown): unknown {
+  const projector = SNAPSHOT_PROJECTIONS[name];
+  if (!projector || data === undefined || data === null) return data ?? null;
+  if (Array.isArray(data)) return asRecords(data).map(projector);
+  const record = asObject(data);
+  return record ? projector(record) : data;
+}
+
+/**
+ * Rule 9 deny list for the datasets the projections above pass through
+ * (roles, partitions, scheduled views, policies): matched on the lowercased
+ * key with dots, underscores, and hyphens removed, so accessKey, client_secret,
+ * and authorization match while accessId, roleIds, and label stay legible.
+ */
+const CREDENTIAL_KEY_PATTERN = /(password|passwd|passphrase|secret|token|apikey|privatekey|secretkey|accesskey|authorization)$/;
+
+function isCredentialKey(key: string): boolean {
+  return CREDENTIAL_KEY_PATTERN.test(key.toLowerCase().replace(/[._-]/g, ""));
+}
+
+/**
+ * Applied to every projected snapshot before it is written to core_data or
+ * echoed in a tool payload: redacts the value of every credential-named key
+ * (including {name, value} and {key, value} pair shapes), keeps only the
+ * origin of a webhook-named key's URL, and passes every other string leaf
+ * through the data-side text pass, so a vendor-prefixed token, a JWT, a PEM
+ * block, or a credential carrier inside a free-text field (a role description,
+ * a query, a serialized snapshot) is removed there too. Key names are kept so
+ * the evidence stays legible.
+ */
+export function redactSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSnapshot);
+  const object = asObject(value);
+  if (!object) return typeof value === "string" ? scrubDataText(value) : value;
+  const pairName = asString(object.name) ?? asString(object.key);
+  const output: JsonRecord = {};
+  for (const [key, item] of Object.entries(object)) {
+    if (isCredentialKey(key) || (key === "value" && pairName !== undefined && isCredentialKey(pairName))) {
+      output[key] = item === null || item === undefined ? item : REDACTED;
+    } else if (typeof item === "string" && pairRuleFor(key) === "webhook") {
+      output[key] = webhookReplacement(item);
+    } else {
+      output[key] = redactSnapshot(item);
+    }
+  }
+  return output;
+}
+
+/**
+ * The single serializer for every raw snapshot: core_data/<area>.json and the
+ * rawData echoed by the assess tools both come from here, so the rule 9
+ * projection above and the deny-list walk are applied exactly once and on
+ * every path.
+ */
 function rawSnapshot(collections: Array<[string, SumologicCollection<unknown>]>): Record<string, unknown> {
   return Object.fromEntries(collections.map(([name, item]) => [name, {
     ok: item.ok,
-    complete: item.complete,
-    scope: item.scope,
-    count: item.count ?? null,
+    complete: item.ok ? item.complete : null,
+    scope: item.ok ? item.scope : null,
+    count: item.ok ? item.count ?? null : null,
     error: item.error ?? null,
     http_status: item.httpStatus ?? null,
-    data: item.data ?? null,
+    endpoint: item.endpoint ?? null,
+    data: item.ok ? redactSnapshot(projectSnapshotData(name, item.data)) : notCollectedMarker(item),
   }]));
 }
 
@@ -984,10 +2356,11 @@ export async function checkSumologicAccess(client: SumologicReader): Promise<Sum
     const collection = await load();
     surfaces.push({
       name,
-      endpoint,
+      endpoint: collection.ok ? endpoint : collection.endpoint ?? endpoint,
       status: collection.ok ? "readable" : "not_readable",
-      count: collection.ok ? collection.count : undefined,
-      complete: collection.ok ? collection.complete : undefined,
+      count: collection.ok ? collection.count ?? null : null,
+      complete: collection.ok ? collection.complete : null,
+      httpStatus: collection.ok ? null : collection.httpStatus ?? null,
       error: collection.error,
       capabilityHint,
     });
@@ -1068,14 +2441,16 @@ export async function assessSumologicIdentity(
     findings.push(finding(2, "high", "manual", "Not applicable: no SAML identity provider is configured, so the SAML bypass allowlist has no effect. Re-run after SSO is configured.", { allowlisted_users: allowlistedUsers.length }));
   } else {
     const inactive = allowlistedUsers.filter((user) => user.isActive === false);
-    const evidence = { allowlisted_users: names(allowlistedUsers, "email"), inactive_allowlisted_users: names(inactive, "email"), threshold: maxAllowlisted };
+    const evidence = { allowlisted_users: names(allowlistedUsers, "email"), inactive_allowlisted_users: names(inactive, "email"), threshold: maxAllowlisted, identity_providers_readable: identityProviders.ok, identity_providers: whenReadable(identityProviders, idps.length) };
+    let allowlistFinding: SumologicFinding;
     if (allowlistedUsers.length > maxAllowlisted) {
-      findings.push(finding(2, "high", "fail", `${allowlistedUsers.length} users bypass SAML (threshold ${maxAllowlisted}); reduce the allowlist to break-glass accounts only.`, evidence));
+      allowlistFinding = finding(2, "high", "fail", `${allowlistedUsers.length} users bypass SAML (threshold ${maxAllowlisted}); reduce the allowlist to break-glass accounts only.`, evidence);
     } else if (inactive.length > 0) {
-      findings.push(finding(2, "high", "warn", `${allowlistedUsers.length} allowlisted users are within the threshold of ${maxAllowlisted}, but ${inactive.length} are inactive accounts that should be removed.`, evidence));
+      allowlistFinding = finding(2, "high", "warn", `${allowlistedUsers.length} allowlisted users are within the threshold of ${maxAllowlisted}, but ${inactive.length} are inactive accounts that should be removed.`, evidence);
     } else {
-      findings.push(finding(2, "high", "pass", `${allowlistedUsers.length} SAML allowlisted user(s) (endpoint readable, threshold ${maxAllowlisted}); emptiness here is compliant because the control asks for a minimized allowlist.`, evidence));
+      allowlistFinding = finding(2, "high", "pass", `${allowlistedUsers.length} SAML allowlisted user(s) (endpoint readable, threshold ${maxAllowlisted}); emptiness here is compliant because the control asks for a minimized allowlist.`, evidence);
     }
+    findings.push(withUnreadableDowngrade(allowlistFinding, "SAML identity provider list", identityProviders, "export Administration > Security > SAML to confirm SAML is configured so that this allowlist is actually in effect."));
   }
 
   const policy = passwordPolicy.data ?? {};
@@ -1120,23 +2495,27 @@ export async function assessSumologicIdentity(
   const requireMfa = requireMfaFlag === true;
   const mfaEvidence = {
     require_mfa_policy: passwordPolicy.ok ? flagText(requireMfaFlag) : null,
-    users_seen: userList.length,
-    users_complete: users.complete,
-    active_users: activeUsers.length,
-    active_users_without_mfa: names(activeWithoutMfa, "email"),
-    users_missing_is_active_flag: usersMissingActiveFlag.length,
-    locked_users: names(activity.locked, "email"),
-    active_users_with_recent_login: activity.recentLogin.length,
-    dormant_active_users: names(activity.dormant, "email"),
-    active_users_without_last_login: names(activity.undatedLogin, "email"),
+    users_readable: users.ok,
+    users_seen: whenReadable(users, userList.length),
+    users_complete: whenReadable(users, users.complete),
+    active_users: whenReadable(users, activeUsers.length),
+    active_users_without_mfa: whenReadable(users, names(activeWithoutMfa, "email")),
+    users_missing_is_active_flag: whenReadable(users, usersMissingActiveFlag.length),
+    locked_users: whenReadable(users, names(activity.locked, "email")),
+    active_users_with_recent_login: whenReadable(users, activity.recentLogin.length),
+    dormant_active_users: whenReadable(users, names(activity.dormant, "email")),
+    active_users_without_last_login: whenReadable(users, names(activity.undatedLogin, "email")),
     user_inactive_threshold_days: userInactiveDays,
   };
+  const perUserMfaText = users.ok
+    ? `${activeWithoutMfa.length}/${activeUsers.length} seen active users report MFA disabled`
+    : `per-user MFA status is unknown because the user list could not be read (${unreadableCause(users)})`;
   if (!passwordPolicy.ok && !users.ok) {
     findings.push(unreadable(5, "critical", "the MFA policy and user list", passwordPolicy, "screenshot the Require MFA setting and export the user list with MFA status."));
   } else if (!passwordPolicy.ok) {
-    findings.push(finding(5, "critical", "manual", `The password policy was unreadable, so org-wide MFA enforcement is unknown; ${activeWithoutMfa.length}/${activeUsers.length} seen active users report MFA disabled. Confirm Require MFA in Administration > Security > Password Policy.`, mfaEvidence));
+    findings.push(finding(5, "critical", "manual", `The password policy was unreadable, so org-wide MFA enforcement is unknown; ${perUserMfaText}. Confirm Require MFA in Administration > Security > Password Policy.`, mfaEvidence));
   } else if (!requireMfa) {
-    findings.push(finding(5, "critical", "fail", `The password policy does not require MFA (requireMfa=${flagText(requireMfaFlag)}); ${activeWithoutMfa.length}/${activeUsers.length} seen active users have MFA disabled.`, mfaEvidence));
+    findings.push(finding(5, "critical", "fail", `The password policy does not require MFA (requireMfa=${flagText(requireMfaFlag)}); ${perUserMfaText}.`, mfaEvidence));
   } else if (!users.ok) {
     findings.push(finding(5, "critical", "manual", `Require MFA is enabled, but the user list was unreadable (${users.error ?? "unknown error"}), so per-user coverage cannot be confirmed; export the user list with MFA status.`, mfaEvidence));
   } else if (userList.length === 0) {
@@ -1151,13 +2530,14 @@ export async function assessSumologicIdentity(
     title: "Sumo Logic identity posture",
     area: "identity",
     summary: {
-      identity_providers: idps.length,
-      allowlisted_users: allowlistedUsers.length,
-      users_seen: userList.length,
-      active_users_without_mfa: activeWithoutMfa.length,
-      locked_users: activity.locked.length,
-      dormant_active_users: activity.dormant.length,
-      active_users_without_last_login: activity.undatedLogin.length,
+      identity_providers: whenReadable(identityProviders, idps.length),
+      allowlisted_users: whenReadable(allowlisted, allowlistedUsers.length),
+      users_seen: whenReadable(users, userList.length),
+      users_complete: whenReadable(users, users.complete),
+      active_users_without_mfa: whenComplete(users, activeWithoutMfa.length),
+      locked_users: whenComplete(users, activity.locked.length),
+      dormant_active_users: whenComplete(users, activity.dormant.length),
+      active_users_without_last_login: whenComplete(users, activity.undatedLogin.length),
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -1223,13 +2603,13 @@ export async function assessSumologicAccessControl(
       max_admins: maxAdmins,
       custom_roles_without_filter_predicate: names(unscopedRoles),
       users_readable: users.ok,
-      users_complete: users.complete,
-      locked_users: names(activity.locked, "email"),
-      dormant_active_users: names(activity.dormant, "email"),
-      active_users_without_last_login: names(activity.undatedLogin, "email"),
-      admin_members_seen_in_user_list: adminMembers.length,
-      dormant_admin_members: names(adminActivity.dormant, "email"),
-      admin_members_without_last_login: names(adminActivity.undatedLogin, "email"),
+      users_complete: whenReadable(users, users.complete),
+      locked_users: whenReadable(users, names(activity.locked, "email")),
+      dormant_active_users: whenReadable(users, names(activity.dormant, "email")),
+      active_users_without_last_login: whenReadable(users, names(activity.undatedLogin, "email")),
+      admin_members_seen_in_user_list: whenReadable(users, adminMembers.length),
+      dormant_admin_members: whenReadable(users, names(adminActivity.dormant, "email")),
+      admin_members_without_last_login: whenReadable(users, names(adminActivity.undatedLogin, "email")),
       user_inactive_threshold_days: userInactiveDays,
     };
     const concerns: string[] = [];
@@ -1260,7 +2640,7 @@ export async function assessSumologicAccessControl(
   }
 
   const keys = accessKeys.data ?? [];
-  const keyEvidenceBase = { keys_seen: keys.length, keys_complete: accessKeys.complete, scope: accessKeys.scope };
+  const keyEvidenceBase = { keys_seen: whenReadable(accessKeys, keys.length), keys_complete: whenReadable(accessKeys, accessKeys.complete), scope: whenReadable(accessKeys, accessKeys.scope) };
   if (!accessKeys.ok) {
     findings.push(unreadable(7, "high", "the access key inventory", accessKeys, "export Administration > Security > Access Keys with created dates."));
     findings.push(unreadable(8, "medium", "the access key inventory", accessKeys, "export Administration > Security > Access Keys with last-used dates."));
@@ -1326,7 +2706,7 @@ export async function assessSumologicAccessControl(
   } else {
     const loginEnabled = status.loginEnabled === true;
     const contentEnabled = status.contentEnabled === true;
-    const evidence = { login_enabled: loginEnabled, content_enabled: contentEnabled, addresses_seen: addresses.length, addresses_readable: allowlistAddresses.ok, cidrs: names(addresses, "cidr") };
+    const evidence = { login_enabled: loginEnabled, content_enabled: contentEnabled, addresses_seen: whenReadable(allowlistAddresses, addresses.length), addresses_readable: allowlistAddresses.ok, cidrs: whenReadable(allowlistAddresses, names(addresses, "cidr")) };
     if (!loginEnabled) {
       findings.push(finding(13, "high", "fail", `Service allowlist login enforcement is disabled (loginEnabled=false${contentEnabled ? ", contentEnabled=true" : ""}), so API and UI access is not restricted by source IP.`, evidence));
     } else if (!allowlistAddresses.ok) {
@@ -1344,25 +2724,28 @@ export async function assessSumologicAccessControl(
     const rawTimeout = sessionTimeout.data?.maxUserSessionTimeout;
     const minutes = parseSessionTimeoutMinutes(rawTimeout);
     const concurrent = concurrentSessions.ok ? concurrentSessions.data ?? {} : {};
-    const evidence = { max_user_session_timeout: asString(rawTimeout) ?? null, minutes: minutes ?? null, threshold_minutes: maxSessionMinutes, concurrent_sessions_limit_enabled: concurrent.enabled === true, max_concurrent_sessions: asNumber(concurrent.maxConcurrentSessions) ?? null };
+    const evidence = { max_user_session_timeout: asString(rawTimeout) ?? null, minutes: minutes ?? null, threshold_minutes: maxSessionMinutes, concurrent_sessions_policy_readable: concurrentSessions.ok, concurrent_sessions_limit_enabled: concurrentSessions.ok ? concurrent.enabled === true : null, max_concurrent_sessions: asNumber(concurrent.maxConcurrentSessions) ?? null };
+    let sessionFinding: SumologicFinding;
     if (minutes === undefined) {
-      findings.push(finding(14, "medium", "manual", "The maxUserSessionTimeout policy did not return a parsable value, so session timeout is unknown; confirm it in Administration > Security > Policies.", evidence));
+      sessionFinding = finding(14, "medium", "manual", "The maxUserSessionTimeout policy did not return a parsable value, so session timeout is unknown; confirm it in Administration > Security > Policies.", evidence);
     } else if (minutes > maxSessionMinutes) {
-      findings.push(finding(14, "medium", "fail", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes), above the ${maxSessionMinutes}-minute threshold.`, evidence));
+      sessionFinding = finding(14, "medium", "fail", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes), above the ${maxSessionMinutes}-minute threshold.`, evidence);
     } else {
-      findings.push(finding(14, "medium", concurrent.enabled === true ? "pass" : "warn", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes, threshold ${maxSessionMinutes})${concurrent.enabled === true ? " and concurrent session limits are enabled" : ", but the concurrent sessions limit policy is not enabled"}.`, evidence));
+      const concurrentText = !concurrentSessions.ok ? "" : concurrent.enabled === true ? " and concurrent session limits are enabled" : ", but the concurrent sessions limit policy is not enabled";
+      sessionFinding = finding(14, "medium", concurrent.enabled === true ? "pass" : "warn", `Maximum web session timeout is ${asString(rawTimeout)} (${minutes} minutes, threshold ${maxSessionMinutes})${concurrentText}.`, evidence);
     }
+    findings.push(withUnreadableDowngrade(sessionFinding, "concurrent sessions limit policy", concurrentSessions, "screenshot Administration > Security > Policies > User Concurrent Sessions Limit."));
   }
 
   return {
     title: "Sumo Logic access control",
     area: "access-control",
     summary: {
-      roles_seen: roleList.length,
-      users_seen: (users.data ?? []).length,
-      access_keys_seen: keys.length,
-      access_key_scope: accessKeys.scope,
-      allowlist_addresses: addresses.length,
+      roles_seen: whenReadable(roles, roleList.length),
+      users_seen: whenReadable(users, userList.length),
+      access_keys_seen: whenReadable(accessKeys, keys.length),
+      access_key_scope: whenReadable(accessKeys, accessKeys.scope),
+      allowlist_addresses: whenReadable(allowlistAddresses, addresses.length),
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -1411,36 +2794,90 @@ export async function assessSumologicDataGovernance(
   } else if (auditPolicy.data?.enabled !== true) {
     findings.push(finding(9, "high", "fail", `The audit policy is not enabled (enabled=${String(auditPolicy.data?.enabled ?? "absent")}), so account events are not written to the audit index.`, { audit_policy_enabled: auditPolicy.data?.enabled ?? null, plan_type: planType ?? null }));
   } else {
-    const evidence = { audit_policy_enabled: true, search_audit_enabled: searchAuditPolicy.ok ? searchAuditPolicy.data?.enabled === true : null, audit_index_partitions: names(auditIndexes), active_audit_index_partitions: activeAuditIndexes.length, plan_type: planType ?? null };
+    const evidence = {
+      audit_policy_enabled: true,
+      search_audit_policy_readable: searchAuditPolicy.ok,
+      search_audit_enabled: searchAuditPolicy.ok ? searchAuditPolicy.data?.enabled === true : null,
+      partitions_readable: partitions.ok,
+      audit_index_partitions: whenReadable(partitions, names(auditIndexes)),
+      active_audit_index_partitions: whenComplete(partitions, activeAuditIndexes.length),
+      partitions_seen: whenReadable(partitions, partitionList.length),
+      partitions_complete: whenReadable(partitions, partitions.complete),
+      plan_type: planType ?? null,
+    };
     if (!partitions.ok) {
       findings.push(finding(9, "high", "manual", `The audit policy is enabled but the partition list was unreadable (${partitions.error ?? "unknown error"}), so the audit index state is unverified; run \`_index=sumologic_audit_events\` for the last 24 hours to prove events flow.`, evidence));
+    } else if (activeAuditIndexes.length === 0 && partitions.complete === false) {
+      findings.push(finding(9, "high", "manual", `The audit policy is enabled but no active AuditIndex partition was among the ${partitionList.length} partitions seen before pagination stopped, so the audit index is unread rather than absent. Read the full partition list and run \`_index=sumologic_audit_events\` to confirm events are received.${partialNote(partitions)}`, evidence));
     } else if (activeAuditIndexes.length === 0) {
-      findings.push(finding(9, "high", "manual", `The audit policy is enabled but no active AuditIndex partition was visible${planType ? ` (plan ${planType})` : ""}; the audit index may be unavailable on this plan. Run \`_index=sumologic_audit_events\` to confirm events are received.`, evidence));
+      findings.push(finding(9, "high", "manual", `The audit policy is enabled but no active AuditIndex partition was visible${planType ? ` (plan ${planType})` : ""}; the audit index may be unavailable on this plan. Run \`_index=sumologic_audit_events\` to confirm events are received.${partialNote(partitions)}`, evidence));
     } else if (searchAuditPolicy.ok && searchAuditPolicy.data?.enabled !== true) {
-      findings.push(finding(9, "high", "warn", `The audit policy is enabled and ${activeAuditIndexes.length} active audit index partition(s) exist, but the search audit policy is disabled, so query activity is not logged. Event flow still requires a manual search of _index=sumologic_audit_events.`, evidence));
+      findings.push(finding(9, "high", "warn", `The audit policy is enabled and ${activeAuditIndexes.length} active audit index partition(s) exist, but the search audit policy is disabled, so query activity is not logged. Event flow still requires a manual search of _index=sumologic_audit_events.${partialNote(partitions)}`, evidence));
     } else {
-      findings.push(finding(9, "high", "pass", `Audit and search audit policies are enabled and ${activeAuditIndexes.length} active audit index partition(s) exist (${names(activeAuditIndexes).join(", ")}). Confirm event flow with a search of _index=sumologic_audit_events.`, evidence));
+      const policyText = searchAuditPolicy.ok ? "Audit and search audit policies are enabled" : "The audit policy is enabled";
+      findings.push(withUnreadableDowngrade(
+        withPartialDowngrade(
+          finding(9, "high", "pass", `${policyText} and ${activeAuditIndexes.length} active audit index partition(s) exist (${names(activeAuditIndexes).join(", ")}). Confirm event flow with a search of _index=sumologic_audit_events.`, evidence),
+          partitions,
+        ),
+        "search audit policy",
+        searchAuditPolicy,
+        "screenshot Administration > Security > Policies > Search Audit to confirm query activity is logged.",
+      ));
     }
   }
 
   const connectionList = connections.data ?? [];
+  const scheduledViewList = scheduledViews.data ?? [];
   const forwardingPartitions = partitionList.filter((partition) => asString(partition.dataForwardingId));
-  const forwardingViews = (scheduledViews.data ?? []).filter((view) => asString(view.dataForwardingId));
+  const forwardingViews = scheduledViewList.filter((view) => asString(view.dataForwardingId));
   if (!connections.ok) {
     findings.push(unreadable(10, "medium", "the connection list", connections, "export Manage Data > Monitoring > Connections and Manage Data > Logs > Data Forwarding destinations with owner approvals."));
   } else {
     const destinations = connectionList.map((connection) => ({ name: asString(connection.name) ?? asString(connection.id) ?? "connection", type: asString(connection.type) ?? "unknown", host: hostOf(asString(connection.url)) ?? null }));
     const unapproved = approvedDestinations.length > 0 ? destinations.filter((item) => !item.host || !domainMatches(item.host, approvedDestinations)) : [];
-    const evidence = { connections_seen: connectionList.length, connections_complete: connections.complete, destinations, partitions_forwarding: names(forwardingPartitions), scheduled_views_forwarding: names(forwardingViews, "indexName"), approved_destination_domains: approvedDestinations, unapproved_destinations: unapproved.map((item) => item.name) };
-    if (connectionList.length === 0 && forwardingPartitions.length === 0 && forwardingViews.length === 0 && partitions.ok && partitionList.length > 0) {
-      findings.push(withPartialDowngrade(finding(10, "medium", "pass", "Zero outbound connections and zero data forwarding destinations are configured (endpoints readable), so no external destination review is pending; emptiness is compliant for this control.", evidence), connections));
+    const evidence = {
+      connections_seen: connectionList.length,
+      connections_complete: connections.complete,
+      partitions_readable: partitions.ok,
+      partitions_seen: whenReadable(partitions, partitionList.length),
+      partitions_complete: whenReadable(partitions, partitions.complete),
+      scheduled_views_readable: scheduledViews.ok,
+      scheduled_views_seen: whenReadable(scheduledViews, scheduledViewList.length),
+      scheduled_views_complete: whenReadable(scheduledViews, scheduledViews.complete),
+      destinations,
+      partitions_forwarding: whenReadable(partitions, names(forwardingPartitions)),
+      scheduled_views_forwarding: whenReadable(scheduledViews, names(forwardingViews, "indexName")),
+      approved_destination_domains: approvedDestinations,
+      unapproved_destinations: unapproved.map((item) => item.name),
+    };
+    const forwardingCount = forwardingPartitions.length + forwardingViews.length;
+    let forwardingFinding: SumologicFinding;
+    if (connectionList.length === 0 && forwardingCount === 0 && partitions.ok && scheduledViews.ok && partitionList.length > 0) {
+      forwardingFinding = finding(10, "medium", "pass", "Zero outbound connections and zero data forwarding destinations are configured (endpoints readable), so no external destination review is pending; emptiness is compliant for this control.", evidence);
     } else if (approvedDestinations.length > 0 && unapproved.length > 0) {
-      findings.push(finding(10, "medium", "fail", `${unapproved.length}/${connectionList.length} connections point outside the approved destination domains (${unapproved.map((item) => item.name).join(", ")}).${partialNote(connections)}`, evidence));
+      forwardingFinding = finding(10, "medium", "fail", `${unapproved.length}/${connectionList.length} connections point outside the approved destination domains (${unapproved.map((item) => item.name).join(", ")}).`, evidence);
+    } else if (approvedDestinations.length > 0 && connectionList.length === 0) {
+      // The approved-domain check only ever covers connections, so with none
+      // to check there is nothing to pass on: the forwarding destinations on
+      // partitions and scheduled views (or an empty partition inventory) still
+      // need a human.
+      const remaining = forwardingCount > 0
+        ? `${forwardingCount} data forwarding destination(s) on ${forwardingPartitions.length} partition(s) and ${forwardingViews.length} scheduled view(s) remain unchecked against the approved domains`
+        : "no data forwarding destination was seen but the partition inventory is empty, so that absence cannot be confirmed";
+      forwardingFinding = finding(10, "medium", "manual", `No outbound connections were found to check against the approved destination domains; ${remaining}, so a human must confirm each forwarding destination is approved.`, evidence);
     } else if (approvedDestinations.length > 0) {
-      findings.push(withPartialDowngrade(finding(10, "medium", "pass", `All ${connectionList.length} connections resolve to approved destination domains; ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) still require owner review.`, evidence), connections));
+      forwardingFinding = finding(10, "medium", "pass", `All ${connectionList.length} connections resolve to approved destination domains; ${forwardingCount} data forwarding destination(s) still require owner review.`, evidence);
     } else {
-      findings.push(finding(10, "medium", "manual", `${connectionList.length} outbound connection(s) and ${forwardingPartitions.length + forwardingViews.length} data forwarding destination(s) exist; no approved destination list was supplied, so a human must confirm each destination is approved (pass approved_destination_domains to automate).${partialNote(connections)}`, evidence));
+      forwardingFinding = finding(10, "medium", "manual", `${connectionList.length} outbound connection(s) and ${forwardingCount} data forwarding destination(s) exist; no approved destination list was supplied, so a human must confirm each destination is approved (pass approved_destination_domains to automate).`, evidence);
     }
+    // The data forwarding destinations live on partitions and scheduled views,
+    // so those inventories are essential: unreadable drops a pass to manual and
+    // a capped page drops it to warn, naming the inventory either way.
+    forwardingFinding = withPartialDowngrades(forwardingFinding, [["connection list", connections], ["partition list", partitions], ["scheduled view list", scheduledViews]]);
+    forwardingFinding = withUnreadableDowngrade(forwardingFinding, "partition list", partitions, "export Manage Data > Logs > Partitions with each data forwarding destination.", "manual");
+    forwardingFinding = withUnreadableDowngrade(forwardingFinding, "scheduled view list", scheduledViews, "export Manage Data > Logs > Scheduled Views with each data forwarding destination.", "manual");
+    findings.push(forwardingFinding);
   }
 
   const collectorList = collectors.data ?? [];
@@ -1455,7 +2892,7 @@ export async function assessSumologicDataGovernance(
     const ephemeral = collectorList.filter((collector) => collector.ephemeral === true);
     const versions = [...new Set(installed.map((collector) => asString(collector.collectorVersion)).filter((item): item is string => Boolean(item)))].sort();
     const missingVersion = installed.filter((collector) => !asString(collector.collectorVersion));
-    const evidence = { collectors_seen: collectorList.length, collectors_complete: collectors.complete, installed: installed.length, hosted: collectorList.length - installed.length, offline_non_ephemeral: names(offline), offline_beyond_threshold: names(longOffline), ephemeral: ephemeral.length, collector_versions: versions, installed_missing_version: names(missingVersion), offline_threshold_days: offlineDays };
+    const evidence = { collectors_seen: collectorList.length, collectors_complete: collectors.complete, installed: whenComplete(collectors, installed.length), hosted: whenComplete(collectors, collectorList.length - installed.length), offline_non_ephemeral: names(offline), offline_beyond_threshold: names(longOffline), ephemeral: whenComplete(collectors, ephemeral.length), collector_versions: versions, installed_missing_version: names(missingVersion), offline_threshold_days: offlineDays };
     if (longOffline.length > 0) {
       findings.push(finding(12, "medium", "fail", `${longOffline.length} installed collector(s) have been offline for more than ${offlineDays} days (or have no last-seen timestamp) and remain registered.${partialNote(collectors)}`, evidence));
     } else if (offline.length > 0 || versions.length > 1 || missingVersion.length > 0) {
@@ -1507,11 +2944,12 @@ export async function assessSumologicDataGovernance(
     title: "Sumo Logic data governance",
     area: "data-governance",
     summary: {
-      partitions_seen: partitionList.length,
-      active_audit_indexes: activeAuditIndexes.length,
-      connections_seen: connectionList.length,
-      collectors_seen: collectorList.length,
-      ingest_budgets_seen: budgets.length,
+      partitions_seen: whenReadable(partitions, partitionList.length),
+      partitions_complete: whenReadable(partitions, partitions.complete),
+      active_audit_indexes: whenComplete(partitions, activeAuditIndexes.length),
+      connections_seen: whenReadable(connections, connectionList.length),
+      collectors_seen: whenReadable(collectors, collectorList.length),
+      ingest_budgets_seen: whenReadable(ingestBudgets, budgets.length),
       plan_type: planType ?? null,
       unreadable_surfaces: collectErrors(collections).length,
     },
@@ -1544,6 +2982,7 @@ export async function assessSumologicContentSharing(
     if (!id) continue;
     permissionResults.push({ item, permissions: await client.getContentPermissions(id) });
   }
+  const unreadablePermissions = permissionResults.filter((entry) => !entry.permissions.ok);
   const collections: Array<[string, SumologicCollection<unknown>]> = [
     ["data_access_level_policy", dataAccessPolicy],
     ["share_dashboards_outside_organization_policy", sharePolicy],
@@ -1552,62 +2991,104 @@ export async function assessSumologicContentSharing(
     ["monitors", monitors],
     ["connections", connections],
     ["users", users],
-    ["content_permissions", collectionOf(permissionResults.map((entry) => ({ id: entry.item.id, name: entry.item.name, itemType: entry.item.itemType, ok: entry.permissions.ok, permissions: entry.permissions.data ?? null })))],
+    ["content_permissions", contentPermissionsCollection(personalFolder, permissionResults, unreadablePermissions)],
   ];
   const findings: SumologicFinding[] = [];
 
+  // Items shared org-wide are only known when at least one permission lookup
+  // succeeded; when every lookup failed the count and list render null.
+  const permissionsAllFailed = permissionResults.length > 0 && unreadablePermissions.length === permissionResults.length;
   const orgShared = permissionResults.filter((entry) => [...asRecords(entry.permissions.data?.explicitPermissions), ...asRecords(entry.permissions.data?.implicitPermissions)].some((permission) => asString(permission.sourceType) === "org"));
-  const unreadablePermissions = permissionResults.filter((entry) => !entry.permissions.ok);
+  const whenPermissionsRead = <T>(value: T): T | null => (personalFolder.ok && !permissionsAllFailed ? value : null);
   const sampleNote = unsampledChildren > 0 ? ` Only ${children.length} of ${allChildren.length} personal-folder items were sampled (content_sample=${sample}); ${unsampledChildren} were not evaluated.` : "";
   const sharingEvidence = {
     data_access_level_enabled: dataAccessPolicy.ok ? dataAccessPolicy.data?.enabled === true : null,
-    personal_folder_items_total: allChildren.length,
-    personal_folder_items_sampled: permissionResults.length,
-    personal_folder_items_unsampled: unsampledChildren,
+    personal_folder_readable: personalFolder.ok,
+    personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+    personal_folder_items_sampled: whenReadable(personalFolder, permissionResults.length),
+    personal_folder_items_unsampled: whenReadable(personalFolder, unsampledChildren),
     content_sample: sample,
-    org_shared_items: names(orgShared.map((entry) => entry.item)),
-    permission_lookups_failed: unreadablePermissions.length,
+    org_shared_items: whenPermissionsRead(names(orgShared.map((entry) => entry.item))),
+    permission_lookups_failed: whenReadable(personalFolder, unreadablePermissions.length),
   };
+  const sampledShareText = personalFolder.ok ? `${orgShared.length} sampled item(s) are shared org-wide` : "the personal folder could not be read, so no items were sampled";
+  const personalFolderEvidence = "export the key owner's personal folder listing and the content permissions of each item to review org-wide shares.";
+  const permissionLookupNote = unreadablePermissions.length > 0 ? ` ${unreadablePermissions.length} content permission lookup(s) failed (${unreadablePermissions.slice(0, 5).map((entry) => `${asString(entry.item.name) ?? asString(entry.item.id) ?? "item"}: ${entry.permissions.error ?? "unknown error"}`).join("; ")}), so those items were not checked.` : "";
+  let sharingFinding: SumologicFinding;
   if (!dataAccessPolicy.ok) {
-    findings.push(unreadable(11, "medium", "the data access level policy", dataAccessPolicy, "screenshot Administration > Security > Policies > Data Access Level and review Library sharing for org-wide shares."));
+    sharingFinding = unreadable(11, "medium", "the data access level policy", dataAccessPolicy, "screenshot Administration > Security > Policies > Data Access Level and review Library sharing for org-wide shares.");
   } else if (dataAccessPolicy.data?.enabled !== true) {
-    findings.push(finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${orgShared.length} sampled item(s) are shared org-wide.${sampleNote}`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "fail", `The Data Access Level policy is not enabled (enabled=${String(dataAccessPolicy.data?.enabled ?? "absent")}), so content can be shared with users whose role filters expose more data than the owner's; ${sampledShareText}.${sampleNote}${permissionLookupNote}`, sharingEvidence);
   } else if (orgShared.length > 0) {
-    findings.push(finding(11, "medium", "warn", `The Data Access Level policy is enabled, but ${orgShared.length}/${permissionResults.length} sampled personal-folder items are shared with the whole org (${names(orgShared.map((entry) => entry.item)).join(", ")}); review whether org-wide sharing is required.${sampleNote}`, sharingEvidence));
-  } else if (!personalFolder.ok || permissionResults.length === 0 || unreadablePermissions.length > 0) {
-    findings.push(finding(11, "medium", "manual", `The Data Access Level policy is enabled, but content permissions could not be sampled (${unreadablePermissions.length} lookups failed, ${permissionResults.length} items sampled); review Library sharing for org-wide shares manually.${sampleNote}`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "warn", `The Data Access Level policy is enabled, but ${orgShared.length}/${permissionResults.length} sampled personal-folder items are shared with the whole org (${names(orgShared.map((entry) => entry.item)).join(", ")}); review whether org-wide sharing is required.${sampleNote}${permissionLookupNote}`, sharingEvidence);
+  } else if (!personalFolder.ok) {
+    sharingFinding = finding(11, "medium", "manual", "The Data Access Level policy is enabled, but content permissions could not be sampled because the personal folder could not be read; review Library sharing for org-wide shares manually.", sharingEvidence);
+  } else if (permissionResults.length === 0 || unreadablePermissions.length > 0) {
+    sharingFinding = finding(11, "medium", "manual", `The Data Access Level policy is enabled, but content permissions could not be sampled (${unreadablePermissions.length} lookups failed, ${permissionResults.length} items sampled); review Library sharing for org-wide shares manually.${sampleNote}${permissionLookupNote}`, sharingEvidence);
   } else if (unsampledChildren > 0) {
-    findings.push(finding(11, "medium", "warn", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide, but the population is incomplete.${sampleNote} Raise content_sample or review the remaining items in the Library before treating this control as satisfied.`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "warn", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide, but the population is incomplete.${sampleNote} Raise content_sample or review the remaining items in the Library before treating this control as satisfied.`, sharingEvidence);
   } else {
-    findings.push(finding(11, "medium", "pass", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide (all ${allChildren.length} items in the folder were evaluated); the sample covers the key owner's folder only, so Admin Recommended and Global folders still merit periodic review.`, sharingEvidence));
+    sharingFinding = finding(11, "medium", "pass", `The Data Access Level policy is enabled and none of the ${permissionResults.length} sampled personal-folder items are shared org-wide (all ${allChildren.length} items in the folder were evaluated); the sample covers the key owner's folder only, so Admin Recommended and Global folders still merit periodic review.`, sharingEvidence);
   }
+  findings.push(withUnreadableDowngrade(sharingFinding, "personal folder", personalFolder, personalFolderEvidence, "manual"));
 
   const monitorList = monitors.data ?? [];
   const monitorsWithRunAs = monitorList.filter((monitor) => asString(asObject(monitor.runAs)?.runAsId));
   const scheduledContent = children.filter((item) => item.isScheduled === true);
-  const scheduleEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, monitors_with_run_as: monitorsWithRunAs.length, scheduled_searches_in_sampled_folder: names(scheduledContent), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length, monitors_readable: monitors.ok };
+  const scheduleEvidence = {
+    monitors_seen: whenReadable(monitors, monitorList.length),
+    monitors_complete: whenReadable(monitors, monitors.complete),
+    monitors_with_run_as: whenReadable(monitors, monitorsWithRunAs.length),
+    scheduled_searches_in_sampled_folder: whenReadable(personalFolder, names(scheduledContent)),
+    personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+    personal_folder_items_sampled: whenReadable(personalFolder, children.length),
+    monitors_readable: monitors.ok,
+    personal_folder_readable: personalFolder.ok,
+  };
   if (!monitors.ok && !personalFolder.ok) {
     findings.push(unreadable(15, "medium", "the monitor and content inventories", monitors, "list scheduled searches and monitors with their owners and runAs identities, and confirm none run under shared administrator accounts."));
   } else {
-    findings.push(finding(15, "medium", "manual", `Scheduled search role bindings are not exposed by the API: ${monitorList.length} monitor(s) seen (${monitorsWithRunAs.length} with an explicit runAs identity) and ${scheduledContent.length} scheduled search(es) in the sampled folder. A human must confirm each scheduled search and monitor runs under a scoped user, not a shared admin credential.${partialNote(monitors)}`, scheduleEvidence));
+    const monitorText = monitors.ok ? `${monitorList.length} monitor(s) seen (${monitorsWithRunAs.length} with an explicit runAs identity)` : "the monitor list could not be read";
+    const scheduledText = personalFolder.ok ? `${scheduledContent.length} scheduled search(es) in the sampled folder` : "the personal folder could not be read so no scheduled searches were sampled";
+    let scheduleFinding = finding(15, "medium", "manual", `Scheduled search role bindings are not exposed by the API: ${monitorText} and ${scheduledText}. A human must confirm each scheduled search and monitor runs under a scoped user, not a shared admin credential.${partialNote(monitors)}`, scheduleEvidence);
+    scheduleFinding = withUnreadableDowngrade(scheduleFinding, "monitor list", monitors, "export Alerts > Monitors with each monitor's runAs identity.", "manual");
+    scheduleFinding = withUnreadableDowngrade(scheduleFinding, "personal folder", personalFolder, "list the scheduled searches in the key owner's folder with their owners.", "manual");
+    findings.push(scheduleFinding);
   }
 
   const lookupItems = children.filter((item) => /lookup/i.test(asString(item.itemType) ?? ""));
   const lookupOrgShared = orgShared.filter((entry) => /lookup/i.test(asString(entry.item.itemType) ?? ""));
-  const lookupEvidence = { lookup_tables_in_sampled_folder: names(lookupItems), lookup_tables_shared_org_wide: names(lookupOrgShared.map((entry) => entry.item)), personal_folder_items_total: allChildren.length, personal_folder_items_sampled: children.length };
+  const lookupEvidence = {
+    lookup_tables_in_sampled_folder: whenReadable(personalFolder, names(lookupItems)),
+    lookup_tables_shared_org_wide: whenPermissionsRead(names(lookupOrgShared.map((entry) => entry.item))),
+    personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+    personal_folder_items_sampled: whenReadable(personalFolder, children.length),
+    personal_folder_readable: personalFolder.ok,
+    permission_lookups_failed: whenReadable(personalFolder, unreadablePermissions.length),
+  };
+  let lookupFinding: SumologicFinding;
   if (lookupOrgShared.length > 0) {
-    findings.push(finding(18, "medium", "warn", `${lookupOrgShared.length} lookup table(s) in the sampled folder are shared org-wide (${names(lookupOrgShared.map((entry) => entry.item)).join(", ")}); confirm they contain no sensitive data.`, lookupEvidence));
+    lookupFinding = finding(18, "medium", "warn", `${lookupOrgShared.length} lookup table(s) in the sampled folder are shared org-wide (${names(lookupOrgShared.map((entry) => entry.item)).join(", ")}); confirm they contain no sensitive data.${permissionLookupNote}`, lookupEvidence);
   } else {
-    findings.push(finding(18, "medium", "manual", `The API has no lookup table listing endpoint (only /v1/lookupTables/{id}); ${lookupItems.length} lookup table(s) were seen in the sampled folder. A human must inventory lookup tables in the Library, identify those with sensitive data, and export /v2/content/{id}/permissions for each.`, lookupEvidence));
+    const sampledText = personalFolder.ok ? `${lookupItems.length} lookup table(s) were seen in the sampled folder` : "the personal folder could not be read, so no lookup tables were sampled";
+    lookupFinding = finding(18, "medium", "manual", `The API has no lookup table listing endpoint (lookup tables are only readable one at a time by id); ${sampledText}. A human must inventory lookup tables in the Library, identify those with sensitive data, and export the content permissions of each.${permissionLookupNote}`, lookupEvidence);
   }
+  findings.push(withUnreadableDowngrade(lookupFinding, "personal folder", personalFolder, personalFolderEvidence, "manual"));
 
   const dashboardList = dashboards.data ?? [];
   const publicDashboards = dashboardList.filter((dashboard) => dashboard.isPublic === true);
-  const dashboardEvidence = { share_outside_org_enabled: sharePolicy.ok ? sharePolicy.data?.enabled === true : null, dashboards_seen: dashboardList.length, dashboards_complete: dashboards.complete, public_dashboards: names(publicDashboards, "title") };
+  const dashboardEvidence = {
+    share_outside_org_enabled: sharePolicy.ok ? sharePolicy.data?.enabled === true : null,
+    dashboards_readable: dashboards.ok,
+    dashboards_seen: whenReadable(dashboards, dashboardList.length),
+    dashboards_complete: whenReadable(dashboards, dashboards.complete),
+    public_dashboards: whenReadable(dashboards, names(publicDashboards, "title")),
+  };
   if (!sharePolicy.ok) {
     findings.push(unreadable(19, "medium", "the share-dashboards-outside-organization policy", sharePolicy, "screenshot Administration > Security > Policies > Share Dashboards Outside Organization and list externally shared dashboards."));
   } else if (sharePolicy.data?.enabled === true) {
-    findings.push(finding(19, "medium", "fail", `Sharing dashboards outside the organization is enabled; ${publicDashboards.length}/${dashboardList.length} seen dashboards are flagged public.`, dashboardEvidence));
+    const publicText = dashboards.ok ? `${publicDashboards.length}/${dashboardList.length} seen dashboards are flagged public` : `the dashboard list could not be read (${unreadableCause(dashboards)}), so per-dashboard exposure is unknown`;
+    findings.push(finding(19, "medium", "fail", `Sharing dashboards outside the organization is enabled; ${publicText}.`, dashboardEvidence));
   } else if (sharePolicy.data?.enabled !== false) {
     findings.push(finding(19, "medium", "manual", "The share-dashboards-outside-organization policy response did not include an enabled flag, so the external sharing state is unknown; confirm it in Administration > Security > Policies.", dashboardEvidence));
   } else if (!dashboards.ok) {
@@ -1625,6 +3106,7 @@ export async function assessSumologicContentSharing(
   const externalRecipients: string[] = [];
   const unknownConnections: string[] = [];
   let notificationCount = 0;
+  let connectionNotificationCount = 0;
   for (const monitor of monitorList) {
     for (const entry of asRecords(monitor.notifications)) {
       const notification = asObject(entry.notification) ?? {};
@@ -1635,38 +3117,68 @@ export async function assessSumologicContentSharing(
           if (domain && orgDomains.size > 0 && !domainMatches(domain, [...orgDomains])) externalRecipients.push(asString(recipient) as string);
         }
       } else {
+        connectionNotificationCount += 1;
         const connectionId = asString(notification.connectionId);
         if (connectionId && connections.ok && !connectionIds.has(connectionId)) unknownConnections.push(`${asString(monitor.name) ?? monitor.id}:${connectionId}`);
       }
     }
   }
   const disabledMonitors = monitorList.filter((monitor) => monitor.isDisabled === true);
-  const routingEvidence = { monitors_seen: monitorList.length, monitors_complete: monitors.complete, notifications_seen: notificationCount, org_email_domains: [...orgDomains].slice(0, 25), external_email_recipients: externalRecipients.slice(0, 25), notifications_to_unknown_connections: unknownConnections.slice(0, 25), disabled_monitors: names(disabledMonitors) };
+  const routingEvidence = {
+    monitors_seen: monitorList.length,
+    monitors_complete: monitors.complete,
+    notifications_seen: notificationCount,
+    connection_notifications_seen: connectionNotificationCount,
+    users_readable: users.ok,
+    users_seen: whenReadable(users, (users.data ?? []).length),
+    connections_readable: connections.ok,
+    connections_seen: whenReadable(connections, connectionIds.size),
+    org_email_domains: users.ok || orgDomains.size > 0 ? [...orgDomains].slice(0, 25) : null,
+    external_email_recipients: orgDomains.size > 0 ? externalRecipients.slice(0, 25) : null,
+    notifications_to_unknown_connections: whenReadable(connections, unknownConnections.slice(0, 25)),
+    disabled_monitors: names(disabledMonitors),
+  };
   if (!monitors.ok) {
     findings.push(unreadable(20, "medium", "the monitor list", monitors, "export Alerts > Monitors with notification destinations and confirm each routes to an approved channel."));
-  } else if (monitorList.length === 0) {
-    findings.push(finding(20, "medium", "manual", "Zero monitors were returned (endpoint readable), so no alert routing exists to evaluate; confirm whether security alerting is implemented elsewhere.", routingEvidence));
-  } else if (externalRecipients.length > 0 || unknownConnections.length > 0) {
-    findings.push(finding(20, "medium", "fail", `${externalRecipients.length} email recipient(s) fall outside the org domains and ${unknownConnections.length} notification(s) reference connections not in the connection inventory.${partialNote(monitors)}`, routingEvidence));
-  } else if (orgDomains.size === 0) {
-    findings.push(finding(20, "medium", "manual", `${notificationCount} notification(s) across ${monitorList.length} monitors were seen, but no org email domains could be derived (user list unreadable and no approved_email_domains supplied), so recipient review is manual.`, routingEvidence));
-  } else if (disabledMonitors.length > 0 || notificationCount === 0) {
-    findings.push(finding(20, "medium", "warn", `Alert routing stays within org domains and known connections, but ${disabledMonitors.length} monitor(s) are disabled and ${notificationCount} notification(s) exist; confirm security monitors are active.${partialNote(monitors)}`, routingEvidence));
   } else {
-    findings.push(withPartialDowngrade(finding(20, "medium", "pass", `${notificationCount} notification(s) across ${monitorList.length} monitors route to org email domains or known connections, and no monitors are disabled.`, routingEvidence), monitors));
+    let routingFinding: SumologicFinding;
+    if (monitorList.length === 0) {
+      routingFinding = finding(20, "medium", "manual", "Zero monitors were returned (endpoint readable), so no alert routing exists to evaluate; confirm whether security alerting is implemented elsewhere.", routingEvidence);
+    } else if (externalRecipients.length > 0 || unknownConnections.length > 0) {
+      routingFinding = finding(20, "medium", "fail", `${externalRecipients.length} email recipient(s) fall outside the org domains and ${unknownConnections.length} notification(s) reference connections not in the connection inventory.${partialNote(monitors)}`, routingEvidence);
+    } else if (orgDomains.size === 0) {
+      routingFinding = finding(20, "medium", "manual", `${notificationCount} notification(s) across ${monitorList.length} monitors were seen, but no org email domains could be derived (${users.ok ? "no user emails were returned" : "user list unreadable"} and no approved_email_domains supplied), so recipient review is manual.`, routingEvidence);
+    } else if (disabledMonitors.length > 0 || notificationCount === 0) {
+      routingFinding = finding(20, "medium", "warn", `Alert routing stays within org domains and known connections, but ${disabledMonitors.length} monitor(s) are disabled and ${notificationCount} notification(s) exist; confirm security monitors are active.${partialNote(monitors)}`, routingEvidence);
+    } else {
+      routingFinding = withPartialDowngrade(finding(20, "medium", "pass", `${notificationCount} notification(s) across ${monitorList.length} monitors route to org email domains or known connections, and no monitors are disabled.`, routingEvidence), monitors);
+    }
+    // The user list supplies the org email domains and the connection list
+    // validates webhook targets; either being unreadable means part of the
+    // routing was judged blind, so a pass cannot stand.
+    routingFinding = withUnreadableDowngrade(routingFinding, "user list", users, "export Administration > Users and Roles > Users to confirm the org email domains that recipients were judged against.");
+    routingFinding = withUnreadableDowngrade(
+      routingFinding,
+      "connection list",
+      connections,
+      "export Manage Data > Monitoring > Connections and confirm every webhook notification targets an approved connection.",
+      connectionNotificationCount > 0 ? "manual" : "warn",
+    );
+    findings.push(routingFinding);
   }
 
   return {
     title: "Sumo Logic content sharing and alerting",
     area: "content-sharing",
     summary: {
-      personal_folder_items_total: allChildren.length,
-      personal_folder_items_sampled: permissionResults.length,
-      personal_folder_items_unsampled: unsampledChildren,
-      org_shared_items: orgShared.length,
-      dashboards_seen: dashboardList.length,
-      monitors_seen: monitorList.length,
-      external_email_recipients: externalRecipients.length,
+      personal_folder_items_total: whenReadable(personalFolder, allChildren.length),
+      personal_folder_items_sampled: whenReadable(personalFolder, permissionResults.length),
+      personal_folder_items_unsampled: whenReadable(personalFolder, unsampledChildren),
+      org_shared_items: whenPermissionsRead(orgShared.length),
+      dashboards_seen: whenReadable(dashboards, dashboardList.length),
+      monitors_seen: whenReadable(monitors, monitorList.length),
+      monitors_complete: whenReadable(monitors, monitors.complete),
+      external_email_recipients: orgDomains.size > 0 ? whenComplete(monitors, externalRecipients.length) : null,
       unreadable_surfaces: collectErrors(collections).length,
     },
     findings,
@@ -1942,7 +3454,7 @@ function createClient(args: AuthArgs): SumologicApiClient {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return scrubErrorText(error instanceof Error ? error.message : String(error));
 }
 
 const authParams = {

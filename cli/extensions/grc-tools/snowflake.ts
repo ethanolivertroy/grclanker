@@ -26,6 +26,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -119,7 +120,13 @@ export interface SnowflakeResultSet {
   statementHandle?: string;
 }
 
-export type SnowflakeStatementStatus = "ok" | "denied" | "error" | "timeout";
+/**
+ * `not_requested` is the outcome of a statement that was never sent because
+ * the bearer token could not be built (a private key that does not load, a
+ * missing token): no endpoint was called, so no HTTP status, statement text,
+ * or server error is recorded for it.
+ */
+export type SnowflakeStatementStatus = "ok" | "denied" | "error" | "timeout" | "not_requested";
 
 export interface SnowflakeStatementOutcome {
   key: string;
@@ -127,27 +134,76 @@ export interface SnowflakeStatementOutcome {
   status: SnowflakeStatementStatus;
   columns: string[];
   rows: SqlRow[];
-  numRows: number;
-  partitionCount: number;
-  fetchedPartitions: number;
-  truncated: boolean;
+  /** Null when the statement did not complete, so an unread inventory never renders as zero rows. */
+  numRows: number | null;
+  partitionCount: number | null;
+  fetchedPartitions: number | null;
+  truncated: boolean | null;
   rowLimit?: number;
   error?: string;
+  /** The local failure code of a statement that was never sent (an OpenSSL code such as ERR_OSSL_UNSUPPORTED). */
+  code?: string;
+}
+
+/** What a bundle consumer reads in place of the rows of a statement that did not complete. */
+export interface SnowflakeNotCollectedMarker {
+  collected: false;
+  status: Exclude<SnowflakeStatementStatus, "ok">;
+  /** The statement that was actually executed; null when it was never sent. */
+  statement: string | null;
+  error: string | null;
+}
+
+/**
+ * The serialized form of a statement outcome: core_data files and the
+ * statements echoed by the assess tools. A statement that did not complete
+ * carries a not-collected marker in place of its rows and null columns, so a
+ * denial can never be mistaken for an empty result set; a readable statement
+ * with no rows keeps []. A statement that was never sent has `statement: null`
+ * on both levels, so the bundle names only statements the run executed.
+ */
+export interface SnowflakeStatementSnapshot {
+  key: string;
+  statement: string | null;
+  status: SnowflakeStatementStatus;
+  columns: string[] | null;
+  rows: SqlRow[] | SnowflakeNotCollectedMarker;
+  numRows: number | null;
+  partitionCount: number | null;
+  fetchedPartitions: number | null;
+  truncated: boolean | null;
+  rowLimit?: number;
+  error?: string;
+  code?: string;
 }
 
 export interface SnowflakeAccessSurface {
   name: string;
-  statement: string;
-  status: "readable" | "denied" | "error" | "timeout";
-  rowCount?: number;
+  /** The statement that was executed; null when it was never sent. */
+  statement: string | null;
+  status: "readable" | "denied" | "error" | "timeout" | "not_requested";
+  /** Rows seen on a readable surface; null when the statement did not complete. */
+  rowCount: number | null;
   error?: string;
 }
+
+/**
+ * Whether the run observed its own identity: `confirmed` when the session
+ * context statement returned the user and role, `unconfirmed` when statements
+ * were sent but the session context did not complete (the user and role are
+ * the configured values), `not_authenticated` when no request was sent at all.
+ */
+export type SnowflakeAuthenticationStatus = "confirmed" | "unconfirmed" | "not_authenticated";
 
 export interface SnowflakeAccessCheckResult {
   status: "healthy" | "limited";
   account: string;
-  user: string;
+  /** The session user, the configured user when unconfirmed, null when not authenticated. */
+  user: string | null;
   role?: string;
+  authentication: SnowflakeAuthenticationStatus;
+  /** The one-sentence authentication statement also carried in notes. */
+  authenticationNote: string;
   fullVisibility: boolean;
   surfaces: SnowflakeAccessSurface[];
   notes: string[];
@@ -173,7 +229,7 @@ export interface SnowflakeAssessmentResult {
   area: string;
   summary: JsonRecord;
   findings: SnowflakeFinding[];
-  statements: SnowflakeStatementOutcome[];
+  statements: SnowflakeStatementSnapshot[];
 }
 
 export interface SnowflakeAuditBundleResult {
@@ -391,34 +447,973 @@ function rowNumber(row: SqlRow, ...names: string[]): number | undefined {
   return asNumber(rowValue(row, ...names));
 }
 
-export function redactSecrets(text: string, secrets: Array<string | undefined> = []): string {
-  let output = text
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]")
-    .replace(/eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}/g, "[REDACTED TOKEN]")
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/g, "Bearer [REDACTED TOKEN]");
-  for (const secret of secrets) {
-    if (secret && secret.length >= 6) {
-      output = output.split(secret).join("[REDACTED]");
-    }
+// ---------------------------------------------------------------------------------------------
+// Error-text hygiene (rule 9). Every error string this module records passes through
+// redactSecrets when the API error is constructed and again where the error is recorded. Two
+// guards are construction requirements: a value inside any carrier (Authorization, Cookie,
+// Set-Cookie, x-api-key and similar headers, cookie or session assignments, URL userinfo and query
+// pairs, the Bearer, Basic, SSWS, Token, and ApiKey schemes, credential-named pairs) is removed
+// whatever its shape, and a configured secret is removed whatever its shape in its raw,
+// JSON-escaped, URL-encoded, base64, and base64url forms. Real token shapes (JWTs, PEM blocks, vendor
+// prefixes, hex digests, runs of 16 or more token characters with base64 symbols, scattered digits,
+// or token casing) are removed bare. A bare value shaped like a name (words joined by hyphens or
+// underscores with at most one digit group, such as prod-us-east-2026) is indistinguishable from a
+// resource name and stays; it is caught only inside a carrier or as a configured secret. A
+// token-shaped segment of a bare path (preceded by "/" outside a URL: a request target such as
+// /api/v1/users/<id>/factors or a config file path) is an identifier the run itself named and stays
+// so the endpoint reported is the one requested; inside a URL with a scheme every path segment keeps
+// the rule because webhook URLs carry their token there.
+//
+// The pair rule (reviewer C, item G): the value under a credential-named key (a credential word
+// anywhere in the name, compound and vendor environment names included: DB_PASSWORD,
+// SPLUNK_PASSWORD, OKTA_CLIENT_TOKEN) is removed whatever its shape and length in the "key=value",
+// "key: value", "key:value", and JSON forms, in prose and inside a JSON string alike; no plain-word
+// shape exempts it. Three key classes refine that:
+// - bearer ids: a key ending in "secret_id" (VAULT_SECRET_ID, role_secret_id, secretId) or naming a
+//   session id (session_id, sid, jsessionid, phpsessid, sessid) carries a bearer credential, so its
+//   value goes whatever the shape, a UUID included; this is decided before the setting test;
+// - settings: a credential-named key whose final segment is url, uri, endpoint, method, algorithm,
+//   audience, issuer, shape, type, mode, path, file, dir, limit, count, id, name, policy, or policies
+//   (token_endpoint, auth_method, token_type, api_key_id, password_policies,
+//   X-Snowflake-Authorization-Token-Type) names a setting, and
+//   its value stays unless it is token-shaped or a configured secret;
+// - webhooks: webhook*, *hook_url, and callback_url values lose their path and query and keep the
+//   origin, because the token of a webhook URL sits in its path.
+// Identifier keys without a credential word (OKTA_CLIENT_ID, SUMO_ACCESS_ID, SNOWFLAKE_ACCOUNT,
+// X-Request-Id) are not pairs under this rule; their values are judged by shape only.
+//
+// The escape rule (reviewer C, item H): a literal JSON escape is a boundary before every carrier
+// opener, so a header line that begins after one ("request headers:\u000aAuthorization: Splunk
+// <key>", "proxy:\n\tpassword: hunter2") is scrubbed as a header line, never as the value of the
+// word before the escape; see the note above ESCAPE_LETTER.
+//
+// The quote rule (reviewer C, items F and L): a quoted carrier value is read to the closing quote that
+// matches its opener (the same quote character behind the same backslash run), so an escaped inner
+// quote at any JSON depth is inner content and goes with the value; an unterminated quote and an
+// unquoted value end at a ";" or "," before the next header token, whose name may carry any RFC 7230
+// token character, so the following header keeps its name and its own treatment; see
+// readQuotedContent and scrubCookieHeaders.
+// ---------------------------------------------------------------------------------------------
+
+const REDACTED = "[REDACTED]";
+const MIN_CONFIGURED_SECRET_LENGTH = 4;
+const LONG_TOKEN_MIN_LENGTH = 16;
+const MIN_LETTERS_FOR_CASING = 6;
+
+// A literal JSON escape ("\n", "\r", "\t", "\b", "\f", "\/", "\uXXXX": the two- or six-character
+// sequence, not the control character) is a boundary before every carrier opener. A header name,
+// scheme word, pair key, URL, or token that begins right after one is read on its own, never as the
+// value of the word before the escape and never with the escape letter as its first character, and
+// a value, URL, or query pair ends at the backslash that opens the next escape. A backslash joins a
+// quote only as its escape, so a lone backslash is never read as an opening quote.
+const ESCAPE_LETTER = String.raw`(?:[nrtbf/]|u[0-9A-Fa-f]{4})`;
+/** The start of a carrier or token: outside a word (none of `wordCharacters` before it) or right after a literal escape, and not on an escape letter. */
+function carrierStart(wordCharacters: string): string {
+  return String.raw`(?:(?<![${wordCharacters}])|(?<=\\[nrtbf/]|\\u[0-9A-Fa-f]{4}))(?!(?<=\\)${ESCAPE_LETTER})`;
+}
+const CARRIER_START = carrierStart("A-Za-z0-9_");
+/** A quote unit at any JSON depth: the quote character and the backslashes that escape it (`"`, `\"`, `\\\"`). */
+const QUOTE_UNIT = String.raw`(?:\\*["'])`;
+
+const PEM_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----/g;
+const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
+// A URL wherever it sits in the text, spelled with "://" or with the JSON-escaped slashes a serialized
+// body carries ("https:\/\/host\/path"). In the escaped spelling "\/" is the URL's own path separator
+// and goes with it; after "://" it is the boundary every literal escape is, and the URL ends there.
+// The escaped form is unescaped for reading and written back escaped.
+const ESCAPED_SLASH = "\\/";
+const EMBEDDED_URL_PATTERN = new RegExp(String.raw`${CARRIER_START}[a-z][a-z0-9+.-]*:(?:\/\/[^\s"'<>()[\]{}\\]+|\\\/\\\/(?:\\\/|[^\s"'<>()[\]{}\\])+)`, "gi");
+// The userinfo ends at the first "/", "?", or "#": an "@" inside a query or fragment ("https://h?e=a@x.com&q=v") never turns the query into the host.
+const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
+const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+// A ";" inside a query value is part of the value (URLSearchParams semantics), so "?token=<v>;<rest>"
+// loses the whole value with no tail. The ";" separator belongs to Cookie and Set-Cookie parsing alone,
+// and the cookie reader runs before this pass, so a pair inside a cookie header is already gone. A pair
+// whose value is already the marker is left alone, so a second pass never grows it to "[REDACTED]]".
+const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>)\]}\\]+)/g;
+// The authorization scheme words, matched in any casing on both sides: a peer's error text may spell
+// "bearer" or "BASIC", and an Authorization carrier may carry "sNoWfLaKe". In prose, a scheme word
+// followed by a run of 8 or more token characters is a credential unless the run is prose: a mechanism
+// word ("Basic authentication"), a dotted version ("OAuth 2.0"), an auth-param of a challenge
+// (`Bearer realm="api"`), or one plain word or hyphenated lowercase compound after a spelling that is
+// as often an English word or a product name as a scheme: a lowercase spelling ("token provided", "the
+// bearer presented") or a product name in any casing ("Splunk Enterprise", "Snowflake statement
+// failed", "HMAC signature"). After a header-cased or upper-cased authorization scheme ("Bearer",
+// "BASIC", "SSWS") the run is the credential whatever its shape. A run with a digit, a symbol, or mixed
+// casing inside a word is never prose. The token after a scheme word may be quoted (plain, single, or
+// JSON-escaped); the quote is kept and the token removed.
+const SCHEME_WORDS = "bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|splunk|snowflake|hmac|aws4-hmac-sha256|veracode-hmac-sha-256";
+const SCHEME_VALUE_PATTERN = new RegExp(String.raw`${CARRIER_START}(${SCHEME_WORDS})\s+(${QUOTE_UNIT}?)([A-Za-z0-9._~+/=-]{8,})`, "gi");
+const SCHEME_PROSE_WORDS = new Set(["authentication", "authorization", "authenticated", "authorized", "credential", "credentials", "challenge"]);
+const PRODUCT_SCHEME_WORDS = new Set(["splunk", "snowflake", "hmac"]);
+const SCHEME_WORD_PATTERN = new RegExp(`^(?:${SCHEME_WORDS})$`, "i");
+const PLAIN_WORD_PATTERN = /^(?:[A-Z]?[a-z]+(?:-[a-z]+)*|[A-Z]+)$/;
+const VERSION_PATTERN = /^\d+(?:\.\d+)+$/;
+const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|charset|algorithm|qop|stale|domain|opaque|title|resource|client_id|authorization_uri|as_uri|ticket)=/i;
+// A value may begin with backslashes that open no escape and no quote (a Windows path, a stray
+// backslash); they go with the value rather than hiding it.
+const STRAY_BACKSLASHES = String.raw`(?:\\+(?![nrtbf/u"']))?`;
+const SCHEME_TOKEN_PATTERN = new RegExp(String.raw`^(\s+)(?!\[REDACTED\])(${QUOTE_UNIT}?)(${STRAY_BACKSLASHES}[^\s"'<>;,()[\]{}\\]+)`);
+// A pair key or value may sit in plain, single, or JSON-escaped quotes at any depth; the value ends at a quote or the escaping backslash.
+const ASSIGNMENT_KEY_PATTERN = new RegExp(String.raw`(${QUOTE_UNIT}?)${CARRIER_START}([A-Za-z][A-Za-z0-9_.-]{0,63})\b(${QUOTE_UNIT}?\s*([:=])\s*(${QUOTE_UNIT}?))`, "g");
+const ASSIGNMENT_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])${STRAY_BACKSLASHES}[^\s"'<>;,&()[\]{}\\]+`, "y");
+const URL_ORIGIN_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/[^\s/?#@"'<>]+(?=[/?#]|$)/i;
+const SINGLE_RUN_PATTERN = /^[A-Za-z0-9+=_-]+$/;
+const BEARER_ID_KEY_PATTERN = /(?:secret|session|token)[_.-]?id$/i;
+const BEARER_ID_KEY_SEGMENTS = new Set(["sid", "jsessionid", "phpsessid", "sessid"]);
+const BEARER_ID_KEY_TAILS = new Set(["secret_id", "session_id", "token_id"]);
+// The final segments that name a setting rather than a credential, the AppRole settings an assessment
+// reports included (secret_id_ttl, token_max_ttl, secret_id_num_uses, token_bound_cidrs, token_accessor).
+const SETTING_KEY_SUFFIXES = new Set(["url", "uri", "endpoint", "method", "algorithm", "audience", "issuer", "shape", "type", "mode", "path", "file", "dir", "limit", "count", "id", "name", "policy", "policies", "ttl", "uses", "cidrs", "accessor"]);
+// A webhook key is URL-valued: the bare word, or a *_url, *_uri, or *_endpoint key with a hook word
+// before the suffix (webhook_url, slack_hook_uri, callback_url). webhook_count and webhook_secret are
+// not URLs and follow the pair rule for their own final segment.
+const WEBHOOK_KEYS = new Set(["webhook", "webhooks", "hook", "hooks"]);
+const WEBHOOK_URL_WORDS = new Set(["webhook", "webhooks", "hook", "hooks", "callback"]);
+const URL_KEY_SUFFIXES = new Set(["url", "uri", "endpoint"]);
+// Every token shape starts at a carrier start, so a token glued to a literal escape ("\neyJ...",
+// "\u000aAKIA...") is read after the escape and never with the escape letter as its first character.
+const JWT_IN_TEXT_PATTERN = new RegExp(String.raw`${CARRIER_START}eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*`, "g");
+const AWS_ACCESS_KEY_ID_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b`, "g");
+const AWS_SECRET_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9/+=")}[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])`, "g");
+const HEX_DIGEST_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Fa-f0-9]{32,}\b`, "g");
+const VENDOR_TOKEN_SHAPES: readonly string[] = [
+  String.raw`00[A-Za-z0-9_-]{40}\b`,
+  String.raw`xox[abopers]-[A-Za-z0-9-]{10,}`,
+  String.raw`gh[pousr]_[A-Za-z0-9]{20,}`,
+  String.raw`github_pat_[A-Za-z0-9_]{20,}`,
+  String.raw`glpat-[A-Za-z0-9_-]{20,}`,
+  String.raw`AIza[0-9A-Za-z_-]{35}\b`,
+  String.raw`ya29\.[0-9A-Za-z._-]{20,}`,
+  String.raw`sk_(?:live|test)_[A-Za-z0-9]{10,}`,
+  String.raw`SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}`,
+];
+const VENDOR_TOKEN_PATTERNS: readonly RegExp[] = VENDOR_TOKEN_SHAPES.map((shape) => new RegExp(`${CARRIER_START}${shape}`, "g"));
+// "/", ".", ":", "@", "=", "\", and whitespace end a run, so URL path segments, dotted hostnames, the
+// two sides of a pair, and the text on either side of a literal escape are judged on their own; "="
+// joins a run only as trailing base64 padding that no value follows, so a key whose value was already
+// replaced or is quoted ("httpEventCollectorToken=[REDACTED]", "SPLUNK_ACS_TOKEN='[REDACTED]'") keeps its name.
+const LONG_TOKEN_RUN_PATTERN = new RegExp(String.raw`${carrierStart("A-Za-z0-9+_-")}[A-Za-z0-9+_-]{${LONG_TOKEN_MIN_LENGTH},}(?:={1,2}(?![A-Za-z0-9&\["'\\]))?`, "g");
+const DIGIT_GROUP_PATTERN = /\d+/g;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Trailing base64 padding is judged apart from the run it follows: `private_key_file=` is a setting
+// key whose value starts with a symbol, not a padded token.
+const BASE64_PADDING_PATTERN = /={1,2}$/;
+// A setting suffix concatenated onto another word (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID) still names the setting.
+const SETTING_KEY_SUFFIX_PATTERN = new RegExp(`(?:${[...SETTING_KEY_SUFFIXES].join("|")})$`);
+const SAFE_KEY_SHAPE_PATTERN = /^(?:max|min)[_-]|[_-](?:limit|days|hours|minutes|seconds|count|path|file|dir)$/i;
+const EXTRA_CREDENTIAL_KEY_SEGMENTS = new Set(["sid", "sig", "pwd", "passwd", "pass", "sessid", "phpsessid", "auth", "nonce", "sas"]);
+// "session" carries a credential only as the final segment (session=, user_session=); session_context and session_policy name settings.
+const FINAL_CREDENTIAL_KEY_SEGMENTS = new Set(["session"]);
+const EXTRA_CREDENTIAL_KEYS = new Set(["x-amz-signature", "x-amz-credential", "x-amz-security-token", "x-goog-signature", "x-goog-credential", "oauth_signature", "oauth_token", "oauth_verifier", "proxy-authorization"]);
+
+function keySegments(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/** True when a header, query parameter, or pair name carries a credential; thresholds and file references are exempt. */
+function isCredentialCarrierKey(key: string): boolean {
+  if (isSensitiveArgumentKey(key)) return true;
+  if (SAFE_KEY_SHAPE_PATTERN.test(key)) return false;
+  if (EXTRA_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+  const segments = keySegments(key);
+  if (FINAL_CREDENTIAL_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "")) return true;
+  return segments.some((segment) => EXTRA_CREDENTIAL_KEY_SEGMENTS.has(segment));
+}
+
+type PairRule = "credential" | "setting" | "webhook" | "none";
+
+/** A key ending in "secret_id", "token_id", or a session id name carries a bearer credential whatever the value's shape: a Vault secret id is a UUID, a token id is the token, a session id is the session. */
+function isBearerIdKey(key: string, segments: readonly string[]): boolean {
+  if (BEARER_ID_KEY_PATTERN.test(key)) return true;
+  return BEARER_ID_KEY_TAILS.has(segments.slice(-2).join("_")) || BEARER_ID_KEY_SEGMENTS.has(segments[segments.length - 1] ?? "");
+}
+
+/** A URL-valued webhook key (webhook, webhook_url, slack_hook_uri, callback_url) whose path carries the token; see WEBHOOK_KEYS. */
+function isWebhookKey(segments: readonly string[]): boolean {
+  if (segments.length === 1) return WEBHOOK_KEYS.has(segments[0] ?? "");
+  return URL_KEY_SUFFIXES.has(segments[segments.length - 1] ?? "") && segments.slice(0, -1).some((segment) => WEBHOOK_URL_WORDS.has(segment));
+}
+
+/** Whether a key's last word is a credential noun or the key is a bearer id: the test a bare path label must pass to be read as a pair. */
+function namesCredential(key: string): boolean {
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1] ?? "";
+  const noun = CREDENTIAL_ENCODING_WORDS.has(last) ? segments[segments.length - 2] ?? "" : last;
+  return CREDENTIAL_NOUN_PATTERN.test(noun) || isBearerIdKey(key, segments);
+}
+
+/** Authorization, Proxy-Authorization, and WWW-Authenticate carry a scheme word in front of the credential; every other key's value goes whatever word it starts with. */
+function isAuthorizationStyleKey(segments: readonly string[]): boolean {
+  return segments[segments.length - 1] === "authorization" || segments.slice(-2).join("_") === "www_authenticate";
+}
+
+/** The final segment names a setting, as its own word or concatenated onto another (OKTA_CLIENT_AUTHORIZATIONMODE, OKTA_CLIENT_PRIVATEKEYID); a bearer id is read before this test. */
+function isSettingSegment(segment: string): boolean {
+  return SETTING_KEY_SUFFIXES.has(segment) || SETTING_KEY_SUFFIX_PATTERN.test(segment);
+}
+
+/** How the value of a `key=value` or `key: value` pair is treated; see the pair rule above. */
+function pairRuleFor(key: string): PairRule {
+  const segments = keySegments(key);
+  if (isBearerIdKey(key, segments)) return "credential";
+  if (isWebhookKey(segments)) return "webhook";
+  if (!isCredentialCarrierKey(key)) return "none";
+  return isSettingSegment(segments[segments.length - 1] ?? "") ? "setting" : "credential";
+}
+
+/** A setting value is removed only when it is a single run of 16 or more characters with a real token shape (base64 symbols, scattered digits, or token casing); an identifier (0oa1audit, key-2024-01), a UUID, a scheme word, a mode name, or a URL stays for the later shape rules to judge. */
+function isTokenShapedValue(value: string): boolean {
+  return value.length >= LONG_TOKEN_MIN_LENGTH && SINGLE_RUN_PATTERN.test(value) && looksLikeToken(value);
+}
+
+/** A webhook value keeps its origin and loses its path and query; a value that is not a URL goes whole. */
+function webhookReplacement(value: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(value)?.[0];
+  return origin === undefined ? REDACTED : `${origin}/${REDACTED}`;
+}
+
+/** A 40-character base64 run is an AWS secret access key when it is random-looking; a bare path of word segments ("/api/v1/users/<id>/roles") that happens to span 40 characters is a request target and stays. */
+function looksLikeAwsSecret(run: string): boolean {
+  if (run.startsWith("/") || run.split("/").some((segment) => /^(?:[a-z]+|v\d+)$/.test(segment))) return false;
+  if (/[/+]/.test(run)) return true;
+  return /\d/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run);
+}
+
+/** MD5, SHA-1, and SHA-256 digests and hex-encoded keys: 32 or more hex characters mixing letters and digits. */
+function looksLikeHexDigest(run: string): boolean {
+  return /[A-Fa-f]/.test(run) && /\d/.test(run);
+}
+
+// camelCase and PascalCase identifiers: an optional lowercase head, capitalized words, and at most a
+// short trailing acronym ("frozenTimePeriodInSecs", "maxTotalDataSizeMB").
+const CAMEL_CASE_PATTERN = /^[a-z]*(?:[A-Z][a-z]+)*[A-Z]{0,4}$/;
+
+/**
+ * Token casing changes more often than once every three letters. Words and acronyms change at word
+ * boundaries only, and a camelCase identifier whose words average three or more letters is a name
+ * even when its case changes often ("frozenTimePeriodInSecs"); an alternating run of capitalized
+ * one- or two-letter fragments ("xKqZvBnMwLpRtYsHdG") has no such word structure and is a token.
+ */
+function hasTokenCasing(letters: string): boolean {
+  if (letters.length < MIN_LETTERS_FOR_CASING) return false;
+  let changes = 0;
+  for (let index = 1; index < letters.length; index += 1) {
+    const previousLower = letters[index - 1] >= "a" && letters[index - 1] <= "z";
+    const currentLower = letters[index] >= "a" && letters[index] <= "z";
+    if (previousLower !== currentLower) changes += 1;
+  }
+  if (changes * 3 <= letters.length) return false;
+  if (!CAMEL_CASE_PATTERN.test(letters)) return true;
+  const words = (letters.match(/[A-Z]/g) ?? []).length + (/^[a-z]/.test(letters) ? 1 : 0);
+  return words * 3 > letters.length;
+}
+
+/** The long-token rule: a UUID is an identifier; a base64 symbol, a second digit group anywhere in the run, or a "-" or "_" separated segment with token casing makes a token; words joined by "-" or "_" with at most one digit group are a name. */
+function looksLikeToken(run: string): boolean {
+  if (UUID_PATTERN.test(run)) return false;
+  if (/[+=]/.test(run)) return true;
+  if ((run.match(DIGIT_GROUP_PATTERN) ?? []).length > 1) return true;
+  return run.split(/[-_]/).some((segment) => hasTokenCasing(segment.replace(DIGIT_GROUP_PATTERN, "")));
+}
+
+/** True when the run at `index` is a segment of a bare path: preceded by a path separator ("/" or a lone "\"; the escape "\/" is a boundary, not a separator) and not inside a URL that carries a scheme. */
+function isBarePathSegment(text: string, index: number, urlSpans: ReadonlyArray<readonly [number, number]>): boolean {
+  const before = text[index - 1];
+  if (before === "/" ? text[index - 2] === "\\" : before !== "\\") return false;
+  return !urlSpans.some(([start, end]) => index >= start && index < end);
+}
+
+/** The long-token rule over the text; a scheme word that happens to carry digits ("aws4-hmac-sha256") names a mechanism and stays. */
+function scrubBareTokens(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
+  return text.replace(LONG_TOKEN_RUN_PATTERN, (run: string, offset: number) =>
+    looksLikeToken(run.replace(BASE64_PADDING_PATTERN, "")) && !SCHEME_WORD_PATTERN.test(run) && !isBarePathSegment(text, offset, urlSpans) ? REDACTED : run,
+  );
+}
+
+// The credentials this process has configured or minted (a client's token, private key, client
+// assertion, and the access token or session it obtained), so every scrub pass removes them without
+// being handed the client: redactSnapshot on a string leaf, an error text built outside the client.
+// Each entry keeps its encoded forms, lower-cased, so a leaf that carries none of them is passed over
+// with a substring check; bounded so a long-lived process that mints tokens does not grow it without limit.
+const REGISTERED_SECRET_LIMIT = 64;
+interface RegisteredSecret {
+  readonly value: string;
+  readonly forms: readonly string[];
+}
+const registeredSecrets: RegisteredSecret[] = [];
+
+/** Registers the credentials a client was configured with or minted; a value under the configured-secret minimum is ignored. */
+export function registerConfiguredSecrets(values: ReadonlyArray<string | undefined>): void {
+  for (const value of values) {
+    if (typeof value !== "string" || value.length < MIN_CONFIGURED_SECRET_LENGTH || registeredSecrets.some((entry) => entry.value === value)) continue;
+    const forms = [...new Set(scrubbedFormsOf(value).map((form) => form.toLowerCase()))].filter((form) => form.length >= MIN_CONFIGURED_SECRET_LENGTH);
+    registeredSecrets.push({ value, forms });
+    if (registeredSecrets.length > REGISTERED_SECRET_LIMIT) registeredSecrets.shift();
+  }
+}
+
+/** The registered credentials whose encoded forms may occur in the text; a text that carries none skips the full pass. */
+function registeredSecretsIn(text: string): string[] {
+  if (registeredSecrets.length === 0) return [];
+  const lower = text.toLowerCase();
+  if (lower.length !== text.length) return registeredSecrets.map((entry) => entry.value);
+  return registeredSecrets.filter((entry) => entry.forms.some((form) => lower.includes(form))).map((entry) => entry.value);
+}
+
+/** Removes the secrets handed in and every registered credential in each encoded form; a handed-in value also goes wherever it stands. */
+function scrubConfiguredSecrets(text: string, secrets: ReadonlyArray<string | undefined>): string {
+  const handed = [...new Set(secrets)].filter((value): value is string => typeof value === "string" && value.length >= MIN_CONFIGURED_SECRET_LENGTH);
+  const values = [...new Set([...handed, ...registeredSecretsIn(text)])];
+  if (values.length === 0) return text;
+  return scrubLiteralSecrets(scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED), handed);
+}
+
+/**
+ * The shared needle rule matches a form under eight characters only as a whole token, so a short
+ * passphrase glued into a longer run ("xhunter2y") would survive it. A value handed to the call is
+ * this client's own credential wherever it stands, so it goes literally as well, longest first; a
+ * value that is part of the marker itself is skipped so a second pass changes nothing.
+ */
+function scrubLiteralSecrets(text: string, values: readonly string[]): string {
+  let output = text;
+  for (const value of [...values].sort((left, right) => right.length - left.length)) {
+    if (!REDACTED.includes(value) && output.includes(value)) output = output.split(value).join(REDACTED);
   }
   return output;
 }
 
+/** A URL keeps its scheme, host, and path and loses its userinfo, query, and fragment; a slash-escaped URL is written back with its slashes escaped. */
+function scrubEmbeddedUrl(match: string): string {
+  const escaped = match.includes(ESCAPED_SLASH);
+  const spelled = escaped ? match.split(ESCAPED_SLASH).join("/") : match;
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(spelled)?.[0] ?? "";
+  const url = spelled.slice(0, spelled.length - trailing.length);
+  const parts = URL_PARTS_PATTERN.exec(url);
+  if (!parts) return match;
+  const [, scheme, hostAndPath, query, fragment] = parts;
+  const kept = `${scheme}${hostAndPath}`;
+  return `${escaped ? kept.split("/").join(ESCAPED_SLASH) : kept}${redactedUrlPart(query)}${redactedUrlPart(fragment)}${trailing}`;
+}
+
+/** A query or fragment with content becomes its delimiter and the marker; a bare delimiter (what an earlier pass left before its marker) carries nothing and stays, so a second pass adds no second marker. */
+function redactedUrlPart(part: string | undefined): string {
+  if (!part) return "";
+  return part.length > 1 ? `${part[0]}${REDACTED}` : part;
+}
+
+function scrubQueryPair(match: string, separator: string, key: string): string {
+  return isCredentialCarrierKey(key) ? `${separator}${key}=${REDACTED}` : match;
+}
+
+/** The word after a scheme word in prose is prose, not a credential, when it is a mechanism word, a dotted version, an auth-param, or one plain word after a lowercase spelling or a product name. */
+function isSchemeProse(scheme: string, word: string): boolean {
+  if (SCHEME_PROSE_WORDS.has(word.toLowerCase())) return true;
+  if (PLAIN_WORD_PATTERN.test(word) && (scheme === scheme.toLowerCase() || PRODUCT_SCHEME_WORDS.has(scheme.toLowerCase()))) return true;
+  return VERSION_PATTERN.test(word) || AUTH_PARAM_PATTERN.test(word);
+}
+
+function scrubSchemeValue(match: string, scheme: string, quote: string, value: string, offset: number, text: string): string {
+  const trailing = TRAILING_PUNCTUATION_PATTERN.exec(value)?.[0] ?? "";
+  const word = value.slice(0, value.length - trailing.length);
+  if (isSchemeProse(scheme, word) || isRedactedPairKey(word, text, offset + match.length)) return match;
+  return `${scheme} ${quote}${REDACTED}${trailing}`;
+}
+
+/** A run that is a bare pair key with the marker right after it (`username="[REDACTED]"`, `access_token=[REDACTED]`) names a pair whose value an earlier pass removed, and keeps its name. */
+function isRedactedPairKey(word: string, text: string, index: number): boolean {
+  if (!PAIR_KEY_ONLY_PATTERN.test(word)) return false;
+  REDACTED_PAIR_VALUE_PATTERN.lastIndex = index;
+  return REDACTED_PAIR_VALUE_PATTERN.test(text);
+}
+
+// The RFC 7230 token characters, so a following header whose name carries a "." or other token
+// punctuation (X.Api.Key) is recognised as the next header rather than swallowed (item L).
+const NEXT_HEADER_NAME = "[!#$%&'*+.^_`|~0-9A-Za-z-]+";
+// A ";" or "," ends a carrier value when the text after it (past optional spaces) opens the next
+// header "Name:" token or a JSON fragment.
+const NEXT_HEADER_AFTER_SEPARATOR = new RegExp(String.raw`^[ \t]*(?:[{[]|${QUOTE_UNIT}?${NEXT_HEADER_NAME}${QUOTE_UNIT}?[ \t]*:)`);
+// A quoted value that opens with a scheme word keeps the scheme and its gap and loses the rest, except
+// that a scheme followed by a pair list is read pair by pair. The pairs are the credential: a quoted
+// value goes whatever its key (`Snowflake Token="<v>"`, `Digest response="<v>"`, `Bearer blob="<v>"`)
+// unless the key is a descriptive parameter (realm, qop, algorithm, ...), and a bare value follows its
+// key's own rule, so an HMAC header's "id=...,ts=...,nonce=...,sig=..." keeps its timestamp. A
+// challenge header (WWW-Authenticate) is read the same way, so its `realm="api"` stays and its nonce goes.
+const LEADING_SCHEME_IN_VALUE = /^([A-Za-z][A-Za-z0-9-]*)(\s+)(\S[\s\S]*)$/;
+const PAIR_LIST_START = /^[A-Za-z][A-Za-z0-9_.-]*=/;
+// The run after the scheme is a bare key ("Token=", "username=") whose value follows it.
+const PAIR_KEY_ONLY_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]*=$/;
+// The pairs of a request credential's list: a key up to its "=", a bare value, and the separator before
+// the next pair ("," with optional spaces, or spaces alone).
+const LIST_PAIR_KEY_PATTERN = /[A-Za-z][A-Za-z0-9_.-]*=/y;
+// A bare value that is already the marker reads as one value, so the list goes on past a pair an earlier pass removed.
+const LIST_BARE_VALUE_PATTERN = /\[REDACTED\]|[^\s"'<>;,()[\]{}\\]*/y;
+const LIST_PAIR_SEPARATOR_PATTERN = /[ \t]*,[ \t]*|[ \t]+/y;
+// The descriptive parameters of a credential's pair list, whose quoted value stays (`realm="api"`,
+// `qop="auth"`, `algorithm="SHA-256"`, a challenge's `error="invalid_token"`); every other quoted value
+// in the list is the credential.
+const LIST_KEPT_PARAM_PATTERN = /^(?:realm|qop|algorithm|charset|error|error_description|error_uri|scope)$/i;
+// The proof parameters of an authentication exchange: Digest's `response`, an HTTP Signatures or
+// OAuth 1.0 `signature` and `oauth_signature`, the MAC and Hawk schemes' `mac`, and an HMAC header's
+// `sig`. A proof's value is the credential wherever its pair sits in a list with a challenge parameter
+// (realm, nonce, cnonce, opaque, qop, or an oauth_* name), with or without a scheme word or a header in
+// front of the list, so `realm="api", nonce="n", response="<proof>"` is never read as a bare challenge;
+// a proof-free challenge (`realm="api", qop="auth"`) and a pair list of another kind (`status=500
+// response=slow`) keep their values. Inside a scheme word's list a bare proof goes whatever its neighbours.
+const PROOF_PARAM_PATTERN = /^(?:response|signature|oauth_signature|mac|sig)$/i;
+const CHALLENGE_PARAM_PATTERN = /^(?:realm|nonce|cnonce|opaque|qop|oauth_[a-z0-9_]+)$/i;
+// The first key of a pair list, at a carrier start; the keys after it are read past the list separator.
+const PAIR_LIST_KEY_PATTERN = new RegExp(String.raw`${CARRIER_START}[A-Za-z][A-Za-z0-9_.-]*=`, "g");
+// The marker, in quotes or bare, where a pair's value stood before an earlier pass removed it.
+const REDACTED_PAIR_VALUE_PATTERN = new RegExp(String.raw`${QUOTE_UNIT}?\[REDACTED\]`, "y");
+// In prose, an authorization scheme word followed by a quoted pair opens a credential's pair list
+// ("Digest username="...", response="..."", "Bearer blob="..."") and the list rule applies; a product
+// name (Splunk, Snowflake, HMAC) followed by a quoted pair is prose about the product.
+const SCHEME_PAIR_LIST_PATTERN = new RegExp(String.raw`${CARRIER_START}(?:bearer|basic|digest|token|oauth|negotiate|ntlm|ssws|apikey|api-key|aws4-hmac-sha256|veracode-hmac-sha-256)\s+(?=[A-Za-z][A-Za-z0-9_.-]*=${QUOTE_UNIT})`, "gi");
+// After a bare path label the text is prose ("/api/v1/api-tokens: request failed with 403",
+// "/oauth/token-request: invalid_client") and stays, unless the segment itself names a credential
+// in the singular (its last word is password, key, secret, token, passphrase, or assertion, alone
+// or followed by an encoding word such as pem or base64, or it is a bearer id): then the next token
+// is the value whatever its shape and whatever follows it ("kv/password: <value> [code 003001]",
+// "kv/privateKeyPem: <value>"), while a plural label ("api-tokens", "secrets") names a collection
+// and its colon continues as prose, and so does a label whose last word names a file or path
+// ("kv/private_key_file: /x/y.pem").
+const CREDENTIAL_NOUN_PATTERN = /(?:password|passwd|passphrase|pwd|secret|token|key|assertion)$/;
+const CREDENTIAL_ENCODING_WORDS = new Set(["pem", "der", "b64", "base64", "jwk"]);
+// A credential-named flag whose value is the next argument (`psql --password <value> -h db`), as a
+// spawned CLI echoes its command line; `--name=value` is a pair and is read by the pair rule.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z][A-Za-z0-9_.-]{0,63})([ \t]+)(?!\[REDACTED\])(?!-)([^\s"'<>;,&()[\]{}\\]+)`, "g");
+
+/** The number of backslashes in the run ending immediately before `index`. */
+function backslashRunBefore(text: string, index: number): number {
+  let count = 0;
+  while (index - count - 1 >= 0 && text[index - count - 1] === "\\") count += 1;
+  return count;
+}
+
+/** True when a ";" or "," at `index` precedes the next header "Name:" token or a JSON fragment. */
+function endsAtNextHeader(text: string, index: number): boolean {
+  const ch = text[index];
+  if (ch !== ";" && ch !== ",") return false;
+  return NEXT_HEADER_AFTER_SEPARATOR.test(text.slice(index + 1));
+}
+
+interface QuotedRead {
+  /** The value content between the opener and the closer (or the unterminated stop), to be redacted. */
+  content: string;
+  /** The index just past the value: past the closing quote unit when terminated, at the stop otherwise. */
+  end: number;
+  /** True when a matching closer was found; false when a raw newline, an outer string, or the next header token ended the value. */
+  terminated: boolean;
+}
+
+/** A quote unit opening a value at `start`: its leading backslash run and quote character, or undefined when `start` is not on a quote unit. */
+function openingQuoteUnit(text: string, start: number): { backslashes: number; quoteChar: string; contentStart: number } | undefined {
+  let backslashes = 0;
+  while (text[start + backslashes] === "\\") backslashes += 1;
+  const quoteChar = text[start + backslashes];
+  if (quoteChar !== '"' && quoteChar !== "'") return undefined;
+  return { backslashes, quoteChar, contentStart: start + backslashes + 1 };
+}
+
+/**
+ * Reads the content of a quoted value that opened with `openBackslashes` backslashes and quote char
+ * `quoteChar`. A quote of the same char preceded by the same backslash run closes it, so a deeper
+ * quote (more backslashes: an escaped inner quote at any JSON depth) is inner content; a raw newline,
+ * a shallower quote (an outer string closing), or a ";"/"," before the next header token ends it
+ * unterminated so the following header keeps its name.
+ */
+function readQuotedContent(text: string, contentStart: number, openBackslashes: number, quoteChar: string): QuotedRead {
+  let i = contentStart;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\n" || ch === "\r") return { content: text.slice(contentStart, i), end: i, terminated: false };
+    if (ch === quoteChar) {
+      const run = backslashRunBefore(text, i);
+      if (run === openBackslashes) return { content: text.slice(contentStart, i - run), end: i + 1, terminated: true };
+      if (run < openBackslashes) return { content: text.slice(contentStart, i - run), end: i - run, terminated: false };
+    }
+    if (endsAtNextHeader(text, i)) return { content: text.slice(contentStart, i), end: i, terminated: false };
+    i += 1;
+  }
+  return { content: text.slice(contentStart, i), end: i, terminated: false };
+}
+
+// A cookie header value that is not wholly quoted runs across ";"/"," separated pairs; these are the
+// characters that make up a bare pair name or value (everything but the delimiters handled below). An
+// apostrophe is an RFC 6265 token character ("my'pref=", "sid=O'..."), so it is content, not a quote.
+const COOKIE_PLAIN_CHAR = /[^\r\n\t <>"\\;,=]/;
+const SPACE_BEFORE_JSON = /^[ \t]*[{[]/;
+
+/**
+ * Reads an unquoted cookie header value from `start`: it runs across ";"/"," separated pairs whose
+ * values may themselves be quoted, and ends before a ";"/"," or a space that precedes the next header
+ * token or a JSON fragment, at a raw newline or tab, at a literal escape, or at a bare quote. A pair
+ * value opened with a quote is read quote-aware, and an unterminated one ends the whole value there so
+ * the following header keeps its name. Returns the index just past the value.
+ */
+function readUnquotedCookieValue(text: string, start: number): number {
+  if (!COOKIE_PLAIN_CHAR.test(text[start] ?? "")) return start;
+  let i = start + 1;
+  while (i < text.length) {
+    const ch = text[i];
+    if (COOKIE_PLAIN_CHAR.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (ch === "=") {
+      i += 1;
+      while (text[i] === " " || text[i] === "\t") i += 1;
+      const opener = openingQuoteUnit(text, i);
+      if (opener) {
+        const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+        if (!read.terminated) return read.end;
+        i = read.end;
+      }
+      continue;
+    }
+    if (ch === ";" || ch === ",") {
+      if (endsAtNextHeader(text, i)) break;
+      i += 1;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (SPACE_BEFORE_JSON.test(text.slice(i + 1))) break;
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+// A cookie or session header at a carrier start, up to the separator; the value is read procedurally.
+const COOKIE_HEADER_START = new RegExp(String.raw`${CARRIER_START}(set-cookie|cookies?)(${QUOTE_UNIT}?\s*[:=]\s*)`, "gi");
+
+/**
+ * Removes the value of every Cookie and Set-Cookie header. A wholly quoted value is read to its
+ * matching closer (an escaped inner quote at any JSON depth is inner content); an unquoted value runs
+ * across its pairs and ends before the next header token, so the following header keeps its name. The
+ * marker `[REDACTED]` is left untouched so the pass is idempotent.
+ */
+function scrubCookieHeaders(text: string): string {
+  COOKIE_HEADER_START.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = COOKIE_HEADER_START.exec(text)) !== null) {
+    const [whole, header, separator] = match;
+    if (whole.length === 0) {
+      COOKIE_HEADER_START.lastIndex += 1;
+      continue;
+    }
+    const valueStart = match.index + whole.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    let prefix: string;
+    let redacted: string;
+    let end: number;
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      if (read.content.length === 0 || read.content === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      const openerText = text.slice(valueStart, opener.contentStart);
+      const closerText = read.terminated ? text.slice(read.end - (opener.backslashes + 1), read.end) : "";
+      prefix = openerText;
+      redacted = `${REDACTED}${closerText}`;
+      end = read.end;
+    } else {
+      const valueEnd = readUnquotedCookieValue(text, valueStart);
+      if (valueEnd === valueStart) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      let contentEnd = valueEnd;
+      while (contentEnd > valueStart && (text[contentEnd - 1] === " " || text[contentEnd - 1] === "\t")) contentEnd -= 1;
+      if (text.slice(valueStart, contentEnd) === REDACTED) {
+        COOKIE_HEADER_START.lastIndex = valueStart;
+        continue;
+      }
+      prefix = "";
+      redacted = `${REDACTED}${text.slice(contentEnd, valueEnd)}`;
+      end = valueEnd;
+    }
+    out += `${text.slice(last, match.index)}${header}${separator}${prefix}${redacted}`;
+    last = end;
+    COOKIE_HEADER_START.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+interface ListRead {
+  /** The text written in place of the list, from its first key to `end`. */
+  replacement: string;
+  /** The index just past the last pair read. */
+  end: number;
+}
+
+/** The bare value of a pair in a request credential's list follows its key's own rule: a credential or proof key loses it, a setting key loses a token-shaped one, a webhook key keeps its origin, and any other key keeps it. */
+function scrubBareListValue(key: string, value: string): string {
+  if (value.length === 0 || value === REDACTED) return value;
+  if (PROOF_PARAM_PATTERN.test(key)) return REDACTED;
+  const rule = pairRuleFor(key);
+  switch (rule) {
+    case "credential":
+      return REDACTED;
+    case "setting":
+      return isTokenShapedValue(value) ? REDACTED : value;
+    case "webhook":
+      return webhookReplacement(value);
+    case "none":
+      return value;
+    default: {
+      const unhandled: never = rule;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Reads one pair's value at `valueStart`, up to `limit`. The pairs of a credential's list are the
+ * credential, so a quoted value is removed whatever its key (`Snowflake Token="<v>"`, `Digest
+ * response="<v>"`, `Bearer blob="<v>"`) unless the key is a descriptive parameter (`realm="api"`),
+ * while a bare value follows its key's own rule so `qop=auth`, `nc=00000001`, and an HMAC header's
+ * timestamp stay legible and a bare proof (`response=<v>`, `sig=<v>`) goes. `terminated` is false when a
+ * quoted value never closed, which ends the list there.
+ */
+function readListPairValue(text: string, valueStart: number, key: string, limit: number): ListRead & { terminated: boolean } {
+  const opener = openingQuoteUnit(text, valueStart);
+  if (!opener) {
+    LIST_BARE_VALUE_PATTERN.lastIndex = valueStart;
+    const run = LIST_BARE_VALUE_PATTERN.exec(text)?.[0] ?? "";
+    const value = text.slice(valueStart, Math.min(valueStart + run.length, limit));
+    return { replacement: scrubBareListValue(key, value), end: valueStart + value.length, terminated: true };
+  }
+  const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+  const terminated = read.terminated && read.end <= limit;
+  const end = Math.min(read.end, limit);
+  const content = terminated ? read.content : text.slice(opener.contentStart, end);
+  const closer = terminated ? text.slice(read.end - opener.backslashes - 1, read.end) : "";
+  const value = content.length === 0 || content === REDACTED || LIST_KEPT_PARAM_PATTERN.test(key) ? content : REDACTED;
+  return { replacement: `${text.slice(valueStart, opener.contentStart)}${value}${closer}`, end, terminated };
+}
+
+/** Reads a credential's pair list from `start`, its first key, up to `limit`; the list ends at the first text that is not another pair. */
+function scrubRequestPairList(text: string, start: number, limit: number): ListRead {
+  let replacement = "";
+  let end = start;
+  let position = start;
+  while (position < limit) {
+    LIST_PAIR_KEY_PATTERN.lastIndex = position;
+    const key = LIST_PAIR_KEY_PATTERN.exec(text)?.[0];
+    if (key === undefined || position + key.length > limit) break;
+    const pair = readListPairValue(text, position + key.length, key.slice(0, -1), limit);
+    replacement += `${text.slice(end, position)}${key}${pair.replacement}`;
+    end = pair.end;
+    if (!pair.terminated) break;
+    LIST_PAIR_SEPARATOR_PATTERN.lastIndex = end;
+    const separator = LIST_PAIR_SEPARATOR_PATTERN.exec(text)?.[0];
+    if (separator === undefined) break;
+    position = end + separator.length;
+  }
+  return { replacement, end };
+}
+
+/**
+ * The run after a scheme word under an Authorization-style key, when it is a bare key whose value
+ * follows ("Token=", "username="). A quoted value opens the credential's pair list, read with the list
+ * rule under a request header and a challenge header alike. A key whose value is already the
+ * marker stays as it is, so a second pass adds nothing. Undefined when the run is the credential
+ * itself, which goes whole.
+ */
+function readSchemePairList(text: string, start: number, run: string, limit: number): ListRead | undefined {
+  if (!PAIR_KEY_ONLY_PATTERN.test(run)) return undefined;
+  const valueStart = start + run.length;
+  if (valueStart < limit && openingQuoteUnit(text, valueStart)) return scrubRequestPairList(text, start, limit);
+  if (text.startsWith(REDACTED, valueStart)) return { replacement: `${run}${REDACTED}`, end: valueStart + REDACTED.length };
+  return undefined;
+}
+
+/** Reads the quoted pair list after every authorization scheme word in prose (see SCHEME_PAIR_LIST_PATTERN) with the list rule; a list under a header was read by the assignment pass and reads the same a second time. */
+function scrubSchemePairLists(text: string): string {
+  SCHEME_PAIR_LIST_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SCHEME_PAIR_LIST_PATTERN.exec(text)) !== null) {
+    if (match[0].length === 0) {
+      SCHEME_PAIR_LIST_PATTERN.lastIndex += 1;
+      continue;
+    }
+    const list = scrubRequestPairList(text, match.index + match[0].length, text.length);
+    out += `${text.slice(last, match.index + match[0].length)}${list.replacement}`;
+    last = list.end;
+    SCHEME_PAIR_LIST_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+interface ListPair {
+  /** The pair's key, without its "=". */
+  key: string;
+  /** The value's content: between the quote units when quoted, the bare run otherwise. */
+  content: string;
+  /** The index of the content's first character. */
+  contentStart: number;
+}
+
+/**
+ * Reads the pair list whose first key starts at `start`: pairs separated by "," or spaces, with values
+ * quoted at any depth or bare. The list ends at the first text that is not another pair, and an
+ * unterminated quoted value ends it there.
+ */
+function readPairList(text: string, start: number): { pairs: ListPair[]; end: number } {
+  const pairs: ListPair[] = [];
+  let position = start;
+  let end = start;
+  while (position < text.length) {
+    LIST_PAIR_KEY_PATTERN.lastIndex = position;
+    const key = LIST_PAIR_KEY_PATTERN.exec(text)?.[0];
+    if (key === undefined) break;
+    const valueStart = position + key.length;
+    const opener = openingQuoteUnit(text, valueStart);
+    if (opener) {
+      const read = readQuotedContent(text, opener.contentStart, opener.backslashes, opener.quoteChar);
+      pairs.push({ key: key.slice(0, -1), content: read.content, contentStart: opener.contentStart });
+      end = read.end;
+      if (!read.terminated) break;
+    } else {
+      LIST_BARE_VALUE_PATTERN.lastIndex = valueStart;
+      const content = LIST_BARE_VALUE_PATTERN.exec(text)?.[0] ?? "";
+      pairs.push({ key: key.slice(0, -1), content, contentStart: valueStart });
+      end = valueStart + content.length;
+    }
+    LIST_PAIR_SEPARATOR_PATTERN.lastIndex = end;
+    const separator = LIST_PAIR_SEPARATOR_PATTERN.exec(text)?.[0];
+    if (separator === undefined) break;
+    position = end + separator.length;
+  }
+  return { pairs, end };
+}
+
+/**
+ * Removes the value of every proof parameter (see PROOF_PARAM_PATTERN) in a pair list that also carries
+ * a challenge parameter, whatever the value's shape and whether or not a scheme word or a header
+ * precedes the list: `realm="api", nonce="n", response="<proof>"` as a data value, after a literal
+ * escape, or inside a JSON string. The other pairs keep their own rule, so `realm="api"` stays.
+ */
+function scrubProofPairLists(text: string): string {
+  PAIR_LIST_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = PAIR_LIST_KEY_PATTERN.exec(text)) !== null) {
+    const list = readPairList(text, match.index);
+    if (list.pairs.some((pair) => CHALLENGE_PARAM_PATTERN.test(pair.key))) {
+      for (const pair of list.pairs) {
+        if (!PROOF_PARAM_PATTERN.test(pair.key) || pair.content.length === 0 || pair.content === REDACTED) continue;
+        out += `${text.slice(last, pair.contentStart)}${REDACTED}`;
+        last = pair.contentStart + pair.content.length;
+      }
+    }
+    PAIR_LIST_KEY_PATTERN.lastIndex = list.end;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/**
+ * Replaces the value of every credential-named pair: `key=value`, `key: value`, `"key": "value"`,
+ * and `Header-Name: value`. The value goes whatever its shape (an `=` pair, a quoted value, a header
+ * value, a plain word in prose, or a word that happens to be a scheme word: `sslPassword=splunk
+ * rejected` and `db_password: token` lose their value). Only an Authorization-style key
+ * (Authorization, Proxy-Authorization, WWW-Authenticate) carries a scheme word in front of its
+ * credential, where the scheme is kept and the token removed (`Authorization: Bearer <token>`); a
+ * pair list after the scheme is read pair by pair, see LEADING_SCHEME_IN_VALUE. A setting key keeps
+ * a value that is not token-shaped, a bearer-id key loses a UUID, and a webhook key keeps only the
+ * origin. The last segment of a bare path used as a label
+ * ("/api/authn/v2/api_credentials: <detail>") is a request target, not a pair key, so the prose
+ * after it is kept, unless the segment names a credential in the singular ("kv/password: <value>"),
+ * whose next token is the value; inside a URL with a scheme the pair rule still applies.
+ */
+function replaceCredentialAssignments(text: string): string {
+  const urlSpans = [...text.matchAll(EMBEDDED_URL_PATTERN)].map((match) => [match.index ?? 0, (match.index ?? 0) + match[0].length] as const);
+  ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
+    const [whole, openingQuote, key, separator, separatorChar, valueOpenQuote] = match;
+    if (whole.length === 0) {
+      ASSIGNMENT_KEY_PATTERN.lastIndex += 1;
+      continue;
+    }
+    const rule = pairRuleFor(key);
+    if (rule === "none") continue;
+    const valueStart = match.index + whole.length;
+    const barePathLabel = openingQuote === "" && separatorChar === ":" && isBarePathSegment(text, match.index, urlSpans);
+    if (barePathLabel && !namesCredential(key)) continue;
+    const schemeCarrier = isAuthorizationStyleKey(keySegments(key));
+    let kept = "";
+    let consumed: number;
+    let replacement = REDACTED;
+    if (valueOpenQuote !== "") {
+      // The value is quoted; read to its matching closer so an escaped inner quote at any JSON depth stays inner content and the value never ends early.
+      const { content } = readQuotedContent(text, valueStart, valueOpenQuote.length - 1, valueOpenQuote[valueOpenQuote.length - 1] ?? '"');
+      if (content.length === 0 || content === REDACTED) {
+        ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+        continue;
+      }
+      consumed = content.length;
+      const lead = LEADING_SCHEME_IN_VALUE.exec(content);
+      if (schemeCarrier && lead && SCHEME_WORD_PATTERN.test(lead[1])) {
+        if (lead[3].startsWith(REDACTED)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+        kept = `${lead[1]}${lead[2]}`;
+        const firstPair = PAIR_LIST_START.test(lead[3]) ? SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + lead[1].length)) : null;
+        if (firstPair) {
+          const list = readSchemePairList(text, valueStart + lead[1].length + firstPair[1].length, firstPair[3], valueStart + content.length);
+          kept = `${lead[1]}${firstPair[1]}${firstPair[2]}`;
+          if (list) {
+            replacement = list.replacement;
+            consumed = list.end - valueStart;
+          } else {
+            consumed = lead[1].length + firstPair[0].length;
+          }
+        }
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(content)) {
+          ASSIGNMENT_KEY_PATTERN.lastIndex = valueStart;
+          continue;
+        }
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(content);
+      }
+    } else {
+      ASSIGNMENT_VALUE_PATTERN.lastIndex = valueStart;
+      const value = ASSIGNMENT_VALUE_PATTERN.exec(text)?.[0];
+      if (value === undefined) continue;
+      consumed = value.length;
+      if (schemeCarrier && SCHEME_WORD_PATTERN.test(value)) {
+        const token = SCHEME_TOKEN_PATTERN.exec(text.slice(valueStart + value.length));
+        if (!token) continue;
+        const list = token[2] === "" ? readSchemePairList(text, valueStart + value.length + token[1].length, token[3], text.length) : undefined;
+        kept = `${value}${token[1]}${token[2]}`;
+        if (list) {
+          replacement = list.replacement;
+          consumed = list.end - valueStart;
+        } else {
+          consumed += token[0].length;
+        }
+      } else if (rule === "setting") {
+        if (!isTokenShapedValue(value)) continue;
+      } else if (rule === "webhook") {
+        replacement = webhookReplacement(value);
+        if (text.startsWith(REDACTED, valueStart + consumed)) consumed += REDACTED.length;
+      }
+    }
+    out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${kept}${replacement}`;
+    last = valueStart + consumed;
+    ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+/** Replaces the value argument of every credential-named flag (`--password <value>`); a setting flag (`--token-type bearer`) keeps its value. */
+function replaceFlagValues(text: string): string {
+  return text.replace(FLAG_VALUE_PATTERN, (match: string, name: string, gap: string) => (pairRuleFor(name) === "credential" ? `--${name}${gap}${REDACTED}` : match));
+}
+
+/**
+ * The carrier and shape rules shared by the error and data passes: PEM blocks, configured secrets,
+ * cookie headers, URLs, query pairs, the proof parameters of a pair list, credential pairs and flags,
+ * pair lists and scheme words in prose, JWTs, AWS keys, and vendor-prefixed tokens. `longTokens` adds the
+ * generic long-token and hex-digest rules, which the error pass runs and the data pass leaves off so
+ * identifiers survive in evidence.
+ */
+function scrubText(text: string, secrets: ReadonlyArray<string | undefined>, longTokens: boolean): string {
+  let scrubbed = text.replace(PEM_BLOCK_PATTERN, REDACTED).replace(PEM_OPEN_PATTERN, REDACTED);
+  scrubbed = scrubCookieHeaders(scrubConfiguredSecrets(scrubbed, secrets))
+    .replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl)
+    .replace(QUERY_PAIR_PATTERN, scrubQueryPair);
+  scrubbed = scrubSchemePairLists(replaceFlagValues(replaceCredentialAssignments(scrubProofPairLists(scrubbed))))
+    .replace(SCHEME_VALUE_PATTERN, scrubSchemeValue)
+    .replace(JWT_IN_TEXT_PATTERN, REDACTED)
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
+    .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));
+  if (longTokens) scrubbed = scrubbed.replace(HEX_DIGEST_PATTERN, (run) => (looksLikeHexDigest(run) ? REDACTED : run));
+  for (const pattern of VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, REDACTED);
+  return longTokens ? scrubBareTokens(scrubbed) : scrubbed;
+}
+
+/**
+ * The single redaction pass for error text. Idempotent: text that has been scrubbed once comes
+ * back unchanged because `[REDACTED]` matches none of the patterns.
+ */
+export function redactSecrets(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  return scrubText(text, secrets, true);
+}
+
+/**
+ * The redaction pass for data-side text: every string a snapshot walker visits. A credential carrier
+ * (`Authorization: Bearer <token>`, `password=<value>`, a webhook URL) or an unambiguous credential
+ * shape (a vendor-prefixed token, a JWT, a PEM block, an AWS key) inside a free-text field is
+ * removed on the data side too, while the generic long-token rule stays off so a name or an id that
+ * merely looks random survives. Idempotent like the error pass.
+ */
+export function scrubDataText(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  return scrubText(text, secrets, false);
+}
+
+/** Describes a response body that is not JSON without copying any of it. */
+function describeNonJsonBody(response: Response, rawText: string): string {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+  return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText)} bytes)`;
+}
+
+/** A TOML line the simple reader cannot accept; it records the line number only, never the line. */
+export class SnowflakeTomlSyntaxError extends Error {
+  readonly line: number;
+
+  constructor(line: number) {
+    super(`Invalid TOML at line ${line}`);
+    this.name = "SnowflakeTomlSyntaxError";
+    this.line = line;
+  }
+}
+
+/**
+ * Reads the subset of TOML that Snowflake connection files use: comments,
+ * section headers, and single-line key = value pairs. A line that is none of
+ * those, or a quoted value that does not close on its own line, is a syntax
+ * error reported by line number, so a stray or continued credential line
+ * never reaches a value or an error message.
+ */
 export function parseSimpleToml(text: string): Record<string, JsonRecord> {
   const sections: Record<string, JsonRecord> = { "": {} };
   let current = "";
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const lineNumber = index + 1;
+    const line = lines[index].trim();
     if (line.length === 0 || line.startsWith("#")) continue;
-    const sectionMatch = /^\[\s*([^\]]+?)\s*\]$/.exec(line);
+    const sectionMatch = /^\[\s*([^\]]+?)\s*\](?:\s+#.*)?$/.exec(line);
     if (sectionMatch) {
       current = sectionMatch[1].replace(/"/g, "").trim();
       sections[current] = sections[current] ?? {};
       continue;
     }
-    const keyMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
-    if (!keyMatch) continue;
-    sections[current][keyMatch[1]] = parseTomlValue(keyMatch[2].trim());
+    const keyMatch = /^("[^"]+"|'[^']+'|[A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
+    if (!keyMatch) throw new SnowflakeTomlSyntaxError(lineNumber);
+    const key = keyMatch[1].replace(/^["']|["']$/g, "");
+    sections[current][key] = parseTomlValue(keyMatch[2].trim(), lineNumber);
   }
   return sections;
 }
@@ -434,25 +1429,74 @@ function findClosingQuote(raw: string, quote: string, start: number): number {
   return -1;
 }
 
-function parseTomlValue(raw: string): unknown {
-  if (raw.startsWith("\"\"\"")) {
-    const end = raw.indexOf("\"\"\"", 3);
-    return end >= 0 ? raw.slice(3, end) : raw.slice(3);
+function parseTomlValue(raw: string, lineNumber: number): unknown {
+  if (raw.startsWith("\"\"\"") || raw.startsWith("'''")) {
+    const delimiter = raw.slice(0, 3);
+    const end = raw.indexOf(delimiter, 3);
+    if (end < 0) throw new SnowflakeTomlSyntaxError(lineNumber);
+    return raw.slice(3, end);
   }
   if (raw.startsWith("\"")) {
     const end = findClosingQuote(raw, "\"", 1);
-    const inner = end >= 0 ? raw.slice(1, end) : raw.slice(1);
-    return inner.replace(/\\n/g, "\n").replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
+    if (end < 0) throw new SnowflakeTomlSyntaxError(lineNumber);
+    return raw.slice(1, end).replace(/\\n/g, "\n").replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
   }
   if (raw.startsWith("'")) {
     const end = findClosingQuote(raw, "'", 1);
-    return end >= 0 ? raw.slice(1, end) : raw.slice(1);
+    if (end < 0) throw new SnowflakeTomlSyntaxError(lineNumber);
+    return raw.slice(1, end);
   }
   const withoutComment = raw.replace(/\s+#.*$/, "").trim();
   if (/^(true|false)$/i.test(withoutComment)) return withoutComment.toLowerCase() === "true";
   const numeric = Number(withoutComment);
   if (withoutComment.length > 0 && Number.isFinite(numeric)) return numeric;
   return withoutComment;
+}
+
+const FS_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
+const CRYPTO_ERROR_CODE_PATTERN = /^ERR_[A-Z0-9_]{1,60}$/;
+
+function thrownCode(error: unknown, pattern: RegExp): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && pattern.test(code) ? code : undefined;
+}
+
+/**
+ * Read step of the config loader: a missing file is simply absent, every
+ * other failure is reported by path and errno code only, never by the
+ * filesystem's own wording.
+ */
+function readConfigFileText(pathname: string): string | undefined {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") return undefined;
+    throw new Error(`Unable to read Snowflake config file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
+}
+
+/** Parse step: catches every thrown value and reports path, line, and a fixed code; nothing from the line itself. */
+function readSnowflakeTomlFile(pathname: string): Record<string, JsonRecord> | undefined {
+  const text = readConfigFileText(pathname);
+  if (text === undefined) return undefined;
+  try {
+    return parseSimpleToml(text);
+  } catch (error) {
+    const where = error instanceof SnowflakeTomlSyntaxError ? ` at line ${error.line}` : "";
+    throw new Error(`Unable to parse Snowflake config file: invalid TOML in ${pathname}${where} (INVALID_TOML)`);
+  }
+}
+
+/** The private key file is credential-bearing, so a read failure names the path and errno code only. */
+function readPrivateKeyFile(pathname: string): string {
+  try {
+    return readFileSync(pathname, "utf8");
+  } catch (error) {
+    const code = thrownCode(error, FS_ERROR_CODE_PATTERN);
+    if (code === "ENOENT") throw new Error(`Snowflake private key file was not found: ${pathname} (ENOENT)`);
+    throw new Error(`Unable to read Snowflake private key file ${pathname} (${code ?? "UNREADABLE"})`);
+  }
 }
 
 export interface SnowflakeTomlConnection {
@@ -469,15 +1513,15 @@ export function loadSnowflakeTomlConnection(
   const configDir = asString(env.SNOWFLAKE_HOME) ?? join(homeDirectory, ".snowflake");
   const configPath = join(configDir, "config.toml");
   const connectionsPath = join(configDir, "connections.toml");
-  const configSections = existsSync(configPath) ? parseSimpleToml(readFileSync(configPath, "utf8")) : undefined;
+  const configSections = readSnowflakeTomlFile(configPath);
   const name = connectionName
     ?? asString(env.SNOWFLAKE_CONNECTION_NAME)
     ?? asString(env.SNOWFLAKE_DEFAULT_CONNECTION_NAME)
     ?? asString(configSections?.[""]?.default_connection_name)
     ?? "default";
 
-  if (existsSync(connectionsPath)) {
-    const sections = parseSimpleToml(readFileSync(connectionsPath, "utf8"));
+  const sections = readSnowflakeTomlFile(connectionsPath);
+  if (sections) {
     const values = sections[name] ?? sections[`connections.${name}`];
     if (values) return { name, values, source: connectionsPath };
   }
@@ -592,11 +1636,7 @@ export function resolveSnowflakeConfiguration(
   if (inlinePrivateKey) {
     privateKeyPem = inlinePrivateKey.replace(/\\n/g, "\n");
   } else if (privateKeyPath) {
-    const resolvedPath = expandHome(privateKeyPath, homeDirectory);
-    if (!existsSync(resolvedPath)) {
-      throw new Error(`Snowflake private key file was not found: ${resolvedPath}`);
-    }
-    privateKeyPem = readFileSync(resolvedPath, "utf8");
+    privateKeyPem = readPrivateKeyFile(expandHome(privateKeyPath, homeDirectory));
   }
 
   const explicitTokenType = parseTokenType(authenticator);
@@ -660,13 +1700,29 @@ export function computePublicKeyFingerprint(privateKey: KeyObject): string {
   return `SHA256:${createHash("sha256").update(publicKeyDer).digest("base64")}`;
 }
 
+/**
+ * A private key that cannot be turned into a bearer token. The message is
+ * fixed text plus a validated code (OpenSSL's ERR_OSSL_* code, or
+ * INVALID_PRIVATE_KEY when the library gave none); the key material, the
+ * passphrase, and the library's own wording never reach it.
+ */
+export class SnowflakePrivateKeyError extends Error {
+  readonly code: string;
+
+  constructor(code: string, detail: string = "Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.") {
+    super(`Unable to load the Snowflake private key (${code}). ${detail}`);
+    this.name = "SnowflakePrivateKeyError";
+    this.code = code;
+  }
+}
+
 export function buildSnowflakeKeyPairJwt(
   config: Pick<SnowflakeResolvedConfig, "account" | "user" | "privateKeyPem" | "privateKeyPassphrase">,
   now: Date = new Date(),
   lifetimeSeconds: number = JWT_LIFETIME_SECONDS,
 ): { token: string; expiresAt: number; issuer: string; subject: string } {
   if (!config.privateKeyPem) {
-    throw new Error("Snowflake key-pair authentication requires a private key.");
+    throw new SnowflakePrivateKeyError("MISSING_PRIVATE_KEY", "Snowflake key-pair authentication requires a private key.");
   }
   let privateKey: KeyObject;
   try {
@@ -676,7 +1732,7 @@ export function buildSnowflakeKeyPairJwt(
       passphrase: config.privateKeyPassphrase,
     });
   } catch (error) {
-    throw new Error(`Unable to load the Snowflake private key: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+    throw new SnowflakePrivateKeyError(thrownCode(error, CRYPTO_ERROR_CODE_PATTERN) ?? "INVALID_PRIVATE_KEY");
   }
   const qualifiedUser = `${normalizeJwtAccountIdentifier(config.account)}.${config.user.trim().toUpperCase()}`;
   const issuer = `${qualifiedUser}.${computePublicKeyFingerprint(privateKey)}`;
@@ -688,20 +1744,122 @@ export function buildSnowflakeKeyPairJwt(
   return { token: `${header}.${payload}.${signature}`, expiresAt: expiresAt * 1000, issuer, subject: qualifiedUser };
 }
 
+/** What the SQL API returned for one request; a non-JSON body is described, never kept. */
+interface SnowflakeApiResponse {
+  status: number;
+  statusText: string;
+  payload: JsonRecord;
+  headers: Headers;
+  nonJsonBody?: string;
+}
+
+export type SnowflakeStatementErrorKind = Exclude<SnowflakeStatementStatus, "ok">;
+
 export class SnowflakeStatementError extends Error {
   readonly statusCode?: number;
   readonly sqlCode?: string;
   readonly sqlState?: string;
-  readonly kind: "denied" | "error" | "timeout";
+  readonly kind: SnowflakeStatementErrorKind;
+  /** The local failure code when the statement was never sent. */
+  readonly code?: string;
 
-  constructor(message: string, options: { statusCode?: number; sqlCode?: string; sqlState?: string; kind?: "denied" | "error" | "timeout" } = {}) {
-    super(message);
+  /**
+   * The message and codes are scrubbed here as well as at the record point,
+   * so an error built anywhere in the client never carries a credential even
+   * if a caller stores error.message directly.
+   */
+  constructor(message: string, options: { statusCode?: number; sqlCode?: string; sqlState?: string; kind?: SnowflakeStatementErrorKind; code?: string } = {}) {
+    super(redactSecrets(message));
     this.name = "SnowflakeStatementError";
     this.statusCode = options.statusCode;
-    this.sqlCode = options.sqlCode;
-    this.sqlState = options.sqlState;
-    this.kind = options.kind ?? classifyErrorMessage(message, options.statusCode);
+    this.sqlCode = options.sqlCode === undefined ? undefined : redactSecrets(options.sqlCode);
+    this.sqlState = options.sqlState === undefined ? undefined : redactSecrets(options.sqlState);
+    this.kind = options.kind ?? classifyErrorMessage(this.message, options.statusCode);
+    this.code = options.code;
   }
+
+  /**
+   * The error for a statement that is never sent because no bearer token can
+   * be built: the message names the local failure and its code, never an
+   * endpoint, and the request loop does not retry it.
+   */
+  static notRequested(reason: string, code: string, remediation?: string): SnowflakeStatementError {
+    return new SnowflakeStatementError(
+      `Not requested: ${reason} (${code}); no statement was sent.${remediation ? ` ${remediation}` : ""}`,
+      { kind: "not_requested", code },
+    );
+  }
+
+  /**
+   * Builds the error for a response that cannot be used as a result set: a
+   * body that is not JSON becomes a status-and-length note whatever its
+   * content type, a JSON body contributes only the documented message, code,
+   * and sqlState fields, and the configured secrets are removed before the
+   * pattern pass runs.
+   */
+  static fromResponse(response: SnowflakeApiResponse, secrets: Array<string | undefined>): SnowflakeStatementError {
+    return new SnowflakeStatementError(redactSecrets(extractApiError(response), secrets), {
+      statusCode: response.status,
+      sqlCode: response.nonJsonBody === undefined ? asString(response.payload.code) : undefined,
+      sqlState: response.nonJsonBody === undefined ? asString(response.payload.sqlState) : undefined,
+    });
+  }
+}
+
+/** A URL resolved onto the configured account origin, or the fixed reason it was refused before any request. */
+type OriginResolution = { url: string; refusal?: undefined } | { url?: undefined; refusal: string };
+
+/** A root path (`/...` but not `//...` or `/\...`); any other slash or backslash form is a protocol-relative or relative reference. */
+const ROOT_PATH_PATTERN = /^\/(?![/\\])/;
+/** An absolute URL: a scheme (any casing) followed by a colon. */
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
+
+/**
+ * The origin a URL names, spelled as scheme and host (`https://host:8443`) or,
+ * for a URL without a host (`javascript:`, `data:`, `file:`, `blob:`), as its
+ * bare scheme. `URL.origin` would spell the first three as the opaque string
+ * "null" and a blob: URL as the origin of the URL inside it, so a blob: link
+ * carrying the configured host would compare equal to it.
+ */
+function originLabel(url: URL): string {
+  return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+}
+
+/**
+ * Where a URL may lead, decided before any credential is built or any request
+ * is sent. A client-built path or the server-supplied statementStatusUrl of an
+ * asynchronous statement is followed only when it is a root path on the
+ * configured account origin or an absolute URL that resolves, as a browser
+ * would, onto that origin (scheme and host compared after URL normalization,
+ * so casing never matters) and carries no userinfo. A relative reference such
+ * as `@other.example/x`, a protocol-relative (`//host`) form, or a backslash
+ * (`\\host`) form is refused whatever host it names, since concatenating it
+ * onto the account URL would move the host or request a path the server never
+ * meant; a link on a hostless scheme (`javascript:`, `data:`, `blob:`, `file:`)
+ * is refused by its scheme. Each refusal is fixed text naming only the
+ * configured origin and the rejected origin: no path, query, fragment, or
+ * userinfo of the link reaches any text, so the bearer token never leaves for
+ * another host and no window of the link is echoed.
+ */
+function resolveOnConfiguredOrigin(candidate: string, baseUrl: string): OriginResolution {
+  const configured = originLabel(new URL(baseUrl));
+  let resolved: URL;
+  try {
+    resolved = new URL(candidate, baseUrl);
+  } catch {
+    return { refusal: `could not be parsed against the configured account origin ${configured}` };
+  }
+  const origin = originLabel(resolved);
+  if (resolved.username !== "" || resolved.password !== "") {
+    return { refusal: `carries userinfo for origin ${origin} (configured account origin ${configured})` };
+  }
+  if (origin !== configured) {
+    return { refusal: `is on origin ${origin}, not the configured account origin ${configured}` };
+  }
+  if (!ROOT_PATH_PATTERN.test(candidate) && !ABSOLUTE_URL_PATTERN.test(candidate)) {
+    return { refusal: `is a protocol-relative or relative reference rather than a root path on the configured account origin ${configured} or an absolute URL on it` };
+  }
+  return { url: resolved.href };
 }
 
 function classifyErrorMessage(message: string, statusCode?: number): "denied" | "error" | "timeout" {
@@ -713,12 +1871,17 @@ function classifyErrorMessage(message: string, statusCode?: number): "denied" | 
   return "error";
 }
 
-function extractApiError(payload: JsonRecord, status: number, statusText: string): string {
-  const message = asString(payload.message) ?? asString(payload.error) ?? "";
-  const code = asString(payload.code);
-  const sqlState = asString(payload.sqlState);
+function extractApiError(response: SnowflakeApiResponse): string {
+  const outcome = response.status >= 200 && response.status < 300 ? "returned an unreadable response" : "failed";
+  const statusLine = `${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  if (response.nonJsonBody !== undefined) {
+    return `Snowflake SQL API request ${outcome} (${statusLine}): ${response.nonJsonBody}`;
+  }
+  const message = asString(response.payload.message) ?? asString(response.payload.error) ?? "";
+  const code = asString(response.payload.code);
+  const sqlState = asString(response.payload.sqlState);
   const detail = [code ? `code ${code}` : undefined, sqlState ? `sqlState ${sqlState}` : undefined].filter(Boolean).join(", ");
-  return `Snowflake SQL API request failed (${status} ${statusText})${message ? `: ${message}` : ""}${detail ? ` [${detail}]` : ""}`;
+  return `Snowflake SQL API request ${outcome} (${statusLine})${message ? `: ${message}` : ""}${detail ? ` [${detail}]` : ""}`;
 }
 
 export class SnowflakeSqlClient {
@@ -731,38 +1894,72 @@ export class SnowflakeSqlClient {
     this.config = config;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => new Date());
+    registerConfiguredSecrets([config.token, config.privateKeyPem, config.privateKeyPassphrase]);
   }
 
   getResolvedConfig(): SnowflakeResolvedConfig {
     return this.config;
   }
 
+  /**
+   * The bearer token for the next request. When none can be built, the
+   * statement is reported as not requested with the local failure code; no
+   * endpoint is named because none was called.
+   */
   private getBearerToken(): string {
     if (this.config.tokenType === "KEYPAIR_JWT") {
       const nowMs = this.now().getTime();
       if (!this.jwt || this.jwt.expiresAt - JWT_REFRESH_SKEW_SECONDS * 1000 <= nowMs) {
-        const built = buildSnowflakeKeyPairJwt(this.config, this.now());
+        let built: ReturnType<typeof buildSnowflakeKeyPairJwt>;
+        try {
+          built = buildSnowflakeKeyPairJwt(this.config, this.now());
+        } catch (error) {
+          const code = error instanceof SnowflakePrivateKeyError ? error.code : "INVALID_PRIVATE_KEY";
+          throw SnowflakeStatementError.notRequested(
+            "the Snowflake private key could not be loaded",
+            code,
+            "Provide a PKCS#8 PEM key and, for an encrypted key, its passphrase.",
+          );
+        }
         this.jwt = { token: built.token, expiresAt: built.expiresAt };
+        registerConfiguredSecrets([built.token]);
       }
       return this.jwt.token;
     }
     if (!this.config.token) {
-      throw new Error("Snowflake bearer token is missing.");
+      throw SnowflakeStatementError.notRequested("no Snowflake bearer token is configured", "MISSING_TOKEN");
     }
     return this.config.token;
   }
 
+  /** The caller's token, the JWT built from the key pair, the private key, and its passphrase; every form of each is removed from error text. */
+  private configuredSecrets(): Array<string | undefined> {
+    return [this.config.token, this.jwt?.token, this.config.privateKeyPem, this.config.privateKeyPassphrase];
+  }
+
   private redact(message: string): string {
-    return redactSecrets(message, [this.config.token, this.jwt?.token, this.config.privateKeyPassphrase]);
+    return redactSecrets(message, this.configuredSecrets());
   }
 
   private async request(
     method: "GET" | "POST",
     pathname: string,
     body?: JsonRecord,
-  ): Promise<{ status: number; statusText: string; payload: JsonRecord; headers: Headers }> {
+  ): Promise<SnowflakeApiResponse> {
+    // The URL is resolved onto the configured origin before any credential is
+    // built or attached, so a path that would move the host is refused with
+    // fixed text naming only the two origins and nothing leaves.
+    const resolution = resolveOnConfiguredOrigin(pathname, this.config.baseUrl);
+    if (resolution.url === undefined) {
+      throw new SnowflakeStatementError(`Snowflake SQL API request refused: the request URL ${resolution.refusal}, so no request was sent.`, { kind: "error" });
+    }
+    const url = resolution.url;
     let attempt = 0;
     for (;;) {
+      // A credential that cannot be turned into a bearer token is a
+      // configuration error, not a transport failure: the not-requested error
+      // propagates before any fetch and is never retried.
+      const authorization = `Bearer ${this.getBearerToken()}`;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
       try {
@@ -770,22 +1967,27 @@ export class SnowflakeSqlClient {
           accept: "application/json",
           "content-type": "application/json",
           "user-agent": "grclanker-snowflake-inspector/1.0",
-          authorization: `Bearer ${this.getBearerToken()}`,
+          authorization,
           "x-snowflake-authorization-token-type": this.config.tokenType,
         });
-        const response = await this.fetchImpl(`${this.config.baseUrl}${pathname}`, {
+        const response = await this.fetchImpl(url, {
           method,
           headers,
           body: body ? JSON.stringify(body) : undefined,
           signal: controller.signal,
         });
+        // A body that is not JSON (a proxy error page, an HTML sign-in form) is
+        // never copied into the payload or an error string: it is described by
+        // content type and size only, because such pages can echo credentials.
         const rawText = await response.text();
         let payload: JsonRecord = {};
+        let nonJsonBody: string | undefined;
         if (rawText.length > 0) {
           try {
-            payload = asObject(JSON.parse(rawText)) ?? { data: JSON.parse(rawText) };
+            const parsed: unknown = JSON.parse(rawText);
+            payload = asObject(parsed) ?? { data: parsed };
           } catch {
-            payload = { message: rawText.slice(0, 240) };
+            nonJsonBody = describeNonJsonBody(response, rawText);
           }
         }
         const retryable = response.status === 429 || response.status >= 500;
@@ -794,7 +1996,7 @@ export class SnowflakeSqlClient {
           await sleep(this.retryDelay(attempt, response.headers));
           continue;
         }
-        return { status: response.status, statusText: response.statusText, payload, headers: response.headers };
+        return { status: response.status, statusText: response.statusText, payload, headers: response.headers, nonJsonBody };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (controller.signal.aborted) {
@@ -831,35 +2033,32 @@ export class SnowflakeSqlClient {
     if (this.config.schema) body.schema = this.config.schema;
 
     const submit = await this.request("POST", `/api/v2/statements?async=true&requestId=${randomUUID()}`, body);
-    let payload = submit.payload;
-    let status = submit.status;
-    let statusText = submit.statusText;
-    let handle = asString(payload.statementHandle);
-    const statusUrl = asString(payload.statementStatusUrl) ?? (handle ? `/api/v2/statements/${handle}` : undefined);
+    let latest = submit;
+    let handle = asString(latest.payload.statementHandle);
+    const statusUrl = asString(latest.payload.statementStatusUrl) ?? (handle ? `/api/v2/statements/${handle}` : undefined);
     const deadline = this.now().getTime() + (options.timeoutSeconds ?? this.config.statementTimeoutSeconds) * 1000 + this.config.timeoutMs;
 
-    while (status === 202 || (status === 429 && handle)) {
+    while (latest.nonJsonBody === undefined && (latest.status === 202 || (latest.status === 429 && handle))) {
       if (!statusUrl) break;
+      const statusResolution = resolveOnConfiguredOrigin(statusUrl, this.config.baseUrl);
+      if (statusResolution.url === undefined) {
+        throw new SnowflakeStatementError(`Snowflake SQL API returned a statement status URL that ${statusResolution.refusal}; the statement was not polled and its result was not read.`, { kind: "error" });
+      }
       if (this.now().getTime() > deadline) {
         throw new SnowflakeStatementError(`Snowflake statement ${handle ?? ""} did not complete before the ${this.config.statementTimeoutSeconds}s statement timeout.`, { kind: "timeout" });
       }
       await sleep(this.pollDelay(submit.headers));
-      const poll = await this.request("GET", statusUrl);
-      payload = poll.payload;
-      status = poll.status;
-      statusText = poll.statusText;
-      handle = asString(payload.statementHandle) ?? handle;
+      latest = await this.request("GET", statusUrl);
+      handle = asString(latest.payload.statementHandle) ?? handle;
     }
 
-    if (status !== 200) {
-      throw new SnowflakeStatementError(this.redact(extractApiError(payload, status, statusText)), {
-        statusCode: status,
-        sqlCode: asString(payload.code),
-        sqlState: asString(payload.sqlState),
-      });
+    // A 2xx with a non-JSON body is an unreadable statement, not an empty
+    // result set, so it is reported like any other failed response.
+    if (latest.status !== 200 || latest.nonJsonBody !== undefined) {
+      throw SnowflakeStatementError.fromResponse(latest, this.configuredSecrets());
     }
 
-    return this.materializeResultSet(statement, payload, handle);
+    return this.materializeResultSet(statement, latest.payload, handle);
   }
 
   private pollDelay(headers: Headers): number {
@@ -883,8 +2082,8 @@ export class SnowflakeSqlClient {
       const partitionsToFetch = Math.min(partitionCount, this.config.maxPartitions);
       for (let partition = 1; partition < partitionsToFetch; partition += 1) {
         const response = await this.request("GET", `/api/v2/statements/${handle}?partition=${partition}`);
-        if (response.status !== 200) {
-          throw new SnowflakeStatementError(this.redact(extractApiError(response.payload, response.status, response.statusText)), { statusCode: response.status });
+        if (response.status !== 200 || response.nonJsonBody !== undefined) {
+          throw SnowflakeStatementError.fromResponse(response, this.configuredSecrets());
         }
         rawRows.push(...asArray(response.payload.data).map((row) => asArray(row)));
         fetchedPartitions += 1;
@@ -920,6 +2119,11 @@ const ROLE_USAGE_ROW_LIMIT = 500;
 const FAILED_LOGIN_ROW_LIMIT = 500;
 const TAG_REFERENCE_ROW_LIMIT = 200;
 const MAX_POLICY_REFERENCE_LOOKUPS = 20;
+/**
+ * Snowflake returns at most 10,000 rows from a SHOW command and reports no
+ * total, so a full page is the only signal that the inventory was cut off.
+ */
+export const SHOW_ROW_CAP = 10_000;
 
 function stripStringLiterals(statement: string): string {
   return statement.replace(STRING_LITERAL_PATTERN, "''");
@@ -1008,6 +2212,133 @@ function emptyOutcome(key: string, statement: string): SnowflakeStatementOutcome
   return { key, statement, status: "ok", columns: [], rows: [], numRows: 0, partitionCount: 1, fetchedPartitions: 1, truncated: false };
 }
 
+/** The outcome of a statement that did not complete: no row count, no partition count, no truncation flag. */
+function unreadOutcome(key: string, statement: string): SnowflakeStatementOutcome {
+  return { key, statement, status: "error", columns: [], rows: [], numRows: null, partitionCount: null, fetchedPartitions: null, truncated: null };
+}
+
+/** Row count for evidence and summaries: null when the statement was not read. */
+export function rowsSeen(outcome: SnowflakeStatementOutcome): number | null {
+  return outcome.status === "ok" ? outcome.rows.length : null;
+}
+
+/** True when the statement completed and every partition was fetched within the row limit, so a count over its rows describes the whole inventory. */
+function fullyRead(outcome: SnowflakeStatementOutcome): boolean {
+  return outcome.status === "ok" && outcome.truncated !== true;
+}
+
+/**
+ * A count judged over a statement's rows describes the whole inventory only
+ * when the read was complete: under a partial read it renders null rather than
+ * the count of the rows read, since a 0 there would claim an absence from the
+ * unread partitions (reviewer C, item I). The seen-of-total sits in the
+ * finding's statements list and partial_inventory note beside it.
+ */
+function countIfFullyRead(outcome: SnowflakeStatementOutcome, count: number): number | null {
+  return fullyRead(outcome) ? count : null;
+}
+
+/** The suffix a summary gives a population under a partial read, so a count of the rows read never reads as a count for the account. */
+function amongRowsRead(outcome: SnowflakeStatementOutcome): string {
+  return fullyRead(outcome) ? "" : " among the rows read";
+}
+
+/** The service-class remark in a stale-login pass: under a partial read an empty class is unread, not a count of zero for the account. */
+function serviceClassLoginNote(users: SnowflakeStatementOutcome, serviceCount: number): string {
+  if (fullyRead(users)) return `${serviceCount} service-class users showed no stale logins`;
+  return serviceCount === 0 ? "no service-class user was among the rows read" : `${serviceCount} service-class users among the rows read showed no stale logins`;
+}
+
+/**
+ * Rule 9 deny list for the rows every statement returns: matched on the
+ * lowercased key with dots, underscores, and hyphens removed, so PASSWORD,
+ * OAUTH_CLIENT_SECRET, and a parameter named *_TOKEN match while the
+ * boolean and policy columns that merely mention a credential (HAS_PASSWORD,
+ * MUST_CHANGE_PASSWORD, PASSWORD_MIN_LENGTH, SESSION_MAX_LIFESPAN_MINS) and
+ * every identifier (NAME, LOGIN_NAME, OWNER, ROLE_NAME) stay legible.
+ */
+const CREDENTIAL_COLUMN_PATTERN = /(password|passwd|passphrase|secret|token|privatekey|apikey|clientsecret)$/;
+const CREDENTIAL_COLUMN_EXEMPT_PREFIX = /^(has|is|must|uses|min|max|require)/;
+const JSON_LITERAL_PATTERN = /^(?:true|false|null)$/i;
+const PAIR_NAME_COLUMNS = ["name", "key", "property"];
+const PAIR_VALUE_COLUMNS = new Set(["value", "property_value"]);
+
+function isCredentialColumn(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[._-]/g, "");
+  return CREDENTIAL_COLUMN_PATTERN.test(normalized) && !CREDENTIAL_COLUMN_EXEMPT_PREFIX.test(normalized);
+}
+
+function pairNameOf(record: JsonRecord): string | undefined {
+  for (const column of PAIR_NAME_COLUMNS) {
+    const name = asString(record[column]);
+    if (name !== undefined) return name;
+  }
+  return undefined;
+}
+
+/**
+ * Applied to the rows of every completed statement before they are written to
+ * core_data or echoed in a tool payload: removes the value of every
+ * credential-named column (and of the value column of a {key, value} or
+ * {property, property_value} row whose name is credential-named, unless it is
+ * a JSON literal such as a parameter's "false"), keeps only the origin of a
+ * webhook-named column's URL, and passes every other string through the
+ * data-side text pass, so a vendor-prefixed token, a JWT, a PEM block, or a
+ * credential carrier inside a comment, a query text, or an error message is
+ * removed there too. Column names and nulls are kept so the evidence stays
+ * legible, and containers are kept at every depth.
+ */
+export function redactSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactSnapshot);
+  const record = asObject(value);
+  if (!record) return typeof value === "string" ? scrubDataText(value) : value;
+  const pairName = pairNameOf(record);
+  const output: JsonRecord = {};
+  for (const [key, item] of Object.entries(record)) {
+    const credentialPair = PAIR_VALUE_COLUMNS.has(key.toLowerCase()) && pairName !== undefined && isCredentialColumn(pairName);
+    if (isCredentialColumn(key) || credentialPair) {
+      output[key] = item === null || item === undefined || (typeof item === "string" && JSON_LITERAL_PATTERN.test(item)) ? item : REDACTED;
+    } else if (typeof item === "string" && pairRuleFor(key) === "webhook") {
+      output[key] = webhookReplacement(item);
+    } else {
+      output[key] = redactSnapshot(item);
+    }
+  }
+  return output;
+}
+
+/**
+ * The single serializer for a statement outcome on every output path: the
+ * rows of a statement that did not complete are replaced by a marker naming
+ * the statement, its outcome, and the error, and its columns become null; the
+ * rows of one that completed pass through the rule 9 walk above.
+ */
+export function snapshotStatement(outcome: SnowflakeStatementOutcome): SnowflakeStatementSnapshot {
+  if (outcome.status === "ok") return { ...outcome, rows: redactSnapshot(outcome.rows) as SqlRow[] };
+  // A statement that was never sent is not named: the key identifies what
+  // would have been collected, and the error names the local failure.
+  const statement = outcome.status === "not_requested" ? null : outcome.statement;
+  return {
+    key: outcome.key,
+    statement,
+    status: outcome.status,
+    columns: null,
+    rows: { collected: false, status: outcome.status, statement, error: outcome.error ?? null },
+    numRows: null,
+    partitionCount: null,
+    fetchedPartitions: null,
+    truncated: null,
+    rowLimit: outcome.rowLimit,
+    error: outcome.error,
+    ...(outcome.code === undefined ? {} : { code: outcome.code }),
+  };
+}
+
+function configuredSecretsOf(client: SnowflakeQueryClient): Array<string | undefined> {
+  const config = client.getResolvedConfig();
+  return [config.token, config.privateKeyPem, config.privateKeyPassphrase];
+}
+
 export async function collectStatement(
   client: SnowflakeQueryClient,
   key: string,
@@ -1030,12 +2361,17 @@ export async function collectStatement(
       rowLimit,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    // Every statement error is recorded here and nowhere else, so this is the
+    // one place the redaction pass has to run for findings and the bundle,
+    // whichever constructor or throw site built the message.
+    const message = redactSecrets(error instanceof Error ? error.message : String(error), configuredSecretsOf(client));
     const kind = error instanceof SnowflakeStatementError ? error.kind : classifyErrorMessage(message);
+    const code = error instanceof SnowflakeStatementError ? error.code : undefined;
     return {
-      ...emptyOutcome(key, statement),
+      ...unreadOutcome(key, statement),
       status: kind,
-      error: redactSecrets(message),
+      error: message,
+      ...(code === undefined ? {} : { code }),
     };
   }
 }
@@ -1097,7 +2433,13 @@ async function collectSessionContext(client: SnowflakeQueryClient): Promise<Sess
   };
 }
 
+/**
+ * The role the statements ran under: the session's when it was read, else the
+ * configured role that every request carried. When no request was sent there
+ * is no such role, so the configured name is not reported as active.
+ */
 function effectiveRole(config: SnowflakeResolvedConfig, session: SessionContext): string | undefined {
+  if (session.outcome.status === "not_requested") return undefined;
   return upper(session.role) || upper(config.role) || undefined;
 }
 
@@ -1105,7 +2447,7 @@ function hasFullVisibility(role: string | undefined): boolean {
   return Boolean(role && FULL_VISIBILITY_ROLES.has(role));
 }
 
-function describeOutcomeProblem(outcome: SnowflakeStatementOutcome): string {
+function describeOutcomeProblem(outcome: Pick<SnowflakeStatementOutcome, "key" | "status" | "error">): string {
   switch (outcome.status) {
     case "ok":
       return "";
@@ -1115,6 +2457,8 @@ function describeOutcomeProblem(outcome: SnowflakeStatementOutcome): string {
       return `${outcome.key} timed out: ${outcome.error ?? "no detail"}`;
     case "error":
       return `${outcome.key} failed: ${outcome.error ?? "no detail"}`;
+    case "not_requested":
+      return `${outcome.key}: ${outcome.error ?? "Not requested: no detail"}`;
     default: {
       const exhaustive: never = outcome.status;
       return String(exhaustive);
@@ -1154,23 +2498,38 @@ function finding(
 }
 
 /**
- * Wraps a verdict so that failed, denied, or timed-out statements become
- * manual findings and truncated inventories can never pass outright.
+ * A secondary inventory the verdict reads without requiring it: the control
+ * can still be judged when it is unreadable, but never as a pass.
+ */
+interface OptionalStatement {
+  outcome: SnowflakeStatementOutcome;
+  /** What went unchecked because the inventory was unreadable, phrased for the summary. */
+  unchecked: string;
+  /** Verdict replacing pass when the inventory is unreadable; warn unless the inventory is essential. */
+  demoteTo?: "warn" | "manual";
+}
+
+/**
+ * Wraps a verdict so that failed, denied, or timed-out required statements
+ * become manual findings, an unreadable optional inventory demotes a pass to
+ * warn or manual while naming what was not checked, and truncated inventories
+ * can never pass outright.
  */
 function evaluateControl(
   control: number,
   required: SnowflakeStatementOutcome[],
   manualEvidence: string,
   evaluate: () => { status: SnowflakeFindingStatus; summary: string; evidence?: JsonRecord },
-  options: { optional?: SnowflakeStatementOutcome[] } = {},
+  options: { optional?: OptionalStatement[] } = {},
 ): SnowflakeFinding {
+  const optional = options.optional ?? [];
   const problems = required.filter((outcome) => outcome.status !== "ok");
   const statementEvidence = {
-    statements: [...required, ...(options.optional ?? [])].map((outcome) => ({
+    statements: [...required, ...optional.map((entry) => entry.outcome)].map((outcome) => ({
       key: outcome.key,
       status: outcome.status,
-      rows: outcome.rows.length,
-      truncated: outcome.truncated,
+      rows: rowsSeen(outcome),
+      truncated: outcome.status === "ok" ? outcome.truncated : null,
       error: outcome.error,
     })),
   };
@@ -1183,15 +2542,33 @@ function evaluateControl(
     );
   }
   const verdict = evaluate();
-  const truncation = truncationNote(required);
-  const evidence = { ...(verdict.evidence ?? {}), ...statementEvidence };
-  if (truncation && verdict.status === "pass") {
-    return finding(control, "warn", `${verdict.summary} Partial inventory: ${truncation}; the verdict cannot be pass on a partial result.`, { ...evidence, partial_inventory: truncation });
+  let status = verdict.status;
+  let summary = verdict.summary;
+  const evidence: JsonRecord = { ...(verdict.evidence ?? {}), ...statementEvidence };
+  const unreadable = optional.filter((entry) => entry.outcome.status !== "ok");
+  if (unreadable.length > 0) {
+    evidence.unreadable_inventories = unreadable.map((entry) => entry.outcome.key);
+    if (status === "pass") {
+      status = unreadable.some((entry) => entry.demoteTo === "manual") ? "manual" : "warn";
+      const notes = unreadable.map((entry) => `${describeOutcomeProblem(entry.outcome)}, so ${entry.unchecked}`).join("; ");
+      summary = `${summary} Unreadable inventory: ${notes}. The verdict cannot be pass while an inventory it reads is unreadable; collect manually: ${manualEvidence}`;
+    } else {
+      summary = `${summary} Unreadable inventory: ${unreadable.map((entry) => `${entry.outcome.key} (${entry.outcome.status})`).join(", ")}.`;
+    }
   }
+  const truncation = truncationNote([...required, ...optional.map((entry) => entry.outcome)]);
   if (truncation) {
-    return finding(control, verdict.status, `${verdict.summary} Partial inventory: ${truncation}.`, { ...evidence, partial_inventory: truncation });
+    evidence.partial_inventory = truncation;
+    if (status === "pass") {
+      return finding(control, "warn", `${summary} Partial inventory: ${truncation}; the verdict cannot be pass on a partial result.`, evidence);
+    }
+    return finding(control, status, `${summary} Partial inventory: ${truncation}.`, evidence);
   }
-  return finding(control, verdict.status, verdict.summary, evidence);
+  return finding(control, status, summary, evidence);
+}
+
+function unverifiedRoleNote(inventory: string): string {
+  return `the active role could not be verified and ${inventory} may be scoped to a role with narrower visibility`;
 }
 
 function partialVisibilityNote(role: string | undefined, subject: string): string {
@@ -1271,6 +2648,17 @@ function unrecognizedUserNote(summary: UserClassSummary): string | undefined {
   return `${summary.unrecognized} users carry an unrecognized TYPE (${summary.unrecognized_types.join(", ")}) and were not classified; review them manually`;
 }
 
+/** User class counts for evidence: null under a partial user read, since a 0 there would claim an absence from the unread rows; the unrecognized type names seen stay. */
+function userClassesEvidence(users: SnowflakeStatementOutcome, summary: UserClassSummary): JsonRecord {
+  return {
+    person: countIfFullyRead(users, summary.person),
+    service: countIfFullyRead(users, summary.service),
+    snowflake_managed: countIfFullyRead(users, summary.snowflake_managed),
+    unrecognized: countIfFullyRead(users, summary.unrecognized),
+    unrecognized_types: summary.unrecognized_types,
+  };
+}
+
 function isDisabledUser(row: SqlRow): boolean {
   return rowBoolean(row, "DISABLED") === true;
 }
@@ -1336,12 +2724,13 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
   const readable = surfaces.filter((surface) => surface.status === "readable").length;
   const accountUsageReadable = surfaces.filter((surface) => surface.name.startsWith("account_usage_") && surface.status === "readable").length;
   const status = session.outcome.status === "ok" && accountUsageReadable >= 10 && readable >= surfaces.length - 3 ? "healthy" : "limited";
+  const authentication = describeAuthentication(config, session, role);
   const notes = [
     `Using Snowflake account ${session.account ?? config.account} via ${config.baseUrl} (${config.tokenType}).`,
-    `Authenticated as ${session.user ?? config.user} with role ${role ?? "(default role)"}${session.warehouse ? ` and warehouse ${session.warehouse}` : ""}.`,
+    authentication.note,
     `${readable}/${surfaces.length} Snowflake audit surfaces are readable; ${accountUsageReadable} ACCOUNT_USAGE views responded.`,
   ];
-  if (!hasFullVisibility(role)) {
+  if (authentication.status !== "not_authenticated" && !hasFullVisibility(role)) {
     notes.push(partialVisibilityNote(role, "SHOW commands"));
   }
   if (config.sourceChain.length > 0) {
@@ -1351,8 +2740,10 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
   return {
     status,
     account: session.account ?? config.account,
-    user: session.user ?? config.user,
+    user: authentication.user,
     role,
+    authentication: authentication.status,
+    authenticationNote: authentication.note,
     fullVisibility: hasFullVisibility(role),
     surfaces,
     notes,
@@ -1363,16 +2754,59 @@ export async function checkSnowflakeAccess(client: SnowflakeQueryClient): Promis
   };
 }
 
+/**
+ * What the run can say about its own identity. Only a session context row is
+ * an observation; the configured user and role are reported as configured
+ * values when statements were sent without that row, and nothing is claimed
+ * when no request was sent.
+ */
+function describeAuthentication(
+  config: SnowflakeResolvedConfig,
+  session: SessionContext,
+  role: string | undefined,
+): { status: SnowflakeAuthenticationStatus; user: string | null; note: string } {
+  switch (session.outcome.status) {
+    case "ok": {
+      const user = session.user ?? config.user;
+      return {
+        status: "confirmed",
+        user,
+        note: `Authenticated as ${user} with role ${role ?? "(default role)"}${session.warehouse ? ` and warehouse ${session.warehouse}` : ""}.`,
+      };
+    }
+    case "not_requested":
+      return {
+        status: "not_authenticated",
+        user: null,
+        note: `Not authenticated: ${notRequestedReason(session.outcome)}; no request was sent.`,
+      };
+    default:
+      return {
+        status: "unconfirmed",
+        user: config.user,
+        note: `Authentication not confirmed: the session context statement ${session.outcome.status === "denied" ? "was denied" : session.outcome.status === "timeout" ? "timed out" : "failed"}, so the configured user ${config.user} and role ${role ?? "(default role)"} are reported as configured, not as observed.`,
+      };
+  }
+}
+
+/** The reason clause of a not-requested error ("<reason> (<code>)"), which SnowflakeStatementError.notRequested writes before the first semicolon. */
+function notRequestedReason(outcome: SnowflakeStatementOutcome): string {
+  const reason = (outcome.error ?? "").replace(/^Not requested: /, "").split(";")[0].trim();
+  return reason || `the bearer token could not be built (${outcome.code ?? "UNKNOWN"})`;
+}
+
 function toSurface(name: string, outcome: SnowflakeStatementOutcome): SnowflakeAccessSurface {
   switch (outcome.status) {
     case "ok":
       return { name, statement: outcome.statement, status: "readable", rowCount: outcome.rows.length };
     case "denied":
-      return { name, statement: outcome.statement, status: "denied", error: outcome.error };
+      return { name, statement: outcome.statement, status: "denied", rowCount: null, error: outcome.error };
     case "timeout":
-      return { name, statement: outcome.statement, status: "timeout", error: outcome.error };
+      return { name, statement: outcome.statement, status: "timeout", rowCount: null, error: outcome.error };
     case "error":
-      return { name, statement: outcome.statement, status: "error", error: outcome.error };
+      return { name, statement: outcome.statement, status: "error", rowCount: null, error: outcome.error };
+    case "not_requested":
+      return { name, statement: null, status: "not_requested", rowCount: null, error: outcome.error };
     default: {
       const exhaustive: never = outcome.status;
       return exhaustive;
@@ -1400,14 +2834,14 @@ export async function assessSnowflakeNetworkAndAuthentication(
   const session = await collectSessionContext(client);
   const role = effectiveRole(config, session);
 
-  const showNetworkPolicies = await collectStatement(client, "show_network_policies", SNOWFLAKE_STATEMENTS.showNetworkPolicies);
+  const showNetworkPolicies = await collectStatement(client, "show_network_policies", SNOWFLAKE_STATEMENTS.showNetworkPolicies, SHOW_ROW_CAP);
   const networkParameter = await collectStatement(client, "account_network_policy_parameter", SNOWFLAKE_STATEMENTS.accountNetworkPolicyParameter);
   const networkReferences = await collectStatement(client, "network_policy_references", SNOWFLAKE_STATEMENTS.policyReferences("NETWORK_POLICY", limit), limit);
   const networkPolicies = await collectStatement(client, "network_policies", SNOWFLAKE_STATEMENTS.networkPolicies(limit), limit);
   const users = await collectStatement(client, "users", SNOWFLAKE_STATEMENTS.users(limit), limit);
   const passwordPolicies = await collectStatement(client, "password_policies", SNOWFLAKE_STATEMENTS.passwordPolicies(limit), limit);
   const passwordReferences = await collectPolicyReferencesByName(client, "password_policy_references", passwordPolicies);
-  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations);
+  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations, SHOW_ROW_CAP);
   const sessionPolicies = await collectStatement(client, "session_policies", SNOWFLAKE_STATEMENTS.sessionPolicies(limit), limit);
   const sessionReferences = await collectPolicyReferencesByName(client, "session_policy_references", sessionPolicies);
 
@@ -1469,11 +2903,11 @@ export async function assessSnowflakeNetworkAndAuthentication(
     const withoutMfa = passwordHumans.filter((row) => rowBoolean(row, "HAS_MFA") !== true && rowBoolean(row, "EXT_AUTHN_DUO") !== true);
     const unknownFlags = passwordHumans.filter((row) => rowBoolean(row, "HAS_MFA") === undefined && rowBoolean(row, "EXT_AUTHN_DUO") === undefined);
     const evidence = {
-      enabled_human_users: humans.length,
-      password_human_users: passwordHumans.length,
+      enabled_human_users: countIfFullyRead(users, humans.length),
+      password_human_users: countIfFullyRead(users, passwordHumans.length),
       users_without_mfa: withoutMfa.slice(0, 50).map(userName),
-      users_with_unknown_mfa_flags: unknownFlags.length,
-      user_classes: userClasses,
+      users_with_unknown_mfa_flags: countIfFullyRead(users, unknownFlags.length),
+      user_classes: userClassesEvidence(users, userClasses),
     };
     const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
@@ -1486,12 +2920,12 @@ export async function assessSnowflakeNetworkAndAuthentication(
       return { status: "warn", summary: `Every classified person user with a password reports MFA, but ${unrecognized}.`, evidence };
     }
     if (passwordHumans.length === 0) {
-      return { status: "pass", summary: `No enabled person users hold a password (${humans.length} enabled person users rely on SSO, key pair, or other factors; ${userClasses.service} service-class users are assessed under control 5), so password MFA enforcement is not applicable and no unprotected password login exists.`, evidence };
+      return { status: "pass", summary: `No enabled person users${amongRowsRead(users)} hold a password (${humans.length} enabled person users rely on SSO, key pair, or other factors; ${userClasses.service} service-class users${amongRowsRead(users)} are assessed under control 5), so password MFA enforcement is not applicable and no unprotected password login exists.`, evidence };
     }
-    return { status: "pass", summary: `All ${passwordHumans.length} enabled person users with passwords report HAS_MFA or EXT_AUTHN_DUO = true.`, evidence };
+    return { status: "pass", summary: `All ${passwordHumans.length} enabled person users with passwords${amongRowsRead(users)} report HAS_MFA or EXT_AUTHN_DUO = true.`, evidence };
   }));
 
-  findings.push(evaluateControl(4, [passwordPolicies, ...passwordReferences.outcomes], "Snowsight or SHOW PASSWORD POLICIES plus SELECT * FROM TABLE(<db>.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '<db>.<schema>.<policy>')): confirm an account-level password policy with length, complexity, retry, and lockout settings.", () => {
+  findings.push(evaluateControl(4, [passwordPolicies, ...passwordReferences.outcomes], "the ACCOUNT_USAGE PASSWORD_POLICIES view and each policy's INFORMATION_SCHEMA POLICY_REFERENCES lookup, or Snowsight Admin > Security: confirm an account-level password policy with length, complexity, retry, and lockout settings.", () => {
     const accountRefs = passwordReferences.accountLevel;
     const attachedNames = new Set(accountRefs.map((row) => upper(rowValue(row, "POLICY_NAME"))));
     const weak: string[] = [];
@@ -1544,16 +2978,19 @@ export async function assessSnowflakeNetworkAndAuthentication(
     const withoutKey = serviceUsers.filter((row) => rowBoolean(row, "HAS_RSA_PUBLIC_KEY") !== true && rowBoolean(row, "HAS_WORKLOAD_IDENTITY") !== true);
     const withPassword = serviceUsers.filter((row) => rowBoolean(row, "HAS_PASSWORD") === true);
     const evidence = {
-      service_users: serviceUsers.length,
+      service_users: countIfFullyRead(users, serviceUsers.length),
       service_users_by_type: countBy(serviceUsers, (row) => upper(rowValue(row, "TYPE"))),
       snowflake_managed_service_users: managedUsers.slice(0, 50).map(userName),
       service_users_without_key_pair: withoutKey.slice(0, 50).map(userName),
       service_users_with_password: withPassword.slice(0, 50).map(userName),
-      user_classes: userClasses,
+      user_classes: userClassesEvidence(users, userClasses),
     };
     const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
       return { status: "manual", summary: "USERS returned zero rows; service account authentication cannot be assessed from an empty inventory.", evidence };
+    }
+    if (serviceUsers.length === 0 && !fullyRead(users)) {
+      return { status: "manual", summary: `No user typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE was among the ${users.rows.length} user rows read, and the read stopped early, so the service account inventory is unread rather than empty. Read the full USERS view, then confirm each service-class user uses key-pair or workload identity authentication.${unrecognized ? ` ${unrecognized}.` : ""}`, evidence };
     }
     if (serviceUsers.length === 0) {
       return { status: "manual", summary: `None of the ${users.rows.length} users are typed SERVICE, SERVICE_AGENT, or LEGACY_SERVICE (${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed); classify automation accounts with TYPE = SERVICE and confirm each uses key-pair or workload identity authentication.${unrecognized ? ` ${unrecognized}.` : ""}`, evidence };
@@ -1562,9 +2999,9 @@ export async function assessSnowflakeNetworkAndAuthentication(
       return { status: "fail", summary: `${withoutKey.length}/${serviceUsers.length} service-class users lack an RSA public key or workload identity and ${withPassword.length} still hold a password.`, evidence };
     }
     if (unrecognized) {
-      return { status: "warn", summary: `All ${serviceUsers.length} enabled service-class users authenticate with key pairs or workload identity, but ${unrecognized}.`, evidence };
+      return { status: "warn", summary: `All ${serviceUsers.length} enabled service-class users${amongRowsRead(users)} authenticate with key pairs or workload identity, but ${unrecognized}.`, evidence };
     }
-    return { status: "pass", summary: `All ${serviceUsers.length} enabled service-class users (SERVICE, SERVICE_AGENT, LEGACY_SERVICE) authenticate with key pairs or workload identity and hold no password${managedUsers.length > 0 ? `; ${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed and listed in evidence` : ""}.`, evidence };
+    return { status: "pass", summary: `All ${serviceUsers.length} enabled service-class users${amongRowsRead(users)} (SERVICE, SERVICE_AGENT, LEGACY_SERVICE) authenticate with key pairs or workload identity and hold no password${managedUsers.length > 0 ? `; ${managedUsers.length} SNOWFLAKE_SERVICE users are Snowflake managed and listed in evidence` : ""}.`, evidence };
   }));
 
   findings.push(evaluateControl(6, [integrations], "SHOW SECURITY INTEGRATIONS in Snowsight: confirm an enabled SAML2 (or External OAuth) security integration and SCIM provisioning.", () => {
@@ -1587,7 +3024,7 @@ export async function assessSnowflakeNetworkAndAuthentication(
     return { status: "pass", summary: `${enabledSaml.length} enabled SAML2 integration(s) found${scim.length > 0 ? ` with ${scim.length} enabled SCIM integration(s)` : "; no enabled SCIM integration was visible"}.`, evidence };
   }));
 
-  findings.push(evaluateControl(25, [sessionPolicies, ...sessionReferences.outcomes], "SHOW SESSION POLICIES plus SELECT * FROM TABLE(<db>.INFORMATION_SCHEMA.POLICY_REFERENCES(POLICY_NAME => '<db>.<schema>.<policy>')): confirm an account-level session policy with idle timeouts.", () => {
+  findings.push(evaluateControl(25, [sessionPolicies, ...sessionReferences.outcomes], "the ACCOUNT_USAGE SESSION_POLICIES view and each policy's INFORMATION_SCHEMA POLICY_REFERENCES lookup, or Snowsight Admin > Security: confirm an account-level session policy with idle timeouts.", () => {
     const accountRefs = sessionReferences.accountLevel;
     const attached = new Set(accountRefs.map((row) => upper(rowValue(row, "POLICY_NAME"))));
     const compliantAttached = sessionPolicies.rows.filter((row) => {
@@ -1629,8 +3066,8 @@ export async function assessSnowflakeNetworkAndAuthentication(
       account: session.account ?? config.account,
       role: role ?? null,
       full_visibility: hasFullVisibility(role),
-      users_seen: users.rows.length,
-      network_policies_seen: networkPolicies.rows.length,
+      users_seen: rowsSeen(users),
+      network_policies_seen: rowsSeen(networkPolicies),
       ...summarizeStatuses(findings),
     },
     findings,
@@ -1646,7 +3083,7 @@ export async function assessSnowflakeNetworkAndAuthentication(
       integrations,
       sessionPolicies,
       ...sessionReferences.outcomes,
-    ],
+    ].map(snapshotStatement),
   };
 }
 
@@ -1783,11 +3220,11 @@ export async function assessSnowflakeAccessControl(
       role: role ?? null,
       full_visibility: hasFullVisibility(role),
       lookback_days: lookbackDays,
-      role_grants_seen: roleGrants.rows.length,
+      role_grants_seen: rowsSeen(roleGrants),
       ...summarizeStatuses(findings),
     },
     findings,
-    statements: [session.outcome, roleGrants, globalGrants, adminGrants, roleUsage, directGrants, publicGrants],
+    statements: [session.outcome, roleGrants, globalGrants, adminGrants, roleUsage, directGrants, publicGrants].map(snapshotStatement),
   };
 }
 
@@ -1811,7 +3248,7 @@ export async function assessSnowflakeMonitoringAndLifecycle(
   const users = await collectStatement(client, "users", SNOWFLAKE_STATEMENTS.users(limit), limit);
   const retention = await collectStatement(client, "data_retention_parameter", SNOWFLAKE_STATEMENTS.dataRetentionParameter);
   const accessHistory = await collectStatement(client, "access_history_probe", SNOWFLAKE_STATEMENTS.accessHistoryProbe);
-  const warehouses = await collectStatement(client, "show_warehouses", SNOWFLAKE_STATEMENTS.showWarehouses);
+  const warehouses = await collectStatement(client, "show_warehouses", SNOWFLAKE_STATEMENTS.showWarehouses, SHOW_ROW_CAP);
 
   const findings: SnowflakeFinding[] = [];
 
@@ -1821,18 +3258,21 @@ export async function assessSnowflakeMonitoringAndLifecycle(
     const excessive = failedLogins.rows.filter((row) => (rowNumber(row, "FAILURE_COUNT") ?? 0) >= failedLoginThreshold);
     const evidence = {
       lookback_days: lookbackDays,
-      successful_logins: successes,
-      failed_logins: failures,
+      successful_logins: countIfFullyRead(loginOutcomes, successes),
+      failed_logins: countIfFullyRead(loginOutcomes, failures),
       threshold: failedLoginThreshold,
       excessive_sources: excessive.slice(0, 50).map((row) => ({ user: rowValue(row, "USER_NAME"), ip: rowValue(row, "CLIENT_IP"), failures: rowValue(row, "FAILURE_COUNT"), last_error: rowValue(row, "LAST_ERROR") })),
     };
+    if (successes + failures === 0 && !fullyRead(loginOutcomes)) {
+      return { status: "manual", summary: `No LOGIN_HISTORY outcome row for the last ${lookbackDays} days was among the rows read, and the read stopped early, so the login window is unread rather than empty.`, evidence };
+    }
     if (successes + failures === 0) {
       return { status: "manual", summary: `LOGIN_HISTORY returned zero events for the last ${lookbackDays} days; monitoring cannot be evaluated from an empty window (view latency is up to 2 hours).`, evidence };
     }
     if (excessive.length > 0) {
-      return { status: "fail", summary: `${excessive.length} user/IP sources exceeded ${failedLoginThreshold} failed logins in ${lookbackDays} days (${failures} failures total).`, evidence };
+      return { status: "fail", summary: `${excessive.length} user/IP sources exceeded ${failedLoginThreshold} failed logins in ${lookbackDays} days (${failures} failures${amongRowsRead(loginOutcomes)}).`, evidence };
     }
-    return { status: "pass", summary: `${failures} failed logins across ${successes + failures} login events in ${lookbackDays} days; no source exceeded the ${failedLoginThreshold}-failure threshold.`, evidence };
+    return { status: "pass", summary: `${failures} failed logins across ${successes + failures} login events${amongRowsRead(loginOutcomes)} in ${lookbackDays} days; no source${amongRowsRead(failedLogins)} exceeded the ${failedLoginThreshold}-failure threshold.`, evidence };
   }));
 
   findings.push(evaluateControl(12, [users], `Review enabled users whose LAST_SUCCESS_LOGIN is older than ${staleUserDays} days or NULL and disable or remove them.`, () => {
@@ -1854,13 +3294,13 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       if (daysSince(lastLogin, now) > staleUserDays) stale.push(userName(row));
     }
     const evidence = {
-      enabled_human_users: humans.length,
+      enabled_human_users: countIfFullyRead(users, humans.length),
       stale_user_days: staleUserDays,
       stale_users: stale.slice(0, 50),
       users_without_login_timestamp: neverOrUnknown.slice(0, 50),
-      users_without_login_timestamp_count: neverOrUnknown.length,
+      users_without_login_timestamp_count: countIfFullyRead(users, neverOrUnknown.length),
       stale_service_class_users: staleServiceUsers.slice(0, 50).map(userName),
-      user_classes: userClasses,
+      user_classes: userClassesEvidence(users, userClasses),
     };
     const unrecognized = unrecognizedUserNote(userClasses);
     if (users.rows.length === 0) {
@@ -1870,15 +3310,15 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       return { status: "fail", summary: `${stale.length}/${humans.length} enabled person users have not logged in for more than ${staleUserDays} days; ${neverOrUnknown.length} more have no LAST_SUCCESS_LOGIN and were not counted as active.`, evidence };
     }
     if (neverOrUnknown.length > 0) {
-      return { status: "warn", summary: `No enabled person user exceeded ${staleUserDays} days since login, but ${neverOrUnknown.length}/${humans.length} have a NULL LAST_SUCCESS_LOGIN (never logged in or outside the one-year retention) and must be reviewed.`, evidence };
+      return { status: "warn", summary: `No enabled person user${amongRowsRead(users)} exceeded ${staleUserDays} days since login, but ${neverOrUnknown.length}/${humans.length} have a NULL LAST_SUCCESS_LOGIN (never logged in or outside the one-year retention) and must be reviewed.`, evidence };
     }
     if (unrecognized) {
-      return { status: "warn", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days, but ${unrecognized}.`, evidence };
+      return { status: "warn", summary: `All ${humans.length} enabled person users${amongRowsRead(users)} logged in within ${staleUserDays} days, but ${unrecognized}.`, evidence };
     }
     if (staleServiceUsers.length > 0) {
-      return { status: "warn", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days, but ${staleServiceUsers.length} enabled service-class users have not authenticated in that window and should be reviewed for decommissioning.`, evidence };
+      return { status: "warn", summary: `All ${humans.length} enabled person users${amongRowsRead(users)} logged in within ${staleUserDays} days, but ${staleServiceUsers.length} enabled service-class users have not authenticated in that window and should be reviewed for decommissioning.`, evidence };
     }
-    return { status: "pass", summary: `All ${humans.length} enabled person users logged in within ${staleUserDays} days (${userClasses.service} service-class users showed no stale logins).`, evidence };
+    return { status: "pass", summary: `All ${humans.length} enabled person users${amongRowsRead(users)} logged in within ${staleUserDays} days (${serviceClassLoginNote(users, userClasses.service)}).`, evidence };
   }));
 
   findings.push(evaluateControl(13, [retention], "SHOW PARAMETERS LIKE 'DATA_RETENTION_TIME_IN_DAYS' IN ACCOUNT and confirm ACCESS_HISTORY/QUERY_HISTORY (365-day fixed retention) are exported to long-term storage if longer retention is required.", () => {
@@ -1891,11 +3331,9 @@ export async function assessSnowflakeMonitoringAndLifecycle(
     if (value < minRetentionDays) {
       return { status: "fail", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value}, below the ${minRetentionDays}-day threshold.`, evidence };
     }
-    if (accessHistory.status !== "ok") {
-      return { status: "warn", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value}, but ACCESS_HISTORY was not readable (${accessHistory.status}); object access auditing needs Enterprise Edition and IMPORTED PRIVILEGES.`, evidence };
-    }
-    return { status: "pass", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value} and ACCESS_HISTORY plus QUERY_HISTORY are readable with Snowflake's fixed 365-day retention.`, evidence };
-  }, { optional: [accessHistory] }));
+    const accessHistoryNote = accessHistory.status === "ok" ? " and ACCESS_HISTORY plus QUERY_HISTORY are readable with Snowflake's fixed 365-day retention" : "";
+    return { status: "pass", summary: `Account DATA_RETENTION_TIME_IN_DAYS is ${value}${accessHistoryNote}.`, evidence };
+  }, { optional: [{ outcome: accessHistory, unchecked: "ACCESS_HISTORY was not readable and object access auditing could not be confirmed (needs Enterprise Edition and IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE)" }] }));
 
   findings.push(evaluateControl(24, [warehouses], `SHOW WAREHOUSES: confirm every warehouse has auto_suspend set to ${maxAutoSuspendSeconds} seconds or less.`, () => {
     const never: string[] = [];
@@ -1921,7 +3359,7 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       return { status: "warn", summary: `${tooLong.length}/${warehouses.rows.length} warehouses auto-suspend after more than ${maxAutoSuspendSeconds} seconds.`, evidence };
     }
     return { status: hasFullVisibility(role) ? "pass" : "warn", summary: `All ${warehouses.rows.length} visible warehouses auto-suspend within ${maxAutoSuspendSeconds} seconds.${hasFullVisibility(role) ? "" : ` ${partialVisibilityNote(role, "SHOW WAREHOUSES")}`}`, evidence };
-  }));
+  }, { optional: [{ outcome: session.outcome, unchecked: unverifiedRoleNote("SHOW WAREHOUSES") }] }));
 
   return {
     title: "Snowflake monitoring and lifecycle posture",
@@ -1930,12 +3368,12 @@ export async function assessSnowflakeMonitoringAndLifecycle(
       account: session.account ?? config.account,
       role: role ?? null,
       lookback_days: lookbackDays,
-      users_seen: users.rows.length,
-      warehouses_seen: warehouses.rows.length,
+      users_seen: rowsSeen(users),
+      warehouses_seen: rowsSeen(warehouses),
       ...summarizeStatuses(findings),
     },
     findings,
-    statements: [session.outcome, loginOutcomes, failedLogins, users, retention, accessHistory, warehouses],
+    statements: [session.outcome, loginOutcomes, failedLogins, users, retention, accessHistory, warehouses].map(snapshotStatement),
   };
 }
 
@@ -1956,13 +3394,13 @@ export async function assessSnowflakeDataProtection(
   const tagReferences = await collectStatement(client, "tag_references", SNOWFLAKE_STATEMENTS.tagReferenceSummary, TAG_REFERENCE_ROW_LIMIT);
   const stageParameters = await collectStatement(client, "stage_parameters", SNOWFLAKE_STATEMENTS.stageParameters);
   const unloadParameters = await collectStatement(client, "unload_parameters", SNOWFLAKE_STATEMENTS.unloadParameters);
-  const databases = await collectStatement(client, "show_databases", SNOWFLAKE_STATEMENTS.showDatabases);
-  const shares = await collectStatement(client, "show_shares", SNOWFLAKE_STATEMENTS.showShares);
-  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations);
-  const replicationGroups = await collectStatement(client, "show_replication_groups", SNOWFLAKE_STATEMENTS.showReplicationGroups);
+  const databases = await collectStatement(client, "show_databases", SNOWFLAKE_STATEMENTS.showDatabases, SHOW_ROW_CAP);
+  const shares = await collectStatement(client, "show_shares", SNOWFLAKE_STATEMENTS.showShares, SHOW_ROW_CAP);
+  const integrations = await collectStatement(client, "show_integrations", SNOWFLAKE_STATEMENTS.showIntegrations, SHOW_ROW_CAP);
+  const replicationGroups = await collectStatement(client, "show_replication_groups", SNOWFLAKE_STATEMENTS.showReplicationGroups, SHOW_ROW_CAP);
 
   const findings: SnowflakeFinding[] = [];
-  const tagSummary = tagReferences.status === "ok" ? tagReferences.rows.slice(0, 25).map((row) => ({ tag: `${rowValue(row, "TAG_DATABASE")}.${rowValue(row, "TAG_SCHEMA")}.${rowValue(row, "TAG_NAME")}`, references: rowValue(row, "REFERENCE_COUNT") })) : [];
+  const tagSummary = tagReferences.status === "ok" ? tagReferences.rows.slice(0, 25).map((row) => ({ tag: `${rowValue(row, "TAG_DATABASE")}.${rowValue(row, "TAG_SCHEMA")}.${rowValue(row, "TAG_NAME")}`, references: rowValue(row, "REFERENCE_COUNT") })) : null;
 
   findings.push(evaluateControl(14, [maskingCount, maskingReferences], "Snowsight Data > Governance: confirm masking policies exist and are assigned to every sensitive column (POLICY_REFERENCES WHERE POLICY_KIND = 'MASKING_POLICY').", () => {
     const policies = rowNumber(maskingCount.rows[0] ?? {}, "POLICY_COUNT") ?? 0;
@@ -1978,8 +3416,8 @@ export async function assessSnowflakeDataProtection(
     if (broken > 0) {
       return { status: "warn", summary: `${maskingReferences.rows.length} masking policy references exist but ${broken} are not ACTIVE (conflicting or mismatched assignments).`, evidence };
     }
-    return { status: "pass", summary: `${policies} masking policies are assigned through ${maskingReferences.rows.length} active column or tag references${tagSummary.length > 0 ? ` alongside ${tagSummary.length} classification tags` : ""}.`, evidence };
-  }, { optional: [tagReferences] }));
+    return { status: "pass", summary: `${policies} masking policies are assigned through ${maskingReferences.rows.length} active column or tag references${tagSummary && tagSummary.length > 0 ? ` alongside ${tagSummary.length} classification tags` : ""}.`, evidence };
+  }, { optional: [{ outcome: tagReferences, unchecked: "classification tag coverage (TAG_REFERENCES) was not checked and tag-based masking assignments could not be confirmed" }] }));
 
   findings.push(evaluateControl(15, [rowAccessCount, rowAccessReferences], "Snowsight Data > Governance: confirm row access policies exist and are assigned to sensitive tables (POLICY_REFERENCES WHERE POLICY_KIND = 'ROW_ACCESS_POLICY').", () => {
     const policies = rowNumber(rowAccessCount.rows[0] ?? {}, "POLICY_COUNT") ?? 0;
@@ -2040,11 +3478,11 @@ export async function assessSnowflakeDataProtection(
       return { status: "fail", summary: `${below.length}/${customer.length} customer databases have retention_time below ${minRetentionDays}: ${below.slice(0, 10).join(", ")}.`, evidence };
     }
     return { status: hasFullVisibility(role) ? "pass" : "warn", summary: `All ${customer.length} visible customer databases retain Time Travel for at least ${minRetentionDays} day(s).${hasFullVisibility(role) ? "" : ` ${partialVisibilityNote(role, "SHOW DATABASES")}`}`, evidence };
-  }));
+  }, { optional: [{ outcome: session.outcome, unchecked: unverifiedRoleNote("SHOW DATABASES") }] }));
 
   findings.push(finding(20, "manual", "Not verifiable through SQL: Tri-Secret Secure is enabled by Snowflake Support for Business Critical (or higher) accounts. Collect the Snowflake Support case or Snowsight Admin > Accounts edition evidence and the composite master key confirmation.", { edition_requirement: "Business Critical or higher", sql_verifiable: false }));
 
-  findings.push(finding(21, "manual", "Not verifiable through SQL: customer-managed key enrollment is confirmed through Snowflake Support and your cloud KMS. SYSTEM$GET_SNOWFLAKE_PLATFORM_INFO() only returns VPC/VNet IDs, and SYSTEM$GET_CMK_KMS_KEY_POLICY, SYSTEM$GET_CMK_AKV_CONSENT_URL, and SYSTEM$GET_GCP_KMS_CMK_GRANT_ACCESS_CMD return setup templates. Collect the KMS key policy and rotation evidence from AWS KMS, Azure Key Vault, or Google Cloud KMS.", { edition_requirement: "Business Critical or higher", sql_verifiable: false }));
+  findings.push(finding(21, "manual", "Not verifiable through SQL: customer-managed key enrollment is confirmed through Snowflake Support and your cloud KMS; the platform-info and CMK system functions only return VPC or VNet identifiers and setup templates, so none was run. Collect the KMS key policy and rotation evidence from AWS KMS, Azure Key Vault, or Google Cloud KMS.", { edition_requirement: "Business Critical or higher", sql_verifiable: false }));
 
   findings.push(evaluateControl(22, [shares], "SHOW SHARES as ACCOUNTADMIN: review every OUTBOUND share, its consumer accounts (to column), and any listing_global_name exposure.", () => {
     const outbound = shares.rows.filter((row) => upper(rowValue(row, "kind")) === "OUTBOUND");
@@ -2063,7 +3501,12 @@ export async function assessSnowflakeDataProtection(
       return { status: "manual", summary: `SHOW SHARES under role ${role ?? "(unknown)"} returned ${shares.rows.length} rows and no OUTBOUND share, but only ${SHARE_INVENTORY_ROLE} lists every outbound share: other roles see only shares they own and roles without IMPORT SHARE receive empty results, so this is indistinguishable from a denied read. Re-run SHOW SHARES as ${SHARE_INVENTORY_ROLE} to confirm the outbound inventory.`, evidence };
     }
     return { status: "pass", summary: `SHOW SHARES was readable under ${SHARE_INVENTORY_ROLE} and lists no OUTBOUND shares (${shares.rows.length} inbound shares seen); for this control an empty outbound inventory is compliant.`, evidence };
-  }, { optional: [replicationGroups] }));
+  }, {
+    optional: [
+      { outcome: replicationGroups, unchecked: "replication groups that copy data to other accounts (SHOW REPLICATION GROUPS) were not checked" },
+      { outcome: session.outcome, unchecked: `the active role could not be verified as ${SHARE_INVENTORY_ROLE}, the only role that lists every outbound share`, demoteTo: "manual" },
+    ],
+  }));
 
   findings.push(evaluateControl(23, [integrations], "SHOW API INTEGRATIONS and SHOW EXTERNAL ACCESS INTEGRATIONS: confirm every enabled integration and external function is approved.", () => {
     const external = integrations.rows.filter((row) => /^(API|EXTERNAL_ACCESS|EXTERNAL ACCESS)$/i.test(rowValue(row, "category") ?? "") || /API|EXTERNAL_ACCESS/i.test(rowValue(row, "type") ?? ""));
@@ -2076,7 +3519,7 @@ export async function assessSnowflakeDataProtection(
       return { status: hasFullVisibility(role) ? "pass" : "warn", summary: `No enabled API or external access integrations were found among ${integrations.rows.length} integrations; for this control an empty inventory is compliant when read with full visibility.${hasFullVisibility(role) ? "" : ` ${partialVisibilityNote(role, "SHOW INTEGRATIONS")}`}`, evidence };
     }
     return { status: "warn", summary: `${enabled.length} enabled API or external access integrations allow outbound calls: ${enabled.slice(0, 10).map((row) => rowValue(row, "name")).join(", ")}; confirm each is approved.`, evidence };
-  }));
+  }, { optional: [{ outcome: session.outcome, unchecked: unverifiedRoleNote("SHOW INTEGRATIONS") }] }));
 
   return {
     title: "Snowflake data protection posture",
@@ -2085,12 +3528,12 @@ export async function assessSnowflakeDataProtection(
       account: session.account ?? config.account,
       role: role ?? null,
       full_visibility: hasFullVisibility(role),
-      databases_seen: databases.rows.length,
-      shares_seen: shares.rows.length,
+      databases_seen: rowsSeen(databases),
+      shares_seen: rowsSeen(shares),
       ...summarizeStatuses(findings),
     },
     findings,
-    statements: [session.outcome, maskingCount, maskingReferences, rowAccessCount, rowAccessReferences, tagReferences, stageParameters, unloadParameters, databases, shares, integrations, replicationGroups],
+    statements: [session.outcome, maskingCount, maskingReferences, rowAccessCount, rowAccessReferences, tagReferences, stageParameters, unloadParameters, databases, shares, integrations, replicationGroups].map(snapshotStatement),
   };
 }
 
@@ -2259,9 +3702,11 @@ function buildExecutiveSummary(config: SnowflakeResolvedConfig, access: Snowflak
     "# Snowflake Security Inspector Executive Summary",
     "",
     `Account: ${access.account}`,
-    `Authenticated as: ${access.user} (role ${access.role ?? "default"}, ${config.tokenType})`,
+    access.authentication === "confirmed"
+      ? `Authenticated as: ${access.user} (role ${access.role ?? "default"}, ${config.tokenType})`
+      : `Authentication: ${access.authenticationNote}`,
     `Generated: ${new Date().toISOString()}`,
-    `Access check: ${access.status}${access.fullVisibility ? "" : " (partial visibility: role lacks MANAGE GRANTS)"}`,
+    `Access check: ${access.status}${access.fullVisibility || access.authentication === "not_authenticated" ? "" : " (partial visibility: role lacks MANAGE GRANTS)"}`,
     "",
     "## Result Counts",
     "",
@@ -2319,7 +3764,7 @@ function buildQuickReference(result: { outputDir: string }, assessments: Snowfla
     "- `compliance/<framework>.md`: framework-specific mapping reports",
     "- `core_data/access_check.json`: readable surface inventory",
     "- `metadata.json`: non-secret run metadata",
-    errorCount > 0 ? "- `_errors.log`: statements that were denied, failed, or timed out during collection" : "- `_errors.log`: not written because every statement completed",
+    errorCount > 0 ? "- `_errors.log`: statements that were denied, failed, timed out, or were never sent during collection" : "- `_errors.log`: not written because every statement completed",
     "",
     "## Assessments",
     "",
@@ -2345,6 +3790,7 @@ export async function exportSnowflakeAuditBundle(
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const statements = assessments.flatMap((assessment) => assessment.statements);
   const failedStatements = statements.filter((statement) => statement.status !== "ok");
+  const notRequestedStatements = statements.filter((statement) => statement.status === "not_requested");
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(outputRoot, `${safeDirName(access.account || config.account)}-audit-bundle`);
@@ -2354,10 +3800,13 @@ export async function exportSnowflakeAuditBundle(
     account: access.account,
     user: access.user,
     role: access.role ?? null,
+    authentication: access.authentication,
     token_type: config.tokenType,
     base_url: config.baseUrl,
     source_chain: config.sourceChain,
     statement_count: statements.length,
+    requested_statement_count: statements.length - notRequestedStatements.length,
+    not_requested_statement_count: notRequestedStatements.length,
     failed_statement_count: failedStatements.length,
   }));
   await writeSecureTextFile(outputDir, "core_data/access_check.json", serializeJson(access));
@@ -2381,7 +3830,8 @@ export async function exportSnowflakeAuditBundle(
   }
   await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", `${buildQuickReference({ outputDir }, assessments, failedStatements.length)}\n`);
   if (failedStatements.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${failedStatements.map((statement) => `[${statement.status}] ${statement.key}: ${statement.error ?? "no detail"}\n  ${statement.statement}`).join("\n")}\n`);
+    // A statement that was never sent has no statement line: the log names only statements the run executed.
+    await writeSecureTextFile(outputDir, "_errors.log", `${failedStatements.map((statement) => `[${statement.status}] ${statement.key}: ${statement.error ?? "no detail"}${statement.statement === null ? "" : `\n  ${statement.statement}`}`).join("\n")}\n`);
   }
 
   const zipPath = resolveSecureOutputPath(outputRoot, `${basename(outputDir)}.zip`);
