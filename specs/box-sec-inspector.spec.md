@@ -3,20 +3,35 @@ slug: "box-sec-inspector"
 name: "Box Security Inspector"
 vendor: "Box"
 category: "saas-collaboration"
-language: "go"
-status: "spec-only"
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/box-sec-inspector"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
+legacy_repo: "https://github.com/hackIDLE/box-sec-inspector"
+reference_docs: "https://developer.box.com/reference/"
 ---
 
-# Box Enterprise Security Inspector — Architecture Specification
+# Box Enterprise Security Inspector: Architecture Specification
 
 ## 1. Overview
 
 **box-sec-inspector** is a security compliance inspection tool for Box Enterprise environments. It audits authentication policies, external collaboration settings, sharing controls, data governance (retention, legal hold, classification), device trust, Shield smart access policies, and admin role assignments via the Box REST API. The tool produces structured findings mapped to major compliance frameworks, enabling security teams to identify misconfigurations, enforce data protection policies, and maintain continuous compliance posture.
 
 Written in Go with a hybrid CLI/TUI architecture, it supports both automated pipeline execution (JSON/SARIF output) and interactive exploration of findings.
+
+### grclanker implementation
+
+The shipped implementation lives in grclanker as native TypeScript tools (`cli/extensions/grc-tools/box.ts`) rather than the standalone Go binary described in sections 7 through 9. It is read-only, uses `fetch` and `node:crypto` (no Box SDK), and registers:
+
+- `box_check_access`: token exchange plus a probe of 15 read surfaces.
+- `box_assess_identity_access`: controls 1, 2, 3, 17, 18, 21, 22, 23, 24.
+- `box_assess_sharing_collaboration`: controls 4, 5, 6, 7, 8, 9, 19, 20.
+- `box_assess_data_governance`: controls 10, 11, 12, 13.
+- `box_assess_shield_monitoring`: controls 14, 15, 16, 25.
+- `box_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified matrix, one report per framework in section 5, and a zip archive.
+
+The integration guide is `src/content/docs/docs/integrations/box.md`; regression coverage is `cli/tests/box.test.mjs`; the live smoke is `npm --prefix cli run test:box:live`.
 
 ## 2. APIs & SDKs
 
@@ -55,13 +70,13 @@ Written in Go with a hybrid CLI/TUI architecture, it supports both automated pip
 ### Box Events API (for Audit)
 
 Key event types for security auditing:
-- `LOGIN` / `FAILED_LOGIN` — Authentication events
-- `ADD_LOGIN_ACTIVITY_DEVICE` / `REMOVE_LOGIN_ACTIVITY_DEVICE` — Device trust events
-- `CHANGE_ADMIN_ROLE` — Admin role changes
-- `SHARE` / `UNSHARE` / `COLLABORATION_INVITE` — Sharing events
-- `DOWNLOAD` / `PREVIEW` — Content access events
-- `POLICY_VIOLATION` — Shield policy violations
-- `CONTENT_ACCESS` — Access to sensitive content
+- `LOGIN` / `FAILED_LOGIN`: Authentication events
+- `ADD_LOGIN_ACTIVITY_DEVICE` / `REMOVE_LOGIN_ACTIVITY_DEVICE`: Device trust events
+- `CHANGE_ADMIN_ROLE`: Admin role changes
+- `SHARE` / `UNSHARE` / `COLLABORATION_INVITE`: Sharing events
+- `DOWNLOAD` / `PREVIEW`: Content access events
+- `POLICY_VIOLATION`: Shield policy violations
+- `CONTENT_ACCESS`: Access to sensitive content
 
 ### SDKs and Libraries
 
@@ -76,7 +91,7 @@ Key event types for security auditing:
 
 ## 3. Authentication
 
-### JWT (Server Authentication) — Recommended
+### JWT (Server Authentication), recommended
 
 ```json
 {
@@ -148,31 +163,31 @@ Alternatively, configure via `~/.box-sec-inspector/config.yaml` or CLI flags.
 
 ## 4. Security Controls
 
-1. **SSO Enforcement** — Verify external SSO is configured and enforced for all users (not optional or disabled).
-2. **2FA for Admins** — Confirm two-factor authentication is required for all admin and co-admin accounts.
-3. **2FA for All Users** — Check if 2FA is enforced enterprise-wide, not just for admins.
-4. **External Collaboration Restrictions** — Verify external collaboration is restricted to allowlisted domains only.
-5. **Collaboration Allowlist Audit** — Review the external collaboration allowlist for stale or overly broad domain entries.
-6. **Sharing Link Policies** — Ensure shared links default to "People in this company" or more restrictive; detect "Open" default links.
-7. **Shared Link Expiration** — Verify shared links have mandatory expiration dates configured.
-8. **Shared Link Password Policy** — Check if password protection is required for externally shared links.
-9. **Watermarking Enabled** — Verify watermarking is enabled for sensitive content to deter unauthorized distribution.
-10. **Device Trust/Pins** — Audit device pin configuration; ensure only approved devices can access enterprise content.
-11. **Classification Labels** — Verify classification labels are defined and applied to sensitive content.
-12. **Retention Policies** — Confirm retention policies exist and are assigned to appropriate folders/metadata for compliance.
-13. **Legal Hold Policies** — Verify legal hold policies are properly configured and assigned for litigation readiness.
-14. **Shield Smart Access Policies** — Audit Box Shield policies for anomaly detection, smart access rules, and threat detection.
-15. **Shield Information Barriers** — Verify information barrier segments prevent unauthorized data flow between groups.
-16. **Enterprise Event Streaming** — Confirm enterprise event streaming is active for audit trail and SIEM integration.
-17. **Admin Role Minimization** — Detect excessive Admin/Co-Admin role assignments; ensure least-privilege.
-18. **Co-Admin Permission Scoping** — Verify co-admin roles have appropriately scoped permissions (not full admin equivalent).
-19. **App Approval Process** — Check that custom/third-party app access requires admin approval (not open by default).
-20. **Custom Terms of Service** — Verify custom ToS is configured and required for users before accessing content.
-21. **Password Policy Strength** — Validate enterprise password policy meets minimum complexity and length requirements.
-22. **Session Duration Limits** — Confirm session timeout and maximum session duration are appropriately configured.
-23. **IP Allowlisting** — Verify IP-based access restrictions are configured for the enterprise.
-24. **Inactive User Detection** — Identify user accounts that have not logged in within 90 days.
-25. **Content Access Monitoring** — Verify Shield or event monitoring is configured for sensitive content access patterns.
+1. **SSO Enforcement**: Verify external SSO is configured and enforced for all users (not optional or disabled).
+2. **2FA for Admins**: Confirm two-factor authentication is required for all admin and co-admin accounts.
+3. **2FA for All Users**: Check if 2FA is enforced enterprise-wide, not just for admins.
+4. **External Collaboration Restrictions**: Verify external collaboration is restricted to allowlisted domains only.
+5. **Collaboration Allowlist Audit**: Review the external collaboration allowlist for stale or overly broad domain entries.
+6. **Sharing Link Policies**: Ensure shared links default to "People in this company" or more restrictive; detect "Open" default links.
+7. **Shared Link Expiration**: Verify shared links have mandatory expiration dates configured.
+8. **Shared Link Password Policy**: Check if password protection is required for externally shared links.
+9. **Watermarking Enabled**: Verify watermarking is enabled for sensitive content to deter unauthorized distribution.
+10. **Device Trust/Pins**: Audit device pin configuration; ensure only approved devices can access enterprise content.
+11. **Classification Labels**: Verify classification labels are defined and applied to sensitive content.
+12. **Retention Policies**: Confirm retention policies exist and are assigned to appropriate folders/metadata for compliance.
+13. **Legal Hold Policies**: Verify legal hold policies are properly configured and assigned for litigation readiness.
+14. **Shield Smart Access Policies**: Audit Box Shield policies for anomaly detection, smart access rules, and threat detection.
+15. **Shield Information Barriers**: Verify information barrier segments prevent unauthorized data flow between groups.
+16. **Enterprise Event Streaming**: Confirm enterprise event streaming is active for audit trail and SIEM integration.
+17. **Admin Role Minimization**: Detect excessive Admin/Co-Admin role assignments; ensure least-privilege.
+18. **Co-Admin Permission Scoping**: Verify co-admin roles have appropriately scoped permissions (not full admin equivalent).
+19. **App Approval Process**: Check that custom/third-party app access requires admin approval (not open by default).
+20. **Custom Terms of Service**: Verify custom ToS is configured and required for users before accessing content.
+21. **Password Policy Strength**: Validate enterprise password policy meets minimum complexity and length requirements.
+22. **Session Duration Limits**: Confirm session timeout and maximum session duration are appropriately configured.
+23. **IP Allowlisting**: Verify IP-based access restrictions are configured for the enterprise.
+24. **Inactive User Detection**: Identify user accounts that have not logged in within 90 days.
+25. **Content Access Monitoring**: Verify Shield or event monitoring is configured for sensitive content access patterns.
 
 ## 5. Compliance Framework Mappings
 
@@ -215,7 +230,7 @@ Alternatively, configure via `~/.box-sec-inspector/config.yaml` or CLI flags.
 | Box Reports (Admin) | Reporting | Usage analytics, not security posture analysis |
 | Custom Event Stream Scripts | Custom | No structured compliance mapping or standardized output |
 
-**Gap:** No existing tool provides automated security posture assessment of Box Enterprise configurations — including Shield policies, collaboration restrictions, device trust, and data governance settings — mapped to compliance frameworks. box-sec-inspector fills this gap.
+**Gap:** No existing tool provides automated security posture assessment of Box Enterprise configurations, including Shield policies, collaboration restrictions, device trust, and data governance settings, mapped to compliance frameworks. box-sec-inspector fills this gap.
 
 ## 7. Architecture
 
@@ -380,4 +395,31 @@ make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker (TypeScript) as of 2026-09-21. All 25 controls in section 4 produce a finding with the eight framework mappings from section 5.
+
+### What shipped
+
+- Authentication: JWT (RS256, RS384, or RS512 assertion signed with `node:crypto`, `kid` from `publicKeyID`), Client Credentials Grant (`box_subject_type` `enterprise` or `user`), and OAuth 2.0 access tokens with refresh-token renewal on 401. Configuration precedence is tool arguments, then `BOX_*` environment variables, then `~/.box-sec-inspector/config.yaml` (or `BOX_CONFIG_PATH`). Secrets are redacted from error messages.
+- Client: marker pagination (`usemarker`/`marker`), offset pagination for `GET /groups`, `stream_position` paging for `admin_logs` events, `retry-after` aware retry on 429 and exponential backoff on 5xx, per-request timeouts, and memoized reads within a run.
+- Tools: `box_check_access`, `box_assess_identity_access`, `box_assess_sharing_collaboration`, `box_assess_data_governance`, `box_assess_shield_monitoring`, `box_export_audit_bundle` (see the grclanker implementation subsection in section 1).
+- Automated verdicts (`pass`, `warn`, or `fail`) for controls 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 24, and 25. Controls 8, 19, and 23 are always `manual`; controls 10 and 18 are `manual` whenever device pins or co-admins exist. Every `manual` finding names the Admin Console evidence to collect.
+- Verdict safety: absent data never produces `fail`. Configuration categories that Box returns as `null`, an unreadable user list (controls 2, 3, 17, 18, 24), and settings missing from a readable category produce `manual` or `warn` with the reason. Configuration items with `is_used: false` are treated as not enforced and never support `pass`; the finding reports the item's `is_used` state and reported value in its evidence. An empty user inventory (zero users, or no `admin` account) and a truncated list (the API still offered a `next_marker`, an offset below `total_count`, or a `next_stream_position` when the cap was reached) are reported as `warn` for every finding whose `pass` would rest on the absence of a record (controls 2, 3, 5, 17, 18, 24, 25); truncation is recorded per assessment (`truncated`), in the bundle summary (`truncated_datasets`), and per snapshot in `core_data/collection_status.json`.
+- Tests: mocked coverage for configuration precedence, JWT and CCG token exchange, marker and offset pagination, retry and redaction, OAuth refresh, access check (healthy and limited), every assessment with passing and failing fixtures, and the export bundle (layout, zip, `_errors.log`, output path safety). Live smoke: `npm --prefix cli run test:box:live`.
+
+### Deviations from this spec, following the official Box documentation
+
+- Rate limit: Box documents 1000 API requests per minute per user (not 10 per second). The client honors `retry-after` on 429 and backs off exponentially on 5xx instead of using a fixed token bucket.
+- Device pins: the documented endpoint is `GET /2.0/enterprises/{enterprise_id}/device_pinners`, not `GET /2.0/device_pins`.
+- Legal hold assignments: the documented endpoint is `GET /2.0/legal_hold_policy_assignments?policy_id=...`, not a nested `/legal_hold_policies/{id}/assignments` path.
+- Enterprise settings: `GET /2.0/enterprises/{id}` does not return security settings. Posture values (SSO, MFA, password, session, sharing, watermarking, Shield rules) come from `GET /2.0/enterprise_configurations/{enterprise_id}?categories=security,content_and_sharing,user_settings,shield` with the `box-version: 2025.0` header, and IP and integration lists from `GET /2.0/shield_lists` (also `2025.0`).
+- Classification labels: read from the enterprise security classification template `GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema` in addition to `GET /2.0/metadata_templates/enterprise`.
+- Inactive users: the user object has no last login field, so control 24 correlates `admin_logs` activity events (`LOGIN`, `ADMIN_LOGIN`, `DOWNLOAD`, `UPLOAD`, and similar) with active managed users inside the lookback window. `FAILED_LOGIN` events are collected as evidence but do not count as activity.
+- Event types: `POLICY_VIOLATION` and `CONTENT_ACCESS` are not valid `event_type` filters; the implementation uses the documented `SHIELD_*`, `CONTENT_WORKFLOW_*`, `FILE_MARKED_MALICIOUS`, `DEVICE_TRUST_CHECK_FAILED`, `DOWNLOAD`, and `PREVIEW` types.
+- Users: `is_exempt_from_login_verification` (true means the user is exempt from 2-step verification) is the per-user MFA signal; there is no per-user "2FA status" field.
+- Enterprise ID: for OAuth tokens without `BOX_ENTERPRISE_ID`, the ID is discovered from `GET /2.0/users/me?fields=enterprise`.
+
+### What remains
+
+- The API does not expose the open shared link password requirement (control 8), the app approval policy (control 19), enterprise IP allowlisting (control 23), the device trust enforcement policy (control 10), or co-admin permission sets (control 18); these stay manual until Box exposes them.
+- Folder-level sampling (`GET /folders/{id}` and `/collaborations`) for watermark and classification application is not automated; the findings list the sampling step as manual evidence.
+- SARIF, CSV, and HTML reporters and the interactive TUI from sections 7 and 8 are not part of the grclanker implementation; the audit bundle provides JSON and Markdown outputs instead.

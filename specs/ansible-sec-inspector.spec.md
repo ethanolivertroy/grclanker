@@ -3,10 +3,10 @@ slug: ansible-sec-inspector
 name: Ansible AAP Security Inspector
 vendor: Red Hat
 category: community-specs
-language: go
-status: spec-only
+language: "typescript"
+status: "implemented"
 version: "1.0"
-last_updated: "2026-04-15"
+last_updated: "2026-09-21"
 source_repo: "https://github.com/hackIDLE/grclanker"
 source_pr: "https://github.com/hackIDLE/grclanker/pull/4"
 contributor: "GRCJP"
@@ -53,6 +53,49 @@ that produces that evidence.
 - Access control: team permissions, organization RBAC, least privilege enforcement
 - Audit logging: job activity logging, event retention, notification coverage
 - Platform security: API token hygiene, LDAP/SSO enforcement, session management
+
+### grclanker implementation
+
+This spec describes a standalone Go CLI. The grclanker deliverable is the native
+TypeScript tool family in `cli/extensions/grc-tools/ansible.ts`, which implements
+all 30 controls below as read-only checks against the controller `/api/v2/`
+surface and is documented in `src/content/docs/docs/integrations/ansible.md`.
+
+| Tool | Spec controls | Finding ids |
+|---|---|---|
+| `ansible_check_access` | none (access probe for 18 audit surfaces) | none |
+| `ansible_assess_job_health` | 1, 2, 3, 4, 5, 28 | `AAP-JOB-01` to `AAP-JOB-06` |
+| `ansible_assess_host_coverage` | 6 to 15 | `AAP-HOST-01` to `AAP-HOST-05`, `AAP-TMPL-01` to `AAP-TMPL-03`, `AAP-SCHED-01`, `AAP-SCHED-02` |
+| `ansible_assess_platform_security` | 16 to 27, 29, 30 | `AAP-CRED-01` to `AAP-CRED-05`, `AAP-RBAC-01` to `AAP-RBAC-05`, `AAP-AUDIT-01`, `AAP-AUDIT-02`, `AAP-PROJ-01`, `AAP-PLAT-01` |
+| `ansible_export_audit_bundle` | all 30 | bundle with `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip named after the allocated directory |
+
+Implementation rules that differ from or refine the Go design in sections 7 to 9:
+
+- Findings use four statuses: `pass`, `warn`, `fail`, `manual`. An unreadable,
+  forbidden, or errored endpoint never yields `pass`; it yields `manual` naming the
+  cause and the controller UI evidence to collect.
+- An empty inventory never yields `pass` by default. Each control states whether
+  emptiness is `fail` (zero jobs, zero notification templates, zero activity
+  records, zero workflows while templates exist) or `manual`. The single exception
+  by intent is control 20, where zero OAuth2 tokens is compliant.
+- Items missing a date (`finished`, `last_job_run`, `modified`, `created`,
+  `next_run`, `last_updated`, `timestamp`) are never counted as fresh and cap the
+  finding at `warn`.
+- Pagination follows `next` to completion unless a caller limit stops it; the
+  truncation is recorded, surfaced in `evidence.partial_view`, and downgrades
+  `pass` to `warn`. An audit account that is neither `is_superuser` nor
+  `is_system_auditor` is treated as a partial inventory for every control.
+- Every documented flag a verdict depends on is read: schedule `enabled`,
+  template `ask_credential_on_launch`, `ask_variables_on_launch`, and
+  `ask_execution_environment_on_launch`, credential `kind` and `inputs.vault_id`,
+  user `is_superuser` and `is_system_auditor`, role `name` with
+  `summary_fields.resource_type`, and the `SCHEDULE_MAX_JOBS`,
+  `ACTIVITY_STREAM_ENABLED`, and `LOG_AGGREGATOR_ENABLED` settings.
+- `AAP_VERIFY_SSL=false` disables TLS verification only for the tool's own
+  requests through a dedicated `node:https` agent; the process-wide
+  `NODE_TLS_REJECT_UNAUTHORIZED` variable is never modified.
+- Session login and token auth follow section 3, except that the password is read
+  only from `AAP_PASSWORD` and is rejected as a tool argument.
 
 ## 2. APIs & SDKs
 
@@ -722,6 +765,33 @@ Threshold Flags:
 
 ## 10. Status
 
-**Not yet implemented. Spec only.**
+**Implemented in grclanker as native TypeScript tools (2026-09-21).**
+
+Shipped:
+
+- All 30 controls in section 4 as findings across `ansible_assess_job_health`,
+  `ansible_assess_host_coverage`, and `ansible_assess_platform_security`, plus
+  `ansible_check_access` and `ansible_export_audit_bundle`
+- Token and session authentication per section 3, `AAP_URL`, `AAP_TIMEOUT`, and
+  request-scoped `AAP_VERIFY_SSL`
+- The compliance mappings in section 5 on every finding, a unified matrix, and one
+  bundle report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG)
+- Verdict-safety rules for unreadable endpoints, empty inventories, unavailable
+  features, missing dates, partial inventories, and pagination, each covered by a
+  regression test in `cli/tests/ansible.test.mjs` together with all-403, all-empty,
+  and partial-inventory false-pass fixtures
+- A live smoke script (`npm --prefix cli run test:ansible:live`) that skips without
+  credentials and an integration guide in the docs site
+
+Remaining and out of scope for grclanker:
+
+- The standalone Go binary, Cobra CLI, Bubble Tea TUI, and the HTML and CSV
+  reporters described in sections 7 to 9
+- AAP 2.5 platform gateway authenticators and gateway token inventories; the tools
+  read the controller `/api/v2/` surface only and render control 25 as `manual`
+  when the controller settings category exposes no LDAP, SAML, or OIDC keys
+- Host variable scanning and launch-time `extra_vars` for control 18, and disabled
+  user detection for control 20, which the controller API does not expose
+- Live integration tests against an AAP trial or sandbox instance
 
 Mirrors the grclanker spec format: https://github.com/hackIDLE/grclanker

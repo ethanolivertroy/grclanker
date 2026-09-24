@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { ensureGrclankerHome, getGrclankerHome, getGrclankerStateDir } from "../../config/paths.js";
+import { persistentCachesEnabled } from "./shared.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SOURCE_STATUS_TTL_MS = 6 * 60 * 60 * 1000;
@@ -336,7 +337,12 @@ function sourcesCachePath(homeDir = getGrclankerHome()): string {
   return resolve(fedrampStateDir(homeDir), "sources.json");
 }
 
+/**
+ * Create the FedRAMP state directory unless the caller disabled persistent
+ * caches; reads tolerate a missing directory, so skipping it is safe.
+ */
 async function ensureFedrampStateDir(homeDir = getGrclankerHome()): Promise<void> {
+  if (!persistentCachesEnabled()) return;
   ensureGrclankerHome(homeDir);
   await mkdir(fedrampStateDir(homeDir), { recursive: true });
 }
@@ -347,7 +353,9 @@ async function readJsonFile<T>(path: string): Promise<T | undefined> {
   return JSON.parse(raw) as T;
 }
 
-async function writeJsonFile(path: string, value: unknown): Promise<void> {
+/** Persist a cache payload unless the caller disabled persistent caches. */
+async function writeCacheFile(path: string, value: unknown): Promise<void> {
+  if (!persistentCachesEnabled()) return;
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
@@ -913,7 +921,7 @@ export async function loadFedrampCatalog(options?: {
       catalog: live.catalog,
       provenance: live.provenance,
     };
-    await writeJsonFile(cachePath, payload);
+    await writeCacheFile(cachePath, payload);
     const value: FedrampLoadedCatalog = {
       catalog: live.catalog,
       provenance: live.provenance,
@@ -1003,7 +1011,7 @@ export async function inspectFedrampOfficialSources(options?: {
       primary: catalog.provenance,
       secondary,
     };
-    await writeJsonFile(cachePath, payload);
+    await writeCacheFile(cachePath, payload);
     const value: FedrampSourceStatus = {
       primary: catalog.provenance,
       secondary,

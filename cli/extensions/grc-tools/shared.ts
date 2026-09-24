@@ -1,4 +1,5 @@
 /** Shared utilities for GRC extension tools */
+import { AsyncLocalStorage } from "node:async_hooks";
 
 interface CacheEntry<T> {
   data: T;
@@ -6,6 +7,28 @@ interface CacheEntry<T> {
 }
 
 const cache = new Map<string, CacheEntry<unknown>>();
+
+interface PersistencePolicy {
+  persistentCaches: boolean;
+}
+
+/**
+ * Per-call persistence policy. Tools that mirror public data sets to the
+ * grclanker state directory consult it before touching the filesystem, so a
+ * host that must not mutate the user's disk (an Agent SDK dry-run session)
+ * can run those tools for real while keeping their caches in memory only.
+ */
+const persistencePolicy = new AsyncLocalStorage<PersistencePolicy>();
+
+/** True unless the surrounding async context disabled on-disk caches. */
+export function persistentCachesEnabled(): boolean {
+  return persistencePolicy.getStore()?.persistentCaches !== false;
+}
+
+/** Run `fn` with on-disk caches disabled. In-memory caches still apply. */
+export function runWithoutPersistentCaches<T>(fn: () => Promise<T>): Promise<T> {
+  return persistencePolicy.run({ persistentCaches: false }, fn);
+}
 
 /**
  * Fetch JSON with in-memory TTL cache.
