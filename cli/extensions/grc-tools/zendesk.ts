@@ -73,6 +73,10 @@ export interface ZendeskListResult {
   items: JsonRecord[];
   truncated: boolean;
   pages: number;
+  // Why paging stopped before the end when truncated is true: a stalled or repeated
+  // cursor, has_more without a link, the item or page cap, or a server-supplied next link
+  // the client refused to follow (a foreign origin or a link carrying user credentials).
+  truncation_reason?: string;
 }
 
 // One 2xx answer that passed the shape guard: the JSON object it carried and the
@@ -93,10 +97,12 @@ export interface ZendeskAccessSurface {
   // Items seen by a readable probe; null when the probe did not read anything, so a
   // refused surface is never mistaken for an empty one.
   count: number | null;
-  // True when a readable list probe stopped at its item cap or on a stuck cursor (count
-  // is a seen count rather than the population); null when the probe failed; absent for
-  // a readable single-object probe.
+  // True when a readable list probe stopped at its item cap, on a stuck cursor, or at a
+  // next link the client refused to follow (count is a seen count rather than the
+  // population); null when the probe failed; absent for a readable single-object probe.
   truncated?: boolean | null;
+  // Why a truncated list probe stopped early; absent otherwise.
+  truncationReason?: string;
   // The HTTP status observed by a failed probe; null when it was readable or no response arrived.
   httpStatus: number | null;
   error?: string;
@@ -302,8 +308,14 @@ function normalizeSubdomain(value: string): string {
   return candidate;
 }
 
+// A configured base URL keeps its scheme, host, port, and path prefix for requests; its
+// user-and-secret prefix, query, and fragment are dropped here so no request, the
+// configured origin a refused next link is compared against, or any output ever
+// carries them.
 function normalizeBaseUrl(rawUrl: string): string {
   const parsed = new URL(rawUrl.trim());
+  parsed.username = "";
+  parsed.password = "";
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
@@ -436,18 +448,26 @@ export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
  * the unread inventory is itself a verdict-safety requirement. Two guards make
  * that safe and both hold by construction:
  *
- * 1. A value inside a carrier is removed whatever its shape: the Authorization,
- *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-Auth-Token and similar
- *    header lines to the end of the line; the userinfo of every embedded URL;
- *    credential-named query and fragment pairs of every URL and bare query string
- *    (the ?token= and &api_key= a target_url or trigger action may carry) and any
- *    query value shaped like a token; the schemes Bearer, Basic, Digest, Token, Negotiate,
- *    NTLM, SSWS, and ApiKey (only a listed prose word after the scheme, "Basic
- *    authentication", stays; after the noun "Token" any short plain lowercase word does); credential-named key=value pairs (to the next
- *    delimiter), key: value pairs (to the end of the line), "key":"value" pairs,
- *    and key="value" XML or HTML attributes; and webhook services whose URL path is
- *    the secret. Nothing this module renders puts a credential word in front of a
- *    colon or an equals sign, so every fixed text survives the scrub.
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization and
+ *    Proxy-Authorization header lines, keeping the scheme word the credentials follow
+ *    (Bearer, Basic, Digest, ...) and removing the one token after it, or the whole
+ *    parameter list after a Digest or AWS4-HMAC-SHA256 scheme; the Cookie and Set-Cookie
+ *    lines to the end of the line; the X-Api-Key, X-Auth-Token and similar single-token
+ *    header lines to the end of their first token; the userinfo of every embedded URL,
+ *    bare or with its slashes escaped by a stringify; credential-named query and
+ *    fragment pairs of every URL and bare query string (the ?token= and &api_key= a
+ *    target_url or trigger action may carry) and any query value shaped like a token;
+ *    the schemes Bearer, Basic, Digest, Token, OAuth, Negotiate, NTLM, SSWS, ApiKey,
+ *    Splunk, Snowflake, and AWS4-HMAC-SHA256 in any casing (only a listed prose word
+ *    after the scheme, "Basic authentication", or an auth-param name, Bearer realm=,
+ *    stays; after the nouns Token, OAuth, Splunk, and Snowflake any short plain lowercase
+ *    word does); credential-named key=value pairs (to the next delimiter, wherever the
+ *    key starts: after --, -D, or a path slash), key: value pairs (to the end of the
+ *    line, or one token after a path slash), --key value flags, "key":"value" pairs,
+ *    and key="value" XML or HTML attributes; the path and query of a URL under a
+ *    webhook or webhook_url key; and webhook services whose URL path is the secret.
+ *    Nothing this module renders puts a credential word in front of a colon or an
+ *    equals sign, so every fixed text survives the scrub.
  * 2. A configured secret (the API token, the OAuth access token, and the composed
  *    Basic credential the client sends, base64 of email/token:api_token) is removed whatever
  *    its shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
@@ -457,8 +477,8 @@ export const CREDENTIAL_REDACTION_MARKER = "[REDACTED]";
  *    payload and every written file.
  *
  * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
- * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, and (in
- * error text) any run of
+ * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, GitHub,
+ * Stripe, and Slack prefixed tokens, and (in error text) any run of
  * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
  * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
  * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
@@ -485,35 +505,134 @@ const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/
 // ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
 const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
 // Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
-// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay. The
+// userinfo ends where the authority does, at "/", "?", or "#", so an "@" inside a query or
+// fragment (https://h?e=a@x.com&token=..., https://h#f@x.com) is never read as userinfo: the
+// host stays "h", and the query is left to the pair rule and the origin reducer instead of
+// being carried on as if it were the host.
 const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
-const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s\/?#@"'<>\\]+@/i;
 // A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
-// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
-// ";" and "," that end a URL inside a sentence (no token carries either).
-const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
+// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, a
+// backslash (no token carries one; the escape after it, \" or \n inside a JSON string, is
+// kept so the string still parses and the text after it is still read), or the "," that
+// ends a URL inside a sentence. A ";" is part of the value, as URLSearchParams reads it
+// (?token=hunter2;restofsecret is one value and loses the whole of it); the ";" that ends a
+// pair belongs to the cookie and key-list header lines, which are read before this rule, so
+// a cookie pair whose name holds "&" or "#" goes with its cookie.
+// A quote with a value character on both sides (O'hunter2) is content of the value.
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>,\\]+(?:["'](?![:)}\]])[^&#\s"'<>,\\]+)*)/g;
 // A credential-bearing header line: the whole value goes, whatever its shape. The name and
-// separator are matched here and the value is consumed by headerValueEnd, which carries a
-// quoted value (double, single, or JSON-escaped quotes) through its closing quote, so
-// Cookie: sid="value" loses value and quotes together instead of stopping at the first
-// quote. A value that already opens with a marker is left alone so the rule is idempotent.
-const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
+// separator are matched here (the name may be quoted as a JSON member name, with its quotes
+// escaped to any depth: "Cookie": ..., \"Cookie\": ..., \\\"Cookie\\\": ...) and the value
+// is consumed by headerValueEnd, which carries a quoted value through its closing quote at
+// the same depth, so Cookie: sid="value" loses value and quotes together instead of
+// stopping at the first quote, and ends an unquoted value before the next header on a
+// compound line, so the next header keeps its name. A value that already opens with a
+// marker is left alone so the rule is idempotent. The name starts where no word character
+// precedes it, or right after a JSON string escape left in place by one stringify (\n, \r,
+// \t, \b, \f, \v, \0, \uXXXX, \xHH): "request failed\nX-SecurityCenter: value" is a header
+// line inside a JSON string, and the escape letter is not part of the name that follows it.
+const HEADER_LINE_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv0]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}))(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)((?:\\*["'])?\s*:\s*)/gi;
+// The escape letters that can sit between a backslash and the key or header name after it.
+const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv0]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})/;
 // Inside a header value a quote opens a quoted segment only where a value can start: at the
-// start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
-// quote that closes the text the header line was quoted in.
+// start of the value or after "=", ":", ",", ";", "(", or whitespace. A quote with a token
+// character on both sides (sid=O'hunter2, my'pref=value, my"pref=value) is content of the
+// value, since RFC 6265 lets a cookie name or value carry an apostrophe. A quote anywhere
+// else, at the end of a token, is the quote that closes the text the header line was quoted
+// in.
 const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
+// What follows a quote that opens or closes something: whitespace, a delimiter, a closing
+// bracket, a tag, another quote, or an escape. Any other character continues the token.
+const QUOTE_BOUNDARY_PATTERN = /[\s,;:)}\]<>"'\\]/;
 const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
+// The "Name:" token of the next header after ";" or "," on a compound line (the name may be
+// quoted, as in a JSON object, with the quotes escaped to any depth, and may hold dots, as
+// X.Api.Key does when a proxy rewrites hyphens); a colon followed by "//" is a URL scheme,
+// not a header. The token is looked for within FOLLOWING_HEADER_LOOKAHEAD characters of the
+// separator.
+const FOLLOWING_HEADER_PATTERN = /^\s*(?:\\*["'])?[A-Za-z][A-Za-z0-9.-]*(?:\\*["'])?\s*:(?!\/\/)/;
+const FOLLOWING_HEADER_LOOKAHEAD = 96;
+// Header classes. An Authorization or Proxy-Authorization value opens with the scheme word
+// its credentials follow (Bearer, Basic, Digest, and the rest of AUTH_SCHEME_WORDS, in any
+// casing): the word stays as spelled and the one token (or one quoted string) after it
+// goes, so the operator still reads which scheme was replayed and prose after the token
+// stays; a parameter list after the scheme (Digest username=..., realm=...) goes whole, as
+// does a value that opens with anything else (a scheme word the list does not know, such
+// as GenieKey, SharedKey, or Bot, a bare token, a digit), to the end of the line: an
+// unknown first word may be a scheme with its credentials after it, so nothing after it
+// is trusted. A cookie header, or Tenable's X-ApiKeys (accessKey=...; secretKey=...), is
+// a list of pairs and goes whole. Every other header (X-Api-Key, X-Auth-Token,
+// X-Vault-Token, ...) carries one token: an unquoted value ends at the first whitespace,
+// so a JSON fragment or prose after it on the same line ({"status":"denied"}, "rejected")
+// is still read; a value that opens with a listed scheme word (X-Auth-Token: Bearer <v>)
+// is the word and the token after it together, and both go under the one marker, as the
+// scheme word is part of the value under any key but Authorization; a quoted value ends
+// at its closing quote whatever it holds.
+const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
+const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
+const AUTH_SCHEME_WORDS = new Set([
+  "basic", "bearer", "digest", "hoba", "mutual", "negotiate", "oauth", "scram-sha-1", "scram-sha-256", "vapid", "dpop", "gnap",
+  "privatetoken", "concealed", "ntlm", "token", "ssws", "apikey", "api-key", "splunk", "snowflake", "aws4-hmac-sha256",
+]);
+const AUTH_SCHEME_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)(?:\s+|$)/;
+// A header value the header rule already treated, as the pair rules then see it: the scheme
+// word and, after whitespace and an optional quote, the marker.
+const REDACTED_SCHEME_VALUE_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)\s+((?:\\*["'])?)\[REDACTED\]/;
+const AUTH_PARAM_LIST_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*=/;
 // A scheme and its credentials: the value is removed whatever its shape, except the
 // prose words that follow a scheme name in a sentence ("Basic authentication is
 // required", "Bearer token") and a Titlecase word, which makes the scheme name an
 // adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
 // credential is base64 and a bearer token or API key carries digits, symbols, or token
-// casing, so neither is ever one capitalized word of letters. "Token" is also this
-// module's own noun ("Token hygiene", "token inventory"), so after it any plain
-// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its
-// credentials as key="value" attributes, which the attribute rule removes, so OAuth is
-// not a scheme here and "OAuth clients" stays.
-const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+// casing, so neither is ever one capitalized word of letters. "Token", "OAuth", "Splunk",
+// and "Snowflake" are also nouns of this module's own prose and of product names ("Token
+// hygiene", "OAuth clients", "Splunk index", "Snowflake account"), so after them any plain
+// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. An auth-param name before
+// "=" (Bearer realm="api", Digest qop="auth") is the challenge's grammar, not a credential;
+// the quoted value after it is judged by the attribute rule under its own name. A
+// parameter list that carries credentials is read whole by the parameter-list rule first.
+const SCHEME_WORD_SOURCE = "Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
+const SCHEME_VALUE_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})`, "gi");
+const NOUN_SCHEME_WORDS = new Set(["token", "oauth", "splunk", "snowflake"]);
+const AUTH_PARAM_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=$/;
+const AUTH_PARAM_NAMES = new Set([
+  "realm", "error", "error_description", "error_uri", "scope", "charset", "nonce", "opaque", "qop", "algorithm", "stale", "domain",
+  "uri", "response", "cnonce", "nc", "username", "credential", "signedheaders", "signature", "oauth_consumer_key", "oauth_token",
+  "oauth_signature_method", "oauth_signature", "oauth_timestamp", "oauth_nonce", "oauth_version", "oauth_callback", "oauth_verifier",
+]);
+// A scheme word followed by a parameter list (name=value, name2=value2, ...) is the value of
+// an Authorization header wherever it appears, with the header name in front of it or
+// without one (Snowflake Token="<value>", Token token="<value>", nonce="...", Digest
+// username="...", realm="...", nonce="...", response="...", OAuth oauth_token="..."): the
+// word stays and the whole list goes, as it does under the header name. A list made only
+// of the parameters a challenge carries (the realm, the Bearer error fields, the Basic
+// charset, the Digest challenge fields: Bearer realm="api", error="invalid_token", a
+// WWW-Authenticate value) is a challenge and stays for the per-parameter rules; a list with
+// any other parameter (Token, token, key, username, uri, response, oauth_token, ...) is the
+// credential side of its scheme. The list is read by readAuthParameterList.
+const CHALLENGE_PARAM_NAMES = new Set(["realm", "error", "error_description", "error_uri", "scope", "charset", "domain", "nonce", "opaque", "stale", "algorithm", "qop", "userhash"]);
+// The parameters that carry the proof of a credential: the Digest response, a signature
+// (oauth_signature, signature, sig), or a MAC. A proof's value goes whatever its shape, in
+// a list after a scheme word or in one without a scheme word.
+const PROOF_PARAM_NAMES = new Set(["response", "signature", "oauth_signature", "mac", "sig"]);
+// A parameter list without a scheme word (realm="api", nonce="n", response="<proof>": the
+// value of a www_authenticate field, or a credential echoed without its scheme word) is an
+// auth parameter list when it holds two or more parameters and one of them, other than a
+// proof, is a known auth parameter (a challenge parameter, or username, uri, nc, cnonce, an
+// oauth_* parameter). In such a list, or in the list after a scheme word, a proof goes and a
+// challenge parameter keeps its value: the nonce of a challenge is public, so a proof-free
+// challenge (Digest realm="api", qop="auth", nonce="n") keeps every value, while a list
+// that carries a proof is not a challenge, whatever parameters open it. Any other parameter
+// (username, oauth_token) is judged under its own name, and a lone name=value pair is no
+// list. A list opens at a name that no word character precedes.
+const AUTH_PARAMETER_LIST_OPENER_PATTERN = /(?<![A-Za-z0-9_.:-])[A-Za-z][A-Za-z0-9_-]*=/g;
+const SCHEME_LED_LIST_PATTERN = new RegExp(String.raw`\b(?:${SCHEME_WORD_SOURCE})\s+$`, "i");
+const SCHEME_PARAMETER_LIST_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+(?=[A-Za-z][A-Za-z0-9_-]*=)`, "gi");
+const AUTH_PARAM_ITEM_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=/y;
+const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'\\<>]+/y;
+const AUTH_PARAM_SEPARATOR_PATTERN = /\s*,\s*/y;
 const PLAIN_WORD_PATTERN = /^[a-z]+$/;
 const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
 const SCHEME_PROSE_WORDS = new Set([
@@ -531,18 +650,81 @@ const SCHEME_PROSE_WORDS = new Set([
 // Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
 // character precedes it rather than at a word boundary.
 const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
-const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
+// The same pair inside a JSON text that was itself stringified into a string value, so its
+// quotes arrive behind a run of backslashes (\" one level down, \\\" two levels down): the
+// run is captured and the pair's four quotes must all carry it, so the value ends at the
+// quote of its own depth.
+const JSON_ESCAPED_PAIR_PATTERN = /(\\+)"([A-Za-z_][A-Za-z0-9_.-]{0,63})\1"(\s*:\s*)\1"((?!\[REDACTED\])(?:(?!\1")[^\r\n])+?)\1"/g;
+// A quoted attribute or pair value: the quote may be escaped to any depth, and the value
+// ends at the quote of its own depth.
+// A quote with a value character on both sides (O'hunter2) is content of the value.
+const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(\\*["'])((?!\[REDACTED\])(?:[^"'\r\n]|["'](?=[^\s"'\r\n<>;,&:)}\]\\]))+)\2/g;
 // An unquoted pair: key=value runs to the next delimiter, key: value (a header or
 // YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
 // structure after a credential-named key (compact "password":{...}, "auth":null}) is
-// never taken for a value.
-const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
-const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;{}[\]]*[^\s\r\n<>"',;{}[\]]/y;
-const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
+// never taken for a value. The key and the value may be quoted with the quotes escaped to
+// any depth; a value never runs into the escaped quote that closes it. A key starts where
+// no word character precedes it: after the "--" of a command-line flag (--password=v), the
+// "-D" of a Java system property (-Dpassword=v, where the D is read as part of the key and
+// the credential word is still its tail), a "/" path separator, or a "." (the tail of a
+// dotted name is scanned only when no key match started earlier on the name); or right
+// after a \0 escape, whose digit cannot start a key (the letter escapes, \n and the rest,
+// are read as part of the key and removed by keyAfterEscape).
+const ASSIGNMENT_KEY_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\0))((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
+// The escape one stringify leaves for a control character: \n, \r, \t, \b, \f, \v, \0, or a
+// \uXXXX or \xHH code of a control (U+0000 to U+001F, U+007F, and the line and paragraph
+// separators U+2028 and U+2029). An escape of a printable character (\u00e9) is content.
+const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|007[fF]|202[89])|x(?:[01][0-9a-fA-F]|7[fF]))`;
+// A credential name after "--" with its value as the next argument (psql --password value):
+// the flag starts where no word character or "-" precedes it (at the start of a quoted
+// command line too), its name may open with a letter or an underscore (a cookie name such as
+// _zendesk_session is a credential name too), and the value is the one token after it, never
+// another flag, ending where an unquoted pair value does.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z_][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
+// After a credential-named path segment and ":" (kv/password: value) the value is at most
+// one token. A singular label (password, token, key) takes that token whatever its shape
+// and whatever follows it (/etc/app/password: <value> was rejected); a plural label names a
+// collection (/api/v1/api-tokens: request failed with 403), so prose after the token means
+// there was no value, while a lone token after a plural label is one.
+const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
+// A key whose last word is a plural credential word, in the segment split (api-tokens, keys,
+// oauth_tokens) or concatenated (apikeys, sshkeys).
+const PLURAL_CREDENTIAL_LABEL_PATTERN = /(?:token|secret|key|cookie|password|credential|passphrase|signature|session)s$/;
+// The "-D" of a Java system property (java -Dkey=value) is not part of the key.
+const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
+// A delimited (key=value) value ends at whitespace or a control character, raw or left
+// escaped by one stringify (\n, \r, \t, \b, \f, \v, \0, \u0009 and the other \u00XX control
+// codes, \x09), as an unquoted header token does, so a pair or header chained after the
+// escape (api_key=<v>\tpassword: <v>) is read on its own and loses its own value. A key:
+// value line ends at a line break only, raw or escaped (\n, \r, \u000a, \u000d), as the raw
+// line does, so the header or pair on the next escaped line is read on its own.
+// A quote with a value character on both sides (O'hunter2, my'pref) is content of the value;
+// a quote at the end of a token, or an escaped quote, ends it, as does a value's first quote.
+const DELIMITED_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+`, "y");
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\s\r\n<>"',;{}[\]]/y;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
+// A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
+// userinfo goes as it does from a bare URL and ends at the same "/", "?", or "#"; the query
+// pairs are read by the pair rule.
+const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s\/?#@"'<>\\]+@/gi;
+// A key naming a webhook URL: the incoming webhooks of Slack, Discord, Teams, and PagerDuty
+// carry their token in the path or query, so under webhook, webhook_url, webhookUrl, or
+// WEBHOOK_URL a URL value keeps its scheme and host only, whatever the host. webhook_count,
+// webhook_id, and webhook_name are not URL-valued and stay; a webhook key whose value is not
+// a URL (a name, an id) stays too.
+const WEBHOOK_URL_TAIL_WORDS = new Set(["url", "uri", "endpoint", "address", "link"]);
+const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
+const WEBHOOK_VALUE_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/iy;
+const URL_ORIGIN_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)?([^/?#]*)/i;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+// Vendor token prefixes that name a credential on their own, on both sides: GitHub (ghp_,
+// gho_, ghu_, ghs_, ghr_, github_pat_), Stripe (sk_live_, sk_test_, rk_live_, rk_test_), and
+// Slack (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-, xoxo-).
+const GITHUB_TOKEN_PATTERN = /\b(?:gh[oprsu]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g;
+const STRIPE_KEY_PATTERN = /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g;
+const SLACK_TOKEN_PATTERN = /\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g;
 const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
 const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
@@ -578,13 +760,19 @@ const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
 // JSON structure and literals after a key are never a credential value.
 const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
 // A bare integer under a plural credential word ("oauth_tokens": 1, keys=3, secrets: 0) is
-// a count, this module's own summary vocabulary, not a credential.
+// a count, this module's own summary vocabulary, not a credential; the digits end at
+// whitespace, raw or left escaped by a stringify (keys: 3\tcookies: 0), or at the end.
 const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
-const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+const COUNT_VALUE_PATTERN = new RegExp(String.raw`^\d+(?:\s|${ESCAPED_CONTROL_SOURCE}|$)`);
 // "code" names a credential only behind one of these words (registration_code,
 // activation_code, authorization_code, recovery_code); status_code, error_code, and
 // country_code stay evidence.
 const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
+// A secret id or token id is the bearer credential itself (a Vault AppRole secret_id, an
+// API token_id, roleSecretId), unlike client_id, tenant_id, key_id, or access_key_id, which
+// name a public identifier; secret_id_ttl, secret_id_accessor, and token_accessor end in a
+// setting word and stay. The qualifier is tested by its tail so -Dsecret_id is read too.
+const BEARER_ID_QUALIFIER_PATTERN = /(?:secret|token)$/;
 
 function credentialKeyWord(segment: string): boolean {
   return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
@@ -603,8 +791,27 @@ export function isCredentialKey(key: string): boolean {
   if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
   if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
   if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
+  if (last === "id") return words.length > 1 && BEARER_ID_QUALIFIER_PATTERN.test(words[words.length - 2]);
+  // A connection string (connection_string, connectionString, DB_CONNECTION_STRING) embeds
+  // the password of the account it connects as.
+  if (last === "string" && words[words.length - 2] === "connection") return true;
   if (credentialKeyWord(last)) return true;
   return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+/** True when a key names a webhook URL whose path and query carry the webhook's token. */
+function isWebhookUrlKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === "webhook") return true;
+  return last !== undefined && WEBHOOK_URL_TAIL_WORDS.has(last) && words[words.length - 2] === "webhook";
+}
+
+// The URL under a webhook key with its userinfo, path, query, and fragment replaced: the
+// scheme and host stay, so the destination is still read.
+function redactedWebhookUrl(url: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(url);
+  return `${origin ? `${origin[1]}${origin[2]}` : ""}/${CREDENTIAL_REDACTION_MARKER}`;
 }
 
 // True for a value that opens with a bare integer under a plural credential word: a count,
@@ -613,6 +820,14 @@ function isCountValue(key: string, value: string): boolean {
   if (!COUNT_VALUE_PATTERN.test(value)) return false;
   const words = keyWords(key);
   return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+// True for a key whose last word is a plural credential word (api-tokens, keys, apikeys): a
+// collection, so as a path label it is a pair only when a lone token follows.
+function isPluralCredentialKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  return last !== undefined && (PLURAL_CREDENTIAL_WORDS.has(last) || PLURAL_CREDENTIAL_LABEL_PATTERN.test(last));
 }
 
 /** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
@@ -668,14 +883,17 @@ function isTokenShapedValue(value: string): boolean {
   return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
 }
 
-// The word after a scheme name is prose when it is a Titlecase word, a plain lowercase
-// word from the list above, or, after "Token", any plain lowercase word too short to be
-// a real token.
+// The word after a scheme name is prose when it is a Titlecase word, an auth-param name
+// before its "=", a plain lowercase word from the list above, or, after a noun scheme
+// word (Token, OAuth, Splunk, Snowflake), any plain lowercase word too short to be a real
+// token.
 function isSchemeProse(scheme: string, value: string): boolean {
   if (TITLE_WORD_PATTERN.test(value)) return true;
+  const authParam = AUTH_PARAM_PATTERN.exec(value);
+  if (authParam) return AUTH_PARAM_NAMES.has(authParam[1].toLowerCase());
   if (!PLAIN_WORD_PATTERN.test(value)) return false;
   if (SCHEME_PROSE_WORDS.has(value)) return true;
-  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+  return NOUN_SCHEME_WORDS.has(scheme.toLowerCase()) && value.length < LONG_TOKEN_MIN_LENGTH;
 }
 
 function isPublicPemLabel(label: string): boolean {
@@ -704,60 +922,293 @@ function scrubUrlUserinfo(url: string): string {
   return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
 }
 
-// Where the value of a header line that starts at start ends: at the end of the line, at an
-// HTML tag, or at the quote that closes the text the line sits in. A quoted segment
-// ("value", 'value') is carried through its closing quote on the same line; a JSON-escaped
-// quote (\") is content, and once one has been seen the next unescaped quote closes the JSON
-// string the header line is embedded in. Trailing whitespace is not part of the value.
-function headerValueEnd(text: string, start: number): number {
+// The run of backslashes at index.
+function backslashRun(text: string, index: number): number {
+  let run = 0;
+  while (text[index + run] === "\\") run += 1;
+  return run;
+}
+
+// The quote token at index: a bare quote, or a quote behind the odd run of backslashes that
+// JSON escaping puts before it at some nesting depth (\" one level down, \\\" two levels
+// down, and so on). An even run escapes backslashes and leaves the quote bare, so it is no
+// token here; the caller steps over the run and reads the quote on its own.
+function quoteTokenAt(text: string, index: number): string | undefined {
+  const run = backslashRun(text, index);
+  const quote = text[index + run];
+  if ((quote !== '"' && quote !== "'") || (run > 0 && run % 2 === 0)) return undefined;
+  return text.slice(index, index + run + 1);
+}
+
+// True when the quote token at index sits inside a token, a value character before it and
+// another after it, so it is content of the value and neither opens nor closes a segment.
+function midTokenQuoteAt(text: string, index: number, tokenLength: number): boolean {
+  const before = text[index - 1];
+  const after = text[index + tokenLength];
+  if (before === undefined || after === undefined) return false;
+  if (HEADER_VALUE_OPENER_PATTERN.test(before) || before === '"' || before === "'" || before === "\\") return false;
+  return !QUOTE_BOUNDARY_PATTERN.test(after);
+}
+
+// True when the quote token at index, though a value could start there, is followed by
+// nothing a quoted value starts with (whitespace, a delimiter, a bracket, a tag, or the
+// end of the text): it is the quote closing the enclosing text, as after a base64 value
+// that ends in "=" (Basic dXNlcjpwYXNz=","code":401), not one opening a segment.
+function closingQuoteAfterOpener(text: string, index: number, tokenLength: number): boolean {
+  const after = text[index + tokenLength];
+  return after === undefined || /[\s,;:)}\]<>]/.test(after);
+}
+
+// The first line end or HTML tag at or after start, or the end of the text.
+function lineEndFrom(text: string, start: number): number {
+  const terminator = HEADER_VALUE_TERMINATOR_PATTERN.exec(text.slice(start));
+  return terminator ? start + terminator.index : text.length;
+}
+
+// The control characters the one-letter escapes stand for.
+const CONTROL_ESCAPE_LETTERS = new Map<string, number>([["n", 0x0a], ["r", 0x0d], ["t", 0x09], ["b", 0x08], ["f", 0x0c], ["v", 0x0b], ["0", 0x00]]);
+
+// True for the code of a control character: U+0000 to U+001F, U+007F, or the line and
+// paragraph separators U+2028 and U+2029.
+function isControlCode(code: number): boolean {
+  return code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029;
+}
+
+// The code of the control character an escape at index stands for (\n, \r, \t, \b, \f, \v,
+// \0, \uXXXX, or \xHH behind an odd run of backslashes, as one stringify leaves it), or -1
+// when the text at index is no such escape: an even run escapes backslashes, and the escape
+// of a printable character (\u00e9) is content.
+function escapedControlCodeAt(text: string, index: number): number {
+  const run = backslashRun(text, index);
+  if (run === 0 || run % 2 === 0) return -1;
+  const letter = text[index + run];
+  if (letter === undefined) return -1;
+  const simple = CONTROL_ESCAPE_LETTERS.get(letter);
+  if (simple !== undefined) return simple;
+  const digits = letter === "u" ? 4 : letter === "x" ? 2 : 0;
+  if (digits === 0) return -1;
+  const hex = text.slice(index + run + 1, index + run + 1 + digits);
+  if (hex.length !== digits || !/^[0-9a-f]+$/i.test(hex)) return -1;
+  const code = parseInt(hex, 16);
+  return isControlCode(code) ? code : -1;
+}
+
+// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d, \x0a, \x0d): a
+// line end for an unquoted header value, as the raw character is.
+function escapedLineBreakAt(text: string, index: number): boolean {
+  const code = escapedControlCodeAt(text, index);
+  return code === 0x0a || code === 0x0d;
+}
+
+// Where the unquoted token that starts at start ends: at the first whitespace or raw control
+// character, at a control the stringify left escaped (\t, \u0009, \f, \b, and a line break
+// among them), or at limit. A token never carries a control, so the pair or header chained
+// after the escape is read on its own.
+function unquotedTokenEnd(text: string, start: number, limit: number): number {
   let index = start;
-  let escapedQuotes = false;
-  while (index < text.length) {
+  while (index < limit) {
     const char = text[index];
-    if (HEADER_VALUE_TERMINATOR_PATTERN.test(char)) break;
-    if (char === "\\" && (text[index + 1] === '"' || text[index + 1] === "'")) {
-      escapedQuotes = true;
-      index += 2;
+    if (/\s/.test(char) || isControlCode(char.charCodeAt(0))) break;
+    if (char === "\\") {
+      if (escapedControlCodeAt(text, index) !== -1) break;
+      index += backslashRun(text, index);
       continue;
     }
-    if (char === '"' || char === "'") {
-      if (escapedQuotes || (index > start && !HEADER_VALUE_OPENER_PATTERN.test(text[index - 1]))) break;
-      const close = text.indexOf(char, index + 1);
-      const segment = text.slice(index + 1, close === -1 ? text.length : close);
-      if (close !== -1 && !HEADER_VALUE_TERMINATOR_PATTERN.test(segment)) {
-        index = close + 1;
-        // A value that is one quoted string ends with its closing quote.
-        if (index - segment.length - 2 === start) return index;
-        continue;
-      }
-    }
     index += 1;
+  }
+  return index;
+}
+
+// The key without the escape letter in front of it: after an escaping backslash the letter
+// belongs to the escape (\napi_key is a newline and then api_key), not to the key. Only the
+// credential test uses the result; the text itself is left as it arrived.
+function keyAfterEscape(text: string, keyStart: number, key: string): string {
+  let run = 0;
+  while (keyStart - 1 - run >= 0 && text[keyStart - 1 - run] === "\\") run += 1;
+  if (run % 2 === 0) return key;
+  const letter = ESCAPE_LETTER_PATTERN.exec(key);
+  return letter ? key.slice(letter[0].length) : key;
+}
+
+// The index of the token that closes a quoted segment opened with token, before limit, or
+// -1. A token inside a token (sid="O'hunter2") is content of the segment, as is a token at a
+// deeper depth (more backslashes); a token nearer the surface closes the text the segment
+// sits in, so the segment is unterminated.
+function closingQuoteIndex(text: string, from: number, token: string, limit: number): number {
+  let index = from;
+  while (index < limit) {
+    const candidate = quoteTokenAt(text, index);
+    if (candidate === undefined) {
+      index += text[index] === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (midTokenQuoteAt(text, index, candidate.length)) {
+      index += candidate.length;
+      continue;
+    }
+    if (candidate === token) return index;
+    if (candidate.length < token.length) return -1;
+    index += candidate.length;
+  }
+  return -1;
+}
+
+// Where the value of a header line that starts at start ends. A value that opens with a
+// quote token ends at the token that closes it on the same line, whatever it carries (a
+// "; Name:" inside a quoted cookie is content); when nothing closes it, the quote is content
+// and the value ends as an unquoted one does. An unquoted value ends at the end of the line,
+// at an HTML tag, at the ";" or "," before the "Name:" token of the next header on a
+// compound line (on "Cookie: sid=value; X-Api-Key: value" the next header keeps its name
+// and gets its own carrier treatment, and a Content-Type or Date after a cookie keeps its
+// name and value), at a line break left escaped inside a JSON string (\n, \r, \u000a), or
+// at the quote that closes the text the line sits in. Inside an unquoted value a quote
+// where a value can start opens a quoted segment carried through its closing token; a
+// quote inside a token (sid=O'hunter2, my'pref=value) is content; a quote at the end of a
+// token, or one after "=" that only a delimiter or the end follows (sid=abc==",), closes
+// the enclosing text. Trailing whitespace is not part of the value.
+function headerValueEnd(text: string, start: number): number {
+  const limit = lineEndFrom(text, start);
+  const opening = quoteTokenAt(text, start);
+  if (opening !== undefined) {
+    const close = closingQuoteIndex(text, start + opening.length, opening, limit);
+    if (close !== -1) return close + opening.length;
+  }
+  let index = opening === undefined ? start : start + opening.length;
+  while (index < limit) {
+    const char = text[index];
+    if ((char === ";" || char === ",") && FOLLOWING_HEADER_PATTERN.test(text.slice(index + 1, index + 1 + FOLLOWING_HEADER_LOOKAHEAD))) break;
+    if (char === "\\" && escapedLineBreakAt(text, index)) break;
+    const token = quoteTokenAt(text, index);
+    if (token === undefined) {
+      index += char === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (!HEADER_VALUE_OPENER_PATTERN.test(text[index - 1])) {
+      if (!midTokenQuoteAt(text, index, token.length)) break;
+      index += token.length;
+      continue;
+    }
+    if (closingQuoteAfterOpener(text, index, token.length)) break;
+    const close = closingQuoteIndex(text, index + token.length, token, limit);
+    index = close === -1 ? index + token.length : close + token.length;
   }
   while (index > start && /\s/.test(text[index - 1])) index -= 1;
   return index;
 }
 
-// The quote a header value is wrapped in as a whole, or "" when it is not one quoted string.
-// JSON-escaped quotes are content of the string the line sits in and go with the value.
+// The quote token a header value is wrapped in as a whole (bare or escaped to any depth), or
+// "" when it is not one quoted string.
 function enclosingQuote(value: string): string {
-  return value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0] ? value[0] : "";
+  const token = quoteTokenAt(value, 0);
+  return token !== undefined && value.length >= token.length * 2 && value.endsWith(token) ? token : "";
 }
 
-// Every credential-bearing header line loses its value whatever the value's shape; a value
-// that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
+// True for an Authorization pair whose value reads "Bearer [REDACTED]" or the like: the header
+// rule already treated it, and the pair rules leave the scheme word standing. Under any other
+// credential-named key the scheme word is part of the value and goes with it.
+function keepsSchemeWord(key: string, value: string): boolean {
+  if (!AUTHORIZATION_HEADERS.has(key.toLowerCase())) return false;
+  const scheme = REDACTED_SCHEME_VALUE_PATTERN.exec(value);
+  return scheme !== null && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase());
+}
+
+// The listed scheme word a header value opens with, when a token follows it, or undefined:
+// for a bare scheme word, a word the list does not know, or a value that opens with anything
+// but a word.
+function leadingSchemeWord(value: string): RegExpExecArray | undefined {
+  const scheme = AUTH_SCHEME_PATTERN.exec(value);
+  if (!scheme || scheme[0].length === value.length || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return undefined;
+  return scheme;
+}
+
+// Where the credentials after a scheme word end, credentialsStart being the index after the
+// word and the whitespace behind it: a parameter list (username=..., realm=...) runs to end,
+// a quoted string to the quote that closes it (or to end when nothing does), and a bare
+// token to its first whitespace or escaped control.
+function schemeCredentialsEnd(text: string, credentialsStart: number, end: number): number {
+  const credentials = text.slice(credentialsStart, end);
+  if (AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
+  const quote = quoteTokenAt(credentials, 0);
+  if (quote !== undefined) {
+    const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
+    return close === -1 ? end : close + quote.length;
+  }
+  return unquotedTokenEnd(text, credentialsStart, end);
+}
+
+// Where the value of a single-token header ends: an unquoted value at its first whitespace
+// or escaped control, a quoted one where headerValueEnd put it. A value that opens with a
+// listed scheme word and a token (X-Auth-Token: Bearer <token>) is the word and the
+// credentials after it, as it would be under Authorization, so the token is never left
+// standing after the marker.
+function singleTokenEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme !== undefined) return schemeCredentialsEnd(text, start + scheme[0].length, end);
+  return unquotedTokenEnd(text, start, end);
+}
+
+// Where an Authorization value ends: after the listed scheme word and the one token (or one
+// quoted string) of credentials that follows it, so prose after the token on a free-text
+// line stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the
+// end of the line, as does a value quoted as a whole, a bare scheme word, and a value that
+// opens with anything but a listed scheme word (GenieKey <token>, SharedKey account:<sig>,
+// a bare token): the first word may be a scheme the list does not know, with its credentials
+// after it, so the whole line goes.
+function authorizationValueEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme === undefined) return end;
+  return schemeCredentialsEnd(text, start + scheme[0].length, end);
+}
+
+// The replacement for a header value, or undefined when nothing is left to remove: the value
+// already opens with the marker (bare, inside its quotes, or after its scheme word), or an
+// Authorization value is a bare scheme word with no credentials after it. An Authorization
+// value keeps its scheme word as spelled; the credentials after it go whole, inside their own
+// quotes when they were quoted (Bearer "value" becomes Bearer "[REDACTED]"). A value that is
+// one quoted string keeps its quotes around the replacement so quoted text stays quoted.
+function redactedHeaderValue(header: string, value: string): string | undefined {
+  const quote = enclosingQuote(value);
+  const inner = quote === "" ? value : value.slice(quote.length, value.length - quote.length);
+  if (inner.startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
+  if (AUTHORIZATION_HEADERS.has(header)) {
+    const scheme = AUTH_SCHEME_PATTERN.exec(inner);
+    if (scheme && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) {
+      const credentials = inner.slice(scheme[0].length);
+      if (credentials.length === 0) return undefined;
+      const credentialQuote = enclosingQuote(credentials);
+      if (credentials.slice(credentialQuote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
+      return `${quote}${scheme[1]} ${credentialQuote}${CREDENTIAL_REDACTION_MARKER}${credentialQuote}${quote}`;
+    }
+  }
+  return `${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+}
+
+// Every credential-bearing header line loses its credentials whatever their shape, by the
+// header's class: an Authorization value keeps its listed scheme word and loses the token
+// after it (or its whole parameter list), or goes whole when it opens with anything else; a
+// cookie or key list goes whole; and a single-token header loses its first token, or the
+// listed scheme word and the token after it when it opens with one. On a compound line each
+// header is its own line: the value of one ends before the name of the next, which is then
+// matched and treated on its own.
 function scrubHeaderLines(text: string): string {
   HEADER_LINE_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
+    const header = match[1].toLowerCase();
     const start = match.index + match[0].length;
-    const end = headerValueEnd(text, start);
+    const lineEnd = headerValueEnd(text, start);
+    const end = LIST_VALUE_HEADERS.has(header) ? lineEnd : AUTHORIZATION_HEADERS.has(header) ? authorizationValueEnd(text, start, lineEnd) : singleTokenEnd(text, start, lineEnd);
     const value = text.slice(start, end);
-    if (value.length === 0 || value.startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
-    const quote = enclosingQuote(value);
-    if (value.slice(quote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
-    out += `${text.slice(last, start)}${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+    if (value.length === 0) continue;
+    const replacement = redactedHeaderValue(header, value);
+    if (replacement === undefined) continue;
+    out += `${text.slice(last, start)}${replacement}`;
     last = end;
     HEADER_LINE_PATTERN.lastIndex = end;
   }
@@ -766,39 +1217,249 @@ function scrubHeaderLines(text: string): string {
 
 // The key and separator are matched on their own and the value is consumed only when the
 // key names a credential, so the value of an ordinary pair is rescanned and a credential
-// pair nested inside it (data=token=...) is still caught.
+// pair nested inside it (data=token=...) is still caught. A value the scheme rule already
+// reduced to "<scheme> [REDACTED]" keeps its scheme word under an Authorization key and loses
+// it under any other credential key, where the scheme word was the start of the value. A
+// colon-terminated key that ends a path segment is a label whose value is at most one token:
+// a singular label (/etc/app/password: <value> was rejected) takes that token whatever its
+// shape and whatever follows, and a plural label (/api/v1/api-tokens: request failed) takes
+// it only when no prose continues after it, since prose means there was no value at all; an
+// escaped slash (\/) before the key is a line break, not a path.
 function replaceCredentialAssignments(text: string): string {
+  const fates = authParameterFates(text);
   ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
-    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
-    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
-    valuePattern.lastIndex = match.index + whole.length;
+    if (operator === "=" && fates.get(match.index + openingQuote.length) === "challenge") continue;
+    const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
+    const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
+    const valueStart = match.index + whole.length;
+    if (isWebhookUrlKey(name)) {
+      WEBHOOK_VALUE_PATTERN.lastIndex = valueStart;
+      const url = WEBHOOK_VALUE_PATTERN.exec(text)?.[0];
+      if (url === undefined) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedWebhookUrl(url)}`;
+      last = valueStart + url.length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
+    if (!(operator === "=" ? isCredentialAssignmentKey(name) : isCredentialKey(name))) continue;
+    const redactedScheme = REDACTED_SCHEME_VALUE_PATTERN.exec(text.slice(valueStart));
+    if (redactedScheme !== null && AUTH_SCHEME_WORDS.has(redactedScheme[1].toLowerCase())) {
+      if (AUTHORIZATION_HEADERS.has(name.toLowerCase())) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedScheme[2]}${CREDENTIAL_REDACTION_MARKER}`;
+      last = valueStart + redactedScheme[0].length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
+    const pathLabel = operator === ":" && text[match.index - 1] === "/" && text[match.index - 2] !== "\\";
+    const valuePattern = operator === ":" && !pathLabel ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = valueStart;
     const value = valuePattern.exec(text)?.[0];
-    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
+    if (pathLabel && isPluralCredentialKey(name) && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
-    last = match.index + whole.length + value.length;
+    last = valueStart + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
   }
   return last === 0 ? text : `${out}${text.slice(last)}`;
 }
 
+// A credential-named flag with its value as the next argument loses that argument.
+function replaceFlagValues(text: string): string {
+  return text.replace(FLAG_VALUE_PATTERN, (match, flag: string, space: string) => (isCredentialKey(flag) ? `--${flag}${space}${CREDENTIAL_REDACTION_MARKER}` : match));
+}
+
+// Where a quoted parameter value that opens at valueStart with the quote token ends: after
+// the token that closes it; at a shallower token, which closes the text the list sits in,
+// so the value was cut off and nothing of it stays; or at limit when nothing closes it. A
+// token inside a token (O'hunter2) is content of the value.
+function quotedParameterValueEnd(text: string, valueStart: number, quote: string, limit: number): number {
+  let index = valueStart + quote.length;
+  while (index < limit) {
+    const candidate = quoteTokenAt(text, index);
+    if (candidate === undefined) {
+      index += text[index] === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (midTokenQuoteAt(text, index, candidate.length)) {
+      index += candidate.length;
+      continue;
+    }
+    if (candidate === quote) return index + candidate.length;
+    if (candidate.length < quote.length) return index;
+    index += candidate.length;
+  }
+  return limit;
+}
+
+// One parameter of a list: its name as spelled (without an escape letter glued to its
+// front), where the name starts, and where its value starts and ends; the quote token that
+// opens a quoted value, or undefined for a bare one.
+interface AuthParameter {
+  name: string;
+  nameStart: number;
+  valueStart: number;
+  valueEnd: number;
+  quote: string | undefined;
+}
+
+// What a parameter of an auth parameter list is: a proof (its value goes), a challenge
+// parameter (its value stays), or another parameter (judged under its own name).
+type AuthParameterFate = "proof" | "challenge" | "other";
+
+// The parameter list that opens at start (name=value, name2=value2, ...): its parameters
+// and where it ends. A quoted value (bare or escaped to any depth) runs to the quote that
+// closes it, or to the end of the text it sits in when nothing does (a cut-off value keeps
+// no part of itself), an unquoted value is one token, and the list ends before a "," that
+// no further parameter follows, so prose after the list stays. Undefined when no parameter
+// opens at start (nothing after the "=").
+function readAuthParameterList(text: string, start: number): { end: number; items: AuthParameter[] } | undefined {
+  const limit = lineEndFrom(text, start);
+  const items: AuthParameter[] = [];
+  let index = start;
+  while (index < limit) {
+    AUTH_PARAM_ITEM_PATTERN.lastIndex = index;
+    const item = AUTH_PARAM_ITEM_PATTERN.exec(text);
+    if (item === null) break;
+    const valueStart = index + item[0].length;
+    const quote = quoteTokenAt(text, valueStart);
+    let valueEnd: number;
+    if (quote !== undefined) {
+      valueEnd = quotedParameterValueEnd(text, valueStart, quote, limit);
+    } else {
+      AUTH_PARAM_BARE_VALUE_PATTERN.lastIndex = valueStart;
+      const bare = AUTH_PARAM_BARE_VALUE_PATTERN.exec(text);
+      if (bare === null) break;
+      valueEnd = valueStart + bare[0].length;
+    }
+    items.push({ name: keyAfterEscape(text, index, item[1]), nameStart: index, valueStart, valueEnd, quote });
+    AUTH_PARAM_SEPARATOR_PATTERN.lastIndex = valueEnd;
+    const separator = AUTH_PARAM_SEPARATOR_PATTERN.exec(text);
+    if (separator === null || separator[0].length === 0) break;
+    index = valueEnd + separator[0].length;
+  }
+  const lastItem = items[items.length - 1];
+  return lastItem === undefined ? undefined : { end: lastItem.valueEnd, items };
+}
+
+function authParameterFate(name: string): AuthParameterFate {
+  const lower = name.toLowerCase();
+  if (PROOF_PARAM_NAMES.has(lower)) return "proof";
+  return CHALLENGE_PARAM_NAMES.has(lower) ? "challenge" : "other";
+}
+
+// A known auth parameter other than a proof: one of them makes a list without a scheme
+// word an auth parameter list.
+function isAuthParameterAnchor(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (AUTH_PARAM_NAMES.has(lower) || CHALLENGE_PARAM_NAMES.has(lower)) && !PROOF_PARAM_NAMES.has(lower);
+}
+
+// The fate of every parameter of every auth parameter list in text, by where its name
+// starts: the list after a scheme word, whatever it holds (a credential list after a scheme
+// word has already gone whole when this runs), and a list without one that holds two or
+// more parameters, one of them an anchor. A parameter outside such a list has no entry.
+function authParameterFates(text: string): Map<number, AuthParameterFate> {
+  const fates = new Map<number, AuthParameterFate>();
+  AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = 0;
+  let opener: RegExpExecArray | null;
+  while ((opener = AUTH_PARAMETER_LIST_OPENER_PATTERN.exec(text)) !== null) {
+    const list = readAuthParameterList(text, opener.index);
+    if (list === undefined) continue;
+    const schemeLed = SCHEME_LED_LIST_PATTERN.test(text.slice(Math.max(0, opener.index - 32), opener.index));
+    if (schemeLed || (list.items.length > 1 && list.items.some((item) => isAuthParameterAnchor(item.name)))) {
+      for (const item of list.items) fates.set(item.nameStart, authParameterFate(item.name));
+    }
+    AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = list.end;
+  }
+  return fates;
+}
+
+// A scheme word and the credential parameter list after it lose the list and keep the
+// word, header name in front or none; a challenge's parameter list stays.
+function replaceSchemeParameterLists(text: string): string {
+  SCHEME_PARAMETER_LIST_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SCHEME_PARAMETER_LIST_PATTERN.exec(text)) !== null) {
+    const list = readAuthParameterList(text, match.index + match[0].length);
+    if (list === undefined || !list.items.some((item) => !CHALLENGE_PARAM_NAMES.has(item.name.toLowerCase()))) continue;
+    out += `${text.slice(last, match.index)}${match[1]} ${CREDENTIAL_REDACTION_MARKER}`;
+    last = list.end;
+    SCHEME_PARAMETER_LIST_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// Every proof parameter of an auth parameter list loses its value, quoted (the quote token
+// of its own depth stays, and a cut-off value gets no closing quote it never had) or bare;
+// the parameters beside it are left as they are.
+function replaceAuthParameterProofs(text: string): string {
+  const proofs = [...authParameterFates(text).entries()].filter(([, fate]) => fate === "proof").map(([nameStart]) => nameStart);
+  if (proofs.length === 0) return text;
+  let out = "";
+  let last = 0;
+  for (const nameStart of proofs) {
+    const list = readAuthParameterList(text, nameStart);
+    const item = list?.items[0];
+    if (item === undefined || item.nameStart !== nameStart) continue;
+    const quote = item.quote ?? "";
+    const closed = quote !== "" && item.valueEnd - quote.length > item.valueStart && text.startsWith(quote, item.valueEnd - quote.length);
+    const value = text.slice(item.valueStart + quote.length, closed ? item.valueEnd - quote.length : item.valueEnd);
+    if (value.length === 0 || value === CREDENTIAL_REDACTION_MARKER) continue;
+    out += `${text.slice(last, item.valueStart)}${quote}${CREDENTIAL_REDACTION_MARKER}${closed ? quote : ""}`;
+    last = item.valueEnd;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// The rule for a quoted attribute or pair value under a key: redacted under a credential
+// key (or reduced to its origin under a webhook key), the match otherwise.
+type QuotedValueRule = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string) => string;
+
+// Every key="value" attribute, at any escape depth, under the quoted-value rule; a challenge
+// parameter inside an auth parameter list (the nonce of Digest realm="api", nonce="n")
+// keeps its value whatever its name says.
+function replaceQuotedAttributes(text: string, quotedValue: QuotedValueRule): string {
+  const fates = authParameterFates(text);
+  return text.replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number) =>
+    (fates.get(offset) === "challenge" ? match : quotedValue(keyAfterEscape(text, offset, key), value, () => `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match)));
+}
+
 /** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
+// Header lines go first: a recognised header line takes its whole value, so the URL and
+// query rules never split a cookie pair whose name holds "&" or "#" off its cookie. The
+// parameter-list rule runs before the scheme rule, so a credential list after a scheme
+// word goes whole instead of losing its first "name=" and keeping the quoted value, and the
+// proof rule right after it, so a proof in a list without a scheme word goes before the
+// per-parameter rules read the list.
 function scrubCarriers(text: string, pemScope: PemScope): string {
-  const scrubbed = scrubHeaderLines(scrubPem(text, pemScope)
+  const quotedValue = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string): string => {
+    if (isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(value)) return webhook(redactedWebhookUrl(value));
+    return isCredentialKey(key) && !isCountValue(key, value) && !keepsSchemeWord(key, value) ? redacted() : match;
+  };
+  const carriers = scrubHeaderLines(scrubPem(text, pemScope))
     .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
-    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match)))
+    .replace(SLASH_ESCAPED_URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match));
+  const pairs = replaceAuthParameterProofs(replaceSchemeParameterLists(carriers))
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
-    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
-  return replaceCredentialAssignments(scrubbed)
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => quotedValue(key, value, () => `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"`, (url) => `"${key}"${separator}"${url}"`, match))
+    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match));
+  const scrubbed = replaceQuotedAttributes(pairs, quotedValue);
+  return replaceCredentialAssignments(replaceFlagValues(scrubbed))
     .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
     .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER);
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(GITHUB_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(STRIPE_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(SLACK_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER);
 }
 
 /** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
@@ -862,6 +1523,40 @@ function endpointLabel(url: string): string {
   }
 }
 
+/**
+ * A server-supplied next link (links.next, next_page) the client refused to follow: the
+ * request that would have carried the credential to it never left. The message is fixed
+ * text naming the endpoint being paged, the rejected origin (scheme, host, and port, or the
+ * bare scheme of a link without a host, such as javascript: or data:), and the configured
+ * origin, never the link's path, query, or user credentials; the list stops there as
+ * truncated with reason as its truncation_reason.
+ */
+class ZendeskNextLinkError extends Error {
+  readonly reason: string;
+
+  constructor(endpoint: string, reason: string) {
+    super(`Zendesk ${endpoint} paging stopped: ${reason}.`);
+    this.name = "ZendeskNextLinkError";
+    this.reason = reason;
+  }
+}
+
+// Truncation reasons for the paging outcomes that do not involve a refused link.
+const STALLED_CURSOR_REASON = "the server promised more items after a page that added none, so the cursor stopped advancing";
+const HAS_MORE_WITHOUT_LINK_REASON = "meta.has_more was true on the last page but no next link or cursor was given";
+const REPEATED_LINK_REASON = "the next link repeated the page just read";
+// A link that names a scheme (https:, HTTPS:, javascript:, data:, blob:, file:) or opens
+// with two slashes or backslashes (protocol-relative; a URL parser reads "\\evil.example"
+// as "//evil.example") is absolute and must resolve onto the configured origin; anything
+// else is a path on the configured base URL.
+const ABSOLUTE_LINK_PATTERN = /^(?:[a-z][a-z0-9+.-]*:|[\\/]{2})/i;
+
+// The origin a parsed URL names: scheme, host, and port, or the bare scheme when the URL
+// has no host (javascript:, data:, file:, blob:).
+function originOf(url: URL): string {
+  return url.host.length > 0 ? `${url.protocol}//${url.host}` : url.protocol;
+}
+
 // A property name is split into lower-case segments on underscores, hyphens,
 // dots, spaces, and camelCase boundaries, so api_key, apiKey, APIKey, and the
 // header name X-Api-Key all end in ["api", "key"]. The value is a credential when
@@ -883,9 +1578,11 @@ const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // values are replaced).
 const HEADER_MAP_SEGMENTS = new Set(["headers", "custom_headers"]);
 const CREDENTIAL_CONTAINER_SAFE_KEYS = new Set(["username", "name"]);
-// A {name, value} pair whose name is a credential (an app parameter named api_token) or
-// any object flagged secure: true (owned app parameters) is a credential pair: its value
-// and default fields are replaced while the name, kind, and required flags are kept.
+// A {name, value} pair whose name is a credential in either vocabulary, the walker's (an
+// app parameter named api_token) or the text rules' (auth, X-Auth, a header name such as
+// Cookie), or any object flagged secure: true (owned app parameters) is a credential pair:
+// its value and default fields are replaced while the name, kind, and required flags are
+// kept, whatever the secure flag says.
 const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
 
 /**
@@ -928,7 +1625,7 @@ function isCredentialPair(record: JsonRecord): boolean {
   if (record.secure === true) return true;
   const pairName = typeof record.name === "string" ? record.name : undefined;
   return pairName !== undefined
-    && isCredentialPropertyName(pairName)
+    && (isCredentialPropertyName(pairName) || isCredentialKey(pairName))
     && [...CREDENTIAL_PAIR_VALUE_KEYS].some((key) => key in record);
 }
 
@@ -945,6 +1642,10 @@ function redactCredentialValue(value: unknown, insideContainer: boolean, parentK
       || (credentialPair && CREDENTIAL_PAIR_VALUE_KEYS.has(key));
     if (credentialName && ((typeof entry === "string" && entry.length > 0) || typeof entry === "number")) {
       output[key] = CREDENTIAL_REDACTION_MARKER;
+      continue;
+    }
+    if (typeof entry === "string" && isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(entry)) {
+      output[key] = redactedWebhookUrl(entry);
       continue;
     }
     const childContainer = insideContainer || isHeaderMapName(key) || (parentKey === "authentication" && key === "data");
@@ -1159,6 +1860,41 @@ export class ZendeskApiClient {
   }
 
   /**
+   * The URL a server-supplied next link (links.next, next_page) is followed to, which is
+   * only ever on the configured origin. A link with a scheme, or a protocol-relative one
+   * (two slashes or backslashes), is resolved against the configured base URL and must
+   * match its origin (scheme, host, and port) exactly and carry no user credentials;
+   * otherwise a ZendeskNextLinkError is thrown before any request is built, so the
+   * credential never leaves for the link, and the fixed text names only the rejected
+   * origin (or the bare scheme of a link without a host) and the configured origin. A
+   * relative link is a path on the base URL.
+   */
+  private nextLinkUrl(link: string, path: string): string {
+    if (!ABSOLUTE_LINK_PATTERN.test(link)) return this.buildUrl(link);
+    const endpoint = endpointLabel(path);
+    const configuredOrigin = originOf(new URL(this.config.baseUrl));
+    let target: URL;
+    try {
+      target = new URL(link, this.config.baseUrl);
+    } catch {
+      throw new ZendeskNextLinkError(endpoint, `the next link was not a valid URL and was not followed; only links on the configured origin ${configuredOrigin} are followed`);
+    }
+    const targetOrigin = originOf(target);
+    if (target.username !== "" || target.password !== "") {
+      throw new ZendeskNextLinkError(endpoint, `the next link to ${targetOrigin} carried user credentials in the URL and was not followed; only links on the configured origin ${configuredOrigin} without user credentials are followed`);
+    }
+    if (targetOrigin !== configuredOrigin) {
+      throw new ZendeskNextLinkError(
+        endpoint,
+        target.host.length > 0
+          ? `the next link pointed to ${targetOrigin}, outside the configured origin ${configuredOrigin}, and was not followed`
+          : `the next link used the ${targetOrigin} scheme, outside the configured origin ${configuredOrigin}, and was not followed`,
+      );
+    }
+    return target.toString();
+  }
+
+  /**
    * One read, with the shape guard every 2xx answer passes: a response whose body is
    * not a JSON object (an empty body, the HTML page a proxy or captive portal serves,
    * a foreign JSON value) is not the documented document. It is thrown as an
@@ -1220,6 +1956,7 @@ export class ZendeskApiClient {
     let nextUrl: string | undefined = this.buildUrl(path, baseQuery);
     let pages = 0;
     let truncated = false;
+    let truncationReason: string | undefined;
 
     while (nextUrl) {
       const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
@@ -1241,24 +1978,37 @@ export class ZendeskApiClient {
         // An empty or fully repeated page while the server still promises more is a
         // cursor that stopped advancing, so the inventory is partial rather than complete.
         truncated = hasMore === true || Boolean(continuation);
+        if (truncated) truncationReason = STALLED_CURSOR_REASON;
         break;
       }
       if (!continuation) {
         truncated = hasMore === true;
+        if (truncated) truncationReason = HAS_MORE_WITHOUT_LINK_REASON;
         break;
       }
       if (continuation === nextUrl) {
         truncated = true;
+        truncationReason = REPEATED_LINK_REASON;
         break;
       }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
+        truncationReason = items.length >= maxItems ? `the item cap of ${maxItems} was reached` : `the page cap of ${DEFAULT_MAX_PAGES} was reached`;
         break;
       }
-      nextUrl = continuation;
+      // The link is checked before any request is built for it: a refused link ends the
+      // read here, with the pages already merged kept and the reason recorded.
+      try {
+        nextUrl = this.nextLinkUrl(continuation, path);
+      } catch (error) {
+        if (!(error instanceof ZendeskNextLinkError)) throw error;
+        truncated = true;
+        truncationReason = error.reason;
+        break;
+      }
     }
 
-    return { items, truncated, pages };
+    return { items, truncated, pages, ...(truncationReason === undefined ? {} : { truncation_reason: truncationReason }) };
   }
 
   async listOffset(
@@ -1274,6 +2024,7 @@ export class ZendeskApiClient {
     let nextUrl: string | undefined = this.buildUrl(path, { ...query, per_page: perPage });
     let pages = 0;
     let truncated = false;
+    let truncationReason: string | undefined;
 
     while (nextUrl) {
       const document = await this.getDocument(this.buildUrl(nextUrl), nextUrl);
@@ -1289,21 +2040,33 @@ export class ZendeskApiClient {
         // An empty or replayed page while a continuation still exists is an offset the
         // server ignored, so the inventory is partial rather than complete.
         truncated = Boolean(continuation);
+        if (truncated) truncationReason = STALLED_CURSOR_REASON;
         break;
       }
       if (!continuation) break;
       if (continuation === nextUrl) {
         truncated = true;
+        truncationReason = REPEATED_LINK_REASON;
         break;
       }
       if (items.length >= maxItems || pages >= DEFAULT_MAX_PAGES) {
         truncated = true;
+        truncationReason = items.length >= maxItems ? `the item cap of ${maxItems} was reached` : `the page cap of ${DEFAULT_MAX_PAGES} was reached`;
         break;
       }
-      nextUrl = continuation;
+      // The link is checked before any request is built for it: a refused link ends the
+      // read here, with the pages already merged kept and the reason recorded.
+      try {
+        nextUrl = this.nextLinkUrl(continuation, path);
+      } catch (error) {
+        if (!(error instanceof ZendeskNextLinkError)) throw error;
+        truncated = true;
+        truncationReason = error.reason;
+        break;
+      }
     }
 
-    return { items, truncated, pages };
+    return { items, truncated, pages, ...(truncationReason === undefined ? {} : { truncation_reason: truncationReason }) };
   }
 
   async getCurrentUser(): Promise<JsonRecord> {
@@ -1545,7 +2308,9 @@ function isListResult(value: unknown): value is ZendeskListResult {
 
 // Per-read collection status for assessment summaries. seen, truncated, and pages
 // are counts of what the read actually did, so a read that never ran reports null
-// for all three rather than 0, false, or 1.
+// for all three rather than 0, false, or 1. A list read that stopped early before
+// adding any item reports seen null as well: 0 beside truncated=true would still be
+// read as an empty inventory by a consumer that takes the count alone.
 function collectionStatusOf(snap: ZendeskSnapshot<unknown>): JsonRecord {
   const list = snap.status === "ok" && isListResult(snap.data) ? snap.data : undefined;
   const readObject = snap.status === "ok" && !list;
@@ -1553,8 +2318,9 @@ function collectionStatusOf(snap: ZendeskSnapshot<unknown>): JsonRecord {
     status: snap.status,
     endpoint: snap.endpoint ?? null,
     http_status: snap.httpStatus ?? null,
-    seen: list ? list.items.length : readObject ? (snap.data === undefined || snap.data === null ? 0 : 1) : null,
+    seen: list ? (list.items.length === 0 && list.truncated ? null : list.items.length) : readObject ? (snap.data === undefined || snap.data === null ? 0 : 1) : null,
     truncated: list ? list.truncated : readObject ? false : null,
+    truncation_reason: list?.truncation_reason ?? null,
     pages: list ? list.pages : null,
     error: snap.error ?? null,
   };
@@ -1570,11 +2336,15 @@ function snapshotsForBundle(entries: Array<[string, ZendeskSnapshot<unknown>]>):
 
 // The line reads "<name> dataset: <error>", never "<name>: <error>": a dataset named for
 // what it holds (oauth_tokens) followed by a colon is a credential pair to the scrub, and
-// the whole message after it would be replaced.
+// the whole message after it would be replaced. A list read to completion writes nothing;
+// one that stopped early writes the reason paging stopped, so a partial inventory is on
+// record next to the failed reads.
 function snapshotErrors(entries: Array<[string, ZendeskSnapshot<unknown>]>): string[] {
-  return entries
-    .filter(([, snap]) => snap.status !== "ok")
-    .map(([name, snap]) => `${name} dataset: ${snap.error ?? snap.status}`);
+  return entries.flatMap(([name, snap]) => {
+    if (snap.status !== "ok") return [`${name} dataset: ${snap.error ?? snap.status}`];
+    const reason = isListResult(snap.data) && snap.data.truncated ? snap.data.truncation_reason : undefined;
+    return reason === undefined ? [] : [`${name} dataset: partial inventory, paging stopped early because ${reason}`];
+  });
 }
 
 function finding(
@@ -1625,38 +2395,90 @@ function truncationOrNull(...snaps: Array<ZendeskSnapshot<ZendeskListResult>>): 
   return snaps.some((snap) => snap.status !== "ok") ? null : false;
 }
 
+// The truncation reason of a list read that stopped early; undefined for a complete read.
+function truncationReasonOf(snap: ZendeskSnapshot<unknown>): string | undefined {
+  if (snap.status !== "ok" || !isListResult(snap.data) || !snap.data.truncated) return undefined;
+  return snap.data.truncation_reason ?? "more pages exist or the cursor stopped advancing";
+}
+
+/*
+ * Incomplete inventories. An inventory is incomplete when it could not be read (refused,
+ * unavailable, or failed) or when paging stopped before the end (the item or page cap, a
+ * stalled cursor, a next link outside the configured origin). Evidence over an incomplete
+ * inventory asserts no absence and names no item:
+ *
+ * - A count is a lower bound. A positive count is rendered as observed, qualified by the
+ *   inventory_truncated flag and the summary's truncation note; zero renders null, since 0
+ *   would read as a verified "none" that a partial read cannot support. A count over an
+ *   unreadable inventory renders null.
+ * - Item-level detail (names, labels, hosts, per-item records) is withheld and renders
+ *   null: a partial named list is filed as the review list, and whatever the unread
+ *   remainder holds escapes the review. The summary and evidence say how much was seen;
+ *   reading the inventory to completion (a higher max_items, a fixed cursor, the missing
+ *   permission) restores the detail.
+ * - No finding passes over an incomplete inventory it read, even one its pass branch did
+ *   not consume (rule 1 corollary), and a fail that rests on an absence (zero records
+ *   seen) is warn, since the unread remainder may hold the records.
+ * - A status count over a category that read an incomplete inventory is not asserted
+ *   when it is zero: a finding over that inventory may be undetermined, so 0 would claim
+ *   that no finding has the status when one may.
+ */
+function isIncomplete(snap: ZendeskSnapshot<unknown>): boolean {
+  return snap.status !== "ok" || truncationReasonOf(snap) !== undefined;
+}
+
 function truncationNote(name: string, snap: ZendeskSnapshot<ZendeskListResult>): string {
   return isTruncated(snap)
-    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (more pages exist or the cursor stopped advancing), so the verdict is limited to the seen population.`
+    ? ` The ${name} inventory was truncated after ${listSnapshotItems(snap).length} items (${truncationReasonOf(snap)}), so the verdict is limited to the seen population and item-level detail is withheld from the evidence until the inventory is read to completion.`
     : "";
 }
 
-// Evidence and summary counts derived from a dataset that could not be read render as
-// null rather than 0 or [], so an unread inventory is never mistaken for an empty one.
-function countOrNull(snap: ZendeskSnapshot<unknown>, count: number): number | null {
-  return snap.status === "ok" ? count : null;
+// A count over the inventories it is derived from: null when one was unreadable, null
+// when it is zero and one was truncated, the count otherwise (see "Incomplete inventories").
+function countOrNull(count: number, ...snaps: Array<ZendeskSnapshot<unknown>>): number | null {
+  if (snaps.some((snap) => snap.status !== "ok")) return null;
+  return count === 0 && snaps.some(isIncomplete) ? null : count;
 }
 
 function listCountOrNull(snap: ZendeskSnapshot<ZendeskListResult>): number | null {
-  return countOrNull(snap, listSnapshotItems(snap).length);
+  return countOrNull(listSnapshotItems(snap).length, snap);
 }
 
-function listOrNull<T>(snap: ZendeskSnapshot<unknown>, values: T[]): T[] | null {
-  return snap.status === "ok" ? values : null;
+// Item-level detail over the inventories it is drawn from: withheld (null) while any of
+// them is incomplete (see "Incomplete inventories").
+function detailOrNull<T>(values: T, ...snaps: Array<ZendeskSnapshot<unknown>>): T | null {
+  return snaps.some(isIncomplete) ? null : values;
+}
+
+// Why an inventory is incomplete: the cause of a failed read, or the point where paging stopped.
+function incompleteCause(name: string, snap: ZendeskSnapshot<unknown>): string {
+  const reason = truncationReasonOf(snap);
+  return reason === undefined
+    ? snapshotCause(name, snap)
+    : `${name} was truncated after ${isListResult(snap.data) ? snap.data.items.length : 0} items (${reason}), so its unread remainder may hold what the pass ruled out.`;
 }
 
 // Rule 1 corollary: a finding that read several inventories may not pass when a
-// secondary one was unreadable, even when the pass branch did not consume it, because
+// secondary one was incomplete, even when the pass branch did not consume it, because
 // the reviewer cannot tell a verified absence from an unread one. The cause is named and
-// the secondaries are recorded in evidence.
-function capForUnreadable(item: ZendeskFinding, secondaries: Array<[string, ZendeskSnapshot<unknown>]>): ZendeskFinding {
+// the secondaries are recorded in evidence, unreadable and truncated ones apart.
+function capForIncomplete(item: ZendeskFinding, secondaries: Array<[string, ZendeskSnapshot<unknown>]>): ZendeskFinding {
   const unreadable = secondaries.filter(([, snap]) => snap.status !== "ok");
-  if (item.status !== "pass" || unreadable.length === 0) return item;
+  const truncated = secondaries.filter(([, snap]) => truncationReasonOf(snap) !== undefined);
+  if (item.status !== "pass" || (unreadable.length === 0 && truncated.length === 0)) return item;
+  const causes = [
+    ...(unreadable.length > 0 ? [`Verdict capped at warn because a secondary inventory could not be read: ${unreadable.map(([name, snap]) => incompleteCause(name, snap)).join(" ")}`] : []),
+    ...(truncated.length > 0 ? [`Verdict capped at warn because a secondary inventory was truncated: ${truncated.map(([name, snap]) => incompleteCause(name, snap)).join(" ")}`] : []),
+  ];
   return {
     ...item,
     status: "warn",
-    summary: `${item.summary} Verdict capped at warn because a secondary inventory could not be read: ${unreadable.map(([name, snap]) => snapshotCause(name, snap)).join(" ")}`,
-    evidence: { ...(item.evidence ?? {}), verdict_capped_by_unreadable: unreadable.map(([name]) => name) },
+    summary: `${item.summary} ${causes.join(" ")}`,
+    evidence: {
+      ...(item.evidence ?? {}),
+      ...(unreadable.length > 0 ? { verdict_capped_by_unreadable: unreadable.map(([name]) => name) } : {}),
+      ...(truncated.length > 0 ? { verdict_capped_by_truncated: truncated.map(([name]) => name) } : {}),
+    },
   };
 }
 
@@ -1780,6 +2602,7 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       status: snap.status === "ok" ? "readable" : snap.status,
       count: snap.status === "ok" ? (probe.count ? probe.count(snap.data) : Array.isArray(items) ? items.length : undefined) ?? null : null,
       ...(snap.status === "ok" ? (Array.isArray(items) ? { truncated: listResult?.truncated === true } : {}) : { truncated: null }),
+      ...(snap.status === "ok" && listResult?.truncated === true && typeof listResult.truncation_reason === "string" ? { truncationReason: listResult.truncation_reason } : {}),
       httpStatus: snap.httpStatus ?? null,
       error: snap.error,
     });
@@ -1813,6 +2636,11 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
       ...(unavailable.length > 0 ? [`Unavailable on this account or plan: ${unavailable.join(", ")}.`] : []),
       ...(unreadable.length > 0 ? [`Not read (the request failed or answered without the documented JSON document; see the surface errors): ${unreadable.join(", ")}. Their findings render manual or capped until they are readable.`] : []),
       ...(truncatedProbes.length > 0 ? [`Probe counts for ${truncatedProbes.join(", ")} are capped samples (marked +), not the full population; the assessment tools page to max_items.`] : []),
+      // A probe that stopped at a refused next link or a stalled cursor names the reason:
+      // its count is not a sample the cap produced.
+      ...surfaces
+        .filter((surface) => surface.truncated === true && surface.truncationReason !== undefined && !surface.truncationReason.includes(" cap of "))
+        .map((surface) => `The ${surface.name} probe stopped paging early because ${surface.truncationReason}.`),
       ...(currentUserRole && currentUserRole !== "admin" ? ["The credential is not an admin, so admin-only surfaces (security settings, deletion schedules, OAuth clients and tokens, audit logs, owned apps, brands, suspended tickets) will render as manual findings."] : []),
     ],
     recommendedNextStep: status === "healthy"
@@ -1835,13 +2663,20 @@ function resolveOptions(options: ZendeskAssessmentOptions): Required<Omit<Zendes
   };
 }
 
-function summarizeStatuses(findings: ZendeskFinding[]): JsonRecord {
-  return {
-    pass: findings.filter((item) => item.status === "pass").length,
-    warn: findings.filter((item) => item.status === "warn").length,
-    fail: findings.filter((item) => item.status === "fail").length,
-    manual: findings.filter((item) => item.status === "manual").length,
+// Status counts over a set of findings. With incomplete=true (an inventory the findings
+// read was unreadable or truncated) a count of zero renders null: a finding over that
+// inventory may be undetermined, so 0 would claim that no finding has the status when
+// one may (see "Incomplete inventories"). A positive count is rendered as observed.
+function summarizeStatuses(findings: ZendeskFinding[], incomplete: boolean): JsonRecord {
+  const count = (status: ZendeskFindingStatus): number | null => {
+    const total = findings.filter((item) => item.status === status).length;
+    return total === 0 && incomplete ? null : total;
   };
+  return { pass: count("pass"), warn: count("warn"), fail: count("fail"), manual: count("manual") };
+}
+
+function anyIncomplete(entries: Array<[string, ZendeskSnapshot<unknown>]>): boolean {
+  return entries.some(([, snap]) => isIncomplete(snap));
 }
 
 function roleCeilingReason(currentUser: ZendeskSnapshot<JsonRecord>): string | undefined {
@@ -1945,7 +2780,7 @@ function assessAgentTwoFactor(
     return manualFinding(2, title, "critical", `${snapshotCause("Team member list (/users?role[]=agent&role[]=admin)", teamSnap)} ${enforcementText}`, `export the team member list from Admin Center > People > Team > Team members and ${requirementInstruction}`, { two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
   }
   if (teamMembers.length === 0) {
-    return manualFinding(2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population. ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: 0, two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
+    return manualFinding(2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population.${truncationNote("team member", teamSnap)} ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap), two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
   }
   const withoutTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === false);
   const unknownTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === undefined);
@@ -1957,11 +2792,11 @@ function assessAgentTwoFactor(
     enforce_sso: enforceSso ?? null,
     security_settings_status: securitySnap.status,
     seen_team_members: teamMembers.length,
+    without_two_factor_count: countOrNull(withoutTwoFactor.length, teamSnap),
+    two_factor_flag_missing_count: countOrNull(unknownTwoFactor.length, teamSnap),
     inventory_truncated: truncated,
-    without_two_factor: withoutTwoFactor.slice(0, 50).map(userLabel),
-    without_two_factor_partial: truncated,
-    two_factor_flag_missing: unknownTwoFactor.slice(0, 50).map(userLabel),
-    two_factor_flag_missing_partial: truncated,
+    without_two_factor: detailOrNull(withoutTwoFactor.slice(0, 50).map(userLabel), teamSnap),
+    two_factor_flag_missing: detailOrNull(unknownTwoFactor.slice(0, 50).map(userLabel), teamSnap),
   };
   const atLeast = truncated ? "at least " : "";
   if (securitySnap.status !== "ok") {
@@ -2129,7 +2964,7 @@ function assessEndUserAuthentication(
       ? " Note: settings.api.api_password_access_end_users=true, so end users may call the API with email and password; review whether that is intended."
       : "";
   const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, account_settings_status: settingsSnap.status, security_settings_status: securitySnap.status };
-  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [["Account settings (/account/settings)", settingsSnap]]);
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForIncomplete(item, [["Account settings (/account/settings)", settingsSnap]]);
   if (securitySnap.status !== "ok") {
     return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
   }
@@ -2206,8 +3041,8 @@ export async function assessZendeskAuthentication(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: countOrNull(teamSnap, teamMembers.length),
-      ...summarizeStatuses(finalFindings),
+      seen_team_members: countOrNull(teamMembers.length, teamSnap),
+      ...summarizeStatuses(finalFindings, anyIncomplete(entries)),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -2278,24 +3113,24 @@ function assessApiTokens(
     api_token_access: apiTokenAccess ?? null,
     auth_mode: config.authMode,
     token_audit_log_status: tokenLogsSnap.status,
-    token_events_read: countOrNull(tokenLogsSnap, events.length),
+    token_events_read: countOrNull(events.length, tokenLogsSnap),
     token_events_truncated: tokenLogsSnap.status === "ok" ? isTruncated(tokenLogsSnap) : null,
-    tokens_created: countOrNull(tokenLogsSnap, summary.created),
-    tokens_destroyed: countOrNull(tokenLogsSnap, summary.destroyed),
-    tokens_outstanding: countOrNull(tokenLogsSnap, summary.outstanding.length),
-    tokens_outstanding_over_stale_days: countOrNull(tokenLogsSnap, summary.outstandingOverStale),
-    tokens_outstanding_undated: countOrNull(tokenLogsSnap, summary.outstandingUndated),
-    outstanding_tokens: listOrNull(tokenLogsSnap, summary.outstanding.slice(0, 50)),
+    tokens_created: countOrNull(summary.created, tokenLogsSnap),
+    tokens_destroyed: countOrNull(summary.destroyed, tokenLogsSnap),
+    tokens_outstanding: countOrNull(summary.outstanding.length, tokenLogsSnap),
+    tokens_outstanding_over_stale_days: countOrNull(summary.outstandingOverStale, tokenLogsSnap),
+    tokens_outstanding_undated: countOrNull(summary.outstandingUndated, tokenLogsSnap),
+    outstanding_tokens: detailOrNull(summary.outstanding.slice(0, 50), tokenLogsSnap),
     newest_token_event: summary.newestEvent ?? null,
   };
   const auditText = tokenLogsSnap.status === "ok"
-    ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events${isTruncated(tokenLogsSnap) ? " (history truncated)" : ""}, leaving ${summary.outstanding.length} outstanding token(s).`
+    ? `The audit log (filter[source_type]=apitoken) recorded ${summary.created} token creation and ${summary.destroyed} deletion events, leaving ${summary.outstanding.length} outstanding token(s).${truncationNote("token event", tokenLogsSnap)}`
     : snapshotCause(tokenLogSource, tokenLogsSnap);
   if (settingsSnap.status !== "ok") {
     return manualFinding(13, title, "high", `${snapshotCause("Account settings", settingsSnap)} ${auditText}`, instruction, evidence);
   }
   if (apiTokenAccess === false) {
-    return capForUnreadable(
+    return capForIncomplete(
       finding(13, title, "high", "pass", `settings.api.api_token_access=false, so API tokens cannot be used to authenticate to this account. ${auditText}`, evidence),
       [[tokenLogSource, tokenLogsSnap]],
     );
@@ -2308,7 +3143,7 @@ function assessApiTokens(
     const caveat = config.authMode === "api_token"
       ? " This assessment itself authenticated with an API token, so the audit history does not cover every token."
       : isTruncated(tokenLogsSnap)
-        ? " The token event history was truncated, so older tokens may be missing."
+        ? " Older tokens may be missing from the unread remainder of the history."
         : " The audit log records events rather than an inventory, so confirm the token list in Admin Center.";
     return finding(13, title, "high", "warn", `${accessText} ${auditText}${caveat} ${retirement}`, evidence);
   }
@@ -2348,7 +3183,7 @@ export async function assessZendeskAccessControl(
   if (teamSnap.status !== "ok") {
     findings.push(manualFinding(6, leastPrivilegeTitle, "critical", snapshotCause("Team member list", teamSnap), "export Admin Center > People > Team > Team members with role assignments and Admin Center > People > Team > Roles."));
   } else if (teamMembers.length === 0) {
-    findings.push(manualFinding(6, leastPrivilegeTitle, "critical", "Zero active team members were visible, which indicates a partial view of the account.", "use an admin credential and export the team member and role lists from Admin Center.", { seen_team_members: 0 }));
+    findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `Zero active team members were visible, which indicates a partial view of the account.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the team member and role lists from Admin Center.", { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
     const customRoles = listSnapshotItems(rolesSnap);
     const adminEquivalent = customRoles
@@ -2357,18 +3192,21 @@ export async function assessZendeskAccessControl(
     const unrestrictedAgents = agents.filter((user) => asBoolean(user.restricted_agent) === false);
     const evidence: JsonRecord = {
       seen_team_members: teamMembers.length,
-      admins: admins.length,
-      agents: agents.length,
-      unrestricted_agents: unrestrictedAgents.length,
+      admins: countOrNull(admins.length, teamSnap),
+      agents: countOrNull(agents.length, teamSnap),
+      unrestricted_agents: countOrNull(unrestrictedAgents.length, teamSnap),
       custom_roles_status: rolesSnap.status,
       custom_roles: listCountOrNull(rolesSnap),
-      admin_equivalent_custom_roles: listOrNull(rolesSnap, adminEquivalent.slice(0, 25)),
+      admin_equivalent_custom_roles_count: countOrNull(adminEquivalent.length, rolesSnap),
+      admin_equivalent_custom_roles: detailOrNull(adminEquivalent.slice(0, 25), rolesSnap),
       inventory_truncated: truncationOrNull(teamSnap, rolesSnap),
     };
+    // The roles are named only when the role inventory was read to completion.
+    const adminEquivalentText = isTruncated(rolesSnap) ? "" : ` (${adminEquivalent.map((role) => `${role.name}: ${role.reasons.join(", ")}`).join("; ")})`;
     if (rolesSnap.status !== "ok") {
-      findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
+      findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `${snapshotCause("Custom roles (/custom_roles, Enterprise plan)", rolesSnap)} Built-in roles seen: ${admins.length} admins, ${agents.length} agents (${unrestrictedAgents.length} unrestricted).${truncationNote("team member", teamSnap)}`, "capture Admin Center > People > Team > Roles and confirm agents are assigned the least-privileged built-in or custom role.", evidence));
     } else if (adminEquivalent.some((role) => role.members > 0)) {
-      findings.push(finding(6, leastPrivilegeTitle, "critical", "fail", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions (${adminEquivalent.map((role) => `${role.name}: ${role.reasons.join(", ")}`).join("; ")}).${truncationNote("team member", teamSnap)}`, evidence));
+      findings.push(finding(6, leastPrivilegeTitle, "critical", "fail", `${adminEquivalent.filter((role) => role.members > 0).length} custom roles grant admin-equivalent permissions${adminEquivalentText}.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)}`, evidence));
     } else if (isTruncated(teamSnap) || isTruncated(rolesSnap) || adminEquivalent.length > 0 || (agents.length > 0 && unrestrictedAgents.length === agents.length)) {
       findings.push(finding(6, leastPrivilegeTitle, "critical", "warn", `${customRoles.length} custom roles reviewed; ${adminEquivalent.length} admin-equivalent roles have no members; ${unrestrictedAgents.length}/${agents.length} agents are unrestricted.${truncationNote("team member", teamSnap)}${truncationNote("custom role", rolesSnap)} Review whether unrestricted agents need account-wide ticket access.`, evidence));
     } else {
@@ -2380,15 +3218,17 @@ export async function assessZendeskAccessControl(
   if (teamSnap.status !== "ok") {
     findings.push(manualFinding(7, adminTitle, "high", snapshotCause("Team member list", teamSnap), "export the admin list from Admin Center > People > Team > Team members filtered to the Administrator role."));
   } else if (admins.length === 0) {
-    findings.push(manualFinding(7, adminTitle, "high", "Zero admins were visible although every account has at least one admin (account owner), so the inventory is partial.", "use an admin credential and export the Administrator list from Admin Center.", { seen_admins: 0, seen_team_members: teamMembers.length }));
+    findings.push(manualFinding(7, adminTitle, "high", `Zero admins were visible although every account has at least one admin (account owner), so the inventory is partial.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the Administrator list from Admin Center.", { seen_admins: countOrNull(0, teamSnap), seen_team_members: countOrNull(teamMembers.length, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
     const loginBuckets = partitionByDate(admins, "last_login_at", resolved.staleDays, now);
     const evidence: JsonRecord = {
       seen_admins: admins.length,
       admin_threshold: resolved.adminThreshold,
-      admins: admins.slice(0, 50).map(userLabel),
-      dormant_admins: loginBuckets.stale.slice(0, 25).map(userLabel),
-      admins_without_last_login: loginBuckets.undated.slice(0, 25).map(userLabel),
+      dormant_admins_count: countOrNull(loginBuckets.stale.length, teamSnap),
+      admins_without_last_login_count: countOrNull(loginBuckets.undated.length, teamSnap),
+      admins: detailOrNull(admins.slice(0, 50).map(userLabel), teamSnap),
+      dormant_admins: detailOrNull(loginBuckets.stale.slice(0, 25).map(userLabel), teamSnap),
+      admins_without_last_login: detailOrNull(loginBuckets.undated.slice(0, 25).map(userLabel), teamSnap),
       inventory_truncated: truncationOrNull(teamSnap),
     };
     if (admins.length > resolved.adminThreshold) {
@@ -2406,20 +3246,20 @@ export async function assessZendeskAccessControl(
   if (groupsSnap.status !== "ok" || membershipsSnap.status !== "ok") {
     findings.push(manualFinding(8, groupsTitle, "medium", `${snapshotCause("Groups", groupsSnap)} ${snapshotCause("Group memberships", membershipsSnap)}`, "capture Admin Center > People > Team > Groups with member counts."));
   } else if (groups.length === 0) {
-    findings.push(manualFinding(8, groupsTitle, "medium", "Zero groups were visible although every account has a default group, so the inventory is partial.", "use an admin credential and capture Admin Center > People > Team > Groups.", { seen_groups: 0 }));
+    findings.push(manualFinding(8, groupsTitle, "medium", `Zero groups were visible although every account has a default group, so the inventory is partial.${truncationNote("group", groupsSnap)}`, "use an admin credential and capture Admin Center > People > Team > Groups.", { seen_groups: countOrNull(0, groupsSnap), inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap) }));
   } else {
     const privateGroups = groups.filter((group) => asBoolean(group.is_public) === false);
     const evidence: JsonRecord = {
       seen_groups: groups.length,
-      private_groups: privateGroups.length,
-      seen_memberships: memberships.length,
-      groups: groups.slice(0, 50).map((group) => asString(group.name) ?? asString(group.id) ?? "group"),
+      private_groups: countOrNull(privateGroups.length, groupsSnap),
+      seen_memberships: countOrNull(memberships.length, membershipsSnap),
+      groups: detailOrNull(groups.slice(0, 50).map((group) => asString(group.name) ?? asString(group.id) ?? "group"), groupsSnap),
       inventory_truncated: truncationOrNull(groupsSnap, membershipsSnap),
     };
     if (groups.length === 1 || memberships.length === 0) {
-      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}`, evidence));
+      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} group(s) and ${memberships.length} memberships were visible, so ticket access is not segmented by group.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
     } else if (isTruncated(groupsSnap) || isTruncated(membershipsSnap)) {
-      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} groups and ${memberships.length} memberships were seen but the inventory was truncated, so segmentation could not be fully confirmed.`, evidence));
+      findings.push(finding(8, groupsTitle, "medium", "warn", `${groups.length} groups and ${memberships.length} memberships were seen but the inventory was truncated, so segmentation could not be fully confirmed.${truncationNote("group", groupsSnap)}${truncationNote("group membership", membershipsSnap)}`, evidence));
     } else {
       findings.push(finding(8, groupsTitle, "medium", "pass", `${groups.length} groups (${privateGroups.length} private) with ${memberships.length} memberships were read to completion, showing group-based segmentation is configured.`, evidence));
     }
@@ -2440,17 +3280,21 @@ export async function assessZendeskAccessControl(
     const nonExpiringTokens = tokens.filter((token) => !asString(token.expires_at));
     const usage = partitionByDate(tokens, "used_at", resolved.staleDays, now);
     const tokenSource = "OAuth tokens (/oauth/tokens?all=true, admin only)";
+    const clientLabel = (item: JsonRecord): string => asString(item.name) ?? asString(item.identifier) ?? "client";
     const evidence: JsonRecord = {
-      oauth_clients: clients.length,
-      clients_without_scope_restriction: unscoped.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
-      public_clients: publicClients.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
-      clients_with_http_redirects: insecureRedirects.slice(0, 25).map((item) => asString(item.name) ?? asString(item.identifier) ?? "client"),
+      oauth_clients: countOrNull(clients.length, clientsSnap),
+      clients_without_scope_restriction_count: countOrNull(unscoped.length, clientsSnap),
+      public_clients_count: countOrNull(publicClients.length, clientsSnap),
+      clients_with_http_redirects_count: countOrNull(insecureRedirects.length, clientsSnap),
+      clients_without_scope_restriction: detailOrNull(unscoped.slice(0, 25).map(clientLabel), clientsSnap),
+      public_clients: detailOrNull(publicClients.slice(0, 25).map(clientLabel), clientsSnap),
+      clients_with_http_redirects: detailOrNull(insecureRedirects.slice(0, 25).map(clientLabel), clientsSnap),
       oauth_tokens_status: tokensSnap.status,
       oauth_tokens: listCountOrNull(tokensSnap),
-      tokens_with_write_or_impersonate: countOrNull(tokensSnap, privilegedTokens.length),
-      tokens_without_expiry: countOrNull(tokensSnap, nonExpiringTokens.length),
-      tokens_unused_over_stale_days: countOrNull(tokensSnap, usage.stale.length),
-      tokens_without_used_at: countOrNull(tokensSnap, usage.undated.length),
+      tokens_with_write_or_impersonate: countOrNull(privilegedTokens.length, tokensSnap),
+      tokens_without_expiry: countOrNull(nonExpiringTokens.length, tokensSnap),
+      tokens_unused_over_stale_days: countOrNull(usage.stale.length, tokensSnap),
+      tokens_without_used_at: countOrNull(usage.undated.length, tokensSnap),
       inventory_truncated: truncationOrNull(clientsSnap, tokensSnap),
     };
     if (unscoped.length > 0 || insecureRedirects.length > 0) {
@@ -2490,13 +3334,13 @@ export async function assessZendeskAccessControl(
     summary: {
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
-      seen_team_members: countOrNull(teamSnap, teamMembers.length),
-      admins: countOrNull(teamSnap, admins.length),
+      seen_team_members: countOrNull(teamMembers.length, teamSnap),
+      admins: countOrNull(admins.length, teamSnap),
       custom_roles: listCountOrNull(rolesSnap),
-      groups: countOrNull(groupsSnap, groups.length),
+      groups: countOrNull(groups.length, groupsSnap),
       oauth_clients: listCountOrNull(clientsSnap),
       oauth_tokens: listCountOrNull(tokensSnap),
-      ...summarizeStatuses(finalFindings),
+      ...summarizeStatuses(finalFindings, anyIncomplete(entries)),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -2555,11 +3399,11 @@ function assessDeletionPolicies(
     deletion_schedules_status: deletionSnap.status,
     account_settings_status: settingsSnap.status,
     agent_ticket_deletion: agentTicketDeletion ?? null,
-    custom_roles_with_ticket_redaction: countOrNull(rolesSnap, redactionRoles),
-    custom_roles_managing_deletion_schedules: countOrNull(rolesSnap, deletionScheduleRoles),
+    custom_roles_with_ticket_redaction: countOrNull(redactionRoles, rolesSnap),
+    custom_roles_managing_deletion_schedules: countOrNull(deletionScheduleRoles, rolesSnap),
     custom_roles_status: rolesSnap.status,
   };
-  const cap = (item: ZendeskFinding): ZendeskFinding => capForUnreadable(item, [[settingsSource, settingsSnap], [rolesSource, rolesSnap]]);
+  const cap = (item: ZendeskFinding): ZendeskFinding => capForIncomplete(item, [[settingsSource, settingsSnap], [rolesSource, rolesSnap]]);
   if (deletionSnap.status !== "ok") {
     return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
   }
@@ -2571,19 +3415,25 @@ function assessDeletionPolicies(
   const defaults = schedules.filter((schedule) => asBoolean(schedule.default) === true).length;
   const evidence: JsonRecord = {
     ...baseEvidence,
-    deletion_schedules: schedules.length,
-    active_deletion_schedules: active.length,
-    active_by_object: { ...activeByObject, other: otherActive },
-    active_without_conditions: activeWithoutConditions,
-    default_schedules: defaults,
+    deletion_schedules: countOrNull(schedules.length, deletionSnap),
+    active_deletion_schedules: countOrNull(active.length, deletionSnap),
+    active_by_object: Object.fromEntries(Object.entries({ ...activeByObject, other: otherActive }).map(([object, count]) => [object, countOrNull(count, deletionSnap)])),
+    active_without_conditions: countOrNull(activeWithoutConditions, deletionSnap),
+    default_schedules: countOrNull(defaults, deletionSnap),
     inventory_truncated: truncationOrNull(deletionSnap),
-    schedules: schedules.slice(0, 25).map(summarizeDeletionSchedule),
+    schedules: detailOrNull(schedules.slice(0, 25).map(summarizeDeletionSchedule), deletionSnap),
   };
+  // Zero schedules, or zero active ones, is a verified gap only when the inventory was
+  // read to completion; a truncated read may have stopped before the schedules.
   if (schedules.length === 0) {
-    return finding(12, title, "high", "fail", `The deletion schedules endpoint was readable and returned zero schedules, so no automated retention or deletion policy is configured.${context}`, evidence);
+    return isTruncated(deletionSnap)
+      ? finding(12, title, "high", "warn", `Zero deletion schedules were seen but the inventory was truncated before completion, so whether an automated retention or deletion policy is configured could not be determined.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
+      : finding(12, title, "high", "fail", `The deletion schedules endpoint was readable and returned zero schedules, so no automated retention or deletion policy is configured.${context}`, evidence);
   }
   if (active.length === 0) {
-    return finding(12, title, "high", "fail", `${schedules.length} deletion schedule(s) exist but none is active.${context}`, evidence);
+    return isTruncated(deletionSnap)
+      ? finding(12, title, "high", "warn", `${schedules.length} deletion schedule(s) were seen and none is active, but the inventory was truncated before completion.${truncationNote("deletion schedule", deletionSnap)}${context}`, evidence)
+      : finding(12, title, "high", "fail", `${schedules.length} deletion schedule(s) exist but none is active.${context}`, evidence);
   }
   const byObjectText = Object.entries(activeByObject).filter(([, count]) => count > 0).map(([object, count]) => `${count} for ${object}`).concat(otherActive > 0 ? [`${otherActive} for custom objects`] : []).join(", ");
   const ticketSchedules = activeByObject["zen:ticket"] ?? 0;
@@ -2623,17 +3473,29 @@ export async function assessZendeskDataProtection(
 
   const auditTitle = "Audit logging enabled and accessible";
   const auditEntries = listSnapshotItems(auditSnap);
+  // The recent-log read is a sample: it asks for DEFAULT_AUDIT_LOG_SAMPLE entries and stops
+  // at that cap by design, so a sample that filled is complete even though the walk reports
+  // the cap. The sample is cut short when paging stopped before it filled (a stalled cursor
+  // or a refused next link), and only then is the read incomplete for this finding.
+  const sampleCutShort = isTruncated(auditSnap) && auditEntries.length < DEFAULT_AUDIT_LOG_SAMPLE;
   if (auditSnap.status !== "ok") {
     findings.push(manualFinding(9, auditTitle, "high", `${snapshotCause("Audit logs (/audit_logs, Enterprise plan and admin role)", auditSnap)} This is a plan or permission limitation, not a pass.`, "capture Admin Center > Account > Audit log showing recent entries, or record that the plan does not include the audit log.", { audit_log_status: auditSnap.status }));
   } else if (auditEntries.length === 0) {
-    findings.push(manualFinding(9, auditTitle, "high", "The audit log endpoint was readable but returned zero entries, which is unexpected for an active account.", "open Admin Center > Account > Audit log and confirm entries are being recorded.", { audit_log_entries: 0 }));
+    findings.push(manualFinding(9, auditTitle, "high", sampleCutShort
+      ? `The audit log endpoint was readable but the read stopped before any entry arrived (${truncationReasonOf(auditSnap)}), so whether entries are being recorded could not be determined.`
+      : "The audit log endpoint was readable but returned zero entries, which is unexpected for an active account.", "open Admin Center > Account > Audit log and confirm entries are being recorded.", { audit_log_entries: countOrNull(0, auditSnap), sample_size: DEFAULT_AUDIT_LOG_SAMPLE, sample_cut_short: sampleCutShort }));
   } else {
     const newest = parseDate(auditEntries[0]?.created_at);
-    findings.push(finding(9, auditTitle, "high", "pass", `The audit log is readable with ${auditEntries.length} recent entries sampled; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, {
+    const evidence: JsonRecord = {
       audit_log_entries_sampled: auditEntries.length,
+      sample_size: DEFAULT_AUDIT_LOG_SAMPLE,
+      sample_cut_short: sampleCutShort,
       newest_entry: newest?.toISOString() ?? null,
-      actions_seen: [...new Set(auditEntries.map((entry) => asString(entry.action)).filter(Boolean))],
-    }));
+      actions_seen: sampleCutShort ? null : [...new Set(auditEntries.map((entry) => asString(entry.action)).filter(Boolean))],
+    };
+    findings.push(sampleCutShort
+      ? finding(9, auditTitle, "high", "warn", `The audit log is readable, but the ${DEFAULT_AUDIT_LOG_SAMPLE}-entry sample was cut short after ${auditEntries.length} entries (${truncationReasonOf(auditSnap)}), so the sampled window could not be confirmed; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence)
+      : finding(9, auditTitle, "high", "pass", `The audit log is readable with ${auditEntries.length} recent entries sampled; newest entry ${newest ? newest.toISOString() : "has no created_at"}.`, evidence));
   }
 
   const retentionTitle = "Audit log retention meets compliance requirements";
@@ -2693,11 +3555,11 @@ export async function assessZendeskDataProtection(
     const suspended = listSnapshotItems(suspendedSnap);
     const buckets = partitionByDate(suspended, "created_at", resolved.suspendedTicketAgeDays, now);
     const evidence: JsonRecord = {
-      seen_suspended_tickets: suspended.length,
-      older_than_threshold: buckets.stale.length,
-      without_created_at: buckets.undated.length,
+      seen_suspended_tickets: countOrNull(suspended.length, suspendedSnap),
+      older_than_threshold: countOrNull(buckets.stale.length, suspendedSnap),
+      without_created_at: countOrNull(buckets.undated.length, suspendedSnap),
       age_threshold_days: resolved.suspendedTicketAgeDays,
-      causes: [...new Set(suspended.map((ticket) => asString(ticket.cause)).filter(Boolean))].slice(0, 20),
+      causes: detailOrNull([...new Set(suspended.map((ticket) => asString(ticket.cause)).filter(Boolean))].slice(0, 20), suspendedSnap),
       inventory_truncated: truncationOrNull(suspendedSnap),
     };
     if (suspended.length === 0 && isTruncated(suspendedSnap)) {
@@ -2730,11 +3592,12 @@ export async function assessZendeskDataProtection(
       subdomain: config.subdomain,
       current_user_role: asString(currentUserSnap.data?.role) ?? null,
       audit_log_status: auditSnap.status,
-      audit_log_entries_sampled: countOrNull(auditSnap, auditEntries.length),
+      audit_log_entries_sampled: countOrNull(auditEntries.length, auditSnap),
       private_attachments: privateAttachments ?? null,
       deletion_schedules: listCountOrNull(deletionSnap),
       suspended_tickets: listCountOrNull(suspendedSnap),
-      ...summarizeStatuses(finalFindings),
+      // The recent-log sample stops at its cap by design; it is incomplete only when cut short.
+      ...summarizeStatuses(finalFindings, sampleCutShort || anyIncomplete(entries.filter(([name]) => name !== "audit_logs_recent"))),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -2772,23 +3635,30 @@ export async function assessZendeskIntegrations(
   } else {
     const marketplace = installations.filter((item) => !ownedIds.has(asString(item.app_id) ?? ""));
     const enabled = marketplace.filter((item) => asBoolean(item.enabled) !== false);
+    // Marketplace apps are the installations not matched to an owned app, so the split
+    // rests on both inventories: it is not asserted while either is incomplete.
     const evidence: JsonRecord = {
-      app_installations: installations.length,
-      marketplace_installations: countOrNull(ownedSnap, marketplace.length),
-      enabled_marketplace_installations: countOrNull(ownedSnap, enabled.length),
+      app_installations: countOrNull(installations.length, installationsSnap),
+      marketplace_installations: countOrNull(marketplace.length, installationsSnap, ownedSnap),
+      enabled_marketplace_installations: countOrNull(enabled.length, installationsSnap, ownedSnap),
       owned_apps_status: ownedSnap.status,
       inventory_truncated: truncationOrNull(installationsSnap, ownedSnap),
-      apps: marketplace.slice(0, 50).map((item) => ({ name: installationName(item), enabled: asBoolean(item.enabled) ?? null, product: asString(item.product) ?? null, role_restrictions: asArray(item.role_restrictions).length, group_restrictions: asArray(item.group_restrictions).length })),
+      apps: detailOrNull(marketplace.slice(0, 50).map((item) => ({ name: installationName(item), enabled: asBoolean(item.enabled) ?? null, product: asString(item.product) ?? null, role_restrictions: asArray(item.role_restrictions).length, group_restrictions: asArray(item.group_restrictions).length })), installationsSnap, ownedSnap),
     };
+    const ownedNote = ownedSnap.status !== "ok"
+      ? `, but owned apps could not be separated because ${snapshotCause("/apps/owned", ownedSnap).toLowerCase()}`
+      : isTruncated(ownedSnap)
+        ? `, but the owned app inventory was truncated after ${ownedApps.length} items (${truncationReasonOf(ownedSnap)}), so the split between private and marketplace apps is not asserted`
+        : "";
     if (installations.length === 0 && isTruncated(installationsSnap)) {
       findings.push(finding(15, marketplaceTitle, "medium", "warn", `Zero installed apps were seen but the installation inventory was truncated before completion.${truncationNote("app installation", installationsSnap)}`, evidence));
     } else if (installations.length === 0) {
-      findings.push(capForUnreadable(
+      findings.push(capForIncomplete(
         finding(15, marketplaceTitle, "medium", "pass", "The app installation endpoint was readable and returned zero installed apps, so there are no marketplace apps to review.", evidence),
         [["Owned apps (/apps/owned, used to separate private apps from marketplace apps)", ownedSnap]],
       ));
     } else {
-      findings.push(manualFinding(15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried${ownedSnap.status !== "ok" ? ", but owned apps could not be separated because " + snapshotCause("/apps/owned", ownedSnap).toLowerCase() : ""}; app permission reviews cannot be verified through the API.`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
+      findings.push(manualFinding(15, marketplaceTitle, "medium", `${marketplace.length} marketplace app installations (${enabled.length} enabled) were inventoried among ${installations.length} installed apps${ownedNote}; app permission reviews cannot be verified through the API.${truncationNote("app installation", installationsSnap)}`, "record the reviewer, date, and outcome of the permission review for each installed app in Admin Center > Apps and integrations > Zendesk Support apps.", evidence));
     }
   }
 
@@ -2798,19 +3668,20 @@ export async function assessZendeskIntegrations(
   } else {
     const retired = ownedApps.filter((app) => asBoolean(app.deprecated) === true || asBoolean(app.obsolete) === true);
     const evidence: JsonRecord = {
-      owned_apps: ownedApps.length,
-      deprecated_or_obsolete: retired.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "app"),
+      owned_apps: countOrNull(ownedApps.length, ownedSnap),
+      deprecated_or_obsolete_count: countOrNull(retired.length, ownedSnap),
+      deprecated_or_obsolete: detailOrNull(retired.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "app"), ownedSnap),
       inventory_truncated: truncationOrNull(ownedSnap),
-      apps: ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })),
+      apps: detailOrNull(ownedApps.slice(0, 50).map((app) => ({ name: asString(app.name) ?? null, visibility: asString(app.visibility) ?? null, framework_version: asString(app.framework_version) ?? null, parameters: asArray(app.parameters).length })), ownedSnap),
     };
     if (ownedApps.length === 0 && isTruncated(ownedSnap)) {
       findings.push(finding(16, customAppTitle, "medium", "warn", `Zero owned apps were seen but the inventory was truncated before completion.${truncationNote("owned app", ownedSnap)}`, evidence));
     } else if (ownedApps.length === 0) {
       findings.push(finding(16, customAppTitle, "medium", "pass", "The owned apps endpoint was readable and returned zero private or custom apps.", evidence));
     } else if (retired.length > 0) {
-      findings.push(finding(16, customAppTitle, "medium", "warn", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.`, evidence));
+      findings.push(finding(16, customAppTitle, "medium", "warn", `${retired.length}/${ownedApps.length} owned apps are deprecated or obsolete and should be removed or updated; scope review of the remaining apps is manual.${truncationNote("owned app", ownedSnap)}`, evidence));
     } else {
-      findings.push(manualFinding(16, customAppTitle, "medium", `${ownedApps.length} private or custom apps were inventoried; requested locations and secure parameters must be reviewed against the manifest.`, "record the scope review for each private app (manifest locations, secure parameters, external domains).", evidence));
+      findings.push(manualFinding(16, customAppTitle, "medium", `${ownedApps.length} private or custom apps were inventoried; requested locations and secure parameters must be reviewed against the manifest.${truncationNote("owned app", ownedSnap)}`, "record the scope review for each private app (manifest locations, secure parameters, external domains).", evidence));
     }
   }
 
@@ -2835,19 +3706,21 @@ export async function assessZendeskIntegrations(
     const activeBrands = brands.filter((brand) => asBoolean(brand.active) !== false);
     const states = [...new Set(activeBrands.map((brand) => asString(brand.help_center_state) ?? "unknown"))];
     const evidence: JsonRecord = {
-      brands: brands.length,
-      active_brands: activeBrands.length,
-      help_center_states: states,
+      brands: countOrNull(brands.length, brandsSnap),
+      active_brands: countOrNull(activeBrands.length, brandsSnap),
+      help_center_states: detailOrNull(states, brandsSnap),
       current_user_role: currentRole ?? null,
-      brands_detail: brands.slice(0, 50).map((brand) => ({ name: asString(brand.name) ?? null, active: asBoolean(brand.active) ?? null, help_center_state: asString(brand.help_center_state) ?? null, has_help_center: asBoolean(brand.has_help_center) ?? null, host_mapping: asString(brand.host_mapping) ?? null })),
+      brands_detail: detailOrNull(brands.slice(0, 50).map((brand) => ({ name: asString(brand.name) ?? null, active: asBoolean(brand.active) ?? null, help_center_state: asString(brand.help_center_state) ?? null, has_help_center: asBoolean(brand.has_help_center) ?? null, host_mapping: asString(brand.host_mapping) ?? null })), brandsSnap),
       inventory_truncated: truncationOrNull(brandsSnap),
     };
     if (brands.length === 0) {
-      findings.push(manualFinding(22, brandTitle, "medium", "Zero brands were visible although every account has a default brand, so the view is partial.", "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
+      findings.push(manualFinding(22, brandTitle, "medium", `Zero brands were visible although every account has a default brand, so the view is partial.${truncationNote("brand", brandsSnap)}`, "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
     } else if (currentRole !== "admin") {
-      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to a non-admin credential (role ${currentRole ?? "unknown"}), which only lists brands the agent belongs to, so cross-brand consistency cannot be confirmed.`, evidence));
+      // A role that could not be read is not a non-admin role; the summary says which.
+      const credential = currentRole === undefined ? "a credential whose role could not be read, which may list only the brands the agent belongs to" : `a non-admin credential (role ${currentRole}), which only lists brands the agent belongs to`;
+      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to ${credential}, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
     } else if (isTruncated(brandsSnap)) {
-      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were seen but the inventory was truncated, so cross-brand consistency cannot be confirmed.`, evidence));
+      findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were seen but the inventory was truncated, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
     } else if (states.length > 1 || states.includes("unknown")) {
       findings.push(finding(22, brandTitle, "medium", "warn", `${activeBrands.length} active brands expose mixed help center states (${states.join(", ")}); confirm each public or restricted help center is intentional.`, evidence));
     } else {
@@ -2863,19 +3736,22 @@ export async function assessZendeskIntegrations(
     const active = agreements.filter((item) => ["accepted", "pending"].includes(asString(item.status) ?? ""));
     const broken = agreements.filter((item) => ["failed", "ssl_error", "configuration_error"].includes(asString(item.status) ?? ""));
     const evidence: JsonRecord = {
-      sharing_agreements: agreements.length,
-      active_agreements: active.slice(0, 25).map((item) => ({ name: asString(item.name) ?? null, remote_subdomain: asString(item.remote_subdomain) ?? null, partner_name: asString(item.partner_name) ?? null, status: asString(item.status) ?? null, type: asString(item.type) ?? null })),
-      broken_agreements: broken.length,
+      sharing_agreements: countOrNull(agreements.length, sharingSnap),
+      active_agreements_count: countOrNull(active.length, sharingSnap),
+      active_agreements: detailOrNull(active.slice(0, 25).map((item) => ({ name: asString(item.name) ?? null, remote_subdomain: asString(item.remote_subdomain) ?? null, partner_name: asString(item.partner_name) ?? null, status: asString(item.status) ?? null, type: asString(item.type) ?? null })), sharingSnap),
+      broken_agreements: countOrNull(broken.length, sharingSnap),
       inventory_truncated: truncationOrNull(sharingSnap),
     };
+    // Remote accounts are named only when the agreement inventory was read to completion.
+    const remoteAccounts = isTruncated(sharingSnap) ? "" : ` (${active.map((item) => asString(item.remote_subdomain) ?? asString(item.partner_name) ?? asString(item.name) ?? "unnamed").join(", ")})`;
     if (agreements.length === 0 && isTruncated(sharingSnap)) {
       findings.push(finding(23, sharingTitle, "medium", "warn", `Zero sharing agreements were seen but the inventory was truncated before completion.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
     } else if (agreements.length === 0) {
       findings.push(finding(23, sharingTitle, "medium", "pass", "The sharing agreement endpoint was readable and returned zero agreements, so tickets are not shared with external Zendesk accounts.", evidence));
     } else if (broken.length > 0) {
-      findings.push(finding(23, sharingTitle, "medium", "warn", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.`, evidence));
+      findings.push(finding(23, sharingTitle, "medium", "warn", `${broken.length}/${agreements.length} sharing agreements are in a failed, ssl_error, or configuration_error state and ${active.length} are active; review each remote account.${truncationNote("sharing agreement", sharingSnap)}`, evidence));
     } else {
-      findings.push(manualFinding(23, sharingTitle, "medium", `${active.length}/${agreements.length} sharing agreements are accepted or pending with external accounts (${active.map((item) => asString(item.remote_subdomain) ?? asString(item.partner_name) ?? asString(item.name) ?? "unnamed").join(", ")}).`, "record the business justification and data handling agreement for each remote account.", evidence));
+      findings.push(manualFinding(23, sharingTitle, "medium", `${active.length}/${agreements.length} sharing agreements are accepted or pending with external accounts${remoteAccounts}.${truncationNote("sharing agreement", sharingSnap)}`, "record the business justification and data handling agreement for each remote account.", evidence));
     }
   }
 
@@ -2895,14 +3771,19 @@ export async function assessZendeskIntegrations(
     const truncationNotes = `${truncationNote("target", targetsSnap)}${truncationNote("webhook", webhooksSnap)}`;
     const targetText = targetsSnap.status === "ok" ? `${insecureTargets.length} active targets` : "an unread target inventory";
     const webhookText = webhooksSnap.status === "ok" ? `${insecureWebhooks.length} active webhooks` : "an unread webhook inventory";
+    const targetLabel = (target: JsonRecord): string => asString(target.title) ?? asString(target.id) ?? "target";
+    const webhookLabel = (hook: JsonRecord): string => asString(hook.name) ?? asString(hook.id) ?? "webhook";
     const evidence: JsonRecord = {
       targets_status: targetsSnap.status,
-      active_targets: countOrNull(targetsSnap, activeTargets.length),
-      insecure_targets: listOrNull(targetsSnap, insecureTargets.slice(0, 25).map((target) => asString(target.title) ?? asString(target.id) ?? "target")),
+      active_targets: countOrNull(activeTargets.length, targetsSnap),
+      insecure_targets_count: countOrNull(insecureTargets.length, targetsSnap),
+      insecure_targets: detailOrNull(insecureTargets.slice(0, 25).map(targetLabel), targetsSnap),
       webhooks_status: webhooksSnap.status,
-      active_webhooks: countOrNull(webhooksSnap, activeWebhooks.length),
-      insecure_webhooks: listOrNull(webhooksSnap, insecureWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
-      webhooks_without_authentication: listOrNull(webhooksSnap, unauthenticatedWebhooks.slice(0, 25).map((hook) => asString(hook.name) ?? asString(hook.id) ?? "webhook")),
+      active_webhooks: countOrNull(activeWebhooks.length, webhooksSnap),
+      insecure_webhooks_count: countOrNull(insecureWebhooks.length, webhooksSnap),
+      webhooks_without_authentication_count: countOrNull(unauthenticatedWebhooks.length, webhooksSnap),
+      insecure_webhooks: detailOrNull(insecureWebhooks.slice(0, 25).map(webhookLabel), webhooksSnap),
+      webhooks_without_authentication: detailOrNull(unauthenticatedWebhooks.slice(0, 25).map(webhookLabel), webhooksSnap),
       inventory_truncated: truncationOrNull(targetsSnap, webhooksSnap),
     };
     if (insecureTargets.length > 0 || insecureWebhooks.length > 0) {
@@ -2949,26 +3830,39 @@ export async function assessZendeskIntegrations(
     const unresolvedNote = unresolved.length > 0
       ? ` ${unresolved.length} destination(s) could not be resolved to a URL, so their scheme was not checked:${targetsSnap.status !== "ok" ? ` ${snapshotCause("targets", targetsSnap)}` : ""}${webhooksSnap.status !== "ok" ? ` ${snapshotCause("webhooks", webhooksSnap)}` : ""}${isTruncated(targetsSnap) || isTruncated(webhooksSnap) ? " The target or webhook inventory was truncated." : ""}`
       : "";
+    // The action list is drawn from the rule inventories, and its resolved destinations
+    // from the target and webhook inventories: a truncated destination inventory withholds
+    // the list too, since the URLs it resolved are a partial view of that inventory. An
+    // unreadable destination inventory resolved nothing, so it withholds nothing.
+    const actionDetail = detailOrNull(external.slice(0, 50), triggersSnap, automationsSnap, ...[targetsSnap, webhooksSnap].filter(isTruncated));
+    const destinationHosts = actionDetail === null ? "" : ` (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")})`;
     const evidence: JsonRecord = {
-      active_triggers: listSnapshotItems(triggersSnap).filter((rule) => asBoolean(rule.active) !== false).length,
-      active_automations: listSnapshotItems(automationsSnap).filter((rule) => asBoolean(rule.active) !== false).length,
-      external_notification_actions: external.slice(0, 50),
-      insecure_destinations: insecure.length,
+      active_triggers: countOrNull(listSnapshotItems(triggersSnap).filter((rule) => asBoolean(rule.active) !== false).length, triggersSnap),
+      active_automations: countOrNull(listSnapshotItems(automationsSnap).filter((rule) => asBoolean(rule.active) !== false).length, automationsSnap),
+      external_notification_actions_count: countOrNull(external.length, triggersSnap, automationsSnap),
+      external_notification_actions: actionDetail,
+      // With a destination left unresolved the insecure count is unknown, not zero; the
+      // count among the destinations that did resolve to a URL is kept beside it.
+      insecure_destinations: unresolved.length > 0 ? null : countOrNull(insecure.length, triggersSnap, automationsSnap),
+      // Zero among the resolved destinations is asserted only over complete inventories; an
+      // unreadable destination inventory resolved nothing, so it does not unsettle the count.
+      insecure_resolved_destinations: insecure.length === 0 && [triggersSnap, automationsSnap, targetsSnap, webhooksSnap].some(isTruncated) ? null : insecure.length,
       unresolved_destinations: unresolved.length,
       targets_status: targetsSnap.status,
       webhooks_status: webhooksSnap.status,
       inventory_truncated: truncated,
     };
+    const ruleTruncationNotes = `${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`;
     if (insecure.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${truncationNote("trigger", triggersSnap)}${truncationNote("automation", automationsSnap)}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "fail", `${insecure.length}/${external.length} external notification actions deliver ticket data to http:// destinations.${unresolvedNote}${ruleTruncationNotes}`, evidence));
     } else if (rules.length === 0) {
-      findings.push(manualFinding(25, exfilTitle, "high", "Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.", "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
+      findings.push(manualFinding(25, exfilTitle, "high", `Zero active triggers or automations were visible although Zendesk accounts ship with default triggers, so the view is partial.${ruleTruncationNotes}`, "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action.", evidence));
     } else if (external.length > 0) {
-      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations (${[...new Set(external.map((item) => urlHost(item.destination) ?? item.destination))].slice(0, 10).join(", ")}); confirm each destination is an approved processor.${unresolvedNote}${truncated ? " The rule inventory was truncated." : ""}`, evidence));
+      findings.push(finding(25, exfilTitle, "high", "warn", `${external.length} active rule actions send ticket data to external destinations${destinationHosts}; confirm each destination is an approved processor.${unresolvedNote}${ruleTruncationNotes}`, evidence));
     } else if (truncated) {
-      findings.push(finding(25, exfilTitle, "high", "warn", "No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.", evidence));
+      findings.push(finding(25, exfilTitle, "high", "warn", `No external notification actions were found in the seen rules, but the trigger or automation inventory was truncated, so the full population was not reviewed.${ruleTruncationNotes}`, evidence));
     } else {
-      findings.push(capForUnreadable(
+      findings.push(capForIncomplete(
         finding(25, exfilTitle, "high", "pass", `${rules.length} active triggers and automations were read to completion and none notify external targets, webhooks, or sharing agreements.`, evidence),
         destinationSources,
       ));
@@ -2999,7 +3893,7 @@ export async function assessZendeskIntegrations(
       brands: listCountOrNull(brandsSnap),
       webhooks: listCountOrNull(webhooksSnap),
       targets: listCountOrNull(targetsSnap),
-      ...summarizeStatuses(finalFindings),
+      ...summarizeStatuses(finalFindings, anyIncomplete(entries)),
       collection: collectionSummary(entries),
     },
     findings: finalFindings,
@@ -3130,7 +4024,11 @@ function formatAssessmentText(result: ZendeskAssessmentResult): string {
 
 function buildExecutiveSummary(config: ZendeskResolvedConfig, assessments: ZendeskAssessmentResult[], errors: string[], generatedAt: string): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const counts = summarizeStatuses(findings);
+  // A category renders a null status count only when an inventory its findings read was
+  // incomplete, so the roll-up inherits that state from the category summaries.
+  const incomplete = assessments.some((assessment) => ["pass", "warn", "fail", "manual"].some((key) => assessment.summary[key] === null));
+  const counts = summarizeStatuses(findings, incomplete);
+  const renderCount = (value: unknown): string => value === null ? "none seen (not asserted: an inventory the findings read was incomplete)" : String(value);
   const lines = [
     "# Zendesk Security Inspection Executive Summary",
     "",
@@ -3140,10 +4038,10 @@ function buildExecutiveSummary(config: ZendeskResolvedConfig, assessments: Zende
     "",
     "## Result Counts",
     "",
-    `- Pass: ${counts.pass}`,
-    `- Warn: ${counts.warn}`,
-    `- Fail: ${counts.fail}`,
-    `- Manual: ${counts.manual}`,
+    `- Pass: ${renderCount(counts.pass)}`,
+    `- Warn: ${renderCount(counts.warn)}`,
+    `- Fail: ${renderCount(counts.fail)}`,
+    `- Manual: ${renderCount(counts.manual)}`,
     "",
     "## Failing and Warning Findings",
     "",
@@ -3182,7 +4080,7 @@ function buildQuickReference(): string {
     `- \`core_data/\` contains redacted Zendesk API snapshots used during this assessment (credentials are never written: OAuth token values, client secrets, target passwords, app parameters flagged secure, {name, value} pairs with credential names, and other credential-bearing properties are replaced with ${CREDENTIAL_REDACTION_MARKER}; inside every string value, URL userinfo, credential-named or token-shaped query pairs such as ?token=, token-in-path webhook URLs, header, cookie, and scheme carriers, and private PEM blocks are replaced while the scheme, host, and path are kept; the configured API token, OAuth token, and composed Basic credential are removed from every file in every encoded form).`,
     "- `analysis/` contains normalized findings (`findings.json`) and one JSON file per assessment category. Counts derived from an inventory that could not be read render as null, never 0.",
     "- `compliance/` contains the executive summary, the unified matrix, and one report per framework (FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, DISA STIG, IRAP, ISMAP).",
-    "- `_errors.log` appears only when some reads failed but the bundle still completed. Error strings carry the HTTP status and Zendesk's documented error fields only; non-JSON bodies are summarized as a status-and-length note and never echoed.",
+    "- `_errors.log` appears only when some reads failed or stopped paging early but the bundle still completed. Error strings carry the HTTP status and Zendesk's documented error fields only; non-JSON bodies are summarized as a status-and-length note and never echoed. A partial inventory line names why paging stopped (the item or page cap, a stalled cursor, or a next link outside the configured origin that was not followed).",
     "- Manual findings name the Admin Center evidence a reviewer must collect; they never count as passing.",
     "",
     "Recommended reading order:",

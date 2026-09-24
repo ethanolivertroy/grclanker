@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import {
@@ -324,7 +324,10 @@ test("resolveTenableConfiguration treats non-cloud URLs as Tenable Security Cent
   assert.equal(both.securityCenter.baseUrl, "https://sc.example.internal");
 
   assert.throws(() => resolveTenableConfiguration({ config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), /TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY/);
-  assert.throws(() => resolveTenableConfiguration({ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), /needs API keys/);
+  assert.throws(() => resolveTenableConfiguration({ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, EMPTY_ENV), (error) => {
+    assert.equal(error.message, "Tenable Security Center at https://sc.example.internal needs API keys. Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).");
+    return true;
+  });
 });
 
 test("round 7(b): environment credentials survive an argument overlay that carries unrelated or undefined keys, and the source chain names the environment", () => {
@@ -1086,8 +1089,8 @@ function carriersOf(value) {
     [`Set-Cookie: TNS_SESSIONID="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
     [`X-ApiKeys: accessKey="${value}";secretKey="${value}"`, /^X-ApiKeys: \[REDACTED\]$/],
     [`x-apikey: accesskey='${value}'; secretkey='${value}';`, /^x-apikey: \[REDACTED\]$/],
-    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
-    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: Bearer "\[REDACTED\]"$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "Bearer \[REDACTED\]" was rejected$/],
     [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
     [`X-SecurityCenter: '${value}'`, /^X-SecurityCenter: '\[REDACTED\]'$/],
     [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
@@ -1097,6 +1100,53 @@ function carriersOf(value) {
     [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
     [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
     [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
+    // Compound lines: a cookie value, quoted or not, ends before the "Name:" token of the next
+    // header on the line, so the following header keeps its name and gets its own carrier
+    // treatment, and a Content-Type after the cookie keeps its name and value.
+    [`Cookie: sid=${value}; X-ApiKeys: "${value}"`, /^Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
+    [`Cookie: sid="${value}"; X-ApiKeys: "${value}"`, /^Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
+    [`Cookie: TNS_SESSIONID=${value}; theme=dark; X-Api-Key: "${value}"; Content-Type: "application/json"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"$/],
+    [`Cookie: sid="${value}", X-SecurityCenter: "${value}", Content-Type: "application/json"`, /^Cookie: \[REDACTED\], X-SecurityCenter: "\[REDACTED\]", Content-Type: "application\/json"$/],
+    [`Set-Cookie: TNS_SESSIONID=${value}; Path=/; HttpOnly; X-ApiKeys: "accessKey=${value}"`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"$/],
+    [`Cookie: sid=${value}; Content-Type: "application/json"; X-ApiKeys: accessKey=${value};secretKey=${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-ApiKeys: \[REDACTED\]$/],
+    [`X-ApiKeys: "accessKey=${value}"; Cookie: sid=${value}; Content-Type: text/plain`, /^X-ApiKeys: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/plain$/],
+    [`{"error_msg":"Cookie: sid=${value}; X-ApiKeys: \\"${value}\\"; Content-Type: \\"application/json\\"","code":401}`, /^\{"error_msg":"Cookie: \[REDACTED\]; X-ApiKeys: \\"\[REDACTED\]\\"; Content-Type: \\"application\/json\\"","code":401\}$/],
+    [`<p>Cookie: sid="${value}"; X-ApiKeys: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-ApiKeys: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
+    [`Cookie: sid=${value}; X-Cookie: "token=${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; X-Cookie: "\[REDACTED\]", Accept: text\/html$/],
+    // The shared end-at-separator rule, edge by edge: a quoted value ends at its closing
+    // quote even with "; Name:" inside; cookie attributes before the next header go with the
+    // cookie; an unterminated quoted value ends before the next header; Content-Type and
+    // Date after a cookie keep their names and values.
+    [`Cookie: "sid=${value}; X-ApiKeys: ${value}"`, /^Cookie: "\[REDACTED\]"$/],
+    [`Set-Cookie: TNS_SESSIONID=${value}; Path=/; HttpOnly; X-ApiKeys: accessKey=${value}`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]$/],
+    [`Set-Cookie: TNS_SESSIONID=${value}; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/; X-ApiKeys: ${value}`, /^Set-Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]$/],
+    [`Cookie: "sid=${value}; X-ApiKeys: ${value}`, /^Cookie: \[REDACTED\]; X-ApiKeys: \[REDACTED\]$/],
+    [`Cookie: sid=${value}; Content-Type: application/json; Date: Tue, 22 Sep 2026 18:00:00 GMT`, /^Cookie: \[REDACTED\]; Content-Type: application\/json; Date: Tue, 22 Sep 2026 18:00:00 GMT$/],
+    // JSON-escaped carriers at any depth: a header pair, a credential pair, an attribute, and
+    // an assignment inside a JSON text stringified into a string value (one and two levels
+    // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
+    [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-ApiKeys\\": \\"accessKey=${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-ApiKeys\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"X-SecurityCenter\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"X-SecurityCenter\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"Bearer \[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{'X-Cookie': 'token=${value}'}"}`, /^\{"detail":"\{'X-Cookie': '\[REDACTED\]'\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
+    [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"secretKey\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"secretKey\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"<scanner name=\\"s1\\" key=\\"${value}\\"/>"}`, /^\{"detail":"<scanner name=\\"s1\\" key=\\"\[REDACTED\]\\"\/>"\}$/],
+    [`{"detail":"password: \\"${value}\\" rejected"}`, /^\{"detail":"password: \\"\[REDACTED\]\\" rejected"\}$/],
+    [`{"detail":"registration_code=\\"${value}\\" rejected"}`, /^\{"detail":"registration_code=\\"\[REDACTED\]\\" rejected"\}$/],
+    // Reviewer E gap 9: a header name or a pair key right after a JSON string escape left by
+    // one stringify (\n, \t, \r\n, \u000a, \u0009) is a carrier as it is at a word boundary,
+    // bare, inside a JSON string member, and nested one level down; an unquoted value ends at
+    // the next escaped line break, so the header after it keeps its name and a Content-Type
+    // or Date keeps name and value, and a quoted value still ends at its closing quote.
+    [`request failed\\napi_key=${value}; \\nX-SecurityCenter: ${value}\\nContent-Type: application/json`, /^request failed\\napi_key=\[REDACTED\]; \\nX-SecurityCenter: \[REDACTED\]\\nContent-Type: application\/json$/],
+    [`{"detail":"request failed\\napi_key=${value}; \\nX-SecurityCenter: ${value}\\nContent-Type: application/json"}`, /^\{"detail":"request failed\\napi_key=\[REDACTED\]; \\nX-SecurityCenter: \[REDACTED\]\\nContent-Type: application\/json"\}$/],
+    [`upstream said {"headers":"\\r\\nX-SecurityCenter: ${value}\\r\\nAuthorization: Bearer ${value}\\r\\nX-Cookie: token=${value}\\u000aCookie: sid=${value}"}`, /^upstream said \{"headers":"\\r\\nX-SecurityCenter: \[REDACTED\]\\r\\nAuthorization: Bearer \[REDACTED\]\\r\\nX-Cookie: \[REDACTED\]\\u000aCookie: \[REDACTED\]"\}$/],
+    [`\\tX-SecurityCenter: "${value}"\\u0009X-ApiKeys: accessKey=${value};secretKey=${value}\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT`, /^\\tX-SecurityCenter: "\[REDACTED\]"\\u0009X-ApiKeys: \[REDACTED\]\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT$/],
+    [`\\nX-PAN-KEY: ${value}\\nx-redlock-auth: ${value}\\nSet-Cookie: session=${value}; Path=/\\nX-Total-Count: 3`, /^\\nX-PAN-KEY: \[REDACTED\]\\nx-redlock-auth: \[REDACTED\]\\nSet-Cookie: \[REDACTED\]\\nX-Total-Count: 3$/],
+    [`\\tpassword: ${value}\\nkey=${value}&x=1\\u000apin=${value}\\nContent-Length: 42`, /^\\tpassword: \[REDACTED\]\\nkey=\[REDACTED\]&x=1\\u000apin=\[REDACTED\]\\nContent-Length: 42$/],
+    [`{"detail":"login failed\\nAuthorization: Basic ${value}\\nsid=${value}; \\nauth: ${value}"}`, /^\{"detail":"login failed\\nAuthorization: Basic \[REDACTED\]\\nsid=\[REDACTED\]; \\nauth: \[REDACTED\]"\}$/],
     [`accessKey=${value};secretKey=${value}`, /^accessKey=\[REDACTED\];secretKey=\[REDACTED\]$/],
     [`TNS_SESSIONID=${value}; Path=/`, /^TNS_SESSIONID=\[REDACTED\]; Path=\/$/],
     [`session=${value} expired`, /^session=\[REDACTED\] expired$/],
@@ -1120,6 +1170,755 @@ function carriersOf(value) {
     [`<field name='pw' password='${value}'/>`, /^<field name='pw' password='\[REDACTED\]'\/>$/],
   ];
 }
+
+// Reviewer E gap 9: inside a JSON string that was stringified once, a line break or a tab
+// arrives as the two characters \n, \r, \t (or the six of \u000a, \u0009), and the header
+// name after it has no word boundary in front of it ("\nX-SecurityCenter" reads as one
+// word), so the header rule missed it and the pair rule read "nX-SecurityCenter" as a key
+// naming nothing. Every credential header the three integrations send, after every escape,
+// bare, as a JSON string member, and followed by more escaped text, loses its value in both
+// scrubs; the Content-Type and Date on the next escaped line keep their names and values;
+// the pair rule reads the key after the escape the same way; the result is a fixed point.
+const GAP9_VALUE = "sess-escn-NLINE-27182818284590";
+const GAP9_HEADERS = [
+  ["X-SecurityCenter", (value) => `X-SecurityCenter: ${value}`],
+  ["X-ApiKeys", (value) => `X-ApiKeys: accessKey=${value}; secretKey=${value}`],
+  ["X-Cookie", (value) => `X-Cookie: token=${value}`],
+  ["X-PAN-KEY", (value) => `X-PAN-KEY: ${value}`],
+  ["x-redlock-auth", (value) => `x-redlock-auth: ${value}`],
+  ["Authorization Bearer", (value) => `Authorization: Bearer ${value}`],
+  ["Authorization Basic", (value) => `Authorization: Basic ${value}`],
+  ["Cookie", (value) => `Cookie: sid=${value}`],
+  ["Set-Cookie", (value) => `Set-Cookie: session=${value}; Path=/; HttpOnly`],
+  ["quoted X-SecurityCenter", (value) => `X-SecurityCenter: "${value}"`],
+  ["quoted Cookie", (value) => `Cookie: sid="${value}"; theme=dark`],
+];
+const GAP9_ESCAPES = ["\\n", "\\r\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\u000a", "\\u0009", "\\\""];
+const GAP9_FOLLOWING = "\\nContent-Type: application/json\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT";
+const GAP9_CONTEXTS = [
+  ["bare", (escape, line) => `request failed${escape}${line}`],
+  ["JSON member", (escape, line) => `{"detail":"request failed${escape}${line}","code":403}`],
+  ["followed by escaped text", (escape, line) => `request failed${escape}${line}${GAP9_FOLLOWING}`],
+];
+const GAP9_PAIRS = [
+  (value) => `\\nkey=${value}&x=1`, (value) => `\\nauth: ${value}`, (value) => `\\nsid=${value}; path=/`, (value) => `\\npin=${value}`,
+  (value) => `\\u000atoken=${value}`, (value) => `\\tpassword: ${value}`, (value) => `\\r\\nsecret='${value}'`, (value) => `\\nkey="${value}"`,
+  (value) => `\\u0009otp=${value}`, (value) => `\\bapi_key=${value}`,
+];
+const GAP9_CONTROLS = [
+  "request failed\\nContent-Type: application/json\\nDate: Tue, 22 Sep 2026 18:00:00 GMT\\nX-Total-Count: 3",
+  '{"detail":"request failed\\nContent-Length: 42\\r\\nAccept: text/html\\tX-Request-Id: 7d2f4e6a"}',
+  "\\napi_keys: 3\\nkeys=2\\ncookies: 0",
+  "The upstream\\nrequested the token inventory\\nand the cookie count is 3",
+];
+
+test("reviewer E gap 9: every credential header and pair key after a JSON string escape loses its value in both scrubs, bare, as a JSON member, and followed by more escaped text, while the headers on the next escaped line keep their names", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [name, line] of GAP9_HEADERS) for (const escape of GAP9_ESCAPES) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap(escape, line(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} ${name} after ${JSON.stringify(escape)} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      if (context === "JSON member") assert.ok(out.endsWith('","code":403}'), `${label}: the JSON member lost its closing text: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const pair of GAP9_PAIRS) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap("", pair(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} pair ${JSON.stringify(pair(GAP9_VALUE))} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP9_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 9: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * (GAP9_HEADERS.length * GAP9_ESCAPES.length + GAP9_PAIRS.length) * GAP9_CONTEXTS.length);
+});
+
+// Reviewer E gap 10: two RFC 6265 token characters let a later cookie pair's value through.
+// An apostrophe in a pair name or value (my'pref=value, sid=O'hunter2) was read as the quote
+// closing the text the line was quoted in, so the value ended at "my" and the pair after
+// the apostrophe stayed; and "&" or "#" in a credential-named pair whose value sat in
+// JSON-escaped quotes (my&sid=\"value\") was taken first by the URL query rule with the
+// lone backslash as its value, leaving the quoted value behind an orphan quote. Two rules
+// now hold in both scrubs of all three modules: a quote closes a value only at the end of a
+// token (before whitespace, a delimiter, a bracket, another quote, an escape, or the end),
+// never mid-token, in header values, pair values, quoted attributes, and query values; and
+// a bare query value never takes a backslash (the escape after it is kept, so a JSON string
+// still parses and the text after it is still read), with a recognised header line read
+// before the query rule. The controls, the closing quote and following members of an
+// enclosing JSON member, escaped controls, and a single-quoted enclosing text survive.
+const GAP10_VALUES = ["hunter2", "Tr0ub4dor3", "correct-horse-battery-staple", "abc123", "x7", "9f8e7d6c5b4a3f2e1d0c", "O'Brien42", "p@ss.w0rd", "sess-apos-QUOTE-14142135623730", "dXNlcjpwYXNzd29yZA==", "AKIAIOSFODNN7EXAMPLE", "s3cr3t_2026-09-22T18.00.00Z"];
+const GAP10_ROWS = [
+  // rule 1: an apostrophe or a raw quote inside a token is content of the value
+  [(v) => `Cookie: theme=dark; my'pref=${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my'pref="${v}"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`, () => `Cookie: [REDACTED]; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`],
+  [(v) => `Cookie: sid=O'${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my"pref=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: sid="O'${v}"; theme=dark; X-ApiKeys: accessKey=${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `Set-Cookie: my'sid=${v}; Path=/; HttpOnly; Date: Mon, 22 Sep 2026 12:30:00 GMT`, () => `Set-Cookie: [REDACTED]; Date: Mon, 22 Sep 2026 12:30:00 GMT`],
+  [(v) => `X-Cookie: token=a; my'pref=${v}`, () => `X-Cookie: [REDACTED]`],
+  [(v) => `{"detail":"Cookie: theme=dark; my'pref=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `{"detail":"Cookie: sid=O'${v}; Content-Type: text/html","code":401}`, () => `{"detail":"Cookie: [REDACTED]; Content-Type: text/html","code":401}`],
+  [(v) => `'Cookie: sid=O'${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `sid=O'${v}; path=/`, () => `sid=[REDACTED]; path=/`],
+  [(v) => `password: O'${v}`, () => `password: [REDACTED]`],
+  [(v) => `password='O'${v}'`, () => `password='[REDACTED]'`],
+  [(v) => `{"x":"token=O'${v}"}`, () => `{"x":"token=[REDACTED]"}`],
+  [(v) => `?token=O'${v}&x=1`, () => `?token=[REDACTED]&x=1`],
+  // rule 2: a bare query value stops before a backslash and the escape is kept
+  [(v) => `{"url": "https://h.example.com/p?token=${v}\\"}`, () => `{"url": "https://h.example.com/p?token=[REDACTED]\\"}`],
+  [(v) => `{"log": "GET /x?api_key=${v}\\nstatus 502"}`, () => `{"log": "GET /x?api_key=[REDACTED]\\nstatus 502"}`],
+  [(v) => `{"hook":"https://hooks.slack.com/services/T000/B000/${v}\\"}`, () => `{"hook":"https://hooks.slack.com/services/[REDACTED]\\"}`],
+  [(v) => `{"message": "Cookie: theme=dark; my&sid=\\"${v}\\""}`, () => `{"message": "Cookie: [REDACTED]"}`],
+  [(v) => `{"headers":"Set-Cookie: my#sid=\\"${v}\\"; HttpOnly; Content-Type: \\"text/html\\""}`, () => `{"headers":"Set-Cookie: [REDACTED]; Content-Type: \\"text/html\\""}`],
+  [(v) => `{"headers":"Cookie: theme=dark; my&sid=\\"${v}\\"; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`, () => `{"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`],
+  // boundaries that held before and must keep holding
+  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: Bearer [REDACTED]`],
+  [(v) => `Cookie: my&sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: theme=dark; my#sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `rejected header "Cookie: sid=${v}" and "X-Other: 1"`, () => `rejected header "Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `{"detail":"Cookie: sid=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `'Cookie: sid=${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `Cookie: "sid=${v}; X-ApiKeys: ${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `X-ApiKeys: accessKey="${v}";secretKey="${v}"; Content-Type: application/json`, () => `X-ApiKeys: [REDACTED]; Content-Type: application/json`],
+  [(v) => `{"error":"X-ApiKeys: accessKey=\\"${v}\\";secretKey=\\"${v}\\"","code":403}`, () => `{"error":"X-ApiKeys: [REDACTED]","code":403}`],
+  [(v) => `Cookie: sid=${v}"; theme=dark`, () => `Cookie: [REDACTED]"; theme=dark`],
+  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: Basic [REDACTED]","code":401}`],
+  [(v) => `Cookie: sid=${v}=" and "X-Other: 1"`, () => `Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `sid=${v}'; path=/`, () => `sid=[REDACTED]'; path=/`],
+  [(v) => `api_key=${v}"}`, () => `api_key=[REDACTED]"}`],
+  [(v) => `?token=${v}'}`, () => `?token=[REDACTED]'}`],
+];
+const GAP10_CONTROLS = [
+  `Content-Type: "text/html; charset=utf-8"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`,
+  `{"detail":"it's a fine day","code":200}`,
+  `the cookie count is 3 and the token inventory holds 2`,
+  `{"names":["O'Brien","D'Angelo"],"cookies":0}`,
+  `password=""`,
+];
+
+test("reviewer E gap 10: a quote inside a token is content of a cookie, pair, attribute, or query value in both scrubs, a bare query value stops before a backslash and keeps the escape, and a recognised header line is read before the query rule", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expect] of GAP10_ROWS) for (const value of GAP10_VALUES) {
+      const input = make(value);
+      const out = scrub(input);
+      const label = `reviewer E gap 10: ${scrub.name} ${JSON.stringify(input)}`;
+      assert.equal(out, expect(value), label);
+      assertNoWindow(out, value, label);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP10_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 10: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * GAP10_ROWS.length * GAP10_VALUES.length);
+});
+
+// Reviewer E finding C: an Authorization or Proxy-Authorization value whose first word is not
+// a listed scheme word (Bot, GenieKey, Zoho-oauthtoken, Api-Token, SharedKey, LOW, AWS, Key,
+// Element, HMAC) goes whole, to the end of the line or to the next header on a compound
+// line, in both scrubs: the unknown word may be a scheme with its credentials after it, so
+// nothing after it is trusted. A single-token header whose value opens with a listed scheme
+// word (X-Auth-Token: Bearer <v>, X-Api-Key: Token <v>) loses the word and the token after it
+// under one marker, so the token is never left standing after the marker while prose after
+// the token stays. A listed scheme under Authorization keeps its word and loses the one
+// token after it. The values are shapes the long-token rule does not catch (a UUID, a dotted
+// token, short values) beside one it does; each row is read bare, as a JSON string member,
+// and on an escaped line, and the text around the header survives.
+const FINDING_C_VALUES = ["eb243592-faa2-4ba2-a551-1afdf565c889", "MTA1MjQ4NDQ2NzI2.GhYz9q.r0tAt3dT0k3nV4lu3", "a1b2c3d4e5f", "hunter2x", "Kq7Zx2Vw9Lm4Tp8Rq3Wn6Yb1Xc5Vd8Fg"];
+const FINDING_C_ROWS = [
+  // an unlisted first word, or no word at all: the whole value goes
+  [(v) => `Authorization: Bot ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Zoho-oauthtoken ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Zoho-enczapikey ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Api-Token ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Key ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Element ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: HMAC ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: SharedKey account:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: LOW ${v}:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: AWS AKIAIOSFODNN7EXAMPLE:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Proxy-Authorization: Bot ${v}`, () => "Proxy-Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v} was rejected`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: ${v} was rejected`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: 12345 ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v}, X-Api-Key: ${v}; Date: Tue, 22 Sep 2026 18:00:00 GMT`, () => "Authorization: [REDACTED], X-Api-Key: [REDACTED]; Date: Tue, 22 Sep 2026 18:00:00 GMT"],
+  // a single-token header whose value opens with a listed scheme word: the word and the token go together
+  [(v) => `X-Auth-Token: Bearer ${v}`, () => "X-Auth-Token: [REDACTED]"],
+  [(v) => `X-Api-Key: Token ${v}`, () => "X-Api-Key: [REDACTED]"],
+  [(v) => `X-Auth-Token: Bearer ${v} rejected`, () => "X-Auth-Token: [REDACTED] rejected"],
+  [(v) => `X-Api-Key: Token ${v} then retry`, () => "X-Api-Key: [REDACTED] then retry"],
+  [(v) => `X-Api-Key: ApiKey ${v}; Content-Type: application/json`, () => "X-Api-Key: [REDACTED]; Content-Type: application/json"],
+  // controls: a listed scheme under Authorization keeps its word and loses the one token
+  // after it, or its whole parameter list; a bare token under a single-token header goes alone
+  [(v) => `Authorization: Bearer ${v} was rejected`, () => "Authorization: Bearer [REDACTED] was rejected"],
+  [(v) => `Proxy-Authorization: Basic ${v} was rejected`, () => "Proxy-Authorization: Basic [REDACTED] was rejected"],
+  [(v) => `Authorization: SSWS ${v}`, () => "Authorization: SSWS [REDACTED]"],
+  [(v) => `Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=${v}`, () => "Authorization: AWS4-HMAC-SHA256 [REDACTED]"],
+  [(v) => `X-Auth-Token: ${v} rejected`, () => "X-Auth-Token: [REDACTED] rejected"],
+];
+const FINDING_C_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"detail":"${line}","code":401}`],
+  ["escaped line", (line) => `request failed\\n${line}\\nContent-Type: application/json`],
+];
+const FINDING_C_CONTROLS = [
+  "Proxy-Authorization: [REDACTED]; Content-Type: application/json",
+  "X-Auth-Token: [REDACTED] rejected",
+  'Authorization: "Bearer [REDACTED]" was rejected',
+  "Basic authentication is required; the Bearer token is missing; Content-Type: application/json, Date: Tue, 22 Sep 2026 18:00:00 GMT",
+];
+
+test("reviewer E finding C: an Authorization value with an unlisted first word goes whole, a single-token header that opens with a listed scheme word loses the word and the token together, and a listed scheme under Authorization keeps its word, in both scrubs, bare, as a JSON member, and on an escaped line", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expect] of FINDING_C_ROWS) for (const value of FINDING_C_VALUES) for (const [context, wrap] of FINDING_C_CONTEXTS) {
+      const input = wrap(make(value));
+      const out = scrub(input);
+      const label = `reviewer E finding C: ${scrub.name} ${context} ${JSON.stringify(input)}`;
+      assert.equal(out, wrap(expect(value)), label);
+      assertNoWindow(out, value, label);
+      assert.ok(!out.includes("AKIAIOSFODNN7EXAMPLE"), `${label}: the access key id half of a SigV2 value survived in ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of FINDING_C_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding C: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * FINDING_C_ROWS.length * FINDING_C_VALUES.length * FINDING_C_CONTEXTS.length);
+});
+
+// Reviewer E finding A: inside a JSON string that was stringified once, a tab, form feed,
+// backspace, vertical tab, NUL, or their \u0009-style codes arrive as two or six characters,
+// and an unquoted pair value in the = spelling, a single-token header value, the token after
+// a scheme word, and a --flag value ran through them, so a second credential pair chained
+// after the escape lost its key into the first value and kept its own value. Every such
+// value now ends at an escaped control as it does at the raw character (a line break, \t,
+// \b, \f, \v, \0, \u0000 to \u001f, \u007f, \x09 and the other \xHH controls), so the
+// second pair is read on its own and loses its value; a key: value line still ends at a line
+// break only, so the second pair after a tab goes with the first value there (nothing
+// survives). The escape of a printable character (\u00e9) is content; a raw control ends a
+// value the same way; text with no carrier is untouched; the result is a fixed point.
+const FINDING_A_FIRST = "hunter2first";
+const FINDING_A_SECOND = "correcthorsesecond";
+const FINDING_A_FIRST_CARRIERS = [
+  ["api_key=", (v) => `api_key=${v}`],
+  ["token=", (v) => `token=${v}`],
+  ["password: ", (v) => `password: ${v}`],
+  ["Authorization: Bearer ", (v) => `Authorization: Bearer ${v}`],
+  ["X-Auth-Token: Bearer ", (v) => `X-Auth-Token: Bearer ${v}`],
+  ["Cookie: sid=", (v) => `Cookie: sid=${v}`],
+  ["X-Api-Key: ", (v) => `X-Api-Key: ${v}`],
+  ['"api_key":"', (v) => `"api_key":"${v}"`],
+  ["--password ", (v) => `--password ${v}`],
+  ["-Dpassword=", (v) => `-Dpassword=${v}`],
+];
+const FINDING_A_ESCAPES = ["\\t", "\\n", "\\r\\n", "\\u0009", "\\u000a", "\\f", "\\b", "\\v", "\\0", "\\x09", "\\u001f", "\\u007f"];
+const FINDING_A_SECOND_CARRIERS = [
+  ["password: ", (v) => `password: ${v}`],
+  ["password:", (v) => `password:${v}`],
+  ["secret=", (v) => `secret=${v}`],
+  ["X-Api-Key: ", (v) => `X-Api-Key: ${v}`],
+  ["Authorization: Bearer ", (v) => `Authorization: Bearer ${v}`],
+  ["Cookie: sid=", (v) => `Cookie: sid=${v}`],
+];
+const FINDING_A_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"message":"${line}","code":502}`],
+  ["prose before", (line) => `login failed: ${line}`],
+];
+// Exact renderings: the = spelling, the header token, the scheme credentials, and the flag
+// value end at the escape, and the chained pair keeps its key and loses its value.
+const FINDING_A_EXACT = [
+  [(e) => `api_key=${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}`, (e) => `api_key=[REDACTED]${e}password: [REDACTED]`],
+  [(e) => `token=${FINDING_A_FIRST}${e}secret=${FINDING_A_SECOND}`, (e) => `token=[REDACTED]${e}secret=[REDACTED]`],
+  [(e) => `api_key=${FINDING_A_FIRST}${e}X-Api-Key: ${FINDING_A_SECOND}`, (e) => `api_key=[REDACTED]${e}X-Api-Key: [REDACTED]`],
+  [(e) => `Authorization: Bearer ${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}`, (e) => `Authorization: Bearer [REDACTED]${e}password: [REDACTED]`],
+  [(e) => `X-Api-Key: ${FINDING_A_FIRST}${e}X-Api-Key: ${FINDING_A_SECOND}`, (e) => `X-Api-Key: [REDACTED]${e}X-Api-Key: [REDACTED]`],
+  [(e) => `X-Auth-Token: Bearer ${FINDING_A_FIRST}${e}Cookie: sid=${FINDING_A_SECOND}`, (e) => `X-Auth-Token: [REDACTED]${e}Cookie: [REDACTED]`],
+  [(e) => `--password ${FINDING_A_FIRST}${e}secret=${FINDING_A_SECOND}`, (e) => `--password [REDACTED]${e}secret=[REDACTED]`],
+  [(e) => `{"message":"--password ${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}","code":502}`, (e) => `{"message":"--password [REDACTED]${e}password: [REDACTED]","code":502}`],
+];
+const FINDING_A_CONTROLS = [
+  "Content-Type: application/json\\tX-Request-Id: 7d2f4e6a\\u0009Date: Tue, 22 Sep 2026 18:00:00 GMT",
+  '{"message":"request failed\\tstatus 502\\fretry later\\bdone","code":502}',
+  "api_keys: 3\\tkeys=2\\u0009cookies: 0",
+  "path C:\\\\temp\\\\file.txt and C:\\\\Users\\\\bob\\\\.kube\\\\config",
+  "api_key=[REDACTED]\\tpassword: [REDACTED]",
+];
+
+test("reviewer E finding A: an unquoted pair value, a single-token header value, the token after a scheme word, and a flag value end at every escaped control, so a credential pair chained after the escape loses its own value in both scrubs", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [firstName, first] of FINDING_A_FIRST_CARRIERS) for (const escape of FINDING_A_ESCAPES) for (const [secondName, second] of FINDING_A_SECOND_CARRIERS) for (const [context, wrap] of FINDING_A_CONTEXTS) {
+      const input = wrap(`${first(FINDING_A_FIRST)}${escape}${second(FINDING_A_SECOND)}`);
+      const out = scrub(input);
+      const label = `reviewer E finding A: ${scrub.name} [${firstName}] ${JSON.stringify(escape)} [${secondName}] ${context}: ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assertNoWindow(out, FINDING_A_FIRST, label);
+      assertNoWindow(out, FINDING_A_SECOND, label);
+      if (context === "JSON member") assert.ok(out.endsWith('","code":502}'), `${label}: the JSON member lost its closing text`);
+      if (context === "prose before") assert.ok(out.startsWith("login failed: "), `${label}: the prose before the pair was lost`);
+      assert.equal(scrub(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [make, expect] of FINDING_A_EXACT) for (const escape of FINDING_A_ESCAPES) {
+      const input = make(escape);
+      assert.equal(scrub(input), expect(escape), `reviewer E finding A: ${scrub.name} ${JSON.stringify(input)}`);
+    }
+    for (const escape of ["\t", "\n", "\f", "\v", "\u001f"]) {
+      assert.equal(scrub(`api_key=${FINDING_A_FIRST}${escape}password: ${FINDING_A_SECOND}`), `api_key=[REDACTED]${escape}password: [REDACTED]`, `reviewer E finding A: ${scrub.name} raw control ${JSON.stringify(escape)}`);
+    }
+    assert.equal(scrub(`api_key=${FINDING_A_FIRST}\\u00e9tail rejected`), "api_key=[REDACTED] rejected", `reviewer E finding A: ${scrub.name} keeps the escape of a printable character inside the value`);
+    assert.equal(scrub(`password: ${FINDING_A_FIRST}\\tpassword: ${FINDING_A_SECOND}`), "password: [REDACTED]", `reviewer E finding A: ${scrub.name} a key: value line ends at a line break only`);
+    for (const text of FINDING_A_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding A: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * FINDING_A_FIRST_CARRIERS.length * FINDING_A_ESCAPES.length * FINDING_A_SECOND_CARRIERS.length * FINDING_A_CONTEXTS.length);
+});
+
+// Reviewer E finding D (ruling R5): a colon-terminated credential key that ends a path
+// segment is a label whose value is at most one token. A singular label (password, token,
+// api_key, secret) takes that token whatever its shape, a random token or a plain word,
+// and whatever follows it, so "/etc/app/password: <value> was rejected" renders
+// "/etc/app/password: [REDACTED] was rejected"; a plural label (api-tokens, tokens, apikeys,
+// passwords, credentials) names a collection, so prose after the token means there was no
+// value ("/api/v1/api-tokens: request failed with 403" stays) while a lone token after it is
+// one; a count under a plural label stays; an escaped slash before the key is not a path.
+const FINDING_D_VALUES = ["hunter2first", "hunter2", "3f9c2b1e-7a4d-4c58-9b0e-2d6f8a1c5e73", "Kq7Zx2Vw9Lm4Tp8RfS1uY3cB6dN0hJ5g", "mfa.Xk9pQ2.rT7vN4wL8s"];
+const FINDING_D_SINGULAR_LABELS = ["/etc/app/password: ", "secrets/db/password: ", "vault read secret/app/token: ", "/run/secrets/api_key: ", "GET /api/v2/oauth/token: ", "kv/data/app/secret: ", "# /etc/app/password: ", "https://vault.example.com:8200/v1/secret/app/key: "];
+const FINDING_D_PLURAL_LABELS = ["/api/v1/api-tokens: ", "GET /api/v2/oauth/tokens: ", "/api/v1/apikeys: ", "/etc/app/passwords: ", "/v1/credentials: ", "/api/v1/keys: "];
+const FINDING_D_TAILS = [" was rejected", " is expired", " has no policy", ""];
+const FINDING_D_PROSE = ["request failed with 403", "listing returned 200 items", "read refused for this role"];
+const FINDING_D_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"detail":"${line}","code":403}`],
+  ["escaped line", (line) => `request failed\\n${line}\\nContent-Type: application/json`],
+];
+const FINDING_D_CONTROLS = [
+  "/api/v1/api-tokens: request failed with 403",
+  "GET /api/v2/oauth/tokens: request failed",
+  "/api/v2/oauth/tokens: 3",
+  "/api/v1/keys: listing returned 200 items",
+  "/rest/token failed (403): upstream rejected the request",
+  "GET /api/v2/users/me.json: request failed with 403",
+  "/etc/app/password:",
+  "/etc/app/password: [REDACTED] was rejected",
+];
+
+test("reviewer E finding D: a singular credential label at the end of a path segment takes the next token whatever its shape and whatever follows, a plural label followed by prose stays and followed by a lone token loses it, in both scrubs, bare, as a JSON member, and on an escaped line", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const value of FINDING_D_VALUES) for (const [context, wrap] of FINDING_D_CONTEXTS) {
+      for (const label of FINDING_D_SINGULAR_LABELS) for (const tail of FINDING_D_TAILS) {
+        const input = wrap(`${label}${value}${tail}`);
+        const out = scrub(input);
+        const name = `reviewer E finding D: ${scrub.name} ${context} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+        assert.equal(out, wrap(`${label}[REDACTED]${tail}`), name);
+        assertNoWindow(out, value, name);
+        assert.equal(scrub(out), out, `${name}: not idempotent`);
+        cases += 1;
+      }
+      for (const label of FINDING_D_PLURAL_LABELS) {
+        const lone = wrap(`${label}${value}`);
+        const out = scrub(lone);
+        const name = `reviewer E finding D: ${scrub.name} ${context} ${JSON.stringify(lone)} -> ${JSON.stringify(out)}`;
+        assert.equal(out, wrap(`${label}[REDACTED]`), `${name}: a lone token after a plural label is its value`);
+        assertNoWindow(out, value, name);
+        cases += 1;
+      }
+    }
+    for (const [context, wrap] of FINDING_D_CONTEXTS) for (const label of FINDING_D_PLURAL_LABELS) for (const prose of FINDING_D_PROSE) {
+      const input = wrap(`${label}${prose}`);
+      assert.equal(scrub(input), input, `reviewer E finding D: ${scrub.name} ${context} changed a plural label followed by prose: ${JSON.stringify(input)}`);
+      cases += 1;
+    }
+    assert.equal(scrub("line\\/password: hunter2first was rejected"), "line\\/password: [REDACTED]", `reviewer E finding D: ${scrub.name} an escaped slash before the key is a line break, not a path, so the key: value line goes to its end`);
+    for (const text of FINDING_D_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding D: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * (FINDING_D_VALUES.length * FINDING_D_CONTEXTS.length * (FINDING_D_SINGULAR_LABELS.length * FINDING_D_TAILS.length + FINDING_D_PLURAL_LABELS.length) + FINDING_D_CONTEXTS.length * FINDING_D_PLURAL_LABELS.length * FINDING_D_PROSE.length));
+});
+
+// CodeRabbit item on #76: the user-and-secret prefix of a URL ends where its authority does, at
+// the first "/", "?", or "#", so an "@" inside a query or fragment is never read as userinfo.
+// Before the fix https://h?e=a@x.com&token=<v> rendered https://[REDACTED]@x.com&token=[REDACTED]
+// (the host "h" and the query lost, "x.com&token=" carried on as the host) and a webhook_url
+// with that shape reduced to the fake origin https://x.com&v=<v>/[REDACTED].
+const USERINFO_LONG_CANARY = "Qm7Vx2Lk9Rt4Pw8Zs3Yh6Nd1Bc5Fg0Jt";
+// [input, expected, the value no window of which may appear in the output]
+const USERINFO_URL_ROWS = [
+  ["https://h?e=a@x.com&token=s3cr3t", "https://h?e=a@x.com&token=[REDACTED]", "s3cr3t"],
+  ["https://h#f@x.com", "https://h#f@x.com", null],
+  [`https://h?e=a@x.com&token=${USERINFO_LONG_CANARY}`, "https://h?e=a@x.com&token=[REDACTED]", USERINFO_LONG_CANARY],
+  ["https://h?token=s3cr3t@x.com", "https://h?token=[REDACTED]", "s3cr3t"],
+  ["https://h/p?e=a@x.com#f@y.com", "https://h/p?e=a@x.com#f@y.com", null],
+  // Controls: a real user-and-secret prefix still goes, before a path, a query, or a fragment.
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com/path?e=a`, "https://[REDACTED]@x.com/path?e=a", USERINFO_LONG_CANARY],
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com?e=a`, "https://[REDACTED]@x.com?e=a", USERINFO_LONG_CANARY],
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com#frag`, "https://[REDACTED]@x.com#frag", USERINFO_LONG_CANARY],
+];
+const USERINFO_WEBHOOK_ROWS = [
+  ["webhook_url=https://h?e=a@x.com&v=s3cr3t", "webhook_url=https://h/[REDACTED]", "s3cr3t"],
+  ['{"webhook_url":"https://h?e=a@x.com&v=s3cr3t"}', '{"webhook_url":"https://h/[REDACTED]"}', "s3cr3t"],
+  ["webhook_url: https://h#f@x.com", "webhook_url: https://h/[REDACTED]", null],
+];
+const escapeSlashes = (text) => text.replaceAll("/", "\\/");
+const USERINFO_CONTEXTS = [
+  ["bare", (url) => url],
+  ["in a sentence", (url) => `redirect to ${url} denied`],
+  ["escaped bare", (url) => escapeSlashes(url)],
+  ["escaped JSON member", (url) => `{"detail":"redirect to ${escapeSlashes(url)} denied","code":403}`],
+];
+
+test("CodeRabbit #76 userinfo: the user-and-secret prefix of a URL ends at the first /, ?, or #, so an @ inside a query or fragment keeps the host, the query is read pair by pair, and a webhook URL reduces to its true origin, in both scrubs, the walker, and an echoed URL in a Tenable error string", async () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [input, expected, canary] of USERINFO_URL_ROWS) for (const [context, wrap] of USERINFO_CONTEXTS) {
+      const text = wrap(input);
+      const out = scrub(text);
+      const name = `userinfo: ${scrub.name} ${context} ${JSON.stringify(text)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, wrap(expected), name);
+      if (canary) assertNoWindow(out, canary, name);
+      assert.equal(scrub(out), out, `${name}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected, canary] of USERINFO_WEBHOOK_ROWS) {
+      const out = scrub(input);
+      const name = `userinfo: ${scrub.name} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, name);
+      if (canary) assertNoWindow(out, canary, name);
+      assert.equal(scrub(out), out, `${name}: not idempotent`);
+      cases += 1;
+    }
+  }
+  assert.equal(cases, 2 * (USERINFO_URL_ROWS.length * USERINFO_CONTEXTS.length + USERINFO_WEBHOOK_ROWS.length));
+  // The walker applies the same rules to every string leaf and reads a webhook_url from the raw value.
+  for (const [input, expected, canary] of USERINFO_URL_ROWS) {
+    const walked = redactCredentialProperties({ url: input, description: `see ${input} for details`, nested: [{ endpoint: input }] });
+    assert.deepEqual(walked, { url: expected, description: `see ${expected} for details`, nested: [{ endpoint: expected }] }, `userinfo: walker ${input}`);
+    if (canary) assertNoWindow(JSON.stringify(walked), canary, `userinfo: walker ${input}`);
+  }
+  assert.deepEqual(redactCredentialProperties({ webhook_url: "https://h?e=a@x.com&v=s3cr3t", other: { webhook_url: "https://h#f@x.com" } }), { webhook_url: "https://h/[REDACTED]", other: { webhook_url: "https://h/[REDACTED]" } }, "userinfo: the walker reduces a webhook_url to its true origin");
+  // End to end: a 403 body echoing the URL reaches the operator through the client's error path.
+  for (const [url, expected, canary] of USERINFO_URL_ROWS) {
+    const clients = createTenableClients(vmConfig(), { fetchImpl: async () => jsonResponse({ error: `redirect to ${url} denied` }, 403), sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 });
+    const error = await clients.vm.get("/users").catch((thrown) => thrown);
+    assert.ok(error instanceof TenableApiError, `userinfo: ${url} threw ${String(error)}`);
+    assert.ok(error.message.includes(`redirect to ${expected} denied`), `userinfo: echoed URL ${url} -> ${error.message}`);
+    if (canary) assertNoWindow(error.message, canary, `userinfo: echoed URL ${url}`);
+  }
+});
+
+// Harness self-check (frozen revision 3, flag carrier cells): a credential name after "--"
+// whose spelling opens with an underscore (the `TNS_SESSIONID` cookie name with a leading underscore) was not read as a
+// flag, so "psql --_TNS_SESSIONID <value> -h db" kept the value when no token rule caught its
+// shape. The flag name may now open with a letter or an underscore; the value is still the
+// one token after it, never another flag, and a flag glued to a word (x--_password v) or a
+// non-credential underscore flag (--_theme dark) stays.
+const UNDERSCORE_FLAG_NAME_VALUE = "skvclmtirehs";
+const UNDERSCORE_FLAG_LONG_VALUE = "Wn4Kd8Tq2Zr7Vb1Xs9Pm3Lc6Yh0Jf5Gt";
+const UNDERSCORE_FLAG_ROWS = [
+  [(v) => `psql --_TNS_SESSIONID ${v} -h db`, `psql --_TNS_SESSIONID [REDACTED] -h db`],
+  [(v) => `--_TNS_SESSIONID ${v}`, `--_TNS_SESSIONID [REDACTED]`],
+  [(v) => `psql --_password ${v} -h db`, "psql --_password [REDACTED] -h db"],
+  [(v) => `run --__token ${v} --verbose`, "run --__token [REDACTED] --verbose"],
+  [(v) => `"cmd --_api_key ${v}"`, '"cmd --_api_key [REDACTED]"'],
+  [(v) => `{"message":"psql --_TNS_SESSIONID ${v} -h db failed","code":502}`, `{"message":"psql --_TNS_SESSIONID [REDACTED] -h db failed","code":502}`],
+];
+const UNDERSCORE_FLAG_CONTROLS = [
+  "--_theme dark",
+  "psql --_timeout 30 -h db",
+  "--_password --other",
+  "--_TNS_SESSIONID [REDACTED] -h db",
+  "count --_items 3",
+];
+
+test("harness self-check: a credential-named flag whose name opens with an underscore (--_TNS_SESSIONID <value>) loses its one value argument in both scrubs, while a non-credential underscore flag and a flag glued to a word stay", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expected] of UNDERSCORE_FLAG_ROWS) for (const value of [UNDERSCORE_FLAG_NAME_VALUE, UNDERSCORE_FLAG_LONG_VALUE]) {
+      const input = make(value);
+      const out = scrub(input);
+      const label = `underscore flag: ${scrub.name} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(scrub(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const text of UNDERSCORE_FLAG_CONTROLS) assert.equal(scrub(text), text, `underscore flag: ${scrub.name} changed a control: ${text}`);
+    assert.equal(scrub(`x--_password ${UNDERSCORE_FLAG_NAME_VALUE}`), `x--_password ${UNDERSCORE_FLAG_NAME_VALUE}`, `underscore flag: ${scrub.name} a flag glued to a word is not a flag`);
+  }
+  assert.equal(cases, 2 * UNDERSCORE_FLAG_ROWS.length * 2);
+  assert.equal(isCredentialKey("_TNS_SESSIONID"), true);
+  assert.equal(isCredentialKey("_theme"), false);
+});
+
+// Harness self-check (Codex P1 on #81, query carrier cells): a ";" inside a query value is part
+// of the value, as URLSearchParams reads it, so "?token=hunter2;restofsecret" is one value and
+// loses the whole of it. The query rule used to end a value at ";" and left ";restofsecret"
+// standing in relative, absolute, JSON-escaped, and slash-escaped URLs alike, through both
+// scrubs, the error constructor, and the walker. The ";" boundary belongs to the Cookie,
+// Set-Cookie, X-Cookie, and X-ApiKeys header lines, which go whole and are read before the query rule.
+const SEMICOLON_QUERY_VALUE = "hunter2;restofsecret";
+const SEMICOLON_QUERY_LONG_VALUE = "Rk7Vm2Qx9Tz4;Lw8Hn3Bd6Yp1Cf5";
+const SEMICOLON_QUERY_ROWS = [
+  [(v) => `GET /users?token=${v} failed`, "GET /users?token=[REDACTED] failed"],
+  [(v) => `GET /scans?folder_id=2&api_key=${v}&limit=50`, "GET /scans?folder_id=2&api_key=[REDACTED]&limit=50"],
+  [(v) => `GET /users?token=${v}; retrying`, "GET /users?token=[REDACTED] retrying"],
+  [(v) => `request to https://cloud.tenable.com/users?token=${v} failed`, "request to https://cloud.tenable.com/users?token=[REDACTED] failed"],
+  [(v) => `request to https://cloud.tenable.com/users?token=${v}`, "request to https://cloud.tenable.com/users?token=[REDACTED]"],
+  [(v) => `{"url":"https://cloud.tenable.com/users?token=${v}","status":401}`, '{"url":"https://cloud.tenable.com/users?token=[REDACTED]","status":401}'],
+  [(v) => `{"error":"request to \\"https://cloud.tenable.com/users?token=${v}\\" failed"}`, '{"error":"request to \\"https://cloud.tenable.com/users?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"error":"GET \\"/users?token=${v}\\" failed"}`, '{"error":"GET \\"/users?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"url":"https:\\/\\/cloud.tenable.com\\/users?token=${v}"}`, '{"url":"https:\\/\\/cloud.tenable.com\\/users?token=[REDACTED]"}'],
+  [(v) => `request to https:\\/\\/cloud.tenable.com\\/users?token=${v} failed`, "request to https:\\/\\/cloud.tenable.com\\/users?token=[REDACTED] failed"],
+  [(v) => `see https://sc.example.com/rest/token#access_token=${v}&type=bearer`, "see https://sc.example.com/rest/token#access_token=[REDACTED]&type=bearer"],
+];
+const SEMICOLON_QUERY_CONTROLS = [
+  ["Cookie: &sid=a; pref=b", "Cookie: [REDACTED]"],
+  ["Set-Cookie: TNS_SESSIONID=abc123; Path=/; HttpOnly", "Set-Cookie: [REDACTED]"],
+  ["GET /users?sort=asc;include=roles ok", "GET /users?sort=asc;include=roles ok"],
+  ["GET /scans?folder_id=2&limit=50 ok", "GET /scans?folder_id=2&limit=50 ok"],
+  ["GET /users?token=[REDACTED] failed", "GET /users?token=[REDACTED] failed"],
+];
+const SEMICOLON_QUERY_SINKS = [
+  ["redactErrorText", redactErrorText],
+  ["redactCredentialValueText", redactCredentialValueText],
+  ["redactSecrets", (text) => redactSecrets(text, [])],
+  ["TenableApiError", (text) => new TenableApiError(text, 401, "GET /users").message],
+  ["redactCredentialProperties", (text) => redactCredentialProperties({ note: text, items: [{ description: text }] }).note],
+];
+
+test("harness self-check: a \";\" inside a query value is part of the value, so ?token=hunter2;restofsecret loses the whole value in relative, absolute, JSON-escaped, and slash-escaped URLs through both scrubs, the error constructor, and the walker, while Cookie: &sid=a; pref=b still goes whole", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SEMICOLON_QUERY_SINKS) {
+    for (const [make, expected] of SEMICOLON_QUERY_ROWS) for (const value of [SEMICOLON_QUERY_VALUE, SEMICOLON_QUERY_LONG_VALUE]) {
+      const input = make(value);
+      const out = sink(input);
+      const label = `semicolon query value: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [text, expected] of SEMICOLON_QUERY_CONTROLS) assert.equal(sink(text), expected, `semicolon query value: ${sinkName} control ${JSON.stringify(text)}`);
+  }
+  assert.equal(cases, SEMICOLON_QUERY_SINKS.length * SEMICOLON_QUERY_ROWS.length * 2);
+});
+
+// Harness self-check (CodeRabbit on #81, discussion_r4081238237, scheme carrier cells): a scheme
+// word followed by a parameter list (Snowflake Token="<value>", Token token="<value>",
+// nonce="...", Digest username="...", nonce="...", response="...") is the value of an
+// Authorization header wherever it appears. With the header name in front the whole list
+// already went ("Authorization: Snowflake [REDACTED]"); without it the scheme rule consumed the
+// first "Token=" alone and left the quoted token standing ("Snowflake [REDACTED]\"<value>\""),
+// and a headerless Digest list kept its response="..." on the data side. The word now stays
+// and the whole list goes in both cases, bare, after a JSON escape, inside a JSON string, and
+// end to end through a 401 body that echoes the header; a list made only of challenge
+// parameters (a WWW-Authenticate value: Bearer realm="api", error="invalid_token") stays.
+const SCHEME_LIST_SHORT_VALUE = "skvclmtirehs";
+const SCHEME_LIST_LONG_VALUE = "Zq8Lm3Vn7Rt2Kp6Xw9Hs4Bd1";
+const DIGEST_NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093";
+const DIGEST_RESPONSE = "6629fae49393a05397450978507c4ef1";
+const SCHEME_LIST_ROWS = [
+  [(v) => `Authorization: Snowflake Token="${v}"`, "Authorization: Snowflake [REDACTED]"],
+  [(v) => `request failed with Authorization: Snowflake Token="${v}" see the log`, "request failed with Authorization: Snowflake [REDACTED]"],
+  [(v) => `authorization: snowflake token="${v}"`, "authorization: snowflake [REDACTED]"],
+  [(v) => `Proxy-Authorization: Snowflake Token='${v}'`, "Proxy-Authorization: Snowflake [REDACTED]"],
+  [(v) => `request failed\\nAuthorization: Snowflake Token=\\"${v}\\"`, "request failed\\nAuthorization: Snowflake [REDACTED]"],
+  [(v) => `{"message":"Authorization: Snowflake Token=\\"${v}\\" was rejected","code":401}`, '{"message":"Authorization: Snowflake [REDACTED]","code":401}'],
+  [(v) => `{"detail":"{\\"header\\":\\"Authorization: Snowflake Token=\\\\\\"${v}\\\\\\"\\"}"}`, '{"detail":"{\\"header\\":\\"Authorization: Snowflake [REDACTED]\\"}"}'],
+  [(v) => `auth header Snowflake Token="${v}" rejected`, "auth header Snowflake [REDACTED] rejected"],
+  [(v) => `Snowflake Token="${v}"`, "Snowflake [REDACTED]"],
+  [(v) => `{"error":"Snowflake Token=\\"${v}\\" rejected","code":401}`, '{"error":"Snowflake [REDACTED] rejected","code":401}'],
+  [(v) => `{"detail":"{\\"h\\":\\"Snowflake Token=\\\\\\"${v}\\\\\\"\\"}"}`, '{"detail":"{\\"h\\":\\"Snowflake [REDACTED]\\"}"}'],
+  [(v) => `Snowflake Token="${v}`, "Snowflake [REDACTED]"],
+  [(v) => `{"error":"Snowflake Token=\\"${v}","code":401}`, '{"error":"Snowflake [REDACTED]","code":401}'],
+  [(v) => `sent Token token="${v}", nonce="${DIGEST_NONCE}" to the API`, "sent Token [REDACTED] to the API"],
+  [(v) => `Authorization: Token token="${v}", nonce="${DIGEST_NONCE}"`, "Authorization: Token [REDACTED]"],
+  [(v) => `Authorization: Bearer token="${v}"`, "Authorization: Bearer [REDACTED]"],
+  [(v) => `ApiKey key="${v}" was refused`, "ApiKey [REDACTED] was refused"],
+  [(v) => `X-SecurityCenter: Snowflake Token="${v}"`, "X-SecurityCenter: [REDACTED]"],
+  [(v) => `OAuth oauth_consumer_key="dpf43f3p2l4k3l03", oauth_token="${v}", oauth_signature="${DIGEST_RESPONSE}" rejected`, "OAuth [REDACTED] rejected"],
+];
+const DIGEST_LIST_ROWS = [
+  [`Authorization: Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/users", response="${DIGEST_RESPONSE}", opaque="5ccc069c403ebaf9f0171e9517f40e41"`, "Authorization: Digest [REDACTED]"],
+  [`{"message":"Authorization: Digest username=\\"auditor\\", realm=\\"api\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\" rejected"}`, '{"message":"Authorization: Digest [REDACTED]"}'],
+  [`request failed\\nAuthorization: Digest username=\\"auditor\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\"`, "request failed\\nAuthorization: Digest [REDACTED]"],
+  [`Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/users", response="${DIGEST_RESPONSE}"`, "Digest [REDACTED]"],
+  [`the client sent Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/users", response="${DIGEST_RESPONSE}" and was refused`, "the client sent Digest [REDACTED] and was refused"],
+  [`{"error":"Digest username=\\"auditor\\", realm=\\"api\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\" rejected"}`, '{"error":"Digest [REDACTED] rejected"}'],
+  [`Digest username=auditor, realm=api, nc=00000001, response=${DIGEST_RESPONSE} refused`, "Digest [REDACTED] refused"],
+];
+const SCHEME_LIST_CONTROLS = [
+  'WWW-Authenticate: Bearer realm="api"',
+  'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+  'WWW-Authenticate: Basic realm="Tenable API", charset="UTF-8"',
+  '{"message":"401 Unauthorized","www_authenticate":"Bearer realm=\\"api\\", error=\\"invalid_token\\""}',
+  'the challenge was Bearer realm="api" and the request was retried',
+  'the challenge was Digest realm="api", qop="auth" and the request was retried',
+  "Snowflake [REDACTED] rejected",
+  "Authorization: Snowflake [REDACTED]",
+  "Token Hygiene",
+  "Basic authentication is required",
+  "Snowflake account acme-eu",
+  "OAuth clients: 3",
+];
+const SCHEME_LIST_SINKS = [
+  ["redactErrorText", redactErrorText],
+  ["redactCredentialValueText", redactCredentialValueText],
+  ["redactSecrets", (text) => redactSecrets(text, [])],
+  ["TenableApiError", (text) => new TenableApiError(text, 401, "GET /users").message],
+  ["redactCredentialProperties", (text) => redactCredentialProperties({ note: text, items: [{ description: text }] }).note],
+];
+
+test("harness self-check: a scheme word and the parameter list after it (Snowflake Token=\"<value>\", Digest ... nonce=\"...\", response=\"...\") lose the whole list with the header name or without it, bare, after a JSON escape, and inside a JSON string, while a WWW-Authenticate challenge's realm=\"api\" stays", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SCHEME_LIST_SINKS) {
+    for (const [make, expected] of SCHEME_LIST_ROWS) for (const value of [SCHEME_LIST_SHORT_VALUE, SCHEME_LIST_LONG_VALUE]) {
+      const input = make(value);
+      const out = sink(input);
+      const label = `scheme parameter list: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected] of DIGEST_LIST_ROWS) {
+      const out = sink(input);
+      const label = `digest parameter list: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      for (const value of [DIGEST_NONCE, DIGEST_RESPONSE]) assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const text of SCHEME_LIST_CONTROLS) assert.equal(sink(text), text, `scheme parameter list: ${sinkName} changed a control: ${text}`);
+  }
+  assert.equal(cases, SCHEME_LIST_SINKS.length * (SCHEME_LIST_ROWS.length * 2 + DIGEST_LIST_ROWS.length));
+});
+
+test("harness self-check: a 401 body that echoes an Authorization header with a Snowflake Token=\"...\" or Digest parameter list reaches the thrown error with the scheme word kept and the list gone, end to end through the client", async () => {
+  const echoes = [
+    [(v) => `Authorization: Snowflake Token="${v}" was rejected`, "Authorization: Snowflake [REDACTED]"],
+    [(v) => `Snowflake Token="${v}" was rejected`, "Snowflake [REDACTED] was rejected"],
+    [() => `Authorization: Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", response="${DIGEST_RESPONSE}" was rejected`, "Authorization: Digest [REDACTED]"],
+    [() => `Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", response="${DIGEST_RESPONSE}" was rejected`, "Digest [REDACTED] was rejected"],
+    [() => 'challenge Bearer realm="api" answered with an expired token', 'challenge Bearer realm="api" answered with an expired token'],
+  ];
+  for (const [make, expected] of echoes) for (const value of [SCHEME_LIST_SHORT_VALUE, SCHEME_LIST_LONG_VALUE]) {
+    const echoed = make(value);
+    const fetchImpl = async () => new Response(JSON.stringify({ error: echoed }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json", "www-authenticate": 'Bearer realm="api"' } });
+    const clients = createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {} });
+    await assert.rejects(() => clients.vm.listUsers(), (error) => {
+      assert.ok(error instanceof TenableApiError, `401 echo: ${echoed} threw ${String(error)}`);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, `Tenable request GET /users failed (HTTP 401 Unauthorized; ${expected})`, `401 echo: ${echoed}`);
+      for (const secret of [value, DIGEST_NONCE, DIGEST_RESPONSE]) assertNoWindow(error.message, secret, `401 echo: ${echoed}`);
+      return true;
+    });
+  }
+});
+
+// Harness self-check (CodeRabbit on #81, discussion_r4081776771, auth-param cells): a parameter
+// list without a scheme word (realm="api", nonce="n", response="<proof>": the value of a
+// www_authenticate field, or a credential echoed without its scheme word) is not a
+// WWW-Authenticate challenge when a later parameter is a proof (response, signature,
+// oauth_signature, mac, sig). Before, such a list fell to the per-parameter rules, where
+// response and mac are not credential names, so a name-shaped proof survived in every sink
+// (and a long one on the data side), while the nonce of a proof-free challenge went as a
+// credential name. Now the proof values go whatever their shape, quoted at any depth or bare,
+// wherever the proof sits in the list, and a proof-free challenge (WWW-Authenticate: Bearer
+// realm="api", Digest realm="api", qop="auth", nonce="n") keeps every value, the nonce
+// included; a lone nonce="..." is no list and still goes, and a list with no known auth
+// parameter (code="401", response="Unauthorized", a MAC address beside an IP) stays.
+const PROOF_SHORT_VALUE = "skvclmtirehs";
+const PROOF_LONG_VALUE = "Qm7Vx2Lk9Rt4Pw8Zs3Yh6Nd1Bc5Fg0Jt";
+const PROOF_PARAM_NAMES = ["response", "signature", "oauth_signature", "mac", "sig"];
+const escapeJsonText = (text) => JSON.stringify(text).slice(1, -1);
+// Each form: the text with the proof under a parameter name, and the same text with the
+// proof gone.
+const PROOF_LIST_FORMS = [
+  (name, v) => [`realm="api", nonce="n", ${name}="${v}"`, `realm="api", nonce="n", ${name}="[REDACTED]"`],
+  (name, v) => [`the client answered realm="api", nonce="n", ${name}="${v}" and was refused`, `the client answered realm="api", nonce="n", ${name}="[REDACTED]" and was refused`],
+  (name, v) => [`status 401\\n${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)}`, `status 401\\n${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)}`],
+  (name, v) => [`{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)}","code":401}`, `{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)}","code":401}`],
+  (name, v) => [`{"detail":"challenge answered:\\n${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)} refused","code":401}`, `{"detail":"challenge answered:\\n${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)} refused","code":401}`],
+  (name, v) => [`{"detail":"{\\"h\\":\\"${escapeJsonText(escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`))}\\"}"}`, `{"detail":"{\\"h\\":\\"${escapeJsonText(escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`))}\\"}"}`],
+  (name, v) => [`{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="${v}`)}","code":401}`, `{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="`)}[REDACTED]","code":401}`],
+  (name, v) => [`realm='api', nonce='n', ${name}='${v}'`, `realm='api', nonce='n', ${name}='[REDACTED]'`],
+  (name, v) => [`realm=api, nonce=n, ${name}=${v}`, `realm=api, nonce=n, ${name}=[REDACTED]`],
+  (name, v) => [`${name}="${v}", realm="api"`, `${name}="[REDACTED]", realm="api"`],
+  (name, v) => [`nonce="n", ${name}="${v}"`, `nonce="n", ${name}="[REDACTED]"`],
+  (name, v) => [`username="auditor", realm="api", nonce="n", uri="/api/v2/users", ${name}="${v}"`, `username="auditor", realm="api", nonce="n", uri="/api/v2/users", ${name}="[REDACTED]"`],
+  (name, v) => [`id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", ${name}="${v}"`, `id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", ${name}="[REDACTED]"`],
+];
+// A lone credential-named pair is no list and goes as before.
+const PROOF_NO_LIST_ROWS = [
+  ['nonce="n"', 'nonce="[REDACTED]"'],
+  ['set realm="api" and retry, nonce="n" was stale', 'set realm="api" and retry, nonce="[REDACTED]" was stale'],
+];
+const PROOF_LIST_CONTROLS = [
+  'WWW-Authenticate: Bearer realm="api"',
+  'WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"',
+  'Digest realm="api", qop="auth", nonce="n"',
+  'Digest nonce="n"',
+  'realm="api", qop="auth", nonce="n"',
+  'realm="api", nonce="n"',
+  'realm=api, qop=auth, nonce=n',
+  'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+  '{"www_authenticate":"Digest realm=\\"api\\", qop=\\"auth\\", nonce=\\"n\\""}',
+  'error="invalid_token", error_description="The token expired, please renew", realm="api"',
+  'code="401", response="Unauthorized"',
+  'mac="00:11:22:33:44:55", ip="10.0.0.1"',
+  'response="ok"',
+  'the response was slow; mac address 00:11:22:33:44:55; sig figs 3',
+  '{"response":"ok","mac":"00:11:22:33:44:55"}',
+  'realm="api", nonce="n", response="[REDACTED]"',
+];
+
+test("harness self-check: a proof parameter (response, signature, oauth_signature, mac, sig) in a parameter list without a scheme word loses its value in both scrubs, the error constructor, and the walker, bare, after a JSON escape, inside a JSON string, and double-escaped, while a proof-free challenge keeps its values, the nonce included", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SCHEME_LIST_SINKS) {
+    for (const form of PROOF_LIST_FORMS) for (const name of PROOF_PARAM_NAMES) for (const value of [PROOF_SHORT_VALUE, PROOF_LONG_VALUE]) {
+      const [input, expected] = form(name, value);
+      const out = sink(input);
+      const label = `proof parameter: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected] of PROOF_NO_LIST_ROWS) assert.equal(sink(input), expected, `proof parameter: ${sinkName} ${JSON.stringify(input)}`);
+    for (const text of PROOF_LIST_CONTROLS) assert.equal(sink(text), text, `proof parameter: ${sinkName} changed a control: ${text}`);
+  }
+  assert.equal(cases, SCHEME_LIST_SINKS.length * PROOF_LIST_FORMS.length * PROOF_PARAM_NAMES.length * 2);
+  // The walker: a www_authenticate value loses its proof and keeps its realm and nonce, a
+  // challenge keeps every value, and response and mac properties are not credentials.
+  assert.deepEqual(
+    redactCredentialProperties({ www_authenticate: `realm="api", nonce="n", response="${PROOF_SHORT_VALUE}"`, nested: [{ challenge: 'Digest realm="api", qop="auth", nonce="n"' }], response: "ok", mac: "00:11:22:33:44:55" }),
+    { www_authenticate: 'realm="api", nonce="n", response="[REDACTED]"', nested: [{ challenge: 'Digest realm="api", qop="auth", nonce="n"' }], response: "ok", mac: "00:11:22:33:44:55" },
+  );
+});
+
+test("harness self-check: a 401 body that echoes a parameter list without a scheme word (realm=\"api\", nonce=\"n\", response=\"<proof>\") reaches the thrown error with the proof gone and the realm and nonce kept, end to end through the client", async () => {
+  for (const name of PROOF_PARAM_NAMES) for (const value of [PROOF_SHORT_VALUE, PROOF_LONG_VALUE]) {
+    const echoed = `the client answered realm="api", nonce="n", ${name}="${value}" and was refused`;
+    const fetchImpl = async () => new Response(JSON.stringify({ error: echoed }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json", "www-authenticate": 'Digest realm="api", qop="auth", nonce="n"' } });
+    const clients = createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {} });
+    await assert.rejects(() => clients.vm.listUsers(), (error) => {
+      assert.ok(error instanceof TenableApiError, `proof echo: ${echoed} threw ${String(error)}`);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, `Tenable request GET /users failed (HTTP 401 Unauthorized; the client answered realm="api", nonce="n", ${name}="[REDACTED]" and was refused)`, `proof echo: ${echoed}`);
+      assertNoWindow(error.message, value, `proof echo: ${echoed}`);
+      return true;
+    });
+  }
+});
 
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
@@ -1170,8 +1969,9 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     assert.equal(redactErrorText(expected), expected, "idempotent");
   }
   // After a scheme the value goes whatever its shape, a plain lowercase word included,
-  // unless it is one of the listed prose words; after the noun "Token" any short plain
-  // lowercase word is prose.
+  // unless it is one of the listed prose words; after the nouns "Token", "OAuth", "Splunk",
+  // and "Snowflake" a plain lowercase word shorter than a long token run is prose, and
+  // "realm=" or another auth parameter name after any scheme is prose.
   for (const [text, expected] of [
     ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
     ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
@@ -1179,6 +1979,9 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
     ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
     ["API key basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API key basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth abcdefghijklmnop rejected", "OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth [REDACTED] rejected"],
+    ["replayed OAuth Kq7Zx2Vw9Lm4Tp8R upstream; replayed Splunk Kq7Zx2Vw9Lm4Tp8R upstream; replayed Snowflake Kq7Zx2Vw9Lm4Tp8R upstream; replayed AWS4-HMAC-SHA256 Kq7Zx2Vw9Lm4Tp8R upstream", "replayed OAuth [REDACTED] upstream; replayed Splunk [REDACTED] upstream; replayed Snowflake [REDACTED] upstream; replayed AWS4-HMAC-SHA256 [REDACTED] upstream"],
+    ["Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head", "Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head"],
     // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
     // token casing, or a run longer than a word still marks a credential.
     ["templates: Basic Network Scan, Basic Agent Scan, Advanced Scan; Bearer Token rotation; Token Hygiene; ApiKey Rotation", "templates: Basic Network Scan, Basic Agent Scan, Advanced Scan; Bearer Token rotation; Token Hygiene; ApiKey Rotation"],
@@ -1216,6 +2019,20 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     "arguments-access_key environment-TENABLE_SECRET_KEY config-file-sc_secret_key default-url",
   ]) {
     assert.equal(redactErrorText(text), text, text);
+  }
+  // Compound header lines with no credential carrier keep every name and value in both
+  // scrubs, bare or JSON-escaped.
+  for (const text of [
+    'Content-Type: "application/json"; Accept: application/json, text/plain; X-Request-Id: 7f3a',
+    "Content-Type: text/plain; charset=utf-8, Accept-Encoding: gzip, deflate",
+    "Date: Tue, 22 Sep 2026 18:00:00 GMT; Content-Type: application/json",
+    "Content-Type: application/json, Date: Tue, 22 Sep 2026 18:00:00 GMT",
+    '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+    '{"detail":"{\\"Content-Type\\": \\"application/json\\", \\"Date\\": \\"Tue, 22 Sep 2026 18:00:00 GMT\\"}"}',
+    '{"detail":"{\\"user\\": \\"auditor\\", \\"name\\": \\"s1\\", \\"tokens\\": 2}"}',
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+    assert.equal(redactCredentialValueText(text), text, text);
   }
 
   for (const [key, expected] of [
@@ -1324,6 +2141,12 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
       exportPollMs: 0,
       exportTimeoutMs: 5_000,
     })],
+    // A chunk of only foreign records (a failed download) and a stray foreign record inside
+    // a documented chunk (unevaluable), with nothing planted in either.
+    ["an export with a foreign chunk and a stray record", clientsFor(threeChunkRoutes(
+      [healthyAssets(), [{ ok: true, region: "prod-us-east-2026" }], [THIRD_ASSET, { ok: true, region: "prod-us-east-2026" }]],
+      [healthyVulns(), [THIRD_VULN], [THIRD_VULN, { ok: true }]],
+    ))],
   ];
   const corpus = [];
   for (const [label, clients] of fixtures) {
@@ -1356,6 +2179,34 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     });
   }
 
+  // Reviewer E gap 3: the resolver texts name the variables to set, and "keys: set ..." read
+  // as a credential pair once, so the remediation sentence was withheld from the operator.
+  // Each resolver text is the identity under both scrubs and reaches the tool result whole.
+  const scNoKeys = "Tenable Security Center at https://sc.example.internal needs API keys. Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).";
+  const vmNoKeys = "TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY (or access_key and secret_key arguments) are required for Tenable Vulnerability Management.";
+  const noPlatform = "No Tenable platform resolved. Set TENABLE_URL to cloud.tenable.com, fedcloud.tenable.com, or a Tenable Security Center URL.";
+  for (const text of [scNoKeys, vmNoKeys, noPlatform]) {
+    assert.equal(redactErrorText(text), text, `resolver text survives the general scrub: ${text}`);
+    assert.equal(redactCredentialValueText(text), text, `resolver text survives the data scrub: ${text}`);
+    corpus.push(text);
+  }
+  const registeredTools = [];
+  registerTenableTools({ registerTool: (tool) => registeredTools.push(tool) });
+  const checkAccessTool = registeredTools.find((tool) => tool.name === "tenable_check_access");
+  for (const [args, text] of [
+    [{ url: "https://sc.example.internal", config_file: EMPTY_CONFIG_FILE }, scNoKeys],
+    [{ url: "https://cloud.tenable.com", config_file: EMPTY_CONFIG_FILE }, vmNoKeys],
+  ]) {
+    assert.throws(() => resolveTenableConfiguration(args, EMPTY_ENV), (error) => {
+      assert.equal(error.message, text);
+      return true;
+    });
+    const result = await checkAccessTool.execute("call-resolver-text", checkAccessTool.prepareArguments(args));
+    assert.equal(result.isError, true);
+    assert.ok(JSON.stringify(result).includes(JSON.stringify(`Tenable access check failed: ${text}`).slice(1, -1)), `the tool result carries the whole resolver text: ${JSON.stringify(result)}`);
+    assert.ok(!JSON.stringify(result).includes("[REDACTED]"), "no marker with nothing planted");
+  }
+
   // Positive controls: the fixtures reach every family of fixed text the rule names.
   const emitted = corpus.join("\n");
   for (const family of [
@@ -1377,6 +2228,11 @@ test("round 7(a): every fixed text emitted on refused, unavailable, failed, capp
     /TENABLE_SC_URL/,
     /so the verdict is capped at warn/,
     /200 OK with an empty response body where the documented JSON document was expected/,
+    // The foreign-record texts: the failed download of a foreign chunk, the kept-out count, and the partial marker.
+    /returned HTTP 200 with a JSON array of 1 records none of which carries any of the documented members "id", "uuid", "has_agent", "last_seen", "network_id", "tags" \(\d+ bytes, not echoed\)/,
+    /"asset_export dataset: 1 of 4 exported records carry none of the documented members \(id, uuid, has_agent, last_seen, network_id, tags\) and were not evaluated\."/,
+    /"vuln_export dataset: 1 of 5 exported records carry none of the documented members \(state, severity, plugin, asset, first_found, last_found\) and were not evaluated\."/,
+    /"complete":\s*false/,
     /Unable to read Tenable config file .* \((EISDIR|ENOENT)\)/,
     /Unable to parse Tenable config file: invalid YAML in .* at line \d+/,
   ]) {
@@ -1424,13 +2280,36 @@ const CANARY_PLAIN = "uhfsumxscmhlzj";
 // that carries a quoted value through its closing quote, so its absence proves that rule ran.
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
+// Reviewer E gap 9: a third name-shaped value that travels only as the X-SecurityCenter
+// session token after a JSON string escape (\nX-SecurityCenter: value), so nothing but a
+// header rule that recognises the name after the escape removes it.
+const CANARY_ESCAPED_HEADER = "sess-escn-NLINE-27182818284590";
+// Reviewer E gap 10: a name-shaped value carried only behind an apostrophe in a cookie pair
+// name or value, behind "&" or "#" in a JSON-escaped quoted pair, and before an escaped
+// quote or line break in a query pair, so only the mid-token quote rule and the backslash
+// boundary remove it.
+const CANARY_APOSTROPHE = "sess-apos-QUOTE-14142135623730";
+const ESCAPED_CANARIES = [CANARY_ESCAPED_HEADER, CANARY_BEARER, CANARY_API_KEY];
+// The secret of a user-and-secret prefix on a configured URL (rule 9: a configured URL is
+// written as scheme and host only).
+const CANARY_USERINFO = "Uq7pXw2ZmK9vT4bR3sN8Lc";
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+// A JSON text stringified into a string value arrives with its quotes escaped (\"): the
+// header pairs and the credential pair inside it are carriers one level down, and each
+// keeps its escaped quotes around the marker so the text stays well formed.
+const CANARY_ESCAPED_NOTE = `upstream body ${JSON.stringify(JSON.stringify({ Cookie: `sid=${CANARY_QUOTED}`, "X-ApiKeys": `accessKey=${CANARY_QUOTED}`, password: CANARY_QUOTED }))}`;
+const SCRUBBED_ESCAPED_NOTE = 'upstream body "{\\"Cookie\\":\\"[REDACTED]\\",\\"X-ApiKeys\\":\\"[REDACTED]\\",\\"password\\":\\"[REDACTED]\\"}"';
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: TNS_SESSIONID=${CANARY_SESSION}; Path=/</p><p>X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}</p>`
     + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
-    + `<p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p><p>X-ApiKeys: accessKey="${CANARY_QUOTED}";secretKey="${CANARY_QUOTED}"</p>`
+    + `<p>Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-ApiKeys: "${CANARY_QUOTED}"; Content-Type: "text/html"</p>`
+    + `<p>Cookie: sid=${CANARY_SESSION}; X-ApiKeys: accessKey="${CANARY_QUOTED}";secretKey="${CANARY_QUOTED}", Accept: text/html</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   // retry-after: 0 keeps the client's 5xx retries instant when the response reaches a real sleep.
   return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8", "retry-after": "0" } });
@@ -1439,13 +2318,43 @@ function htmlCanaryResponse() {
 function jsonCanaryResponse() {
   return new Response(JSON.stringify({
     error: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
-    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark`,
-    error_msg: `X-Cookie: token="${CANARY_QUOTED}"`,
+    // A compound line: the quoted cookie ends at its closing quote, the following quoted
+    // X-Api-Key keeps its name and loses its value, and the Content-Type keeps both.
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "application/json"`,
+    // The JSON-escaped carriers one level down, then a quoted X-Cookie line of their own.
+    error_msg: `${CANARY_ESCAPED_NOTE}; X-Cookie: token="${CANARY_QUOTED}"`,
   }), { status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" } });
 }
 
+// Reviewer E gap 9: a 403 whose documented fields carry header lines behind the two- and
+// six-character escapes one stringify leaves in a JSON string (\n, \r\n, \t, \u000a, \u0009),
+// bare, nested in a stringified request dump, and followed by more escaped text.
+function escapedHeaderCanaryResponse() {
+  return new Response(JSON.stringify({
+    error: `request failed\\napi_key=${CANARY_API_KEY}; \\nX-SecurityCenter: ${CANARY_ESCAPED_HEADER}\\nContent-Type: application/json`,
+    message: `upstream said {"headers":"\\r\\nX-SecurityCenter: ${CANARY_ESCAPED_HEADER}\\r\\nAuthorization: Bearer ${CANARY_BEARER}\\r\\nX-Cookie: token=${CANARY_ESCAPED_HEADER}\\u000aCookie: sid=${CANARY_ESCAPED_HEADER}"}`,
+    error_msg: `\\tX-SecurityCenter: "${CANARY_ESCAPED_HEADER}"\\u0009X-ApiKeys: accessKey=${CANARY_API_KEY};secretKey=${CANARY_API_KEY}\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT`,
+  }), { status: 403, statusText: "Forbidden", headers: { "content-type": "application/json" } });
+}
+const ESCAPED_HEADER_MARKER = new RegExp(escapeRegExp('HTTP 403 Forbidden; request failed\\napi_key=[REDACTED]; \\nX-SecurityCenter: [REDACTED]\\nContent-Type: application/json; upstream said {"headers":"\\r\\nX-SecurityCenter: [REDACTED]\\r\\nAuthorization: Bearer [REDACTED]\\r\\nX-Cookie: [REDACTED]\\u000aCookie: [REDACTED]"}; \\tX-SecurityCenter: "[REDACTED]"\\u0009X-ApiKeys: [REDACTED]\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT'));
+// The header names of the escaped shape are the documented fields' own text, so only the
+// HTML body's text counts as echoed there.
+const ESCAPED_ECHOED_BODY_TEXT = /<html|Set-Cookie|TNS_SESSIONID|did not answer|Proxy-Authorization/i;
+
+// Reviewer E gap 10: a 502 whose documented fields carry the apostrophe pair name, the
+// apostrophe pair value, the "#"-named pair in JSON-escaped quotes one level down, and a
+// query pair before an escaped line break, each followed by a control.
+function apostropheCookieResponse() {
+  return new Response(JSON.stringify({
+    error: `Cookie: theme=dark; my'pref=${CANARY_APOSTROPHE}; Content-Type: "text/html; charset=utf-8"`,
+    message: `X-Cookie: token=O'${CANARY_APOSTROPHE}; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`,
+    error_msg: `upstream said {"headers":"Cookie: theme=dark; my#sid=\\"${CANARY_APOSTROPHE}\\"; Content-Type: \\"application/json\\""} after GET /x?token=${CANARY_APOSTROPHE}\\nstatus 502`,
+  }), { status: 502, statusText: "Bad Gateway", headers: { "content-type": "application/json" } });
+}
+const APOSTROPHE_MARKER = new RegExp(escapeRegExp(`HTTP 502 Bad Gateway; Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"; X-Cookie: [REDACTED]; Date: "Mon, 22 Sep 2026 12:30:00 GMT"; upstream said {"headers":"Cookie: [REDACTED]; Content-Type: \\"application/json\\""} after GET /x?token=[REDACTED]\\nstatus 502`));
+
 // The scrubbed rendering of the JSON canary fields, as every error string must carry it.
-const JSON_CANARY_MARKER = /HTTP 400 Bad Request; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]; X-Cookie: \[REDACTED\]/;
+const JSON_CANARY_MARKER = new RegExp(`HTTP 400 Bad Request; Upstream refused Bearer \\[REDACTED\\] at https://api\\.example\\.com/v1/x\\?token=\\[REDACTED\\] mid-sentence; session=\\[REDACTED\\], api_key=\\[REDACTED\\], Bearer \\[REDACTED\\], sid=\\[REDACTED\\] rejected; Cookie: \\[REDACTED\\]; X-Api-Key: "\\[REDACTED\\]"; Content-Type: "application/json"; ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}; X-Cookie: \\[REDACTED\\]`);
 const HTML_CANARY_MARKER = /HTTP 502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/;
 
 // The configured secrets of the sweep fixture, echoed bare in prose in every encoded form:
@@ -1488,6 +2397,10 @@ test("error-body canary sweep: every Tenable surface failing with an HTML 502 or
     { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: CANARIES },
     { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES },
     { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+    // Reviewer E gap 9: header lines behind JSON string escapes in a 403's documented fields.
+    { name: "json-403-escaped-headers", make: escapedHeaderCanaryResponse, marker: ESCAPED_HEADER_MARKER, canaries: ESCAPED_CANARIES, echoed: ESCAPED_ECHOED_BODY_TEXT },
+    // Reviewer E gap 10: apostrophe, "#", and escaped-quote pair shapes in a 502's documented fields.
+    { name: "json-502-apostrophe-cookie", make: apostropheCookieResponse, marker: APOSTROPHE_MARKER, canaries: [CANARY_APOSTROPHE] },
   ];
   // Fixture self-check: each body carries every canary or form verbatim before the scrubs see it.
   for (const shape of shapes) {
@@ -1514,7 +2427,7 @@ test("error-body canary sweep: every Tenable surface failing with an HTML 502 or
       const errors = results.flatMap((result) => result.errors);
       assert.ok(errors.length > 0, `${label}: the failing surface must be recorded as an error`);
       assert.ok(errors.some((error) => shape.marker.test(error)), `${label}: errors must carry the note: ${JSON.stringify(errors)}`);
-      for (const error of errors) assert.doesNotMatch(error, ECHOED_BODY_TEXT, `${label}: body text echoed: ${error}`);
+      for (const error of errors) assert.doesNotMatch(error, shape.echoed ?? ECHOED_BODY_TEXT, `${label}: body text echoed: ${error}`);
 
       const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-canary-")), { now: NOW });
       const files = readBundleFiles(bundle.outputDir);
@@ -1562,7 +2475,10 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   const { port } = server.address();
   const configFile = join(mkdtempSync(join(tmpdir(), "tenable-tool-config-")), "config.yaml");
-  writeFileSync(configFile, `url: http://127.0.0.1:${port}\naccess_key: ${FIXTURE_ACCESS_KEY}\nsecret_key: ${FIXTURE_SECRET_KEY}\n`);
+  // The configured URL carries a user-and-secret prefix: fetch itself refuses a URL with
+  // credentials, so a request that leaves proves the prefix was dropped at configuration,
+  // and the platform label proves the URL is written as scheme and host only.
+  writeFileSync(configFile, `url: http://sc-operator:${CANARY_USERINFO}@127.0.0.1:${port}\naccess_key: ${FIXTURE_ACCESS_KEY}\nsecret_key: ${FIXTURE_SECRET_KEY}\n`);
 
   const tools = new Map();
   registerTenableTools({ registerTool: (tool) => tools.set(tool.name, tool) });
@@ -1582,12 +2498,13 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
     assert.ok(scProbes.length >= 4 && scProbes.every((probe) => probe.status === "readable"), JSON.stringify(healthy.details.surfaces));
     assert.ok(healthy.details.surfaces.every((probe) => probe.name.startsWith("sc_") || probe.status === "not_configured"), JSON.stringify(healthy.details.surfaces));
     assert.deepEqual(Object.values(failingSurfaces).filter((name) => !scProbes.some((probe) => probe.name === name)), [], "the failing surfaces are probed by name");
-    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(JSON.stringify(healthy), secret, "healthy access check");
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY, CANARY_USERINFO]) assertNoWindow(JSON.stringify(healthy), secret, "healthy access check");
+    assert.ok(!JSON.stringify(healthy).includes("sc-operator"), "the URL user is not written either");
 
     for (const shape of [
-      { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS] },
-      { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS] },
-      { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+      { name: "html-502", make: htmlCanaryResponse, marker: HTML_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS, CANARY_USERINFO] },
+      { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: [...CANARIES, ...ECHOED_FORMS, CANARY_USERINFO] },
+      { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: [...ECHOED_FORMS, CANARY_USERINFO] },
     ]) {
       failing.clear();
       for (const surface of Object.keys(failingSurfaces)) failing.set(surface, shape.make);
@@ -1633,10 +2550,63 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
       // The keys came from the config file alone: metadata names the file, never the values.
       const metadata = JSON.parse(files.get("metadata.json"));
       assert.ok(metadata.source_chain.some((entry) => entry === `config:${configFile}`), JSON.stringify(metadata.source_chain));
+      assert.equal(metadata.platform, `Tenable Security Center http://127.0.0.1:${port}`, "metadata writes the configured URL as scheme and host");
     }
   } finally {
     server.close();
   }
+});
+
+test("rule 9: a user-and-secret prefix on a configured Vulnerability Management or Security Center URL leaves with no request and reaches no platform label, metadata.json, executive summary, assessment, or bundle file; configured URLs are written as scheme and host only", async () => {
+  const configured = {
+    url: `https://vm-operator:${CANARY_USERINFO}@cloud.tenable.com/`,
+    sc_url: `https://sc-operator:${CANARY_USERINFO}@sc.example.internal:8443/`,
+    sc_access_key: SC_FIXTURE.sc_access_key,
+    sc_secret_key: SC_FIXTURE.sc_secret_key,
+  };
+  // Positive control: the URL parser keeps the prefix, so only the loader can drop it.
+  assert.equal(new URL(configured.url).password, CANARY_USERINFO);
+  assert.equal(new URL(configured.sc_url).username, "sc-operator");
+  const config = vmConfig(configured);
+  assert.equal(config.vm.baseUrl, "https://cloud.tenable.com");
+  assert.equal(config.securityCenter.baseUrl, "https://sc.example.internal:8443");
+  assertNoWindow(JSON.stringify(config), CANARY_USERINFO, "resolved configuration");
+
+  const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+  const requests = [];
+  const fallback = routerFetch(routes);
+  const clients = createTenableClients(config, {
+    fetchImpl: async (url, init) => {
+      requests.push(String(url));
+      return fallback(url, init);
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const access = await checkTenableAccess(clients);
+  assert.equal(access.status, "healthy", JSON.stringify(access.notes));
+  assert.equal(access.platform, "Tenable Vulnerability Management https://cloud.tenable.com + Tenable Security Center https://sc.example.internal:8443");
+  const results = await runAll(clients, { expectedAssetCount: 2 });
+  const bundle = await exportTenableAuditBundle(clients, mkdtempSync(join(tmpdir(), "tenable-userinfo-")), { now: NOW });
+  const files = readBundleFiles(bundle.outputDir);
+  const zipEntries = readZipEntries(bundle.zipPath);
+
+  assert.ok(requests.length >= 30, `both platforms were read (${requests.length} requests)`);
+  for (const url of requests) {
+    assertNoWindow(url, CANARY_USERINFO, `request ${url}`);
+    assert.deepEqual({ username: new URL(url).username, password: new URL(url).password }, { username: "", password: "" }, `request URL carries no credentials: ${url}`);
+  }
+  assert.ok(requests.some((url) => url.startsWith("https://cloud.tenable.com/")) && requests.some((url) => url.startsWith("https://sc.example.internal:8443/rest/")), "requests went to both configured hosts");
+  for (const [label, text] of [["access check", JSON.stringify(access)], ["assessments", JSON.stringify(results)], ...files, ...zipEntries]) {
+    assertNoWindow(text, CANARY_USERINFO, label);
+    assert.ok(!/vm-operator|sc-operator/.test(text), `${label} names the URL user`);
+    assert.ok(!text.includes("[REDACTED]") || label === "QUICK_REFERENCE.md", `${label} needed no marker: the prefix never reached a sink`);
+  }
+  const metadata = JSON.parse(files.get("metadata.json"));
+  assert.equal(metadata.platform, access.platform);
+  assert.match(files.get(join("compliance", "executive_summary.md")), /^Platform: https:\/\/cloud\.tenable\.com; Tenable Security Center https:\/\/sc\.example\.internal:8443$/m);
+  assert.ok(basename(bundle.outputDir).startsWith("cloud.tenable.com-audit-bundle"), `the bundle directory is named for the host: ${basename(bundle.outputDir)}`);
 });
 
 test("export polling, vendor reason strings, Security Center error_msg, and timeouts pass through the redacting sink", async () => {
@@ -1710,6 +2680,8 @@ const FAKE_TENABLE_SECRETS = {
   registrationCode: "BnHNcwxb33SF3JaByM3XfK",
   licenseKey: "PKJwsecPe18jp19Xw6vO2r",
   auditFieldToken: "Yd7rmz2KDiBHYn4oc83WbN",
+  auditFieldRedlockAuth: "UHE7I4ihja1YxODlSyT2S0",
+  auditFieldXAuth: "j8lEIFXwMaM2TE4aDCERVZ",
   webhookQueryToken: "5OvJOMuFTt9kEn8tS14NAW",
   credentialSecret: "0aLPuMBcC3LrhC03EFlIq8",
   camelCaseSecret: "2dzaTJuwLGmPzB5L9ZZEK4",
@@ -1736,9 +2708,14 @@ function secretBearingRoutes() {
   routes["GET /audit-log/v1/events"] = {
     events: [{
       ...healthyRoutes()["GET /audit-log/v1/events"].events[0],
+      // Two credential-labelled pairs flagged secure: false (reviewer E finding B): the
+      // label alone makes them credential pairs. X-Trace is a benign unflagged pair.
       fields: [
         { name: "api_token", value: secrets.auditFieldToken },
         { name: "target_url", value: `https://hooks.example.com/services/T000/B000?token=${secrets.webhookQueryToken}` },
+        { name: "x-redlock-auth", value: secrets.auditFieldRedlockAuth, secure: false },
+        { name: "X-Auth", value: secrets.auditFieldXAuth, secure: false },
+        { name: "X-Trace", value: "trace-rvw-1", secure: false },
         { name: "X-Client-Id", value: "client-1" },
       ],
     }],
@@ -1780,7 +2757,15 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
   const fields = events[0].fields;
   assert.deepEqual(fields.find((field) => field.name === "api_token").value, "[REDACTED]");
   assert.equal(fields.find((field) => field.name === "target_url").value, "https://hooks.example.com/services/T000/B000?token=[REDACTED]");
+  assert.deepEqual(fields.find((field) => field.name === "x-redlock-auth"), { name: "x-redlock-auth", value: "[REDACTED]", secure: false }, "an unflagged pair whose name ends in auth loses its value");
+  assert.deepEqual(fields.find((field) => field.name === "X-Auth"), { name: "X-Auth", value: "[REDACTED]", secure: false });
+  assert.deepEqual(fields.find((field) => field.name === "X-Trace"), { name: "X-Trace", value: "trace-rvw-1", secure: false }, "a benign unflagged pair keeps its value");
   assert.equal(fields.find((field) => field.name === "X-Client-Id").value, "client-1");
+  assert.deepEqual(
+    redactCredentialProperties({ fields: [{ name: "auth", value: "rvw1AuthPairValue" }, { name: "Cookie", value: "session=rvw1CookiePairValue", secure: false }, { name: "Content-Type", value: "application/json", secure: false }] }),
+    { fields: [{ name: "auth", value: "[REDACTED]" }, { name: "Cookie", value: "[REDACTED]", secure: false }, { name: "Content-Type", value: "application/json", secure: false }] },
+    "a pair named in the text rules' vocabulary loses its value whatever the secure flag says",
+  );
 
   const credentials = JSON.parse(files.get("core_data/credentials.json"));
   assert.equal(credentials[0].settings.password, "[REDACTED]");
@@ -1805,8 +2790,8 @@ test("exportTenableAuditBundle never writes policy credentials, scanner linking 
 // shape are the name-shaped values that prove the configured-secret pass and the carrier
 // rules run on their own (hyphenated words with one digit group) and the plain lowercase
 // word that only the Bearer scheme gives away.
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_ESCAPED_HEADER, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_TENABLE_SECRETS), FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_ESCAPED_HEADER, CANARY_APOSTROPHE, CANARY_PLAIN, FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]);
 
 test("fixture self-check: planted credentials are alphanumeric and random-looking, share no 6-character window with each other, and no 6-character window of any occurs in the fixtures' legitimate text", async () => {
   const owners = new Map();
@@ -1964,6 +2949,241 @@ test("rule 1 corollary: a pass never survives an unreadable secondary inventory 
   assert.equal(users[2].summary.user_count, null);
 });
 
+// Reviewer E gap 4: a stale container plugin set fails on its own, and a scanner list the
+// key could not read is named in that fail rather than counted as zero of zero entries or
+// rendered as empty lists.
+test("reviewer E gap 4: a stale container fails with the denied scanner read named, not counted, and the scanner lists render null", async () => {
+  const STALE_PLUGIN_SET = "202609190000";
+  const stale = forbidding("GET /scanners");
+  stale["GET /server/properties"] = { loaded_plugin_set: STALE_PLUGIN_SET, nessus_ui_version: "10.8.0", plugin_set: STALE_PLUGIN_SET };
+  const results = await runAll(clientsFor(stale));
+  const pluginCurrency = byId(results, "TENABLE-08");
+  assert.equal(pluginCurrency.status, "fail", pluginCurrency.summary);
+  assert.equal(pluginCurrency.summary, "The container plugin set 202609190000 is 60 hours old (older than 24 hours) and GET /scanners refused the API key with HTTP 403 (Tenable request GET /scanners failed (HTTP 403; forbidden)), so scanner plugin sets are unverified.");
+  assert.doesNotMatch(pluginCurrency.summary, /\d+ of \d+ scanner entries/, "an unread scanner list is never counted");
+  assert.doesNotMatch(pluginCurrency.summary, /0 of 0/);
+  assert.equal(pluginCurrency.evidence.plugin_set_age_hours, 60);
+  assert.equal(pluginCurrency.evidence.scanner_entries, null);
+  assert.equal(pluginCurrency.evidence.scanners_status, "forbidden");
+  assert.equal(pluginCurrency.evidence.evaluated_scanners, null);
+  assert.equal(pluginCurrency.evidence.stale_scanners, null);
+  assert.equal(pluginCurrency.evidence.undated_scanners, null);
+  assert.equal(pluginCurrency.evidence.stale_online_agents, 0, "the readable agent list is still counted");
+  assert.equal(byId(results, "TENABLE-07").status, "manual", "scanner health on the denied read stays manual");
+  assert.equal(results[1].summary.scanner_entries, null);
+  assert.equal(results[1].summary.linked_scanners, null);
+  for (const [name, text] of Object.entries({ summary: pluginCurrency.summary, evidence: JSON.stringify(pluginCurrency.evidence) })) {
+    for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(text, secret, `TENABLE-08 ${name}`);
+  }
+
+  // The same denial under a fresh container is the manual the guide row describes.
+  const freshCurrency = byId(await runAll(clientsFor(forbidding("GET /scanners"))), "TENABLE-08");
+  assert.equal(freshCurrency.status, "manual", freshCurrency.summary);
+  assert.equal(freshCurrency.summary, "The container plugin set is 2 hours old, but GET /scanners refused the API key with HTTP 403 (Tenable request GET /scanners failed (HTTP 403; forbidden)), so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.");
+  assert.equal(freshCurrency.evidence.scanners_status, "forbidden");
+  assert.equal(freshCurrency.evidence.evaluated_scanners, null);
+  assert.equal(freshCurrency.evidence.stale_scanners, null);
+  assert.equal(freshCurrency.evidence.undated_scanners, null);
+
+  // A stale container beside a readable scanner list still counts the entries it read.
+  const counted = healthyRoutes();
+  counted["GET /server/properties"] = { ...counted["GET /server/properties"], loaded_plugin_set: STALE_PLUGIN_SET, plugin_set: STALE_PLUGIN_SET };
+  const countedCurrency = byId(await runAll(clientsFor(counted)), "TENABLE-08");
+  assert.equal(countedCurrency.status, "fail", countedCurrency.summary);
+  assert.equal(countedCurrency.summary, "The container plugin set 202609190000 is 60 hours old (older than 24 hours) and 0 of 1 scanner entries exposing loaded_plugin_set load a set older than 24 hours.");
+  assert.equal(countedCurrency.evidence.scanners_status, "ok");
+  assert.equal(countedCurrency.evidence.scanner_entries, 1);
+  assert.deepEqual(countedCurrency.evidence.evaluated_scanners, [`US Cloud Scanner (${RECENT_PLUGIN_SET})`]);
+  assert.deepEqual(countedCurrency.evidence.stale_scanners, []);
+  assert.deepEqual(countedCurrency.evidence.undated_scanners, []);
+
+  // A stale scanner under a fresh container names the scanner and keeps the count.
+  const staleScanner = healthyRoutes();
+  staleScanner["GET /scanners"] = { scanners: [{ ...staleScanner["GET /scanners"].scanners[0], loaded_plugin_set: STALE_PLUGIN_SET }] };
+  const staleScannerCurrency = byId(await runAll(clientsFor(staleScanner)), "TENABLE-08");
+  assert.equal(staleScannerCurrency.status, "fail", staleScannerCurrency.summary);
+  assert.equal(staleScannerCurrency.summary, `The container plugin set ${RECENT_PLUGIN_SET} is 2 hours old and 1 of 1 scanner entries exposing loaded_plugin_set load a set older than 24 hours (US Cloud Scanner).`);
+  assert.deepEqual(staleScannerCurrency.evidence.stale_scanners, ["US Cloud Scanner (202609190000)"]);
+});
+
+// Reviewer E gap 5 (rule 10): a truncated inventory states seen versus total, or that the
+// total is unknown, on the fail and warn branches as well as the pass branch, and the
+// finding evidence carries the collection flags beside the verdict.
+const PARTIAL_VIEW_FINDINGS = ["TENABLE-05", "TENABLE-06", "TENABLE-07", "TENABLE-08", "TENABLE-09", "TENABLE-12", "TENABLE-13"];
+
+function assertPartialView(item, seen, total, reason) {
+  const stated = total === null ? `Only ${seen} of unknown records were retrieved` : `Only ${seen} of ${total} records were retrieved`;
+  assert.equal(item.summary.split("records were retrieved").length, 2, `${item.id} states the partial view exactly once: ${item.summary}`);
+  assert.ok(item.summary.includes(`${stated} (${reason})`), `${item.id}: ${item.summary}`);
+  assert.equal(item.evidence.inventory_truncated, true, `${item.id} inventory_truncated`);
+  // A truncated walk that delivered no record renders records_seen null: 0 would read as an empty inventory.
+  assert.equal(item.evidence.records_seen, seen === 0 ? null : seen, `${item.id} records_seen`);
+  assert.equal(item.evidence.records_total, total, `${item.id} records_total`);
+}
+
+test("reviewer E gap 5: a truncated inventory states seen versus total on the fail and warn branches and the evidence carries the collection flags", async () => {
+  // Probe A2b: one of a reported five credentials, never used in a scan (warn).
+  const credentials = healthyRoutes();
+  credentials["GET /credentials"] = { credentials: [{ uuid: "c-1", name: "Linux SSH", type: { id: "ssh", name: "SSH" }, created_date: RECENT_SECONDS }], pagination: { total: 5 } };
+  const unused = byId(await runAll(clientsFor(credentials)), "TENABLE-12");
+  assert.equal(unused.status, "warn", unused.summary);
+  assert.equal(unused.summary, "1 managed credentials: 1 have never been used in a scan, 0 were created over a year ago (the API exposes created_date but no rotation date, so confirm rotation manually). Only 1 of 5 records were retrieved (only 1 of the reported 5 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(unused, 1, 5, "only 1 of the reported 5 records were returned");
+  assert.equal(unused.evidence.credential_count, 1);
+  assert.equal(unused.evidence.pagination_total, 5);
+
+  // Networks: one of a reported three, without a scanner (fail), then without scanner_count (warn).
+  const networks = healthyRoutes();
+  networks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, scanner_count: 0, assets_ttl_days: 90 }], pagination: { total: 3 } };
+  const unassigned = byId(await runAll(clientsFor(networks)), "TENABLE-09");
+  assert.equal(unassigned.status, "fail", unassigned.summary);
+  // Over a truncated network inventory the networks are counted, not named, and the per-network detail is withheld.
+  assert.equal(unassigned.summary, "1 of 1 network objects have no assigned scanners. Only 1 of 3 records were retrieved (only 1 of the reported 3 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(unassigned, 1, 3, "only 1 of the reported 3 records were returned");
+  assert.equal(unassigned.evidence.network_count, 1);
+  assert.equal(unassigned.evidence.networks_without_scanners, 1);
+  assert.equal(unassigned.evidence.networks, null, "per-network detail is withheld while the inventory is truncated");
+  assert.doesNotMatch(JSON.stringify(unassigned), /Default/);
+  const completeNetworks = healthyRoutes();
+  completeNetworks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, scanner_count: 0, assets_ttl_days: 90 }], pagination: { total: 1 } };
+  const namedUnassigned = byId(await runAll(clientsFor(completeNetworks)), "TENABLE-09");
+  assert.equal(namedUnassigned.summary, "1 of 1 network objects have no assigned scanners: Default.");
+  assert.deepEqual(namedUnassigned.evidence.networks, [{ name: "Default", scanner_count: 0, assets_ttl_days: 90, is_default: true }]);
+  networks["GET /networks"] = { networks: [{ uuid: "net-1", name: "Default", is_default: true, assets_ttl_days: 90 }], pagination: { total: 3 } };
+  const uncounted = byId(await runAll(clientsFor(networks)), "TENABLE-09");
+  assert.equal(uncounted.status, "warn", uncounted.summary);
+  assert.equal(uncounted.summary, "1 network objects exist but 1 did not expose scanner_count, so scanner assignment cannot be confirmed for them. Only 1 of 3 records were retrieved (only 1 of the reported 3 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(uncounted, 1, 3, "only 1 of the reported 3 records were returned");
+
+  // Exclusions: one of a reported four, always-on (fail), then undocumented (warn).
+  const exclusions = healthyRoutes();
+  exclusions["GET /exclusions"] = { exclusions: [{ id: 1, name: "Maintenance window", description: "CHG-1234", members: "10.0.0.5", schedule: { enabled: false } }], pagination: { total: 4 } };
+  const permanent = byId(await runAll(clientsFor(exclusions)), "TENABLE-13");
+  assert.equal(permanent.status, "fail", permanent.summary);
+  assert.equal(permanent.summary, "1 of 1 exclusions need review: 1 always-on (schedule.enabled=false), 0 without a description, 0 covering /16 or wider ranges. Only 1 of 4 records were retrieved (only 1 of the reported 4 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(permanent, 1, 4, "only 1 of the reported 4 records were returned");
+  exclusions["GET /exclusions"] = { exclusions: [{ id: 1, name: "Maintenance window", members: "10.0.0.5", schedule: { enabled: true, rrules: "FREQ=WEEKLY" } }], pagination: { total: 4 } };
+  const undocumented = byId(await runAll(clientsFor(exclusions)), "TENABLE-13");
+  assert.equal(undocumented.status, "warn", undocumented.summary);
+  assert.equal(undocumented.summary, "1 of 1 exclusions need review: 0 always-on (schedule.enabled=false), 1 without a description, 0 covering /16 or wider ranges. Only 1 of 4 records were retrieved (only 1 of the reported 4 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(undocumented, 1, 4, "only 1 of the reported 4 records were returned");
+
+  // Agents: one of a reported seven, offline and ungrouped (TENABLE-05 and TENABLE-06 fail),
+  // while the plugin currency read of the same list is capped on its pass branch.
+  const agents = healthyRoutes();
+  agents["GET /scanners/null/agents"] = { agents: [{ id: 1, uuid: "ag-1", name: "host-1", status: "off", last_connect: RECENT_SECONDS, core_version: "10.8.0", plugin_feed_id: RECENT_PLUGIN_SET, groups: [] }], pagination: { total: 7 } };
+  const agentResults = await runAll(clientsFor(agents));
+  const offline = byId(agentResults, "TENABLE-05");
+  assert.equal(offline.status, "fail", offline.summary);
+  assert.equal(offline.summary, "1 of 1 agents are offline or have not connected in 7 days (more than 10%). Only 1 of 7 records were retrieved (only 1 of the reported 7 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(offline, 1, 7, "only 1 of the reported 7 records were returned");
+  assert.equal(offline.evidence.pagination_total, 7);
+  const ungrouped = byId(agentResults, "TENABLE-06");
+  assert.equal(ungrouped.status, "fail", ungrouped.summary);
+  assert.equal(ungrouped.summary, "1 of 1 agents belong to no agent group (1 groups defined). Only 1 of 7 records were retrieved (only 1 of the reported 7 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(ungrouped, 1, 7, "only 1 of the reported 7 records were returned");
+  const cappedCurrency = byId(agentResults, "TENABLE-08");
+  assert.equal(cappedCurrency.status, "warn", cappedCurrency.summary);
+  assert.match(cappedCurrency.summary, /load a set newer than 24 hours\. Only 1 of 7 records were retrieved \(only 1 of the reported 7 records were returned\), so the verdict is capped at warn\.$/);
+  assertPartialView(cappedCurrency, 1, 7, "only 1 of the reported 7 records were returned");
+
+  // The same partial agent list with a stale online agent reaches the warn branch of TENABLE-08.
+  agents["GET /scanners/null/agents"] = { agents: [{ id: 1, uuid: "ag-1", name: "host-1", status: "on", last_connect: RECENT_SECONDS, core_version: "10.8.0", plugin_feed_id: "202609190000", groups: [{ id: 1, name: "prod" }] }], pagination: { total: 7 } };
+  const staleAgentCurrency = byId(await runAll(clientsFor(agents)), "TENABLE-08");
+  assert.equal(staleAgentCurrency.status, "warn", staleAgentCurrency.summary);
+  assert.equal(staleAgentCurrency.summary, "The container plugin set is 2 hours old and 1 scanner entries load a fresh plugin set, but 0 scanner instances expose no parseable plugin set (not counted as current) and 1 online agents load a plugin set older than 24 hours. Only 1 of 7 records were retrieved (only 1 of the reported 7 records were returned); the verdict rests on the records retrieved.");
+  assertPartialView(staleAgentCurrency, 1, 7, "only 1 of the reported 7 records were returned");
+  assert.equal(staleAgentCurrency.evidence.stale_online_agents, 1);
+
+  // Probe A3 with a violation: the network walk stops at the 200-page cap with no reported
+  // total, a network without a scanner is among the pages, and the fail says the total is unknown.
+  const fallback = routerFetch(healthyRoutes());
+  const capped = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => {
+      const parsed = new URL(url);
+      if (parsed.pathname !== "/networks") return fallback(url, init);
+      const offset = Number(parsed.searchParams.get("offset") ?? "0");
+      return jsonResponse({ networks: Array.from({ length: 50 }, (_, index) => ({ uuid: `net-${offset + index}`, name: `Network ${offset + index}`, scanner_count: offset + index === 0 ? 0 : 1 })) });
+    },
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const cappedData = await collectTenableSensorCoverageData(capped, { now: NOW });
+  assert.equal(cappedData.networks.total, null);
+  const cappedNetworks = assessTenableSensorCoverage(cappedData, { now: NOW }).findings.find((item) => item.id === "TENABLE-09");
+  assert.equal(cappedNetworks.status, "fail", cappedNetworks.summary);
+  assert.equal(cappedNetworks.summary, "1 of 10000 network objects have no assigned scanners. Only 10000 of unknown records were retrieved (the walk stopped at the 200-page cap); the verdict rests on the records retrieved.");
+  assert.equal(cappedNetworks.evidence.networks, null, "the network detail is withheld while the walk is capped");
+  assertPartialView(cappedNetworks, 10000, null, "the walk stopped at the 200-page cap");
+  assert.equal(cappedNetworks.evidence.pagination_total, null);
+
+  // A stuck offset with a violation: the replayed page is the reason and the total it reported is kept.
+  const stuck = createTenableClients(vmConfig(), {
+    fetchImpl: async (url, init) => (new URL(url).pathname === "/exclusions"
+      ? jsonResponse({ exclusions: [{ id: 1, name: "Lab range", description: "CHG-9", members: "10.0.0.0/8", schedule: { enabled: true, rrules: "FREQ=WEEKLY" } }], pagination: { total: 9 } })
+      : fallback(url, init)),
+    sleepImpl: async () => {},
+    exportPollMs: 0,
+    exportTimeoutMs: 5_000,
+  });
+  const stuckData = await collectTenableScanProgramData(stuck, { now: NOW });
+  const broad = assessTenableScanProgram(stuckData, { now: NOW }).findings.find((item) => item.id === "TENABLE-13");
+  assert.equal(broad.status, "fail", broad.summary);
+  assert.equal(broad.summary, "1 of 1 exclusions need review: 0 always-on (schedule.enabled=false), 0 without a description, 1 covering /16 or wider ranges. Only 1 of 9 records were retrieved (GET /exclusions replayed the same page at offset 1, so the walk could not advance); the verdict rests on the records retrieved.");
+  assertPartialView(broad, 1, 9, "GET /exclusions replayed the same page at offset 1, so the walk could not advance");
+
+  // A complete walk carries the flags without a statement, on a violation branch as well as a pass.
+  const healthy = await runAll(clientsFor(healthyRoutes()));
+  for (const id of PARTIAL_VIEW_FINDINGS) {
+    const item = byId(healthy, id);
+    assert.equal(item.evidence.inventory_truncated, false, `${id} inventory_truncated`);
+    assert.equal(typeof item.evidence.records_seen, "number", `${id} records_seen`);
+    assert.equal(typeof item.evidence.records_total, "number", `${id} records_total`);
+    assert.doesNotMatch(item.summary, /records were retrieved/, `${id}: ${item.summary}`);
+  }
+  assert.equal(byId(healthy, "TENABLE-07").status, "fail", "the healthy scanner last connected two days ago");
+  assert.equal(byId(healthy, "TENABLE-07").evidence.records_total, 1);
+  const securityCenter = byId(healthy, "TENABLE-07-SC");
+  assert.equal(securityCenter.evidence.inventory_truncated, undefined, "an unconfigured Security Center read renders the unreadable marker, not collection flags");
+  assert.equal(securityCenter.evidence.not_collected, true);
+  assert.ok(!("collected" in securityCenter.evidence), "the finding marker states the absence in the positive form, so no false leaf appears under a denied read");
+
+  // An unreadable list renders the flags as null beside the marker of the finding that still reads it.
+  const denied = byId(await runAll(clientsFor(forbidding("GET /scanners/null/agents"))), "TENABLE-08");
+  assert.equal(denied.evidence.inventory_truncated, null);
+  assert.equal(denied.evidence.records_seen, null);
+  assert.equal(denied.evidence.records_total, null);
+});
+
+// Advisory A5: a zero-record page renders the total the API reported, never a hard-coded 0,
+// and zero delivered exclusions under a larger reported total is an unread list, not an empty one.
+test("advisory A5: zero-record branches render the observed pagination.total and zero exclusions under a larger total never read as compliant emptiness", async () => {
+  const routes = healthyRoutes();
+  routes["GET /exclusions"] = { exclusions: [], pagination: { total: 5 } };
+  routes["GET /credentials"] = { credentials: [], pagination: { total: 3 } };
+  routes["GET /audit-log/v1/events"] = { events: [], pagination: { total: 4 } };
+  const results = await runAll(clientsFor(routes));
+  const exclusions = byId(results, "TENABLE-13");
+  assert.equal(exclusions.status, "warn", exclusions.summary);
+  assert.equal(exclusions.summary, "GET /exclusions delivered zero exclusions although pagination.total reports 5, so the exclusion list was not reviewed. Only 0 of 5 records were retrieved (only 0 of the reported 5 records were returned), so the verdict is capped at warn.");
+  assert.doesNotMatch(exclusions.summary, /emptiness is compliant|pagination\.total 0/);
+  assertPartialView(exclusions, 0, 5, "only 0 of the reported 5 records were returned");
+  const credentials = byId(results, "TENABLE-12");
+  assert.equal(credentials.status, "manual");
+  assert.match(credentials.summary, /^GET \/credentials returned zero managed credentials \(pagination\.total 3\)\./);
+  assert.equal(credentials.evidence.pagination_total, 3);
+  const auditLog = byId(results, "TENABLE-18");
+  assert.equal(auditLog.status, "warn");
+  assert.match(auditLog.summary, /^The activity log returned zero events for the last 30 days \(pagination\.total 4\);/);
+
+  const empty = await runAll(clientsFor(emptyRoutes()));
+  assert.equal(byId(empty, "TENABLE-13").status, "pass");
+  assert.equal(byId(empty, "TENABLE-13").summary, "GET /exclusions returned zero exclusions (pagination.total 0), so nothing is excluded from scanning; emptiness is compliant for this control.");
+  assert.match(byId(empty, "TENABLE-12").summary, /\(pagination\.total 0\)\./);
+  assert.match(byId(empty, "TENABLE-18").summary, /\(pagination\.total 0\);/);
+});
+
 test("assessment summaries render null, not zero, for every unreadable dataset", async () => {
   const [scan, sensor, access, vuln] = await runAll(clientsFor(healthyRoutes(), { status: 403 }));
   for (const [key, value] of Object.entries(scan.summary)) {
@@ -1973,8 +3193,10 @@ test("assessment summaries render null, not zero, for every unreadable dataset",
   for (const key of ["user_count", "permission_count", "credential_count", "audit_events", "caller_is_administrator"]) assert.equal(access.summary[key], null, `access_control.summary.${key}`);
   for (const key of ["exported_findings", "exported_assets"]) assert.equal(vuln.summary[key], null, `vulnerability_management.summary.${key}`);
   for (const result of [scan, sensor, access, vuln]) {
-    assert.equal(result.summary.pass, 0, `${result.category}: nothing passes on forbidden data`);
+    // A status count of zero over incomplete inventories renders null, never 0, so it is not read as "none".
+    assert.equal(result.summary.pass, null, `${result.category}: nothing passes on forbidden data, and the zero is not asserted`);
     assert.ok(result.summary.manual >= 1, `${result.category}: unreadable inventories are manual`);
+    assert.ok(!result.findings.some((item) => item.status === "pass"), `${result.category}: no finding passes`);
   }
 });
 
@@ -2042,11 +3264,11 @@ test("addendum 5: refused or failed Tenable reads write not-collected markers na
   const analysis = files.get(join("analysis", "findings.json"));
   const mfa = findings.find((item) => item.id === "TENABLE-10");
   assert.equal(mfa.status, "manual");
-  assert.deepEqual(mfa.evidence, { collected: false, endpoint: "GET /users", dataset_status: "forbidden", http_status: 403, error: mfa.evidence.error });
+  assert.deepEqual(mfa.evidence, { not_collected: true, endpoint: "GET /users", dataset_status: "forbidden", http_status: 403, error: mfa.evidence.error });
   assert.match(mfa.summary, /GET \/users could not be read because GET \/users refused the API key with HTTP 403/);
 
   const [scan, sensor, access, vuln] = await runAll(createTenableClients(vmConfig(), { fetchImpl, sleepImpl: async () => {}, exportPollMs: 0, exportTimeoutMs: 5_000 }));
-  assert.deepEqual(access.summary.collection.users, { status: "forbidden", endpoint: "GET /users", http_status: 403, seen: null, total: null, truncated: null, error: access.summary.collection.users.error });
+  assert.deepEqual(access.summary.collection.users, { status: "forbidden", endpoint: "GET /users", http_status: 403, seen: null, total: null, truncated: null, unevaluable_records: null, error: access.summary.collection.users.error });
   assert.deepEqual(sensor.summary.collection.agents.truncated, null, "a refused walk is neither complete nor truncated");
   assert.equal(sensor.summary.collection.server_properties.http_status, 502);
   assert.equal(sensor.summary.collection.server_properties.status, "error");
@@ -2182,6 +3404,22 @@ const SILENT_SUCCESS_SHAPES = [
     make: () => new Response("<html>Captive portal canary page</html>", { status: 200, statusText: "OK", headers: { "content-type": `Bearer ${CANARY_BEARER}` } }),
     note: /HTTP 200 OK with a non-JSON unknown response body \(\d+ bytes, not echoed\) where the documented JSON document was expected/,
   },
+  {
+    // A JSON array of records none of which carries a member that identifies a documented
+    // record: on the two export chunks and the roles list (whose documented answer is an
+    // array) it is a foreign list and a failed read, never assets, findings, or roles;
+    // everywhere else it is an array where the documented object was expected.
+    name: "200-foreign-records",
+    make: () => new Response(JSON.stringify(FOREIGN_RECORDS), { status: 200, statusText: "OK", headers: { "content-type": "application/json" } }),
+    note: /HTTP 200 OK with (?:a JSON array of 2 records none of which carries any of the documented members (?:"[a-z_]+"(?:, )?)+ \(\d+ bytes, not echoed\)|a JSON array response body \(\d+ bytes, not echoed\) where the documented JSON object was expected)/,
+  },
+];
+
+// Records shaped like a portal's or another API's list: no member that identifies a
+// Tenable asset, finding, or role, and two carried canaries so an echo would show.
+const FOREIGN_RECORDS = [
+  { ok: true, region: "prod-us-east-2026", title: "Captive portal canary page" },
+  { ok: true, note: `Authorization: Bearer ${CANARY_BEARER}`, cookie: `sid=${CANARY_NAMED}` },
 ];
 
 test("silent-success class: a 2xx answer without the documented JSON document on any Vulnerability Management or Security Center surface is an unreadable surface with the observed status, never an empty inventory, a readable probe, a healthy check, or a hard verdict", async () => {
@@ -2295,6 +3533,206 @@ test("silent-success class: a 2xx answer without the documented JSON document on
       }
       assert.ok(requests.every((request) => request.status === 200), `${label}: every request in the run observed a 2xx`);
     }
+  }
+});
+
+// Documented records for the third chunk of each export, alongside one foreign record.
+const THIRD_ASSET = { id: "a-3", has_agent: true, last_authentication_scan_status: "Success", last_seen: RECENT_ISO, network_id: "net-1", network_name: "Default", tags: [{ key: "Environment", value: "prod" }], sources: [{ name: "NESSUS_AGENT" }] };
+const THIRD_VULN = { severity: "high", state: "OPEN", first_found: RECENT_ISO, last_found: RECENT_ISO, plugin: { id: 3, vpr: { score: 7.4 }, cvss3_base_score: 8.0 } };
+const EXPORT_CAPPED = ["TENABLE-03", "TENABLE-04", "TENABLE-14", "TENABLE-15", "TENABLE-16"];
+const UNEVALUABLE_NOTE = /(\d+) of (\d+) exported records carry none of the documented members \((?:[a-z_]+(?:, )?)+\) and were not evaluated/;
+
+function threeChunkRoutes(assetChunks, vulnChunks) {
+  const routes = healthyRoutes();
+  routes["GET /assets/export/asset-export-1/status"] = { status: "FINISHED", chunks_available: [1, 2, 3], chunks_failed: [], total_chunks: 3 };
+  routes["GET /vulns/export/vuln-export-1/status"] = { status: "FINISHED", chunks_available: [1, 2, 3], chunks_failed: [], total_chunks: 3 };
+  assetChunks.forEach((chunk, index) => { routes[`GET /assets/export/asset-export-1/chunks/${index + 1}`] = chunk; });
+  vulnChunks.forEach((chunk, index) => { routes[`GET /vulns/export/vuln-export-1/chunks/${index + 1}`] = chunk; });
+  return routes;
+}
+
+async function exportedBundle(routes, label) {
+  const bundle = await exportTenableAuditBundle(clientsFor(routes), mkdtempSync(join(tmpdir(), "tenable-foreign-records-")), { now: NOW, expectedAssetCount: 3 });
+  const files = readBundleFiles(bundle.outputDir);
+  const zipEntries = readZipEntries(bundle.zipPath);
+  for (const [name, content] of [...files, ...zipEntries]) {
+    assertNoCanary(content, `${label} ${name}`);
+    assert.doesNotMatch(content, NON_DOCUMENT_ECHO, `${label}: a foreign record reached ${name}`);
+  }
+  const bundleName = basename(bundle.outputDir);
+  return { files, zipEntry: (name) => zipEntries.get(`${bundleName}/${name}`) ?? zipEntries.get(name) };
+}
+
+test("TENABLE-15 (round 1 blocking 2): export chunk records without a documented member are never assets or findings: a stray record is unevaluable and caps TENABLE-03, 04, 14, 15, and 16 at warn with its count, a chunk of only foreign records is a failed download, and assets_export.json and vulns_export.json carry a partial marker around the evaluated records instead of a bare array", async () => {
+  // Control: three documented chunks per export are one complete inventory of three records each.
+  const control = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET]], [healthyVulns(), [THIRD_VULN], [THIRD_VULN]]);
+  const controlResults = await runAll(clientsFor(control), { expectedAssetCount: 3 });
+  const controlVerdicts = verdictMap(controlResults);
+  for (const id of EXPORT_CAPPED) assert.equal(controlVerdicts.get(id), "pass", `${id} passes on the documented control`);
+  assert.deepEqual(controlResults.flatMap((result) => result.errors), []);
+  const controlBundle = await exportedBundle(control, "control");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    const written = JSON.parse(controlBundle.files.get(join("core_data", name)));
+    assert.ok(Array.isArray(written) && written.length === 4, `${name} on the control is the bare list of every record: ${controlBundle.files.get(join("core_data", name)).slice(0, 80)}`);
+  }
+
+  // A stray foreign record inside an otherwise documented chunk of each export.
+  const stray = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET, FOREIGN_RECORDS[0]]], [healthyVulns(), [THIRD_VULN], [FOREIGN_RECORDS[1], THIRD_VULN]]);
+  const assetExport = await clientsFor(stray).vm.exportAssets();
+  assert.deepEqual(
+    { kind: assetExport.kind, records: assetExport.records.length, unevaluableRecords: assetExport.unevaluableRecords, fetchedChunks: assetExport.fetchedChunks, downloadFailures: assetExport.downloadFailures, truncated: assetExport.truncated },
+    { kind: "assets", records: 4, unevaluableRecords: 1, fetchedChunks: 3, downloadFailures: 0, truncated: false },
+  );
+  assert.ok(assetExport.records.every((record) => "id" in record), "only documented assets are kept");
+  const vulnExport = await clientsFor(stray).vm.exportVulnerabilities(Math.floor((NOW - 30 * 86_400_000) / 1000));
+  assert.deepEqual({ kind: vulnExport.kind, records: vulnExport.records.length, unevaluableRecords: vulnExport.unevaluableRecords, truncated: vulnExport.truncated }, { kind: "vulns", records: 4, unevaluableRecords: 1, truncated: false });
+
+  const strayResults = await runAll(clientsFor(stray), { expectedAssetCount: 3 });
+  const strayText = JSON.stringify(strayResults);
+  assertNoCanary(strayText, "stray-record assessments");
+  assert.doesNotMatch(strayText, NON_DOCUMENT_ECHO);
+  for (const id of EXPORT_CAPPED) {
+    const item = byId(strayResults, id);
+    assert.equal(item.status, "warn", `${id} is capped at warn by the unevaluable record: ${item.summary}`);
+    assert.match(item.summary, /1 of (?:4|5) exported records carry none of the documented members \((?:[a-z_]+(?:, )?)+\) and were not evaluated, so the verdict is capped at warn\./, `${id}: ${item.summary}`);
+    assert.equal(item.evidence.unevaluable_records, 1, `${id} evidence counts the record that was kept out`);
+  }
+  for (const [id, status] of verdictMap(strayResults)) {
+    if (!EXPORT_CAPPED.includes(id)) assert.equal(status, controlVerdicts.get(id), `${id} does not read the exports and keeps its control verdict`);
+  }
+  const [, sensor, , vuln] = strayResults;
+  assert.deepEqual({ truncated: sensor.summary.collection.asset_export.truncated, unevaluable: sensor.summary.collection.asset_export.unevaluable_records, seen: sensor.summary.collection.asset_export.seen }, { truncated: false, unevaluable: 1, seen: 4 });
+  assert.equal(vuln.summary.collection.vuln_export.unevaluable_records, 1);
+  assert.equal(vuln.summary.collection.users.unevaluable_records, null, "a list that is not an export has no unevaluable count");
+  assert.ok(sensor.errors.some((error) => /^asset_export dataset: 1 of 5 exported records carry none of the documented members \(id, uuid, has_agent, last_seen, network_id, tags\) and were not evaluated\.$/.test(error)), JSON.stringify(sensor.errors));
+  assert.ok(vuln.errors.some((error) => /^vuln_export dataset: 1 of 5 exported records carry none of the documented members \(state, severity, plugin, asset, first_found, last_found\) and were not evaluated\.$/.test(error)), JSON.stringify(vuln.errors));
+
+  const strayBundle = await exportedBundle(stray, "stray record");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    for (const [where, content] of [["file", strayBundle.files.get(join("core_data", name))], ["zip entry", strayBundle.zipEntry(`core_data/${name}`)]]) {
+      assert.ok(content, `${name} ${where} is present`);
+      const written = JSON.parse(content);
+      assert.deepEqual(
+        { collected: written.collected, complete: written.complete, truncated: written.truncated, fetched_chunks: written.fetched_chunks, total_chunks: written.total_chunks, unevaluable_records: written.unevaluable_records, records: written.records.length },
+        { collected: true, complete: false, truncated: false, fetched_chunks: 3, total_chunks: 3, unevaluable_records: 1, records: 4 },
+        `${name} ${where} is a partial marker around the evaluated records: ${content.slice(0, 200)}`,
+      );
+    }
+  }
+  assert.match(strayBundle.files.get("_errors.log"), UNEVALUABLE_NOTE, "_errors.log names the records that were kept out");
+  for (const id of EXPORT_CAPPED) {
+    const item = JSON.parse(strayBundle.files.get(join("analysis", "findings.json"))).find((entry) => entry.id === id);
+    assert.equal(item.status, "warn", `${id} in the bundle`);
+  }
+
+  // A chunk of only foreign records is a failed download: with one chunk lost of three the
+  // export is partial; with the only chunk lost the export is unreadable, never empty.
+  const lostChunk = threeChunkRoutes([healthyAssets(), FOREIGN_RECORDS, [THIRD_ASSET, FOREIGN_RECORDS[0]]], [healthyVulns(), FOREIGN_RECORDS, [THIRD_VULN]]);
+  const lostExport = await clientsFor(lostChunk).vm.exportAssets();
+  assert.deepEqual(
+    { records: lostExport.records.length, unevaluableRecords: lostExport.unevaluableRecords, fetchedChunks: lostExport.fetchedChunks, downloadFailures: lostExport.downloadFailures, truncated: lostExport.truncated, endpoint: lostExport.endpoint, httpStatus: lostExport.httpStatus },
+    { records: 3, unevaluableRecords: 1, fetchedChunks: 2, downloadFailures: 1, truncated: true, endpoint: "GET /assets/export/asset-export-1/chunks/2", httpStatus: 200 },
+  );
+  assert.match(lostExport.reason, /1 chunk downloads failed: Tenable request GET \/assets\/export\/asset-export-1\/chunks\/2 returned HTTP 200 with a JSON array of 2 records none of which carries any of the documented members "id", "uuid", "has_agent", "last_seen", "network_id", "tags" \(\d+ bytes, not echoed\)/);
+  assertNoCanary(JSON.stringify(lostExport), "lost-chunk export result");
+  const lostResults = await runAll(clientsFor(lostChunk), { expectedAssetCount: 3 });
+  for (const id of EXPORT_CAPPED) assert.ok(["warn", "manual"].includes(byId(lostResults, id).status), `${id} never passes on a partial export: ${byId(lostResults, id).summary}`);
+  const lostBundle = await exportedBundle(lostChunk, "lost chunk");
+  const lostAssets = JSON.parse(lostBundle.files.get(join("core_data", "assets_export.json")));
+  assert.deepEqual(
+    { collected: lostAssets.collected, complete: lostAssets.complete, truncated: lostAssets.truncated, fetched_chunks: lostAssets.fetched_chunks, total_chunks: lostAssets.total_chunks, download_failures: lostAssets.download_failures, unevaluable_records: lostAssets.unevaluable_records, records: lostAssets.records.length },
+    { collected: true, complete: false, truncated: true, fetched_chunks: 2, total_chunks: 3, download_failures: 1, unevaluable_records: 1, records: 3 },
+  );
+  assert.match(lostAssets.reason, /1 chunk downloads failed: Tenable request GET \/assets\/export\/asset-export-1\/chunks\/2 returned HTTP 200 with a JSON array of 2 records/);
+  assert.match(lostBundle.files.get("_errors.log"), /asset_export dataset: partial view \(3 of unknown records retrieved; 1 chunk downloads failed/);
+
+  const onlyChunk = healthyRoutes();
+  onlyChunk["GET /assets/export/asset-export-1/chunks/1"] = FOREIGN_RECORDS;
+  onlyChunk["GET /vulns/export/vuln-export-1/chunks/1"] = FOREIGN_RECORDS;
+  const onlyResults = await runAll(clientsFor(onlyChunk), { expectedAssetCount: 2 });
+  for (const id of EXPORT_CAPPED) {
+    const item = byId(onlyResults, id);
+    assert.equal(item.status, "manual", `${id} is unreadable, not an empty inventory: ${item.summary}`);
+    assert.equal(item.evidence.not_collected, true, `${id} evidence is a not-collected marker`);
+  }
+  const onlyBundle = await exportedBundle(onlyChunk, "only chunk foreign");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    const marker = JSON.parse(onlyBundle.files.get(join("core_data", name)));
+    assert.deepEqual({ collected: marker.collected, status: marker.status, dataset_status: marker.dataset_status }, { collected: false, status: 200, dataset_status: "error" }, `${name}: ${JSON.stringify(marker)}`);
+    assert.match(marker.error, /FINISHED with 1 available chunks but none could be downloaded: 1 chunk downloads failed: Tenable request GET \/(?:assets|vulns)\/export\/[a-z]+-export-1\/chunks\/1 returned HTTP 200 with a JSON array of 2 records none of which carries any of the documented members/);
+  }
+});
+
+test("Codex P2 (#75): an export with unevaluable records is an incomplete inventory: the categories that read it render their zero status counts as null beside the partial marker the bundle writes, positive counts stay as observed, the roll-up follows the category summaries, and the categories that read no export keep their counts", async () => {
+  const STATUS_KEYS = ["pass", "warn", "fail", "manual"];
+  const CATEGORY_FILES = ["scan_program", "sensor_coverage", "access_control", "vulnerability_management"];
+  const EXPORT_READERS = ["scan_program", "sensor_coverage", "vulnerability_management"];
+  const observedCounts = (assessment) => Object.fromEntries(STATUS_KEYS.map((key) => [key, assessment.findings.filter((item) => item.status === key).length]));
+  const NOT_ASSERTED = /none seen \(not asserted: an inventory the findings read was incomplete\)/;
+
+  // Control: three documented chunks per export are a complete inventory, so every status count is asserted, zeros included.
+  const control = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET]], [healthyVulns(), [THIRD_VULN], [THIRD_VULN]]);
+  const controlBundle = await exportedBundle(control, "complete export control");
+  const controlAssessments = Object.fromEntries(CATEGORY_FILES.map((name) => [name, JSON.parse(controlBundle.files.get(join("analysis", `${name}.json`)))]));
+  for (const [name, assessment] of Object.entries(controlAssessments)) {
+    const observed = observedCounts(assessment);
+    for (const key of STATUS_KEYS) assert.equal(assessment.summary[key], observed[key], `${name}.summary.${key} on the complete control is the observed count`);
+    assert.ok(STATUS_KEYS.some((key) => observed[key] === 0), `${name}: the control has a zero status count, so the asserted 0 is exercised: ${JSON.stringify(observed)}`);
+  }
+  assert.equal(controlAssessments.scan_program.summary.exported_assets, 4);
+  assert.equal(controlAssessments.sensor_coverage.summary.exported_assets, 4);
+  assert.equal(controlAssessments.vulnerability_management.summary.exported_findings, 4);
+  assert.doesNotMatch(controlBundle.files.get(join("compliance", "executive_summary.md")), NOT_ASSERTED, "a complete inventory asserts every roll-up count");
+
+  // A stray foreign record inside an otherwise documented chunk of each export: the same
+  // readable export the bundle writes under a partial marker.
+  const stray = threeChunkRoutes([healthyAssets(), [THIRD_ASSET], [THIRD_ASSET, FOREIGN_RECORDS[0]]], [healthyVulns(), [THIRD_VULN], [FOREIGN_RECORDS[1], THIRD_VULN]]);
+  const strayBundle = await exportedBundle(stray, "unevaluable export records");
+  for (const name of ["assets_export.json", "vulns_export.json"]) {
+    const written = JSON.parse(strayBundle.files.get(join("core_data", name)));
+    assert.deepEqual(
+      { collected: written.collected, complete: written.complete, truncated: written.truncated, unevaluable_records: written.unevaluable_records, records: written.records.length },
+      { collected: true, complete: false, truncated: false, unevaluable_records: 1, records: 4 },
+      `${name} is a partial marker around the evaluated records`,
+    );
+  }
+  const strayAssessments = Object.fromEntries(CATEGORY_FILES.map((name) => [name, JSON.parse(strayBundle.files.get(join("analysis", `${name}.json`)))]));
+  const withheld = [];
+  for (const name of EXPORT_READERS) {
+    const assessment = strayAssessments[name];
+    const observed = observedCounts(assessment);
+    for (const key of STATUS_KEYS) {
+      const expected = observed[key] === 0 ? null : observed[key];
+      if (expected === null) withheld.push(`${name}.${key}`);
+      assert.strictEqual(assessment.summary[key], expected, `${name}.summary.${key}: zero over an export with unevaluable records renders null, never 0, and a positive count is the observed count (${JSON.stringify(observed)})`);
+    }
+    assert.equal(assessment.summary.collection[name === "vulnerability_management" ? "vuln_export" : "asset_export"].unevaluable_records, 1, `${name}: the collection status counts the record that was kept out`);
+  }
+  assert.ok(withheld.length >= 1, "at least one export-reading category has a zero status count on the mixed export, so the null rendering is exercised");
+  // The demotion the same export carries: every verdict that reads it is capped at warn with the count named.
+  for (const id of EXPORT_CAPPED) {
+    const item = JSON.parse(strayBundle.files.get(join("analysis", "findings.json"))).find((entry) => entry.id === id);
+    assert.equal(item.status, "warn", `${id} is capped at warn by the unevaluable record: ${item.summary}`);
+    assert.equal(item.evidence.unevaluable_records, 1, `${id} evidence counts the record that was kept out`);
+  }
+  // Positive counts are lower bounds and render as observed: the evaluated records are counted, the kept-out one is not.
+  assert.equal(strayAssessments.scan_program.summary.exported_assets, 4);
+  assert.equal(strayAssessments.sensor_coverage.summary.exported_assets, 4);
+  assert.equal(strayAssessments.vulnerability_management.summary.exported_findings, 4);
+  // A category that reads no export is not incomplete and keeps its asserted counts, zeros included.
+  const accessObserved = observedCounts(strayAssessments.access_control);
+  for (const key of STATUS_KEYS) assert.strictEqual(strayAssessments.access_control.summary[key], accessObserved[key], `access_control.summary.${key} reads no export and stays asserted`);
+  assert.deepEqual(accessObserved, observedCounts(controlAssessments.access_control), "the stray record changes nothing the access-control findings read");
+  // The roll-up inherits the incomplete state from the category summaries: a zero roll-up
+  // count is not asserted, a positive one renders as observed (every status occurs at
+  // least once across the four categories of this fixture, so the four lines are counts).
+  const rollup = JSON.parse(strayBundle.files.get(join("analysis", "findings.json")));
+  const executive = strayBundle.files.get(join("compliance", "executive_summary.md"));
+  for (const [key, label] of [["pass", "Passing"], ["warn", "Warning"], ["fail", "Failing"], ["manual", "Manual (unknown or not applicable)"]]) {
+    const total = rollup.filter((item) => item.status === key).length;
+    const line = executive.split("\n").find((text) => text.startsWith(`- ${label}: `));
+    assert.ok(line, `${label} line in the executive summary`);
+    assert.equal(line, `- ${label}: ${total === 0 ? "none seen (not asserted: an inventory the findings read was incomplete)" : total}`, `roll-up ${key}`);
   }
 });
 

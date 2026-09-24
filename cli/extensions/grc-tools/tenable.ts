@@ -306,13 +306,23 @@ function clampInteger(value: number | undefined, fallback: number, min: number, 
   return Math.trunc(clampNumber(value, fallback, min, max));
 }
 
+// A configured URL keeps its scheme, host, port, and path prefix for requests; its
+// user-and-secret prefix, query, and fragment are dropped here so no request, label,
+// or bundle file ever carries them.
 function normalizeBaseUrl(rawUrl: string): string {
   const candidate = /^https?:\/\//i.test(rawUrl.trim()) ? rawUrl.trim() : `https://${rawUrl.trim()}`;
   const parsed = new URL(candidate);
+  parsed.username = "";
+  parsed.password = "";
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
+}
+
+/** The scheme and host of a configured URL, which is all a platform label or summary line writes. */
+function displayOrigin(url: string): string {
+  return new URL(url).origin;
 }
 
 function isTenableCloudHost(baseUrl: string): boolean {
@@ -348,20 +358,28 @@ const REDACTED = CREDENTIAL_REDACTION_MARKER;
  * the unread inventory is itself a verdict-safety requirement. Two guards make
  * that safe and both hold by construction:
  *
- * 1. A value inside a carrier is removed whatever its shape: the Authorization,
- *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-ApiKeys, X-Cookie,
- *    X-SecurityCenter, X-Auth-Token and similar header lines to the end of the
- *    line; the userinfo of every embedded URL; credential-named query and fragment
- *    pairs of every URL and bare query string (the ?token= an audit-log field or a
- *    webhook target may carry) and any query value shaped like a token; the schemes
- *    Bearer, Basic, Digest, Token, Negotiate, NTLM, SSWS, and ApiKey (only a listed
- *    prose word after the scheme, "Basic authentication", stays; after the noun
- *    "Token" any short plain lowercase word does); credential-named key=value pairs
- *    (to the next delimiter: the accessKey= and secretKey= halves of an echoed
- *    X-ApiKeys header), key: value pairs (to the end of the line), "key":"value"
- *    pairs, and key="value" XML or HTML attributes; and webhook services whose URL
- *    path is the secret. Nothing this module renders puts a credential word in front
- *    of a colon or an equals sign, so every fixed text survives the scrub.
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization and
+ *    Proxy-Authorization header lines, keeping the scheme word the credentials follow
+ *    (Bearer, Basic, Digest, ...) and removing the one token after it, or the whole
+ *    parameter list after a Digest or AWS4-HMAC-SHA256 scheme; the Cookie, Set-Cookie,
+ *    X-Cookie, and X-ApiKeys lines to the end of the line; the X-Api-Key,
+ *    X-SecurityCenter, X-Auth-Token and similar single-token header lines to the end
+ *    of their first token; the userinfo of every embedded URL, bare or with its slashes
+ *    escaped by a stringify; credential-named query and fragment pairs of every URL
+ *    and bare query string (the ?token= an audit-log field or a webhook target may
+ *    carry) and any query value shaped like a token; the schemes Bearer, Basic, Digest,
+ *    Token, OAuth, Negotiate, NTLM, SSWS, ApiKey, Splunk, Snowflake, and
+ *    AWS4-HMAC-SHA256 in any casing (only a listed prose word after the scheme, "Basic
+ *    authentication", or an auth-param name, Bearer realm=, stays; after the nouns
+ *    Token, OAuth, Splunk, and Snowflake any short plain lowercase word does);
+ *    credential-named key=value pairs (to the next delimiter, wherever the key starts:
+ *    after --, -D, or a path slash; the accessKey= and secretKey= halves of an echoed
+ *    X-ApiKeys header), key: value pairs (to the end of the line, or one token after a
+ *    path slash), --key value flags, "key":"value" pairs, and key="value" XML or HTML
+ *    attributes; the path and query of a URL under a webhook or webhook_url key; and
+ *    webhook services whose URL path is the secret. Nothing this module renders puts a
+ *    credential word in front of a colon or an equals sign, so every fixed text
+ *    survives the scrub.
  * 2. A configured secret (the Vulnerability Management access key and secret key,
  *    and the Security Center access key and secret key) is removed whatever its
  *    shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
@@ -371,8 +389,8 @@ const REDACTED = CREDENTIAL_REDACTION_MARKER;
  *    payload and every written file.
  *
  * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
- * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, and (in
- * error text) any run of
+ * PAN-OS keys (a proxy page may echo any vendor's key), AWS access key ids, GitHub,
+ * Stripe, and Slack prefixed tokens, and (in error text) any run of
  * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
  * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
  * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
@@ -399,35 +417,134 @@ const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/
 // ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
 const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
 // Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
-// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay. The
+// userinfo ends where the authority does, at "/", "?", or "#", so an "@" inside a query or
+// fragment (https://h?e=a@x.com&token=..., https://h#f@x.com) is never read as userinfo: the
+// host stays "h", and the query is left to the pair rule and the origin reducer instead of
+// being carried on as if it were the host.
 const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
-const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s\/?#@"'<>\\]+@/i;
 // A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
-// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
-// ";" and "," that end a URL inside a sentence (no token carries either).
-const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
+// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, a
+// backslash (no token carries one; the escape after it, \" or \n inside a JSON string, is
+// kept so the string still parses and the text after it is still read), or the "," that
+// ends a URL inside a sentence. A ";" is part of the value, as URLSearchParams reads it
+// (?token=hunter2;restofsecret is one value and loses the whole of it); the ";" that ends a
+// pair belongs to the cookie and key-list header lines, which are read before this rule, so
+// a cookie pair whose name holds "&" or "#" goes with its cookie.
+// A quote with a value character on both sides (O'hunter2) is content of the value.
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>,\\]+(?:["'](?![:)}\]])[^&#\s"'<>,\\]+)*)/g;
 // A credential-bearing header line: the whole value goes, whatever its shape. The name and
-// separator are matched here and the value is consumed by headerValueEnd, which carries a
-// quoted value (double, single, or JSON-escaped quotes) through its closing quote, so
-// Cookie: sid="value" loses value and quotes together instead of stopping at the first
-// quote. A value that already opens with a marker is left alone so the rule is idempotent.
-const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
+// separator are matched here (the name may be quoted as a JSON member name, with its quotes
+// escaped to any depth: "Cookie": ..., \"Cookie\": ..., \\\"Cookie\\\": ...) and the value
+// is consumed by headerValueEnd, which carries a quoted value through its closing quote at
+// the same depth, so Cookie: sid="value" loses value and quotes together instead of
+// stopping at the first quote, and ends an unquoted value before the next header on a
+// compound line, so the next header keeps its name. A value that already opens with a
+// marker is left alone so the rule is idempotent. The name starts where no word character
+// precedes it, or right after a JSON string escape left in place by one stringify (\n, \r,
+// \t, \b, \f, \v, \0, \uXXXX, \xHH): "request failed\nX-SecurityCenter: value" is a header
+// line inside a JSON string, and the escape letter is not part of the name that follows it.
+const HEADER_LINE_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv0]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}))(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)((?:\\*["'])?\s*:\s*)/gi;
+// The escape letters that can sit between a backslash and the key or header name after it.
+const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv0]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})/;
 // Inside a header value a quote opens a quoted segment only where a value can start: at the
-// start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
-// quote that closes the text the header line was quoted in.
+// start of the value or after "=", ":", ",", ";", "(", or whitespace. A quote with a token
+// character on both sides (sid=O'hunter2, my'pref=value, my"pref=value) is content of the
+// value, since RFC 6265 lets a cookie name or value carry an apostrophe. A quote anywhere
+// else, at the end of a token, is the quote that closes the text the header line was quoted
+// in.
 const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
+// What follows a quote that opens or closes something: whitespace, a delimiter, a closing
+// bracket, a tag, another quote, or an escape. Any other character continues the token.
+const QUOTE_BOUNDARY_PATTERN = /[\s,;:)}\]<>"'\\]/;
 const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
+// The "Name:" token of the next header after ";" or "," on a compound line (the name may be
+// quoted, as in a JSON object, with the quotes escaped to any depth, and may hold dots, as
+// X.Api.Key does when a proxy rewrites hyphens); a colon followed by "//" is a URL scheme,
+// not a header. The token is looked for within FOLLOWING_HEADER_LOOKAHEAD characters of the
+// separator.
+const FOLLOWING_HEADER_PATTERN = /^\s*(?:\\*["'])?[A-Za-z][A-Za-z0-9.-]*(?:\\*["'])?\s*:(?!\/\/)/;
+const FOLLOWING_HEADER_LOOKAHEAD = 96;
+// Header classes. An Authorization or Proxy-Authorization value opens with the scheme word
+// its credentials follow (Bearer, Basic, Digest, and the rest of AUTH_SCHEME_WORDS, in any
+// casing): the word stays as spelled and the one token (or one quoted string) after it
+// goes, so the operator still reads which scheme was replayed and prose after the token
+// stays; a parameter list after the scheme (Digest username=..., realm=...) goes whole, as
+// does a value that opens with anything else (a scheme word the list does not know, such
+// as GenieKey, SharedKey, or Bot, a bare token, a digit), to the end of the line: an
+// unknown first word may be a scheme with its credentials after it, so nothing after it
+// is trusted. A cookie header, or Tenable's X-ApiKeys (accessKey=...; secretKey=...), is
+// a list of pairs and goes whole. Every other header (X-Api-Key, X-Auth-Token,
+// X-Vault-Token, ...) carries one token: an unquoted value ends at the first whitespace,
+// so a JSON fragment or prose after it on the same line ({"status":"denied"}, "rejected")
+// is still read; a value that opens with a listed scheme word (X-Auth-Token: Bearer <v>)
+// is the word and the token after it together, and both go under the one marker, as the
+// scheme word is part of the value under any key but Authorization; a quoted value ends
+// at its closing quote whatever it holds.
+const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
+const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
+const AUTH_SCHEME_WORDS = new Set([
+  "basic", "bearer", "digest", "hoba", "mutual", "negotiate", "oauth", "scram-sha-1", "scram-sha-256", "vapid", "dpop", "gnap",
+  "privatetoken", "concealed", "ntlm", "token", "ssws", "apikey", "api-key", "splunk", "snowflake", "aws4-hmac-sha256",
+]);
+const AUTH_SCHEME_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)(?:\s+|$)/;
+// A header value the header rule already treated, as the pair rules then see it: the scheme
+// word and, after whitespace and an optional quote, the marker.
+const REDACTED_SCHEME_VALUE_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)\s+((?:\\*["'])?)\[REDACTED\]/;
+const AUTH_PARAM_LIST_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*=/;
 // A scheme and its credentials: the value is removed whatever its shape, except the
 // prose words that follow a scheme name in a sentence ("Basic authentication is
 // required", "Bearer token") and a Titlecase word, which makes the scheme name an
 // adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
 // credential is base64 and a bearer token or API key carries digits, symbols, or token
-// casing, so neither is ever one capitalized word of letters. "Token" is also this
-// module's own noun ("Token hygiene", "token inventory"), so after it any plain
-// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its
-// credentials as key="value" attributes, which the attribute rule removes, so OAuth is
-// not a scheme here and "OAuth clients" stays.
-const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+// casing, so neither is ever one capitalized word of letters. "Token", "OAuth", "Splunk",
+// and "Snowflake" are also nouns of this module's own prose and of product names ("Token
+// hygiene", "OAuth clients", "Splunk index", "Snowflake account"), so after them any plain
+// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. An auth-param name before
+// "=" (Bearer realm="api", Digest qop="auth") is the challenge's grammar, not a credential;
+// the quoted value after it is judged by the attribute rule under its own name. A
+// parameter list that carries credentials is read whole by the parameter-list rule first.
+const SCHEME_WORD_SOURCE = "Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
+const SCHEME_VALUE_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})`, "gi");
+const NOUN_SCHEME_WORDS = new Set(["token", "oauth", "splunk", "snowflake"]);
+const AUTH_PARAM_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=$/;
+const AUTH_PARAM_NAMES = new Set([
+  "realm", "error", "error_description", "error_uri", "scope", "charset", "nonce", "opaque", "qop", "algorithm", "stale", "domain",
+  "uri", "response", "cnonce", "nc", "username", "credential", "signedheaders", "signature", "oauth_consumer_key", "oauth_token",
+  "oauth_signature_method", "oauth_signature", "oauth_timestamp", "oauth_nonce", "oauth_version", "oauth_callback", "oauth_verifier",
+]);
+// A scheme word followed by a parameter list (name=value, name2=value2, ...) is the value of
+// an Authorization header wherever it appears, with the header name in front of it or
+// without one (Snowflake Token="<value>", Token token="<value>", nonce="...", Digest
+// username="...", realm="...", nonce="...", response="...", OAuth oauth_token="..."): the
+// word stays and the whole list goes, as it does under the header name. A list made only
+// of the parameters a challenge carries (the realm, the Bearer error fields, the Basic
+// charset, the Digest challenge fields: Bearer realm="api", error="invalid_token", a
+// WWW-Authenticate value) is a challenge and stays for the per-parameter rules; a list with
+// any other parameter (Token, token, key, username, uri, response, oauth_token, ...) is the
+// credential side of its scheme. The list is read by readAuthParameterList.
+const CHALLENGE_PARAM_NAMES = new Set(["realm", "error", "error_description", "error_uri", "scope", "charset", "domain", "nonce", "opaque", "stale", "algorithm", "qop", "userhash"]);
+// The parameters that carry the proof of a credential: the Digest response, a signature
+// (oauth_signature, signature, sig), or a MAC. A proof's value goes whatever its shape, in
+// a list after a scheme word or in one without a scheme word.
+const PROOF_PARAM_NAMES = new Set(["response", "signature", "oauth_signature", "mac", "sig"]);
+// A parameter list without a scheme word (realm="api", nonce="n", response="<proof>": the
+// value of a www_authenticate field, or a credential echoed without its scheme word) is an
+// auth parameter list when it holds two or more parameters and one of them, other than a
+// proof, is a known auth parameter (a challenge parameter, or username, uri, nc, cnonce, an
+// oauth_* parameter). In such a list, or in the list after a scheme word, a proof goes and a
+// challenge parameter keeps its value: the nonce of a challenge is public, so a proof-free
+// challenge (Digest realm="api", qop="auth", nonce="n") keeps every value, while a list
+// that carries a proof is not a challenge, whatever parameters open it. Any other parameter
+// (username, oauth_token) is judged under its own name, and a lone name=value pair is no
+// list. A list opens at a name that no word character precedes.
+const AUTH_PARAMETER_LIST_OPENER_PATTERN = /(?<![A-Za-z0-9_.:-])[A-Za-z][A-Za-z0-9_-]*=/g;
+const SCHEME_LED_LIST_PATTERN = new RegExp(String.raw`\b(?:${SCHEME_WORD_SOURCE})\s+$`, "i");
+const SCHEME_PARAMETER_LIST_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+(?=[A-Za-z][A-Za-z0-9_-]*=)`, "gi");
+const AUTH_PARAM_ITEM_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=/y;
+const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'\\<>]+/y;
+const AUTH_PARAM_SEPARATOR_PATTERN = /\s*,\s*/y;
 const PLAIN_WORD_PATTERN = /^[a-z]+$/;
 const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
 const SCHEME_PROSE_WORDS = new Set([
@@ -445,18 +562,81 @@ const SCHEME_PROSE_WORDS = new Set([
 // Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
 // character precedes it rather than at a word boundary.
 const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
-const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
+// The same pair inside a JSON text that was itself stringified into a string value, so its
+// quotes arrive behind a run of backslashes (\" one level down, \\\" two levels down): the
+// run is captured and the pair's four quotes must all carry it, so the value ends at the
+// quote of its own depth.
+const JSON_ESCAPED_PAIR_PATTERN = /(\\+)"([A-Za-z_][A-Za-z0-9_.-]{0,63})\1"(\s*:\s*)\1"((?!\[REDACTED\])(?:(?!\1")[^\r\n])+?)\1"/g;
+// A quoted attribute or pair value: the quote may be escaped to any depth, and the value
+// ends at the quote of its own depth.
+// A quote with a value character on both sides (O'hunter2) is content of the value.
+const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(\\*["'])((?!\[REDACTED\])(?:[^"'\r\n]|["'](?=[^\s"'\r\n<>;,&:)}\]\\]))+)\2/g;
 // An unquoted pair: key=value runs to the next delimiter, key: value (a header or
 // YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
 // structure after a credential-named key (compact "password":{...}, "auth":null}) is
-// never taken for a value.
-const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
-const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;{}[\]]*[^\s\r\n<>"',;{}[\]]/y;
-const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
+// never taken for a value. The key and the value may be quoted with the quotes escaped to
+// any depth; a value never runs into the escaped quote that closes it. A key starts where
+// no word character precedes it: after the "--" of a command-line flag (--password=v), the
+// "-D" of a Java system property (-Dpassword=v, where the D is read as part of the key and
+// the credential word is still its tail), a "/" path separator, or a "." (the tail of a
+// dotted name is scanned only when no key match started earlier on the name); or right
+// after a \0 escape, whose digit cannot start a key (the letter escapes, \n and the rest,
+// are read as part of the key and removed by keyAfterEscape).
+const ASSIGNMENT_KEY_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\0))((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
+// The escape one stringify leaves for a control character: \n, \r, \t, \b, \f, \v, \0, or a
+// \uXXXX or \xHH code of a control (U+0000 to U+001F, U+007F, and the line and paragraph
+// separators U+2028 and U+2029). An escape of a printable character (\u00e9) is content.
+const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|007[fF]|202[89])|x(?:[01][0-9a-fA-F]|7[fF]))`;
+// A credential name after "--" with its value as the next argument (psql --password value):
+// the flag starts where no word character or "-" precedes it (at the start of a quoted
+// command line too), its name may open with a letter or an underscore (a cookie name such as
+// _zendesk_session is a credential name too), and the value is the one token after it, never
+// another flag, ending where an unquoted pair value does.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z_][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
+// After a credential-named path segment and ":" (kv/password: value) the value is at most
+// one token. A singular label (password, token, key) takes that token whatever its shape
+// and whatever follows it (/etc/app/password: <value> was rejected); a plural label names a
+// collection (/api/v1/api-tokens: request failed with 403), so prose after the token means
+// there was no value, while a lone token after a plural label is one.
+const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
+// A key whose last word is a plural credential word, in the segment split (api-tokens, keys,
+// oauth_tokens) or concatenated (apikeys, sshkeys).
+const PLURAL_CREDENTIAL_LABEL_PATTERN = /(?:token|secret|key|cookie|password|credential|passphrase|signature|session)s$/;
+// The "-D" of a Java system property (java -Dkey=value) is not part of the key.
+const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
+// A delimited (key=value) value ends at whitespace or a control character, raw or left
+// escaped by one stringify (\n, \r, \t, \b, \f, \v, \0, \u0009 and the other \u00XX control
+// codes, \x09), as an unquoted header token does, so a pair or header chained after the
+// escape (api_key=<v>\tpassword: <v>) is read on its own and loses its own value. A key:
+// value line ends at a line break only, raw or escaped (\n, \r, \u000a, \u000d), as the raw
+// line does, so the header or pair on the next escaped line is read on its own.
+// A quote with a value character on both sides (O'hunter2, my'pref) is content of the value;
+// a quote at the end of a token, or an escaped quote, ends it, as does a value's first quote.
+const DELIMITED_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+`, "y");
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\s\r\n<>"',;{}[\]]/y;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
+// A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
+// userinfo goes as it does from a bare URL and ends at the same "/", "?", or "#"; the query
+// pairs are read by the pair rule.
+const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s\/?#@"'<>\\]+@/gi;
+// A key naming a webhook URL: the incoming webhooks of Slack, Discord, Teams, and PagerDuty
+// carry their token in the path or query, so under webhook, webhook_url, webhookUrl, or
+// WEBHOOK_URL a URL value keeps its scheme and host only, whatever the host. webhook_count,
+// webhook_id, and webhook_name are not URL-valued and stay; a webhook key whose value is not
+// a URL (a name, an id) stays too.
+const WEBHOOK_URL_TAIL_WORDS = new Set(["url", "uri", "endpoint", "address", "link"]);
+const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
+const WEBHOOK_VALUE_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/iy;
+const URL_ORIGIN_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)?([^/?#]*)/i;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+// Vendor token prefixes that name a credential on their own, on both sides: GitHub (ghp_,
+// gho_, ghu_, ghs_, ghr_, github_pat_), Stripe (sk_live_, sk_test_, rk_live_, rk_test_), and
+// Slack (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-, xoxo-).
+const GITHUB_TOKEN_PATTERN = /\b(?:gh[oprsu]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g;
+const STRIPE_KEY_PATTERN = /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g;
+const SLACK_TOKEN_PATTERN = /\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g;
 const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
 const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
@@ -492,14 +672,20 @@ const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
 // JSON structure and literals after a key are never a credential value.
 const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
 // A bare integer under a plural credential word ("api_keys": 1, keys=3, secrets: 0) is
-// a count, this module's own summary vocabulary, not a credential.
+// a count, this module's own summary vocabulary, not a credential; the digits end at
+// whitespace, raw or left escaped by a stringify (keys: 3\tcookies: 0), or at the end.
 const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
-const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+const COUNT_VALUE_PATTERN = new RegExp(String.raw`^\d+(?:\s|${ESCAPED_CONTROL_SOURCE}|$)`);
 const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // "code" names a credential only behind one of these words (registration_code,
 // activation_code, authorization_code, recovery_code); status_code, error_code, and
 // country_code stay evidence.
 const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
+// A secret id or token id is the bearer credential itself (a Vault AppRole secret_id, an
+// API token_id, roleSecretId), unlike client_id, tenant_id, key_id, or access_key_id, which
+// name a public identifier; secret_id_ttl, secret_id_accessor, and token_accessor end in a
+// setting word and stay. The qualifier is tested by its tail so -Dsecret_id is read too.
+const BEARER_ID_QUALIFIER_PATTERN = /(?:secret|token)$/;
 
 function propertyNameSegments(name: string): string[] {
   return name
@@ -527,8 +713,27 @@ export function isCredentialKey(key: string): boolean {
   if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
   if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
   if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
+  if (last === "id") return words.length > 1 && BEARER_ID_QUALIFIER_PATTERN.test(words[words.length - 2]);
+  // A connection string (connection_string, connectionString, DB_CONNECTION_STRING) embeds
+  // the password of the account it connects as.
+  if (last === "string" && words[words.length - 2] === "connection") return true;
   if (credentialKeyWord(last)) return true;
   return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+/** True when a key names a webhook URL whose path and query carry the webhook's token. */
+function isWebhookUrlKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === "webhook") return true;
+  return last !== undefined && WEBHOOK_URL_TAIL_WORDS.has(last) && words[words.length - 2] === "webhook";
+}
+
+// The URL under a webhook key with its userinfo, path, query, and fragment replaced: the
+// scheme and host stay, so the destination is still read.
+function redactedWebhookUrl(url: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(url);
+  return `${origin ? `${origin[1]}${origin[2]}` : ""}/${REDACTED}`;
 }
 
 // True for a value that opens with a bare integer under a plural credential word: a count,
@@ -537,6 +742,14 @@ function isCountValue(key: string, value: string): boolean {
   if (!COUNT_VALUE_PATTERN.test(value)) return false;
   const words = keyWords(key);
   return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+// True for a key whose last word is a plural credential word (api-tokens, keys, apikeys): a
+// collection, so as a path label it is a pair only when a lone token follows.
+function isPluralCredentialKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  return last !== undefined && (PLURAL_CREDENTIAL_WORDS.has(last) || PLURAL_CREDENTIAL_LABEL_PATTERN.test(last));
 }
 
 /** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
@@ -592,14 +805,17 @@ function isTokenShapedValue(value: string): boolean {
   return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
 }
 
-// The word after a scheme name is prose when it is a Titlecase word, a plain lowercase
-// word from the list above, or, after "Token", any plain lowercase word too short to be
-// a real token.
+// The word after a scheme name is prose when it is a Titlecase word, an auth-param name
+// before its "=", a plain lowercase word from the list above, or, after a noun scheme
+// word (Token, OAuth, Splunk, Snowflake), any plain lowercase word too short to be a real
+// token.
 function isSchemeProse(scheme: string, value: string): boolean {
   if (TITLE_WORD_PATTERN.test(value)) return true;
+  const authParam = AUTH_PARAM_PATTERN.exec(value);
+  if (authParam) return AUTH_PARAM_NAMES.has(authParam[1].toLowerCase());
   if (!PLAIN_WORD_PATTERN.test(value)) return false;
   if (SCHEME_PROSE_WORDS.has(value)) return true;
-  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+  return NOUN_SCHEME_WORDS.has(scheme.toLowerCase()) && value.length < LONG_TOKEN_MIN_LENGTH;
 }
 
 function isPublicPemLabel(label: string): boolean {
@@ -628,60 +844,293 @@ function scrubUrlUserinfo(url: string): string {
   return url.replace(URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`);
 }
 
-// Where the value of a header line that starts at start ends: at the end of the line, at an
-// HTML tag, or at the quote that closes the text the line sits in. A quoted segment
-// ("value", 'value') is carried through its closing quote on the same line; a JSON-escaped
-// quote (\") is content, and once one has been seen the next unescaped quote closes the JSON
-// string the header line is embedded in. Trailing whitespace is not part of the value.
-function headerValueEnd(text: string, start: number): number {
+// The run of backslashes at index.
+function backslashRun(text: string, index: number): number {
+  let run = 0;
+  while (text[index + run] === "\\") run += 1;
+  return run;
+}
+
+// The quote token at index: a bare quote, or a quote behind the odd run of backslashes that
+// JSON escaping puts before it at some nesting depth (\" one level down, \\\" two levels
+// down, and so on). An even run escapes backslashes and leaves the quote bare, so it is no
+// token here; the caller steps over the run and reads the quote on its own.
+function quoteTokenAt(text: string, index: number): string | undefined {
+  const run = backslashRun(text, index);
+  const quote = text[index + run];
+  if ((quote !== '"' && quote !== "'") || (run > 0 && run % 2 === 0)) return undefined;
+  return text.slice(index, index + run + 1);
+}
+
+// True when the quote token at index sits inside a token, a value character before it and
+// another after it, so it is content of the value and neither opens nor closes a segment.
+function midTokenQuoteAt(text: string, index: number, tokenLength: number): boolean {
+  const before = text[index - 1];
+  const after = text[index + tokenLength];
+  if (before === undefined || after === undefined) return false;
+  if (HEADER_VALUE_OPENER_PATTERN.test(before) || before === '"' || before === "'" || before === "\\") return false;
+  return !QUOTE_BOUNDARY_PATTERN.test(after);
+}
+
+// True when the quote token at index, though a value could start there, is followed by
+// nothing a quoted value starts with (whitespace, a delimiter, a bracket, a tag, or the
+// end of the text): it is the quote closing the enclosing text, as after a base64 value
+// that ends in "=" (Basic dXNlcjpwYXNz=","code":401), not one opening a segment.
+function closingQuoteAfterOpener(text: string, index: number, tokenLength: number): boolean {
+  const after = text[index + tokenLength];
+  return after === undefined || /[\s,;:)}\]<>]/.test(after);
+}
+
+// The first line end or HTML tag at or after start, or the end of the text.
+function lineEndFrom(text: string, start: number): number {
+  const terminator = HEADER_VALUE_TERMINATOR_PATTERN.exec(text.slice(start));
+  return terminator ? start + terminator.index : text.length;
+}
+
+// The control characters the one-letter escapes stand for.
+const CONTROL_ESCAPE_LETTERS = new Map<string, number>([["n", 0x0a], ["r", 0x0d], ["t", 0x09], ["b", 0x08], ["f", 0x0c], ["v", 0x0b], ["0", 0x00]]);
+
+// True for the code of a control character: U+0000 to U+001F, U+007F, or the line and
+// paragraph separators U+2028 and U+2029.
+function isControlCode(code: number): boolean {
+  return code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029;
+}
+
+// The code of the control character an escape at index stands for (\n, \r, \t, \b, \f, \v,
+// \0, \uXXXX, or \xHH behind an odd run of backslashes, as one stringify leaves it), or -1
+// when the text at index is no such escape: an even run escapes backslashes, and the escape
+// of a printable character (\u00e9) is content.
+function escapedControlCodeAt(text: string, index: number): number {
+  const run = backslashRun(text, index);
+  if (run === 0 || run % 2 === 0) return -1;
+  const letter = text[index + run];
+  if (letter === undefined) return -1;
+  const simple = CONTROL_ESCAPE_LETTERS.get(letter);
+  if (simple !== undefined) return simple;
+  const digits = letter === "u" ? 4 : letter === "x" ? 2 : 0;
+  if (digits === 0) return -1;
+  const hex = text.slice(index + run + 1, index + run + 1 + digits);
+  if (hex.length !== digits || !/^[0-9a-f]+$/i.test(hex)) return -1;
+  const code = parseInt(hex, 16);
+  return isControlCode(code) ? code : -1;
+}
+
+// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d, \x0a, \x0d): a
+// line end for an unquoted header value, as the raw character is.
+function escapedLineBreakAt(text: string, index: number): boolean {
+  const code = escapedControlCodeAt(text, index);
+  return code === 0x0a || code === 0x0d;
+}
+
+// Where the unquoted token that starts at start ends: at the first whitespace or raw control
+// character, at a control the stringify left escaped (\t, \u0009, \f, \b, and a line break
+// among them), or at limit. A token never carries a control, so the pair or header chained
+// after the escape is read on its own.
+function unquotedTokenEnd(text: string, start: number, limit: number): number {
   let index = start;
-  let escapedQuotes = false;
-  while (index < text.length) {
+  while (index < limit) {
     const char = text[index];
-    if (HEADER_VALUE_TERMINATOR_PATTERN.test(char)) break;
-    if (char === "\\" && (text[index + 1] === '"' || text[index + 1] === "'")) {
-      escapedQuotes = true;
-      index += 2;
+    if (/\s/.test(char) || isControlCode(char.charCodeAt(0))) break;
+    if (char === "\\") {
+      if (escapedControlCodeAt(text, index) !== -1) break;
+      index += backslashRun(text, index);
       continue;
     }
-    if (char === '"' || char === "'") {
-      if (escapedQuotes || (index > start && !HEADER_VALUE_OPENER_PATTERN.test(text[index - 1]))) break;
-      const close = text.indexOf(char, index + 1);
-      const segment = text.slice(index + 1, close === -1 ? text.length : close);
-      if (close !== -1 && !HEADER_VALUE_TERMINATOR_PATTERN.test(segment)) {
-        index = close + 1;
-        // A value that is one quoted string ends with its closing quote.
-        if (index - segment.length - 2 === start) return index;
-        continue;
-      }
-    }
     index += 1;
+  }
+  return index;
+}
+
+// The key without the escape letter in front of it: after an escaping backslash the letter
+// belongs to the escape (\napi_key is a newline and then api_key), not to the key. Only the
+// credential test uses the result; the text itself is left as it arrived.
+function keyAfterEscape(text: string, keyStart: number, key: string): string {
+  let run = 0;
+  while (keyStart - 1 - run >= 0 && text[keyStart - 1 - run] === "\\") run += 1;
+  if (run % 2 === 0) return key;
+  const letter = ESCAPE_LETTER_PATTERN.exec(key);
+  return letter ? key.slice(letter[0].length) : key;
+}
+
+// The index of the token that closes a quoted segment opened with token, before limit, or
+// -1. A token inside a token (sid="O'hunter2") is content of the segment, as is a token at a
+// deeper depth (more backslashes); a token nearer the surface closes the text the segment
+// sits in, so the segment is unterminated.
+function closingQuoteIndex(text: string, from: number, token: string, limit: number): number {
+  let index = from;
+  while (index < limit) {
+    const candidate = quoteTokenAt(text, index);
+    if (candidate === undefined) {
+      index += text[index] === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (midTokenQuoteAt(text, index, candidate.length)) {
+      index += candidate.length;
+      continue;
+    }
+    if (candidate === token) return index;
+    if (candidate.length < token.length) return -1;
+    index += candidate.length;
+  }
+  return -1;
+}
+
+// Where the value of a header line that starts at start ends. A value that opens with a
+// quote token ends at the token that closes it on the same line, whatever it carries (a
+// "; Name:" inside a quoted cookie is content); when nothing closes it, the quote is content
+// and the value ends as an unquoted one does. An unquoted value ends at the end of the line,
+// at an HTML tag, at the ";" or "," before the "Name:" token of the next header on a
+// compound line (on "Cookie: sid=value; X-ApiKeys: value" the next header keeps its name
+// and gets its own carrier treatment, and a Content-Type or Date after a cookie keeps its
+// name and value), at a line break left escaped inside a JSON string (\n, \r, \u000a), or
+// at the quote that closes the text the line sits in. Inside an unquoted value a quote
+// where a value can start opens a quoted segment carried through its closing token; a
+// quote inside a token (sid=O'hunter2, my'pref=value) is content; a quote at the end of a
+// token, or one after "=" that only a delimiter or the end follows (sid=abc==",), closes
+// the enclosing text. Trailing whitespace is not part of the value.
+function headerValueEnd(text: string, start: number): number {
+  const limit = lineEndFrom(text, start);
+  const opening = quoteTokenAt(text, start);
+  if (opening !== undefined) {
+    const close = closingQuoteIndex(text, start + opening.length, opening, limit);
+    if (close !== -1) return close + opening.length;
+  }
+  let index = opening === undefined ? start : start + opening.length;
+  while (index < limit) {
+    const char = text[index];
+    if ((char === ";" || char === ",") && FOLLOWING_HEADER_PATTERN.test(text.slice(index + 1, index + 1 + FOLLOWING_HEADER_LOOKAHEAD))) break;
+    if (char === "\\" && escapedLineBreakAt(text, index)) break;
+    const token = quoteTokenAt(text, index);
+    if (token === undefined) {
+      index += char === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (!HEADER_VALUE_OPENER_PATTERN.test(text[index - 1])) {
+      if (!midTokenQuoteAt(text, index, token.length)) break;
+      index += token.length;
+      continue;
+    }
+    if (closingQuoteAfterOpener(text, index, token.length)) break;
+    const close = closingQuoteIndex(text, index + token.length, token, limit);
+    index = close === -1 ? index + token.length : close + token.length;
   }
   while (index > start && /\s/.test(text[index - 1])) index -= 1;
   return index;
 }
 
-// The quote a header value is wrapped in as a whole, or "" when it is not one quoted string.
-// JSON-escaped quotes are content of the string the line sits in and go with the value.
+// The quote token a header value is wrapped in as a whole (bare or escaped to any depth), or
+// "" when it is not one quoted string.
 function enclosingQuote(value: string): string {
-  return value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0] ? value[0] : "";
+  const token = quoteTokenAt(value, 0);
+  return token !== undefined && value.length >= token.length * 2 && value.endsWith(token) ? token : "";
 }
 
-// Every credential-bearing header line loses its value whatever the value's shape; a value
-// that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
+// True for an Authorization pair whose value reads "Bearer [REDACTED]" or the like: the header
+// rule already treated it, and the pair rules leave the scheme word standing. Under any other
+// credential-named key the scheme word is part of the value and goes with it.
+function keepsSchemeWord(key: string, value: string): boolean {
+  if (!AUTHORIZATION_HEADERS.has(key.toLowerCase())) return false;
+  const scheme = REDACTED_SCHEME_VALUE_PATTERN.exec(value);
+  return scheme !== null && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase());
+}
+
+// The listed scheme word a header value opens with, when a token follows it, or undefined:
+// for a bare scheme word, a word the list does not know, or a value that opens with anything
+// but a word.
+function leadingSchemeWord(value: string): RegExpExecArray | undefined {
+  const scheme = AUTH_SCHEME_PATTERN.exec(value);
+  if (!scheme || scheme[0].length === value.length || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return undefined;
+  return scheme;
+}
+
+// Where the credentials after a scheme word end, credentialsStart being the index after the
+// word and the whitespace behind it: a parameter list (username=..., realm=...) runs to end,
+// a quoted string to the quote that closes it (or to end when nothing does), and a bare
+// token to its first whitespace or escaped control.
+function schemeCredentialsEnd(text: string, credentialsStart: number, end: number): number {
+  const credentials = text.slice(credentialsStart, end);
+  if (AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
+  const quote = quoteTokenAt(credentials, 0);
+  if (quote !== undefined) {
+    const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
+    return close === -1 ? end : close + quote.length;
+  }
+  return unquotedTokenEnd(text, credentialsStart, end);
+}
+
+// Where the value of a single-token header ends: an unquoted value at its first whitespace
+// or escaped control, a quoted one where headerValueEnd put it. A value that opens with a
+// listed scheme word and a token (X-Auth-Token: Bearer <token>) is the word and the
+// credentials after it, as it would be under Authorization, so the token is never left
+// standing after the marker.
+function singleTokenEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme !== undefined) return schemeCredentialsEnd(text, start + scheme[0].length, end);
+  return unquotedTokenEnd(text, start, end);
+}
+
+// Where an Authorization value ends: after the listed scheme word and the one token (or one
+// quoted string) of credentials that follows it, so prose after the token on a free-text
+// line stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the
+// end of the line, as does a value quoted as a whole, a bare scheme word, and a value that
+// opens with anything but a listed scheme word (GenieKey <token>, SharedKey account:<sig>,
+// a bare token): the first word may be a scheme the list does not know, with its credentials
+// after it, so the whole line goes.
+function authorizationValueEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme === undefined) return end;
+  return schemeCredentialsEnd(text, start + scheme[0].length, end);
+}
+
+// The replacement for a header value, or undefined when nothing is left to remove: the value
+// already opens with the marker (bare, inside its quotes, or after its scheme word), or an
+// Authorization value is a bare scheme word with no credentials after it. An Authorization
+// value keeps its scheme word as spelled; the credentials after it go whole, inside their own
+// quotes when they were quoted (Bearer "value" becomes Bearer "[REDACTED]"). A value that is
+// one quoted string keeps its quotes around the replacement so quoted text stays quoted.
+function redactedHeaderValue(header: string, value: string): string | undefined {
+  const quote = enclosingQuote(value);
+  const inner = quote === "" ? value : value.slice(quote.length, value.length - quote.length);
+  if (inner.startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
+  if (AUTHORIZATION_HEADERS.has(header)) {
+    const scheme = AUTH_SCHEME_PATTERN.exec(inner);
+    if (scheme && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) {
+      const credentials = inner.slice(scheme[0].length);
+      if (credentials.length === 0) return undefined;
+      const credentialQuote = enclosingQuote(credentials);
+      if (credentials.slice(credentialQuote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) return undefined;
+      return `${quote}${scheme[1]} ${credentialQuote}${CREDENTIAL_REDACTION_MARKER}${credentialQuote}${quote}`;
+    }
+  }
+  return `${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+}
+
+// Every credential-bearing header line loses its credentials whatever their shape, by the
+// header's class: an Authorization value keeps its listed scheme word and loses the token
+// after it (or its whole parameter list), or goes whole when it opens with anything else; a
+// cookie or key list goes whole; and a single-token header loses its first token, or the
+// listed scheme word and the token after it when it opens with one. On a compound line each
+// header is its own line: the value of one ends before the name of the next, which is then
+// matched and treated on its own.
 function scrubHeaderLines(text: string): string {
   HEADER_LINE_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
+    const header = match[1].toLowerCase();
     const start = match.index + match[0].length;
-    const end = headerValueEnd(text, start);
+    const lineEnd = headerValueEnd(text, start);
+    const end = LIST_VALUE_HEADERS.has(header) ? lineEnd : AUTHORIZATION_HEADERS.has(header) ? authorizationValueEnd(text, start, lineEnd) : singleTokenEnd(text, start, lineEnd);
     const value = text.slice(start, end);
-    if (value.length === 0 || value.startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
-    const quote = enclosingQuote(value);
-    if (value.slice(quote.length).startsWith(CREDENTIAL_REDACTION_MARKER)) continue;
-    out += `${text.slice(last, start)}${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`;
+    if (value.length === 0) continue;
+    const replacement = redactedHeaderValue(header, value);
+    if (replacement === undefined) continue;
+    out += `${text.slice(last, start)}${replacement}`;
     last = end;
     HEADER_LINE_PATTERN.lastIndex = end;
   }
@@ -690,39 +1139,249 @@ function scrubHeaderLines(text: string): string {
 
 // The key and separator are matched on their own and the value is consumed only when the
 // key names a credential, so the value of an ordinary pair is rescanned and a credential
-// pair nested inside it (data=token=...) is still caught.
+// pair nested inside it (data=token=...) is still caught. A value the scheme rule already
+// reduced to "<scheme> [REDACTED]" keeps its scheme word under an Authorization key and loses
+// it under any other credential key, where the scheme word was the start of the value. A
+// colon-terminated key that ends a path segment is a label whose value is at most one token:
+// a singular label (/etc/app/password: <value> was rejected) takes that token whatever its
+// shape and whatever follows, and a plural label (/api/v1/api-tokens: request failed) takes
+// it only when no prose continues after it, since prose means there was no value at all; an
+// escaped slash (\/) before the key is a line break, not a path.
 function replaceCredentialAssignments(text: string): string {
+  const fates = authParameterFates(text);
   ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
-    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
-    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
-    valuePattern.lastIndex = match.index + whole.length;
+    if (operator === "=" && fates.get(match.index + openingQuote.length) === "challenge") continue;
+    const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
+    const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
+    const valueStart = match.index + whole.length;
+    if (isWebhookUrlKey(name)) {
+      WEBHOOK_VALUE_PATTERN.lastIndex = valueStart;
+      const url = WEBHOOK_VALUE_PATTERN.exec(text)?.[0];
+      if (url === undefined) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedWebhookUrl(url)}`;
+      last = valueStart + url.length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
+    if (!(operator === "=" ? isCredentialAssignmentKey(name) : isCredentialKey(name))) continue;
+    const redactedScheme = REDACTED_SCHEME_VALUE_PATTERN.exec(text.slice(valueStart));
+    if (redactedScheme !== null && AUTH_SCHEME_WORDS.has(redactedScheme[1].toLowerCase())) {
+      if (AUTHORIZATION_HEADERS.has(name.toLowerCase())) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedScheme[2]}${CREDENTIAL_REDACTION_MARKER}`;
+      last = valueStart + redactedScheme[0].length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
+    const pathLabel = operator === ":" && text[match.index - 1] === "/" && text[match.index - 2] !== "\\";
+    const valuePattern = operator === ":" && !pathLabel ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = valueStart;
     const value = valuePattern.exec(text)?.[0];
-    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
+    if (pathLabel && isPluralCredentialKey(name) && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${CREDENTIAL_REDACTION_MARKER}`;
-    last = match.index + whole.length + value.length;
+    last = valueStart + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
   }
   return last === 0 ? text : `${out}${text.slice(last)}`;
 }
 
+// A credential-named flag with its value as the next argument loses that argument.
+function replaceFlagValues(text: string): string {
+  return text.replace(FLAG_VALUE_PATTERN, (match, flag: string, space: string) => (isCredentialKey(flag) ? `--${flag}${space}${CREDENTIAL_REDACTION_MARKER}` : match));
+}
+
+// Where a quoted parameter value that opens at valueStart with the quote token ends: after
+// the token that closes it; at a shallower token, which closes the text the list sits in,
+// so the value was cut off and nothing of it stays; or at limit when nothing closes it. A
+// token inside a token (O'hunter2) is content of the value.
+function quotedParameterValueEnd(text: string, valueStart: number, quote: string, limit: number): number {
+  let index = valueStart + quote.length;
+  while (index < limit) {
+    const candidate = quoteTokenAt(text, index);
+    if (candidate === undefined) {
+      index += text[index] === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (midTokenQuoteAt(text, index, candidate.length)) {
+      index += candidate.length;
+      continue;
+    }
+    if (candidate === quote) return index + candidate.length;
+    if (candidate.length < quote.length) return index;
+    index += candidate.length;
+  }
+  return limit;
+}
+
+// One parameter of a list: its name as spelled (without an escape letter glued to its
+// front), where the name starts, and where its value starts and ends; the quote token that
+// opens a quoted value, or undefined for a bare one.
+interface AuthParameter {
+  name: string;
+  nameStart: number;
+  valueStart: number;
+  valueEnd: number;
+  quote: string | undefined;
+}
+
+// What a parameter of an auth parameter list is: a proof (its value goes), a challenge
+// parameter (its value stays), or another parameter (judged under its own name).
+type AuthParameterFate = "proof" | "challenge" | "other";
+
+// The parameter list that opens at start (name=value, name2=value2, ...): its parameters
+// and where it ends. A quoted value (bare or escaped to any depth) runs to the quote that
+// closes it, or to the end of the text it sits in when nothing does (a cut-off value keeps
+// no part of itself), an unquoted value is one token, and the list ends before a "," that
+// no further parameter follows, so prose after the list stays. Undefined when no parameter
+// opens at start (nothing after the "=").
+function readAuthParameterList(text: string, start: number): { end: number; items: AuthParameter[] } | undefined {
+  const limit = lineEndFrom(text, start);
+  const items: AuthParameter[] = [];
+  let index = start;
+  while (index < limit) {
+    AUTH_PARAM_ITEM_PATTERN.lastIndex = index;
+    const item = AUTH_PARAM_ITEM_PATTERN.exec(text);
+    if (item === null) break;
+    const valueStart = index + item[0].length;
+    const quote = quoteTokenAt(text, valueStart);
+    let valueEnd: number;
+    if (quote !== undefined) {
+      valueEnd = quotedParameterValueEnd(text, valueStart, quote, limit);
+    } else {
+      AUTH_PARAM_BARE_VALUE_PATTERN.lastIndex = valueStart;
+      const bare = AUTH_PARAM_BARE_VALUE_PATTERN.exec(text);
+      if (bare === null) break;
+      valueEnd = valueStart + bare[0].length;
+    }
+    items.push({ name: keyAfterEscape(text, index, item[1]), nameStart: index, valueStart, valueEnd, quote });
+    AUTH_PARAM_SEPARATOR_PATTERN.lastIndex = valueEnd;
+    const separator = AUTH_PARAM_SEPARATOR_PATTERN.exec(text);
+    if (separator === null || separator[0].length === 0) break;
+    index = valueEnd + separator[0].length;
+  }
+  const lastItem = items[items.length - 1];
+  return lastItem === undefined ? undefined : { end: lastItem.valueEnd, items };
+}
+
+function authParameterFate(name: string): AuthParameterFate {
+  const lower = name.toLowerCase();
+  if (PROOF_PARAM_NAMES.has(lower)) return "proof";
+  return CHALLENGE_PARAM_NAMES.has(lower) ? "challenge" : "other";
+}
+
+// A known auth parameter other than a proof: one of them makes a list without a scheme
+// word an auth parameter list.
+function isAuthParameterAnchor(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (AUTH_PARAM_NAMES.has(lower) || CHALLENGE_PARAM_NAMES.has(lower)) && !PROOF_PARAM_NAMES.has(lower);
+}
+
+// The fate of every parameter of every auth parameter list in text, by where its name
+// starts: the list after a scheme word, whatever it holds (a credential list after a scheme
+// word has already gone whole when this runs), and a list without one that holds two or
+// more parameters, one of them an anchor. A parameter outside such a list has no entry.
+function authParameterFates(text: string): Map<number, AuthParameterFate> {
+  const fates = new Map<number, AuthParameterFate>();
+  AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = 0;
+  let opener: RegExpExecArray | null;
+  while ((opener = AUTH_PARAMETER_LIST_OPENER_PATTERN.exec(text)) !== null) {
+    const list = readAuthParameterList(text, opener.index);
+    if (list === undefined) continue;
+    const schemeLed = SCHEME_LED_LIST_PATTERN.test(text.slice(Math.max(0, opener.index - 32), opener.index));
+    if (schemeLed || (list.items.length > 1 && list.items.some((item) => isAuthParameterAnchor(item.name)))) {
+      for (const item of list.items) fates.set(item.nameStart, authParameterFate(item.name));
+    }
+    AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = list.end;
+  }
+  return fates;
+}
+
+// A scheme word and the credential parameter list after it lose the list and keep the
+// word, header name in front or none; a challenge's parameter list stays.
+function replaceSchemeParameterLists(text: string): string {
+  SCHEME_PARAMETER_LIST_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SCHEME_PARAMETER_LIST_PATTERN.exec(text)) !== null) {
+    const list = readAuthParameterList(text, match.index + match[0].length);
+    if (list === undefined || !list.items.some((item) => !CHALLENGE_PARAM_NAMES.has(item.name.toLowerCase()))) continue;
+    out += `${text.slice(last, match.index)}${match[1]} ${CREDENTIAL_REDACTION_MARKER}`;
+    last = list.end;
+    SCHEME_PARAMETER_LIST_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// Every proof parameter of an auth parameter list loses its value, quoted (the quote token
+// of its own depth stays, and a cut-off value gets no closing quote it never had) or bare;
+// the parameters beside it are left as they are.
+function replaceAuthParameterProofs(text: string): string {
+  const proofs = [...authParameterFates(text).entries()].filter(([, fate]) => fate === "proof").map(([nameStart]) => nameStart);
+  if (proofs.length === 0) return text;
+  let out = "";
+  let last = 0;
+  for (const nameStart of proofs) {
+    const list = readAuthParameterList(text, nameStart);
+    const item = list?.items[0];
+    if (item === undefined || item.nameStart !== nameStart) continue;
+    const quote = item.quote ?? "";
+    const closed = quote !== "" && item.valueEnd - quote.length > item.valueStart && text.startsWith(quote, item.valueEnd - quote.length);
+    const value = text.slice(item.valueStart + quote.length, closed ? item.valueEnd - quote.length : item.valueEnd);
+    if (value.length === 0 || value === CREDENTIAL_REDACTION_MARKER) continue;
+    out += `${text.slice(last, item.valueStart)}${quote}${CREDENTIAL_REDACTION_MARKER}${closed ? quote : ""}`;
+    last = item.valueEnd;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// The rule for a quoted attribute or pair value under a key: redacted under a credential
+// key (or reduced to its origin under a webhook key), the match otherwise.
+type QuotedValueRule = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string) => string;
+
+// Every key="value" attribute, at any escape depth, under the quoted-value rule; a challenge
+// parameter inside an auth parameter list (the nonce of Digest realm="api", nonce="n")
+// keeps its value whatever its name says.
+function replaceQuotedAttributes(text: string, quotedValue: QuotedValueRule): string {
+  const fates = authParameterFates(text);
+  return text.replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number) =>
+    (fates.get(offset) === "challenge" ? match : quotedValue(keyAfterEscape(text, offset, key), value, () => `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match)));
+}
+
 /** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
+// Header lines go first: a recognised header line takes its whole value, so the URL and
+// query rules never split a cookie pair whose name holds "&" or "#" off its cookie. The
+// parameter-list rule runs before the scheme rule, so a credential list after a scheme
+// word goes whole instead of losing its first "name=" and keeping the quoted value, and the
+// proof rule right after it, so a proof in a list without a scheme word goes before the
+// per-parameter rules read the list.
 function scrubCarriers(text: string, pemScope: PemScope): string {
-  const scrubbed = scrubHeaderLines(scrubPem(text, pemScope)
+  const quotedValue = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string): string => {
+    if (isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(value)) return webhook(redactedWebhookUrl(value));
+    return isCredentialKey(key) && !isCountValue(key, value) && !keepsSchemeWord(key, value) ? redacted() : match;
+  };
+  const carriers = scrubHeaderLines(scrubPem(text, pemScope))
     .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}`)
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
-    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match)))
+    .replace(SLASH_ESCAPED_URL_USERINFO_PATTERN, `$1${CREDENTIAL_REDACTION_MARKER}@`)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${CREDENTIAL_REDACTION_MARKER}` : match));
+  const pairs = replaceAuthParameterProofs(replaceSchemeParameterLists(carriers))
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${CREDENTIAL_REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"` : match))
-    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${CREDENTIAL_REDACTION_MARKER}${quote}` : match));
-  return replaceCredentialAssignments(scrubbed)
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => quotedValue(key, value, () => `"${key}"${separator}"${CREDENTIAL_REDACTION_MARKER}"`, (url) => `"${key}"${separator}"${url}"`, match))
+    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${CREDENTIAL_REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match));
+  const scrubbed = replaceQuotedAttributes(pairs, quotedValue);
+  return replaceCredentialAssignments(replaceFlagValues(scrubbed))
     .replace(JWT_PATTERN, CREDENTIAL_REDACTION_MARKER)
     .replace(PANOS_API_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
-    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER);
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(GITHUB_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(STRIPE_KEY_PATTERN, CREDENTIAL_REDACTION_MARKER)
+    .replace(SLACK_TOKEN_PATTERN, CREDENTIAL_REDACTION_MARKER);
 }
 
 /** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
@@ -804,14 +1463,20 @@ function redactCredentialNode(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactCredentialNode);
   const record = asObject(value);
   if (!record) return value;
+  // A {name, value} pair is a credential pair when flagged secure: true or when its name is
+  // a credential in either vocabulary, the walker's or the text rules' (auth, X-Auth, a
+  // header name such as Cookie), whatever the secure flag says.
   const pairName = typeof record.name === "string" ? record.name : undefined;
-  const pairIsCredential = (pairName !== undefined && propertyNameIsCredential(pairName)) || record.secure === true;
+  const pairIsCredential = (pairName !== undefined && (propertyNameIsCredential(pairName) || isCredentialKey(pairName))) || record.secure === true;
   const result: JsonRecord = {};
   for (const [key, entry] of Object.entries(record)) {
     if (entry === null || entry === undefined) {
       result[key] = entry;
     } else if (propertyNameIsCredential(key) || (pairIsCredential && (key === "value" || key === "default"))) {
       result[key] = REDACTED;
+    } else if (typeof entry === "string" && isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(entry)) {
+      // A URL under a webhook key keeps its origin only: the path and query are the secret.
+      result[key] = redactedWebhookUrl(entry);
     } else {
       result[key] = redactCredentialNode(entry);
     }
@@ -898,14 +1563,16 @@ export function describeErrorBody(response: Response, rawText: string, scrub: (t
 
 // What a 2xx answer was expected to carry: the documented JSON document of any kind, a
 // JSON object, a JSON array, one documented member of a JSON object (an array, an
-// object, a Security Center list, or the member's mere presence), or any one of the
-// members that identify a documented object.
+// object, a Security Center list, or the member's mere presence), any one of the
+// members that identify a documented object, or an array at least one of whose records
+// carries a member that identifies a documented record.
 type DocumentExpectation =
   | { kind: "document" }
   | { kind: "object" }
   | { kind: "array" }
   | { kind: "member"; key: string; type: "array" | "object" | "list" | "member" }
-  | { kind: "members"; keys: string[] };
+  | { kind: "members"; keys: string[] }
+  | { kind: "records"; keys: string[]; count: number };
 
 /**
  * A 2xx answer whose body is not the documented JSON document (an empty body, the HTML
@@ -923,6 +1590,8 @@ export function describeNonDocumentBody(response: Response, rawText: string, exp
       return `${base} with a JSON response body without the documented "${expected.key}" ${expected.type} (${size})`;
     case "members":
       return `${base} with a JSON response body without any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
+    case "records":
+      return `${base} with a JSON array of ${expected.count} records none of which carries any of the documented members ${expected.keys.map((key) => `"${key}"`).join(", ")} (${size})`;
     case "document":
       what = "the documented JSON document";
       break;
@@ -1172,7 +1841,9 @@ export function resolveTenableConfiguration(
     const scAccess = scAccessKey.value ?? (primaryIsCloud ? undefined : accessKey.value);
     const scSecret = scSecretKey.value ?? (primaryIsCloud ? undefined : secretKey.value);
     if (!scAccess || !scSecret) {
-      throw new Error(`Tenable Security Center at ${resolvedScUrl} needs API keys: set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).`);
+      // A full stop, not a colon, after "keys": the pair rule reads "keys: <text>" as a
+      // credential assignment and would withhold the remediation sentence.
+      throw new Error(`Tenable Security Center at ${resolvedScUrl} needs API keys. Set TENABLE_SC_ACCESS_KEY and TENABLE_SC_SECRET_KEY (or TENABLE_ACCESS_KEY and TENABLE_SECRET_KEY when TENABLE_URL points at Security Center).`);
     }
     if (scUrl.source) sourceChain.push(scUrl.source);
     sourceChain.push(scAccessKey.source ?? accessKey.source ?? "", scSecretKey.source ?? secretKey.source ?? "");
@@ -1361,6 +2032,18 @@ abstract class TenableHttpClient {
     return asRecords(document.value);
   }
 
+  // A documented list is recognised by its records: an array none of whose records
+  // carries a member that identifies a documented record (a portal's JSON, another API's
+  // list) is a foreign document, never an inventory. An empty array is the documented
+  // empty answer.
+  protected documentedListOf(document: TenableDocument, members: string[]): JsonRecord[] {
+    const records = this.documentedList(document);
+    if (records.length > 0 && !records.some((record) => isDocumentedRecord(record, members))) {
+      throw this.nonDocument(document, { kind: "records", keys: members, count: records.length });
+    }
+    return records;
+  }
+
   // A documented object is recognised by any one of the members that identify it; an
   // object carrying none of them (a health page, a portal's JSON) is a foreign document.
   protected documentedObject(document: TenableObjectDocument, keys: string[]): JsonRecord {
@@ -1383,13 +2066,36 @@ interface TenableObjectDocument extends TenableDocument {
 }
 
 /**
+ * The members that identify a documented record of each array surface: the identity and
+ * status fields the verdicts read. A 2xx array none of whose records carries any of them
+ * is a foreign document (a portal's JSON, another API's list) and is a failed read (for
+ * an export chunk, a failed download), never an empty inventory; a record carrying none
+ * of them inside an otherwise documented export chunk is unevaluable and is kept out of
+ * the export's records with its count recorded, which caps every verdict that reads the
+ * export.
+ */
+const DOCUMENTED_RECORD_MEMBERS: Record<"roles" | "assets" | "vulns", string[]> = {
+  roles: ["uuid", "id", "name", "type", "privileges"],
+  assets: ["id", "uuid", "has_agent", "last_seen", "network_id", "tags"],
+  vulns: ["state", "severity", "plugin", "asset", "first_found", "last_found"],
+};
+
+/** Whether a record carries at least one of the members that identify a documented record of the surface. */
+function isDocumentedRecord(record: JsonRecord, members: string[]): boolean {
+  return members.some((member) => member in record);
+}
+
+/**
  * Outcome of one export workflow. Counters are null when the workflow never
  * observed them (the export was not started, or polling ended before a chunk
  * list was reported). fetchedChunks and downloadFailures count this client's
- * own chunk downloads; failedChunks is Tenable's chunks_failed. endpoint names
- * the request that reported the final state or the one that failed.
+ * own chunk downloads; failedChunks is Tenable's chunks_failed; unevaluableRecords
+ * counts the records of downloaded chunks that carried none of the documented
+ * members and were kept out of records. endpoint names the request that reported
+ * the final state or the one that failed.
  */
 export interface TenableExportResult {
+  kind: "assets" | "vulns" | null;
   exportUuid: string | null;
   status: string | null;
   records: JsonRecord[];
@@ -1398,6 +2104,7 @@ export interface TenableExportResult {
   fetchedChunks: number | null;
   failedChunks: number | null;
   downloadFailures: number | null;
+  unevaluableRecords: number | null;
   truncated: boolean | null;
   reason?: string;
   endpoint: string | null;
@@ -1443,9 +2150,10 @@ export class TenableApiClient extends TenableHttpClient {
     return this.requestJson(path, {}, query);
   }
 
-  // A read whose documented answer is a JSON array of records.
-  private async getList(path: string, query: Record<string, string | number | boolean | undefined | Array<string | number>> = {}): Promise<JsonRecord[]> {
-    return this.documentedList(await this.requestDocument(path, {}, query));
+  // A read whose documented answer is a JSON array of records recognised by the members
+  // that identify them.
+  private async getList(path: string, members: string[]): Promise<JsonRecord[]> {
+    return this.documentedListOf(await this.requestDocument(path), members);
   }
 
   // A read whose documented answer is a JSON object carrying the named array member.
@@ -1561,7 +2269,7 @@ export class TenableApiClient extends TenableHttpClient {
   }
 
   async listRoles(): Promise<JsonRecord[]> {
-    return this.getList("/access-control/v1/roles");
+    return this.getList("/access-control/v1/roles", DOCUMENTED_RECORD_MEMBERS.roles);
   }
 
   async listPermissions(): Promise<JsonRecord[]> {
@@ -1615,6 +2323,7 @@ export class TenableApiClient extends TenableHttpClient {
     const statusPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/status`;
     const statusEndpoint = `GET ${statusPath}`;
     const notRun = (status: string, reason: string, endpoint: string, httpStatus: number | null): TenableExportResult => ({
+      kind,
       exportUuid,
       status,
       records: [],
@@ -1623,6 +2332,7 @@ export class TenableApiClient extends TenableHttpClient {
       fetchedChunks: null,
       failedChunks: null,
       downloadFailures: null,
+      unevaluableRecords: null,
       truncated: null,
       reason,
       endpoint,
@@ -1656,15 +2366,24 @@ export class TenableApiClient extends TenableHttpClient {
     const totalChunks = asNumber(status.total_chunks) ?? available.length;
     const records: JsonRecord[] = [];
     const downloadErrors: string[] = [];
+    const members = DOCUMENTED_RECORD_MEMBERS[kind];
     let fetchedChunks = 0;
+    let unevaluableRecords = 0;
     let failedEndpoint: string | undefined;
     let failedStatus: number | undefined;
     for (const chunkId of available.slice(0, maxChunks)) {
       const chunkPath = `/${kind}/export/${encodeURIComponent(exportUuid)}/chunks/${chunkId}`;
       try {
         // A chunk is the documented JSON array of records; a 2xx answer of any other
-        // shape is a failed download, never an empty chunk.
-        records.push(...await this.getList(chunkPath));
+        // shape, or an array none of whose records carries a documented member, is a
+        // failed download, never an empty chunk. Inside a documented chunk a record
+        // that carries none of the members is unevaluable: it is kept out of the
+        // records and counted, so the verdicts that read the export are capped
+        // rather than passed on it.
+        const chunkRecords = await this.getList(chunkPath, members);
+        const documented = chunkRecords.filter((record) => isDocumentedRecord(record, members));
+        records.push(...documented);
+        unevaluableRecords += chunkRecords.length - documented.length;
         fetchedChunks += 1;
       } catch (error) {
         downloadErrors.push(errorMessage(error));
@@ -1679,6 +2398,7 @@ export class TenableApiClient extends TenableHttpClient {
       downloadErrors.length > 0 ? `${downloadErrors.length} chunk downloads failed: ${downloadErrors.slice(0, 3).join("; ")}` : undefined,
     ].filter((item): item is string => Boolean(item));
     return {
+      kind,
       exportUuid,
       status: state,
       records,
@@ -1687,6 +2407,7 @@ export class TenableApiClient extends TenableHttpClient {
       fetchedChunks,
       failedChunks: failed,
       downloadFailures: downloadErrors.length,
+      unevaluableRecords,
       truncated: state !== "FINISHED" || fetchedChunks < available.length || failed > 0 || totalChunks > available.length,
       reason: reasons.length > 0 ? reasons.join("; ") : undefined,
       endpoint: failedEndpoint ?? statusEndpoint,
@@ -1853,6 +2574,7 @@ function notConfiguredDataset<T>(data: T, message: string): TenableDataset<T> {
 }
 
 const EMPTY_EXPORT: TenableExportResult = {
+  kind: null,
   exportUuid: null,
   status: null,
   records: [],
@@ -1861,6 +2583,7 @@ const EMPTY_EXPORT: TenableExportResult = {
   fetchedChunks: null,
   failedChunks: null,
   downloadFailures: null,
+  unevaluableRecords: null,
   truncated: null,
   endpoint: null,
   httpStatus: null,
@@ -1933,20 +2656,91 @@ async function collectExport(endpoint: string, load: () => Promise<TenableExport
 function datasetErrors(label: string, dataset: TenableDataset<unknown>): string[] {
   if (dataset.status === "not_configured") return [];
   if (dataset.status !== "ok") return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
+  const lines: string[] = [];
   if (dataset.truncated) {
-    return [`${label} dataset: partial view (${dataset.seen ?? "unknown"} of ${dataset.total ?? "unknown"} records retrieved${dataset.error ? `; ${dataset.error}` : ""}).`];
+    lines.push(`${label} dataset: partial view (${dataset.seen ?? "unknown"} of ${dataset.total ?? "unknown"} records retrieved${dataset.error ? `; ${dataset.error}` : ""}).`);
+  } else if (dataset.error) {
+    lines.push(`${label} dataset: ${dataset.error}`);
   }
-  return dataset.error ? [`${label} dataset: ${dataset.error}`] : [];
+  if (unevaluableRecordsOf(dataset) > 0) lines.push(`${label} dataset:${unevaluableRecordsNote(dataset)}`);
+  return lines;
 }
 
-/** Records in a readable list dataset; null when the list was not collected. */
+/*
+ * Incomplete inventories. An inventory is incomplete when it was not read (refused or
+ * failed), when its page walk was truncated (a page cap, a stalled or replayed page,
+ * or fewer records delivered than pagination.total reports), or when it is an export
+ * some of whose records were kept out as unevaluable (records that carried none of the
+ * documented members): the evaluated records are then not the whole population the
+ * export delivered, which is the same state the partial marker written to the bundle
+ * records. A count over an incomplete inventory is a lower bound: a positive count is
+ * rendered as observed, and a count of zero renders null, because the unread or
+ * unevaluated remainder may hold what the seen population did not. Item-level detail
+ * (names, labels, per-record entries) is withheld as null while an inventory is
+ * incomplete, so no consumer reads a partial list as the population. No finding passes
+ * over an inventory it did not read to completion, and a fail that rests on the absence
+ * of records becomes warn when the walk was truncated. A platform that is not configured
+ * is not an incomplete inventory: no read was attempted and its findings say so.
+ */
+function isIncomplete(dataset: TenableDataset<unknown>): boolean {
+  return dataset.status === "forbidden"
+    || dataset.status === "error"
+    || (dataset.status === "ok" && (dataset.truncated === true || unevaluableRecordsOf(dataset) > 0));
+}
+
+function anyIncomplete(datasets: Record<string, TenableDataset<unknown>>): boolean {
+  return Object.values(datasets).some(isIncomplete);
+}
+
+/** A count over inventories: null when any was not read, null in place of 0 when any is incomplete, otherwise the observed count. */
+function boundedCount(count: number, ...datasets: Array<TenableDataset<unknown>>): number | null {
+  if (datasets.some((dataset) => dataset.status !== "ok")) return null;
+  return count === 0 && datasets.some(isIncomplete) ? null : count;
+}
+
+/** Item-level detail over inventories: withheld as null while any is incomplete. */
+function detailOrNull<T>(values: T, ...datasets: Array<TenableDataset<unknown>>): T | null {
+  return datasets.some(isIncomplete) ? null : values;
+}
+
+/** Records in a readable list dataset; null when the list was not collected or was truncated before delivering any. */
 function countOrNull(dataset: TenableDataset<unknown[]>): number | null {
-  return dataset.status === "ok" ? dataset.data.length : null;
+  return boundedCount(dataset.status === "ok" ? dataset.data.length : 0, dataset);
 }
 
 function recordCount(dataset: TenableDataset<TenableExportResult>): number | null {
-  return dataset.status === "ok" ? dataset.data.records.length : null;
+  return boundedCount(dataset.status === "ok" ? dataset.data.records.length : 0, dataset);
 }
+
+/** The records-seen figure of a collection status: null when a truncated walk delivered none. */
+function seenOrNull(dataset: TenableDataset<unknown>): number | null {
+  return dataset.status === "ok" && dataset.truncated === true && dataset.seen === 0 ? null : dataset.seen;
+}
+
+function isExportResult(value: unknown): value is TenableExportResult {
+  const record = asObject(value);
+  return record !== undefined && "exportUuid" in record && "unevaluableRecords" in record && Array.isArray(record.records);
+}
+
+/** Records of a readable export that carried none of the documented members and were kept out; 0 for any other dataset. */
+function unevaluableRecordsOf(dataset: TenableDataset<unknown>): number {
+  return dataset.status === "ok" && isExportResult(dataset.data) ? dataset.data.unevaluableRecords ?? 0 : 0;
+}
+
+/**
+ * The sentence a verdict appends for export records that carried none of the documented
+ * members: how many of the exported records were not evaluated, which members would have
+ * identified them, and (when given) what that does to the verdict. Empty when every
+ * record was documented.
+ */
+function unevaluableRecordsNote(dataset: TenableDataset<unknown>, consequence?: string): string {
+  const unevaluable = unevaluableRecordsOf(dataset);
+  if (unevaluable === 0 || !isExportResult(dataset.data)) return "";
+  const members = dataset.data.kind === null ? [] : DOCUMENTED_RECORD_MEMBERS[dataset.data.kind];
+  return ` ${unevaluable} of ${unevaluable + dataset.data.records.length} exported records carry none of the documented members (${members.join(", ")}) and were not evaluated${consequence ? `, ${consequence}` : ""}.`;
+}
+
+const CAPPED_AT_WARN = "so the verdict is capped at warn";
 
 /** "fetched/total" chunk ratio of an export that ran; null when it did not. */
 function chunkRatio(dataset: TenableDataset<TenableExportResult>): string | null {
@@ -1973,14 +2767,42 @@ function collectedOrMarker<T>(dataset: TenableDataset<T>, project: (data: T) => 
   return dataset.status === "ok" ? project(dataset.data) : notCollectedMarker(dataset);
 }
 
+/**
+ * What a readable export writes to core_data: its records when every available chunk
+ * was downloaded and every record was documented; otherwise a partial marker around the
+ * records it did evaluate (chunks lost to max_chunks, chunks_failed, or failed downloads,
+ * and records kept out as unevaluable), so the file is never read as the whole inventory.
+ */
+function partialExportOrRecords(result: TenableExportResult): unknown {
+  const unevaluable = result.unevaluableRecords ?? 0;
+  if (!result.truncated && unevaluable === 0) return result.records;
+  return {
+    collected: true,
+    complete: false,
+    truncated: result.truncated,
+    total_chunks: result.totalChunks,
+    available_chunks: result.availableChunks,
+    fetched_chunks: result.fetchedChunks,
+    failed_chunks: result.failedChunks,
+    download_failures: result.downloadFailures,
+    unevaluable_records: unevaluable,
+    reason: result.reason ?? null,
+    records: result.records,
+  };
+}
+
+// unevaluable_records counts the records of a readable export that carried none of the
+// documented members and were kept out of its records; null for a dataset that is not an
+// export or was not read.
 function collectionStatusOf(dataset: TenableDataset<unknown>): JsonRecord {
   return {
     status: dataset.status,
     endpoint: dataset.endpoint,
     http_status: dataset.httpStatus,
-    seen: dataset.seen,
+    seen: seenOrNull(dataset),
     total: dataset.total,
     truncated: dataset.truncated,
+    unevaluable_records: dataset.status === "ok" && isExportResult(dataset.data) ? dataset.data.unevaluableRecords : null,
     error: dataset.error ?? null,
   };
 }
@@ -2039,8 +2861,10 @@ function unreadableFinding(control: number, severity: TenableSeverity, dataset: 
   const summary = dataset.status === "not_configured"
     ? `Not applicable: ${describeUnread(dataset)}, so this control was not assessed. A human must collect ${manualEvidence}.`
     : `Unknown: ${dataset.endpoint} could not be read because ${describeUnread(dataset)}. A human must collect ${manualEvidence}.`;
+  // The evidence states the absence in the positive form (not_collected: true): a false
+  // leaf appearing under a denied read is the shape an empty or disabled setting takes.
   return finding(control, "manual", severity, summary, {
-    collected: false,
+    not_collected: true,
     endpoint: dataset.endpoint,
     dataset_status: dataset.status,
     http_status: dataset.httpStatus,
@@ -2048,22 +2872,50 @@ function unreadableFinding(control: number, severity: TenableSeverity, dataset: 
   }, idSuffix);
 }
 
+// The partial-view sentence of a truncated inventory, followed by the unevaluable-record
+// sentence of an export some of whose records could not be evaluated.
 function partialNote(dataset: TenableDataset<unknown>): string {
-  return dataset.truncated && dataset.status === "ok"
-    ? ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}, so the verdict is capped at warn.`
+  const truncatedNote = dataset.truncated && dataset.status === "ok"
+    ? ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}, ${CAPPED_AT_WARN}.`
     : "";
+  return `${truncatedNote}${unevaluableRecordsNote(dataset, CAPPED_AT_WARN)}`;
 }
 
-// A pass never survives a capped, stuck, or unreadable inventory it depends on.
+// A pass never survives a capped, stuck, or unreadable inventory it depends on, nor an
+// export whose chunks carried records that could not be evaluated.
 function capForPartial(status: TenableFindingStatus, dataset: TenableDataset<unknown>): TenableFindingStatus {
-  if (status === "pass" && (dataset.status !== "ok" || dataset.truncated)) return "warn";
+  if (status === "pass" && (dataset.status !== "ok" || dataset.truncated || unevaluableRecordsOf(dataset) > 0)) return "warn";
   return status;
+}
+
+// The partial-view statement of a truncated inventory appears on every branch, not only
+// the pass branch the author appended it to: a fail or warn read from a capped or stuck
+// walk says how many records it rests on, and the evidence carries the collection flags.
+function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>): TenableFinding {
+  const readable = dataset.status === "ok";
+  const evidence: JsonRecord = {
+    ...item.evidence,
+    inventory_truncated: readable ? dataset.truncated : null,
+    records_seen: readable ? seenOrNull(dataset) ?? null : null,
+    records_total: readable ? dataset.total ?? null : null,
+  };
+  if (!readable || !dataset.truncated || item.summary.includes(" records were retrieved")) return { ...item, evidence };
+  const partial = ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}; the verdict rests on the records retrieved.`;
+  return { ...item, summary: `${item.summary}${partial}`, evidence };
 }
 
 // Rule 1 corollary: a finding that reads several inventories cannot pass while any of
 // them is unreadable, even when the unreadable one only feeds evidence.
 function capForUnreadable(status: TenableFindingStatus, ...datasets: Array<TenableDataset<unknown>>): TenableFindingStatus {
   if (status === "pass" && datasets.some((dataset) => dataset.status !== "ok")) return "warn";
+  return status;
+}
+
+// The corollary extended to truncation: a pass does not survive a secondary inventory
+// that was unreadable or truncated, since its unread remainder may hold what the pass
+// ruled out.
+function capForIncomplete(status: TenableFindingStatus, ...datasets: Array<TenableDataset<unknown>>): TenableFindingStatus {
+  if (status === "pass" && datasets.some((dataset) => dataset.status !== "ok" || dataset.truncated === true)) return "warn";
   return status;
 }
 
@@ -2567,6 +3419,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       threshold: credentialThreshold,
       export_status: data.assetExport.data.status,
       chunks_fetched: chunkRatio(data.assetExport),
+      unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
 
@@ -2578,23 +3431,29 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     const undocumented = exclusions.filter((item) => !asString(item.description));
     const broad = exclusions.filter((item) => exclusionIsBroad(asString(item.members)));
     const issues = new Set([...permanent, ...undocumented, ...broad].map((item) => asString(item.name) ?? asString(item.id) ?? "exclusion"));
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       13,
       exclusions.length === 0 ? capForPartial("pass", data.exclusions) : issues.size === 0 ? capForPartial("pass", data.exclusions) : permanent.length > 0 || broad.length > 0 ? "fail" : "warn",
       "medium",
       exclusions.length === 0
-        ? `${data.exclusions.endpoint} returned pagination.total 0, so nothing is excluded from scanning; emptiness is compliant for this control.${partialNote(data.exclusions)}`
+        ? data.exclusions.truncated
+          // Zero delivered records under a larger reported total is an unread list, not an empty one.
+          ? `${data.exclusions.endpoint} delivered zero exclusions although pagination.total reports ${data.exclusions.total ?? "an unknown count"}, so the exclusion list was not reviewed.${partialNote(data.exclusions)}`
+          : `${data.exclusions.endpoint} returned zero exclusions (pagination.total ${data.exclusions.total ?? "not reported"}), so nothing is excluded from scanning; emptiness is compliant for this control.`
         : issues.size === 0
           ? `All ${exclusions.length} exclusions are scheduled, documented, and scoped to narrow targets.${partialNote(data.exclusions)}`
           : `${issues.size} of ${exclusions.length} exclusions need review: ${permanent.length} always-on (schedule.enabled=false), ${undocumented.length} without a description, ${broad.length} covering /16 or wider ranges.`,
       {
-        exclusion_count: exclusions.length,
+        exclusion_count: boundedCount(exclusions.length, data.exclusions),
         pagination_total: data.exclusions.total ?? null,
-        permanent_exclusions: permanent.map((item) => asString(item.name)).slice(0, 50),
-        undocumented_exclusions: undocumented.map((item) => asString(item.name)).slice(0, 50),
-        broad_exclusions: broad.map((item) => asString(item.name)).slice(0, 50),
+        permanent_exclusions_count: boundedCount(permanent.length, data.exclusions),
+        undocumented_exclusions_count: boundedCount(undocumented.length, data.exclusions),
+        broad_exclusions_count: boundedCount(broad.length, data.exclusions),
+        permanent_exclusions: detailOrNull(permanent.map((item) => asString(item.name)).slice(0, 50), data.exclusions),
+        undocumented_exclusions: detailOrNull(undocumented.map((item) => asString(item.name)).slice(0, 50), data.exclusions),
+        broad_exclusions: detailOrNull(broad.map((item) => asString(item.name)).slice(0, 50), data.exclusions),
       },
-    ));
+    ), data.exclusions));
   }
 
   if (data.targetGroups.status !== "ok") {
@@ -2644,6 +3503,18 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     ...datasetErrors("sc_scan_results", data.scScanResults),
   ];
 
+  const datasets = {
+    scans: data.scans,
+    policies: data.policies,
+    policy_details: data.policyDetails,
+    templates: data.templates,
+    exclusions: data.exclusions,
+    target_groups: data.targetGroups,
+    users: data.users,
+    asset_export: data.assetExport,
+    sc_scans: data.scScans,
+    sc_scan_results: data.scScanResults,
+  };
   return {
     title: "Tenable scan program",
     category: "scan_program",
@@ -2654,19 +3525,8 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       target_group_count: countOrNull(data.targetGroups),
       exported_assets: recordCount(data.assetExport),
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        scans: data.scans,
-        policies: data.policies,
-        policy_details: data.policyDetails,
-        templates: data.templates,
-        exclusions: data.exclusions,
-        target_groups: data.targetGroups,
-        users: data.users,
-        asset_export: data.assetExport,
-        sc_scans: data.scScans,
-        sc_scan_results: data.scScanResults,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
@@ -2782,8 +3642,14 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       ? data.networks.data.filter((network) => !perNetwork.has(asString(network.name) ?? "") && !perNetwork.has(asString(network.uuid) ?? "")).map((network) => asString(network.name) ?? asString(network.uuid) ?? "network")
       : [];
     const expected = options.expectedAssetCount;
+    // Networks are named only when the network inventory was read to completion; over a
+    // truncated walk the note counts them and says why they are not named.
     const networkNote = data.networks.status === "ok"
-      ? (emptyNetworks.length > 0 ? ` Networks without assets: ${emptyNetworks.slice(0, 10).join(", ")}.` : "")
+      ? emptyNetworks.length === 0
+        ? ""
+        : data.networks.truncated
+          ? ` ${emptyNetworks.length} of the ${data.networks.data.length} network objects retrieved have no assets; the network inventory was truncated (${data.networks.seen ?? "an unknown number"} of ${data.networks.total ?? "unknown"} records), so they are not named until it is read to completion.`
+          : ` Networks without assets: ${emptyNetworks.slice(0, 10).join(", ")}.`
       : ` ${describeUnread(data.networks)}, so networks without assets are unknown.`;
     let status: TenableFindingStatus;
     let summary: string;
@@ -2792,8 +3658,8 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       summary = "The asset export finished with zero assets, so no asset inventory exists to compare against expected ranges; emptiness fails this control.";
     } else if (expected !== undefined && expected > 0) {
       const coverage = ratio(fresh.length, expected);
-      status = coverage >= 0.95 ? capForUnreadable(capForPartial("pass", data.assetExport), data.networks) : "fail";
-      summary = `${fresh.length} assets seen within ${staleAssetDays} days against an expected population of ${expected} (${percent(coverage)} coverage).${undated.length > 0 ? ` ${undated.length} assets have no last_seen date and were not counted.` : ""}${partialNote(data.assetExport)}${unreadableNote([{ dataset: data.networks, consequence: "networks without assets are unknown" }])}`;
+      status = coverage >= 0.95 ? capForIncomplete(capForPartial("pass", data.assetExport), data.networks) : "fail";
+      summary = `${fresh.length} assets seen within ${staleAssetDays} days against an expected population of ${expected} (${percent(coverage)} coverage).${undated.length > 0 ? ` ${undated.length} assets have no last_seen date and were not counted.` : ""}${partialNote(data.assetExport)}${partialNote(data.networks)}${unreadableNote([{ dataset: data.networks, consequence: "networks without assets are unknown" }])}`;
     } else {
       status = "manual";
       summary = `${assets.length} assets exported (${fresh.length} seen within ${staleAssetDays} days, ${stale} stale, ${undated.length} without last_seen). The API does not know the expected network ranges; pass expected_asset_count or compare the per-network counts in the evidence against the authoritative inventory.${networkNote}`;
@@ -2804,10 +3670,12 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       stale_assets: stale,
       undated_assets: undated.length,
       assets_per_network: Object.fromEntries(perNetwork),
-      networks_without_assets: data.networks.status === "ok" ? emptyNetworks.slice(0, 50) : null,
+      networks_without_assets_count: boundedCount(emptyNetworks.length, data.networks),
+      networks_without_assets: detailOrNull(emptyNetworks.slice(0, 50), data.networks),
       networks_status: data.networks.status,
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
+      unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
 
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
@@ -2821,6 +3689,10 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     } else if (assets.length === 0) {
       tagStatus = "manual";
       tagSummary = "Zero assets were exported, so tag coverage cannot be measured.";
+    } else if (categories.length === 0 && data.tagCategories.truncated) {
+      // Zero delivered records under a truncated walk is an unread taxonomy, not an absent one.
+      tagStatus = "warn";
+      tagSummary = `${data.tagCategories.endpoint} delivered zero tag categories although pagination.total reports ${data.tagCategories.total ?? "an unknown count"}, so the tag taxonomy was not reviewed.${partialNote(data.tagCategories)}`;
     } else if (categories.length === 0) {
       tagStatus = "fail";
       tagSummary = "No tag categories are defined, so assets are not classified for compliance scope, business unit, or environment.";
@@ -2828,16 +3700,20 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       tagStatus = "fail";
       tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag, below the ${percent(taggedThreshold)} threshold (${categories.length} categories defined).`;
     } else {
-      tagStatus = capForUnreadable(capForPartial("pass", data.assetExport), data.tagValues);
-      tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}${unreadableNote([{ dataset: data.tagValues, consequence: "the tag value population is unknown" }])}`;
+      tagStatus = capForIncomplete(capForPartial("pass", data.assetExport), data.tagCategories, data.tagValues);
+      tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}${partialNote(data.tagCategories)}${partialNote(data.tagValues)}${unreadableNote([{ dataset: data.tagValues, consequence: "the tag value population is unknown" }])}`;
     }
     findings.push(finding(16, tagStatus, "medium", tagSummary, {
       asset_count: assets.length,
       tagged_assets: tagged.length,
       tagged_ratio: taggedRatio,
       threshold: taggedThreshold,
-      tag_categories: data.tagCategories.status === "ok" ? categories.slice(0, 50) : null,
+      tag_category_count: countOrNull(data.tagCategories),
+      tag_categories: detailOrNull(categories.slice(0, 50), data.tagCategories),
+      tag_categories_truncated: data.tagCategories.status === "ok" ? data.tagCategories.truncated : null,
       tag_value_count: countOrNull(data.tagValues),
+      tag_values_truncated: data.tagValues.status === "ok" ? data.tagValues.truncated : null,
+      unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
 
@@ -2876,18 +3752,19 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForUnreadable("pass", data.serverProperties);
       summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.${unreadableNote([{ dataset: data.serverProperties, consequence: "the licensed agent count (license.agents) is unknown" }])}`;
     }
-    findings.push(finding(5, status, "high", summary, {
-      agent_count: agents.length,
+    findings.push(withPartialView(finding(5, status, "high", summary, {
+      agent_count: boundedCount(agents.length, data.agents),
       pagination_total: data.agents.total ?? null,
       licensed_agents: licensedAgents ?? null,
       server_properties_status: data.serverProperties.status,
-      offline_agents: offline.length,
-      stale_connect_agents: staleConnect.length,
-      undated_agents: undated.length,
+      offline_agents: boundedCount(offline.length, data.agents),
+      stale_connect_agents: boundedCount(staleConnect.length, data.agents),
+      undated_agents: boundedCount(undated.length, data.agents),
       newest_version: newest ?? null,
-      outdated_agents: outdated.map((agent) => `${asString(agent.name) ?? agent.id} (${asString(agent.core_version)})`).slice(0, 50),
+      outdated_agents_count: boundedCount(outdated.length, data.agents),
+      outdated_agents: detailOrNull(outdated.map((agent) => `${asString(agent.name) ?? agent.id} (${asString(agent.core_version)})`).slice(0, 50), data.agents),
       agent_offline_days: agentOfflineDays,
-    }));
+    }), data.agents));
 
     const ungrouped = agents.filter((agent) => asRecords(agent.groups).length === 0);
     const groupCount = data.agentGroups.status === "ok" ? data.agentGroups.data.length : null;
@@ -2909,13 +3786,14 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       groupStatus = "pass";
       groupSummary = `All ${agents.length} agents belong to at least one of ${groupCount} agent groups. Confirm the groups mirror network segments or business units.`;
     }
-    findings.push(finding(6, groupStatus, "medium", groupSummary, {
-      agent_count: agents.length,
+    findings.push(withPartialView(finding(6, groupStatus, "medium", groupSummary, {
+      agent_count: boundedCount(agents.length, data.agents),
       agent_group_count: groupCount,
-      ungrouped_agents: ungrouped.map((agent) => asString(agent.name) ?? asString(agent.id)).slice(0, 50),
-      groups: data.agentGroups.status === "ok" ? data.agentGroups.data.map((group) => ({ name: asString(group.name), agents_count: asNumber(group.agents_count) ?? null })).slice(0, 50) : null,
+      ungrouped_agents_count: boundedCount(ungrouped.length, data.agents),
+      ungrouped_agents: detailOrNull(ungrouped.map((agent) => asString(agent.name) ?? asString(agent.id)).slice(0, 50), data.agents),
+      groups: detailOrNull(data.agentGroups.status === "ok" ? data.agentGroups.data.map((group) => ({ name: asString(group.name), agents_count: asNumber(group.agents_count) ?? null })).slice(0, 50) : null, data.agentGroups),
       agent_groups_status: data.agentGroups.status,
-    }));
+    }), data.agents));
   }
 
   const linkedScanners = data.scanners.data.filter((scanner) => asString(scanner.type) !== "local" && asBoolean(scanner.pool) !== true && asBoolean(scanner.group) !== true);
@@ -2942,7 +3820,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       return version !== undefined && compareVersions(version, newest) < 0;
     }) : [];
     const unhealthy = new Set([...unlinked, ...off, ...staleConnect].map((scanner) => asString(scanner.name) ?? asString(scanner.id) ?? "scanner"));
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       7,
       unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForNonAdmin(capForPartial("pass", data.scanners), callerIsAdministrator),
       "high",
@@ -2962,7 +3840,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
         newest_version: newest ?? null,
         outdated: outdated.map((scanner) => `${asString(scanner.name)} (${asString(scanner.ui_version)})`).slice(0, 50),
       },
-    ));
+    ), data.scanners));
   }
 
   if (data.serverProperties.status !== "ok") {
@@ -2986,8 +3864,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = "manual";
       summary = `${data.serverProperties.endpoint} did not expose a parseable plugin_set, so plugin currency cannot be confirmed; collect the plugin set date from Settings > About.`;
     } else if (!serverFresh || staleScanners.length > 0) {
+      // A stale container plugin set fails on its own; when the scanner list was not read,
+      // the scanner clause names the unread read instead of counting zero of zero entries.
       status = "fail";
-      summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and ${staleScanners.length} of ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set older than ${pluginStaleHours} hours${staleScanners.length > 0 ? ` (${staleScanners.map((scanner) => asString(scanner.name) ?? asString(scanner.id)).slice(0, 10).join(", ")})` : ""}.`;
+      const scannerClause = data.scanners.status !== "ok"
+        ? `${describeUnread(data.scanners)}, so scanner plugin sets are unverified`
+        : `${staleScanners.length} of ${datedScanners.length} scanner entries exposing loaded_plugin_set load a set older than ${pluginStaleHours} hours${staleScanners.length > 0 ? ` (${staleScanners.map((scanner) => asString(scanner.name) ?? asString(scanner.id)).slice(0, 10).join(", ")})` : ""}`;
+      summary = `The container plugin set ${asString(data.serverProperties.data.plugin_set) ?? "unknown"} is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old${serverFresh ? "" : ` (older than ${pluginStaleHours} hours)`} and ${scannerClause}.`;
     } else if (data.scanners.status !== "ok") {
       status = "manual";
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old, but ${describeUnread(data.scanners)}, so no scanner plugin set could be evaluated; collect each scanner's plugin set from Settings > Sensors.`;
@@ -3005,17 +3888,18 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForPartial("pass", data.agents);
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set (${linkedScanners.length} linked appliances) load a set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
     }
-    findings.push(finding(8, status, "high", summary, {
+    findings.push(withPartialView(finding(8, status, "high", summary, {
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
       plugin_set_age_hours: serverPluginMs === undefined ? null : Math.round((now - serverPluginMs) / 3_600_000),
       scanner_entries: countOrNull(data.scanners),
-      evaluated_scanners: datedScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
-      stale_scanners: staleScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50),
-      undated_scanners: undatedScanners.map((scanner) => asString(scanner.name)).slice(0, 50),
-      stale_online_agents: data.agents.status === "ok" ? staleAgents.length : null,
+      scanners_status: data.scanners.status,
+      evaluated_scanners: data.scanners.status === "ok" ? datedScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50) : null,
+      stale_scanners: data.scanners.status === "ok" ? staleScanners.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loaded_plugin_set)})`).slice(0, 50) : null,
+      undated_scanners: data.scanners.status === "ok" ? undatedScanners.map((scanner) => asString(scanner.name)).slice(0, 50) : null,
+      stale_online_agents: boundedCount(staleAgents.length, data.agents),
       agents_status: data.agents.status,
       threshold_hours: pluginStaleHours,
-    }));
+    }), data.agents));
   }
 
   if (data.networks.status !== "ok") {
@@ -3024,23 +3908,26 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     const networks = data.networks.data;
     const withoutScanners = networks.filter((network) => asNumber(network.scanner_count) === 0);
     const unknownCount = networks.filter((network) => asNumber(network.scanner_count) === undefined);
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       9,
       networks.length === 0 ? "manual" : withoutScanners.length > 0 ? "fail" : unknownCount.length > 0 ? "warn" : capForPartial("pass", data.networks),
       "medium",
       networks.length === 0
         ? `${data.networks.endpoint} returned zero network objects; the default network should always exist, so the view is incomplete. Collect the network list from Settings > Sensors > Networks.`
         : withoutScanners.length > 0
-          ? `${withoutScanners.length} of ${networks.length} network objects have no assigned scanners: ${withoutScanners.map((network) => asString(network.name)).slice(0, 10).join(", ")}.`
+          // Names are given only over a network inventory read to completion.
+          ? `${withoutScanners.length} of ${networks.length} network objects have no assigned scanners${data.networks.truncated ? "" : `: ${withoutScanners.map((network) => asString(network.name)).slice(0, 10).join(", ")}`}.`
           : unknownCount.length > 0
             ? `${networks.length} network objects exist but ${unknownCount.length} did not expose scanner_count, so scanner assignment cannot be confirmed for them.`
             : `All ${networks.length} network objects have at least one assigned scanner.${partialNote(data.networks)}`,
       {
-        network_count: networks.length,
+        network_count: boundedCount(networks.length, data.networks),
         pagination_total: data.networks.total ?? null,
-        networks: networks.map((network) => ({ name: asString(network.name), scanner_count: asNumber(network.scanner_count) ?? null, assets_ttl_days: asNumber(network.assets_ttl_days) ?? null, is_default: asBoolean(network.is_default) ?? null })).slice(0, 50),
+        networks_without_scanners: boundedCount(withoutScanners.length, data.networks),
+        networks_without_scanner_count: boundedCount(unknownCount.length, data.networks),
+        networks: detailOrNull(networks.map((network) => ({ name: asString(network.name), scanner_count: asNumber(network.scanner_count) ?? null, assets_ttl_days: asNumber(network.assets_ttl_days) ?? null, is_default: asBoolean(network.is_default) ?? null })).slice(0, 50), data.networks),
       },
-    ));
+    ), data.networks));
   }
 
   findings.push(assessSecurityCenterScanners(data.scScanners, data.scFeed, now, pluginStaleHours));
@@ -3059,31 +3946,32 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     ...datasetErrors("sc_feed", data.scFeed),
   ];
 
+  const datasets = {
+    server_properties: data.serverProperties,
+    scanners: data.scanners,
+    agents: data.agents,
+    agent_groups: data.agentGroups,
+    networks: data.networks,
+    tag_categories: data.tagCategories,
+    tag_values: data.tagValues,
+    asset_export: data.assetExport,
+    users: data.users,
+    sc_scanners: data.scScanners,
+    sc_feed: data.scFeed,
+  };
   return {
     title: "Tenable sensor and asset coverage",
     category: "sensor_coverage",
     summary: {
-      exported_assets: data.assetExport.status === "ok" ? assets.length : null,
+      exported_assets: recordCount(data.assetExport),
       agent_count: countOrNull(data.agents),
       scanner_entries: countOrNull(data.scanners),
-      linked_scanners: data.scanners.status === "ok" ? linkedScanners.length : null,
+      linked_scanners: boundedCount(linkedScanners.length, data.scanners),
       network_count: countOrNull(data.networks),
       tag_categories: countOrNull(data.tagCategories),
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        server_properties: data.serverProperties,
-        scanners: data.scanners,
-        agents: data.agents,
-        agent_groups: data.agentGroups,
-        networks: data.networks,
-        tag_categories: data.tagCategories,
-        tag_values: data.tagValues,
-        asset_export: data.assetExport,
-        users: data.users,
-        sc_scanners: data.scScanners,
-        sc_feed: data.scFeed,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
@@ -3122,7 +4010,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     status = "pass";
     summary = `All ${enabled.length} enabled Security Center scanners report status 1, checked in within 24 hours, load a plugin set newer than ${pluginStaleHours} hours, and the active plugin feed is not stale.`;
   }
-  return finding(7, status, "high", summary, {
+  return withPartialView(finding(7, status, "high", summary, {
     sc_scanner_count: scanners.data.length,
     sc_enabled_scanners: enabled.length,
     sc_unhealthy: unhealthy.map((scanner) => `${asString(scanner.name)} (status ${asString(scanner.status)})`).slice(0, 50),
@@ -3131,7 +4019,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     sc_stale_plugins: stalePlugins.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loadedPluginSet) ?? asString(scanner.pluginSet)})`).slice(0, 50),
     sc_feed_active_stale: feedStale ?? null,
     sc_feed_active_update_time: asString(feedActive?.updateTime) ?? null,
-  }, "-SC");
+  }, "-SC"), scanners);
 }
 
 export interface TenableAccessControlData {
@@ -3265,7 +4153,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   if (data.permissions.status !== "ok") {
     findings.push(unreadableFinding(11, "high", data.permissions, "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
   } else if (data.permissions.data.length === 0) {
-    findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: 0 }));
+    findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: boundedCount(0, data.permissions) }));
   } else {
     const permissions = data.permissions.data;
     const broad = permissions.filter((permission) => {
@@ -3290,10 +4178,12 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
             ? `${permissions.length} permissions follow least privilege for AllUsers, but ${describeUnread(data.accessGroups)}, so legacy access groups are unverified and the verdict is capped at warn.`
             : `${permissions.length} permissions are defined and none grants AllUsers write-style actions on all assets; no legacy access groups remain.${partialNote(data.accessGroups)}${unreadableNote([{ dataset: data.groups, consequence: "user group membership is unknown" }])}${nonAdminNote(callerIsAdministrator)}`,
       {
-        permission_count: permissions.length,
-        broad_permissions: broad.map((permission) => asString(permission.name)).slice(0, 50),
-        legacy_access_groups: data.accessGroups.status === "ok" ? legacyAccessGroups.map((group) => asString(group.name)).slice(0, 50) : null,
+        permission_count: boundedCount(permissions.length, data.permissions),
+        broad_permissions: detailOrNull(broad.map((permission) => asString(permission.name)).slice(0, 50), data.permissions),
+        legacy_access_group_count: boundedCount(legacyAccessGroups.length, data.accessGroups),
+        legacy_access_groups: detailOrNull(legacyAccessGroups.map((group) => asString(group.name)).slice(0, 50), data.accessGroups),
         access_groups_status: data.accessGroups.status,
+        access_groups_truncated: data.accessGroups.status === "ok" ? data.accessGroups.truncated : null,
         user_groups: countOrNull(data.groups),
       },
     ));
@@ -3302,7 +4192,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   if (data.credentials.status !== "ok") {
     findings.push(unreadableFinding(12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
   } else if (data.credentials.data.length === 0) {
-    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total 0). Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: 0 }));
+    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}).${data.credentials.truncated ? " The walk was truncated before any record arrived, so the credential list was not reviewed." : ""} Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: boundedCount(0, data.credentials), pagination_total: data.credentials.total ?? null, inventory_truncated: data.credentials.truncated }));
   } else {
     const credentials = data.credentials.data;
     const unused = credentials.filter((credential) => asNumber(asObject(credential.last_used_by)?.id) === undefined);
@@ -3316,7 +4206,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       const type = asString(asObject(credential.type)?.name) ?? asString(asObject(credential.type)?.id) ?? "unknown";
       types.set(type, (types.get(type) ?? 0) + 1);
     }
-    findings.push(finding(
+    findings.push(withPartialView(finding(
       12,
       unused.length > 0 || old.length > 0 ? "warn" : undated.length > 0 ? "warn" : capForPartial("pass", data.credentials),
       "medium",
@@ -3326,14 +4216,16 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
           ? `${credentials.length} managed credentials are all in use, but ${undated.length} expose no created_date.`
           : `All ${credentials.length} managed credentials are in use and were created within the last year across ${types.size} credential types.${partialNote(data.credentials)}`,
       {
-        credential_count: credentials.length,
+        credential_count: boundedCount(credentials.length, data.credentials),
         pagination_total: data.credentials.total ?? null,
         types: Object.fromEntries(types),
-        unused_credentials: unused.map((credential) => asString(credential.name)).slice(0, 50),
-        older_than_one_year: old.map((credential) => asString(credential.name)).slice(0, 50),
-        undated_credentials: undated.length,
+        unused_credentials_count: boundedCount(unused.length, data.credentials),
+        older_than_one_year_count: boundedCount(old.length, data.credentials),
+        unused_credentials: detailOrNull(unused.map((credential) => asString(credential.name)).slice(0, 50), data.credentials),
+        older_than_one_year: detailOrNull(old.map((credential) => asString(credential.name)).slice(0, 50), data.credentials),
+        undated_credentials: boundedCount(undated.length, data.credentials),
       },
-    ));
+    ), data.credentials));
   }
 
   if (data.auditLog.status !== "ok") {
@@ -3349,7 +4241,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     let summary: string;
     if (events.length === 0) {
       status = "warn";
-      summary = `The activity log returned zero events for the last ${lookbackDays} days (pagination.total ${data.auditLog.total ?? 0}); an active tenant should record logins and API calls, so confirm logging and the date filter.`;
+      summary = `The activity log returned zero events for the last ${lookbackDays} days (pagination.total ${data.auditLog.total ?? "not reported"}); an active tenant should record logins and API calls, so confirm logging and the date filter.`;
     } else if (data.auditLog.truncated) {
       status = "warn";
       summary = `Only ${events.length} of ${data.auditLog.total ?? "unknown"} activity log events were retrieved for the last ${lookbackDays} days, so the review is partial; ${sensitive.size} sensitive events were seen.`;
@@ -3361,19 +4253,21 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       summary = `${events.length} activity log events were retrieved completely for the last ${lookbackDays} days with no deletions, privilege changes, or exclusion changes; ${failures.length} failed actions recorded.`;
     }
     findings.push(finding(18, status, "medium", summary, {
-      event_count: events.length,
+      event_count: boundedCount(events.length, data.auditLog),
       pagination_total: data.auditLog.total ?? null,
+      inventory_truncated: data.auditLog.truncated,
       lookback_days: lookbackDays,
-      deletions: deletes.length,
-      privilege_changes: privilege.length,
-      exclusion_or_template_changes: exclusionOrPolicy.length,
-      failed_actions: failures.length,
-      sensitive_samples: [...deletes, ...privilege, ...exclusionOrPolicy].slice(0, 25).map((event) => ({
+      deletions: boundedCount(deletes.length, data.auditLog),
+      privilege_changes: boundedCount(privilege.length, data.auditLog),
+      exclusion_or_template_changes: boundedCount(exclusionOrPolicy.length, data.auditLog),
+      failed_actions: boundedCount(failures.length, data.auditLog),
+      sensitive_events: boundedCount(sensitive.size, data.auditLog),
+      sensitive_samples: detailOrNull([...deletes, ...privilege, ...exclusionOrPolicy].slice(0, 25).map((event) => ({
         received: asString(event.received),
         action: asString(event.action),
         actor: asString(asObject(event.actor)?.name),
         target: asString(asObject(event.target)?.name),
-      })),
+      })), data.auditLog),
     }));
   }
 
@@ -3390,6 +4284,16 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     ...datasetErrors("sc_users", data.scUsers),
   ];
 
+  const datasets = {
+    users: data.users,
+    groups: data.groups,
+    roles: data.roles,
+    permissions: data.permissions,
+    access_groups: data.accessGroups,
+    credentials: data.credentials,
+    audit_log: data.auditLog,
+    sc_users: data.scUsers,
+  };
   return {
     title: "Tenable access control",
     category: "access_control",
@@ -3399,17 +4303,8 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       credential_count: countOrNull(data.credentials),
       audit_events: countOrNull(data.auditLog),
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        users: data.users,
-        groups: data.groups,
-        roles: data.roles,
-        permissions: data.permissions,
-        access_groups: data.accessGroups,
-        credentials: data.credentials,
-        audit_log: data.auditLog,
-        sc_users: data.scUsers,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
@@ -3489,8 +4384,10 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
   const findings: TenableFinding[] = [];
   const callerIsAdministrator = detectAdministrator(data.users);
   const assetCount = data.assetExport.status === "ok" ? data.assetExport.data.records.length : undefined;
-  const capPopulation = (status: TenableFindingStatus): TenableFindingStatus => capForNonAdmin(capForPartial(status, data.assetExport), callerIsAdministrator);
-  const populationNote = `${partialNote(data.assetExport)}${nonAdminNote(callerIsAdministrator)}`;
+  // A pass over the two exports never survives a partial asset population, a vulnerability
+  // export some of whose records could not be evaluated, or a non-administrator caller.
+  const capPopulation = (status: TenableFindingStatus): TenableFindingStatus => capForNonAdmin(capForPartial(capForPartial(status, data.assetExport), data.vulnExport), callerIsAdministrator);
+  const populationNote = `${partialNote(data.assetExport)}${unevaluableRecordsNote(data.vulnExport, CAPPED_AT_WARN)}${nonAdminNote(callerIsAdministrator)}`;
 
   if (data.vulnExport.status !== "ok") {
     findings.push(unreadableFinding(14, "high", data.vulnExport, "the VPR distribution of open findings from Findings > Vulnerabilities"));
@@ -3517,7 +4414,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       vprSummary = "The asset export returned zero assets, so an empty vulnerability set does not demonstrate VPR-based prioritization.";
     } else if (open.length === 0) {
       vprStatus = "manual";
-      vprSummary = `No open findings were exported for the last ${lookbackDays} days across ${assetCount} assets, so VPR usage cannot be evaluated; confirm scans are producing findings.`;
+      vprSummary = `No open findings were exported for the last ${lookbackDays} days across ${assetCount} assets, so VPR usage cannot be evaluated; confirm scans are producing findings.${unevaluableRecordsNote(data.vulnExport)}`;
     } else if (data.vulnExport.truncated) {
       vprStatus = "warn";
       vprSummary = `Partial export: ${data.vulnExport.data.fetchedChunks ?? "unknown"} of ${data.vulnExport.data.totalChunks ?? "unknown"} chunks were downloaded (${data.vulnExport.error ?? "partial"}), covering ${open.length} open findings; ${percent(vprCoverage)} of rated findings carry a VPR score.`;
@@ -3539,6 +4436,8 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       asset_count: assetCount ?? null,
       export_status: data.vulnExport.data.status,
       chunks: chunkRatio(data.vulnExport),
+      unevaluable_records: unevaluableRecordsOf(data.vulnExport),
+      asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
 
     const overdue: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -3576,7 +4475,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       slaSummary = `No critical or high findings exceed SLA, but ${overdue.medium} medium and ${overdue.low} low findings are overdue and ${undated} open findings have no first_found date (not counted as compliant).`;
     } else if (open.length === 0) {
       slaStatus = capPopulation("pass");
-      slaSummary = `Zero open findings were exported for the last ${lookbackDays} days; this passes only because the export FINISHED completely and the asset export returned ${assetCount} assets.${populationNote}`;
+      slaSummary = `Zero open findings were exported for the last ${lookbackDays} days from an export that FINISHED completely, against an asset export of ${assetCount} assets.${populationNote}`;
     } else {
       slaStatus = capPopulation("pass");
       slaSummary = `All ${open.length} open findings are within SLA (critical ${sla.critical}d, high ${sla.high}d, medium ${sla.medium}d, low ${sla.low}d) across ${assetCount} assets${mttrDays !== null ? `; mean time to remediate over ${fixTimes.length} fixed findings is ${mttrDays} days` : ""}.${populationNote}`;
@@ -3590,6 +4489,8 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       mttr_days: mttrDays,
       asset_count: assetCount ?? null,
       chunks: chunkRatio(data.vulnExport),
+      unevaluable_records: unevaluableRecordsOf(data.vulnExport),
+      asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
     }));
   }
 
@@ -3598,7 +4499,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     findings.push(data.vulnExportJobs.status === "not_configured"
       ? unreadableFinding(19, "medium", data.vulnExportJobs, manualEvidence)
       : finding(19, "manual", "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
-        collected: false,
+        not_collected: true,
         vuln_export_jobs: collectionStatusOf(data.vulnExportJobs),
         asset_export_jobs: collectionStatusOf(data.assetExportJobs),
       }));
@@ -3650,6 +4551,13 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     ...datasetErrors("users", data.users),
   ];
 
+  const datasets = {
+    vuln_export: data.vulnExport,
+    asset_export: data.assetExport,
+    vuln_export_jobs: data.vulnExportJobs,
+    asset_export_jobs: data.assetExportJobs,
+    users: data.users,
+  };
   return {
     title: "Tenable vulnerability management",
     category: "vulnerability_management",
@@ -3658,27 +4566,24 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       exported_assets: assetCount ?? null,
       vuln_export_status: data.vulnExport.data.status,
       caller_is_administrator: callerIsAdministrator,
-      ...statusCounts(findings),
-      collection: collectionSummary({
-        vuln_export: data.vulnExport,
-        asset_export: data.assetExport,
-        vuln_export_jobs: data.vulnExportJobs,
-        asset_export_jobs: data.assetExportJobs,
-        users: data.users,
-      }),
+      ...statusCounts(findings, anyIncomplete(datasets)),
+      collection: collectionSummary(datasets),
     },
     findings,
     errors,
   };
 }
 
-function statusCounts(findings: TenableFinding[]): JsonRecord {
-  return {
-    pass: findings.filter((item) => item.status === "pass").length,
-    warn: findings.filter((item) => item.status === "warn").length,
-    fail: findings.filter((item) => item.status === "fail").length,
-    manual: findings.filter((item) => item.status === "manual").length,
+// Status counts over a set of findings. With incomplete=true (an inventory the findings
+// read was unreadable or truncated) a count of zero renders null: a finding over that
+// inventory may be undetermined, so 0 would claim that no finding has the status when
+// one may (see "Incomplete inventories"). A positive count is rendered as observed.
+function statusCounts(findings: TenableFinding[], incomplete: boolean): JsonRecord {
+  const count = (status: TenableFindingStatus): number | null => {
+    const total = findings.filter((item) => item.status === status).length;
+    return total === 0 && incomplete ? null : total;
   };
+  return { pass: count("pass"), warn: count("warn"), fail: count("fail"), manual: count("manual") };
 }
 
 /**
@@ -3763,7 +4668,7 @@ export async function checkTenableAccess(clients: TenableClients): Promise<Tenab
   const failed = configured.filter((surface) => surface.status === "not_readable");
   const observedRefusals = [...new Set(forbidden.map((surface) => surface.httpStatus).filter((code): code is number => code !== null))].sort();
   const status = configured.length > 0 && readable.length === configured.length && callerIsAdministrator !== false ? "healthy" : "limited";
-  const platform = [vm ? `Tenable Vulnerability Management ${vm.getConfig().baseUrl}${vm.getConfig().fedramp ? " (FedRAMP)" : ""}` : undefined, sc ? `Tenable Security Center ${sc.getConfig().baseUrl}` : undefined].filter(Boolean).join(" + ");
+  const platform = [vm ? `Tenable Vulnerability Management ${displayOrigin(vm.getConfig().baseUrl)}${vm.getConfig().fedramp ? " (FedRAMP)" : ""}` : undefined, sc ? `Tenable Security Center ${displayOrigin(sc.getConfig().baseUrl)}` : undefined].filter(Boolean).join(" + ");
   const roleNote = usersProbe.surface.status === "not_configured"
     ? "Caller role could not be determined because no Tenable Vulnerability Management tenant is configured."
     : usersProbe.surface.status !== "readable"
@@ -3878,19 +4783,23 @@ function formatAssessmentText(result: TenableAssessmentResult): string {
 
 function buildExecutiveSummary(config: TenableResolvedConfig, assessments: TenableAssessmentResult[], errors: string[]): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
-  const counts = statusCounts(findings);
+  // A category renders a null status count only when an inventory its findings read was
+  // incomplete, so the roll-up inherits that state from the category summaries.
+  const incomplete = assessments.some((assessment) => ["pass", "warn", "fail", "manual"].some((key) => assessment.summary[key] === null));
+  const counts = statusCounts(findings, incomplete);
+  const renderCount = (value: unknown): string => value === null ? "none seen (not asserted: an inventory the findings read was incomplete)" : String(value);
   const lines = [
     "# Tenable Audit Executive Summary",
     "",
-    `Platform: ${config.vm ? `${config.vm.baseUrl}${config.vm.fedramp ? " (FedRAMP)" : ""}` : "Tenable Vulnerability Management not configured"}${config.securityCenter ? `; Tenable Security Center ${config.securityCenter.baseUrl}` : ""}`,
+    `Platform: ${config.vm ? `${displayOrigin(config.vm.baseUrl)}${config.vm.fedramp ? " (FedRAMP)" : ""}` : "Tenable Vulnerability Management not configured"}${config.securityCenter ? `; Tenable Security Center ${displayOrigin(config.securityCenter.baseUrl)}` : ""}`,
     `Generated: ${new Date().toISOString()}`,
     "",
     "## Result Counts",
     "",
-    `- Passing: ${counts.pass}`,
-    `- Warning: ${counts.warn}`,
-    `- Failing: ${counts.fail}`,
-    `- Manual (unknown or not applicable): ${counts.manual}`,
+    `- Passing: ${renderCount(counts.pass)}`,
+    `- Warning: ${renderCount(counts.warn)}`,
+    `- Failing: ${renderCount(counts.fail)}`,
+    `- Manual (unknown or not applicable): ${renderCount(counts.manual)}`,
     "",
     "## Highest Priority Findings",
     "",
@@ -3978,7 +4887,7 @@ export async function exportTenableAuditBundle(
   // as a not-collected marker instead of an empty inventory; a readable but empty
   // list stays []. Readable data was redacted at collection time and is scrubbed
   // once more here before it touches disk.
-  const exportRecords = (result: TenableExportResult) => result.records;
+  const exportRecords = (result: TenableExportResult) => partialExportOrRecords(result);
   const coreData: Array<[string, unknown]> = [
     ["core_data/access_check.json", access],
     ["core_data/scans.json", collectedOrMarker(scanProgramData.scans)],

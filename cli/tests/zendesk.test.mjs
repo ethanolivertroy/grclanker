@@ -127,6 +127,10 @@ function sampleConfig(overrides = {}) {
   };
 }
 
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function jsonResponse(value, options = {}) {
   return new Response(JSON.stringify(value), {
     status: options.status ?? 200,
@@ -1295,7 +1299,11 @@ test("assessZendeskAccessControl enumerates API token events from the audit log 
     },
   }), { now: () => NOW });
   assert.equal(findingById(truncatedHistory, "ZD-13").status, "warn");
-  assert.match(findingById(truncatedHistory, "ZD-13").summary, /history truncated/);
+  assert.match(findingById(truncatedHistory, "ZD-13").summary, /The token event inventory was truncated after 2 items \(.+\), so the verdict is limited to the seen population and item-level detail is withheld/);
+  assert.match(findingById(truncatedHistory, "ZD-13").summary, /Older tokens may be missing from the unread remainder of the history\./);
+  assert.equal(findingById(truncatedHistory, "ZD-13").evidence.token_events_truncated, true);
+  assert.equal(findingById(truncatedHistory, "ZD-13").evidence.tokens_outstanding, null, "a zero count over a truncated inventory is not asserted");
+  assert.equal(findingById(truncatedHistory, "ZD-13").evidence.outstanding_tokens, null, "item-level detail is withheld while the inventory is incomplete");
 
   const noAuditLog = await assessZendeskAccessControl(healthyClient({
     getAccountSettings: tokenSettings,
@@ -1640,6 +1648,16 @@ test("self-check (c) variant: an unknown credential role caps verdicts at warn",
     assert.notEqual(status, "pass", `${id} must not pass when the credential role is unknown`);
   }
   assert.ok(results.every((result) => result.errors.some((entry) => entry.startsWith("current_user dataset:"))));
+
+  // Advisory A4: a role that could not be read is not reported as a non-admin role.
+  const brands = results.flatMap((result) => result.findings).find((item) => item.id === "ZD-22");
+  assert.equal(brands.status, "warn", brands.summary);
+  assert.match(brands.summary, /^\d+ brands were visible to a credential whose role could not be read, which may list only the brands the agent belongs to, so cross-brand consistency cannot be confirmed\./);
+  assert.doesNotMatch(brands.summary, /non-admin|role unknown/);
+  assert.equal(brands.evidence.current_user_role, null);
+  const agentBrands = findingById(await assessZendeskIntegrations(healthyClient({ async getCurrentUser() { return { id: 7, email: "agent@example.com", role: "agent" }; } }), { now: () => NOW }), "ZD-22");
+  assert.equal(agentBrands.status, "warn", agentBrands.summary);
+  assert.match(agentBrands.summary, /brands were visible to a non-admin credential \(role agent\), which only lists brands the agent belongs to, so cross-brand consistency cannot be confirmed\./);
 });
 
 test("every finding carries the framework mappings from the spec table", async () => {
@@ -2091,6 +2109,33 @@ test("redactCredentialProperties scrubs URL query credentials, userinfo, token-i
     "{name, value} pairs with credential names and secure: true objects lose value and default fields while names and kinds stay",
   );
 
+  // Reviewer E finding B: a pair whose name is a credential in the text rules' vocabulary
+  // (a header name ending in auth) loses its value whatever the secure flag says. The pairs
+  // sit under a neutral container: a headers map is replaced whole by its own rule.
+  assert.deepEqual(
+    redactCredentialProperties({
+      fields: [
+        { name: "x-redlock-auth", value: "rvw1RedlockPairValue", secure: false },
+        { name: "X-Auth", value: "rvw1XAuthPairValue", secure: false },
+        { name: "auth", value: "rvw1AuthPairValue" },
+        { name: "Cookie", value: "session=rvw1CookiePairValue", secure: false },
+        { name: "X-Trace", value: "trace-rvw-1", secure: false },
+        { name: "Content-Type", value: "application/json", secure: false },
+      ],
+    }),
+    {
+      fields: [
+        { name: "x-redlock-auth", value: "[REDACTED]", secure: false },
+        { name: "X-Auth", value: "[REDACTED]", secure: false },
+        { name: "auth", value: "[REDACTED]" },
+        { name: "Cookie", value: "[REDACTED]", secure: false },
+        { name: "X-Trace", value: "trace-rvw-1", secure: false },
+        { name: "Content-Type", value: "application/json", secure: false },
+      ],
+    },
+    "an unflagged pair whose name names a credential loses its value; a benign unflagged pair keeps it",
+  );
+
   assert.deepEqual(
     redactCredentialProperties({ secret: 123456, api_key: 4242, id: 42, port: 443, password_length: 12, count: 0 }),
     { secret: "[REDACTED]", api_key: "[REDACTED]", id: 42, port: 443, password_length: 12, count: 0 },
@@ -2104,7 +2149,9 @@ test("redactCredentialProperties scrubs URL query credentials, userinfo, token-i
 
 test("redactErrorText and describeErrorBody scrub credential-shaped text regardless of content type and never echo non-JSON bodies", () => {
   const bearer = redactErrorText("upstream said Authorization: Bearer abcdefghijklmnop and Basic dXNlcjpwYXNz then Cookie: _zendesk_session=abc123def456; Path=/");
-  assert.equal(bearer, "upstream said Authorization: [REDACTED]", "a header line is withheld to its end and the marker is not re-scrubbed into a different shape");
+  assert.equal(bearer, "upstream said Authorization: Bearer [REDACTED] and Basic [REDACTED] then Cookie: [REDACTED]", "an Authorization value is its scheme word and the one token after it, the rest of the line gets its own carrier treatment, and the marker is not re-scrubbed into a different shape");
+  assert.equal(redactErrorText("Authorization: Digest username=\"Mufasa\", realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", response=\"6629fae49393a05397450978507c4ef1\""), "Authorization: Digest [REDACTED]", "a parameter list after the scheme goes whole");
+  assert.equal(redactCredentialValueText("note: key Authorization: Bearer v8cVjqg71d1bQBCQrqEhOQ2Un3jIPVKl end"), "note: key Authorization: Bearer [REDACTED] end", "prose after the one token of an Authorization value stays");
   assert.equal(redactErrorText("Cookie: _zendesk_session=abc123def456; Path=/ was sent"), "Cookie: [REDACTED]");
   assert.equal(redactErrorText("Bearer abcdefghijklmnop rejected"), "Bearer [REDACTED] rejected");
   assert.equal(redactErrorText("Basic dXNlcjpwYXNzd29yZA== rejected"), "Basic [REDACTED] rejected");
@@ -2156,8 +2203,8 @@ function carriersOf(value) {
     [`Cookie: sid='${value}'; theme=dark`, /^Cookie: \[REDACTED\]$/],
     [`Cookie: theme=dark; sid="${value}"; lang=en`, /^Cookie: \[REDACTED\]$/],
     [`Set-Cookie: _zendesk_session="${value}"; Path=/; HttpOnly`, /^Set-Cookie: \[REDACTED\]$/],
-    [`Authorization: Bearer "${value}"`, /^Authorization: \[REDACTED\]$/],
-    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "\[REDACTED\]" was rejected$/],
+    [`Authorization: Bearer "${value}"`, /^Authorization: Bearer "\[REDACTED\]"$/],
+    [`Authorization: "Bearer ${value}" was rejected`, /^Authorization: "Bearer \[REDACTED\]" was rejected$/],
     [`X-Api-Key: "${value}"`, /^X-Api-Key: "\[REDACTED\]"$/],
     [`x-auth-token: '${value}'`, /^x-auth-token: '\[REDACTED\]'$/],
     [`{"detail":"upstream rejected Cookie: sid=\\"${value}\\"; path=/","code":401}`, /^\{"detail":"upstream rejected Cookie: \[REDACTED\]","code":401\}$/],
@@ -2166,6 +2213,41 @@ function carriersOf(value) {
     [`<p>Cookie: sid="${value}"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next<\/p>$/],
     [`<p>Cookie: sid="${value}</p><p>next="1"</p>`, /^<p>Cookie: \[REDACTED\]<\/p><p>next="1"<\/p>$/],
     [`Cookie: sid="${value}"\nX-Other: keep`, /^Cookie: \[REDACTED\]\nX-Other: keep$/],
+    // Compound lines: a cookie value, quoted or not, ends before the "Name:" token of the next
+    // header on the line, so the following header keeps its name and gets its own carrier
+    // treatment, and a Content-Type after the cookie keeps its name and value.
+    [`Cookie: sid=${value}; X-Api-Key: "${value}"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"$/],
+    [`Cookie: sid="${value}"; X-Api-Key: "${value}"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"$/],
+    [`Cookie: _zendesk_session=${value}; theme=dark; X-Api-Key: "${value}"; Content-Type: "application/json"`, /^Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "application\/json"$/],
+    [`Cookie: sid="${value}", X-ApiKeys: "${value}", Content-Type: "application/json"`, /^Cookie: \[REDACTED\], X-ApiKeys: "\[REDACTED\]", Content-Type: "application\/json"$/],
+    [`Set-Cookie: _zendesk_session=${value}; Path=/; HttpOnly; X-PAN-KEY: "${value}"`, /^Set-Cookie: \[REDACTED\]; X-PAN-KEY: "\[REDACTED\]"$/],
+    [`Cookie: sid=${value}; Content-Type: "application/json"; X-Redlock-Auth: ${value}`, /^Cookie: \[REDACTED\]; Content-Type: "application\/json"; X-Redlock-Auth: \[REDACTED\]$/],
+    [`X-Api-Key: "${value}"; Cookie: sid=${value}; Content-Type: text/plain`, /^X-Api-Key: "\[REDACTED\]"; Cookie: \[REDACTED\]; Content-Type: text\/plain$/],
+    [`{"description":"Cookie: sid=${value}; X-Api-Key: \\"${value}\\"; Content-Type: \\"application/json\\"","error":"InvalidUpstream"}`, /^\{"description":"Cookie: \[REDACTED\]; X-Api-Key: \\"\[REDACTED\]\\"; Content-Type: \\"application\/json\\"","error":"InvalidUpstream"\}$/],
+    [`<p>Cookie: sid="${value}"; X-Api-Key: "${value}"; Content-Type: "text/html"</p><p>next</p>`, /^<p>Cookie: \[REDACTED\]; X-Api-Key: "\[REDACTED\]"; Content-Type: "text\/html"<\/p><p>next<\/p>$/],
+    [`Cookie: sid=${value}; x-auth-token: "${value}", Accept: text/html`, /^Cookie: \[REDACTED\]; x-auth-token: "\[REDACTED\]", Accept: text\/html$/],
+    // The shared end-at-separator rule, edge by edge: a quoted value ends at its closing
+    // quote even with "; Name:" inside; cookie attributes before the next header go with the
+    // cookie; an unterminated quoted value ends before the next header; Content-Type and
+    // Date after a cookie keep their names and values.
+    [`Cookie: "sid=${value}; X-Api-Key: ${value}"`, /^Cookie: "\[REDACTED\]"$/],
+    [`Set-Cookie: sid=${value}; Path=/; HttpOnly; X-Api-Key: ${value}`, /^Set-Cookie: \[REDACTED\]; X-Api-Key: \[REDACTED\]$/],
+    [`Set-Cookie: sid=${value}; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/; X-Api-Key: ${value}`, /^Set-Cookie: \[REDACTED\]; X-Api-Key: \[REDACTED\]$/],
+    [`Cookie: "sid=${value}; X-Api-Key: ${value}`, /^Cookie: \[REDACTED\]; X-Api-Key: \[REDACTED\]$/],
+    [`Cookie: sid=${value}; Content-Type: application/json; Date: Tue, 22 Sep 2026 18:00:00 GMT`, /^Cookie: \[REDACTED\]; Content-Type: application\/json; Date: Tue, 22 Sep 2026 18:00:00 GMT$/],
+    // JSON-escaped carriers at any depth: a header pair, a credential pair, an attribute, and
+    // an assignment inside a JSON text stringified into a string value (one and two levels
+    // down) lose their values and keep their escaped quotes, so the JSON stays well formed.
+    [`{"detail":"{\\"Cookie\\": \\"sid=${value}\\", \\"X-Api-Key\\": \\"${value}\\", \\"Content-Type\\": \\"application/json\\"}"}`, /^\{"detail":"\{\\"Cookie\\": \\"\[REDACTED\]\\", \\"X-Api-Key\\": \\"\[REDACTED\]\\", \\"Content-Type\\": \\"application\/json\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"Cookie\\\\\\": \\\\\\"sid=${value}\\\\\\", \\\\\\"X-Api-Key\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"Cookie\\\\\\": \\\\\\"\[REDACTED\]\\\\\\", \\\\\\"X-Api-Key\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"{\\"Authorization\\": \\"Bearer ${value}\\"}"}`, /^\{"detail":"\{\\"Authorization\\": \\"Bearer \[REDACTED\]\\"\}"\}$/],
+    [`{"detail":"{'Cookie': 'sid=${value}'}"}`, /^\{"detail":"\{'Cookie': '\[REDACTED\]'\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"Cookie: sid=${value}; path=/\\",\\"code\\":401}"}`, /^\{"o":"\{\\"detail\\":\\"Cookie: \[REDACTED\]\\",\\"code\\":401\}"\}$/],
+    [`{"detail":"{\\"password\\": \\"${value}\\", \\"user\\": \\"a\\"}"}`, /^\{"detail":"\{\\"password\\": \\"\[REDACTED\]\\", \\"user\\": \\"a\\"\}"\}$/],
+    [`{"o":"{\\"detail\\":\\"{\\\\\\"client_secret\\\\\\": \\\\\\"${value}\\\\\\"}\\"}"}`, /^\{"o":"\{\\"detail\\":\\"\{\\\\\\"client_secret\\\\\\": \\\\\\"\[REDACTED\]\\\\\\"\}\\"\}"\}$/],
+    [`{"detail":"<entry name=\\"fw1\\" key=\\"${value}\\"/>"}`, /^\{"detail":"<entry name=\\"fw1\\" key=\\"\[REDACTED\]\\"\/>"\}$/],
+    [`{"detail":"password: \\"${value}\\" rejected"}`, /^\{"detail":"password: \\"\[REDACTED\]\\" rejected"\}$/],
+    [`{"detail":"password=\\"${value}\\" rejected"}`, /^\{"detail":"password=\\"\[REDACTED\]\\" rejected"\}$/],
     [`session=${value}; Path=/`, /^session=\[REDACTED\]; Path=\/$/],
     [`_zendesk_session=${value} expired`, /^_zendesk_session=\[REDACTED\] expired$/],
     [`JSESSIONID=${value}; Path=/`, /^JSESSIONID=\[REDACTED\]; Path=\/$/],
@@ -2189,6 +2271,758 @@ function carriersOf(value) {
     [`<field name='pw' password='${value}'/>`, /^<field name='pw' password='\[REDACTED\]'\/>$/],
   ];
 }
+
+// Reviewer E gap 9: inside a JSON string that was stringified once, a line break or a tab
+// arrives as the two characters \n, \r, \t (or the six of \u000a, \u0009), and the header
+// name after it has no word boundary in front of it ("\nX-SecurityCenter" reads as one
+// word), so the header rule missed it and the pair rule read "nX-SecurityCenter" as a key
+// naming nothing. Every credential header the three integrations send, after every escape,
+// bare, as a JSON string member, and followed by more escaped text, loses its value in both
+// scrubs; the Content-Type and Date on the next escaped line keep their names and values;
+// the pair rule reads the key after the escape the same way; the result is a fixed point.
+const GAP9_VALUE = "sess-escn-NLINE-27182818284590";
+const GAP9_HEADERS = [
+  ["X-SecurityCenter", (value) => `X-SecurityCenter: ${value}`],
+  ["X-ApiKeys", (value) => `X-ApiKeys: accessKey=${value}; secretKey=${value}`],
+  ["X-Cookie", (value) => `X-Cookie: token=${value}`],
+  ["X-PAN-KEY", (value) => `X-PAN-KEY: ${value}`],
+  ["x-redlock-auth", (value) => `x-redlock-auth: ${value}`],
+  ["Authorization Bearer", (value) => `Authorization: Bearer ${value}`],
+  ["Authorization Basic", (value) => `Authorization: Basic ${value}`],
+  ["Cookie", (value) => `Cookie: sid=${value}`],
+  ["Set-Cookie", (value) => `Set-Cookie: session=${value}; Path=/; HttpOnly`],
+  ["quoted X-SecurityCenter", (value) => `X-SecurityCenter: "${value}"`],
+  ["quoted Cookie", (value) => `Cookie: sid="${value}"; theme=dark`],
+];
+const GAP9_ESCAPES = ["\\n", "\\r\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\u000a", "\\u0009", "\\\""];
+const GAP9_FOLLOWING = "\\nContent-Type: application/json\\r\\nDate: Tue, 22 Sep 2026 18:00:00 GMT";
+const GAP9_CONTEXTS = [
+  ["bare", (escape, line) => `request failed${escape}${line}`],
+  ["JSON member", (escape, line) => `{"detail":"request failed${escape}${line}","code":403}`],
+  ["followed by escaped text", (escape, line) => `request failed${escape}${line}${GAP9_FOLLOWING}`],
+];
+const GAP9_PAIRS = [
+  (value) => `\\nkey=${value}&x=1`, (value) => `\\nauth: ${value}`, (value) => `\\nsid=${value}; path=/`, (value) => `\\npin=${value}`,
+  (value) => `\\u000atoken=${value}`, (value) => `\\tpassword: ${value}`, (value) => `\\r\\nsecret='${value}'`, (value) => `\\nkey="${value}"`,
+  (value) => `\\u0009otp=${value}`, (value) => `\\bapi_key=${value}`,
+];
+const GAP9_CONTROLS = [
+  "request failed\\nContent-Type: application/json\\nDate: Tue, 22 Sep 2026 18:00:00 GMT\\nX-Total-Count: 3",
+  '{"detail":"request failed\\nContent-Length: 42\\r\\nAccept: text/html\\tX-Request-Id: 7d2f4e6a"}',
+  "\\napi_keys: 3\\nkeys=2\\ncookies: 0",
+  "The upstream\\nrequested the token inventory\\nand the cookie count is 3",
+];
+
+test("reviewer E gap 9: every credential header and pair key after a JSON string escape loses its value in both scrubs, bare, as a JSON member, and followed by more escaped text, while the headers on the next escaped line keep their names", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [name, line] of GAP9_HEADERS) for (const escape of GAP9_ESCAPES) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap(escape, line(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} ${name} after ${JSON.stringify(escape)} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      if (context === "JSON member") assert.ok(out.endsWith('","code":403}'), `${label}: the JSON member lost its closing text: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const pair of GAP9_PAIRS) for (const [context, wrap] of GAP9_CONTEXTS) {
+      const text = wrap("", pair(GAP9_VALUE));
+      const out = scrub(text);
+      const label = `reviewer E gap 9: ${scrub.name} pair ${JSON.stringify(pair(GAP9_VALUE))} ${context}`;
+      assertNoWindow(out, GAP9_VALUE, label);
+      assert.ok(out.includes("[REDACTED]"), `${label}: no marker in ${out}`);
+      if (context === "followed by escaped text") assert.ok(out.endsWith(GAP9_FOLLOWING), `${label}: the following headers lost a name or a value: ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP9_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 9: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * (GAP9_HEADERS.length * GAP9_ESCAPES.length + GAP9_PAIRS.length) * GAP9_CONTEXTS.length);
+});
+
+// Reviewer E gap 10: two RFC 6265 token characters let a later cookie pair's value through.
+// An apostrophe in a pair name or value (my'pref=value, sid=O'hunter2) was read as the quote
+// closing the text the line was quoted in, so the value ended at "my" and the pair after
+// the apostrophe stayed; and "&" or "#" in a credential-named pair whose value sat in
+// JSON-escaped quotes (my&sid=\"value\") was taken first by the URL query rule with the
+// lone backslash as its value, leaving the quoted value behind an orphan quote. Two rules
+// now hold in both scrubs of all three modules: a quote closes a value only at the end of a
+// token (before whitespace, a delimiter, a bracket, another quote, an escape, or the end),
+// never mid-token, in header values, pair values, quoted attributes, and query values; and
+// a bare query value never takes a backslash (the escape after it is kept, so a JSON string
+// still parses and the text after it is still read), with a recognised header line read
+// before the query rule. The controls, the closing quote and following members of an
+// enclosing JSON member, escaped controls, and a single-quoted enclosing text survive.
+const GAP10_VALUES = ["hunter2", "Tr0ub4dor3", "correct-horse-battery-staple", "abc123", "x7", "9f8e7d6c5b4a3f2e1d0c", "O'Brien42", "p@ss.w0rd", "sess-apos-QUOTE-14142135623730", "dXNlcjpwYXNzd29yZA==", "AKIAIOSFODNN7EXAMPLE", "s3cr3t_2026-09-22T18.00.00Z"];
+const GAP10_ROWS = [
+  // rule 1: an apostrophe or a raw quote inside a token is content of the value
+  [(v) => `Cookie: theme=dark; my'pref=${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my'pref="${v}"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`, () => `Cookie: [REDACTED]; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`],
+  [(v) => `Cookie: sid=O'${v}; Content-Type: "text/html; charset=utf-8"`, () => `Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"`],
+  [(v) => `Cookie: theme=dark; my"pref=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: sid="O'${v}"; theme=dark; X-ApiKeys: accessKey=${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `Set-Cookie: my'sid=${v}; Path=/; HttpOnly; Date: Mon, 22 Sep 2026 12:30:00 GMT`, () => `Set-Cookie: [REDACTED]; Date: Mon, 22 Sep 2026 12:30:00 GMT`],
+  [(v) => `X-Cookie: token=a; my'pref=${v}`, () => `X-Cookie: [REDACTED]`],
+  [(v) => `{"detail":"Cookie: theme=dark; my'pref=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `{"detail":"Cookie: sid=O'${v}; Content-Type: text/html","code":401}`, () => `{"detail":"Cookie: [REDACTED]; Content-Type: text/html","code":401}`],
+  [(v) => `'Cookie: sid=O'${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `sid=O'${v}; path=/`, () => `sid=[REDACTED]; path=/`],
+  [(v) => `password: O'${v}`, () => `password: [REDACTED]`],
+  [(v) => `password='O'${v}'`, () => `password='[REDACTED]'`],
+  [(v) => `{"x":"token=O'${v}"}`, () => `{"x":"token=[REDACTED]"}`],
+  [(v) => `?token=O'${v}&x=1`, () => `?token=[REDACTED]&x=1`],
+  // rule 2: a bare query value stops before a backslash and the escape is kept
+  [(v) => `{"url": "https://h.example.com/p?token=${v}\\"}`, () => `{"url": "https://h.example.com/p?token=[REDACTED]\\"}`],
+  [(v) => `{"log": "GET /x?api_key=${v}\\nstatus 502"}`, () => `{"log": "GET /x?api_key=[REDACTED]\\nstatus 502"}`],
+  [(v) => `{"hook":"https://hooks.slack.com/services/T000/B000/${v}\\"}`, () => `{"hook":"https://hooks.slack.com/services/[REDACTED]\\"}`],
+  [(v) => `{"message": "Cookie: theme=dark; my&sid=\\"${v}\\""}`, () => `{"message": "Cookie: [REDACTED]"}`],
+  [(v) => `{"headers":"Set-Cookie: my#sid=\\"${v}\\"; HttpOnly; Content-Type: \\"text/html\\""}`, () => `{"headers":"Set-Cookie: [REDACTED]; Content-Type: \\"text/html\\""}`],
+  [(v) => `{"headers":"Cookie: theme=dark; my&sid=\\"${v}\\"; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`, () => `{"headers":"Cookie: [REDACTED]; Content-Type: \\"text/html; charset=utf-8\\"; Date: \\"Mon, 22 Sep 2026 12:30:00 GMT\\""}`],
+  // boundaries that held before and must keep holding
+  [(v) => `Authorization: Bearer ${v}&token=${v}`, () => `Authorization: Bearer [REDACTED]`],
+  [(v) => `Cookie: my&sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `Cookie: theme=dark; my#sid=${v}`, () => `Cookie: [REDACTED]`],
+  [(v) => `rejected header "Cookie: sid=${v}" and "X-Other: 1"`, () => `rejected header "Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `{"detail":"Cookie: sid=${v}","code":401}`, () => `{"detail":"Cookie: [REDACTED]","code":401}`],
+  [(v) => `'Cookie: sid=${v}'`, () => `'Cookie: [REDACTED]'`],
+  [(v) => `Cookie: "sid=${v}; X-ApiKeys: ${v}`, () => `Cookie: [REDACTED]; X-ApiKeys: [REDACTED]`],
+  [(v) => `X-ApiKeys: accessKey="${v}";secretKey="${v}"; Content-Type: application/json`, () => `X-ApiKeys: [REDACTED]; Content-Type: application/json`],
+  [(v) => `{"error":"X-ApiKeys: accessKey=\\"${v}\\";secretKey=\\"${v}\\"","code":403}`, () => `{"error":"X-ApiKeys: [REDACTED]","code":403}`],
+  [(v) => `Cookie: sid=${v}"; theme=dark`, () => `Cookie: [REDACTED]"; theme=dark`],
+  [(v) => `{"detail":"Authorization: Basic ${v}=","code":401}`, () => `{"detail":"Authorization: Basic [REDACTED]","code":401}`],
+  [(v) => `Cookie: sid=${v}=" and "X-Other: 1"`, () => `Cookie: [REDACTED]" and "X-Other: 1"`],
+  [(v) => `sid=${v}'; path=/`, () => `sid=[REDACTED]'; path=/`],
+  [(v) => `api_key=${v}"}`, () => `api_key=[REDACTED]"}`],
+  [(v) => `?token=${v}'}`, () => `?token=[REDACTED]'}`],
+];
+const GAP10_CONTROLS = [
+  `Content-Type: "text/html; charset=utf-8"; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`,
+  `{"detail":"it's a fine day","code":200}`,
+  `the cookie count is 3 and the token inventory holds 2`,
+  `{"names":["O'Brien","D'Angelo"],"cookies":0}`,
+  `password=""`,
+];
+
+test("reviewer E gap 10: a quote inside a token is content of a cookie, pair, attribute, or query value in both scrubs, a bare query value stops before a backslash and keeps the escape, and a recognised header line is read before the query rule", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expect] of GAP10_ROWS) for (const value of GAP10_VALUES) {
+      const input = make(value);
+      const out = scrub(input);
+      const label = `reviewer E gap 10: ${scrub.name} ${JSON.stringify(input)}`;
+      assert.equal(out, expect(value), label);
+      assertNoWindow(out, value, label);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of GAP10_CONTROLS) assert.equal(scrub(text), text, `reviewer E gap 10: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * GAP10_ROWS.length * GAP10_VALUES.length);
+});
+
+// Reviewer E finding C: an Authorization or Proxy-Authorization value whose first word is not
+// a listed scheme word (Bot, GenieKey, Zoho-oauthtoken, Api-Token, SharedKey, LOW, AWS, Key,
+// Element, HMAC) goes whole, to the end of the line or to the next header on a compound
+// line, in both scrubs: the unknown word may be a scheme with its credentials after it, so
+// nothing after it is trusted. A single-token header whose value opens with a listed scheme
+// word (X-Auth-Token: Bearer <v>, X-Api-Key: Token <v>) loses the word and the token after it
+// under one marker, so the token is never left standing after the marker while prose after
+// the token stays. A listed scheme under Authorization keeps its word and loses the one
+// token after it. The values are shapes the long-token rule does not catch (a UUID, a dotted
+// token, short values) beside one it does; each row is read bare, as a JSON string member,
+// and on an escaped line, and the text around the header survives.
+const FINDING_C_VALUES = ["eb243592-faa2-4ba2-a551-1afdf565c889", "MTA1MjQ4NDQ2NzI2.GhYz9q.r0tAt3dT0k3nV4lu3", "a1b2c3d4e5f", "hunter2x", "Kq7Zx2Vw9Lm4Tp8Rq3Wn6Yb1Xc5Vd8Fg"];
+const FINDING_C_ROWS = [
+  // an unlisted first word, or no word at all: the whole value goes
+  [(v) => `Authorization: Bot ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Zoho-oauthtoken ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Zoho-enczapikey ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Api-Token ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Key ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: Element ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: HMAC ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: SharedKey account:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: LOW ${v}:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: AWS AKIAIOSFODNN7EXAMPLE:${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Proxy-Authorization: Bot ${v}`, () => "Proxy-Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v} was rejected`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: ${v} was rejected`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: 12345 ${v}`, () => "Authorization: [REDACTED]"],
+  [(v) => `Authorization: GenieKey ${v}, X-Api-Key: ${v}; Date: Tue, 22 Sep 2026 18:00:00 GMT`, () => "Authorization: [REDACTED], X-Api-Key: [REDACTED]; Date: Tue, 22 Sep 2026 18:00:00 GMT"],
+  // a single-token header whose value opens with a listed scheme word: the word and the token go together
+  [(v) => `X-Auth-Token: Bearer ${v}`, () => "X-Auth-Token: [REDACTED]"],
+  [(v) => `X-Api-Key: Token ${v}`, () => "X-Api-Key: [REDACTED]"],
+  [(v) => `X-Auth-Token: Bearer ${v} rejected`, () => "X-Auth-Token: [REDACTED] rejected"],
+  [(v) => `X-Api-Key: Token ${v} then retry`, () => "X-Api-Key: [REDACTED] then retry"],
+  [(v) => `X-Api-Key: ApiKey ${v}; Content-Type: application/json`, () => "X-Api-Key: [REDACTED]; Content-Type: application/json"],
+  // controls: a listed scheme under Authorization keeps its word and loses the one token
+  // after it, or its whole parameter list; a bare token under a single-token header goes alone
+  [(v) => `Authorization: Bearer ${v} was rejected`, () => "Authorization: Bearer [REDACTED] was rejected"],
+  [(v) => `Proxy-Authorization: Basic ${v} was rejected`, () => "Proxy-Authorization: Basic [REDACTED] was rejected"],
+  [(v) => `Authorization: SSWS ${v}`, () => "Authorization: SSWS [REDACTED]"],
+  [(v) => `Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=${v}`, () => "Authorization: AWS4-HMAC-SHA256 [REDACTED]"],
+  [(v) => `X-Auth-Token: ${v} rejected`, () => "X-Auth-Token: [REDACTED] rejected"],
+];
+const FINDING_C_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"detail":"${line}","code":401}`],
+  ["escaped line", (line) => `request failed\\n${line}\\nContent-Type: application/json`],
+];
+const FINDING_C_CONTROLS = [
+  "Proxy-Authorization: [REDACTED]; Content-Type: application/json",
+  "X-Auth-Token: [REDACTED] rejected",
+  'Authorization: "Bearer [REDACTED]" was rejected',
+  "Basic authentication is required; the Bearer token is missing; Content-Type: application/json, Date: Tue, 22 Sep 2026 18:00:00 GMT",
+];
+
+test("reviewer E finding C: an Authorization value with an unlisted first word goes whole, a single-token header that opens with a listed scheme word loses the word and the token together, and a listed scheme under Authorization keeps its word, in both scrubs, bare, as a JSON member, and on an escaped line", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expect] of FINDING_C_ROWS) for (const value of FINDING_C_VALUES) for (const [context, wrap] of FINDING_C_CONTEXTS) {
+      const input = wrap(make(value));
+      const out = scrub(input);
+      const label = `reviewer E finding C: ${scrub.name} ${context} ${JSON.stringify(input)}`;
+      assert.equal(out, wrap(expect(value)), label);
+      assertNoWindow(out, value, label);
+      assert.ok(!out.includes("AKIAIOSFODNN7EXAMPLE"), `${label}: the access key id half of a SigV2 value survived in ${out}`);
+      assert.equal(scrub(out), out, `${label}: not idempotent on ${out}`);
+      cases += 1;
+    }
+    for (const text of FINDING_C_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding C: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * FINDING_C_ROWS.length * FINDING_C_VALUES.length * FINDING_C_CONTEXTS.length);
+});
+
+// Reviewer E finding A: inside a JSON string that was stringified once, a tab, form feed,
+// backspace, vertical tab, NUL, or their \u0009-style codes arrive as two or six characters,
+// and an unquoted pair value in the = spelling, a single-token header value, the token after
+// a scheme word, and a --flag value ran through them, so a second credential pair chained
+// after the escape lost its key into the first value and kept its own value. Every such
+// value now ends at an escaped control as it does at the raw character (a line break, \t,
+// \b, \f, \v, \0, \u0000 to \u001f, \u007f, \x09 and the other \xHH controls), so the
+// second pair is read on its own and loses its value; a key: value line still ends at a line
+// break only, so the second pair after a tab goes with the first value there (nothing
+// survives). The escape of a printable character (\u00e9) is content; a raw control ends a
+// value the same way; text with no carrier is untouched; the result is a fixed point.
+const FINDING_A_FIRST = "hunter2first";
+const FINDING_A_SECOND = "correcthorsesecond";
+const FINDING_A_FIRST_CARRIERS = [
+  ["api_key=", (v) => `api_key=${v}`],
+  ["token=", (v) => `token=${v}`],
+  ["password: ", (v) => `password: ${v}`],
+  ["Authorization: Bearer ", (v) => `Authorization: Bearer ${v}`],
+  ["X-Auth-Token: Bearer ", (v) => `X-Auth-Token: Bearer ${v}`],
+  ["Cookie: sid=", (v) => `Cookie: sid=${v}`],
+  ["X-Api-Key: ", (v) => `X-Api-Key: ${v}`],
+  ['"api_key":"', (v) => `"api_key":"${v}"`],
+  ["--password ", (v) => `--password ${v}`],
+  ["-Dpassword=", (v) => `-Dpassword=${v}`],
+];
+const FINDING_A_ESCAPES = ["\\t", "\\n", "\\r\\n", "\\u0009", "\\u000a", "\\f", "\\b", "\\v", "\\0", "\\x09", "\\u001f", "\\u007f"];
+const FINDING_A_SECOND_CARRIERS = [
+  ["password: ", (v) => `password: ${v}`],
+  ["password:", (v) => `password:${v}`],
+  ["secret=", (v) => `secret=${v}`],
+  ["X-Api-Key: ", (v) => `X-Api-Key: ${v}`],
+  ["Authorization: Bearer ", (v) => `Authorization: Bearer ${v}`],
+  ["Cookie: sid=", (v) => `Cookie: sid=${v}`],
+];
+const FINDING_A_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"message":"${line}","code":502}`],
+  ["prose before", (line) => `login failed: ${line}`],
+];
+// Exact renderings: the = spelling, the header token, the scheme credentials, and the flag
+// value end at the escape, and the chained pair keeps its key and loses its value.
+const FINDING_A_EXACT = [
+  [(e) => `api_key=${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}`, (e) => `api_key=[REDACTED]${e}password: [REDACTED]`],
+  [(e) => `token=${FINDING_A_FIRST}${e}secret=${FINDING_A_SECOND}`, (e) => `token=[REDACTED]${e}secret=[REDACTED]`],
+  [(e) => `api_key=${FINDING_A_FIRST}${e}X-Api-Key: ${FINDING_A_SECOND}`, (e) => `api_key=[REDACTED]${e}X-Api-Key: [REDACTED]`],
+  [(e) => `Authorization: Bearer ${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}`, (e) => `Authorization: Bearer [REDACTED]${e}password: [REDACTED]`],
+  [(e) => `X-Api-Key: ${FINDING_A_FIRST}${e}X-Api-Key: ${FINDING_A_SECOND}`, (e) => `X-Api-Key: [REDACTED]${e}X-Api-Key: [REDACTED]`],
+  [(e) => `X-Auth-Token: Bearer ${FINDING_A_FIRST}${e}Cookie: sid=${FINDING_A_SECOND}`, (e) => `X-Auth-Token: [REDACTED]${e}Cookie: [REDACTED]`],
+  [(e) => `--password ${FINDING_A_FIRST}${e}secret=${FINDING_A_SECOND}`, (e) => `--password [REDACTED]${e}secret=[REDACTED]`],
+  [(e) => `{"message":"--password ${FINDING_A_FIRST}${e}password: ${FINDING_A_SECOND}","code":502}`, (e) => `{"message":"--password [REDACTED]${e}password: [REDACTED]","code":502}`],
+];
+const FINDING_A_CONTROLS = [
+  "Content-Type: application/json\\tX-Request-Id: 7d2f4e6a\\u0009Date: Tue, 22 Sep 2026 18:00:00 GMT",
+  '{"message":"request failed\\tstatus 502\\fretry later\\bdone","code":502}',
+  "api_keys: 3\\tkeys=2\\u0009cookies: 0",
+  "path C:\\\\temp\\\\file.txt and C:\\\\Users\\\\bob\\\\.kube\\\\config",
+  "api_key=[REDACTED]\\tpassword: [REDACTED]",
+];
+
+test("reviewer E finding A: an unquoted pair value, a single-token header value, the token after a scheme word, and a flag value end at every escaped control, so a credential pair chained after the escape loses its own value in both scrubs", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [firstName, first] of FINDING_A_FIRST_CARRIERS) for (const escape of FINDING_A_ESCAPES) for (const [secondName, second] of FINDING_A_SECOND_CARRIERS) for (const [context, wrap] of FINDING_A_CONTEXTS) {
+      const input = wrap(`${first(FINDING_A_FIRST)}${escape}${second(FINDING_A_SECOND)}`);
+      const out = scrub(input);
+      const label = `reviewer E finding A: ${scrub.name} [${firstName}] ${JSON.stringify(escape)} [${secondName}] ${context}: ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assertNoWindow(out, FINDING_A_FIRST, label);
+      assertNoWindow(out, FINDING_A_SECOND, label);
+      if (context === "JSON member") assert.ok(out.endsWith('","code":502}'), `${label}: the JSON member lost its closing text`);
+      if (context === "prose before") assert.ok(out.startsWith("login failed: "), `${label}: the prose before the pair was lost`);
+      assert.equal(scrub(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [make, expect] of FINDING_A_EXACT) for (const escape of FINDING_A_ESCAPES) {
+      const input = make(escape);
+      assert.equal(scrub(input), expect(escape), `reviewer E finding A: ${scrub.name} ${JSON.stringify(input)}`);
+    }
+    for (const escape of ["\t", "\n", "\f", "\v", "\u001f"]) {
+      assert.equal(scrub(`api_key=${FINDING_A_FIRST}${escape}password: ${FINDING_A_SECOND}`), `api_key=[REDACTED]${escape}password: [REDACTED]`, `reviewer E finding A: ${scrub.name} raw control ${JSON.stringify(escape)}`);
+    }
+    assert.equal(scrub(`api_key=${FINDING_A_FIRST}\\u00e9tail rejected`), "api_key=[REDACTED] rejected", `reviewer E finding A: ${scrub.name} keeps the escape of a printable character inside the value`);
+    assert.equal(scrub(`password: ${FINDING_A_FIRST}\\tpassword: ${FINDING_A_SECOND}`), "password: [REDACTED]", `reviewer E finding A: ${scrub.name} a key: value line ends at a line break only`);
+    for (const text of FINDING_A_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding A: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * FINDING_A_FIRST_CARRIERS.length * FINDING_A_ESCAPES.length * FINDING_A_SECOND_CARRIERS.length * FINDING_A_CONTEXTS.length);
+});
+
+// Reviewer E finding D (ruling R5): a colon-terminated credential key that ends a path
+// segment is a label whose value is at most one token. A singular label (password, token,
+// api_key, secret) takes that token whatever its shape, a random token or a plain word,
+// and whatever follows it, so "/etc/app/password: <value> was rejected" renders
+// "/etc/app/password: [REDACTED] was rejected"; a plural label (api-tokens, tokens, apikeys,
+// passwords, credentials) names a collection, so prose after the token means there was no
+// value ("/api/v1/api-tokens: request failed with 403" stays) while a lone token after it is
+// one; a count under a plural label stays; an escaped slash before the key is not a path.
+const FINDING_D_VALUES = ["hunter2first", "hunter2", "3f9c2b1e-7a4d-4c58-9b0e-2d6f8a1c5e73", "Kq7Zx2Vw9Lm4Tp8RfS1uY3cB6dN0hJ5g", "mfa.Xk9pQ2.rT7vN4wL8s"];
+const FINDING_D_SINGULAR_LABELS = ["/etc/app/password: ", "secrets/db/password: ", "vault read secret/app/token: ", "/run/secrets/api_key: ", "GET /api/v2/oauth/token: ", "kv/data/app/secret: ", "# /etc/app/password: ", "https://vault.example.com:8200/v1/secret/app/key: "];
+const FINDING_D_PLURAL_LABELS = ["/api/v1/api-tokens: ", "GET /api/v2/oauth/tokens: ", "/api/v1/apikeys: ", "/etc/app/passwords: ", "/v1/credentials: ", "/api/v1/keys: "];
+const FINDING_D_TAILS = [" was rejected", " is expired", " has no policy", ""];
+const FINDING_D_PROSE = ["request failed with 403", "listing returned 200 items", "read refused for this role"];
+const FINDING_D_CONTEXTS = [
+  ["bare", (line) => line],
+  ["JSON member", (line) => `{"detail":"${line}","code":403}`],
+  ["escaped line", (line) => `request failed\\n${line}\\nContent-Type: application/json`],
+];
+const FINDING_D_CONTROLS = [
+  "/api/v1/api-tokens: request failed with 403",
+  "GET /api/v2/oauth/tokens: request failed",
+  "/api/v2/oauth/tokens: 3",
+  "/api/v1/keys: listing returned 200 items",
+  "/rest/token failed (403): upstream rejected the request",
+  "GET /api/v2/users/me.json: request failed with 403",
+  "/etc/app/password:",
+  "/etc/app/password: [REDACTED] was rejected",
+];
+
+test("reviewer E finding D: a singular credential label at the end of a path segment takes the next token whatever its shape and whatever follows, a plural label followed by prose stays and followed by a lone token loses it, in both scrubs, bare, as a JSON member, and on an escaped line", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const value of FINDING_D_VALUES) for (const [context, wrap] of FINDING_D_CONTEXTS) {
+      for (const label of FINDING_D_SINGULAR_LABELS) for (const tail of FINDING_D_TAILS) {
+        const input = wrap(`${label}${value}${tail}`);
+        const out = scrub(input);
+        const name = `reviewer E finding D: ${scrub.name} ${context} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+        assert.equal(out, wrap(`${label}[REDACTED]${tail}`), name);
+        assertNoWindow(out, value, name);
+        assert.equal(scrub(out), out, `${name}: not idempotent`);
+        cases += 1;
+      }
+      for (const label of FINDING_D_PLURAL_LABELS) {
+        const lone = wrap(`${label}${value}`);
+        const out = scrub(lone);
+        const name = `reviewer E finding D: ${scrub.name} ${context} ${JSON.stringify(lone)} -> ${JSON.stringify(out)}`;
+        assert.equal(out, wrap(`${label}[REDACTED]`), `${name}: a lone token after a plural label is its value`);
+        assertNoWindow(out, value, name);
+        cases += 1;
+      }
+    }
+    for (const [context, wrap] of FINDING_D_CONTEXTS) for (const label of FINDING_D_PLURAL_LABELS) for (const prose of FINDING_D_PROSE) {
+      const input = wrap(`${label}${prose}`);
+      assert.equal(scrub(input), input, `reviewer E finding D: ${scrub.name} ${context} changed a plural label followed by prose: ${JSON.stringify(input)}`);
+      cases += 1;
+    }
+    assert.equal(scrub("line\\/password: hunter2first was rejected"), "line\\/password: [REDACTED]", `reviewer E finding D: ${scrub.name} an escaped slash before the key is a line break, not a path, so the key: value line goes to its end`);
+    for (const text of FINDING_D_CONTROLS) assert.equal(scrub(text), text, `reviewer E finding D: ${scrub.name} changed a control: ${text}`);
+  }
+  assert.equal(cases, 2 * (FINDING_D_VALUES.length * FINDING_D_CONTEXTS.length * (FINDING_D_SINGULAR_LABELS.length * FINDING_D_TAILS.length + FINDING_D_PLURAL_LABELS.length) + FINDING_D_CONTEXTS.length * FINDING_D_PLURAL_LABELS.length * FINDING_D_PROSE.length));
+});
+
+// CodeRabbit item on #76: the user-and-secret prefix of a URL ends where its authority does, at
+// the first "/", "?", or "#", so an "@" inside a query or fragment is never read as userinfo.
+// Before the fix https://h?e=a@x.com&token=<v> rendered https://[REDACTED]@x.com&token=[REDACTED]
+// (the host "h" and the query lost, "x.com&token=" carried on as the host) and a webhook_url
+// with that shape reduced to the fake origin https://x.com&v=<v>/[REDACTED].
+const USERINFO_LONG_CANARY = "Qm7Vx2Lk9Rt4Pw8Zs3Yh6Nd1Bc5Fg0Jt";
+// [input, expected, the value no window of which may appear in the output]
+const USERINFO_URL_ROWS = [
+  ["https://h?e=a@x.com&token=s3cr3t", "https://h?e=a@x.com&token=[REDACTED]", "s3cr3t"],
+  ["https://h#f@x.com", "https://h#f@x.com", null],
+  [`https://h?e=a@x.com&token=${USERINFO_LONG_CANARY}`, "https://h?e=a@x.com&token=[REDACTED]", USERINFO_LONG_CANARY],
+  ["https://h?token=s3cr3t@x.com", "https://h?token=[REDACTED]", "s3cr3t"],
+  ["https://h/p?e=a@x.com#f@y.com", "https://h/p?e=a@x.com#f@y.com", null],
+  // Controls: a real user-and-secret prefix still goes, before a path, a query, or a fragment.
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com/path?e=a`, "https://[REDACTED]@x.com/path?e=a", USERINFO_LONG_CANARY],
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com?e=a`, "https://[REDACTED]@x.com?e=a", USERINFO_LONG_CANARY],
+  [`https://svc:${USERINFO_LONG_CANARY}@x.com#frag`, "https://[REDACTED]@x.com#frag", USERINFO_LONG_CANARY],
+];
+const USERINFO_WEBHOOK_ROWS = [
+  ["webhook_url=https://h?e=a@x.com&v=s3cr3t", "webhook_url=https://h/[REDACTED]", "s3cr3t"],
+  ['{"webhook_url":"https://h?e=a@x.com&v=s3cr3t"}', '{"webhook_url":"https://h/[REDACTED]"}', "s3cr3t"],
+  ["webhook_url: https://h#f@x.com", "webhook_url: https://h/[REDACTED]", null],
+];
+const escapeSlashes = (text) => text.replaceAll("/", "\\/");
+const USERINFO_CONTEXTS = [
+  ["bare", (url) => url],
+  ["in a sentence", (url) => `redirect to ${url} denied`],
+  ["escaped bare", (url) => escapeSlashes(url)],
+  ["escaped JSON member", (url) => `{"detail":"redirect to ${escapeSlashes(url)} denied","code":403}`],
+];
+
+test("CodeRabbit #76 userinfo: the user-and-secret prefix of a URL ends at the first /, ?, or #, so an @ inside a query or fragment keeps the host, the query is read pair by pair, and a webhook URL reduces to its true origin, in both scrubs, the walker, and an echoed URL in a Zendesk error string", async () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [input, expected, canary] of USERINFO_URL_ROWS) for (const [context, wrap] of USERINFO_CONTEXTS) {
+      const text = wrap(input);
+      const out = scrub(text);
+      const name = `userinfo: ${scrub.name} ${context} ${JSON.stringify(text)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, wrap(expected), name);
+      if (canary) assertNoWindow(out, canary, name);
+      assert.equal(scrub(out), out, `${name}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected, canary] of USERINFO_WEBHOOK_ROWS) {
+      const out = scrub(input);
+      const name = `userinfo: ${scrub.name} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, name);
+      if (canary) assertNoWindow(out, canary, name);
+      assert.equal(scrub(out), out, `${name}: not idempotent`);
+      cases += 1;
+    }
+  }
+  assert.equal(cases, 2 * (USERINFO_URL_ROWS.length * USERINFO_CONTEXTS.length + USERINFO_WEBHOOK_ROWS.length));
+  // The walker applies the same rules to every string leaf and reads a webhook_url from the raw value.
+  for (const [input, expected, canary] of USERINFO_URL_ROWS) {
+    const walked = redactCredentialProperties({ url: input, description: `see ${input} for details`, nested: [{ endpoint: input }] });
+    assert.deepEqual(walked, { url: expected, description: `see ${expected} for details`, nested: [{ endpoint: expected }] }, `userinfo: walker ${input}`);
+    if (canary) assertNoWindow(JSON.stringify(walked), canary, `userinfo: walker ${input}`);
+  }
+  assert.deepEqual(redactCredentialProperties({ webhook_url: "https://h?e=a@x.com&v=s3cr3t", other: { webhook_url: "https://h#f@x.com" } }), { webhook_url: "https://h/[REDACTED]", other: { webhook_url: "https://h/[REDACTED]" } }, "userinfo: the walker reduces a webhook_url to its true origin");
+  // End to end: a 403 body echoing the URL reaches the operator through the client's error path.
+  for (const [url, expected, canary] of USERINFO_URL_ROWS) {
+    const client = new ZendeskApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ error: { title: "Forbidden", message: `redirect to ${url} denied` } }, { status: 403, statusText: "Forbidden" }),
+      sleep: async () => {},
+    });
+    const error = await client.listGroups().catch((thrown) => thrown);
+    assert.ok(error instanceof ZendeskApiError, `userinfo: ${url} threw ${String(error)}`);
+    assert.ok(error.message.includes(`redirect to ${expected} denied`), `userinfo: echoed URL ${url} -> ${error.message}`);
+    if (canary) assertNoWindow(error.message, canary, `userinfo: echoed URL ${url}`);
+  }
+});
+
+// Harness self-check (frozen revision 3, flag carrier cells): a credential name after "--"
+// whose spelling opens with an underscore (the `_zendesk_session` cookie name) was not read as a
+// flag, so "psql --_zendesk_session <value> -h db" kept the value when no token rule caught its
+// shape. The flag name may now open with a letter or an underscore; the value is still the
+// one token after it, never another flag, and a flag glued to a word (x--_password v) or a
+// non-credential underscore flag (--_theme dark) stays.
+const UNDERSCORE_FLAG_NAME_VALUE = "skvclmtirehs";
+const UNDERSCORE_FLAG_LONG_VALUE = "Wn4Kd8Tq2Zr7Vb1Xs9Pm3Lc6Yh0Jf5Gt";
+const UNDERSCORE_FLAG_ROWS = [
+  [(v) => `psql --_zendesk_session ${v} -h db`, `psql --_zendesk_session [REDACTED] -h db`],
+  [(v) => `--_zendesk_session ${v}`, `--_zendesk_session [REDACTED]`],
+  [(v) => `psql --_password ${v} -h db`, "psql --_password [REDACTED] -h db"],
+  [(v) => `run --__token ${v} --verbose`, "run --__token [REDACTED] --verbose"],
+  [(v) => `"cmd --_api_key ${v}"`, '"cmd --_api_key [REDACTED]"'],
+  [(v) => `{"message":"psql --_zendesk_session ${v} -h db failed","code":502}`, `{"message":"psql --_zendesk_session [REDACTED] -h db failed","code":502}`],
+];
+const UNDERSCORE_FLAG_CONTROLS = [
+  "--_theme dark",
+  "psql --_timeout 30 -h db",
+  "--_password --other",
+  "--_zendesk_session [REDACTED] -h db",
+  "count --_items 3",
+];
+
+test("harness self-check: a credential-named flag whose name opens with an underscore (--_zendesk_session <value>) loses its one value argument in both scrubs, while a non-credential underscore flag and a flag glued to a word stay", () => {
+  let cases = 0;
+  for (const scrub of [redactErrorText, redactCredentialValueText]) {
+    for (const [make, expected] of UNDERSCORE_FLAG_ROWS) for (const value of [UNDERSCORE_FLAG_NAME_VALUE, UNDERSCORE_FLAG_LONG_VALUE]) {
+      const input = make(value);
+      const out = scrub(input);
+      const label = `underscore flag: ${scrub.name} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(scrub(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const text of UNDERSCORE_FLAG_CONTROLS) assert.equal(scrub(text), text, `underscore flag: ${scrub.name} changed a control: ${text}`);
+    assert.equal(scrub(`x--_password ${UNDERSCORE_FLAG_NAME_VALUE}`), `x--_password ${UNDERSCORE_FLAG_NAME_VALUE}`, `underscore flag: ${scrub.name} a flag glued to a word is not a flag`);
+  }
+  assert.equal(cases, 2 * UNDERSCORE_FLAG_ROWS.length * 2);
+  assert.equal(isCredentialKey("_zendesk_session"), true);
+  assert.equal(isCredentialKey("_theme"), false);
+});
+
+// Harness self-check (Codex P1 on #81, query carrier cells): a ";" inside a query value is part
+// of the value, as URLSearchParams reads it, so "?token=hunter2;restofsecret" is one value and
+// loses the whole of it. The query rule used to end a value at ";" and left ";restofsecret"
+// standing in relative, absolute, JSON-escaped, and slash-escaped URLs alike, through both
+// scrubs, the error constructor, and the walker. The ";" boundary belongs to the Cookie and
+// Set-Cookie header lines, which go whole and are read before the query rule.
+const SEMICOLON_QUERY_VALUE = "hunter2;restofsecret";
+const SEMICOLON_QUERY_LONG_VALUE = "Rk7Vm2Qx9Tz4;Lw8Hn3Bd6Yp1Cf5";
+const SEMICOLON_QUERY_ROWS = [
+  [(v) => `GET /api/v2/users?token=${v} failed`, "GET /api/v2/users?token=[REDACTED] failed"],
+  [(v) => `GET /api/v2/users?page=2&api_token=${v}&sort=asc`, "GET /api/v2/users?page=2&api_token=[REDACTED]&sort=asc"],
+  [(v) => `GET /api/v2/users?token=${v}; retrying`, "GET /api/v2/users?token=[REDACTED] retrying"],
+  [(v) => `request to https://acme.zendesk.com/api/v2/users?token=${v} failed`, "request to https://acme.zendesk.com/api/v2/users?token=[REDACTED] failed"],
+  [(v) => `request to https://acme.zendesk.com/api/v2/users?token=${v}`, "request to https://acme.zendesk.com/api/v2/users?token=[REDACTED]"],
+  [(v) => `{"url":"https://acme.zendesk.com/api/v2/users?token=${v}","status":401}`, '{"url":"https://acme.zendesk.com/api/v2/users?token=[REDACTED]","status":401}'],
+  [(v) => `{"error":"request to \\"https://acme.zendesk.com/api/v2/users?token=${v}\\" failed"}`, '{"error":"request to \\"https://acme.zendesk.com/api/v2/users?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"error":"GET \\"/api/v2/users?token=${v}\\" failed"}`, '{"error":"GET \\"/api/v2/users?token=[REDACTED]\\" failed"}'],
+  [(v) => `{"url":"https:\\/\\/acme.zendesk.com\\/api\\/v2\\/users?token=${v}"}`, '{"url":"https:\\/\\/acme.zendesk.com\\/api\\/v2\\/users?token=[REDACTED]"}'],
+  [(v) => `request to https:\\/\\/acme.zendesk.com\\/api\\/v2\\/users?token=${v} failed`, "request to https:\\/\\/acme.zendesk.com\\/api\\/v2\\/users?token=[REDACTED] failed"],
+  [(v) => `see https://acme.zendesk.com/oauth#access_token=${v}&type=bearer`, "see https://acme.zendesk.com/oauth#access_token=[REDACTED]&type=bearer"],
+];
+const SEMICOLON_QUERY_CONTROLS = [
+  ["Cookie: &sid=a; pref=b", "Cookie: [REDACTED]"],
+  ["Set-Cookie: _zendesk_session=abc123; Path=/; HttpOnly", "Set-Cookie: [REDACTED]"],
+  ["GET /api/v2/users?sort=asc;include=roles ok", "GET /api/v2/users?sort=asc;include=roles ok"],
+  ["GET /api/v2/users?page=2&per_page=100 ok", "GET /api/v2/users?page=2&per_page=100 ok"],
+  ["GET /api/v2/users?token=[REDACTED] failed", "GET /api/v2/users?token=[REDACTED] failed"],
+];
+const SEMICOLON_QUERY_SINKS = [
+  ["redactErrorText", redactErrorText],
+  ["redactCredentialValueText", redactCredentialValueText],
+  ["redactSecrets", (text) => redactSecrets(text, [])],
+  ["ZendeskApiError", (text) => new ZendeskApiError(text, 401).message],
+  ["redactCredentialProperties", (text) => redactCredentialProperties({ note: text, items: [{ description: text }] }).note],
+];
+
+test("harness self-check: a \";\" inside a query value is part of the value, so ?token=hunter2;restofsecret loses the whole value in relative, absolute, JSON-escaped, and slash-escaped URLs through both scrubs, the error constructor, and the walker, while Cookie: &sid=a; pref=b still goes whole", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SEMICOLON_QUERY_SINKS) {
+    for (const [make, expected] of SEMICOLON_QUERY_ROWS) for (const value of [SEMICOLON_QUERY_VALUE, SEMICOLON_QUERY_LONG_VALUE]) {
+      const input = make(value);
+      const out = sink(input);
+      const label = `semicolon query value: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [text, expected] of SEMICOLON_QUERY_CONTROLS) assert.equal(sink(text), expected, `semicolon query value: ${sinkName} control ${JSON.stringify(text)}`);
+  }
+  assert.equal(cases, SEMICOLON_QUERY_SINKS.length * SEMICOLON_QUERY_ROWS.length * 2);
+});
+
+// Harness self-check (CodeRabbit on #81, discussion_r4081238237, scheme carrier cells): a scheme
+// word followed by a parameter list (Snowflake Token="<value>", Token token="<value>",
+// nonce="...", Digest username="...", nonce="...", response="...") is the value of an
+// Authorization header wherever it appears. With the header name in front the whole list
+// already went ("Authorization: Snowflake [REDACTED]"); without it the scheme rule consumed the
+// first "Token=" alone and left the quoted token standing ("Snowflake [REDACTED]\"<value>\""),
+// and a headerless Digest list kept its response="..." on the data side. The word now stays
+// and the whole list goes in both cases, bare, after a JSON escape, inside a JSON string, and
+// end to end through a 401 body that echoes the header; a list made only of challenge
+// parameters (a WWW-Authenticate value: Bearer realm="api", error="invalid_token") stays.
+const SCHEME_LIST_SHORT_VALUE = "skvclmtirehs";
+const SCHEME_LIST_LONG_VALUE = "Zq8Lm3Vn7Rt2Kp6Xw9Hs4Bd1";
+const DIGEST_NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093";
+const DIGEST_RESPONSE = "6629fae49393a05397450978507c4ef1";
+const SCHEME_LIST_ROWS = [
+  [(v) => `Authorization: Snowflake Token="${v}"`, "Authorization: Snowflake [REDACTED]"],
+  [(v) => `request failed with Authorization: Snowflake Token="${v}" see the log`, "request failed with Authorization: Snowflake [REDACTED]"],
+  [(v) => `authorization: snowflake token="${v}"`, "authorization: snowflake [REDACTED]"],
+  [(v) => `Proxy-Authorization: Snowflake Token='${v}'`, "Proxy-Authorization: Snowflake [REDACTED]"],
+  [(v) => `request failed\\nAuthorization: Snowflake Token=\\"${v}\\"`, "request failed\\nAuthorization: Snowflake [REDACTED]"],
+  [(v) => `{"message":"Authorization: Snowflake Token=\\"${v}\\" was rejected","code":401}`, '{"message":"Authorization: Snowflake [REDACTED]","code":401}'],
+  [(v) => `{"detail":"{\\"header\\":\\"Authorization: Snowflake Token=\\\\\\"${v}\\\\\\"\\"}"}`, '{"detail":"{\\"header\\":\\"Authorization: Snowflake [REDACTED]\\"}"}'],
+  [(v) => `auth header Snowflake Token="${v}" rejected`, "auth header Snowflake [REDACTED] rejected"],
+  [(v) => `Snowflake Token="${v}"`, "Snowflake [REDACTED]"],
+  [(v) => `{"error":"Snowflake Token=\\"${v}\\" rejected","code":401}`, '{"error":"Snowflake [REDACTED] rejected","code":401}'],
+  [(v) => `{"detail":"{\\"h\\":\\"Snowflake Token=\\\\\\"${v}\\\\\\"\\"}"}`, '{"detail":"{\\"h\\":\\"Snowflake [REDACTED]\\"}"}'],
+  [(v) => `Snowflake Token="${v}`, "Snowflake [REDACTED]"],
+  [(v) => `{"error":"Snowflake Token=\\"${v}","code":401}`, '{"error":"Snowflake [REDACTED]","code":401}'],
+  [(v) => `sent Token token="${v}", nonce="${DIGEST_NONCE}" to the API`, "sent Token [REDACTED] to the API"],
+  [(v) => `Authorization: Token token="${v}", nonce="${DIGEST_NONCE}"`, "Authorization: Token [REDACTED]"],
+  [(v) => `Authorization: Bearer token="${v}"`, "Authorization: Bearer [REDACTED]"],
+  [(v) => `ApiKey key="${v}" was refused`, "ApiKey [REDACTED] was refused"],
+  [(v) => `X-Auth-Token: Snowflake Token="${v}"`, "X-Auth-Token: [REDACTED]"],
+  [(v) => `OAuth oauth_consumer_key="dpf43f3p2l4k3l03", oauth_token="${v}", oauth_signature="${DIGEST_RESPONSE}" rejected`, "OAuth [REDACTED] rejected"],
+];
+const DIGEST_LIST_ROWS = [
+  [`Authorization: Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/api/v2/users", response="${DIGEST_RESPONSE}", opaque="5ccc069c403ebaf9f0171e9517f40e41"`, "Authorization: Digest [REDACTED]"],
+  [`{"message":"Authorization: Digest username=\\"auditor\\", realm=\\"api\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\" rejected"}`, '{"message":"Authorization: Digest [REDACTED]"}'],
+  [`request failed\\nAuthorization: Digest username=\\"auditor\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\"`, "request failed\\nAuthorization: Digest [REDACTED]"],
+  [`Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/api/v2/users", response="${DIGEST_RESPONSE}"`, "Digest [REDACTED]"],
+  [`the client sent Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", uri="/api/v2/users", response="${DIGEST_RESPONSE}" and was refused`, "the client sent Digest [REDACTED] and was refused"],
+  [`{"error":"Digest username=\\"auditor\\", realm=\\"api\\", nonce=\\"${DIGEST_NONCE}\\", response=\\"${DIGEST_RESPONSE}\\" rejected"}`, '{"error":"Digest [REDACTED] rejected"}'],
+  [`Digest username=auditor, realm=api, nc=00000001, response=${DIGEST_RESPONSE} refused`, "Digest [REDACTED] refused"],
+];
+const SCHEME_LIST_CONTROLS = [
+  'WWW-Authenticate: Bearer realm="api"',
+  'WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+  'WWW-Authenticate: Basic realm="Zendesk API", charset="UTF-8"',
+  '{"message":"401 Unauthorized","www_authenticate":"Bearer realm=\\"api\\", error=\\"invalid_token\\""}',
+  'the challenge was Bearer realm="api" and the request was retried',
+  'the challenge was Digest realm="api", qop="auth" and the request was retried',
+  "Snowflake [REDACTED] rejected",
+  "Authorization: Snowflake [REDACTED]",
+  "Token Hygiene",
+  "Basic authentication is required",
+  "Snowflake account acme-eu",
+  "OAuth clients: 3",
+];
+const SCHEME_LIST_SINKS = [
+  ["redactErrorText", redactErrorText],
+  ["redactCredentialValueText", redactCredentialValueText],
+  ["redactSecrets", (text) => redactSecrets(text, [])],
+  ["ZendeskApiError", (text) => new ZendeskApiError(text, 401).message],
+  ["redactCredentialProperties", (text) => redactCredentialProperties({ note: text, items: [{ description: text }] }).note],
+];
+
+test("harness self-check: a scheme word and the parameter list after it (Snowflake Token=\"<value>\", Digest ... nonce=\"...\", response=\"...\") lose the whole list with the header name or without it, bare, after a JSON escape, and inside a JSON string, while a WWW-Authenticate challenge's realm=\"api\" stays", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SCHEME_LIST_SINKS) {
+    for (const [make, expected] of SCHEME_LIST_ROWS) for (const value of [SCHEME_LIST_SHORT_VALUE, SCHEME_LIST_LONG_VALUE]) {
+      const input = make(value);
+      const out = sink(input);
+      const label = `scheme parameter list: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected] of DIGEST_LIST_ROWS) {
+      const out = sink(input);
+      const label = `digest parameter list: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      for (const value of [DIGEST_NONCE, DIGEST_RESPONSE]) assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const text of SCHEME_LIST_CONTROLS) assert.equal(sink(text), text, `scheme parameter list: ${sinkName} changed a control: ${text}`);
+  }
+  assert.equal(cases, SCHEME_LIST_SINKS.length * (SCHEME_LIST_ROWS.length * 2 + DIGEST_LIST_ROWS.length));
+});
+
+test("harness self-check: a 401 body that echoes an Authorization header with a Snowflake Token=\"...\" or Digest parameter list reaches the thrown error with the scheme word kept and the list gone, end to end through the client", async () => {
+  const echoes = [
+    [(v) => `Authorization: Snowflake Token="${v}" was rejected`, "Authorization: Snowflake [REDACTED]"],
+    [(v) => `Snowflake Token="${v}" was rejected`, "Snowflake [REDACTED] was rejected"],
+    [() => `Authorization: Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", response="${DIGEST_RESPONSE}" was rejected`, "Authorization: Digest [REDACTED]"],
+    [() => `Digest username="auditor", realm="api", nonce="${DIGEST_NONCE}", response="${DIGEST_RESPONSE}" was rejected`, "Digest [REDACTED] was rejected"],
+    [() => 'challenge Bearer realm="api" answered with an expired token', 'challenge Bearer realm="api" answered with an expired token'],
+  ];
+  for (const [make, expected] of echoes) for (const value of [SCHEME_LIST_SHORT_VALUE, SCHEME_LIST_LONG_VALUE]) {
+    const echoed = make(value);
+    const fetchImpl = async () => jsonResponse({ error: "Couldn't authenticate you", description: echoed }, { status: 401, statusText: "Unauthorized", headers: { "www-authenticate": 'Bearer realm="api"' } });
+    const client = new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+    await assert.rejects(() => client.get("/users/me"), (error) => {
+      assert.ok(error instanceof ZendeskApiError, `401 echo: ${echoed} threw ${String(error)}`);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, `Zendesk request failed for /users/me (401 Unauthorized; Couldn't authenticate you; ${expected})`, `401 echo: ${echoed}`);
+      for (const secret of [value, DIGEST_NONCE, DIGEST_RESPONSE]) assertNoWindow(error.message, secret, `401 echo: ${echoed}`);
+      return true;
+    });
+  }
+});
+
+// Harness self-check (CodeRabbit on #81, discussion_r4081776771, auth-param cells): a parameter
+// list without a scheme word (realm="api", nonce="n", response="<proof>": the value of a
+// www_authenticate field, or a credential echoed without its scheme word) is not a
+// WWW-Authenticate challenge when a later parameter is a proof (response, signature,
+// oauth_signature, mac, sig). Before, such a list fell to the per-parameter rules, where
+// response and mac are not credential names, so a name-shaped proof survived in every sink
+// (and a long one on the data side), while the nonce of a proof-free challenge went as a
+// credential name. Now the proof values go whatever their shape, quoted at any depth or bare,
+// wherever the proof sits in the list, and a proof-free challenge (WWW-Authenticate: Bearer
+// realm="api", Digest realm="api", qop="auth", nonce="n") keeps every value, the nonce
+// included; a lone nonce="..." is no list and still goes, and a list with no known auth
+// parameter (code="401", response="Unauthorized", a MAC address beside an IP) stays.
+const PROOF_SHORT_VALUE = "skvclmtirehs";
+const PROOF_LONG_VALUE = "Qm7Vx2Lk9Rt4Pw8Zs3Yh6Nd1Bc5Fg0Jt";
+const PROOF_PARAM_NAMES = ["response", "signature", "oauth_signature", "mac", "sig"];
+const escapeJsonText = (text) => JSON.stringify(text).slice(1, -1);
+// Each form: the text with the proof under a parameter name, and the same text with the
+// proof gone.
+const PROOF_LIST_FORMS = [
+  (name, v) => [`realm="api", nonce="n", ${name}="${v}"`, `realm="api", nonce="n", ${name}="[REDACTED]"`],
+  (name, v) => [`the client answered realm="api", nonce="n", ${name}="${v}" and was refused`, `the client answered realm="api", nonce="n", ${name}="[REDACTED]" and was refused`],
+  (name, v) => [`status 401\\n${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)}`, `status 401\\n${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)}`],
+  (name, v) => [`{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)}","code":401}`, `{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)}","code":401}`],
+  (name, v) => [`{"detail":"challenge answered:\\n${escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`)} refused","code":401}`, `{"detail":"challenge answered:\\n${escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`)} refused","code":401}`],
+  (name, v) => [`{"detail":"{\\"h\\":\\"${escapeJsonText(escapeJsonText(`realm="api", nonce="n", ${name}="${v}"`))}\\"}"}`, `{"detail":"{\\"h\\":\\"${escapeJsonText(escapeJsonText(`realm="api", nonce="n", ${name}="[REDACTED]"`))}\\"}"}`],
+  (name, v) => [`{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="${v}`)}","code":401}`, `{"detail":"${escapeJsonText(`realm="api", nonce="n", ${name}="`)}[REDACTED]","code":401}`],
+  (name, v) => [`realm='api', nonce='n', ${name}='${v}'`, `realm='api', nonce='n', ${name}='[REDACTED]'`],
+  (name, v) => [`realm=api, nonce=n, ${name}=${v}`, `realm=api, nonce=n, ${name}=[REDACTED]`],
+  (name, v) => [`${name}="${v}", realm="api"`, `${name}="[REDACTED]", realm="api"`],
+  (name, v) => [`nonce="n", ${name}="${v}"`, `nonce="n", ${name}="[REDACTED]"`],
+  (name, v) => [`username="auditor", realm="api", nonce="n", uri="/api/v2/users", ${name}="${v}"`, `username="auditor", realm="api", nonce="n", uri="/api/v2/users", ${name}="[REDACTED]"`],
+  (name, v) => [`id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", ${name}="${v}"`, `id="h480djs93hd8", ts="1336363200", nonce="dj83hs9s", ${name}="[REDACTED]"`],
+];
+// A lone credential-named pair is no list and goes as before.
+const PROOF_NO_LIST_ROWS = [
+  ['nonce="n"', 'nonce="[REDACTED]"'],
+  ['set realm="api" and retry, nonce="n" was stale', 'set realm="api" and retry, nonce="[REDACTED]" was stale'],
+];
+const PROOF_LIST_CONTROLS = [
+  'WWW-Authenticate: Bearer realm="api"',
+  'WWW-Authenticate: Digest realm="api", qop="auth", nonce="n"',
+  'Digest realm="api", qop="auth", nonce="n"',
+  'Digest nonce="n"',
+  'realm="api", qop="auth", nonce="n"',
+  'realm="api", nonce="n"',
+  'realm=api, qop=auth, nonce=n',
+  'Bearer realm="api", error="invalid_token", error_description="The access token expired"',
+  '{"www_authenticate":"Digest realm=\\"api\\", qop=\\"auth\\", nonce=\\"n\\""}',
+  'error="invalid_token", error_description="The token expired, please renew", realm="api"',
+  'code="401", response="Unauthorized"',
+  'mac="00:11:22:33:44:55", ip="10.0.0.1"',
+  'response="ok"',
+  'the response was slow; mac address 00:11:22:33:44:55; sig figs 3',
+  '{"response":"ok","mac":"00:11:22:33:44:55"}',
+  'realm="api", nonce="n", response="[REDACTED]"',
+];
+
+test("harness self-check: a proof parameter (response, signature, oauth_signature, mac, sig) in a parameter list without a scheme word loses its value in both scrubs, the error constructor, and the walker, bare, after a JSON escape, inside a JSON string, and double-escaped, while a proof-free challenge keeps its values, the nonce included", () => {
+  let cases = 0;
+  for (const [sinkName, sink] of SCHEME_LIST_SINKS) {
+    for (const form of PROOF_LIST_FORMS) for (const name of PROOF_PARAM_NAMES) for (const value of [PROOF_SHORT_VALUE, PROOF_LONG_VALUE]) {
+      const [input, expected] = form(name, value);
+      const out = sink(input);
+      const label = `proof parameter: ${sinkName} ${JSON.stringify(input)} -> ${JSON.stringify(out)}`;
+      assert.equal(out, expected, label);
+      assertNoWindow(out, value, label);
+      assert.equal(sink(out), out, `${label}: not idempotent`);
+      cases += 1;
+    }
+    for (const [input, expected] of PROOF_NO_LIST_ROWS) assert.equal(sink(input), expected, `proof parameter: ${sinkName} ${JSON.stringify(input)}`);
+    for (const text of PROOF_LIST_CONTROLS) assert.equal(sink(text), text, `proof parameter: ${sinkName} changed a control: ${text}`);
+  }
+  assert.equal(cases, SCHEME_LIST_SINKS.length * PROOF_LIST_FORMS.length * PROOF_PARAM_NAMES.length * 2);
+  // The walker: a www_authenticate value loses its proof and keeps its realm and nonce, a
+  // challenge keeps every value, and response and mac properties are not credentials.
+  assert.deepEqual(
+    redactCredentialProperties({ www_authenticate: `realm="api", nonce="n", response="${PROOF_SHORT_VALUE}"`, nested: [{ challenge: 'Digest realm="api", qop="auth", nonce="n"' }], response: "ok", mac: "00:11:22:33:44:55" }),
+    { www_authenticate: 'realm="api", nonce="n", response="[REDACTED]"', nested: [{ challenge: 'Digest realm="api", qop="auth", nonce="n"' }], response: "ok", mac: "00:11:22:33:44:55" },
+  );
+});
+
+test("harness self-check: a 401 body that echoes a parameter list without a scheme word (realm=\"api\", nonce=\"n\", response=\"<proof>\") reaches the thrown error with the proof gone and the realm and nonce kept, end to end through the client", async () => {
+  for (const name of PROOF_PARAM_NAMES) for (const value of [PROOF_SHORT_VALUE, PROOF_LONG_VALUE]) {
+    const echoed = `the client answered realm="api", nonce="n", ${name}="${value}" and was refused`;
+    const fetchImpl = async () => jsonResponse({ error: "Couldn't authenticate you", description: echoed }, { status: 401, statusText: "Unauthorized", headers: { "www-authenticate": 'Digest realm="api", qop="auth", nonce="n"' } });
+    const client = new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} });
+    await assert.rejects(() => client.get("/users/me"), (error) => {
+      assert.ok(error instanceof ZendeskApiError, `proof echo: ${echoed} threw ${String(error)}`);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, `Zendesk request failed for /users/me (401 Unauthorized; Couldn't authenticate you; the client answered realm="api", nonce="n", ${name}="[REDACTED]" and was refused)`, `proof echo: ${echoed}`);
+      assertNoWindow(error.message, value, `proof echo: ${echoed}`);
+      return true;
+    });
+  }
+});
 
 test("scrub boundary: name-shaped values stay bare in prose, leave every carrier whatever their shape, and go as configured secrets in every form", () => {
   for (const value of NAME_SHAPED_VALUES) {
@@ -2237,15 +3071,18 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     assert.equal(redactErrorText(expected), expected, "idempotent");
   }
   // After a scheme the value goes whatever its shape, a plain lowercase word included,
-  // unless it is one of the listed prose words; after the noun "Token" any short plain
-  // lowercase word is prose, and OAuth is this module's vocabulary, not a scheme.
+  // unless it is one of the listed prose words; after the nouns "Token", "OAuth", "Splunk",
+  // and "Snowflake" a plain lowercase word shorter than a long token run is prose, and
+  // "realm=" or another auth parameter name after any scheme is prose.
   for (const [text, expected] of [
     ["Bearer abcdefghijklmnop rejected", "Bearer [REDACTED] rejected"],
     ["Basic canarybasic rejected", "Basic [REDACTED] rejected"],
     ["ApiKey canaryapikey rejected", "ApiKey [REDACTED] rejected"],
     ["Token abcdefghijklmnopq expired", "Token [REDACTED] expired"],
     ["Token hygiene could not be judged; token inventory read; Token count 3", "Token hygiene could not be judged; token inventory read; Token count 3"],
-    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop", "OAuth clients all declare scopes; an OAuth bearer token; OAuth abcdefghijklmnop"],
+    ["OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth abcdefghijklmnop rejected", "OAuth clients all declare scopes; an OAuth bearer token; OAuth authentication failed; OAuth [REDACTED] rejected"],
+    ["replayed OAuth Kq7Zx2Vw9Lm4Tp8R upstream; replayed Splunk Kq7Zx2Vw9Lm4Tp8R upstream; replayed Snowflake Kq7Zx2Vw9Lm4Tp8R upstream; replayed AWS4-HMAC-SHA256 Kq7Zx2Vw9Lm4Tp8R upstream", "replayed OAuth [REDACTED] upstream; replayed Splunk [REDACTED] upstream; replayed Snowflake [REDACTED] upstream; replayed AWS4-HMAC-SHA256 [REDACTED] upstream"],
+    ["Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head", "Bearer realm=\"api\"; Bearer token is missing; Digest realm=\"api\", qop=\"auth\"; Splunk search head"],
     ["API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required", "API token basic auth; Bearer tokens expire; Basic credential; Basic authentication is required"],
     // A Titlecase word makes the scheme name an adjective in a title; a digit, a symbol,
     // token casing, or a run longer than a word still marks a credential.
@@ -2284,6 +3121,20 @@ test("scrub boundary: name-shaped values stay bare in prose, leave every carrier
     "misconfiguration of the Authorization Code flow on misconfigured-support-cluster",
   ]) {
     assert.equal(redactErrorText(text), text, text);
+  }
+  // Compound header lines with no credential carrier keep every name and value in both
+  // scrubs, bare or JSON-escaped.
+  for (const text of [
+    'Content-Type: "application/json"; Accept: application/json, text/plain; X-Request-Id: 7f3a',
+    "Content-Type: text/plain; charset=utf-8, Accept-Encoding: gzip, deflate",
+    "Date: Tue, 22 Sep 2026 18:00:00 GMT; Content-Type: application/json",
+    "Content-Type: application/json, Date: Tue, 22 Sep 2026 18:00:00 GMT",
+    '<p>Content-Type: "text/html"; X-Request-Id: "7f3a"</p><p>next</p>',
+    '{"detail":"{\\"Content-Type\\": \\"application/json\\", \\"Date\\": \\"Tue, 22 Sep 2026 18:00:00 GMT\\"}"}',
+    '{"detail":"{\\"user\\": \\"auditor@example.com\\", \\"name\\": \\"svc\\", \\"tokens\\": 2}"}',
+  ]) {
+    assert.equal(redactErrorText(text), text, text);
+    assert.equal(redactCredentialValueText(text), text, text);
   }
 
   for (const [key, expected] of [
@@ -2497,15 +3348,33 @@ const CANARY_PLAIN = "jdvdnheoejphwk";
 // nor the pair rule removes it, only a header rule that carries a quoted value through its
 // closing quote, so its absence proves that rule ran.
 const CANARY_QUOTED = "sess-qtdv-QCARRY-16180339887498";
+// Reviewer E gap 10: a name-shaped value carried only behind an apostrophe in a cookie pair
+// name or value, behind "&" or "#" in a JSON-escaped quoted pair, and before an escaped
+// quote or line break in a query pair, so only the mid-token quote rule and the backslash
+// boundary remove it.
+const CANARY_APOSTROPHE = "sess-apos-QUOTE-14142135623730";
 const CANARIES = [CANARY_BEARER, CANARY_SESSION, CANARY_API_KEY, CANARY_URL_TOKEN, CANARY_NAMED, CANARY_PLAIN, CANARY_QUOTED];
 const CANARY_URL = `https://api.example.com/v1/x?token=${CANARY_URL_TOKEN}`;
+// A value only a refused foreign-origin next link carries, in its query and as its
+// password: it proves the link itself is never recorded and never requested.
+const CANARY_NEXT_LINK = "Vq7mR2tZk9XcP4nB6wLd3Y";
+// The secret of a user-and-secret prefix on a configured base URL (rule 9: a configured URL
+// is dropped to scheme, host, and path at configuration and never written).
+const CANARY_USERINFO = "Hn3xKw8Rq5TzM2pY7vB4Ld";
+// A JSON text stringified into a string value arrives with its quotes escaped (\"): the
+// header pairs and the credential pair inside it are carriers one level down, and each
+// keeps its escaped quotes around the marker so the text stays well formed.
+const CANARY_ESCAPED_NOTE = `upstream body ${JSON.stringify(JSON.stringify({ Cookie: `sid=${CANARY_QUOTED}`, "X-Api-Key": CANARY_QUOTED, password: CANARY_QUOTED }))}`;
+const SCRUBBED_ESCAPED_NOTE = 'upstream body "{\\"Cookie\\":\\"[REDACTED]\\",\\"X-Api-Key\\":\\"[REDACTED]\\",\\"password\\":\\"[REDACTED]\\"}"';
 // The scrubbed rendering of the JSON canary fields, as every error string must carry it.
-const JSON_CANARY_MARKER = /400 Bad Request; InvalidUpstream; Upstream refused Bearer \[REDACTED\] at https:\/\/api\.example\.com\/v1\/x\?token=\[REDACTED\] mid-sentence; _zendesk_session=\[REDACTED\], api_key=\[REDACTED\], Bearer \[REDACTED\], sid=\[REDACTED\] rejected; Cookie: \[REDACTED\]/;
+const JSON_CANARY_MARKER = new RegExp(`400 Bad Request; InvalidUpstream; Upstream refused Bearer \\[REDACTED\\] at https://api\\.example\\.com/v1/x\\?token=\\[REDACTED\\] mid-sentence; _zendesk_session=\\[REDACTED\\], api_key=\\[REDACTED\\], Bearer \\[REDACTED\\], sid=\\[REDACTED\\] rejected; Cookie: \\[REDACTED\\]; X-Api-Key: "\\[REDACTED\\]"; Content-Type: "application/json"; ${escapeRegExp(SCRUBBED_ESCAPED_NOTE)}`);
 
 function htmlCanaryResponse() {
   const body = `<html><head><title>502 Bad Gateway</title></head><body><p>Authorization: Bearer ${CANARY_BEARER}</p>`
     + `<p>Set-Cookie: _zendesk_session=${CANARY_SESSION}; Path=/</p><p>X-Api-Key: ${CANARY_API_KEY}</p>`
-    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p><p>Cookie: sid="${CANARY_QUOTED}"; theme=dark</p>`
+    + `<p>Proxy-Authorization: Bearer ${CANARY_PLAIN}</p><p>Cookie: sid=${CANARY_NAMED}</p>`
+    + `<p>Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "text/html"</p>`
+    + `<p>Cookie: sid=${CANARY_SESSION}; x-auth-token: "${CANARY_QUOTED}", Accept: text/html</p>`
     + `<p>The upstream at ${CANARY_URL} did not answer in time, retry later.</p></body></html>`;
   return new Response(body, { status: 502, statusText: "Bad Gateway", headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -2514,7 +3383,10 @@ function jsonCanaryResponse() {
   return jsonResponse({
     error: "InvalidUpstream",
     description: `Upstream refused Bearer ${CANARY_BEARER} at ${CANARY_URL} mid-sentence; _zendesk_session=${CANARY_SESSION}, api_key=${CANARY_API_KEY}, Bearer ${CANARY_PLAIN}, sid=${CANARY_NAMED} rejected`,
-    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark`,
+    // A compound line: the quoted cookie ends at its closing quote, the following quoted
+    // X-Api-Key keeps its name and loses its value, and the Content-Type keeps both; then
+    // the JSON-escaped carriers one level down.
+    message: `Cookie: sid="${CANARY_QUOTED}"; theme=dark; X-Api-Key: "${CANARY_QUOTED}"; Content-Type: "application/json"; ${CANARY_ESCAPED_NOTE}`,
   }, { status: 400, statusText: "Bad Request" });
 }
 
@@ -2524,6 +3396,18 @@ function jsonCanaryResponse() {
 const ECHOED_FORMS = [...secretForms(FIXTURE_API_TOKEN), ...secretForms(FIXTURE_BASIC_CREDENTIAL)];
 // The plain Basic pair is echoed too; its email half is not a secret and stays.
 const ECHOED_MARKER = /credentials(?: \[REDACTED\])+ auditor@example\.com\/token:\[REDACTED\] rejected/;
+
+// Reviewer E gap 10: a 502 whose documented fields carry the apostrophe pair name, the
+// apostrophe pair value, the "&"-named pair in JSON-escaped quotes one level down, and a
+// query pair before an escaped line break, each followed by a control.
+function apostropheCookieResponse() {
+  return jsonResponse({
+    error: `Cookie: theme=dark; my'pref=${CANARY_APOSTROPHE}; Content-Type: "text/html; charset=utf-8"`,
+    description: `Cookie: sid=O'${CANARY_APOSTROPHE}; Date: "Mon, 22 Sep 2026 12:30:00 GMT"`,
+    message: `upstream said {"headers":"Cookie: theme=dark; my&sid=\\"${CANARY_APOSTROPHE}\\"; Content-Type: \\"application/json\\""} after GET /x?token=${CANARY_APOSTROPHE}\\nstatus 502`,
+  }, { status: 502, statusText: "Bad Gateway" });
+}
+const APOSTROPHE_MARKER = new RegExp(escapeRegExp(`502 Bad Gateway; Cookie: [REDACTED]; Content-Type: "text/html; charset=utf-8"; Cookie: [REDACTED]; Date: "Mon, 22 Sep 2026 12:30:00 GMT"; upstream said {"headers":"Cookie: [REDACTED]; Content-Type: \\"application/json\\""} after GET /x?token=[REDACTED]\\nstatus 502`));
 
 function echoedSecretsResponse() {
   return jsonResponse({ error: "InvalidUpstream", description: `credentials ${ECHOED_FORMS.join(" ")} auditor@example.com/token:${FIXTURE_API_TOKEN} rejected` }, { status: 400, statusText: "Bad Request" });
@@ -2538,8 +3422,8 @@ function assertNoCanary(text, label, canaries = CANARIES) {
 // rules run on their own (hyphenated words with one digit group), the plain lowercase word
 // that only the Bearer scheme gives away, and the Slack path (the documented T/B/secret
 // shape, the whole path being the secret).
-const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
-const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
+const PLANTED_CREDENTIALS = [...Object.values(LOADER_CANARIES), ...CANARIES, CANARY_NEXT_LINK, CANARY_APOSTROPHE, CANARY_USERINFO, ...Object.values(FAKE_ZENDESK_SECRETS), FIXTURE_API_TOKEN];
+const SHAPED_CREDENTIALS = new Set([CANARY_NAMED, CANARY_QUOTED, CANARY_APOSTROPHE, CANARY_PLAIN, FIXTURE_API_TOKEN, FAKE_ZENDESK_SECRETS.slackWebhookPath]);
 
 // Every HTTP surface ZendeskApiClient reads, keyed by path (the three /audit_logs reads are
 // distinguished by their query), served from the same fixtures as healthyClient().
@@ -2616,6 +3500,10 @@ test("the HTTP-level healthy fixture reproduces the mocked-client verdicts befor
   }
 });
 
+// Body text the notes must never echo, whatever the shape. The JSON canary's compound line
+// carries a redacted X-Api-Key by design, so only an X-Api-Key whose value survived counts.
+const ECHOED_BODY_TEXT = /<html|Set-Cookie|X-Api-Key: (?!"\[REDACTED\]")|did not answer|Proxy-Authorization/i;
+
 test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or a JSON error body leaks no credential into any tool result, finding, or bundle file", async () => {
   const routes = await healthyHttpRoutes();
   const surfaces = Object.keys(routes);
@@ -2624,6 +3512,7 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
     { name: "html-502", make: htmlCanaryResponse, marker: /502 Bad Gateway; non-JSON text\/html response body \(\d+ bytes, not echoed\)/, canaries: CANARIES },
     { name: "json-400", make: jsonCanaryResponse, marker: JSON_CANARY_MARKER, canaries: CANARIES },
     { name: "echoed-secrets", make: echoedSecretsResponse, marker: ECHOED_MARKER, canaries: ECHOED_FORMS },
+    { name: "json-502-apostrophe-cookie", make: apostropheCookieResponse, marker: APOSTROPHE_MARKER, canaries: [CANARY_APOSTROPHE] },
   ];
   // Fixture self-check: each body carries every canary or form verbatim before the scrubs see it.
   for (const shape of shapes) {
@@ -2655,7 +3544,7 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
       assert.ok(errors.length > 0, `${label}: the failing surface must be recorded as an error`);
       for (const error of errors) {
         assert.match(error, shape.marker, `${label}: every error must carry the note: ${error}`);
-        assert.doesNotMatch(error, /<html|Set-Cookie|X-Api-Key:|did not answer/i, `${label}: body text echoed: ${error}`);
+        assert.doesNotMatch(error, ECHOED_BODY_TEXT, `${label}: body text echoed: ${error}`);
       }
       for (const item of results.flatMap((result) => result.findings)) {
         if (/could not be read|502 Bad Gateway|400 Bad Request/.test(item.summary)) {
@@ -2677,9 +3566,6 @@ test("error-body canary sweep: every Zendesk surface failing with an HTML 502 or
     }
   }
 });
-
-// Body text the notes must never echo, whatever the shape.
-const ECHOED_BODY_TEXT = /<html|Set-Cookie|X-Api-Key:|did not answer|Proxy-Authorization/i;
 
 test("the registered tools scrub error strings end to end over HTTP: access check, every assess tool, and the export", async () => {
   const routes = await healthyHttpRoutes();
@@ -2786,7 +3672,8 @@ test("the registered tools scrub error strings end to end over HTTP: access chec
 test("ZendeskApiError, transport errors, and the tool catch blocks scrub messages built at the throw site", async () => {
   const constructed = new ZendeskApiError(`Zendesk request failed for /x (500; Bearer ${CANARY_BEARER} at ${CANARY_URL}; Bearer ${CANARY_PLAIN}; sid=${CANARY_NAMED}; Cookie: _zendesk_session=${CANARY_SESSION}; sid="${CANARY_QUOTED}")`, 500);
   assertNoCanary(constructed.message, "constructor");
-  assert.equal(constructed.message, "Zendesk request failed for /x (500; Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED]; Bearer [REDACTED]; sid=[REDACTED]; Cookie: [REDACTED]", "the Cookie header line is withheld to the end of the line, quoted values included");
+  // The ";" glued to the query value is part of that value (URLSearchParams semantics), so it goes with it.
+  assert.equal(constructed.message, "Zendesk request failed for /x (500; Bearer [REDACTED] at https://api.example.com/v1/x?token=[REDACTED] Bearer [REDACTED]; sid=[REDACTED]; Cookie: [REDACTED]", "the Cookie header line is withheld to the end of the line, quoted values included");
   assert.equal(constructed.status, 500);
   // A quoted header value in a JSON string, in the escaped form the raw body carries it.
   const escaped = new ZendeskApiError(`upstream body {"detail":"rejected Cookie: sid=\\"${CANARY_QUOTED}\\"; path=/","code":401}`, 401);
@@ -2799,7 +3686,7 @@ test("ZendeskApiError, transport errors, and the tool catch blocks scrub message
   });
   await assert.rejects(transport.getCurrentUser(), (error) => {
     assertNoCanary(error.message, "transport error");
-    assert.match(error.message, /https:\/\/\[REDACTED\]@proxy\.example\.com sending Authorization: \[REDACTED\]/);
+    assert.match(error.message, /https:\/\/\[REDACTED\]@proxy\.example\.com sending Authorization: Bearer \[REDACTED\]/);
     return true;
   });
   const transportResult = await assessZendeskAuthentication(transport, { now: () => NOW });
@@ -3075,6 +3962,8 @@ test("ZD-25 records unresolved destinations when the target or webhook inventory
   const item = findingById(targetsForbidden, "ZD-25");
   assert.equal(item.status, "warn", item.summary);
   assert.equal(item.evidence.unresolved_destinations, 1);
+  assert.equal(item.evidence.insecure_destinations, null, "advisory A3: with a destination unresolved the insecure count is unknown, not zero");
+  assert.equal(item.evidence.insecure_resolved_destinations, 0);
   assert.equal(item.evidence.targets_status, "forbidden");
   assert.equal(item.evidence.external_notification_actions[0].destination, "target 77");
   assert.equal(item.evidence.external_notification_actions[0].unresolved, true);
@@ -3086,6 +3975,7 @@ test("ZD-25 records unresolved destinations when the target or webhook inventory
   assert.match(capped.summary, /none notify external targets, webhooks, or sharing agreements\. Verdict capped at warn because a secondary inventory could not be read: Webhooks \(\/webhooks, used to resolve notification_webhook destinations\) returned 403/);
   assert.deepEqual(capped.evidence.verdict_capped_by_unreadable, ["Webhooks (/webhooks, used to resolve notification_webhook destinations)"]);
   assert.equal(capped.evidence.unresolved_destinations, 0);
+  assert.equal(capped.evidence.insecure_destinations, 0, "every destination resolved, so the count is known");
 
   const truncatedTargets = await assessZendeskIntegrations(healthyClient({
     async listTargets() {
@@ -3097,7 +3987,26 @@ test("ZD-25 records unresolved destinations when the target or webhook inventory
   }), { now: () => NOW });
   const unseen = findingById(truncatedTargets, "ZD-25");
   assert.equal(unseen.evidence.unresolved_destinations, 1);
+  assert.equal(unseen.evidence.insecure_destinations, null);
   assert.match(unseen.summary, /The target or webhook inventory was truncated/);
+
+  // A resolved http destination beside an unresolved one still fails, and the evidence
+  // keeps the resolved count while the total stays unknown.
+  const mixed = await assessZendeskIntegrations(healthyClient({
+    listTargets: forbidden("/targets"),
+    async listWebhooks() {
+      return list([{ id: "wh9", name: "Legacy", status: "active", endpoint: "http://legacy.example.com/hook", authentication: { type: "basic_auth" } }]);
+    },
+    async listTriggers() {
+      return list([{ id: 9, title: "Post to legacy", active: true, actions: [{ field: "notification_webhook", value: ["wh9", "{{ticket.title}}"] }, { field: "notification_target", value: ["77", "{{ticket.title}}"] }] }]);
+    },
+  }), { now: () => NOW });
+  const mixedItem = findingById(mixed, "ZD-25");
+  assert.equal(mixedItem.status, "fail", mixedItem.summary);
+  assert.match(mixedItem.summary, /^1\/2 external notification actions deliver ticket data to http:\/\/ destinations\. 1 destination\(s\) could not be resolved/);
+  assert.equal(mixedItem.evidence.insecure_destinations, null);
+  assert.equal(mixedItem.evidence.insecure_resolved_destinations, 1);
+  assert.equal(mixedItem.evidence.unresolved_destinations, 1);
 });
 
 test("ZD-15 caps the zero-installation pass when owned apps are unreadable and renders unread marketplace counts as null", async () => {
@@ -3113,7 +4022,7 @@ test("ZD-15 caps the zero-installation pass when owned apps are unreadable and r
   assert.equal(findingById(result, "ZD-16").status, "manual");
 });
 
-test("ZD-02 marks named principal lists as partial when the team inventory is truncated", async () => {
+test("ZD-02 withholds named principal lists and keeps the counts when the team inventory is truncated", async () => {
   const result = await assessZendeskAuthentication(healthyClient({
     async listTeamMembers() {
       const member = teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false });
@@ -3126,14 +4035,25 @@ test("ZD-02 marks named principal lists as partial when the team inventory is tr
   assert.equal(item.status, "warn");
   assert.match(item.summary, /at least 1 team members report two_factor_auth_enabled=false \(not yet enrolled\) and at least 1 did not expose the flag/);
   assert.equal(item.evidence.inventory_truncated, true);
-  assert.equal(item.evidence.without_two_factor_partial, true);
-  assert.equal(item.evidence.two_factor_flag_missing_partial, true);
-  assert.deepEqual(item.evidence.without_two_factor, ["user-2@example.com"]);
-  assert.deepEqual(item.evidence.two_factor_flag_missing, ["user-3@example.com"]);
+  assert.equal(item.evidence.without_two_factor_count, 1, "a positive count over a truncated inventory is the observed lower bound");
+  assert.equal(item.evidence.two_factor_flag_missing_count, 1);
+  assert.equal(item.evidence.without_two_factor, null, "item-level detail is withheld until the inventory is read to completion");
+  assert.equal(item.evidence.two_factor_flag_missing, null);
+  assert.ok(!("without_two_factor_partial" in item.evidence) && !("two_factor_flag_missing_partial" in item.evidence), "no partial flags accompany withheld detail");
+  assert.doesNotMatch(JSON.stringify(item), /user-2@example\.com|user-3@example\.com/, "no principal from the truncated inventory is named");
 
-  const complete = findingById(await assessZendeskAuthentication(healthyClient(), { now: () => NOW }), "ZD-02");
-  assert.equal(complete.evidence.without_two_factor_partial, false);
-  assert.equal(complete.evidence.two_factor_flag_missing_partial, false);
+  const complete = findingById(await assessZendeskAuthentication(healthyClient({
+    async listTeamMembers() {
+      const member = teamMember({ id: 2, role: "agent", two_factor_auth_enabled: false });
+      const unknown = teamMember({ id: 3, role: "agent" });
+      delete unknown.two_factor_auth_enabled;
+      return list([teamMember({ id: 1, role: "admin" }), member, unknown]);
+    },
+  }), { now: () => NOW }), "ZD-02");
+  assert.equal(complete.evidence.inventory_truncated, false);
+  assert.deepEqual(complete.evidence.without_two_factor, ["user-2@example.com"]);
+  assert.deepEqual(complete.evidence.two_factor_flag_missing, ["user-3@example.com"]);
+  assert.equal(complete.evidence.without_two_factor_count, 1);
 });
 
 test("assessment summaries and evidence render unread inventories as null, never 0 or []", async () => {
@@ -3552,4 +4472,250 @@ test("ZendeskApiClient fails a paged read whose later page or single-object read
     scripted([() => new Response(null, { status: 204, statusText: "No Content" })]).getAccountSettings(),
     /returned 204 No Content with an empty response body where the documented JSON document was expected/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Foreign-origin next link: a server-supplied links.next or next_page is followed only on
+// the configured subdomain origin
+// ---------------------------------------------------------------------------
+
+// The refused link carries CANARY_NEXT_LINK in its query and (for the userinfo shapes) as
+// the password: no request, result, file, or zip entry may carry it or any window of it.
+const CONFIGURED_ORIGIN = "https://acme.zendesk.com";
+const FOREIGN_HOST_REASON = /^the next link pointed to https:\/\/evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/;
+const FOREIGN_PORT_REASON = /^the next link pointed to https:\/\/acme\.zendesk\.com:8443, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/;
+
+// Every shape a foreign next link takes on a paged read of path, with the fixed text the
+// refusal records: the rejected origin (for a link carrying user credentials, its origin
+// without them) and the configured origin, never the link's path, query, or credentials.
+function foreignNextLinks(path) {
+  const rest = `${path}?page%5Bafter%5D=${CANARY_NEXT_LINK}&page=2&per_page=100`;
+  return [
+    ["another host", `https://evil.example.com${rest}`, FOREIGN_HOST_REASON],
+    ["a host that merely starts with the configured one", `https://acme.zendesk.com.evil.example.com${rest}`, /^the next link pointed to https:\/\/acme\.zendesk\.com\.evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["another port", `https://acme.zendesk.com:8443${rest}`, FOREIGN_PORT_REASON],
+    ["another scheme", `http://acme.zendesk.com${rest}`, /^the next link pointed to http:\/\/acme\.zendesk\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["the configured host as userinfo before a foreign host", `https://acme.zendesk.com:${CANARY_NEXT_LINK}@evil.example.com${rest}`, /^the next link to https:\/\/evil\.example\.com carried user credentials in the URL and was not followed; only links on the configured origin https:\/\/acme\.zendesk\.com without user credentials are followed$/],
+    ["user credentials on the configured host", `https://auditor%40example.com:${CANARY_NEXT_LINK}@acme.zendesk.com${rest}`, /^the next link to https:\/\/acme\.zendesk\.com carried user credentials in the URL and was not followed; only links on the configured origin https:\/\/acme\.zendesk\.com without user credentials are followed$/],
+    ["protocol-relative", `//evil.example.com${rest}`, FOREIGN_HOST_REASON],
+    ["backslash protocol-relative", `\\\\evil.example.com${rest}`, FOREIGN_HOST_REASON],
+    ["a javascript scheme", `javascript:alert('${CANARY_NEXT_LINK}')`, /^the next link used the javascript: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["a data scheme", `data:text/plain,${CANARY_NEXT_LINK}`, /^the next link used the data: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["a blob scheme", `blob:https://evil.example.com/${CANARY_NEXT_LINK}`, /^the next link used the blob: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+    ["a file scheme", `file:///etc/${CANARY_NEXT_LINK}`, /^the next link used the file: scheme, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed$/],
+  ];
+}
+
+// The two paging loops, each with its first page (carrying the next link under test) and
+// its complete second page.
+const NEXT_LINK_READS = [
+  {
+    label: "listCursor",
+    path: "/api/v2/users",
+    read: (client) => client.listTeamMembers(),
+    firstPage: (next) => jsonResponse({ users: [{ id: 1, role: "admin" }], meta: { has_more: true, after_cursor: "c2" }, links: { next } }),
+    secondPage: () => jsonResponse({ users: [{ id: 2, role: "agent" }], meta: { has_more: false, after_cursor: null }, links: { next: null } }),
+  },
+  {
+    label: "listOffset",
+    path: "/api/v2/targets",
+    read: (client) => client.listTargets(),
+    firstPage: (next) => jsonResponse({ targets: [{ id: 1 }], next_page: next, previous_page: null, count: 2 }),
+    secondPage: () => jsonResponse({ targets: [{ id: 2 }], next_page: null, previous_page: `${CONFIGURED_ORIGIN}/api/v2/targets?page=1`, count: 2 }),
+  },
+];
+
+function nextLinkClient(link, pages, requests) {
+  return new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url, init) => {
+      requests.push({ url, authorization: headerValue(init.headers, "authorization") });
+      return requests.length === 1 ? pages.firstPage(link) : pages.secondPage();
+    },
+    sleep: async () => {},
+  });
+}
+
+test("foreign-origin next link: listCursor and listOffset refuse a links.next or next_page outside the configured origin before any request leaves, keep the page already read, and record the inventory truncated with a fixed-text reason", async () => {
+  for (const pages of NEXT_LINK_READS) {
+    for (const [shape, link, reasonPattern] of foreignNextLinks(pages.path)) {
+      const label = `${pages.label} with ${shape}`;
+      const requests = [];
+      const result = await pages.read(nextLinkClient(link, pages, requests));
+      assert.equal(requests.length, 1, `${label}: no request leaves for the refused link`);
+      assert.ok(requests[0].url.startsWith(`${CONFIGURED_ORIGIN}${pages.path}?`), `${label}: the only request went to the configured origin (${requests[0].url})`);
+      assert.equal(requests[0].authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`, `${label}: the credential went to the configured origin only`);
+      assert.equal(result.items.length, 1, `${label}: the page already read is kept`);
+      assert.equal(result.pages, 1, `${label}: the refused link is not a page`);
+      assert.equal(result.truncated, true, `${label}: the inventory is recorded truncated`);
+      assert.match(result.truncation_reason, reasonPattern, `${label}: the reason names the rejected origin or host and the configured origin`);
+      const rendered = JSON.stringify(result);
+      assertNoWindow(rendered, CANARY_NEXT_LINK, `${label}: the link's query and user credentials`);
+      assert.ok(!rendered.includes(`${pages.path}?`) && !rendered.includes("page%5Bafter%5D") && !rendered.includes("per_page"), `${label}: the link's path and query are not recorded`);
+      assert.ok(!rendered.includes("@"), `${label}: no userinfo is recorded`);
+      assert.equal(redactErrorText(result.truncation_reason), result.truncation_reason, `${label}: the reason is fixed text the general scrub leaves alone`);
+      assert.equal(redactCredentialValueText(result.truncation_reason), result.truncation_reason, `${label}: the reason is fixed text the data scrub leaves alone`);
+    }
+
+    // Same-origin controls: an absolute link on the configured origin (as served, with the
+    // default port spelled out, or with the host in another case), a relative path on the
+    // base URL, and a protocol-relative link on the configured host are followed with the
+    // credential, and the read completes untruncated.
+    const relativePath = pages.path.replace(/^\/api\/v2/, "");
+    const controls = [
+      ["an absolute same-origin link", `${CONFIGURED_ORIGIN}${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["the default port spelled out", `https://acme.zendesk.com:443${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["the host in another case", `https://ACME.Zendesk.com${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["a relative path", `${relativePath}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+      ["a protocol-relative same-origin link", `//acme.zendesk.com${pages.path}?page=2`, `${CONFIGURED_ORIGIN}${pages.path}?page=2`],
+    ];
+    for (const [shape, link, followed] of controls) {
+      const label = `${pages.label} with ${shape}`;
+      const requests = [];
+      const result = await pages.read(nextLinkClient(link, pages, requests));
+      assert.equal(requests.length, 2, `${label}: the same-origin link is followed`);
+      assert.equal(requests[1].url, followed, `${label}: the second request is the link on the configured origin`);
+      assert.equal(requests[1].authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`, `${label}: the credential goes to the configured origin`);
+      assert.deepEqual(result, { items: [{ id: 1, ...(pages.label === "listCursor" ? { role: "admin" } : {}) }, { id: 2, ...(pages.label === "listCursor" ? { role: "agent" } : {}) }], truncated: false, pages: 2 }, `${label}: both pages are merged and the read is complete`);
+    }
+  }
+});
+
+test("foreign-origin next link over HTTP: a refused link demotes the dependent findings, names the reason in the access check, the tool results, core_data, the collection status, _errors.log, and the executive summary, and no request or output carries the link", async () => {
+  const routes = await healthyHttpRoutes();
+  const foreignUsersLink = `https://evil.example.com/api/v2/users?page%5Bafter%5D=${CANARY_NEXT_LINK}`;
+  const foreignTargetsLink = `https://acme.zendesk.com:8443/api/v2/targets?page=2&per_page=${CANARY_NEXT_LINK}`;
+  const target = { id: 5, title: "Ops hook", active: true, target_url: "https://hooks.example.com/ops", type: "url_target_v2" };
+  const log = [];
+  const client = new ZendeskApiClient(sampleConfig(), {
+    fetchImpl: async (url, init) => {
+      log.push({ url, authorization: headerValue(init.headers, "authorization") });
+      const key = zendeskRouteKey(url);
+      if (key === "/users") return jsonResponse({ ...routes["/users"], meta: { has_more: true, after_cursor: "c2" }, links: { next: foreignUsersLink } });
+      if (key === "/targets") return jsonResponse({ targets: [target], next_page: foreignTargetsLink, previous_page: null, count: 2 });
+      const payload = routes[key];
+      if (payload === undefined) throw new Error(`unrouted Zendesk request: ${url}`);
+      return jsonResponse(payload);
+    },
+    sleep: async () => {},
+  });
+  const teamSeen = routes["/users"].users.length;
+
+  const access = await checkZendeskAccess(client);
+  const team = access.surfaces.find((surface) => surface.name === "team_members");
+  assert.equal(team.status, "readable");
+  assert.equal(team.count, teamSeen, "the probe counts the page it read");
+  assert.equal(team.truncated, true, "the probe count is a seen count, not the population");
+  assert.match(team.truncationReason, FOREIGN_HOST_REASON);
+  const targetsSurface = access.surfaces.find((surface) => surface.name === "targets");
+  assert.equal(targetsSurface.truncated, true);
+  assert.match(targetsSurface.truncationReason, FOREIGN_PORT_REASON);
+  assert.equal(access.surfaces.find((surface) => surface.name === "groups").truncated, false, "a list read to completion carries no reason");
+  assert.equal(access.surfaces.find((surface) => surface.name === "groups").truncationReason, undefined);
+  assert.ok(access.notes.some((note) => /^The team_members probe stopped paging early because the next link pointed to https:\/\/evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed\.$/.test(note)), access.notes.join("\n"));
+  assert.ok(access.notes.some((note) => /^The targets probe stopped paging early because the next link pointed to https:\/\/acme\.zendesk\.com:8443, outside/.test(note)), access.notes.join("\n"));
+
+  const results = await runAllAssessments(client);
+  const accessControl = results.find((result) => result.category === "access-control");
+  const admins = findingById(accessControl, "ZD-07");
+  assert.equal(admins.status, "warn", `a finding over the truncated team inventory demotes: ${admins.summary}`);
+  assert.equal(admins.evidence.inventory_truncated, true);
+  assert.match(admins.summary, new RegExp(`The team member inventory was truncated after ${teamSeen} items \\(the next link pointed to https://evil\\.example\\.com, outside the configured origin https://acme\\.zendesk\\.com, and was not followed\\), so the verdict is limited to the seen population and item-level detail is withheld from the evidence until the inventory is read to completion\\.`));
+  assert.equal(admins.evidence.admins, null, "admin names are withheld while the team inventory is truncated");
+  assert.equal(admins.evidence.dormant_admins_count, null, "a zero count over a truncated inventory is not asserted");
+  assert.equal(admins.evidence.seen_admins, 2, "the positive count is the observed lower bound");
+  const destinations = findingById(results.find((result) => result.category === "integrations"), "ZD-24");
+  assert.equal(destinations.status, "warn", `a finding over the truncated target inventory demotes: ${destinations.summary}`);
+  assert.equal(destinations.evidence.inventory_truncated, true);
+  assert.equal(destinations.evidence.active_targets, 1, "the seen target is counted");
+  assert.match(destinations.summary, /The target inventory was truncated after 1 items \(the next link pointed to https:\/\/acme\.zendesk\.com:8443, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed\)/);
+  assert.deepEqual(accessControl.errors, ["team_members dataset: partial inventory, paging stopped early because the next link pointed to https://evil.example.com, outside the configured origin https://acme.zendesk.com, and was not followed"]);
+  assert.equal(accessControl.summary.collection.team_members.truncated, true);
+  assert.match(accessControl.summary.collection.team_members.truncation_reason, FOREIGN_HOST_REASON);
+  assert.equal(accessControl.summary.collection.team_members.seen, teamSeen);
+  assert.equal(accessControl.summary.collection.groups.truncation_reason, null, "a list read to completion renders a null reason");
+
+  const exported = await exportZendeskAuditBundle(client, sampleConfig(), createTempBase("grclanker-zendesk-next-link-"), { now: () => NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const zip = readZipEntries(exported.zipPath);
+  const teamData = JSON.parse(files.get(join("core_data", "team_members.json")));
+  assert.equal(teamData.truncated, true);
+  assert.equal(teamData.items.length, teamSeen, "the page already read is kept in core_data");
+  assert.match(teamData.truncation_reason, FOREIGN_HOST_REASON);
+  const targetsData = JSON.parse(files.get(join("core_data", "targets.json")));
+  assert.deepEqual({ truncated: targetsData.truncated, items: targetsData.items.length, pages: targetsData.pages }, { truncated: true, items: 1, pages: 1 });
+  assert.match(targetsData.truncation_reason, FOREIGN_PORT_REASON);
+  assert.match(collectionEntry(files, "targets").truncation_reason, FOREIGN_PORT_REASON);
+  const errorLog = files.get("_errors.log");
+  assert.ok(errorLog !== undefined, "_errors.log records the partial inventories");
+  assert.deepEqual(errorLog.trim().split("\n"), [
+    "team_members dataset: partial inventory, paging stopped early because the next link pointed to https://evil.example.com, outside the configured origin https://acme.zendesk.com, and was not followed",
+    "targets dataset: partial inventory, paging stopped early because the next link pointed to https://acme.zendesk.com:8443, outside the configured origin https://acme.zendesk.com, and was not followed",
+  ]);
+  assert.equal(JSON.parse(files.get("metadata.json")).error_count, 2);
+  assert.match(files.get(join("compliance", "executive_summary.md")), /## Partial Collection Warnings\n\n- team_members dataset: partial inventory, paging stopped early because the next link pointed to https:\/\/evil\.example\.com, outside the configured origin https:\/\/acme\.zendesk\.com, and was not followed\n- targets dataset: partial inventory/);
+
+  // No request left for either refused link: every request of the run went to the
+  // configured origin, and only there did the credential go.
+  assert.ok(log.length >= 22, `the run made its reads (${log.length})`);
+  for (const entry of log) {
+    assert.ok(entry.url.startsWith(`${CONFIGURED_ORIGIN}/api/v2/`), `every request went to the configured origin: ${entry.url}`);
+    assert.equal(entry.authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`);
+    assertNoWindow(entry.url, CANARY_NEXT_LINK, "the request log");
+  }
+
+  // Every result, file, and zip entry is free of the link's path, query, and credentials,
+  // and the reason is fixed text the scrub leaves alone, so no marker appears where none was
+  // planted (core_data/ carries the fixture's own webhook and target credentials as markers).
+  const outputs = [["check_access", JSON.stringify(access)], ...results.map((result) => [result.category, JSON.stringify(result)]), ...files, ...[...zip].map(([name, text]) => [`zip:${name}`, text])];
+  for (const [name, text] of outputs) {
+    assertNoWindow(text, CANARY_NEXT_LINK, `${name}: the refused link's query and credentials`);
+    assert.ok(!text.includes("evil.example.com/") && !text.includes(":8443/"), `${name}: the refused link's path is not recorded`);
+    assert.equal(redactErrorText(text), text, `${name}: the reason is fixed text the general scrub leaves alone`);
+    if (!name.includes("core_data") && !name.includes("QUICK_REFERENCE.md")) assert.ok(!text.includes("[REDACTED]"), `${name}: carries no marker with nothing planted`);
+  }
+});
+
+test("rule 9: a user-and-secret prefix on a configured base URL is dropped at configuration, so no request, the configured origin a refused next link is compared against, no tool result, and no bundle file carries it", async () => {
+  const configured = `https://zd-operator:${CANARY_USERINFO}@acme.zendesk.com/api/v2/`;
+  // Positive control: the URL parser keeps the prefix, so only the loader can drop it.
+  assert.equal(new URL(configured).password, CANARY_USERINFO);
+  const config = resolveZendeskConfiguration({ subdomain: "acme", email: "auditor@example.com", api_token: FIXTURE_API_TOKEN, base_url: configured }, {}, createTempBase("grclanker-zendesk-userinfo-home-"));
+  assert.equal(config.baseUrl, "https://acme.zendesk.com/api/v2");
+  assertNoWindow(JSON.stringify(config), CANARY_USERINFO, "resolved configuration");
+
+  const routes = await healthyHttpRoutes();
+  const foreignUsersLink = `https://evil.example.com/api/v2/users?page%5Bafter%5D=${CANARY_NEXT_LINK}`;
+  const log = [];
+  const client = new ZendeskApiClient(config, {
+    fetchImpl: async (url, init) => {
+      log.push({ url, authorization: headerValue(init.headers, "authorization") });
+      const key = zendeskRouteKey(url);
+      if (key === "/users") return jsonResponse({ ...routes["/users"], meta: { has_more: true, after_cursor: "c2" }, links: { next: foreignUsersLink } });
+      const payload = routes[key];
+      if (payload === undefined) throw new Error(`unrouted Zendesk request: ${url}`);
+      return jsonResponse(payload);
+    },
+    sleep: async () => {},
+  });
+  const access = await checkZendeskAccess(client);
+  const results = await runAllAssessments(client);
+  const exported = await exportZendeskAuditBundle(client, config, createTempBase("grclanker-zendesk-userinfo-"), { now: () => NOW });
+  const files = readBundleFiles(exported.outputDir);
+  const zip = readZipEntries(exported.zipPath);
+
+  assert.ok(log.length >= 22, `the run made its reads (${log.length})`);
+  for (const entry of log) {
+    assert.ok(entry.url.startsWith(`${CONFIGURED_ORIGIN}/api/v2/`), `every request went to the configured origin without the prefix: ${entry.url}`);
+    assert.deepEqual({ username: new URL(entry.url).username, password: new URL(entry.url).password }, { username: "", password: "" }, `request URL carries no credentials: ${entry.url}`);
+    assert.equal(entry.authorization, `Basic ${FIXTURE_BASIC_CREDENTIAL}`, "the credential travels in the header, never in the URL");
+  }
+  // The refusal names the configured origin as scheme and host, never the prefix.
+  const team = access.surfaces.find((surface) => surface.name === "team_members");
+  assert.match(team.truncationReason, FOREIGN_HOST_REASON);
+  const outputs = [["check_access", JSON.stringify(access)], ...results.map((result) => [result.category, JSON.stringify(result)]), ...files, ...[...zip].map(([name, text]) => [`zip:${name}`, text])];
+  for (const [name, text] of outputs) {
+    assertNoWindow(text, CANARY_USERINFO, `${name}: the configured URL's secret`);
+    assert.ok(!text.includes("zd-operator"), `${name}: the configured URL's user is not written either`);
+  }
+  assert.match(files.get(join("compliance", "executive_summary.md")), /^Subdomain: acme$/m);
 });

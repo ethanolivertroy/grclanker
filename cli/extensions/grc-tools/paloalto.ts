@@ -383,13 +383,28 @@ function clampNumber(value: number | undefined, fallback: number, min: number, m
   return Math.min(Math.max(parsed, min), max);
 }
 
+// A configured URL keeps its scheme, host, port, and path prefix for requests; its
+// user-and-secret prefix, query, and fragment are dropped here so no request, label,
+// or bundle file ever carries them.
 function normalizeBaseUrl(rawUrl: string): string {
   const withScheme = /^https?:\/\//i.test(rawUrl.trim()) ? rawUrl.trim() : `https://${rawUrl.trim()}`;
   const parsed = new URL(withScheme);
+  parsed.username = "";
+  parsed.password = "";
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/+$/, "");
+}
+
+/** The scheme and host of a configured URL, which is all a label, note, or metadata field writes. */
+function displayOrigin(url: string): string {
+  return new URL(url).origin;
+}
+
+/** The host (and port) of a configured PAN-OS device URL or hostname, which is how the device is named everywhere it is written. */
+function hostLabel(url: string): string {
+  return new URL(url).host;
 }
 
 function parseTimeoutSeconds(value: number | undefined): number {
@@ -419,18 +434,26 @@ export const REDACTION_MARKER = "[REDACTED]";
  * the unread inventory is itself a verdict-safety requirement. Two guards make
  * that safe and both hold by construction:
  *
- * 1. A value inside a carrier is removed whatever its shape: the Authorization,
- *    Proxy-Authorization, Cookie, Set-Cookie, X-Api-Key, X-PAN-KEY, x-redlock-auth
- *    and similar header lines to the end of the line; the userinfo of every
- *    embedded URL; credential-named query and fragment pairs of every URL and bare
- *    query string (the PAN-OS key= parameter included) and any query value shaped
- *    like a token; the schemes Bearer, Basic, Digest, Token, Negotiate, NTLM, SSWS,
- *    and ApiKey (only a listed prose word after the scheme, "Basic authentication",
- *    stays; after the noun "Token" any short plain lowercase word does); credential-named key=value pairs (to the next
- *    delimiter), key: value pairs (to the end of the line), "key":"value" pairs,
- *    and key="value" XML or HTML attributes; and webhook services whose URL path is
- *    the secret. Nothing this module renders puts a credential word in front of a
- *    colon or an equals sign, so every fixed text survives the scrub.
+ * 1. A value inside a carrier is removed whatever its shape: the Authorization and
+ *    Proxy-Authorization header lines, keeping the scheme word the credentials follow
+ *    (Bearer, Basic, Digest, ...) and removing the one token after it, or the whole
+ *    parameter list after a Digest or AWS4-HMAC-SHA256 scheme; the Cookie and Set-Cookie
+ *    lines to the end of the line; the X-Api-Key, X-PAN-KEY, x-redlock-auth and similar
+ *    single-token header lines to the end of their first token; the userinfo of every
+ *    embedded URL, bare or with its slashes escaped by a stringify; credential-named
+ *    query and fragment pairs of every URL and bare query string (the PAN-OS key=
+ *    parameter included) and any query value shaped like a token; the schemes Bearer,
+ *    Basic, Digest, Token, OAuth, Negotiate, NTLM, SSWS, ApiKey, Splunk, Snowflake, and
+ *    AWS4-HMAC-SHA256 in any casing (only a listed prose word after the scheme, "Basic
+ *    authentication", or an auth-param name, Bearer realm=, stays; after the nouns
+ *    Token, OAuth, Splunk, and Snowflake any short plain lowercase word does);
+ *    credential-named key=value pairs (to the next delimiter, wherever the key starts:
+ *    after --, -D, or a path slash), key: value pairs (to the end of the line, or one
+ *    token after a path slash), --key value flags, "key":"value" pairs, and key="value"
+ *    XML or HTML attributes; the path and query of a URL under a webhook or
+ *    webhook_url key; and webhook services whose URL path is the secret. Nothing this
+ *    module renders puts a credential word in front of a colon or an equals sign, so
+ *    every fixed text survives the scrub.
  * 2. A configured secret (the Prisma Cloud access key ID and secret key, the PAN-OS
  *    API key, the keygen password, and the key keygen returns) is removed whatever
  *    its shape and in every encoded form (JSON-escaped, URL-encoded, form-encoded,
@@ -440,7 +463,8 @@ export const REDACTION_MARKER = "[REDACTED]";
  *    payload and every written file.
  *
  * Real token shapes are still removed bare: PEM blocks, JWTs, LUFRPT-prefixed
- * PAN-OS keys, AWS access key ids, and (in error text) any run of
+ * PAN-OS keys, AWS access key ids, GitHub, Stripe, and Slack prefixed tokens, and (in
+ * error text) any run of
  * LONG_TOKEN_MIN_LENGTH or more token characters that carries base64 symbols,
  * digits scattered through its letters (0f9e8d7c6b5a4938), or token casing
  * (Kq7Zx2Vw9Lm4Tp8R). The rule is path-safe: "/", ".", ":", "@", "=", and
@@ -467,35 +491,134 @@ const PEM_OPEN_PATTERN = /-----BEGIN ([A-Z0-9 ]+)-----(?:(?!-----END )[\s\S])*$/
 // ENCRYPTED PRIVATE KEY, RSA/EC/DSA/OPENSSH PRIVATE KEY, PGP PRIVATE KEY BLOCK) is a secret.
 const PUBLIC_PEM_LABELS = new Set(["CERTIFICATE", "TRUSTED CERTIFICATE", "X509 CRL", "CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY", "PKCS7", "CMS"]);
 // Any scheme-prefixed URL: the userinfo is dropped; its query and fragment pairs are
-// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay.
+// judged by the pair rule below, so the scheme, host, path, and ordinary pairs stay. The
+// userinfo ends where the authority does, at "/", "?", or "#", so an "@" inside a query or
+// fragment (https://h?e=a@x.com&token=..., https://h#f@x.com) is never read as userinfo: the
+// host stays "h", and the query is left to the pair rule and the origin reducer instead of
+// being carried on as if it were the host.
 const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
-const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s/@"'<>]+@/i;
+const URL_USERINFO_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)[^\s\/?#@"'<>\\]+@/i;
 // A query or fragment pair, in a URL or a bare query string: a credential-named pair or a
-// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, or the
-// ";" and "," that end a URL inside a sentence (no token carries either).
-const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>;,]+)/g;
+// token-shaped value loses the value. A value ends at "&", "#", whitespace, a quote, a
+// backslash (no token carries one; the escape after it, \" or \n inside a JSON string, is
+// kept so the string still parses and the text after it is still read), or the "," that
+// ends a URL inside a sentence. A ";" is part of the value, as URLSearchParams reads it
+// (?token=hunter2;restofsecret is one value and loses the whole of it); the ";" that ends a
+// pair belongs to the cookie and key-list header lines, which are read before this rule, so
+// a cookie pair whose name holds "&" or "#" goes with its cookie.
+// A quote with a value character on both sides (O'hunter2) is content of the value.
+const QUERY_PAIR_PATTERN = /([?&#])([A-Za-z0-9_.[\]-]+)=((?!\[REDACTED\])[^&#\s"'<>,\\]+(?:["'](?![:)}\]])[^&#\s"'<>,\\]+)*)/g;
 // A credential-bearing header line: the whole value goes, whatever its shape. The name and
-// separator are matched here and the value is consumed by headerValueEnd, which carries a
-// quoted value (double, single, or JSON-escaped quotes) through its closing quote, so
-// Cookie: sid="value" loses value and quotes together instead of stopping at the first
-// quote. A value that already opens with a marker is left alone so the rule is idempotent.
-const HEADER_LINE_PATTERN = /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)(["']?\s*:\s*)/gi;
+// separator are matched here (the name may be quoted as a JSON member name, with its quotes
+// escaped to any depth: "Cookie": ..., \"Cookie\": ..., \\\"Cookie\\\": ...) and the value
+// is consumed by headerValueEnd, which carries a quoted value through its closing quote at
+// the same depth, so Cookie: sid="value" loses value and quotes together instead of
+// stopping at the first quote, and ends an unquoted value before the next header on a
+// compound line, so the next header keeps its name. A value that already opens with a
+// marker is left alone so the rule is idempotent. The name starts where no word character
+// precedes it, or right after a JSON string escape left in place by one stringify (\n, \r,
+// \t, \b, \f, \v, \0, \uXXXX, \xHH): "request failed\nX-SecurityCenter: value" is a header
+// line inside a JSON string, and the escape letter is not part of the name that follows it.
+const HEADER_LINE_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv0]|\\u[0-9A-Fa-f]{4}|\\x[0-9A-Fa-f]{2}))(authorization|proxy-authorization|cookie|set-cookie|x-cookie|x-api-key|x-apikeys?|api-key|apikey|x-securitycenter|x-pan-key|x-redlock-auth|x-auth-token|x-access-token|x-amz-security-token|x-vault-token|private-token|x-goog-api-key|x-csrf-token|x-xsrf-token)((?:\\*["'])?\s*:\s*)/gi;
+// The escape letters that can sit between a backslash and the key or header name after it.
+const ESCAPE_LETTER_PATTERN = /^(?:[nrtbfv0]|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})/;
 // Inside a header value a quote opens a quoted segment only where a value can start: at the
-// start of the value or after "=", ":", ",", ";", "(", or whitespace. Anywhere else it is the
-// quote that closes the text the header line was quoted in.
+// start of the value or after "=", ":", ",", ";", "(", or whitespace. A quote with a token
+// character on both sides (sid=O'hunter2, my'pref=value, my"pref=value) is content of the
+// value, since RFC 6265 lets a cookie name or value carry an apostrophe. A quote anywhere
+// else, at the end of a token, is the quote that closes the text the header line was quoted
+// in.
 const HEADER_VALUE_OPENER_PATTERN = /[=:,;(\s]/;
+// What follows a quote that opens or closes something: whitespace, a delimiter, a closing
+// bracket, a tag, another quote, or an escape. Any other character continues the token.
+const QUOTE_BOUNDARY_PATTERN = /[\s,;:)}\]<>"'\\]/;
 const HEADER_VALUE_TERMINATOR_PATTERN = /[\r\n<>]/;
+// The "Name:" token of the next header after ";" or "," on a compound line (the name may be
+// quoted, as in a JSON object, with the quotes escaped to any depth, and may hold dots, as
+// X.Api.Key does when a proxy rewrites hyphens); a colon followed by "//" is a URL scheme,
+// not a header. The token is looked for within FOLLOWING_HEADER_LOOKAHEAD characters of the
+// separator.
+const FOLLOWING_HEADER_PATTERN = /^\s*(?:\\*["'])?[A-Za-z][A-Za-z0-9.-]*(?:\\*["'])?\s*:(?!\/\/)/;
+const FOLLOWING_HEADER_LOOKAHEAD = 96;
+// Header classes. An Authorization or Proxy-Authorization value opens with the scheme word
+// its credentials follow (Bearer, Basic, Digest, and the rest of AUTH_SCHEME_WORDS, in any
+// casing): the word stays as spelled and the one token (or one quoted string) after it
+// goes, so the operator still reads which scheme was replayed and prose after the token
+// stays; a parameter list after the scheme (Digest username=..., realm=...) goes whole, as
+// does a value that opens with anything else (a scheme word the list does not know, such
+// as GenieKey, SharedKey, or Bot, a bare token, a digit), to the end of the line: an
+// unknown first word may be a scheme with its credentials after it, so nothing after it
+// is trusted. A cookie header, or Tenable's X-ApiKeys (accessKey=...; secretKey=...), is
+// a list of pairs and goes whole. Every other header (X-Api-Key, X-Auth-Token,
+// X-Vault-Token, ...) carries one token: an unquoted value ends at the first whitespace,
+// so a JSON fragment or prose after it on the same line ({"status":"denied"}, "rejected")
+// is still read; a value that opens with a listed scheme word (X-Auth-Token: Bearer <v>)
+// is the word and the token after it together, and both go under the one marker, as the
+// scheme word is part of the value under any key but Authorization; a quoted value ends
+// at its closing quote whatever it holds.
+const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization"]);
+const LIST_VALUE_HEADERS = new Set(["cookie", "set-cookie", "x-cookie", "x-apikeys", "x-apikey"]);
+const AUTH_SCHEME_WORDS = new Set([
+  "basic", "bearer", "digest", "hoba", "mutual", "negotiate", "oauth", "scram-sha-1", "scram-sha-256", "vapid", "dpop", "gnap",
+  "privatetoken", "concealed", "ntlm", "token", "ssws", "apikey", "api-key", "splunk", "snowflake", "aws4-hmac-sha256",
+]);
+const AUTH_SCHEME_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)(?:\s+|$)/;
+// A header value the header rule already treated, as the pair rules then see it: the scheme
+// word and, after whitespace and an optional quote, the marker.
+const REDACTED_SCHEME_VALUE_PATTERN = /^([A-Za-z][A-Za-z0-9-]*)\s+((?:\\*["'])?)\[REDACTED\]/;
+const AUTH_PARAM_LIST_PATTERN = /^[A-Za-z][A-Za-z0-9_-]*=/;
 // A scheme and its credentials: the value is removed whatever its shape, except the
 // prose words that follow a scheme name in a sentence ("Basic authentication is
 // required", "Bearer token") and a Titlecase word, which makes the scheme name an
 // adjective in a title ("Basic Network Scan", "Bearer Token", "Token Hygiene"): a Basic
 // credential is base64 and a bearer token or API key carries digits, symbols, or token
-// casing, so neither is ever one capitalized word of letters. "Token" is also this
-// module's own noun ("Token hygiene", "token inventory"), so after it any plain
-// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. OAuth 1.0 carries its
-// credentials as key="value" attributes, which the attribute rule removes, so OAuth is
-// not a scheme here and "OAuth clients" stays.
-const SCHEME_VALUE_PATTERN = /\b(Bearer|Basic|Digest|Token|Negotiate|NTLM|SSWS|ApiKey|Api-Key)\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})/gi;
+// casing, so neither is ever one capitalized word of letters. "Token", "OAuth", "Splunk",
+// and "Snowflake" are also nouns of this module's own prose and of product names ("Token
+// hygiene", "OAuth clients", "Splunk index", "Snowflake account"), so after them any plain
+// lowercase word shorter than LONG_TOKEN_MIN_LENGTH is prose. An auth-param name before
+// "=" (Bearer realm="api", Digest qop="auth") is the challenge's grammar, not a credential;
+// the quoted value after it is judged by the attribute rule under its own name. A
+// parameter list that carries credentials is read whole by the parameter-list rule first.
+const SCHEME_WORD_SOURCE = "Bearer|Basic|Digest|Token|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
+const SCHEME_VALUE_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+((?!\[REDACTED\])[A-Za-z0-9._~+/=-]{4,})`, "gi");
+const NOUN_SCHEME_WORDS = new Set(["token", "oauth", "splunk", "snowflake"]);
+const AUTH_PARAM_PATTERN = /^([A-Za-z][A-Za-z0-9_-]*)=$/;
+const AUTH_PARAM_NAMES = new Set([
+  "realm", "error", "error_description", "error_uri", "scope", "charset", "nonce", "opaque", "qop", "algorithm", "stale", "domain",
+  "uri", "response", "cnonce", "nc", "username", "credential", "signedheaders", "signature", "oauth_consumer_key", "oauth_token",
+  "oauth_signature_method", "oauth_signature", "oauth_timestamp", "oauth_nonce", "oauth_version", "oauth_callback", "oauth_verifier",
+]);
+// A scheme word followed by a parameter list (name=value, name2=value2, ...) is the value of
+// an Authorization header wherever it appears, with the header name in front of it or
+// without one (Snowflake Token="<value>", Token token="<value>", nonce="...", Digest
+// username="...", realm="...", nonce="...", response="...", OAuth oauth_token="..."): the
+// word stays and the whole list goes, as it does under the header name. A list made only
+// of the parameters a challenge carries (the realm, the Bearer error fields, the Basic
+// charset, the Digest challenge fields: Bearer realm="api", error="invalid_token", a
+// WWW-Authenticate value) is a challenge and stays for the per-parameter rules; a list with
+// any other parameter (Token, token, key, username, uri, response, oauth_token, ...) is the
+// credential side of its scheme. The list is read by readAuthParameterList.
+const CHALLENGE_PARAM_NAMES = new Set(["realm", "error", "error_description", "error_uri", "scope", "charset", "domain", "nonce", "opaque", "stale", "algorithm", "qop", "userhash"]);
+// The parameters that carry the proof of a credential: the Digest response, a signature
+// (oauth_signature, signature, sig), or a MAC. A proof's value goes whatever its shape, in
+// a list after a scheme word or in one without a scheme word.
+const PROOF_PARAM_NAMES = new Set(["response", "signature", "oauth_signature", "mac", "sig"]);
+// A parameter list without a scheme word (realm="api", nonce="n", response="<proof>": the
+// value of a www_authenticate field, or a credential echoed without its scheme word) is an
+// auth parameter list when it holds two or more parameters and one of them, other than a
+// proof, is a known auth parameter (a challenge parameter, or username, uri, nc, cnonce, an
+// oauth_* parameter). In such a list, or in the list after a scheme word, a proof goes and a
+// challenge parameter keeps its value: the nonce of a challenge is public, so a proof-free
+// challenge (Digest realm="api", qop="auth", nonce="n") keeps every value, while a list
+// that carries a proof is not a challenge, whatever parameters open it. Any other parameter
+// (username, oauth_token) is judged under its own name, and a lone name=value pair is no
+// list. A list opens at a name that no word character precedes.
+const AUTH_PARAMETER_LIST_OPENER_PATTERN = /(?<![A-Za-z0-9_.:-])[A-Za-z][A-Za-z0-9_-]*=/g;
+const SCHEME_LED_LIST_PATTERN = new RegExp(String.raw`\b(?:${SCHEME_WORD_SOURCE})\s+$`, "i");
+const SCHEME_PARAMETER_LIST_PATTERN = new RegExp(String.raw`\b(${SCHEME_WORD_SOURCE})\s+(?=[A-Za-z][A-Za-z0-9_-]*=)`, "gi");
+const AUTH_PARAM_ITEM_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)=/y;
+const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'\\<>]+/y;
+const AUTH_PARAM_SEPARATOR_PATTERN = /\s*,\s*/y;
 const PLAIN_WORD_PATTERN = /^[a-z]+$/;
 const TITLE_WORD_PATTERN = /^[A-Z][a-z]{1,19}$/;
 const SCHEME_PROSE_WORDS = new Set([
@@ -513,18 +636,81 @@ const SCHEME_PROSE_WORDS = new Set([
 // Keys may start with "_" (_upstream_session, _token), so a key begins wherever no key
 // character precedes it rather than at a word boundary.
 const JSON_QUOTED_PAIR_PATTERN = /"([A-Za-z_][A-Za-z0-9_.-]{0,63})"(\s*:\s*)"((?!\[REDACTED\])[^"\r\n]+)"/g;
-const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(["'])((?!\[REDACTED\])[^"'\r\n]+)\2/g;
+// The same pair inside a JSON text that was itself stringified into a string value, so its
+// quotes arrive behind a run of backslashes (\" one level down, \\\" two levels down): the
+// run is captured and the pair's four quotes must all carry it, so the value ends at the
+// quote of its own depth.
+const JSON_ESCAPED_PAIR_PATTERN = /(\\+)"([A-Za-z_][A-Za-z0-9_.-]{0,63})\1"(\s*:\s*)\1"((?!\[REDACTED\])(?:(?!\1")[^\r\n])+?)\1"/g;
+// A quoted attribute or pair value: the quote may be escaped to any depth, and the value
+// ends at the quote of its own depth.
+// A quote with a value character on both sides (O'hunter2) is content of the value.
+const QUOTED_ATTRIBUTE_PATTERN = /(?<![A-Za-z0-9_.:-])([A-Za-z_][A-Za-z0-9_.:-]{0,63})\s*=\s*(\\*["'])((?!\[REDACTED\])(?:[^"'\r\n]|["'](?=[^\s"'\r\n<>;,&:)}\]\\]))+)\2/g;
 // An unquoted pair: key=value runs to the next delimiter, key: value (a header or
 // YAML-style line) to the end of the line, where a brace or bracket ends it so a JSON
 // structure after a credential-named key (compact "password":{...}, "auth":null}) is
-// never taken for a value.
-const ASSIGNMENT_KEY_PATTERN = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,63})(["']?\s*([:=])\s*["']?)/g;
-const DELIMITED_VALUE_PATTERN = /(?!\[REDACTED\])[^\s"'<>;,&]+/y;
-const LINE_VALUE_PATTERN = /(?!\[REDACTED\])[^\r\n<>"',;{}[\]]*[^\s\r\n<>"',;{}[\]]/y;
-const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])[^\s"'<>]+/gi;
+// never taken for a value. The key and the value may be quoted with the quotes escaped to
+// any depth; a value never runs into the escaped quote that closes it. A key starts where
+// no word character precedes it: after the "--" of a command-line flag (--password=v), the
+// "-D" of a Java system property (-Dpassword=v, where the D is read as part of the key and
+// the credential word is still its tail), a "/" path separator, or a "." (the tail of a
+// dotted name is scanned only when no key match started earlier on the name); or right
+// after a \0 escape, whose digit cannot start a key (the letter escapes, \n and the rest,
+// are read as part of the key and removed by keyAfterEscape).
+const ASSIGNMENT_KEY_PATTERN = /(?:(?<![A-Za-z0-9_])|(?<=\\0))((?:\\*["'])?)([A-Za-z_][A-Za-z0-9_.-]{0,63})((?:\\*["'])?\s*([:=])\s*(?:\\*["'])?)/g;
+// The escape one stringify leaves for a control character: \n, \r, \t, \b, \f, \v, \0, or a
+// \uXXXX or \xHH code of a control (U+0000 to U+001F, U+007F, and the line and paragraph
+// separators U+2028 and U+2029). An escape of a printable character (\u00e9) is content.
+const ESCAPED_CONTROL_SOURCE = String.raw`\\(?:[nrtbfv0]|u(?:00[01][0-9a-fA-F]|007[fF]|202[89])|x(?:[01][0-9a-fA-F]|7[fF]))`;
+// A credential name after "--" with its value as the next argument (psql --password value):
+// the flag starts where no word character or "-" precedes it (at the start of a quoted
+// command line too), its name may open with a letter or an underscore (a cookie name such as
+// _zendesk_session is a credential name too), and the value is the one token after it, never
+// another flag, ending where an unquoted pair value does.
+const FLAG_VALUE_PATTERN = new RegExp(String.raw`(?<![A-Za-z0-9_-])--([A-Za-z_][A-Za-z0-9_.-]{0,63})([ \t]+)((?!\[REDACTED\])(?!-)(?:(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&])+)`, "g");
+// After a credential-named path segment and ":" (kv/password: value) the value is at most
+// one token. A singular label (password, token, key) takes that token whatever its shape
+// and whatever follows it (/etc/app/password: <value> was rejected); a plural label names a
+// collection (/api/v1/api-tokens: request failed with 403), so prose after the token means
+// there was no value, while a lone token after a plural label is one.
+const PROSE_CONTINUATION_PATTERN = /^[ \t]+[A-Za-z]/;
+// A key whose last word is a plural credential word, in the segment split (api-tokens, keys,
+// oauth_tokens) or concatenated (apikeys, sshkeys).
+const PLURAL_CREDENTIAL_LABEL_PATTERN = /(?:token|secret|key|cookie|password|credential|passphrase|signature|session)s$/;
+// The "-D" of a Java system property (java -Dkey=value) is not part of the key.
+const JAVA_PROPERTY_PREFIX_PATTERN = /(?:^|\s)-$/;
+// A delimited (key=value) value ends at whitespace or a control character, raw or left
+// escaped by one stringify (\n, \r, \t, \b, \f, \v, \0, \u0009 and the other \u00XX control
+// codes, \x09), as an unquoted header token does, so a pair or header chained after the
+// escape (api_key=<v>\tpassword: <v>) is read on its own and loses its own value. A key:
+// value line ends at a line break only, raw or escaped (\n, \r, \u000a, \u000d), as the raw
+// line does, so the header or pair on the next escaped line is read on its own.
+// A quote with a value character on both sides (O'hunter2, my'pref) is content of the value;
+// a quote at the end of a token, or an escaped quote, ends it, as does a value's first quote.
+const DELIMITED_VALUE_PATTERN = new RegExp(String.raw`(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!${ESCAPED_CONTROL_SOURCE})[^\s\x00-\x1f\x7f"'<>;,&]|["'](?=[^\s"'<>;,&:)}\]\\]))+`, "y");
+const LINE_VALUE_PATTERN = /(?!\[REDACTED\])(?!["'])(?:(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\r\n<>"',;{}[\]]|["'](?=[^\s\r\n<>"',;{}[\]:)\\]))*(?!\\+["'])(?!\\(?:[nr]|u000[adAD]|x0[adAD]))[^\s\r\n<>"',;{}[\]]/y;
+const TOKEN_IN_PATH_WEBHOOK_PATTERN = /(https?:\/\/(?:hooks\.slack\.com\/services|discord(?:app)?\.com\/api\/webhooks|[a-z0-9.-]*webhook\.office\.com\/webhookb2)\/)(?!\[REDACTED\])(?:[^\s"'<>\\]|["'](?=[^\s"'<>\\,;:)}\]]))+/gi;
+// A URL whose slashes arrive escaped by a stringify (https:\/\/user:secret@host\/path): the
+// userinfo goes as it does from a bare URL and ends at the same "/", "?", or "#"; the query
+// pairs are read by the pair rule.
+const SLASH_ESCAPED_URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\\\/\\\/)[^\s\/?#@"'<>\\]+@/gi;
+// A key naming a webhook URL: the incoming webhooks of Slack, Discord, Teams, and PagerDuty
+// carry their token in the path or query, so under webhook, webhook_url, webhookUrl, or
+// WEBHOOK_URL a URL value keeps its scheme and host only, whatever the host. webhook_count,
+// webhook_id, and webhook_name are not URL-valued and stay; a webhook key whose value is not
+// a URL (a name, an id) stays too.
+const WEBHOOK_URL_TAIL_WORDS = new Set(["url", "uri", "endpoint", "address", "link"]);
+const URL_VALUE_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
+const WEBHOOK_VALUE_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/iy;
+const URL_ORIGIN_PATTERN = /^([a-z][a-z0-9+.-]*:\/\/)(?:[^/?#@]*@)?([^/?#]*)/i;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)*/g;
 const PANOS_API_KEY_PATTERN = /\bLUFRPT[A-Za-z0-9+/=_-]{16,}/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|APKA|ABIA|ACCA)[A-Z0-9]{16}\b/g;
+// Vendor token prefixes that name a credential on their own, on both sides: GitHub (ghp_,
+// gho_, ghu_, ghs_, ghr_, github_pat_), Stripe (sk_live_, sk_test_, rk_live_, rk_test_), and
+// Slack (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxe-, xoxo-).
+const GITHUB_TOKEN_PATTERN = /\b(?:gh[oprsu]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})/g;
+const STRIPE_KEY_PATTERN = /\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g;
+const SLACK_TOKEN_PATTERN = /\bxox[abeoprs]-[A-Za-z0-9-]{10,}/g;
 const LONG_TOKEN_RUN_PATTERN = /[A-Za-z0-9+_-]{16,}(?:={1,2}(?![A-Za-z0-9&]))?/g;
 const TOKEN_VALUE_PATTERN = /^[A-Za-z0-9+_-]{16,}={0,2}$/;
 const UPPERCASE_CODE_PATTERN = /^[A-Z][A-Z_]*$|^[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+$/;
@@ -560,13 +746,19 @@ const ASSIGNMENT_ONLY_CREDENTIAL_WORDS = new Set(["pass"]);
 // JSON structure and literals after a key are never a credential value.
 const STRUCTURAL_VALUE_PATTERN = /^(?:[{[]|\{\}|\[\]|true|false|null)$/;
 // A bare integer under a plural credential word ("oauth_tokens": 1, keys=3, secrets: 0) is
-// a count, this module's own summary vocabulary, not a credential.
+// a count, this module's own summary vocabulary, not a credential; the digits end at
+// whitespace, raw or left escaped by a stringify (keys: 3\tcookies: 0), or at the end.
 const PLURAL_CREDENTIAL_WORDS = new Set(["tokens", "secrets", "keys", "cookies", "passwords", "credentials"]);
-const COUNT_VALUE_PATTERN = /^\d+(?:\s|$)/;
+const COUNT_VALUE_PATTERN = new RegExp(String.raw`^\d+(?:\s|${ESCAPED_CONTROL_SOURCE}|$)`);
 // "code" names a credential only behind one of these words (registration_code,
 // activation_code, authorization_code, recovery_code); status_code, error_code, and
 // country_code stay evidence.
 const CREDENTIAL_CODE_QUALIFIERS = new Set(["registration", "activation", "linking", "auth", "authorization", "access", "verification", "recovery", "backup", "security", "mfa", "otp", "pairing", "enrollment", "license"]);
+// A secret id or token id is the bearer credential itself (a Vault AppRole secret_id, an
+// API token_id, roleSecretId), unlike client_id, tenant_id, key_id, or access_key_id, which
+// name a public identifier; secret_id_ttl, secret_id_accessor, and token_accessor end in a
+// setting word and stay. The qualifier is tested by its tail so -Dsecret_id is read too.
+const BEARER_ID_QUALIFIER_PATTERN = /(?:secret|token)$/;
 
 function credentialKeyWord(segment: string): boolean {
   return CREDENTIAL_KEY_WORDS.has(segment) || CREDENTIAL_KEY_SUFFIX_PATTERN.test(segment);
@@ -585,8 +777,27 @@ export function isCredentialKey(key: string): boolean {
   if (last === undefined || BOUND_KEY_SEGMENTS.has(words[0])) return false;
   if ((last === "key" || last === "keys") && words.length > 1 && NON_CREDENTIAL_KEY_QUALIFIERS.has(words[words.length - 2])) return false;
   if (last === "code" || last === "codes") return words.length > 1 && CREDENTIAL_CODE_QUALIFIERS.has(words[words.length - 2]);
+  if (last === "id") return words.length > 1 && BEARER_ID_QUALIFIER_PATTERN.test(words[words.length - 2]);
+  // A connection string (connection_string, connectionString, DB_CONNECTION_STRING) embeds
+  // the password of the account it connects as.
+  if (last === "string" && words[words.length - 2] === "connection") return true;
   if (credentialKeyWord(last)) return true;
   return CREDENTIAL_VALUE_FORM_WORDS.has(last) && words.slice(0, -1).some(credentialKeyWord);
+}
+
+/** True when a key names a webhook URL whose path and query carry the webhook's token. */
+function isWebhookUrlKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  if (last === "webhook") return true;
+  return last !== undefined && WEBHOOK_URL_TAIL_WORDS.has(last) && words[words.length - 2] === "webhook";
+}
+
+// The URL under a webhook key with its userinfo, path, query, and fragment replaced: the
+// scheme and host stay, so the destination is still read.
+function redactedWebhookUrl(url: string): string {
+  const origin = URL_ORIGIN_PATTERN.exec(url);
+  return `${origin ? `${origin[1]}${origin[2]}` : ""}/${REDACTION_MARKER}`;
 }
 
 // True for a value that opens with a bare integer under a plural credential word: a count,
@@ -595,6 +806,14 @@ function isCountValue(key: string, value: string): boolean {
   if (!COUNT_VALUE_PATTERN.test(value)) return false;
   const words = keyWords(key);
   return words.length > 0 && PLURAL_CREDENTIAL_WORDS.has(words[words.length - 1]);
+}
+
+// True for a key whose last word is a plural credential word (api-tokens, keys, apikeys): a
+// collection, so as a path label it is a pair only when a lone token follows.
+function isPluralCredentialKey(key: string): boolean {
+  const words = keyWords(key);
+  const last = words[words.length - 1];
+  return last !== undefined && (PLURAL_CREDENTIAL_WORDS.has(last) || PLURAL_CREDENTIAL_LABEL_PATTERN.test(last));
 }
 
 /** isCredentialKey plus the words that name a credential only in a query string or = assignment. */
@@ -650,14 +869,17 @@ function isTokenShapedValue(value: string): boolean {
   return TOKEN_VALUE_PATTERN.test(value) && looksLikeToken(value);
 }
 
-// The word after a scheme name is prose when it is a Titlecase word, a plain lowercase
-// word from the list above, or, after "Token", any plain lowercase word too short to be
-// a real token.
+// The word after a scheme name is prose when it is a Titlecase word, an auth-param name
+// before its "=", a plain lowercase word from the list above, or, after a noun scheme
+// word (Token, OAuth, Splunk, Snowflake), any plain lowercase word too short to be a real
+// token.
 function isSchemeProse(scheme: string, value: string): boolean {
   if (TITLE_WORD_PATTERN.test(value)) return true;
+  const authParam = AUTH_PARAM_PATTERN.exec(value);
+  if (authParam) return AUTH_PARAM_NAMES.has(authParam[1].toLowerCase());
   if (!PLAIN_WORD_PATTERN.test(value)) return false;
   if (SCHEME_PROSE_WORDS.has(value)) return true;
-  return scheme.toLowerCase() === "token" && value.length < LONG_TOKEN_MIN_LENGTH;
+  return NOUN_SCHEME_WORDS.has(scheme.toLowerCase()) && value.length < LONG_TOKEN_MIN_LENGTH;
 }
 
 function isPublicPemLabel(label: string): boolean {
@@ -686,60 +908,293 @@ function scrubUrlUserinfo(url: string): string {
   return url.replace(URL_USERINFO_PATTERN, `$1${REDACTION_MARKER}@`);
 }
 
-// Where the value of a header line that starts at start ends: at the end of the line, at an
-// HTML tag, or at the quote that closes the text the line sits in. A quoted segment
-// ("value", 'value') is carried through its closing quote on the same line; a JSON-escaped
-// quote (\") is content, and once one has been seen the next unescaped quote closes the JSON
-// string the header line is embedded in. Trailing whitespace is not part of the value.
-function headerValueEnd(text: string, start: number): number {
+// The run of backslashes at index.
+function backslashRun(text: string, index: number): number {
+  let run = 0;
+  while (text[index + run] === "\\") run += 1;
+  return run;
+}
+
+// The quote token at index: a bare quote, or a quote behind the odd run of backslashes that
+// JSON escaping puts before it at some nesting depth (\" one level down, \\\" two levels
+// down, and so on). An even run escapes backslashes and leaves the quote bare, so it is no
+// token here; the caller steps over the run and reads the quote on its own.
+function quoteTokenAt(text: string, index: number): string | undefined {
+  const run = backslashRun(text, index);
+  const quote = text[index + run];
+  if ((quote !== '"' && quote !== "'") || (run > 0 && run % 2 === 0)) return undefined;
+  return text.slice(index, index + run + 1);
+}
+
+// True when the quote token at index sits inside a token, a value character before it and
+// another after it, so it is content of the value and neither opens nor closes a segment.
+function midTokenQuoteAt(text: string, index: number, tokenLength: number): boolean {
+  const before = text[index - 1];
+  const after = text[index + tokenLength];
+  if (before === undefined || after === undefined) return false;
+  if (HEADER_VALUE_OPENER_PATTERN.test(before) || before === '"' || before === "'" || before === "\\") return false;
+  return !QUOTE_BOUNDARY_PATTERN.test(after);
+}
+
+// True when the quote token at index, though a value could start there, is followed by
+// nothing a quoted value starts with (whitespace, a delimiter, a bracket, a tag, or the
+// end of the text): it is the quote closing the enclosing text, as after a base64 value
+// that ends in "=" (Basic dXNlcjpwYXNz=","code":401), not one opening a segment.
+function closingQuoteAfterOpener(text: string, index: number, tokenLength: number): boolean {
+  const after = text[index + tokenLength];
+  return after === undefined || /[\s,;:)}\]<>]/.test(after);
+}
+
+// The first line end or HTML tag at or after start, or the end of the text.
+function lineEndFrom(text: string, start: number): number {
+  const terminator = HEADER_VALUE_TERMINATOR_PATTERN.exec(text.slice(start));
+  return terminator ? start + terminator.index : text.length;
+}
+
+// The control characters the one-letter escapes stand for.
+const CONTROL_ESCAPE_LETTERS = new Map<string, number>([["n", 0x0a], ["r", 0x0d], ["t", 0x09], ["b", 0x08], ["f", 0x0c], ["v", 0x0b], ["0", 0x00]]);
+
+// True for the code of a control character: U+0000 to U+001F, U+007F, or the line and
+// paragraph separators U+2028 and U+2029.
+function isControlCode(code: number): boolean {
+  return code <= 0x1f || code === 0x7f || code === 0x2028 || code === 0x2029;
+}
+
+// The code of the control character an escape at index stands for (\n, \r, \t, \b, \f, \v,
+// \0, \uXXXX, or \xHH behind an odd run of backslashes, as one stringify leaves it), or -1
+// when the text at index is no such escape: an even run escapes backslashes, and the escape
+// of a printable character (\u00e9) is content.
+function escapedControlCodeAt(text: string, index: number): number {
+  const run = backslashRun(text, index);
+  if (run === 0 || run % 2 === 0) return -1;
+  const letter = text[index + run];
+  if (letter === undefined) return -1;
+  const simple = CONTROL_ESCAPE_LETTERS.get(letter);
+  if (simple !== undefined) return simple;
+  const digits = letter === "u" ? 4 : letter === "x" ? 2 : 0;
+  if (digits === 0) return -1;
+  const hex = text.slice(index + run + 1, index + run + 1 + digits);
+  if (hex.length !== digits || !/^[0-9a-f]+$/i.test(hex)) return -1;
+  const code = parseInt(hex, 16);
+  return isControlCode(code) ? code : -1;
+}
+
+// True at a line break left escaped by one stringify (\n, \r, \u000a, \u000d, \x0a, \x0d): a
+// line end for an unquoted header value, as the raw character is.
+function escapedLineBreakAt(text: string, index: number): boolean {
+  const code = escapedControlCodeAt(text, index);
+  return code === 0x0a || code === 0x0d;
+}
+
+// Where the unquoted token that starts at start ends: at the first whitespace or raw control
+// character, at a control the stringify left escaped (\t, \u0009, \f, \b, and a line break
+// among them), or at limit. A token never carries a control, so the pair or header chained
+// after the escape is read on its own.
+function unquotedTokenEnd(text: string, start: number, limit: number): number {
   let index = start;
-  let escapedQuotes = false;
-  while (index < text.length) {
+  while (index < limit) {
     const char = text[index];
-    if (HEADER_VALUE_TERMINATOR_PATTERN.test(char)) break;
-    if (char === "\\" && (text[index + 1] === '"' || text[index + 1] === "'")) {
-      escapedQuotes = true;
-      index += 2;
+    if (/\s/.test(char) || isControlCode(char.charCodeAt(0))) break;
+    if (char === "\\") {
+      if (escapedControlCodeAt(text, index) !== -1) break;
+      index += backslashRun(text, index);
       continue;
     }
-    if (char === '"' || char === "'") {
-      if (escapedQuotes || (index > start && !HEADER_VALUE_OPENER_PATTERN.test(text[index - 1]))) break;
-      const close = text.indexOf(char, index + 1);
-      const segment = text.slice(index + 1, close === -1 ? text.length : close);
-      if (close !== -1 && !HEADER_VALUE_TERMINATOR_PATTERN.test(segment)) {
-        index = close + 1;
-        // A value that is one quoted string ends with its closing quote.
-        if (index - segment.length - 2 === start) return index;
-        continue;
-      }
-    }
     index += 1;
+  }
+  return index;
+}
+
+// The key without the escape letter in front of it: after an escaping backslash the letter
+// belongs to the escape (\napi_key is a newline and then api_key), not to the key. Only the
+// credential test uses the result; the text itself is left as it arrived.
+function keyAfterEscape(text: string, keyStart: number, key: string): string {
+  let run = 0;
+  while (keyStart - 1 - run >= 0 && text[keyStart - 1 - run] === "\\") run += 1;
+  if (run % 2 === 0) return key;
+  const letter = ESCAPE_LETTER_PATTERN.exec(key);
+  return letter ? key.slice(letter[0].length) : key;
+}
+
+// The index of the token that closes a quoted segment opened with token, before limit, or
+// -1. A token inside a token (sid="O'hunter2") is content of the segment, as is a token at a
+// deeper depth (more backslashes); a token nearer the surface closes the text the segment
+// sits in, so the segment is unterminated.
+function closingQuoteIndex(text: string, from: number, token: string, limit: number): number {
+  let index = from;
+  while (index < limit) {
+    const candidate = quoteTokenAt(text, index);
+    if (candidate === undefined) {
+      index += text[index] === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (midTokenQuoteAt(text, index, candidate.length)) {
+      index += candidate.length;
+      continue;
+    }
+    if (candidate === token) return index;
+    if (candidate.length < token.length) return -1;
+    index += candidate.length;
+  }
+  return -1;
+}
+
+// Where the value of a header line that starts at start ends. A value that opens with a
+// quote token ends at the token that closes it on the same line, whatever it carries (a
+// "; Name:" inside a quoted cookie is content); when nothing closes it, the quote is content
+// and the value ends as an unquoted one does. An unquoted value ends at the end of the line,
+// at an HTML tag, at the ";" or "," before the "Name:" token of the next header on a
+// compound line (on "Cookie: sid=value; X-PAN-KEY: value" the next header keeps its name
+// and gets its own carrier treatment, and a Content-Type or Date after a cookie keeps its
+// name and value), at a line break left escaped inside a JSON string (\n, \r, \u000a), or
+// at the quote that closes the text the line sits in. Inside an unquoted value a quote
+// where a value can start opens a quoted segment carried through its closing token; a
+// quote inside a token (sid=O'hunter2, my'pref=value) is content; a quote at the end of a
+// token, or one after "=" that only a delimiter or the end follows (sid=abc==",), closes
+// the enclosing text. Trailing whitespace is not part of the value.
+function headerValueEnd(text: string, start: number): number {
+  const limit = lineEndFrom(text, start);
+  const opening = quoteTokenAt(text, start);
+  if (opening !== undefined) {
+    const close = closingQuoteIndex(text, start + opening.length, opening, limit);
+    if (close !== -1) return close + opening.length;
+  }
+  let index = opening === undefined ? start : start + opening.length;
+  while (index < limit) {
+    const char = text[index];
+    if ((char === ";" || char === ",") && FOLLOWING_HEADER_PATTERN.test(text.slice(index + 1, index + 1 + FOLLOWING_HEADER_LOOKAHEAD))) break;
+    if (char === "\\" && escapedLineBreakAt(text, index)) break;
+    const token = quoteTokenAt(text, index);
+    if (token === undefined) {
+      index += char === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (!HEADER_VALUE_OPENER_PATTERN.test(text[index - 1])) {
+      if (!midTokenQuoteAt(text, index, token.length)) break;
+      index += token.length;
+      continue;
+    }
+    if (closingQuoteAfterOpener(text, index, token.length)) break;
+    const close = closingQuoteIndex(text, index + token.length, token, limit);
+    index = close === -1 ? index + token.length : close + token.length;
   }
   while (index > start && /\s/.test(text[index - 1])) index -= 1;
   return index;
 }
 
-// The quote a header value is wrapped in as a whole, or "" when it is not one quoted string.
-// JSON-escaped quotes are content of the string the line sits in and go with the value.
+// The quote token a header value is wrapped in as a whole (bare or escaped to any depth), or
+// "" when it is not one quoted string.
 function enclosingQuote(value: string): string {
-  return value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0] ? value[0] : "";
+  const token = quoteTokenAt(value, 0);
+  return token !== undefined && value.length >= token.length * 2 && value.endsWith(token) ? token : "";
 }
 
-// Every credential-bearing header line loses its value whatever the value's shape; a value
-// that is one quoted string keeps its quotes around the marker so quoted text stays quoted.
+// True for an Authorization pair whose value reads "Bearer [REDACTED]" or the like: the header
+// rule already treated it, and the pair rules leave the scheme word standing. Under any other
+// credential-named key the scheme word is part of the value and goes with it.
+function keepsSchemeWord(key: string, value: string): boolean {
+  if (!AUTHORIZATION_HEADERS.has(key.toLowerCase())) return false;
+  const scheme = REDACTED_SCHEME_VALUE_PATTERN.exec(value);
+  return scheme !== null && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase());
+}
+
+// The listed scheme word a header value opens with, when a token follows it, or undefined:
+// for a bare scheme word, a word the list does not know, or a value that opens with anything
+// but a word.
+function leadingSchemeWord(value: string): RegExpExecArray | undefined {
+  const scheme = AUTH_SCHEME_PATTERN.exec(value);
+  if (!scheme || scheme[0].length === value.length || !AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) return undefined;
+  return scheme;
+}
+
+// Where the credentials after a scheme word end, credentialsStart being the index after the
+// word and the whitespace behind it: a parameter list (username=..., realm=...) runs to end,
+// a quoted string to the quote that closes it (or to end when nothing does), and a bare
+// token to its first whitespace or escaped control.
+function schemeCredentialsEnd(text: string, credentialsStart: number, end: number): number {
+  const credentials = text.slice(credentialsStart, end);
+  if (AUTH_PARAM_LIST_PATTERN.test(credentials)) return end;
+  const quote = quoteTokenAt(credentials, 0);
+  if (quote !== undefined) {
+    const close = closingQuoteIndex(text, credentialsStart + quote.length, quote, end);
+    return close === -1 ? end : close + quote.length;
+  }
+  return unquotedTokenEnd(text, credentialsStart, end);
+}
+
+// Where the value of a single-token header ends: an unquoted value at its first whitespace
+// or escaped control, a quoted one where headerValueEnd put it. A value that opens with a
+// listed scheme word and a token (X-Auth-Token: Bearer <token>) is the word and the
+// credentials after it, as it would be under Authorization, so the token is never left
+// standing after the marker.
+function singleTokenEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme !== undefined) return schemeCredentialsEnd(text, start + scheme[0].length, end);
+  return unquotedTokenEnd(text, start, end);
+}
+
+// Where an Authorization value ends: after the listed scheme word and the one token (or one
+// quoted string) of credentials that follows it, so prose after the token on a free-text
+// line stays; a parameter list after the scheme (Digest username=..., realm=...) goes to the
+// end of the line, as does a value quoted as a whole, a bare scheme word, and a value that
+// opens with anything but a listed scheme word (GenieKey <token>, SharedKey account:<sig>,
+// a bare token): the first word may be a scheme the list does not know, with its credentials
+// after it, so the whole line goes.
+function authorizationValueEnd(text: string, start: number, end: number): number {
+  const value = text.slice(start, end);
+  if (enclosingQuote(value) !== "") return end;
+  const scheme = leadingSchemeWord(value);
+  if (scheme === undefined) return end;
+  return schemeCredentialsEnd(text, start + scheme[0].length, end);
+}
+
+// The replacement for a header value, or undefined when nothing is left to remove: the value
+// already opens with the marker (bare, inside its quotes, or after its scheme word), or an
+// Authorization value is a bare scheme word with no credentials after it. An Authorization
+// value keeps its scheme word as spelled; the credentials after it go whole, inside their own
+// quotes when they were quoted (Bearer "value" becomes Bearer "[REDACTED]"). A value that is
+// one quoted string keeps its quotes around the replacement so quoted text stays quoted.
+function redactedHeaderValue(header: string, value: string): string | undefined {
+  const quote = enclosingQuote(value);
+  const inner = quote === "" ? value : value.slice(quote.length, value.length - quote.length);
+  if (inner.startsWith(REDACTION_MARKER)) return undefined;
+  if (AUTHORIZATION_HEADERS.has(header)) {
+    const scheme = AUTH_SCHEME_PATTERN.exec(inner);
+    if (scheme && AUTH_SCHEME_WORDS.has(scheme[1].toLowerCase())) {
+      const credentials = inner.slice(scheme[0].length);
+      if (credentials.length === 0) return undefined;
+      const credentialQuote = enclosingQuote(credentials);
+      if (credentials.slice(credentialQuote.length).startsWith(REDACTION_MARKER)) return undefined;
+      return `${quote}${scheme[1]} ${credentialQuote}${REDACTION_MARKER}${credentialQuote}${quote}`;
+    }
+  }
+  return `${quote}${REDACTION_MARKER}${quote}`;
+}
+
+// Every credential-bearing header line loses its credentials whatever their shape, by the
+// header's class: an Authorization value keeps its listed scheme word and loses the token
+// after it (or its whole parameter list), or goes whole when it opens with anything else; a
+// cookie or key list goes whole; and a single-token header loses its first token, or the
+// listed scheme word and the token after it when it opens with one. On a compound line each
+// header is its own line: the value of one ends before the name of the next, which is then
+// matched and treated on its own.
 function scrubHeaderLines(text: string): string {
   HEADER_LINE_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = HEADER_LINE_PATTERN.exec(text)) !== null) {
+    const header = match[1].toLowerCase();
     const start = match.index + match[0].length;
-    const end = headerValueEnd(text, start);
+    const lineEnd = headerValueEnd(text, start);
+    const end = LIST_VALUE_HEADERS.has(header) ? lineEnd : AUTHORIZATION_HEADERS.has(header) ? authorizationValueEnd(text, start, lineEnd) : singleTokenEnd(text, start, lineEnd);
     const value = text.slice(start, end);
-    if (value.length === 0 || value.startsWith(REDACTION_MARKER)) continue;
-    const quote = enclosingQuote(value);
-    if (value.slice(quote.length).startsWith(REDACTION_MARKER)) continue;
-    out += `${text.slice(last, start)}${quote}${REDACTION_MARKER}${quote}`;
+    if (value.length === 0) continue;
+    const replacement = redactedHeaderValue(header, value);
+    if (replacement === undefined) continue;
+    out += `${text.slice(last, start)}${replacement}`;
     last = end;
     HEADER_LINE_PATTERN.lastIndex = end;
   }
@@ -748,39 +1203,249 @@ function scrubHeaderLines(text: string): string {
 
 // The key and separator are matched on their own and the value is consumed only when the
 // key names a credential, so the value of an ordinary pair is rescanned and a credential
-// pair nested inside it (data=token=...) is still caught.
+// pair nested inside it (data=token=...) is still caught. A value the scheme rule already
+// reduced to "<scheme> [REDACTED]" keeps its scheme word under an Authorization key and loses
+// it under any other credential key, where the scheme word was the start of the value. A
+// colon-terminated key that ends a path segment is a label whose value is at most one token:
+// a singular label (/etc/app/password: <value> was rejected) takes that token whatever its
+// shape and whatever follows, and a plural label (/api/v1/api-tokens: request failed) takes
+// it only when no prose continues after it, since prose means there was no value at all; an
+// escaped slash (\/) before the key is a line break, not a path.
 function replaceCredentialAssignments(text: string): string {
+  const fates = authParameterFates(text);
   ASSIGNMENT_KEY_PATTERN.lastIndex = 0;
   let out = "";
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = ASSIGNMENT_KEY_PATTERN.exec(text)) !== null) {
     const [whole, openingQuote, key, separator, operator] = match;
-    if (!(operator === "=" ? isCredentialAssignmentKey(key) : isCredentialKey(key))) continue;
-    const valuePattern = operator === ":" ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
-    valuePattern.lastIndex = match.index + whole.length;
+    if (operator === "=" && fates.get(match.index + openingQuote.length) === "challenge") continue;
+    const spelledName = keyAfterEscape(text, match.index + openingQuote.length, key);
+    const name = openingQuote === "" && spelledName.startsWith("D") && JAVA_PROPERTY_PREFIX_PATTERN.test(text.slice(Math.max(0, match.index - 2), match.index)) ? spelledName.slice(1) : spelledName;
+    const valueStart = match.index + whole.length;
+    if (isWebhookUrlKey(name)) {
+      WEBHOOK_VALUE_PATTERN.lastIndex = valueStart;
+      const url = WEBHOOK_VALUE_PATTERN.exec(text)?.[0];
+      if (url === undefined) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedWebhookUrl(url)}`;
+      last = valueStart + url.length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
+    if (!(operator === "=" ? isCredentialAssignmentKey(name) : isCredentialKey(name))) continue;
+    const redactedScheme = REDACTED_SCHEME_VALUE_PATTERN.exec(text.slice(valueStart));
+    if (redactedScheme !== null && AUTH_SCHEME_WORDS.has(redactedScheme[1].toLowerCase())) {
+      if (AUTHORIZATION_HEADERS.has(name.toLowerCase())) continue;
+      out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${redactedScheme[2]}${REDACTION_MARKER}`;
+      last = valueStart + redactedScheme[0].length;
+      ASSIGNMENT_KEY_PATTERN.lastIndex = last;
+      continue;
+    }
+    const pathLabel = operator === ":" && text[match.index - 1] === "/" && text[match.index - 2] !== "\\";
+    const valuePattern = operator === ":" && !pathLabel ? LINE_VALUE_PATTERN : DELIMITED_VALUE_PATTERN;
+    valuePattern.lastIndex = valueStart;
     const value = valuePattern.exec(text)?.[0];
-    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(key, value)) continue;
+    if (value === undefined || STRUCTURAL_VALUE_PATTERN.test(value) || isCountValue(name, value)) continue;
+    if (pathLabel && isPluralCredentialKey(name) && PROSE_CONTINUATION_PATTERN.test(text.slice(valueStart + value.length))) continue;
     out += `${text.slice(last, match.index)}${openingQuote}${key}${separator}${REDACTION_MARKER}`;
-    last = match.index + whole.length + value.length;
+    last = valueStart + value.length;
     ASSIGNMENT_KEY_PATTERN.lastIndex = last;
   }
   return last === 0 ? text : `${out}${text.slice(last)}`;
 }
 
+// A credential-named flag with its value as the next argument loses that argument.
+function replaceFlagValues(text: string): string {
+  return text.replace(FLAG_VALUE_PATTERN, (match, flag: string, space: string) => (isCredentialKey(flag) ? `--${flag}${space}${REDACTION_MARKER}` : match));
+}
+
+// Where a quoted parameter value that opens at valueStart with the quote token ends: after
+// the token that closes it; at a shallower token, which closes the text the list sits in,
+// so the value was cut off and nothing of it stays; or at limit when nothing closes it. A
+// token inside a token (O'hunter2) is content of the value.
+function quotedParameterValueEnd(text: string, valueStart: number, quote: string, limit: number): number {
+  let index = valueStart + quote.length;
+  while (index < limit) {
+    const candidate = quoteTokenAt(text, index);
+    if (candidate === undefined) {
+      index += text[index] === "\\" ? backslashRun(text, index) : 1;
+      continue;
+    }
+    if (midTokenQuoteAt(text, index, candidate.length)) {
+      index += candidate.length;
+      continue;
+    }
+    if (candidate === quote) return index + candidate.length;
+    if (candidate.length < quote.length) return index;
+    index += candidate.length;
+  }
+  return limit;
+}
+
+// One parameter of a list: its name as spelled (without an escape letter glued to its
+// front), where the name starts, and where its value starts and ends; the quote token that
+// opens a quoted value, or undefined for a bare one.
+interface AuthParameter {
+  name: string;
+  nameStart: number;
+  valueStart: number;
+  valueEnd: number;
+  quote: string | undefined;
+}
+
+// What a parameter of an auth parameter list is: a proof (its value goes), a challenge
+// parameter (its value stays), or another parameter (judged under its own name).
+type AuthParameterFate = "proof" | "challenge" | "other";
+
+// The parameter list that opens at start (name=value, name2=value2, ...): its parameters
+// and where it ends. A quoted value (bare or escaped to any depth) runs to the quote that
+// closes it, or to the end of the text it sits in when nothing does (a cut-off value keeps
+// no part of itself), an unquoted value is one token, and the list ends before a "," that
+// no further parameter follows, so prose after the list stays. Undefined when no parameter
+// opens at start (nothing after the "=").
+function readAuthParameterList(text: string, start: number): { end: number; items: AuthParameter[] } | undefined {
+  const limit = lineEndFrom(text, start);
+  const items: AuthParameter[] = [];
+  let index = start;
+  while (index < limit) {
+    AUTH_PARAM_ITEM_PATTERN.lastIndex = index;
+    const item = AUTH_PARAM_ITEM_PATTERN.exec(text);
+    if (item === null) break;
+    const valueStart = index + item[0].length;
+    const quote = quoteTokenAt(text, valueStart);
+    let valueEnd: number;
+    if (quote !== undefined) {
+      valueEnd = quotedParameterValueEnd(text, valueStart, quote, limit);
+    } else {
+      AUTH_PARAM_BARE_VALUE_PATTERN.lastIndex = valueStart;
+      const bare = AUTH_PARAM_BARE_VALUE_PATTERN.exec(text);
+      if (bare === null) break;
+      valueEnd = valueStart + bare[0].length;
+    }
+    items.push({ name: keyAfterEscape(text, index, item[1]), nameStart: index, valueStart, valueEnd, quote });
+    AUTH_PARAM_SEPARATOR_PATTERN.lastIndex = valueEnd;
+    const separator = AUTH_PARAM_SEPARATOR_PATTERN.exec(text);
+    if (separator === null || separator[0].length === 0) break;
+    index = valueEnd + separator[0].length;
+  }
+  const lastItem = items[items.length - 1];
+  return lastItem === undefined ? undefined : { end: lastItem.valueEnd, items };
+}
+
+function authParameterFate(name: string): AuthParameterFate {
+  const lower = name.toLowerCase();
+  if (PROOF_PARAM_NAMES.has(lower)) return "proof";
+  return CHALLENGE_PARAM_NAMES.has(lower) ? "challenge" : "other";
+}
+
+// A known auth parameter other than a proof: one of them makes a list without a scheme
+// word an auth parameter list.
+function isAuthParameterAnchor(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (AUTH_PARAM_NAMES.has(lower) || CHALLENGE_PARAM_NAMES.has(lower)) && !PROOF_PARAM_NAMES.has(lower);
+}
+
+// The fate of every parameter of every auth parameter list in text, by where its name
+// starts: the list after a scheme word, whatever it holds (a credential list after a scheme
+// word has already gone whole when this runs), and a list without one that holds two or
+// more parameters, one of them an anchor. A parameter outside such a list has no entry.
+function authParameterFates(text: string): Map<number, AuthParameterFate> {
+  const fates = new Map<number, AuthParameterFate>();
+  AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = 0;
+  let opener: RegExpExecArray | null;
+  while ((opener = AUTH_PARAMETER_LIST_OPENER_PATTERN.exec(text)) !== null) {
+    const list = readAuthParameterList(text, opener.index);
+    if (list === undefined) continue;
+    const schemeLed = SCHEME_LED_LIST_PATTERN.test(text.slice(Math.max(0, opener.index - 32), opener.index));
+    if (schemeLed || (list.items.length > 1 && list.items.some((item) => isAuthParameterAnchor(item.name)))) {
+      for (const item of list.items) fates.set(item.nameStart, authParameterFate(item.name));
+    }
+    AUTH_PARAMETER_LIST_OPENER_PATTERN.lastIndex = list.end;
+  }
+  return fates;
+}
+
+// A scheme word and the credential parameter list after it lose the list and keep the
+// word, header name in front or none; a challenge's parameter list stays.
+function replaceSchemeParameterLists(text: string): string {
+  SCHEME_PARAMETER_LIST_PATTERN.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SCHEME_PARAMETER_LIST_PATTERN.exec(text)) !== null) {
+    const list = readAuthParameterList(text, match.index + match[0].length);
+    if (list === undefined || !list.items.some((item) => !CHALLENGE_PARAM_NAMES.has(item.name.toLowerCase()))) continue;
+    out += `${text.slice(last, match.index)}${match[1]} ${REDACTION_MARKER}`;
+    last = list.end;
+    SCHEME_PARAMETER_LIST_PATTERN.lastIndex = last;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// Every proof parameter of an auth parameter list loses its value, quoted (the quote token
+// of its own depth stays, and a cut-off value gets no closing quote it never had) or bare;
+// the parameters beside it are left as they are.
+function replaceAuthParameterProofs(text: string): string {
+  const proofs = [...authParameterFates(text).entries()].filter(([, fate]) => fate === "proof").map(([nameStart]) => nameStart);
+  if (proofs.length === 0) return text;
+  let out = "";
+  let last = 0;
+  for (const nameStart of proofs) {
+    const list = readAuthParameterList(text, nameStart);
+    const item = list?.items[0];
+    if (item === undefined || item.nameStart !== nameStart) continue;
+    const quote = item.quote ?? "";
+    const closed = quote !== "" && item.valueEnd - quote.length > item.valueStart && text.startsWith(quote, item.valueEnd - quote.length);
+    const value = text.slice(item.valueStart + quote.length, closed ? item.valueEnd - quote.length : item.valueEnd);
+    if (value.length === 0 || value === REDACTION_MARKER) continue;
+    out += `${text.slice(last, item.valueStart)}${quote}${REDACTION_MARKER}${closed ? quote : ""}`;
+    last = item.valueEnd;
+  }
+  return last === 0 ? text : `${out}${text.slice(last)}`;
+}
+
+// The rule for a quoted attribute or pair value under a key: redacted under a credential
+// key (or reduced to its origin under a webhook key), the match otherwise.
+type QuotedValueRule = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string) => string;
+
+// Every key="value" attribute, at any escape depth, under the quoted-value rule; a challenge
+// parameter inside an auth parameter list (the nonce of Digest realm="api", nonce="n")
+// keeps its value whatever its name says.
+function replaceQuotedAttributes(text: string, quotedValue: QuotedValueRule): string {
+  const fates = authParameterFates(text);
+  return text.replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string, value: string, offset: number) =>
+    (fates.get(offset) === "challenge" ? match : quotedValue(keyAfterEscape(text, offset, key), value, () => `${key}=${quote}${REDACTION_MARKER}${quote}`, (url) => `${key}=${quote}${url}${quote}`, match)));
+}
+
 /** Every carrier rule (guard 1) plus the token shapes a prefix identifies on its own; the long-token rule is left to redactErrorText. */
+// Header lines go first: a recognised header line takes its whole value, so the URL and
+// query rules never split a cookie pair whose name holds "&" or "#" off its cookie. The
+// parameter-list rule runs before the scheme rule, so a credential list after a scheme
+// word goes whole instead of losing its first "name=" and keeping the quoted value, and the
+// proof rule right after it, so a proof in a list without a scheme word goes before the
+// per-parameter rules read the list.
 function scrubCarriers(text: string, pemScope: PemScope): string {
-  const scrubbed = scrubHeaderLines(scrubPem(text, pemScope)
+  const quotedValue = (key: string, value: string, redacted: () => string, webhook: (url: string) => string, match: string): string => {
+    if (isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(value)) return webhook(redactedWebhookUrl(value));
+    return isCredentialKey(key) && !isCountValue(key, value) && !keepsSchemeWord(key, value) ? redacted() : match;
+  };
+  const carriers = scrubHeaderLines(scrubPem(text, pemScope))
     .replace(TOKEN_IN_PATH_WEBHOOK_PATTERN, `$1${REDACTION_MARKER}`)
     .replace(EMBEDDED_URL_PATTERN, scrubUrlUserinfo)
-    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${REDACTION_MARKER}` : match)))
+    .replace(SLASH_ESCAPED_URL_USERINFO_PATTERN, `$1${REDACTION_MARKER}@`)
+    .replace(QUERY_PAIR_PATTERN, (match, separator: string, key: string, value: string) => (isCredentialAssignmentKey(key) || isTokenShapedValue(value) ? `${separator}${key}=${REDACTION_MARKER}` : match));
+  const pairs = replaceAuthParameterProofs(replaceSchemeParameterLists(carriers))
     .replace(SCHEME_VALUE_PATTERN, (match, scheme: string, value: string) => (isSchemeProse(scheme, value) ? match : `${scheme} ${REDACTION_MARKER}`))
-    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => (isCredentialKey(key) && !isCountValue(key, value) ? `"${key}"${separator}"${REDACTION_MARKER}"` : match))
-    .replace(QUOTED_ATTRIBUTE_PATTERN, (match, key: string, quote: string) => (isCredentialKey(key) ? `${key}=${quote}${REDACTION_MARKER}${quote}` : match));
-  return replaceCredentialAssignments(scrubbed)
+    .replace(JSON_QUOTED_PAIR_PATTERN, (match, key: string, separator: string, value: string) => quotedValue(key, value, () => `"${key}"${separator}"${REDACTION_MARKER}"`, (url) => `"${key}"${separator}"${url}"`, match))
+    .replace(JSON_ESCAPED_PAIR_PATTERN, (match, run: string, key: string, separator: string, value: string) => quotedValue(key, value, () => `${run}"${key}${run}"${separator}${run}"${REDACTION_MARKER}${run}"`, (url) => `${run}"${key}${run}"${separator}${run}"${url}${run}"`, match));
+  const scrubbed = replaceQuotedAttributes(pairs, quotedValue);
+  return replaceCredentialAssignments(replaceFlagValues(scrubbed))
     .replace(JWT_PATTERN, REDACTION_MARKER)
     .replace(PANOS_API_KEY_PATTERN, REDACTION_MARKER)
-    .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTION_MARKER);
+    .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTION_MARKER)
+    .replace(GITHUB_TOKEN_PATTERN, REDACTION_MARKER)
+    .replace(STRIPE_KEY_PATTERN, REDACTION_MARKER)
+    .replace(SLACK_TOKEN_PATTERN, REDACTION_MARKER);
 }
 
 /** The general scrub for error text: every carrier rule, every PEM block, and the long-token rule. Idempotent. */
@@ -887,7 +1552,8 @@ function surfaceCollectionStatus(endpoint: string | null, failure: PaloaltoSurfa
     status: failure ? datasetStatusOf(failure.status) : "ok",
     endpoint: failure ? failure.endpoint : endpoint,
     http_status: failure ? failure.status : null,
-    seen: failure ? null : seen,
+    // A truncated walk that delivered no record reports seen null: 0 would read as an empty inventory.
+    seen: failure ? null : truncated === true && seen === 0 ? null : seen,
     truncated: failure ? null : truncated,
     unevaluable_records: failure ? null : unevaluable,
     error: failure ? failure.error : null,
@@ -923,8 +1589,10 @@ const CREDENTIAL_LAST_SEGMENTS = new Set([
 ]);
 const NON_CREDENTIAL_KEY_QUALIFIERS = new Set(["public"]);
 // Header pairs ({key, value, secure} in Prisma Cloud webhook integrations) are credential
-// pairs when flagged secure: true or when the label names a credential (Authorization,
-// X-Api-Key); only the value is replaced so the label and flags stay readable.
+// pairs when flagged secure: true or when the label names a credential in either
+// vocabulary, the walker's (Authorization, X-Api-Key) or the text rules' (x-redlock-auth,
+// X-Auth, Cookie, X-PAN-KEY), whatever the secure flag says; only the value is replaced so
+// the label and flags stay readable.
 const CREDENTIAL_PAIR_LABEL_KEYS = ["key", "name", "header"];
 const CREDENTIAL_PAIR_VALUE_KEYS = new Set(["value", "default", "default_value"]);
 
@@ -963,7 +1631,7 @@ function isCredentialJsonPair(record: JsonRecord): boolean {
   if (record.secure === true) return true;
   const label = CREDENTIAL_PAIR_LABEL_KEYS.map((key) => record[key]).find((value): value is string => typeof value === "string");
   return label !== undefined
-    && isCredentialPropertyName(label)
+    && (isCredentialPropertyName(label) || isCredentialKey(label))
     && [...CREDENTIAL_PAIR_VALUE_KEYS].some((key) => key in record);
 }
 
@@ -986,7 +1654,16 @@ function redactCredentialNode(value: unknown): unknown {
     const credentialName = isCredentialPropertyName(key) || (credentialPair && CREDENTIAL_PAIR_VALUE_KEYS.has(key));
     // The whole value collapses, so a credential container (Compute registry
     // credential: {secret: {plain}}, image secrets[]) never leaks a nested child.
-    output[key] = credentialName && carriesValue(entry) ? REDACTION_MARKER : redactCredentialNode(entry);
+    if (credentialName && carriesValue(entry)) {
+      output[key] = REDACTION_MARKER;
+      continue;
+    }
+    // A URL under a webhook key keeps its origin only: the path and query are the secret.
+    if (typeof entry === "string" && isWebhookUrlKey(key) && URL_VALUE_PATTERN.test(entry)) {
+      output[key] = redactedWebhookUrl(entry);
+      continue;
+    }
+    output[key] = redactCredentialNode(entry);
   }
   return output;
 }
@@ -1651,7 +2328,7 @@ export function resolvePaloaltoConfiguration(
     throw new Error("PAN-OS requires PANOS_API_KEY or both PANOS_USERNAME and PANOS_PASSWORD for keygen.");
   }
   const panos = panosHosts.map((host) => ({
-    host,
+    host: hostLabel(normalizeBaseUrl(host)),
     baseUrl: normalizeBaseUrl(host),
     apiKey: panosApiKey,
     username: panosApiKey ? undefined : panosUsername,
@@ -2616,7 +3293,7 @@ export async function collectComputeSnapshot(client: ComputeSource): Promise<Com
   const cloudDiscovery = await paged("cloud discovery", () => client.listCloudDiscovery());
   const ciScans = await paged("ci scans", () => client.listCiScans());
   return {
-    consoleUrl: client.baseUrl,
+    consoleUrl: displayOrigin(client.baseUrl),
     defenders,
     runtimeContainerPolicy,
     complianceContainerPolicy,
@@ -2909,6 +3586,54 @@ function nullUnless<T>(readable: boolean, value: T): T | null {
   return readable ? value : null;
 }
 
+/*
+ * Incomplete inventories. A surface is incomplete when it was not read, when its walk
+ * stopped early (a page cap, a stuck offset, or a refused next link), or when some of the
+ * records it delivered were kept out as unevaluable (records that carry none of the
+ * surface's documented members): the evaluated records are then not the whole population
+ * the surface delivered. A count over an incomplete surface is a lower bound: a positive
+ * count is rendered as observed, and a count of zero renders null, because the unread or
+ * unevaluated remainder may hold what the seen records did not. Item-level detail (names,
+ * hosts, per-record entries) is withheld as null while a surface is incomplete, so no
+ * consumer reads a partial list as the population. The gate caps a pass over a truncated
+ * surface or one with unevaluable records at warn, and a fail that rests on the absence of
+ * records becomes warn when the walk was truncated.
+ */
+function hasUnevaluableRecords(snapshot: { unevaluable?: Record<string, number> }, surface: string): boolean {
+  return (snapshot.unevaluable?.[surface] ?? 0) > 0;
+}
+
+function computeIncomplete(snapshot: ComputeSnapshot, ...surfaces: string[]): boolean {
+  return surfaces.some((surface) => snapshot.failed.includes(surface) || snapshot.truncated.includes(surface) || hasUnevaluableRecords(snapshot, surface));
+}
+
+function computeCount(snapshot: ComputeSnapshot, surfaces: string[], count: number): number | null {
+  if (!computeReadable(snapshot, ...surfaces)) return null;
+  return count === 0 && computeIncomplete(snapshot, ...surfaces) ? null : count;
+}
+
+function computeDetail<T>(snapshot: ComputeSnapshot, surfaces: string[], value: T): T | null {
+  return computeIncomplete(snapshot, ...surfaces) ? null : value;
+}
+
+function prismaIncomplete(snapshot: PrismaSnapshot, ...surfaces: string[]): boolean {
+  return surfaces.some((surface) => snapshot.failed.includes(surface) || (surface === "open alerts" && snapshot.alertsTruncated === true) || hasUnevaluableRecords(snapshot, surface));
+}
+
+function prismaCount(snapshot: PrismaSnapshot, surfaces: string[], count: number): number | null {
+  if (!prismaReadable(snapshot, ...surfaces)) return null;
+  return count === 0 && prismaIncomplete(snapshot, ...surfaces) ? null : count;
+}
+
+function prismaDetail<T>(snapshot: PrismaSnapshot, surfaces: string[], value: T): T | null {
+  return prismaIncomplete(snapshot, ...surfaces) ? null : value;
+}
+
+/** An absence-based verdict over a truncated walk is warn: the unread remainder may hold the records whose absence the fail rests on. */
+function absenceStatus(truncated: boolean): PaloaltoStatus {
+  return truncated ? "warn" : "fail";
+}
+
 function panosGate(snapshots: PanosDeviceSnapshot[], xpathFragments: string[], options: { needsHaState?: boolean } = {}): EvidenceGate {
   const unreadable: string[] = [];
   for (const snapshot of snapshots) {
@@ -3011,16 +3736,21 @@ const NETWORK_EXPOSURE_PATTERN = /public|internet|0\.0\.0\.0|::\/0|exposed|open 
 const ENCRYPTION_PATTERN = /encrypt|kms|cmk|customer.managed key/i;
 const DLP_PATTERN = /\bdlp\b|data loss|sensitive data|pii|data classification|data security/i;
 
-/** Alert counts, or the same shape with every value null when the alert list was not read. */
-function summarizeAlerts(alerts: JsonRecord[], readable = true): JsonRecord {
-  if (!readable) return { count: null, critical: null, high: null, top_policies: null };
+/**
+ * Alert counts, or the same shape with every value null when the alert list was not
+ * read. Over a truncated alert walk the counts are lower bounds (a zero renders null)
+ * and the per-policy breakdown is withheld until the walk completes.
+ */
+function summarizeAlerts(alerts: JsonRecord[], snapshot: PrismaSnapshot): JsonRecord {
+  if (!prismaReadable(snapshot, "open alerts")) return { count: null, critical: null, high: null, top_policies: null };
   const byPolicy = new Map<string, number>();
   for (const alert of alerts) byPolicy.set(policyName(alert), (byPolicy.get(policyName(alert)) ?? 0) + 1);
+  const count = (value: number): number | null => prismaCount(snapshot, ["open alerts"], value);
   return {
-    count: alerts.length,
-    critical: alerts.filter((item) => policySeverity(item) === "critical").length,
-    high: alerts.filter((item) => policySeverity(item) === "high").length,
-    top_policies: [...byPolicy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, count]) => ({ policy: name, open_alerts: count })),
+    count: count(alerts.length),
+    critical: count(alerts.filter((item) => policySeverity(item) === "critical").length),
+    high: count(alerts.filter((item) => policySeverity(item) === "high").length),
+    top_policies: prismaDetail(snapshot, ["open alerts"], [...byPolicy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, total]) => ({ policy: name, open_alerts: total }))),
   };
 }
 
@@ -3032,7 +3762,7 @@ export function assessPrismaCloudPosture(
   const findings: PaloaltoFinding[] = [];
   const postureReadable = prismaReadable(snapshot, "compliance posture");
   const rulesReadable = prismaReadable(snapshot, "alert rules");
-  const alertsReadable = prismaReadable(snapshot, "open alerts");
+  const alertsTruncated = prismaReadable(snapshot, "open alerts") && snapshot.alertsTruncated === true;
   const policiesReadable = prismaReadable(snapshot, "policies");
   const accountsReadable = prismaReadable(snapshot, "cloud accounts");
   const groupsReadable = prismaReadable(snapshot, "account groups");
@@ -3075,7 +3805,7 @@ export function assessPrismaCloudPosture(
       enabled_rules: nullUnless(rulesReadable, enabledRules.map((rule) => asString(rule.name)).slice(0, 25)),
       disabled_rules: nullUnless(rulesReadable, disabledRules.map((rule) => asString(rule.name)).slice(0, 25)),
       rules_with_notifications: nullUnless(rulesReadable, snapshot.alertRules.filter((rule) => asArray(rule.alertRuleNotificationConfig).length > 0).length),
-      open_alerts: summarizeAlerts(snapshot.alerts, alertsReadable),
+      open_alerts: summarizeAlerts(snapshot.alerts, snapshot),
     },
   ), prismaGate(snapshot, ["alert rules", "open alerts"]), "export Alerts > Alert Rules showing enabled rules and their notification channels."));
 
@@ -3096,7 +3826,7 @@ export function assessPrismaCloudPosture(
     {
       iam_policies: nullUnless(policiesReadable, iamPolicies.length),
       iam_policies_enabled: nullUnless(policiesReadable, iamEnabled.length),
-      iam_alerts: summarizeAlerts(iamAlerts, alertsReadable),
+      iam_alerts: summarizeAlerts(iamAlerts, snapshot),
     },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export the IAM Security policy list and open identity alerts."));
 
@@ -3126,13 +3856,16 @@ export function assessPrismaCloudPosture(
   findings.push(gate(finding(
     5,
     "high",
-    networkPolicies.length === 0 ? "manual" : networkHighOrCritical.length > 0 ? "fail" : networkAlerts.length > 0 ? "warn" : "pass",
+    networkPolicies.length === 0 ? "manual" : networkHighOrCritical.length > 0 ? "fail" : networkAlerts.length > 0 || alertsTruncated ? "warn" : "pass",
     networkPolicies.length === 0
       ? "No enabled network policies were visible, so exposure cannot be detected from alerts; treated as manual. Manual evidence required: enable network exposure policies and export their open alerts."
       : networkAlerts.length === 0
-        ? `No open network exposure alerts across ${networkPolicies.length} enabled network policies in the sampled window; emptiness is compliant here because detection policies are active and alerts were readable.`
+        // Emptiness is compliant only over an alert walk read to completion.
+        ? alertsTruncated
+          ? `No open network exposure alerts among the ${snapshot.alerts.length} alerts delivered before the alert walk stopped, across ${networkPolicies.length} enabled network policies; the unread remainder may hold some, so emptiness is not asserted.`
+          : `No open network exposure alerts across ${networkPolicies.length} enabled network policies in the sampled window; emptiness is compliant here because detection policies are active and alerts were readable.`
         : `${networkAlerts.length} open network exposure alerts (${networkHighOrCritical.length} critical or high).`,
-    { network_policies_enabled: nullUnless(policiesReadable, networkPolicies.length), ...summarizeAlerts(networkAlerts, alertsReadable) },
+    { network_policies_enabled: nullUnless(policiesReadable, networkPolicies.length), ...summarizeAlerts(networkAlerts, snapshot) },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export open network exposure alerts and the enabled network policy list."));
 
   const encryptionPolicies = snapshot.policies.filter((policy) => ENCRYPTION_PATTERN.test(policyLabels(policy)));
@@ -3148,7 +3881,7 @@ export function assessPrismaCloudPosture(
     {
       encryption_policies: nullUnless(policiesReadable, encryptionPolicies.length),
       encryption_policies_enabled: nullUnless(policiesReadable, encryptionEnabled.length),
-      encryption_alerts: summarizeAlerts(encryptionAlerts, alertsReadable),
+      encryption_alerts: summarizeAlerts(encryptionAlerts, snapshot),
     },
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export enabled encryption policies and their open alerts."));
 
@@ -3297,10 +4030,12 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
     {
       vulnerability_rules_enabled: nullUnless(vulnPolicyReadable, vulnPolicyRules.length),
       blocking_rules: nullUnless(vulnPolicyReadable, blockingRules.map((rule) => asString(rule.name)).slice(0, 25)),
-      images_scanned: nullUnless(imagesReadable, compute.images.length),
-      images_without_scan_time: nullUnless(imagesReadable, imagesWithoutScanTime.map((image) => asString(image.id) ?? asString(asObject(image.repoTag)?.repo)).slice(0, 25)),
-      critical_cves: cveStatsReadable ? criticalCves ?? null : null,
-      high_cves: cveStatsReadable ? highCves ?? null : null,
+      images_scanned: computeCount(compute, ["images"], compute.images.length),
+      images_without_scan_time_count: computeCount(compute, ["images"], imagesWithoutScanTime.length),
+      images_without_scan_time: computeDetail(compute, ["images"], nullUnless(imagesReadable, imagesWithoutScanTime.map((image) => asString(image.id) ?? asString(asObject(image.repoTag)?.repo)).slice(0, 25))),
+      // The CVE totals take the stricter of the stats and the image scan results, so a truncated image walk makes them lower bounds.
+      critical_cves: cveStatsReadable && criticalCves !== undefined ? computeCount(compute, ["vulnerability stats", "images"], criticalCves) : null,
+      high_cves: cveStatsReadable && highCves !== undefined ? computeCount(compute, ["vulnerability stats", "images"], highCves) : null,
       cve_stats_by_resource: nullUnless(cveStatsReadable, cveStats.byResource),
       cve_stats_source: nullUnless(cveStatsReadable, cveStats.source),
     },
@@ -3312,6 +4047,12 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   const complianceRate = compliance.rate;
   const connectedDefenders = compute.defenders.filter((defender) => asBoolean(defender.connected) === true).length;
   const defendersReadable = readable("defenders");
+  const defendersTruncated = defendersReadable && compute.truncated.includes("defenders");
+  // Zero connected Defenders is an absence verdict: over a truncated Defender walk the
+  // unread remainder may hold connected ones, so it is warn and says so.
+  const noConnectedDefenders = defendersTruncated
+    ? `no Defender delivered before the Defender walk stopped (${compute.defenders.length} seen) reports connected=true, so whether any host is being evaluated could not be determined`
+    : "no Defender reports connected=true, so no host is actually being evaluated";
   const complianceStatsReadable = readable("compliance stats");
   findings.push(gate(finding(
     8,
@@ -3321,7 +4062,7 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       : hostRules.length === 0
         ? "fail"
         : connectedDefenders === 0
-          ? "fail"
+          ? absenceStatus(defendersTruncated)
           : complianceRate === undefined
             ? "warn"
             : complianceRate < DEFAULT_MIN_HOST_COMPLIANCE_RATE
@@ -3332,14 +4073,14 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       : hostRules.length === 0
         ? `${containerRules.length} container compliance rules are enabled but no host compliance rule is, so host CIS benchmarks are not evaluated.`
         : connectedDefenders === 0
-          ? `${hostRules.length} host compliance rules are enabled but no Defender reports connected=true, so no host is actually being evaluated.`
+          ? `${hostRules.length} host compliance rules are enabled but ${noConnectedDefenders}.`
           : complianceRate === undefined
             ? `${hostRules.length} host and ${containerRules.length} container compliance rules are enabled, but /stats/compliance recorded zero evaluations in rules[] and categories[], so no compliance rate can be derived; treated as warn.`
             : `${hostRules.length} host and ${containerRules.length} container compliance rules enabled across ${connectedDefenders} connected Defenders; ${compliance.failed} failed of ${compliance.total} compliance evaluations (${compliance.source}) gives a ${complianceRate}% compliance rate (threshold ${DEFAULT_MIN_HOST_COMPLIANCE_RATE}%).`,
     {
       host_rules_enabled: nullUnless(readable("compliance host policy"), hostRules.length),
       container_rules_enabled: nullUnless(readable("compliance container policy"), containerRules.length),
-      connected_defenders: nullUnless(defendersReadable, connectedDefenders),
+      connected_defenders: computeCount(compute, ["defenders"], connectedDefenders),
       compliance_rate: complianceStatsReadable ? complianceRate ?? null : null,
       compliance_failed: nullUnless(complianceStatsReadable, compliance.failed),
       compliance_total: nullUnless(complianceStatsReadable, compliance.total),
@@ -3358,17 +4099,17 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   findings.push(gate(finding(
     9,
     "high",
-    runtimeRules.length === 0 ? "fail" : protectiveRules.length === 0 ? "warn" : runtimeDefenders === 0 ? "fail" : "pass",
+    runtimeRules.length === 0 ? "fail" : protectiveRules.length === 0 ? "warn" : runtimeDefenders === 0 ? absenceStatus(defendersTruncated) : "pass",
     runtimeRules.length === 0
       ? "Zero enabled container runtime rules were returned; emptiness is treated as fail because Defenders have no runtime policy to enforce."
       : protectiveRules.length === 0
         ? `${runtimeRules.length} container runtime rules are enabled but every process, network, file system, and DNS effect is alert or disable, so nothing is prevented.`
         : runtimeDefenders === 0
-          ? `${protectiveRules.length} preventive runtime rules exist but no Defender reports connected=true, so nothing enforces them.`
+          ? `${protectiveRules.length} preventive runtime rules exist but ${defendersTruncated ? `no Defender delivered before the Defender walk stopped (${compute.defenders.length} seen) reports connected=true, so whether anything enforces them could not be determined` : "no Defender reports connected=true, so nothing enforces them"}.`
           : `${protectiveRules.length} of ${runtimeRules.length} enabled container runtime rules prevent or block at least one behavior class (${alertOnlyRules.length} alert-only), enforced by ${runtimeDefenders} connected Defenders.`,
     {
       runtime_rules_enabled: nullUnless(readable("runtime container policy"), runtimeRules.length),
-      connected_defenders: nullUnless(defendersReadable, runtimeDefenders),
+      connected_defenders: computeCount(compute, ["defenders"], runtimeDefenders),
       protective_rules: nullUnless(readable("runtime container policy"), protectiveRules.map((rule) => asString(rule.name)).slice(0, 25)),
       alert_only_rules: nullUnless(readable("runtime container policy"), alertOnlyRules.map((rule) => asString(rule.name)).slice(0, 25)),
     },
@@ -3381,41 +4122,48 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
   findings.push(gate(finding(
     10,
     "high",
-    compute.defenders.length === 0 ? "fail" : disconnected.length > 0 ? "fail" : withoutTimestamp.length > 0 || versions.size > 2 ? "warn" : "pass",
+    compute.defenders.length === 0 ? absenceStatus(defendersTruncated) : disconnected.length > 0 ? "fail" : withoutTimestamp.length > 0 || versions.size > 2 ? "warn" : "pass",
     compute.defenders.length === 0
-      ? "Zero Defenders are deployed; emptiness is treated as fail because no host or cluster is protected."
+      ? defendersTruncated
+        ? "Zero Defenders were delivered before the Defender walk stopped, so whether any host or cluster is protected could not be determined."
+        : "Zero Defenders are deployed; emptiness is treated as fail because no host or cluster is protected."
       : disconnected.length > 0
         ? `${disconnected.length} of ${compute.defenders.length} Defenders do not report connected=true.`
         : withoutTimestamp.length > 0
           ? `${connected.length} Defenders report connected=true, but ${withoutTimestamp.length} have no lastModified timestamp and cannot be counted as recently seen.`
           : `${connected.length} Defenders report connected=true across ${versions.size} version(s).`,
     {
-      defenders: nullUnless(defendersReadable, compute.defenders.length),
-      connected: nullUnless(defendersReadable, connected.length),
-      disconnected: nullUnless(defendersReadable, disconnected.map((defender) => asString(defender.hostname)).slice(0, 25)),
-      without_timestamp: nullUnless(defendersReadable, withoutTimestamp.map((defender) => asString(defender.hostname)).slice(0, 25)),
-      versions: nullUnless(defendersReadable, [...versions]),
+      defenders: computeCount(compute, ["defenders"], compute.defenders.length),
+      connected: computeCount(compute, ["defenders"], connected.length),
+      disconnected_count: computeCount(compute, ["defenders"], disconnected.length),
+      without_timestamp_count: computeCount(compute, ["defenders"], withoutTimestamp.length),
+      disconnected: computeDetail(compute, ["defenders"], disconnected.map((defender) => asString(defender.hostname)).slice(0, 25)),
+      without_timestamp: computeDetail(compute, ["defenders"], withoutTimestamp.map((defender) => asString(defender.hostname)).slice(0, 25)),
+      versions: computeDetail(compute, ["defenders"], [...versions]),
     },
   ), computeGate(compute, ["defenders"]), CWPP_EVIDENCE[3].instruction));
 
   const registries = asRecords(compute.registrySettings.specifications);
   const registriesWithoutCadence = registries.filter((registry) => !asString(registry.cap) && asNumber(registry.cap) === undefined && !asString(registry.scanners) && asNumber(registry.scanners) === undefined);
   const registryScansWithoutTime = compute.registryScans.filter((scan) => !asString(scan.scanTime));
+  const registryScansTruncated = readable("registry scans") && compute.truncated.includes("registry scans");
   findings.push(gate(finding(
     11,
     "medium",
-    registries.length === 0 ? "manual" : compute.registryScans.length === 0 ? "fail" : registryScansWithoutTime.length > 0 || registriesWithoutCadence.length > 0 ? "warn" : "pass",
+    registries.length === 0 ? "manual" : compute.registryScans.length === 0 ? absenceStatus(registryScansTruncated) : registryScansWithoutTime.length > 0 || registriesWithoutCadence.length > 0 ? "warn" : "pass",
     registries.length === 0
       ? "Zero registries are configured for scanning; treated as manual because an organization without container registries has nothing to scan. Manual evidence required: confirm no container registry is in use or configure registry scanning."
       : compute.registryScans.length === 0
-        ? `${registries.length} registries are configured but zero registry scan results exist, so scanning has not completed.`
+        ? registryScansTruncated
+          ? `${registries.length} registries are configured but zero registry scan results were delivered before the scan walk stopped, so whether scanning has completed could not be determined.`
+          : `${registries.length} registries are configured but zero registry scan results exist, so scanning has not completed.`
         : registryScansWithoutTime.length > 0
           ? `${registryScansWithoutTime.length} of ${compute.registryScans.length} registry scan results have no scanTime and cannot be counted as fresh.`
           : `${registries.length} registries configured with ${compute.registryScans.length} scanned images.`,
     {
       registries: nullUnless(readable("registry settings"), registries.map((registry) => `${asString(registry.registry) ?? ""}/${asString(registry.repository) ?? "*"}`).slice(0, 25)),
-      registry_scans: nullUnless(readable("registry scans"), compute.registryScans.length),
-      scans_without_time: nullUnless(readable("registry scans"), registryScansWithoutTime.length),
+      registry_scans: computeCount(compute, ["registry scans"], compute.registryScans.length),
+      scans_without_time: computeCount(compute, ["registry scans"], registryScansWithoutTime.length),
     },
   ), computeGate(compute, ["registry settings", "registry scans"]), CWPP_EVIDENCE[4].instruction));
 
@@ -3439,26 +4187,30 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
             ? `${discoveryErrors.length} cloud discovery entries report errors, so coverage is uncertain.`
             : `${compute.cloudDiscovery.length} cloud discovery entries all report total resources equal to defended resources.`,
     {
-      discovery_entries: nullUnless(readable("cloud discovery"), compute.cloudDiscovery.length),
-      unevaluable_entries: nullUnless(readable("cloud discovery"), unevaluableDiscovery),
-      unprotected: nullUnless(readable("cloud discovery"), unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25)),
-      errors: nullUnless(readable("cloud discovery"), discoveryErrors.map((entry) => redactErrorText(asString(entry.err) ?? "")).slice(0, 10)),
+      discovery_entries: computeCount(compute, ["cloud discovery"], compute.cloudDiscovery.length),
+      unevaluable_entries: computeCount(compute, ["cloud discovery"], unevaluableDiscovery),
+      unprotected_count: computeCount(compute, ["cloud discovery"], unprotected.length),
+      unprotected: computeDetail(compute, ["cloud discovery"], unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25)),
+      errors: computeDetail(compute, ["cloud discovery"], discoveryErrors.map((entry) => redactErrorText(asString(entry.err) ?? "")).slice(0, 10)),
     },
   ), computeGate(compute, ["cloud discovery"]), CWPP_EVIDENCE[5].instruction));
 
   const scansWithoutTime = compute.ciScans.filter((scan) => !asString(scan.time));
   const failedScans = compute.ciScans.filter((scan) => asBoolean(scan.pass) === false);
+  const ciScansTruncated = readable("ci scans") && compute.truncated.includes("ci scans");
   findings.push(gate(finding(
     25,
     "medium",
-    compute.ciScans.length === 0 ? "fail" : "warn",
+    compute.ciScans.length === 0 ? absenceStatus(ciScansTruncated) : "warn",
     compute.ciScans.length === 0
-      ? "Zero CI image scan results were returned; emptiness is treated as fail because no pipeline is submitting images to twistcli or the Jenkins plugin."
+      ? ciScansTruncated
+        ? "Zero CI image scan results were delivered before the scan walk stopped, so whether any pipeline submits images to twistcli or the Jenkins plugin could not be determined."
+        : "Zero CI image scan results were returned; emptiness is treated as fail because no pipeline is submitting images to twistcli or the Jenkins plugin."
       : `${compute.ciScans.length} CI scan results (${failedScans.length} failed policy, ${scansWithoutTime.length} without a scan time). Admission control policy has no verified public read endpoint, so this control stays at warn until admission rules are reviewed manually.`,
     {
-      ci_scans: nullUnless(readable("ci scans"), compute.ciScans.length),
-      failed_scans: nullUnless(readable("ci scans"), failedScans.length),
-      scans_without_time: nullUnless(readable("ci scans"), scansWithoutTime.length),
+      ci_scans: computeCount(compute, ["ci scans"], compute.ciScans.length),
+      failed_scans: computeCount(compute, ["ci scans"], failedScans.length),
+      scans_without_time: computeCount(compute, ["ci scans"], scansWithoutTime.length),
       manual_evidence: "export Compute > Defend > Access > Admission rules to confirm admission control gating.",
     },
   ), computeGate(compute, ["ci scans"]), CWPP_EVIDENCE[6].instruction));
@@ -4136,32 +4888,34 @@ export async function checkPaloaltoAccess(clients: PaloaltoClients): Promise<Pal
   if (clients.prisma) {
     const prisma = clients.prisma;
     products.push("prisma-cloud");
-    notes.push(`Prisma Cloud API: ${prisma.apiUrl}`);
+    const prismaOrigin = displayOrigin(prisma.apiUrl);
+    notes.push(`Prisma Cloud API: ${prismaOrigin}`);
     surfaces.push(
-      await readableSurface("prisma-cloud", prisma.apiUrl, "compliance_posture", PRISMA_READ_ENDPOINTS["compliance posture"], () => prisma.getCompliancePosture(), () => 1),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "alert_rules", PRISMA_READ_ENDPOINTS["alert rules"], () => prisma.listAlertRules(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "open_alerts", PRISMA_READ_ENDPOINTS["open alerts"], () => prisma.collectOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), pagedCount, pagedPartial),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "policies", PRISMA_READ_ENDPOINTS.policies, () => prisma.listPolicies(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "cloud_accounts", PRISMA_READ_ENDPOINTS["cloud accounts"], () => prisma.listCloudAccounts(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "account_groups", PRISMA_READ_ENDPOINTS["account groups"], () => prisma.listAccountGroups(), arrayCount),
-      await readableSurface("prisma-cloud", prisma.apiUrl, "user_roles", PRISMA_READ_ENDPOINTS["user roles"], () => prisma.listUserRoles(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "compliance_posture", PRISMA_READ_ENDPOINTS["compliance posture"], () => prisma.getCompliancePosture(), () => 1),
+      await readableSurface("prisma-cloud", prismaOrigin, "alert_rules", PRISMA_READ_ENDPOINTS["alert rules"], () => prisma.listAlertRules(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "open_alerts", PRISMA_READ_ENDPOINTS["open alerts"], () => prisma.collectOpenAlerts(DEFAULT_ALERT_PAGE_SIZE), pagedCount, pagedPartial),
+      await readableSurface("prisma-cloud", prismaOrigin, "policies", PRISMA_READ_ENDPOINTS.policies, () => prisma.listPolicies(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "cloud_accounts", PRISMA_READ_ENDPOINTS["cloud accounts"], () => prisma.listCloudAccounts(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "account_groups", PRISMA_READ_ENDPOINTS["account groups"], () => prisma.listAccountGroups(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "user_roles", PRISMA_READ_ENDPOINTS["user roles"], () => prisma.listUserRoles(), arrayCount),
       // Evaluated after the probes above logged in, so the tenant-scoped path is named when login returned a prismaId.
-      await readableSurface("prisma-cloud", prisma.apiUrl, "integrations", prismaIntegrationsEndpoint(prisma.tenantPrismaId), () => prisma.listIntegrations(), arrayCount),
+      await readableSurface("prisma-cloud", prismaOrigin, "integrations", prismaIntegrationsEndpoint(prisma.tenantPrismaId), () => prisma.listIntegrations(), arrayCount),
     );
     const compute = await resolveComputeClient(clients);
     if (compute) {
       products.push("prisma-compute");
-      notes.push(`Prisma Cloud Compute console: ${compute.baseUrl}`);
+      const computeOrigin = displayOrigin(compute.baseUrl);
+      notes.push(`Prisma Cloud Compute console: ${computeOrigin}`);
       surfaces.push(
-        await readableSurface("prisma-compute", compute.baseUrl, "defenders", COMPUTE_READ_ENDPOINTS.defenders, () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
-        await readableSurface("prisma-compute", compute.baseUrl, "runtime_container_policy", COMPUTE_READ_ENDPOINTS["runtime container policy"], () => compute.getRuntimeContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "compliance_container_policy", COMPUTE_READ_ENDPOINTS["compliance container policy"], () => compute.getComplianceContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "compliance_host_policy", COMPUTE_READ_ENDPOINTS["compliance host policy"], () => compute.getComplianceHostPolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_image_policy", COMPUTE_READ_ENDPOINTS["vulnerability image policy"], () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "registry_settings", COMPUTE_READ_ENDPOINTS["registry settings"], () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
-        await readableSurface("prisma-compute", compute.baseUrl, "vulnerability_stats", COMPUTE_READ_ENDPOINTS["vulnerability stats"], () => compute.getVulnerabilityStats(), arrayCount),
-        await readableSurface("prisma-compute", compute.baseUrl, "cloud_discovery", COMPUTE_READ_ENDPOINTS["cloud discovery"], () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
-        await readableSurface("prisma-compute", compute.baseUrl, "ci_scans", COMPUTE_READ_ENDPOINTS["ci scans"], () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", computeOrigin, "defenders", COMPUTE_READ_ENDPOINTS.defenders, () => compute.listDefenders(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", computeOrigin, "runtime_container_policy", COMPUTE_READ_ENDPOINTS["runtime container policy"], () => compute.getRuntimeContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "compliance_container_policy", COMPUTE_READ_ENDPOINTS["compliance container policy"], () => compute.getComplianceContainerPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "compliance_host_policy", COMPUTE_READ_ENDPOINTS["compliance host policy"], () => compute.getComplianceHostPolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "vulnerability_image_policy", COMPUTE_READ_ENDPOINTS["vulnerability image policy"], () => compute.getVulnerabilityImagePolicy(), (value) => asRecords(asObject(value)?.rules).length),
+        await readableSurface("prisma-compute", computeOrigin, "registry_settings", COMPUTE_READ_ENDPOINTS["registry settings"], () => compute.getRegistrySettings(), (value) => asRecords(asObject(value)?.specifications).length),
+        await readableSurface("prisma-compute", computeOrigin, "vulnerability_stats", COMPUTE_READ_ENDPOINTS["vulnerability stats"], () => compute.getVulnerabilityStats(), arrayCount),
+        await readableSurface("prisma-compute", computeOrigin, "cloud_discovery", COMPUTE_READ_ENDPOINTS["cloud discovery"], () => compute.listCloudDiscovery(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
+        await readableSurface("prisma-compute", computeOrigin, "ci_scans", COMPUTE_READ_ENDPOINTS["ci scans"], () => compute.listCiScans(DEFAULT_COMPUTE_PAGE_SIZE), pagedCount, pagedPartial),
       );
     } else {
       notes.push(`Prisma Cloud Compute not reachable: ${clients.computeUnavailableReason ?? "unknown"} Controls 7-11, 24, and 25 fall back to manual findings.`);
@@ -4252,21 +5006,43 @@ function prismaCollectionSummary(snapshot: PrismaSnapshot): JsonRecord {
   };
 }
 
-function assessmentResult(title: string, findings: PaloaltoFinding[], errors: string[], extra: JsonRecord = {}): PaloaltoAssessmentResult {
+// Status counts over the findings. With incomplete=true (a surface the findings read was
+// unreadable or truncated) a count of zero renders null: a finding over that surface may
+// be undetermined, so 0 would claim that no finding has the status when one may (see
+// "Incomplete inventories"). A positive count is rendered as observed.
+function assessmentResult(title: string, findings: PaloaltoFinding[], errors: string[], extra: JsonRecord = {}, incomplete = errors.length > 0): PaloaltoAssessmentResult {
+  const count = (status: PaloaltoStatus): number | null => {
+    const total = findings.filter((item) => item.status === status).length;
+    return total === 0 && incomplete ? null : total;
+  };
   return {
     title,
     summary: {
       controls: findings.length,
-      pass: findings.filter((item) => item.status === "pass").length,
-      warn: findings.filter((item) => item.status === "warn").length,
-      fail: findings.filter((item) => item.status === "fail").length,
-      manual: findings.filter((item) => item.status === "manual").length,
+      pass: count("pass"),
+      warn: count("warn"),
+      fail: count("fail"),
+      manual: count("manual"),
       collection_errors: errors.length,
       ...extra,
     },
     findings,
     errors,
   };
+}
+
+function renderStatusCount(value: unknown): string {
+  return value === null ? "none seen" : String(value);
+}
+
+/** True when a Prisma Cloud or Compute surface the findings read was unreadable, truncated, or delivered unevaluable records. */
+function prismaSnapshotIncomplete(snapshot: PrismaSnapshot): boolean {
+  const anyUnevaluable = (unevaluable: Record<string, number> | undefined): boolean => Object.values(unevaluable ?? {}).some((count) => count > 0);
+  return snapshot.errors.length > 0
+    || snapshot.failed.length > 0
+    || snapshot.alertsTruncated === true
+    || anyUnevaluable(snapshot.unevaluable)
+    || (snapshot.compute !== undefined && (snapshot.compute.failed.length > 0 || snapshot.compute.truncated.length > 0 || anyUnevaluable(snapshot.compute.unevaluable)));
 }
 
 export async function assessPaloaltoCloudPosture(
@@ -4289,7 +5065,7 @@ export async function assessPaloaltoCloudPosture(
   const snapshot = prismaSnapshot ?? await loadPrismaSnapshot(clients, clampNumber(options.alertLimit, DEFAULT_ALERT_LIMIT, 1, 10000));
   if (!snapshot) throw new Error("Prisma Cloud snapshot could not be collected.");
   const findings = [...assessPrismaCloudPosture(snapshot, options), ...assessPrismaCompute(snapshot)];
-  return assessmentResult("Palo Alto cloud posture (Prisma Cloud)", findings, snapshot.errors, prismaCollectionSummary(snapshot));
+  return assessmentResult("Palo Alto cloud posture (Prisma Cloud)", findings, snapshot.errors, prismaCollectionSummary(snapshot), prismaSnapshotIncomplete(snapshot));
 }
 
 export async function assessPaloaltoFirewallPolicy(clients: PaloaltoClients, snapshots?: PanosDeviceSnapshot[]): Promise<PaloaltoAssessmentResult> {
@@ -4426,7 +5202,7 @@ function buildExecutiveSummary(config: PaloaltoResolvedConfig, assessments: Palo
     "# Palo Alto Networks Audit Bundle: Executive Summary",
     "",
     `Generated: ${new Date().toISOString()}`,
-    `Prisma Cloud: ${config.prisma ? config.prisma.apiUrl : "not configured"}`,
+    `Prisma Cloud: ${config.prisma ? displayOrigin(config.prisma.apiUrl) : "not configured"}`,
     `PAN-OS devices: ${config.panos.length > 0 ? config.panos.map((item) => item.host).join(", ") : "not configured"}`,
     "",
     "## Result Counts",
@@ -4526,7 +5302,7 @@ function buildQuickReference(result: PaloaltoAccessCheckResult, assessments: Pal
     "",
     "## Assessments",
     "",
-    ...assessments.map((item) => `- ${item.title}: ${item.summary.pass} pass, ${item.summary.warn} warn, ${item.summary.fail} fail, ${item.summary.manual} manual`),
+    ...assessments.map((item) => `- ${item.title}: ${renderStatusCount(item.summary.pass)} pass, ${renderStatusCount(item.summary.warn)} warn, ${renderStatusCount(item.summary.fail)} fail, ${renderStatusCount(item.summary.manual)} manual${["pass", "warn", "fail", "manual"].some((key) => item.summary[key] === null) ? " (a count rendered as \"none seen\" is not asserted: a surface the findings read was unreadable or truncated)" : ""}`),
     "",
     "Credentials, API keys, and JWTs are never written into the bundle.",
     `Prisma Cloud integration configurations (auth tokens, API keys, passwords, secure header values, webhook URLs with tokens) and Compute registry credentials and image secrets are replaced with ${REDACTION_MARKER} as they are collected.`,
@@ -4564,7 +5340,7 @@ export async function exportPaloaltoAuditBundle(
   await write("QUICK_REFERENCE.md", `${buildQuickReference(access, assessments)}\n`);
   await writeJson("metadata.json", {
     generated_at: new Date().toISOString(),
-    prisma_api_url: config.prisma?.apiUrl ?? null,
+    prisma_api_url: config.prisma ? displayOrigin(config.prisma.apiUrl) : null,
     prisma_compute_url: prismaSnapshot?.compute?.consoleUrl ?? null,
     panos_hosts: config.panos.map((item) => item.host),
     tls_verification: config.verifyTls,
