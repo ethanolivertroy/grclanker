@@ -18,6 +18,7 @@ import {
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
@@ -486,7 +487,7 @@ function asStringArray(value: unknown): string[] | undefined {
 }
 
 function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
-  const parsed = Number.isFinite(value) ? (value as number) : fallback;
+  const parsed = typeof value === "number" && Number.isFinite(value) ? value : fallback;
   return Math.min(Math.max(parsed, min), max);
 }
 
@@ -634,7 +635,7 @@ const CREDENTIAL_LAST_SEGMENTS = new Set([
   "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization",
   "credential", "credentials", "bearer",
 ]);
-// `app` and `application` qualify a key (`appKey`, `application_key`, `DD_APP_KEY` in an integration record; gap 35).
+// `app` and `application` qualify a key (`appKey`, `application_key`, `DD_APP_KEY` in an integration record).
 const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "app", "application", "private", "secret", "signing", "access", "shared", "session", "master", "client", "auth", "service"]);
 const URL_KEY_SEGMENTS = new Set(["url", "urls", "uri", "endpoint", "link", "href"]);
 const CREDENTIAL_QUERY_PATTERN = /token|secret|password|key|signature|sig|credential|auth/i;
@@ -4560,7 +4561,7 @@ const governanceParams = {
 };
 
 function assessmentTool(
-  pi: any,
+  pi: ExtensionAPI,
   area: Knowbe4Scope,
   label: string,
   description: string,

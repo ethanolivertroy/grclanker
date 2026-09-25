@@ -1324,7 +1324,7 @@ export function describeRequestTarget(pathname: string): string {
 
 function extractRecords(payload: unknown): JsonRecord[] {
   if (Array.isArray(payload)) {
-    return payload.filter((item) => item && typeof item === "object") as JsonRecord[];
+    return payload.filter((item): item is JsonRecord => Boolean(item) && typeof item === "object");
   }
 
   const record = asRecord(payload);
@@ -1341,13 +1341,13 @@ function extractRecords(payload: unknown): JsonRecord[] {
 
   for (const key of candidateKeys) {
     if (Array.isArray(record[key])) {
-      return record[key].filter((item) => item && typeof item === "object") as JsonRecord[];
+      return record[key].filter((item): item is JsonRecord => Boolean(item) && typeof item === "object");
     }
   }
 
   const arrayValue = Object.values(record).find((value) => Array.isArray(value));
   return Array.isArray(arrayValue)
-    ? arrayValue.filter((item) => item && typeof item === "object") as JsonRecord[]
+    ? arrayValue.filter((item): item is JsonRecord => Boolean(item) && typeof item === "object")
     : [];
 }
 

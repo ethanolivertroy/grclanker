@@ -175,7 +175,7 @@ const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
 // The next header on the same line (`; X-Api-Key: x`, `, Content-Type: x`, ` Accept: x`, a quoted or JSON-object
 // name too): a cookie or header value ends before it, so that header keeps its name and gets its own carrier treatment.
 const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`;
-// The schemes that stand as carriers in prose (the ruling's list) and the wider set recognized inside an Authorization header.
+// The schemes that stand as carriers in prose and the wider set recognized inside an Authorization header.
 const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
 const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
 // A quote closes a value only when a delimiter or the end of the text follows it; a quote followed by a value
@@ -1901,7 +1901,14 @@ function unassignedEnabledPolicies(policies: JsonRecord[]): JsonRecord[] {
   return enabledPolicies(policies).filter((policy) => !policyAppliesToHosts(policy));
 }
 
-function policyInventory(policies: JsonRecord[]): JsonRecord {
+type PolicyInventory = JsonRecord & {
+  total_policies: number;
+  enabled_policies: number;
+  enabled_and_assigned_policies: number;
+  enabled_but_unassigned_policies: string[];
+};
+
+function policyInventory(policies: JsonRecord[]): PolicyInventory {
   return {
     total_policies: policies.length,
     enabled_policies: enabledPolicies(policies).length,
@@ -1927,14 +1934,14 @@ function missingPlatforms(policies: JsonRecord[]): string[] {
 
 /** A fail resting on the absence of an enabled and assigned policy; `absence_claim` lets a partial read demote it to manual. */
 function noAssignedPolicyFinding(id: ControlId, policyKind: string, policies: JsonRecord[]): CrowdstrikeFinding {
-  const inventory: JsonRecord = { ...policyInventory(policies), absence_claim: true };
+  const inventory = { ...policyInventory(policies), absence_claim: true };
   if (policies.length === 0) {
     return finding(id, "fail", `The ${policyKind} policies endpoint was readable but returned zero policies; with no ${policyKind} policy defined this control fails.`, inventory);
   }
   return finding(
     id,
     "fail",
-    `None of the ${policies.length} ${policyKind} policies is both enabled and assigned to host groups (${inventory.enabled_policies as number} enabled, ${(inventory.enabled_but_unassigned_policies as string[]).length} enabled but unassigned), so the control is not enforced on any host.`,
+    `None of the ${policies.length} ${policyKind} policies is both enabled and assigned to host groups (${inventory.enabled_policies} enabled, ${inventory.enabled_but_unassigned_policies.length} enabled but unassigned), so the control is not enforced on any host.`,
     inventory,
   );
 }
@@ -2724,9 +2731,9 @@ export async function assessCrowdstrikeDeviceFirewall(
   const deviceControl = await collectDataset(() => client.listDeviceControlPolicies(), emptyPage<JsonRecord>(), "device control policies", "/policy/combined/device-control/v1");
   const deviceControlIds = deviceControl.data.items.map((policy) => asString(policy.id)).filter((id): id is string => Boolean(id));
   const deviceControlDetails: CollectedDataset<JsonRecord[]> = deviceControlIds.length > 0
-    ? await collectDataset(() => client.getDeviceControlPoliciesV2(deviceControlIds), [] as JsonRecord[], "device control policy details", "/policy/entities/device-control/v2")
+    ? await collectDataset<JsonRecord[]>(() => client.getDeviceControlPoliciesV2(deviceControlIds), [], "device control policy details", "/policy/entities/device-control/v2")
     : skippedDataset(
-      [] as JsonRecord[],
+      [],
       "device control policy details",
       isCollected(deviceControl) ? "the device control policies list returned no policy ids to look up" : "the device control policies list was not read",
       "/policy/entities/device-control/v2",
@@ -2734,9 +2741,9 @@ export async function assessCrowdstrikeDeviceFirewall(
   const firewallPolicies = await collectDataset(() => client.listFirewallPolicies(), emptyPage<JsonRecord>(), "firewall policies", "/policy/combined/firewall/v1");
   const firewallIds = assignedPolicies(firewallPolicies.data.items).map((policy) => asString(policy.id)).filter((id): id is string => Boolean(id));
   const containers: CollectedDataset<JsonRecord[]> = firewallIds.length > 0
-    ? await collectDataset(() => client.getFirewallPolicyContainers(firewallIds), [] as JsonRecord[], "firewall policy containers", "/fwmgr/entities/policies/v1")
+    ? await collectDataset<JsonRecord[]>(() => client.getFirewallPolicyContainers(firewallIds), [], "firewall policy containers", "/fwmgr/entities/policies/v1")
     : skippedDataset(
-      [] as JsonRecord[],
+      [],
       "firewall policy containers",
       isCollected(firewallPolicies) ? "the firewall policies list returned no enabled and host-assigned policy ids to look up" : "the firewall policies list was not read",
       "/fwmgr/entities/policies/v1",
@@ -3142,28 +3149,28 @@ export async function assessCrowdstrikeSensorCoverage(
   const platforms = [...new Set(assignedPolicies(sensorUpdate.data.items).map((policy) => (asString(policy.platform_name) ?? "").toLowerCase()).filter(Boolean))];
   const buildsByPlatform = new Map<string, CollectedDataset<JsonRecord[]>>();
   for (const platform of platforms) {
-    buildsByPlatform.set(platform, await collectDataset(() => client.listSensorUpdateBuilds(platform), [] as JsonRecord[], `sensor builds (${platform})`, "/policy/combined/sensor-update-builds/v1"));
+    buildsByPlatform.set(platform, await collectDataset<JsonRecord[]>(() => client.listSensorUpdateBuilds(platform), [], `sensor builds (${platform})`, "/policy/combined/sensor-update-builds/v1"));
   }
   const hosts = await collectDataset(() => client.listHosts(hostLimit), emptyPage<JsonRecord>(), "hosts", "/devices/combined/devices/v1");
   const hostGroups = await collectDataset(() => client.listHostGroups(), emptyPage<JsonRecord>(), "host groups", "/devices/combined/host-groups/v1");
-  const unmanagedCount = await collectDataset(() => client.countDiscoverHosts("entity_type:'unmanaged'"), undefined as number | undefined, "discover unmanaged hosts", "/discover/queries/hosts/v1");
+  const unmanagedCount = await collectDataset<number | undefined>(() => client.countDiscoverHosts("entity_type:'unmanaged'"), undefined, "discover unmanaged hosts", "/discover/queries/hosts/v1");
   const managedCount: CollectedDataset<number | undefined> = unmanagedCount.error
-    ? skippedDataset(undefined as number | undefined, "discover managed hosts", "the discover unmanaged hosts count was not read", "/discover/queries/hosts/v1")
-    : await collectDataset(() => client.countDiscoverHosts("entity_type:'managed'"), undefined as number | undefined, "discover managed hosts", "/discover/queries/hosts/v1");
+    ? skippedDataset<number | undefined>(undefined, "discover managed hosts", "the discover unmanaged hosts count was not read", "/discover/queries/hosts/v1")
+    : await collectDataset<number | undefined>(() => client.countDiscoverHosts("entity_type:'managed'"), undefined, "discover managed hosts", "/discover/queries/hosts/v1");
   const unmanagedSamples: CollectedDataset<CrowdstrikePage<JsonRecord>> = unmanagedCount.error
     ? skippedDataset(emptyPage<JsonRecord>(), "discover unmanaged samples", "the discover unmanaged hosts count was not read", "/discover/combined/hosts/v1")
     : await collectDataset(() => client.listDiscoverHosts("entity_type:'unmanaged'", 100), emptyPage<JsonRecord>(), "discover unmanaged samples", "/discover/combined/hosts/v1");
-  const ztaTotal = await collectDataset(() => client.countZtaAssessments("score:>=0"), undefined as number | undefined, "zero trust assessment totals", "/zero-trust-assessment/queries/assessments/v1");
+  const ztaTotal = await collectDataset<number | undefined>(() => client.countZtaAssessments("score:>=0"), undefined, "zero trust assessment totals", "/zero-trust-assessment/queries/assessments/v1");
   const ztaBelow: CollectedDataset<CrowdstrikePage<JsonRecord>> = ztaTotal.error
     ? skippedDataset(emptyPage<JsonRecord>(), "zero trust assessments below threshold", "the zero trust assessment totals count was not read", "/zero-trust-assessment/queries/assessments/v1")
     : await collectDataset(() => client.listZtaAssessments(`score:<${minScore}`, 1000), emptyPage<JsonRecord>(), "zero trust assessments below threshold", "/zero-trust-assessment/queries/assessments/v1");
   const ztaBelowTotal: CollectedDataset<number | undefined> = ztaTotal.error
-    ? skippedDataset(undefined as number | undefined, "zero trust assessment below-threshold totals", "the zero trust assessment totals count was not read", "/zero-trust-assessment/queries/assessments/v1")
-    : await collectDataset(() => client.countZtaAssessments(`score:<${minScore}`), undefined as number | undefined, "zero trust assessment below-threshold totals", "/zero-trust-assessment/queries/assessments/v1");
+    ? skippedDataset<number | undefined>(undefined, "zero trust assessment below-threshold totals", "the zero trust assessment totals count was not read", "/zero-trust-assessment/queries/assessments/v1")
+    : await collectDataset<number | undefined>(() => client.countZtaAssessments(`score:<${minScore}`), undefined, "zero trust assessment below-threshold totals", "/zero-trust-assessment/queries/assessments/v1");
   const sensorBuilds: CollectedDataset<Record<string, unknown>> = platforms.length > 0
     ? { data: Object.fromEntries([...buildsByPlatform.entries()].map(([platform, dataset]) => [platform, snapshotOf(dataset, dataset.data)])), label: "sensor update builds", endpoint: "/policy/combined/sensor-update-builds/v1" }
     : skippedDataset(
-      {} as Record<string, unknown>,
+      {},
       "sensor update builds",
       isCollected(sensorUpdate) ? "no enabled and host-assigned sensor update policy named a platform to look up" : "the sensor update policies list was not read",
       "/policy/combined/sensor-update-builds/v1",
@@ -3626,8 +3633,8 @@ export async function assessCrowdstrikeAccessGovernance(
 
   const uuids = await collectDataset(() => client.listUserUuids(userLimit), emptyPage<string>(), "user uuids", "/user-management/queries/users/v1");
   const users: CollectedDataset<JsonRecord[]> = uuids.error
-    ? skippedDataset([] as JsonRecord[], "users", "the user uuid list was not read", "/user-management/entities/users/GET/v1")
-    : await collectDataset(() => client.getUsers(uuids.data.items), [] as JsonRecord[], "users", "/user-management/entities/users/GET/v1");
+    ? skippedDataset<JsonRecord[]>([], "users", "the user uuid list was not read", "/user-management/entities/users/GET/v1")
+    : await collectDataset<JsonRecord[]>(() => client.getUsers(uuids.data.items), [], "users", "/user-management/entities/users/GET/v1");
   const rolesByUser = new Map<string, JsonRecord[]>();
   const roleSnapshots: Record<string, unknown> = {};
   const roleErrors: string[] = [];
@@ -3657,7 +3664,7 @@ export async function assessCrowdstrikeAccessGovernance(
   const usersUnavailable = uuids.error ?? users.error;
   const allRolesFailed = views.length > 0 && views.every((view) => !view.roles_readable);
   const userRoles: CollectedDataset<Record<string, unknown>> = usersUnavailable
-    ? skippedDataset({} as Record<string, unknown>, "user roles", uuids.error ? "the user uuid list was not read" : "the user details were not read", "/user-management/combined/user-roles/v2")
+    ? skippedDataset<Record<string, unknown>>({}, "user roles", uuids.error ? "the user uuid list was not read" : "the user details were not read", "/user-management/combined/user-roles/v2")
     : { data: roleSnapshots, label: "user roles", endpoint: "/user-management/combined/user-roles/v2" };
   const userPartial = partialInventory(uuids.data, "users");
   const userFinding = (id: ControlId, evaluate: () => CrowdstrikeFinding): CrowdstrikeFinding => {

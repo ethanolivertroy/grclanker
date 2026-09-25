@@ -237,7 +237,7 @@ type RawConfigArgs = {
 };
 
 type GwsConfigOverlay = {
-  authMode?: GwsAuthMode;
+  authMode?: string;
   credentialsFile?: string;
   credentialsJson?: string;
   accessToken?: string;
@@ -1054,16 +1054,16 @@ function isUserAssignment(assignment: JsonRecord): boolean {
 function getRoleMap(roles: JsonRecord[]): Map<string, JsonRecord> {
   return new Map(
     roles
-      .map((role) => [asString(role.roleId), role] as const)
-      .filter(([roleId]) => Boolean(roleId)) as Array<[string, JsonRecord]>,
+      .map((role): [string | undefined, JsonRecord] => [asString(role.roleId), role])
+      .filter((entry): entry is [string, JsonRecord] => entry[0] !== undefined),
   );
 }
 
 function getUserMap(users: JsonRecord[]): Map<string, JsonRecord> {
   return new Map(
     users
-      .map((user) => [asString(user.id), user] as const)
-      .filter(([userId]) => Boolean(userId)) as Array<[string, JsonRecord]>,
+      .map((user): [string | undefined, JsonRecord] => [asString(user.id), user])
+      .filter((entry): entry is [string, JsonRecord] => entry[0] !== undefined),
   );
 }
 
@@ -1072,12 +1072,12 @@ function getDisplayOrganization(config: GwsResolvedConfig): string {
 }
 
 function countByStatus(findings: GwsFinding[]): Record<GwsFindingStatus, number> {
-  return findings.reduce(
+  return findings.reduce<Record<GwsFindingStatus, number>>(
     (acc, finding) => {
       acc[finding.status] += 1;
       return acc;
     },
-    { Pass: 0, Partial: 0, Fail: 0, Manual: 0, Info: 0 } as Record<GwsFindingStatus, number>,
+    { Pass: 0, Partial: 0, Fail: 0, Manual: 0, Info: 0 },
   );
 }
 
@@ -2093,12 +2093,16 @@ export function normalizeFrameworkSelection(value: unknown): ReportFrameworkKey[
   if (requested.length === 0) return [...REPORT_FRAMEWORK_KEYS];
   const selected: ReportFrameworkKey[] = [];
   for (const entry of requested) {
-    if (!REPORT_FRAMEWORK_KEYS.includes(entry as ReportFrameworkKey)) {
+    if (!isReportFrameworkKey(entry)) {
       throw new Error(`Unknown framework "${entry}". Supported values: ${REPORT_FRAMEWORK_KEYS.join(", ")}.`);
     }
-    if (!selected.includes(entry as ReportFrameworkKey)) selected.push(entry as ReportFrameworkKey);
+    if (!selected.includes(entry)) selected.push(entry);
   }
   return selected;
+}
+
+function isReportFrameworkKey(value: string): value is ReportFrameworkKey {
+  return REPORT_FRAMEWORK_KEYS.some((key) => key === value);
 }
 
 export async function resolveGwsConfiguration(
@@ -2109,7 +2113,7 @@ export async function resolveGwsConfiguration(
   const overlays: GwsConfigOverlay[] = [];
 
   const envOverlay: GwsConfigOverlay = {
-    authMode: normalizeString(env.GWS_AUTH_MODE) as GwsAuthMode | undefined,
+    authMode: normalizeString(env.GWS_AUTH_MODE),
     credentialsFile: normalizeString(env.GWS_CREDENTIALS_FILE)
       ?? normalizeString(env.GWS_SERVICE_ACCOUNT_FILE)
       ?? normalizeString(env.GOOGLE_APPLICATION_CREDENTIALS),
@@ -2128,7 +2132,7 @@ export async function resolveGwsConfiguration(
 
   const normalizedArgs = normalizeAssessmentArgs(args);
   const argsOverlay: GwsConfigOverlay = {
-    authMode: normalizeString(normalizedArgs.auth_mode) as GwsAuthMode | undefined,
+    authMode: normalizeString(normalizedArgs.auth_mode),
     credentialsFile: normalizedArgs.credentials_file,
     credentialsJson: normalizedArgs.credentials_json,
     accessToken: normalizedArgs.access_token,
@@ -2145,8 +2149,8 @@ export async function resolveGwsConfiguration(
   // Later overlays win only where they carry a value: the argument overlay lists every key, so spreading it whole
   // would erase an environment-supplied credentials path with undefined.
   const merged = overlays.reduce<GwsConfigOverlay>((acc, overlay) => ({ ...acc, ...definedEntries(overlay) }), {});
-  const authMode = (merged.authMode
-    ?? (merged.accessToken ? "access_token" : "service_account")) as GwsAuthMode;
+  const authMode = merged.authMode
+    ?? (merged.accessToken ? "access_token" : "service_account");
   if (authMode !== "service_account" && authMode !== "access_token") {
     throw new Error(
       `Unsupported Google Workspace auth_mode "${String(merged.authMode)}". Supported values: service_account, access_token. Interactive installed-app OAuth is not shipped yet; obtain a token externally and use access_token.`,
@@ -2564,22 +2568,26 @@ async function collectTokenInventory(
   const records: TokenInventoryRecord[] = [];
   const failures: TokenReadFailure[] = [];
   let forbidden = 0;
-  const collected = await mapWithConcurrency(users, 4, async (user) => {
+  const collected = await mapWithConcurrency(users, 4, async (user): Promise<{
+    records: TokenInventoryRecord[];
+    failure: TokenReadFailure | undefined;
+    kind: GwsEndpointStatus | undefined;
+  }> => {
     const userKey = asString(user.primaryEmail) ?? asString(user.id);
-    if (!userKey) return { records: [] as TokenInventoryRecord[], failure: undefined as TokenReadFailure | undefined, kind: undefined as GwsEndpointStatus | undefined };
+    if (!userKey) return { records: [], failure: undefined, kind: undefined };
     const userId = asString(user.id) ?? userKey;
     const primaryEmail = asString(user.primaryEmail) ?? userKey;
     try {
       const tokens = await client.listUserTokens(userKey);
       return {
         records: tokens.map((token) => ({ userId, primaryEmail, token })),
-        failure: undefined as TokenReadFailure | undefined,
-        kind: undefined as GwsEndpointStatus | undefined,
+        failure: undefined,
+        kind: undefined,
       };
     } catch (error) {
       return {
-        records: [] as TokenInventoryRecord[],
-        failure: { userId, primaryEmail, error: summarizeError(error) } as TokenReadFailure | undefined,
+        records: [],
+        failure: { userId, primaryEmail, error: summarizeError(error) },
         kind: classifyError(error),
       };
     }

@@ -2906,7 +2906,7 @@ export async function assessGcpOrgGuardrails(
   const maxProjects = clampNumber(options.maxProjects, DEFAULT_MAX_PROJECTS, 1, 500);
   const maxAssets = clampNumber(options.maxAssets, DEFAULT_MAX_ASSETS, 1, 50_000);
   const config = client.getResolvedConfig();
-  const organization = await attempt(() => client.getOrganization(), null as JsonRecord | null);
+  const organization = await attempt<JsonRecord | null>(() => client.getOrganization(), null);
   const context = await loadProjectContext(client, maxProjects);
   const targetProjectId = context.projectIds[0] ?? config.projectId;
 
@@ -2917,7 +2917,7 @@ export async function assessGcpOrgGuardrails(
     if (!targetProjectId) {
       return { constraint, policy: { data: null, error: policyNotAttempted, truncated: false }, unreadable: [notCollected(inventory, "the scope", policyNotAttempted)] };
     }
-    const policy = await attempt(() => client.getEffectiveOrgPolicy(targetProjectId, constraint), null as JsonRecord | null);
+    const policy = await attempt<JsonRecord | null>(() => client.getEffectiveOrgPolicy(targetProjectId, constraint), null);
     return { constraint, policy, unreadable: unreadableCollected(inventory, policy, `the sampled project ${targetProjectId}`) };
   };
 
