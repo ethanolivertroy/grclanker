@@ -515,8 +515,8 @@ function normalizeMaxResults(value: unknown): number {
 /** Values from the CLI's own environment that a capture might echo back; scrubbed wherever they appear. */
 function knownSecretValues(env: NodeJS.ProcessEnv): string[] {
   return Object.entries(env)
-    .filter(([key, value]) => typeof value === "string" && key.startsWith("GOOGLE_WORKSPACE_CLI_") && /TOKEN|SECRET|PASSWORD|KEY/.test(key))
-    .map(([, value]) => value as string);
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[0].startsWith("GOOGLE_WORKSPACE_CLI_") && /TOKEN|SECRET|PASSWORD|KEY/.test(entry[0]))
+    .map(([, value]) => value);
 }
 
 /**
@@ -737,16 +737,17 @@ function maxResultsNote(value: unknown, label: string): string {
 function normalizeAlertRecords(parsed: unknown): GwsOpsActivityRecord[] {
   return recordsFromObject(parsed, ["alerts"]).map((alert) => {
     const metadata = asRecord(alert.metadata);
+    const alertType = asString(alert.type);
     return {
       id: asString(alert.alertId),
       timestamp: asString(alert.createTime) ?? asString(alert.updateTime),
-      detail: asString(alert.type),
+      detail: alertType,
       severity: asString(metadata.severity),
       status: asString(metadata.status),
       source: asString(alert.source),
       actor: asString(metadata.assignee),
       application: "alertcenter",
-      eventNames: asString(alert.type) ? [alert.type as string] : [],
+      eventNames: alertType ? [alertType] : [],
     };
   });
 }
@@ -761,7 +762,9 @@ function normalizeActivityRecords(parsed: unknown, applicationName: "admin" | "t
   return recordsFromObject(parsed, ["items"]).map((item) => {
     const id = asRecord(item.id);
     const actor = asRecord(item.actor);
-    const events = asArray(item.events).map((event) => asString(asRecord(event).name)).filter(Boolean) as string[];
+    const events = asArray(item.events)
+      .map((event) => asString(asRecord(event).name))
+      .filter((event): event is string => event !== undefined);
     const applicationInfo = asRecord(actor.applicationInfo);
     return {
       id: asString(id.uniqueQualifier) ?? asString(id.time),
