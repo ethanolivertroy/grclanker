@@ -255,7 +255,7 @@ export interface DatadogFinding {
   severity: "critical" | "high" | "medium" | "low" | "info";
   status: "pass" | "warn" | "fail" | "manual";
   summary: string;
-  evidence?: JsonRecord;
+  evidence?: DatadogEvidence;
   mappings: string[];
 }
 
@@ -310,6 +310,12 @@ export interface DatadogInventoryGap {
   not_checked: string;
   collect_manually: string;
 }
+
+type DatadogInventoryGapEvidence = JsonRecord | DatadogInventoryGap;
+
+type DatadogEvidence = JsonRecord & {
+  unreadable_inventories?: DatadogInventoryGapEvidence[];
+};
 
 /**
  * Written in place of a list (or object) dataset whenever it was denied, errored, or never requested, so a bundle
@@ -1296,7 +1302,7 @@ export class DatadogApiClient {
       let parsedJson = false;
       if (rawText.length > 0) {
         try {
-          payload = JSON.parse(rawText) as unknown;
+          payload = JSON.parse(rawText);
           parsedJson = true;
         } catch {
           payload = {};
@@ -1869,7 +1875,7 @@ async function loadCloudIntegrations(
   return loadSurface(`${provider}_integrations`, async () => (await load()).map((record) => projectCloudIntegration(provider, record)), errors);
 }
 
-function withUnreadableEvidence(evidence: JsonRecord, gaps: Array<JsonRecord | DatadogInventoryGap>): JsonRecord {
+function withUnreadableEvidence(evidence: DatadogEvidence, gaps: DatadogInventoryGapEvidence[]): DatadogEvidence {
   return gaps.length > 0 ? { ...evidence, unreadable_inventories: gaps } : evidence;
 }
 

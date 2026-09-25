@@ -1806,7 +1806,7 @@ function scrubSnapshotTree(value: unknown, isSecretKey: (key: string) => boolean
   if (depth > SNAPSHOT_DEPTH_CAP) return REDACTED_ERROR_VALUE;
   if (Array.isArray(value)) return value.map((entry) => scrubSnapshotTree(entry, isSecretKey, depth + 1));
   const output: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, entry] of Object.entries(value)) {
     output[key] = isSecretKey(key) ? snapshotMarkerFor(entry) : scrubSnapshotTree(entry, isSecretKey, depth + 1);
   }
   return output;
