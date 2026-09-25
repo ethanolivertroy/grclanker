@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the AFC FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Addressing FedRAMP Communication
@@ -41,7 +41,7 @@ The Addressing FedRAMP Communication rules (formerly FedRAMP Security Inbox) ens
 
 Providers SHOULD promptly and automatically acknowledge the receipt of messages received from FedRAMP in their FedRAMP Security Inbox.
 
-Terms: `FedRAMP Security Inbox`, `Promptly`, `Provider`
+Terms: `FedRAMP Security Inbox`, `Promptly`
 
 Affects: Providers
 
@@ -51,7 +51,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST complete the required actions in Emergency or Emergency Test designated messages sent by FedRAMP within the timeframe included in the message.
 
-Terms: `Certification Class`, `Provider`
+Terms: `Certification Class`
 
 Affects: Providers
 
@@ -63,8 +63,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST route Emergency designated messages sent by FedRAMP to a senior security official for their awareness.
 
-Terms: `Provider`
-
 Affects: Providers
 
 Note: Senior security officials are determined by the provider.
@@ -75,7 +73,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD complete the required actions in Important designated messages sent by FedRAMP within the timeframe specified in the message.
 
-Terms: `Certification Class`, `Provider`
+Terms: `Certification Class`
 
 Affects: Providers
 
@@ -87,7 +85,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST establish and maintain an email address to receive messages from FedRAMP; this inbox is a FedRAMP Security Inbox (FSI).
 
-Terms: `FedRAMP Security Inbox`, `Provider`
+Terms: `FedRAMP Security Inbox`
 
 Affects: Providers
 
@@ -100,7 +98,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST immediately notify FedRAMP of any changes to the email address for their FedRAMP Security Inbox.
 
-Terms: `FedRAMP Security Inbox`, `Provider`
+Terms: `FedRAMP Security Inbox`
 
 Affects: Providers
 
@@ -109,8 +107,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 ### `AFC-CSO-RCV` MUST — Receive Email Without Disruption
 
 Providers MUST receive and react to email messages from FedRAMP without disruption and without requiring additional actions from FedRAMP.
-
-Terms: `Provider`
 
 Affects: Providers
 
@@ -122,7 +118,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST treat any email originating from an @fedramp.gov or @gsa.gov email address as if it was sent from FedRAMP by default; if such a message is confirmed to originate from someone other than FedRAMP then the FedRAMP Security Inbox rules no longer apply.
 
-Terms: `FedRAMP Security Inbox`, `Provider`
+Terms: `FedRAMP Security Inbox`
 
 Affects: Providers
 
@@ -137,7 +133,7 @@ Checklist items:
 - **Emergency Test:** FedRAMP requires an extremely urgent reaction to confirm the functionality and effectiveness of the FedRAMP Security Inbox; emergency test messages will contain aggressive timeframes for reaction and failure to meet these timeframes will result in corrective action.
 - **Important:** There is an important issue that FedRAMP requires the cloud service provider to address; important messages will contain reasonable timeframes for reaction and failure to meet these timeframes may result in corrective action.
 
-Terms: `FedRAMP Security Inbox`, `Incident`, `Provider`
+Terms: `FedRAMP Security Inbox`, `Incident`
 
 Affects: FedRAMP
 
@@ -163,7 +159,7 @@ Checklist items:
 - **Class B:** by 3:00 p.m. Eastern Time on the 3rd business day
 - **Class A:** by 3:00 p.m. Eastern Time on the 5th business day
 
-Terms: `Debilitating Customer Effect`, `FedRAMP Certified`, `Provider`
+Terms: `Debilitating Customer Effect`, `FedRAMP Certified`
 
 Affects: FedRAMP
 
@@ -190,8 +186,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 FedRAMP MAY track and publicly share the time required by cloud service providers to take the actions specified in messages that require an elevated reaction.
 
-Terms: `Provider`
-
 Affects: FedRAMP
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -215,8 +209,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 ### `AFC-FRP-VRE` MUST — Verified Emails
 
 FedRAMP MUST send messages to cloud service providers using an official @fedramp.gov or @gsa.gov email address with properly configured Sender Policy Framework (SPF), DomainKeys Identified Mail (DKIM), and Domain-based Message Authentication Reporting and Conformance (DMARC) email authentication.
-
-Terms: `Provider`
 
 Affects: FedRAMP
 

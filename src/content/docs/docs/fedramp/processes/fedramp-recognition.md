@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the REC FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # FedRAMP Recognition of Independent Assessment Services
@@ -41,7 +41,7 @@ The FedRAMP Recognition of independent assessment services rules explain the req
 
 FedRAMP MUST NOT restore FedRAMP Recognition for an assessor after FedRAMP has revoked that assessor's FedRAMP Recognition 2 times.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: FedRAMP
 
@@ -51,7 +51,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 FedRAMP MUST maintain a process to collect foreign ownership, control, or influence declarations from FedRAMP Recognized assessors and updates to those declarations.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: FedRAMP
 
@@ -61,7 +61,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 FedRAMP MUST NOT accept verification, validation, or other attestations from independent assessors who are not FedRAMP Recognized.
 
-Terms: `Assessor`, `FedRAMP Recognized`, `Validation`, `Verification`
+Terms: `FedRAMP Recognized`, `Validation`, `Verification`
 
 Affects: FedRAMP
 
@@ -71,7 +71,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST obtain and maintain accreditation through the American Association for Laboratory Accreditation (A2LA) Cybersecurity Inspection Body Program to qualify for FedRAMP Recognition.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
@@ -83,7 +83,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST complete at least 2 initial or ongoing assessments for Class B, C, or D FedRAMP Certifications every 2 years to maintain FedRAMP Recognition.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
@@ -97,8 +97,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST report information relating to any foreign interest, foreign influence, or foreign control of the independent assessment service to FedRAMP annually.
 
-Terms: `Assessor`
-
 Affects: Assessors
 
 Structured timeframe: `1` years
@@ -109,7 +107,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST achieve a favorable annual surveillance assessment by the American Association for Laboratory Accreditation (A2LA) to maintain FedRAMP Recognition.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
@@ -121,8 +119,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST supply a corrective action plan when FedRAMP requires one for performance standards deficiencies or organizational risks.
 
-Terms: `Assessor`
-
 Affects: Assessors
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -130,8 +126,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 ### `REC-IAS-CFI` MUST — Changes in Foreign Interest
 
 Assessors MUST report updated information relating to any foreign interest, foreign influence, or foreign control of the independent assessment service within 48 hours of any change in foreign ownership or control.
-
-Terms: `Assessor`
 
 Affects: Assessors
 
@@ -143,8 +137,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST treat deliverables prepared, performed, or submitted by personnel who do not meet required role qualifications as invalid for FedRAMP purposes.
 
-Terms: `Assessor`
-
 Affects: Assessors
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -153,7 +145,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST maintain compliance with the latest American Association for Laboratory Accreditation (A2LA) R311 - Specific Requirements - Federal Risk and Authorization Management Program to maintain FedRAMP Recognition.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
@@ -172,7 +164,7 @@ Checklist items:
 - Assessment Integrity: Submits independent assessments of provider security implementations that are not influenced by provider demands.
 - Chain of Custody: Preserves the integrity and chain of custody of assessor-authored documents and provider-supplied evidence used in FedRAMP assessments.
 
-Terms: `Agency`, `Assessor`, `Cloud Service Offering`, `Provider`
+Terms: `Cloud Service Offering`
 
 Affects: Assessors
 
@@ -182,7 +174,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST satisfy all American Association for Laboratory Accreditation (A2LA) re-entry conditions before regaining FedRAMP Recognition after revocation.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
@@ -194,7 +186,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST achieve a favorable full reassessment by the American Association for Laboratory Accreditation (A2LA) at least once every 2 years to maintain FedRAMP Recognition.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
@@ -206,8 +198,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST staff FedRAMP assessments with all roles required by the American Association for Laboratory Accreditation (A2LA) R311, including personnel who meet the qualifications for each role, unless FedRAMP publishes a specific exception for a limited pilot or other explicitly scoped process.
 
-Terms: `Assessor`
-
 Affects: Assessors
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -216,7 +206,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST NOT perform a FedRAMP independent assessment of the same cloud service offering within 2 years after supplying advisory or consulting services for that offering, unless FedRAMP publishes a specific exception for a limited pilot or other explicitly scoped process.
 
-Terms: `Assessor`, `Cloud Service Offering`, `FedRAMP Independent Assessment`
+Terms: `Cloud Service Offering`, `FedRAMP Independent Assessment`
 
 Affects: Assessors
 

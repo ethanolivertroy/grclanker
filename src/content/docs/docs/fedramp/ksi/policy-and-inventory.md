@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the PIY FedRAMP key securit
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Policy and Inventory
@@ -28,7 +28,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Executive support for achieving the provider's security goals is persistently reviewed and demonstrated.
 
-Terms: `Persistently`, `Provider`
+Terms: `Persistently`
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
@@ -38,7 +38,7 @@ The effectiveness of the provider's investments in achieving security goals is p
 
 Mapped Rev5 controls: `ac-5`, `ca-2`, `cp-2.1`, `cp-4.1`, `ir-3.2`, `pm-3`, `sa-2`, `sa-3`, `sr-2.1`
 
-Terms: `Persistently`, `Provider`
+Terms: `Persistently`
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
@@ -58,6 +58,6 @@ The effectiveness of the provider's vulnerability disclosure program is persiste
 
 Mapped Rev5 controls: `ra-5.11`
 
-Terms: `Persistently`, `Provider`, `Vulnerability`
+Terms: `Persistently`, `Vulnerability`
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.

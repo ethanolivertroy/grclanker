@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the CDS FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Certification Data Sharing
@@ -48,7 +48,7 @@ Varies by certification class:
 - **Class C MUST:** Providers with Class C Certifications MUST maintain a web service, available to all necessary parties, that indicates current and historical availability of core services within the cloud service offering over at least the past 30 days, including availability incidents, in both human-readable and machine-readable formats; this service MUST be available even if the primary cloud service offering is unavailable.
 - **Class D MUST:** Providers with Class D Certifications MUST maintain a web service, available to all necessary parties, that indicates current and historical availability of core services within the cloud service offering over at least the past 30 days, including availability incidents, in both human-readable and machine-readable formats; this service MUST be available even if the primary cloud service offering is unavailable.
 
-Terms: `All Necessary Parties`, `Cloud Service Offering`, `Incident`, `Machine-Readable`, `Provider`
+Terms: `All Necessary Parties`, `Cloud Service Offering`, `Incident`, `Machine-Readable`
 
 Affects: Providers
 
@@ -60,7 +60,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST use automation to ensure information remains consistent between human-readable and machine-readable formats when FedRAMP Certification Data is provided in both formats.
 
-Terms: `Certification Data`, `Machine-Readable`, `Provider`
+Terms: `Certification Data`, `Machine-Readable`
 
 Affects: Providers
 
@@ -70,7 +70,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST always include the FedRAMP ID of the related cloud service offering in all FedRAMP Certification Data once assigned, including all reports, notifications, and other communication that results from FedRAMP rules.
 
-Terms: `Certification Data`, `Cloud Service Offering`, `Provider`
+Terms: `Certification Data`, `Cloud Service Offering`
 
 Affects: Providers
 
@@ -83,7 +83,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST include FedRAMP Certification Reports with their FedRAMP Certification Data without inappropriate modifications, and make such reports available within 2 weeks of receiving the materials from FedRAMP.
 
-Terms: `Agency`, `Certification Data`, `Certification Path`, `Cloud Service Offering`, `Provider`
+Terms: `Certification Data`, `Certification Path`, `Cloud Service Offering`
 
 Affects: Providers
 
@@ -97,7 +97,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST supply snapshots of FedRAMP Certification Data aligned to Ongoing Certification Reports to all necessary parties; these snapshots MUST be available for the duration of FedRAMP Certification.
 
-Terms: `All Necessary Parties`, `Certification Data`, `FedRAMP Certification Report`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Provider`
+Terms: `All Necessary Parties`, `Certification Data`, `FedRAMP Certification Report`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`
 
 Affects: Providers
 
@@ -118,7 +118,7 @@ Checklist items:
 - Date of last update
 - Related FedRAMP Practices (if applicable)
 
-Terms: `Certification Data`, `FedRAMP Practices`, `Machine-Readable`, `Provider`
+Terms: `Certification Data`, `FedRAMP Practices`, `Machine-Readable`
 
 Affects: Providers
 
@@ -132,8 +132,6 @@ Varies by certification class:
 - **Class B MAY:** Providers with Class B Certifications MAY supply per-service FedRAMP Certification materials.
 - **Class C MAY:** Providers with Class C Certifications MAY supply per-service FedRAMP Certification materials.
 - **Class D MUST:** Providers with Class D Certifications MUST supply per-service FedRAMP Certification materials.
-
-Terms: `Agency`, `Provider`
 
 Affects: Providers
 
@@ -164,7 +162,7 @@ Checklist items:
 - Next Ongoing Certification Report date (see CCM-OCR-NRD (Next Report Date))
 - Current FedRAMP Recognized independent assessment service
 
-Terms: `Cloud Service Offering`, `FedRAMP Certification Report`, `FedRAMP Recognized`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Provider`, `Security Category`, `Trust Center`
+Terms: `Cloud Service Offering`, `FedRAMP Certification Report`, `FedRAMP Recognized`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Security Category`, `Trust Center`
 
 Affects: Providers
 
@@ -176,7 +174,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST provide sufficient information in FedRAMP Certification Data to support agency authorization decisions but SHOULD NOT include sensitive information that would likely enable a threat actor to gain unauthorized access, cause harm, disrupt operations, or otherwise have a negative adverse impact on the cloud service offering.
 
-Terms: `Agency`, `Certification Data`, `Cloud Service Offering`, `Likely`, `Provider`
+Terms: `Certification Data`, `Cloud Service Offering`, `Likely`
 
 Affects: Providers
 
@@ -188,7 +186,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY responsibly share some or all of the information in a FedRAMP Certification Package publicly or with other parties if the provider determines doing so will NOT likely have an adverse effect on the cloud service offering.
 
-Terms: `Certification Package`, `Cloud Service Offering`, `Likely`, `Provider`, `Responsibly`
+Terms: `Certification Package`, `Cloud Service Offering`, `Likely`, `Responsibly`
 
 Affects: Providers
 
@@ -198,7 +196,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST publicly share a detailed list of specific services and their security categories that are included in the cloud service offering using clear feature or service names that align with standard public marketing materials; this list MUST be complete enough for a potential customer to determine which services are and are not included in the FedRAMP Minimum Assessment Scope without requesting access to underlying FedRAMP Certification Data.
 
-Terms: `Certification Data`, `Cloud Service Offering`, `Provider`, `Security Category`
+Terms: `Certification Data`, `Cloud Service Offering`, `Security Category`
 
 Affects: Providers
 
@@ -208,7 +206,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST use a FedRAMP-compatible trust center to store and share FedRAMP Certification Data with all necessary parties.
 
-Terms: `All Necessary Parties`, `Certification Data`, `Provider`, `Trust Center`
+Terms: `All Necessary Parties`, `Certification Data`, `Trust Center`
 
 Affects: Providers
 
@@ -220,7 +218,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Trust centers MUST maintain an inventory and history of federal agency users or systems with access to FedRAMP Certification Data and MUST make this information available to FedRAMP upon request.
 
-Terms: `Agency`, `Certification Data`, `Trust Center`
+Terms: `Certification Data`, `Trust Center`
 
 Affects: Providers
 
@@ -282,7 +280,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST notify FedRAMP within 5 business days of denying an agency access request for FedRAMP Certification Data.
 
-Terms: `Agency`, `Certification Data`, `Provider`
+Terms: `Certification Data`
 
 Affects: Providers
 
@@ -294,7 +292,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD supply access to the FedRAMP Certification Package with agencies upon request.
 
-Terms: `Agency`, `Certification Package`, `Provider`
+Terms: `Certification Package`
 
 Affects: Providers
 
@@ -306,7 +304,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST notify all necessary parties when migrating to a trust center and MUST provide information in their existing USDA Connect Community Portal secure folders explaining how to use the trust center to obtain FedRAMP Certification Data.
 
-Terms: `All Necessary Parties`, `Certification Data`, `Provider`, `Trust Center`
+Terms: `All Necessary Parties`, `Certification Data`, `Trust Center`
 
 Affects: Providers
 

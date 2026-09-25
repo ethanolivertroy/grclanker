@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the IEC FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Incident Evaluation and Communication
@@ -41,7 +41,7 @@ The Incident Evaluation and Communication rules explain how providers must commu
 
 Providers SHOULD use automation to minimize human intervention in the process of reporting FedRAMP Reportable Incidents to all affected parties.
 
-Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Provider`
+Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`
 
 Affects: Providers
 
@@ -51,7 +51,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST treat FedRAMP Reportable Incidents as if they have a Potential Agency Impact N-rating (PAIN) of 5 UNLESS they promptly estimate the PAIN rating following the rule in IEC-CSO-EFI (Estimate Federal Impact).
 
-Terms: `Agency`, `FedRAMP Reportable Incident`, `Incident`, `Potential Agency Impact`, `Promptly`, `Provider`
+Terms: `FedRAMP Reportable Incident`, `Incident`, `Potential Agency Impact`, `Promptly`
 
 Affects: Providers
 
@@ -68,7 +68,7 @@ Checklist items:
 - **N4** for a likely debilitating customer effect on 1 agency or a likely disruptive customer effect on more than 1 agency.
 - **N5** for a likely debilitating customer effect on more than 1 agency.
 
-Terms: `Agency`, `Debilitating Customer Effect`, `Disruptive Customer Effect`, `Incident`, `Likely`, `Minimal Customer Effect`, `Narrow Customer Effect`, `Potential Agency Impact`, `Promptly`, `Provider`
+Terms: `Debilitating Customer Effect`, `Disruptive Customer Effect`, `Incident`, `Likely`, `Minimal Customer Effect`, `Narrow Customer Effect`, `Potential Agency Impact`, `Promptly`
 
 Affects: Providers
 
@@ -80,7 +80,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST promptly evaluate incidents to determine if they affect confidentiality or integrity of federal customer data or are likely to affect confidentiality or integrity of federal customer data; such incidents are FedRAMP Reportable Incidents and must be reported following the FedRAMP Incident Evaluation and Communication rules.
 
-Terms: `FedRAMP Reportable Incident`, `Federal Customer Data`, `Incident`, `Likely`, `Promptly`, `Provider`
+Terms: `FedRAMP Reportable Incident`, `Federal Customer Data`, `Incident`, `Likely`, `Promptly`
 
 Affects: Providers
 
@@ -95,7 +95,7 @@ Varies by certification class:
 - **Class C MUST:** Providers with Class C Certifications MUST responsibly notify all affected parties by providing a Final Incident Report once the incident has been resolved and recovery is complete, including final updates to all previously reported information.
 - **Class D MUST:** Providers with Class D Certifications MUST responsibly notify all affected parties by providing a Final Incident Report once the incident has been resolved and recovery is complete, including final updates to all previously reported information.
 
-Terms: `All Affected Parties`, `Final Incident Report (FIR)`, `Incident`, `Provider`, `Responsibly`
+Terms: `All Affected Parties`, `Final Incident Report (FIR)`, `Incident`, `Responsibly`
 
 Affects: Providers
 
@@ -144,7 +144,7 @@ Checklist items:
 - Class D: Estimated recovery plan, milestones, and timelines
 - Class D: List of likely affected customer agencies
 
-Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Initial Incident Report (IIR)`, `Provider`, `Responsibly`
+Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Initial Incident Report (IIR)`, `Responsibly`
 
 Affects: Providers
 
@@ -154,10 +154,10 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Varies by certification class:
 
-- **Class A SHOULD:** Providers with Class A Certifications SHOULD responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the the following additional information that is available and/or the current relevant status for each item:
-- **Class B MUST:** Providers with Class B Certifications MUST responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the the following additional information that is available and/or the current relevant status for each item:
-- **Class C MUST:** Providers with Class C Certifications MUST responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the the following additional information that is available and/or the current relevant status for each item:
-- **Class D MUST:** Providers with Class D Certifications MUST responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the the following additional information that is available and/or the current relevant status for each item:
+- **Class A SHOULD:** Providers with Class A Certifications SHOULD responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the following additional information that is available and/or the current relevant status for each item:
+- **Class B MUST:** Providers with Class B Certifications MUST responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the following additional information that is available and/or the current relevant status for each item:
+- **Class C MUST:** Providers with Class C Certifications MUST responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the following additional information that is available and/or the current relevant status for each item:
+- **Class D MUST:** Providers with Class D Certifications MUST responsibly notify all affected parties of ongoing activity as new information becomes available during incident response for FedRAMP Reportable Incidents, including updates (or lack of updates) to all previously reported information and as much of the following additional information that is available and/or the current relevant status for each item:
 
 Checklist items:
 - Class A: Observed incident activity
@@ -181,17 +181,17 @@ Checklist items:
 - Class D: Root cause
 - Class D: Response and recovery activities
 
-Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Provider`, `Responsibly`, `Vulnerability Response`
+Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Responsibly`, `Vulnerability Response`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update: 2026-09-13 — Removed the extra the in all statements.
 
 ### `IEC-FRP-ORV` MUST — Ongoing Review
 
 FedRAMP MUST periodically review FedRAMP Incident Evaluation and Communication implementation with providers based on lack of reporting or other information.
 
-Terms: `Incident`, `Provider`
+Terms: `Incident`
 
 Affects: FedRAMP
 

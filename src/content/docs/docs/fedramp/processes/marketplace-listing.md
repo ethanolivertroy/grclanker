@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the MKT FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Marketplace Listing
@@ -44,8 +44,6 @@ The Marketplace Listing rules define how FedRAMP decides which cloud service off
 
 Advisors MUST complete the Advisor Listing Request Form to request listing in the FedRAMP Marketplace.
 
-Terms: `Advisor`
-
 Affects: Advisors
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -54,9 +52,9 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Advisors MUST reply to all requests from @fedramp.gov or @gsa.gov email addresses sent to the contact information provided in their advisor listing within 5 business days.
 
-Terms: `Advisor`
-
 Affects: Advisors
+
+Structured timeframe: `5` bizdays
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
@@ -70,7 +68,7 @@ Checklist items:
 - Types of consulting or advisory services offered
 - Optional: Positive attestations from customers or customer references
 
-Terms: `Advisor`, `Machine-Readable`
+Terms: `Machine-Readable`
 
 Affects: Advisors
 
@@ -83,7 +81,7 @@ Providers MUST address at least these FedRAMP rules to apply for a new FedRAMP M
 Checklist items:
 - Certification Data Sharing: CDS-CSO-PUB (Public Information)
 
-Terms: `Certification Data`, `Provider`
+Terms: `Certification Data`
 
 Affects: Providers
 
@@ -92,8 +90,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 ### `MKT-CSO-PML` MUST — Provider Marketplace Listing Requests
 
 Providers MUST notify FedRAMP using the FedRAMP Marketplace Providing Listing Request Form to request a listing in the FedRAMP Marketplace.
-
-Terms: `Provider`
 
 Affects: Providers
 
@@ -115,8 +111,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST complete the Assessor Listing Request Form to request listing in the FedRAMP Marketplace.
 
-Terms: `Assessor`
-
 Affects: Assessors
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -125,7 +119,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST obtain and maintain FedRAMP Recognition to be listed in the FedRAMP Marketplace.
 
-Terms: `Assessor`, `FedRAMP Recognized`
+Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
@@ -141,8 +135,6 @@ Checklist items:
 - Types of independent services offered
 - Optional: Positive attestations from customers or customer references
 
-Terms: `Assessor`
-
 Affects: Assessors
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -155,7 +147,7 @@ Checklist items:
 - Direct Use: The product will be used directly by agency customers for integration into a federal information system that falls within the scope of 44 USC § 3506 and will receive an agency Authorization to Operate.
 - Indirect Use: The product will be included as a third-party information resource in other cloud service offerings that are directly used by agency customers.
 
-Terms: `Agency`, `Cloud Service Offering`, `Information Resource`, `Provider`, `Third-Party Information Resource`
+Terms: `Cloud Service Offering`, `Information Resource`, `Third-Party Information Resource`
 
 Affects: Providers
 
@@ -168,7 +160,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST demonstrate continuous progress towards a FedRAMP Certification, documented in their Trust Center or website and updated at least quarterly; progress is measured by the provider against documented goals and milestones.
 
-Terms: `Provider`, `Trust Center`
+Terms: `Trust Center`
 
 Affects: Providers
 
@@ -180,8 +172,10 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST demonstrate that an assessment for a FedRAMP Certification Class B, C, or D has been scheduled within 2 years of initial listing in the Initial Implementation Phase.
 
-Terms: `Certification Class`, `Provider`
+Terms: `Certification Class`
 
 Affects: Providers
+
+Structured timeframe: `2` years
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
