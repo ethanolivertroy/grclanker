@@ -1869,7 +1869,7 @@ async function loadCloudIntegrations(
   return loadSurface(`${provider}_integrations`, async () => (await load()).map((record) => projectCloudIntegration(provider, record)), errors);
 }
 
-function withUnreadableEvidence(evidence: JsonRecord, gaps: DatadogInventoryGap[]): JsonRecord {
+function withUnreadableEvidence(evidence: JsonRecord, gaps: Array<JsonRecord | DatadogInventoryGap>): JsonRecord {
   return gaps.length > 0 ? { ...evidence, unreadable_inventories: gaps } : evidence;
 }
 
@@ -1884,7 +1884,7 @@ function withInventoryGaps(
   options: { essential: boolean; manualEvidence?: string[] },
 ): DatadogFinding {
   if (gaps.length === 0) return item;
-  const existing = asRecordArray(item.evidence?.unreadable_inventories) as unknown as DatadogInventoryGap[];
+  const existing = asRecordArray(item.evidence?.unreadable_inventories);
   const added = gaps.filter((gap) => !existing.some((known) => known.inventory === gap.inventory));
   const evidence = withUnreadableEvidence(item.evidence ?? {}, [...existing, ...added]);
   const caveat = gaps.map(inventoryGapCaveat).join(" ");
@@ -3291,7 +3291,7 @@ function evaluateDetectionRulesControl(snapshot: DatadogSecurityMonitoringSnapsh
   const caveats = [truncationCaveat("security_rules", surface, "rule_limit")];
   // An empty inventory proves that no detection is active only when the listing was read completely. A listing that
   // returned no rows before it stopped (an empty first page under a next-page cursor, a repeated cursor) leaves whether
-  // any rule exists unknown, so it is reported with the collection's own stop reason rather than as a fail (gap 40).
+  // any rule exists unknown, so it is reported with the collection's own stop reason rather than as a fail.
   if (rules.length === 0 && !complete) {
     return withVerdictCaveats(
       finding(8, "high", "warn", `The security monitoring rules listing returned no rules before it stopped (${surface.truncationReason ?? "the listing stopped early"}), so whether any detection rule is enabled is unknown.`, evidence),

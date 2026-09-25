@@ -25,6 +25,7 @@ import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
+type ToolRegistrar = { registerTool: (definition: unknown) => unknown };
 
 const DEFAULT_OUTPUT_DIR = "./export/elastic";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -3926,7 +3927,8 @@ export function evaluateElasticClusterHardening(
   // proves the feature absent, so the requirement set stays incomplete and the read is named as partial.
   const watchesInUse = watches !== undefined ? Math.max(watches.length, datasetPage(snapshot, "watches")?.total ?? 0) : 0;
   const requirements = requiredLicenseRankFor(realmTypes, usesFlsOrDls, auditEnabled, watchesInUse);
-  const unsupported = license.rank === undefined ? [] : requirements.filter((requirement) => requirement.rank > (license.rank as number));
+  const licenseRank = license.rank;
+  const unsupported = licenseRank === undefined ? [] : requirements.filter((requirement) => requirement.rank > licenseRank);
   const expiryDays = licenseExpiry ? daysBetween(now, Date.parse(licenseExpiry)) : undefined;
   const expiryMissing = licenseReadable && licenseExpiry === undefined && license.type !== "basic";
   const featureSourceProblems = [...settingsProblems, ...dependencyProblems(snapshot, ["roles"])];
@@ -4822,7 +4824,7 @@ const assessmentParams = {
 };
 
 function registerAssessmentTool(
-  pi: any,
+  pi: ToolRegistrar,
   definition: {
     name: string;
     label: string;

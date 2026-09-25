@@ -75,7 +75,7 @@ const CREDENTIAL_LAST_SEGMENTS = new Set([
   "credentials",
   "community",
 ]);
-// `app` and `application` qualify a key (`appKey`, `application_key`, `DD_APP_KEY` in a Datadog integration record; gap 35).
+// `app` and `application` qualify a key (`appKey`, `application_key`, `DD_APP_KEY` in a Datadog integration record).
 const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "app", "application", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client"]);
 const JWT_ASSERTION_TTL_SECONDS = 45;
 const MAX_RETRY_AFTER_MS = 60_000;
@@ -2663,7 +2663,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     const createdAt = parseIsoDate(user.created_at);
     if (createdAt && createdAt > cutoff) return false;
     const id = asString(user.id);
-    return Boolean(id) && !activeActorIds.has(id as string);
+    return id !== undefined && !activeActorIds.has(id);
   });
   const failedLoginActorIds = new Set(failedLogins.map(eventActorId).filter((id): id is string => Boolean(id)));
   const inactiveWithFailedLogins = inactiveCandidates.filter((user) => failedLoginActorIds.has(asString(user.id) ?? ""));

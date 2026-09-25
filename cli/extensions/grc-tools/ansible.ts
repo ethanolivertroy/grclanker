@@ -729,7 +729,7 @@ function scrubConfiguredSecrets(text: string): string {
 // `connection_string`, `ssh_key_data`) are the members an SDK response or a credential store carries, so they count
 // in their PascalCase form too (`SessionToken`, `ClientSecret`, `SecretAccessKey`, `SecretKey`), where a PascalCase
 // error code that merely ends in `Token` (`ExpiredToken`) does not; see isCredentialNamedKey. The bearer ids are the
-// one override to the identifier suffix (CodeRabbit r4077259415 on #78, harness revision 3): a key ending in
+// one override to the identifier suffix: a key ending in
 // `secret_id` (a Vault AppRole secret id) or `token_id` (a token id is the token), or in a session id (`session_id`,
 // `sid`, `sessid`, `jsessionid`, `PHPSESSID`), authenticates rather than identifies, so it is a credential key
 // despite ending in `id` and its value goes whatever its shape, UUID included, while `client_id`, `tenant_id`,
@@ -742,7 +742,7 @@ const ERROR_CREDENTIAL_KEY_PATTERN = `[A-Za-z0-9_.-]*(?:${ERROR_CREDENTIAL_WORDS
 /**
  * Where a key may start: after a character that cannot be part of a key, or after a JSON escape (`\n`, `\t`,
  * `\u000a`) inside a serialized message, where the character before the key is the escape's last letter and
- * `\b` sees no boundary (reviewer D round 5 escapes). Never right after a backslash, so the escape letter is not
+ * `\b` sees no boundary. Never right after a backslash, so the escape letter is not
  * read as the first letter of the key (`\nExpiredToken:` is the error code, not a key `nExpiredToken`).
  */
 const KEY_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
@@ -750,15 +750,15 @@ const KEY_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_.\\-])|(?<=\\[nrtbfv])
 const NAME_BOUNDARY_PATTERN = String.raw`(?:(?<![A-Za-z0-9_])|(?<=\\[nrtbfv])|(?<=\\u[0-9A-Fa-f]{4}))`;
 
 /**
- * The authorization scheme words, matched in any casing (harness revision 3, row B): the HTTP schemes, Okta's
+ * The authorization scheme words, matched in any casing: the HTTP schemes, Okta's
  * SSWS, the Splunk and Snowflake header schemes, and SigV4. Under a credential-named key only an Authorization
  * header treats the word as a scheme in front of the value; under any other key the word is the value.
  */
 const ERROR_SCHEME_WORDS = "Bearer|Basic|Digest|Negotiate|NTLM|OAuth|SSWS|Token|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256";
 const ERROR_SCHEME_PATTERN = `(?:${ERROR_SCHEME_WORDS})`;
 /**
- * key=value and key: value pairs whose key ends in a credential word, wherever the key stands (after a flag
- * prefix `--`, `-D`, a path segment `kv/`, a parenthesis, or a comma: reviewer #78 row D). The value runs to
+ * key=value and key: value pairs whose key ends in a credential word, wherever the key stands: after a flag
+ * prefix `--`, `-D`, a path segment `kv/`, a parenthesis, or a comma. The value runs to
  * whitespace, a quote, `&`, `;`, `,`, a closing bracket, an angle bracket, or a backslash (the compound-line
  * rule), so a pair inside a query string, a header list, a JSON fragment, or a parenthesis keeps the text after
  * it; a marker inside the value (a URL whose query was already removed) is part of it. A value that is already
@@ -769,7 +769,7 @@ const ERROR_CREDENTIAL_PAIR_PATTERN = new RegExp(
   `${KEY_BOUNDARY_PATTERN}(${ERROR_CREDENTIAL_KEY_PATTERN})((?:\\\\*["'])?\\s*[=:]\\s*["']?)((?:${ERROR_SCHEME_PATTERN}\\s+)?(?!\\[REDACTED\\])(?:\\[REDACTED\\]|[^\\s"'&;,<>)\\]}\\\\])+)`,
   "gi",
 );
-/** `--name value` (a CLI flag echoed in a spawned CLI's stderr, reviewer #78 row D): the next token is the value. */
+/** `--name value` in a CLI's stderr: the next token is the value. */
 const FLAG_CARRIER_PATTERN = new RegExp(`(?<![A-Za-z0-9_.-])--(${ERROR_CREDENTIAL_KEY_PATTERN})(\\s+)(?![-\\[])([^\\s"'&;,<>)\\]}\\\\]+)`, "gi");
 const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
 
@@ -782,7 +782,7 @@ const TRAILING_PUNCTUATION_PATTERN = /[.!?:)]+$/;
  */
 const ERROR_QUOTED_VALUE_PATTERN = String.raw`(?<!\\)((\\*)(["']))((?:(?!(?<!\\)\4\5)[^\n])+)((?<!\\)\4\5)`;
 /**
- * Codex P1 (quoted header value). `X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`,
+ * A quoted credential value: `X-Api-Key: "value"`, `Cookie: sid='value'`, `Authorization: Bearer "value"`,
  * `\"X-Auth-Key\":\"value\"`: with or without spaces, single or double quotes, plain or JSON-escaped. The quotes
  * delimit the carrier, so the quoted value is removed whole whatever its shape; the pair rule above stops at the
  * opening quote and would judge a short or name-shaped value ("key", "prod-key") as prose. The header name, the
@@ -798,8 +798,8 @@ const ERROR_QUOTED_SCHEME_PATTERN = new RegExp(String.raw`(?<!["'\\./-])\b(${ERR
 const QUOTED_VALUE_REPLACEMENT = `$1$2$3${REDACTED_ERROR_VALUE}$7`;
 /**
  * A quoted phrase that is a scheme word and one value (`"Bearer prod-token"`, `\"Token prod-key\"`, `'Basic abc'`):
- * the quotes delimit a header value being quoted, so the value goes whatever its shape (reviewer D round 5 depth
- * control, the quoted name-shaped bearer), where the same phrase bare in prose (`sent as Bearer prod-token`) is
+ * the quotes delimit a header value, so the quoted name-shaped bearer goes whatever its shape, where the same
+ * phrase bare in prose (`sent as Bearer prod-token`) is
  * judged by the scheme rule's shape test. A quoted phrase of several words after the scheme is prose and stays.
  */
 const ERROR_QUOTED_SCHEME_PHRASE_PATTERN = new RegExp(
@@ -843,7 +843,7 @@ function quoteOpensAt(text: string, index: number): boolean {
 }
 
 /**
- * Whether a key names a credential (reviewer D round 5 baseline). It does when it is a credential word
+ * Whether a key names a credential. It does when it is a credential word
  * (`password`, `Token`, `skey`, `SessionToken`), sets one off with `_`, `-`, or `.` (`DB_PASSWORD`,
  * `AZURE_CLIENT_SECRET`, `x-api-key`, `Proxy-Authorization`), or is a lowerCamelCase, lowercase, or uppercase
  * compound ending in one (`accessToken`, `clientSecret`, `dbpassword`, `ACCESSTOKEN`). A PascalCase identifier
@@ -864,14 +864,14 @@ function isCredentialNamedKey(key: string): boolean {
 
 /**
  * The value of a pair whose key names a credential is the credential and is removed whatever its shape and
- * length (reviewer D round 5 baseline): `password=letmein`, `DB_PASSWORD=Sunshine`, `AZURE_CLIENT_SECRET: abc12`,
+ * length: `password=letmein`, `DB_PASSWORD=Sunshine`, `AZURE_CLIENT_SECRET: abc12`,
  * and `DUO_SKEY=p@ss` go the way `{"password":"letmein"}` already did. The key, the separator, and the sentence
  * punctuation after the value stay. Under an Authorization header a scheme word in front of the value stays
  * too, a scheme word standing alone ("sent as Authorization: Bearer") names the scheme and carries nothing, and
  * a parameter list after the scheme (SigV4 `Credential=..., SignedHeaders=..., Signature=...`) is judged pair by
  * pair so the region and the request scope stay (scrubAuthorizationParameters has already removed every
  * parameter value that is a proof, so this pass sees markers and the kept parameters). Under any other
- * credential key the scheme word is the value (CodeRabbit r4078025849 on #63: `sslPassword=splunk rejected`,
+ * credential key the scheme word is the value (`sslPassword=splunk rejected`,
  * `db_password: token`), and the prose after it stays. A `--name value` flag is a pair whose separator is the space.
  */
 function scrubCredentialPairs(text: string): string {
@@ -901,7 +901,7 @@ function scrubCredentialPairs(text: string): string {
 
 /**
  * Header carriers whose value is free form: Cookie and Set-Cookie (session values with their attributes) and
- * Cloudflare's legacy X-Auth-Key / X-Auth-Email pair (the global API key and its account; round 4 item F). The
+ * Cloudflare's legacy X-Auth-Key / X-Auth-Email pair (the global API key and its account). The
  * value is removed whatever its shape. Where it ends follows the compound-line rule shared by every scrubber:
  * a quoted value (a plain or JSON-escaped quote) ends at its closing quote, so a closed value that holds `; Name:`
  * is one value and the quotes stay around the marker; an unquoted value, or a quoted one that is never closed,
@@ -913,7 +913,7 @@ function scrubCredentialPairs(text: string): string {
  * so a second pass over a scrubbed message leaves the text after the marker as it is.
  *
  * The header name counts as a carrier at a line start, after any character that is not part of a name, and
- * after a JSON escape (reviewer D round 5 escapes): inside a serialized message the character before `Cookie`
+ * after a JSON escape: inside a serialized message the character before `Cookie`
  * is the escape's last letter (`\nCookie`, `\u000aCookie`), a word character to `\b`, and a boundary that
  * relied on `\b` left the free-form removal to the pair rule, which stops at the first `;` and judges every
  * later cookie pair on its own name and shape. After `--`, `.`, or `/` (plain or JSON-escaped) the name is a
@@ -970,7 +970,7 @@ function scrubHeaderCarriers(text: string): string {
 
 /**
  * An Authorization or Proxy-Authorization header (any prefix the key rule accepts, any casing, plain or after a
- * JSON escape) whose value is a scheme word and a parameter list (CodeRabbit on #81, discussion_r4081238237):
+ * JSON escape) whose value is a scheme word and a parameter list:
  * `Authorization: Snowflake Token="..."`, `Authorization: Digest username="...", realm="...", nonce="...",
  * uri="...", response="..."`, `Authorization: OAuth oauth_token="..."`, any `<Scheme> <name>="..."` shape. The
  * match ends after the space that follows the scheme word, where the first parameter's name starts, and
@@ -993,8 +993,8 @@ const AUTHORIZATION_PARAMETERS_PATTERN = new RegExp(
 const KEPT_SCHEME_PARAMETER_PATTERN =
   /^(?:realm|username|uri|qop|nc|algorithm|charset|userhash|oauth_consumer_key|oauth_signature_method|oauth_timestamp|oauth_version|oauth_callback|credential|signedheaders)$/i;
 /**
- * The parameters whose name says the value is a proof wherever the list stands (CodeRabbit on #81,
- * discussion_r4081776771): Digest's `response`, a `signature` or `sig`, OAuth 1.0's `oauth_signature`, and the MAC
+ * The parameters whose name says the value is a proof wherever the list stands: Digest's `response`, a
+ * `signature` or `sig`, OAuth 1.0's `oauth_signature`, and the MAC
  * scheme's `mac`. In a challenge (see CHALLENGE_PARAMETERS_PATTERN) only these go; under an Authorization header
  * every parameter that is not kept goes, so this list never widens what that header gives up.
  */
@@ -1087,8 +1087,8 @@ function scrubAuthorizationParameters(text: string): string {
 }
 
 /**
- * Where a parameter list that is not under an Authorization key may start (CodeRabbit on #81,
- * discussion_r4081776771): after a scheme word and its whitespace when a parameter follows (a WWW-Authenticate or
+ * Where a parameter list that is not under an Authorization key may start: after a scheme word and its
+ * whitespace when a parameter follows (a WWW-Authenticate or
  * Proxy-Authenticate challenge, `Digest realm="api", nonce="n", response="..."` in prose or in a JSON string, any
  * casing), or at a `realm` parameter or a proof-named parameter standing on its own (`realm="api", nonce="n",
  * response="..."` as a data value, `response="...", realm="api"`). A list shaped like a challenge is not exempt
@@ -1139,8 +1139,18 @@ function looksLikeSchemeCredential(value: string, quoteFollows = false): boolean
   return value.length >= 16 || /[\d+/=]/.test(value) || /[a-z][A-Z]/.test(value);
 }
 
-/** A pattern and its replacement: a string, or a callback typed as String.prototype.replace types it (the match, its groups, the offset, the text). */
-type TextRule = readonly [RegExp, string | ((substring: string, ...args: any[]) => string)];
+type QuotedCredentialReplacement = (
+  match: string,
+  key: string,
+  separator: string,
+  opening: string,
+  backslashes: string,
+  quote: string,
+  content: string,
+  closing: string,
+) => string;
+type SchemeCredentialReplacement = (match: string, scheme: string, value: string, offset: number, text: string) => string;
+type TextRule = readonly [RegExp, string | QuotedCredentialReplacement | SchemeCredentialReplacement];
 
 function applyTextRule(text: string, [pattern, replacement]: TextRule): string {
   return typeof replacement === "string" ? text.replace(pattern, replacement) : text.replace(pattern, replacement);
@@ -1201,10 +1211,10 @@ const BARE_SHAPE_PATTERNS: ReadonlyArray<TextRule> = [
 
 /**
  * URL userinfo, query, and fragment anywhere in the string, not only when the string starts with a URL: any
- * scheme (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`, reviewer #78 row C),
+ * scheme (`https://`, `proxy://`), plain or with its slashes JSON-escaped (`https:\/\/`),
  * after a JSON escape as after any other boundary. The scheme, host, and path stay; the userinfo goes and the
  * query and the fragment each become the marker. The userinfo ends at the first `/`, `?`, or `#` as at
- * whitespace (CodeRabbit on #76), so an `@` inside a query or a fragment is not a userinfo boundary when the
+ * whitespace, so an `@` inside a query or a fragment is not a userinfo boundary when the
  * authority before it is a host: `https://h?e=a@x.com&token=v` is host `h` with a query, which becomes the
  * marker whole. When that authority is not `host[:port]` (`svc:secret`, a password read up to a raw `?` or `#`
  * inside it) and an `@` follows in the run, the run up to that `@` is userinfo after all (scrubUrlMatch).
@@ -1310,7 +1320,7 @@ function scrubCarriers(text: string): string {
 }
 
 /**
- * Rule 9 data-side scrub for a string kept in a snapshot (reviewer D round 5 depth control): the carrier rules of
+ * Rule 9 data-side scrub for a string kept in a snapshot: the carrier rules of
  * redactErrorText (the configured secrets in every encoded form, URL userinfo, query, and fragment strings, the free-form
  * header carriers, the proofs in Authorization parameter lists and in challenges, quoted header and pair values,
  * authorization schemes, vendor token prefixes, JWT and PEM shapes, and credential-named pairs) without its
@@ -1332,7 +1342,7 @@ const SNAPSHOT_DEPTH_CAP = 32;
 const SNAPSHOT_SECRET_KEY_PATTERN =
   /^(?:secret[_-]?key|skey|secret|client[_-]?secret|api[_-]?secret|password|passwd|passphrase|private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|secret[_-]?access[_-]?key|assertion|connection[_-]?string|authorization|cookie|set-cookie|x-auth-key|api[_-]?key|x-api-key|webhook(?:[_-]?url)?)$/i;
 /**
- * The bearer-id override for snapshot keys (CodeRabbit r4077259415 on #78, harness revision 3): a key ending in
+ * The bearer-id override for snapshot keys: a key ending in
  * `secret_id` or `token_id`, any prefix, casing, and separator (`secret_id`, `VAULT_SECRET_ID`, `role_secret_id`,
  * `roleSecretId`, `token_id`, `tokenId`), holds a Vault AppRole secret id or a token id, which authenticates rather
  * than identifies, so its value is the marker whatever its shape; an `_id` key that identifies (`client_id`,
@@ -1360,8 +1370,8 @@ function snapshotMarkerFor(entry: unknown): unknown {
 }
 
 /**
- * Rule 9 walk over a value about to be written to a bundle file or returned as data (reviewer D round 5 depth
- * control). Every string at every depth goes through redactCarrierText, so a carrier inside a benign-keyed string
+ * Rule 9 walk over a value about to be written to a bundle file or returned as data. Every string at every depth
+ * goes through redactCarrierText, so a carrier inside a benign-keyed string
  * (`detail: "Authorization: Bearer ..."`) is scrubbed in place with its siblings kept; a value under a secret
  * field name is the marker; an object or array nested past SNAPSHOT_DEPTH_CAP is the marker, so the depth of a
  * server-supplied tree bounds the work and nothing deeper than the cap is copied.
@@ -1432,7 +1442,7 @@ function originLabel(target: string, base?: string): string | undefined {
 const NEXT_LINK_REFUSED_TAIL = "so the walk was stopped; the link was not followed and no request was made for it";
 
 /**
- * The truncation reason recorded for a refused next link (harness revision 3, class 8): it names the configured
+ * The truncation reason recorded for a refused next link: it names the configured
  * origin and, when the link resolved onto another one, that origin too (scheme, host, and port, or the bare
  * scheme of a `javascript:` or `data:` link), so the operator can see where the API tried to send the client.
  * Never the link itself: no path, query, fragment, or userinfo is recorded. A link on another origin and a
@@ -1517,8 +1527,7 @@ export function sanitizeScmUrl(value: unknown): unknown {
  * redaction marker, every URL string loses its userinfo and query string, and
  * every other string is scrubbed for carriers (a bearer, a cookie, a
  * credential pair inside an arbitrary nested setting value) at every depth;
- * an object or array nested past the snapshot cap is the marker (reviewer D
- * round 5 depth control). A settings tree reaches this step already projected
+ * an object or array nested past the snapshot cap is the marker. A settings tree reaches this step already projected
  * to its documented keys (settingsProjector); the credential `inputs` and
  * notification header maps handed in with redactEveryValue keep the shape the
  * server returned.
@@ -1651,7 +1660,7 @@ function mapOf(spec: FieldSpec): (value: unknown) => JsonRecord | undefined {
  * TypeError message would quote the value. A documented key whose value is not of its documented type (a
  * nested object or array where a scalar is documented, a string where a number is) is dropped rather than
  * copied verbatim, so an undocumented shape under a documented key never travels into the access check, a
- * finding, or the bundle (round 4 item E).
+ * finding, or the bundle.
  */
 function pickTyped(item: unknown, spec: FieldSpec): JsonRecord {
   const projected: JsonRecord = {};
@@ -1721,8 +1730,8 @@ const EXECUTION_ENVIRONMENT_FIELDS = ["id", "name", "description", "image", "pul
 const SURVEY_QUESTION_FIELDS = ["variable", "type", "required", "question_name", "min", "max"];
 const JOB_SETTING_FIELDS: FieldSpec = Object.freeze({ SCHEDULE_MAX_JOBS: "number", MAX_FORKS: "number", DEFAULT_JOB_TIMEOUT: "number", DEFAULT_INVENTORY_UPDATE_TIMEOUT: "number", DEFAULT_PROJECT_UPDATE_TIMEOUT: "number", AD_HOC_COMMANDS: stringList, AWX_TASK_ENV: scalarMap, GALAXY_TASK_ENV: scalarMap });
 /**
- * The settings categories the platform findings read, projected the way `job_settings.json` is (reviewer D
- * round 5 class 10): each spec names the documented keys in their documented types, so an undocumented key of
+ * The settings categories the platform findings read, projected the way `job_settings.json` is: each spec names
+ * the documented keys in their documented types, so an undocumented key of
  * the server's dictionary is dropped rather than copied and a documented key holding another type is dropped
  * rather than copied verbatim. Authentication keeps the category's session and local-auth flags, the backend
  * list, and the LDAP, SAML, and OIDC keys whose populatedness control 25 reads (a server URI, a bind or template
@@ -1930,7 +1939,7 @@ export class AnsibleAapClient {
   /**
    * An absolute target (a scheme in any casing, `HTTPS://host/...` included, or a protocol-relative `//host/...`)
    * resolves against the configured base the way the same-origin rule parsed it, so it is requested as the URL
-   * it is and never appended to the base as a path (harness revision 3, class 8). A relative target is a path
+   * it is and never appended to the base as a path. A relative target is a path
    * under the base: root-relative as given, otherwise under `/api/v2/`.
    */
   private resolveUrl(pathOrUrl: string): string {
@@ -2229,8 +2238,8 @@ function unrecognizedSettingsError(label: string, path: string): string {
 
 /**
  * A settings category read and projected to its documented keys at collection time, so the findings, the
- * summary, and the bundle all see the projection and never the server's whole dictionary (rule 9's tenant
- * configuration clause; reviewer D round 5 class 10). A body that carries none of the documented keys (a foreign
+ * summary, and the bundle all see the projection and never the server's whole dictionary. A body that carries
+ * none of the documented keys (a foreign
  * JSON document, an empty object, a primitive or array, a category whose documented keys all hold undocumented
  * types) is not a recognizable settings surface: the snapshot carries a fixed error and no data, the way an
  * unrecognizable `me` body does in probeScope, so the bundle writes the not-collected marker and the dependent

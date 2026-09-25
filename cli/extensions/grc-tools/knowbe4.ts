@@ -27,6 +27,7 @@ import { errorResult, formatTable, textResult } from "./shared.js";
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
 type JsonRecord = Record<string, unknown>;
+type ToolRegistrar = { registerTool: (definition: unknown) => unknown };
 
 const DEFAULT_OUTPUT_DIR = "./export/knowbe4";
 const DEFAULT_CONFIG_FILE = join(".knowbe4-inspector", "config.yaml");
@@ -486,7 +487,7 @@ function asStringArray(value: unknown): string[] | undefined {
 }
 
 function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
-  const parsed = Number.isFinite(value) ? (value as number) : fallback;
+  const parsed = typeof value === "number" && Number.isFinite(value) ? value : fallback;
   return Math.min(Math.max(parsed, min), max);
 }
 
@@ -634,7 +635,7 @@ const CREDENTIAL_LAST_SEGMENTS = new Set([
   "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization",
   "credential", "credentials", "bearer",
 ]);
-// `app` and `application` qualify a key (`appKey`, `application_key`, `DD_APP_KEY` in an integration record; gap 35).
+// `app` and `application` qualify a key (`appKey`, `application_key`, `DD_APP_KEY` in an integration record).
 const CREDENTIAL_KEY_QUALIFIERS = new Set(["api", "app", "application", "private", "secret", "signing", "access", "shared", "session", "master", "client", "auth", "service"]);
 const URL_KEY_SEGMENTS = new Set(["url", "urls", "uri", "endpoint", "link", "href"]);
 const CREDENTIAL_QUERY_PATTERN = /token|secret|password|key|signature|sig|credential|auth/i;
@@ -4560,7 +4561,7 @@ const governanceParams = {
 };
 
 function assessmentTool(
-  pi: any,
+  pi: ToolRegistrar,
   area: Knowbe4Scope,
   label: string,
   description: string,

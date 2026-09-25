@@ -473,12 +473,16 @@ test("defaultGwsCliRunner parses a real JSON response and forwards the environme
 test("investigateGwsAlerts parses alert records from documented Alert Center fields", async () => {
   const base = createTempBase("grclanker-gws-ops-alerts-");
   const fake = createFakeBinary(base);
+  const alerts = alertsPayload();
+  alerts.alerts[0].type = " Suspicious login ";
 
-  const result = await investigateGwsAlerts({ gwsBin: fake, max_results: 25 }, createRunner());
+  const result = await investigateGwsAlerts({ gwsBin: fake, max_results: 25 }, createRunner({ alerts }));
   assert.equal(result.count, 2);
   assert.equal(result.complete, true);
   assert.equal(result.nextPageToken, undefined);
   assert.equal(result.records[0].id, "a-1");
+  assert.equal(result.records[0].detail, "Suspicious login");
+  assert.deepEqual(result.records[0].eventNames, [" Suspicious login "]);
   assert.equal(result.records[0].status, "NOT_STARTED");
   assert.equal(result.records[0].severity, "HIGH");
   assert.equal(result.records[0].actor, "secops@example.com");

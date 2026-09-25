@@ -817,7 +817,7 @@ const CREDENTIAL_LAST_SEGMENTS = new Set([
   "token", "tokens", "secret", "secrets", "password", "passwd", "pwd", "passphrase", "apikey", "appkey", "appkeys", "applicationkey", "applicationkeys", "authorization",
   "credential", "credentials", "bearer",
 ]);
-// `app` and `application` qualify a key (`appKey`, `applicationKey`, `application_key` in a Datadog integration subscription; gap 35).
+// `app` and `application` qualify a key (`appKey`, `applicationKey`, `application_key` in a Datadog integration subscription).
 const CREDENTIAL_KEY_QUALIFIERS = new Set([
   "api", "app", "application", "private", "secret", "signing", "access", "shared", "encryption", "session", "master", "client", "auth", "full",
   "mobile", "sdk", "relay", "service",
@@ -4978,7 +4978,7 @@ function toBundleOptions(args: ExportAuditBundleArgs): LaunchdarklyAuditBundleOp
 }
 
 function createClient(args: AuthArgs): LaunchdarklyApiClient {
-  return new LaunchdarklyApiClient(resolveLaunchdarklyConfiguration(args as JsonRecord));
+  return new LaunchdarklyApiClient(resolveLaunchdarklyConfiguration(args));
 }
 
 const authParams = {
@@ -5210,7 +5210,7 @@ export function registerLaunchdarklyTools(pi: any): void {
     prepareArguments: normalizeExportAuditBundleArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
       try {
-        const config = resolveLaunchdarklyConfiguration(args as JsonRecord);
+        const config = resolveLaunchdarklyConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportLaunchdarklyAuditBundle(new LaunchdarklyApiClient(config), config, outputRoot, toBundleOptions(args));
         return textResult(
