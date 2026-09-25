@@ -1784,8 +1784,12 @@ export class SplunkApiClient {
       if (total !== undefined ? offset >= total : pageEntries.length < this.pageSize) break;
       if (entries.length >= this.maxEntries) return cappedResult();
     }
-    const known = total !== undefined;
-    return { entries, total: Math.max(total ?? 0, entries.length), truncated: known && entries.length < (total as number), totalKnown: known };
+    return {
+      entries,
+      total: Math.max(total ?? 0, entries.length),
+      truncated: total !== undefined && entries.length < total,
+      totalKnown: total !== undefined,
+    };
   }
 
   async getEntry(path: string): Promise<SplunkEntry | undefined> {
@@ -3165,16 +3169,22 @@ export async function assessSplunkPlatformHardening(client: SplunkInspectorClien
     findings.push(capWithCaveats(finding(19, "manual", "Splunk Cloud ACS is not configured (SPLUNK_STACK and SPLUNK_ACS_TOKEN), so IP allow lists could not be read. Collect GET /access/{feature}/ipallowlists for search-api, hec, s2s, and search-ui manually.", { acs_configured: false }), [deploymentNote]));
   } else {
     const results = await Promise.all(ACS_ALLOWLIST_FEATURES.map(async (feature) => ({ feature, result: await collect(client, () => client.acsGet(`/access/${feature}/ipallowlists`)) })));
-    const evaluated = results.map(({ feature, result }) => {
-      if (!result.ok) return { feature, readable: false, subnets: null as string[] | null, verdict: "manual" as SplunkFindingStatus, note: unreadableCause(result) };
+    const evaluated: Array<{
+      feature: string;
+      readable: boolean;
+      subnets: string[] | null;
+      verdict: SplunkFindingStatus;
+      note: string;
+    }> = results.map(({ feature, result }) => {
+      if (!result.ok) return { feature, readable: false, subnets: null, verdict: "manual", note: unreadableCause(result) };
       const subnets = asStringList(result.value.subnets);
-      if (subnets.some((subnet) => /^(0\.0\.0\.0\/0|::\/0)$/.test(subnet))) return { feature, readable: true, subnets, verdict: "fail" as SplunkFindingStatus, note: "allow list contains 0.0.0.0/0" };
+      if (subnets.some((subnet) => /^(0\.0\.0\.0\/0|::\/0)$/.test(subnet))) return { feature, readable: true, subnets, verdict: "fail", note: "allow list contains 0.0.0.0/0" };
       if (subnets.length === 0) {
         return feature === "search-api"
-          ? { feature, readable: true, subnets, verdict: "warn" as SplunkFindingStatus, note: "no subnets returned; search-api is documented as closed by default, confirm the effective policy" }
-          : { feature, readable: true, subnets, verdict: "fail" as SplunkFindingStatus, note: "no subnets returned; this feature is documented as open to all IPs by default" };
+          ? { feature, readable: true, subnets, verdict: "warn", note: "no subnets returned; search-api is documented as closed by default, confirm the effective policy" }
+          : { feature, readable: true, subnets, verdict: "fail", note: "no subnets returned; this feature is documented as open to all IPs by default" };
       }
-      return { feature, readable: true, subnets, verdict: "pass" as SplunkFindingStatus, note: `${subnets.length} subnets` };
+      return { feature, readable: true, subnets, verdict: "pass", note: `${subnets.length} subnets` };
     });
     const evidence = { features: evaluated, deployment_source: deployment.info.source };
     let allowlistFinding: SplunkFinding;
@@ -3808,15 +3818,13 @@ const authParams = {
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout in seconds. Defaults to 30.", default: 30 })),
 };
 
-function runTool<T>(toolName: string, failurePrefix: string, run: () => Promise<{ text: string; details: JsonRecord }>) {
-  return async () => {
-    try {
-      const result = await run();
-      return textResult(result.text, { tool: toolName, ...result.details });
-    } catch (error) {
-      return errorResult(`${failurePrefix}: ${scrubErrorText(errorMessage(error))}`, { tool: toolName });
-    }
-  };
+async function runTool(toolName: string, failurePrefix: string, run: () => Promise<{ text: string; details: JsonRecord }>) {
+  try {
+    const result = await run();
+    return textResult(result.text, { tool: toolName, ...result.details });
+  } catch (error) {
+    return errorResult(`${failurePrefix}: ${scrubErrorText(errorMessage(error))}`, { tool: toolName });
+  }
 }
 
 export function registerSplunkTools(pi: any): void {
@@ -3830,7 +3838,7 @@ export function registerSplunkTools(pi: any): void {
       return runTool("splunk_check_access", "Splunk access check failed", async () => {
         const result = await checkSplunkAccess(createClient(args));
         return { text: formatAccessCheckText(result), details: { ...result } };
-      })();
+      });
     },
   });
 
@@ -3848,7 +3856,7 @@ export function registerSplunkTools(pi: any): void {
       return runTool("splunk_assess_authentication", "Splunk authentication assessment failed", async () => {
         const result = await assessSplunkAuthentication(createClient(args), { maxTokenAgeDays: args.max_token_age_days, maxSessionMinutes: args.max_session_minutes });
         return { text: formatAssessmentText(result), details: { ...result } };
-      })();
+      });
     },
   });
 
@@ -3865,7 +3873,7 @@ export function registerSplunkTools(pi: any): void {
       return runTool("splunk_assess_access_control", "Splunk access control assessment failed", async () => {
         const result = await assessSplunkAccessControl(createClient(args), { maxAdmins: args.max_admins });
         return { text: formatAssessmentText(result), details: { ...result } };
-      })();
+      });
     },
   });
 
@@ -3879,7 +3887,7 @@ export function registerSplunkTools(pi: any): void {
       return runTool("splunk_assess_data_protection", "Splunk data protection assessment failed", async () => {
         const result = await assessSplunkDataProtection(createClient(args));
         return { text: formatAssessmentText(result), details: { ...result } };
-      })();
+      });
     },
   });
 
@@ -3897,7 +3905,7 @@ export function registerSplunkTools(pi: any): void {
       return runTool("splunk_assess_audit_monitoring", "Splunk audit monitoring assessment failed", async () => {
         const result = await assessSplunkAuditMonitoring(createClient(args), { runSearches: args.run_searches, minAuditRetentionDays: args.min_audit_retention_days });
         return { text: formatAssessmentText(result), details: { ...result } };
-      })();
+      });
     },
   });
 
@@ -3911,7 +3919,7 @@ export function registerSplunkTools(pi: any): void {
       return runTool("splunk_assess_platform_hardening", "Splunk platform hardening assessment failed", async () => {
         const result = await assessSplunkPlatformHardening(createClient(args));
         return { text: formatAssessmentText(result), details: { ...result } };
-      })();
+      });
     },
   });
 
@@ -3944,7 +3952,7 @@ export function registerSplunkTools(pi: any): void {
           text: ["Splunk audit bundle exported.", `Output dir: ${result.outputDir}`, `Zip archive: ${result.zipPath}`, `Findings: ${result.findingCount}`, `Files: ${result.fileCount}`, `Collection errors: ${result.errorCount}`].join("\n"),
           details: { output_dir: result.outputDir, zip_path: result.zipPath, finding_count: result.findingCount, file_count: result.fileCount, error_count: result.errorCount },
         };
-      })();
+      });
     },
   });
 }

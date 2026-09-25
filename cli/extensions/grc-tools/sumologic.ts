@@ -2590,7 +2590,12 @@ export async function assessSumologicAccessControl(
     const adminRoles = roleList.filter((role) => asStringList(role.capabilities).some((capability) => ADMIN_CAPABILITIES.has(capability)) || /^administrator$/i.test(asString(role.name) ?? ""));
     const customAdminRoles = adminRoles.filter((role) => role.systemDefined !== true);
     const adminUserIds = new Set<string>();
-    for (const role of adminRoles) for (const id of asArray(role.users)) if (asString(id)) adminUserIds.add(asString(id) as string);
+    for (const role of adminRoles) {
+      for (const id of asArray(role.users)) {
+        const userId = asString(id);
+        if (userId) adminUserIds.add(userId);
+      }
+    }
     const unscopedRoles = roleList.filter((role) => !asString(role.filterPredicate) && role.systemDefined !== true);
     const adminMembers = userList.filter((user) => adminUserIds.has(asString(user.id) ?? ""));
     const adminActivity = userActivityBuckets(adminMembers, now, userInactiveDays);
@@ -3113,8 +3118,11 @@ export async function assessSumologicContentSharing(
       notificationCount += 1;
       if (asString(notification.connectionType) === "Email") {
         for (const recipient of asArray(notification.recipients)) {
-          const domain = asString(recipient)?.split("@")[1]?.toLowerCase();
-          if (domain && orgDomains.size > 0 && !domainMatches(domain, [...orgDomains])) externalRecipients.push(asString(recipient) as string);
+          const address = asString(recipient);
+          const domain = address?.split("@")[1]?.toLowerCase();
+          if (address && domain && orgDomains.size > 0 && !domainMatches(domain, [...orgDomains])) {
+            externalRecipients.push(address);
+          }
         }
       } else {
         connectionNotificationCount += 1;

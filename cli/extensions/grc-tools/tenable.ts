@@ -3539,7 +3539,10 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
   }
   const scheduled = scans.data.filter((scan) => asString(asObject(scan.schedule)?.type) === "ical");
   const completed = results.status === "ok"
-    ? results.data.filter((result) => /completed/i.test(asString(result.status) ?? "") && parseTimestampMs(result.finishTime) !== undefined && daysBetween(now, parseTimestampMs(result.finishTime) as number) <= staleScanDays)
+    ? results.data.filter((result) => {
+        const finishedAt = parseTimestampMs(result.finishTime);
+        return /completed/i.test(asString(result.status) ?? "") && finishedAt !== undefined && daysBetween(now, finishedAt) <= staleScanDays;
+      })
     : [];
   let status: TenableFindingStatus;
   let summary: string;
