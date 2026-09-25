@@ -1468,7 +1468,7 @@ export class BoxApiClient implements BoxReadClient {
       let bodyNote: string | undefined;
       if (rawText.length > 0) {
         try {
-          parsed = JSON.parse(rawText) as unknown;
+          parsed = JSON.parse(rawText);
           payload = asObject(parsed);
         } catch {
           // A body that is not JSON (an HTML proxy page, a WAF block) can reflect the request, including its
@@ -4141,7 +4141,7 @@ function sharingOptions(args: SharingArgs): BoxSharingOptions {
 }
 
 function createClient(args: AuthArgs): BoxApiClient {
-  return new BoxApiClient(resolveBoxConfiguration(args as JsonRecord));
+  return new BoxApiClient(resolveBoxConfiguration(args));
 }
 
 const authParams = {
@@ -4288,7 +4288,7 @@ export function registerBoxTools(pi: any): void {
     prepareArguments: normalizeExportArgs,
     async execute(_toolCallId: string, args: ExportArgs) {
       try {
-        const config = resolveBoxConfiguration(args as JsonRecord);
+        const config = resolveBoxConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportBoxAuditBundle(new BoxApiClient(config), config, outputRoot, {
           ...identityOptions(args),

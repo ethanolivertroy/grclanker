@@ -4793,7 +4793,7 @@ function assessmentOptionsFromArgs(args: AssessmentArgs): ElasticAssessmentOptio
 }
 
 function createClient(args: CheckAccessArgs): ElasticApiClient {
-  return new ElasticApiClient(resolveElasticConfiguration(args as JsonRecord));
+  return new ElasticApiClient(resolveElasticConfiguration(args));
 }
 
 const authParams = {
@@ -4925,7 +4925,7 @@ export function registerElasticTools(pi: any): void {
     prepareArguments: normalizeExportAuditBundleArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
       try {
-        const config = resolveElasticConfiguration(args as JsonRecord);
+        const config = resolveElasticConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportElasticAuditBundle(new ElasticApiClient(config), config, outputRoot, assessmentOptionsFromArgs(args));
         return textResult(

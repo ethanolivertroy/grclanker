@@ -1182,7 +1182,7 @@ function scrubSnapshotTree(value: unknown, isSecretKey: (key: string) => boolean
   if (depth > SNAPSHOT_DEPTH_CAP) return REDACTED_ERROR_VALUE;
   if (Array.isArray(value)) return value.map((entry) => scrubSnapshotTree(entry, isSecretKey, depth + 1));
   const output: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, entry] of Object.entries(value)) {
     output[key] = isSecretKey(key) ? snapshotMarkerFor(entry) : scrubSnapshotTree(entry, isSecretKey, depth + 1);
   }
   return output;
@@ -1927,7 +1927,7 @@ function judgeOriginPulls(
     return verdict(zone, "manual", manualReason("/zones/{zone_id}/origin_tls_client_auth/settings and /zones/{zone_id}/settings/tls_client_auth", "SSL and Certificates: Read plus Zone Settings: Read", "the Authenticated Origin Pulls status", originOutcome.error));
   }
   const zoneLevelEnabled = originOutcome.ok ? asBoolean(originOutcome.value?.enabled) : undefined;
-  const settingOn = settingReadable ? asString(tlsClientAuth!.value) : undefined;
+  const settingOn = tlsClientAuth && !tlsClientAuth.error ? asString(tlsClientAuth.value) : undefined;
   const zoneLevelOn = zoneLevelEnabled === true || settingOn === "on";
   const zoneLevelOff = !zoneLevelOn && (zoneLevelEnabled === false || settingOn === "off");
   const zoneSummary = `zone-level enabled ${String(zoneLevelEnabled ?? "unread")}, tls_client_auth ${settingOn ?? "unread"}`;
@@ -2520,10 +2520,10 @@ export async function assessCloudflareIdentity(
   if (!accountId) {
     memberStatus = "manual";
     memberSummary = `${note} Collect the member list from Manage Account > Members.`;
-  } else if (!members || !members.ok) {
+  } else if (!memberList) {
     memberStatus = "manual";
     memberSummary = manualReason(`/accounts/${accountId}/members`, "Account Settings: Read", "the account member and role list", members && !members.ok ? members.error : undefined);
-  } else if (memberList!.items.length === 0) {
+  } else if (memberList.items.length === 0) {
     memberStatus = "manual";
     memberSummary = "The member list returned zero members, which cannot be right for an account with an authenticated principal; confirm the token can list members and review roles manually.";
   } else if (superAdmins.length > maxSuperAdmins) {
@@ -2531,7 +2531,7 @@ export async function assessCloudflareIdentity(
     memberSummary = `${superAdmins.length} Super Administrator assignments exceeded the configured threshold of ${maxSuperAdmins}.${membersPartial ? ` ${membersPartial}` : ""}`;
   } else {
     memberStatus = membersPartial || membersWithout2fa.length > 0 ? "warn" : "pass";
-    memberSummary = `${superAdmins.length} Super Administrator assignments across ${memberList!.items.length} members, within the threshold of ${maxSuperAdmins}.${membersWithout2fa.length > 0 ? ` ${membersWithout2fa.length} members have two_factor_authentication_enabled false.` : ""}${membersPartial ? ` ${membersPartial}` : ""}`;
+    memberSummary = `${superAdmins.length} Super Administrator assignments across ${memberList.items.length} members, within the threshold of ${maxSuperAdmins}.${membersWithout2fa.length > 0 ? ` ${membersWithout2fa.length} members have two_factor_authentication_enabled false.` : ""}${membersPartial ? ` ${membersPartial}` : ""}`;
   }
   findings.push(finding("CF-IAM-03", "Account member privilege concentration", "medium", memberStatus, memberSummary, 14, {
     account_id: accountId ?? null,
@@ -2557,25 +2557,25 @@ export async function assessCloudflareIdentity(
   if (!accountId) {
     accessStatus = "manual";
     accessSummary = `${note} Review Zero Trust > Access > Applications manually.`;
-  } else if (!accessApps || !accessApps.ok) {
+  } else if (!apps) {
     accessStatus = "manual";
     accessSummary = manualReason(`/accounts/${accountId}/access/apps`, "Access: Apps and Policies: Read", "the Access application and policy inventory", accessApps && !accessApps.ok ? accessApps.error : undefined);
-  } else if (apps!.items.length === 0) {
+  } else if (apps.items.length === 0) {
     accessStatus = "manual";
     accessSummary = "No Access applications exist; if the account uses Zero Trust, confirm the Access subscription and app inventory manually. Zero apps cannot be judged compliant by default.";
   } else if (bypassPolicies.length > 0 || appsWithoutPolicies.length > 0) {
     accessStatus = "fail";
     accessSummary = `${bypassPolicies.length} Access policies use decision bypass and ${appsWithoutPolicies.length} applications have no attached policy.`;
-  } else if (accessPolicies && !accessPolicies.ok) {
+  } else if (!reusablePolicies) {
     // Reusable policies are where a bypass decision can hide outside any app's
     // inline list, so an unreadable policies endpoint blocks the pass.
     accessStatus = "manual";
-    accessSummary = `${apps!.items.length} Access applications carry ${inlinePolicies.length} inline policies, none with bypass, but the reusable policy list could not be checked. ${manualReason(`/accounts/${accountId}/access/policies`, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", accessPolicies.error)}`;
+    accessSummary = `${apps.items.length} Access applications carry ${inlinePolicies.length} inline policies, none with bypass, but the reusable policy list could not be checked. ${manualReason(`/accounts/${accountId}/access/policies`, "Access: Apps and Policies: Read", "the reusable Access policy list and each policy's decision", accessPolicies && !accessPolicies.ok ? accessPolicies.error : undefined)}`;
   } else {
-    const partials = [partialInventoryNote("Access application", apps!), partialInventoryNote("reusable Access policy", reusablePolicies!)]
+    const partials = [partialInventoryNote("Access application", apps), partialInventoryNote("reusable Access policy", reusablePolicies)]
       .filter((entry): entry is string => Boolean(entry));
     accessStatus = partials.length > 0 ? "warn" : "pass";
-    accessSummary = `${apps!.items.length} Access applications carry ${allPolicies.length} policies (${inlinePolicies.length} inline, ${reusablePolicies!.items.length} reusable; allow, deny, or non_identity), none with bypass.${partials.length > 0 ? ` ${partials.join(" ")}` : ""}`;
+    accessSummary = `${apps.items.length} Access applications carry ${allPolicies.length} policies (${inlinePolicies.length} inline, ${reusablePolicies.items.length} reusable; allow, deny, or non_identity), none with bypass.${partials.length > 0 ? ` ${partials.join(" ")}` : ""}`;
   }
   findings.push(finding("CF-IAM-04", "Zero Trust Access app and policy coverage", "high", accessStatus, accessSummary, 9, {
     access_apps: apps?.items.length ?? null,
@@ -2601,17 +2601,17 @@ export async function assessCloudflareIdentity(
   if (!accountId) {
     idpStatus = "manual";
     idpSummary = `${note} Review Zero Trust > Settings > Authentication manually.`;
-  } else if (!identityProviders || !identityProviders.ok) {
+  } else if (!idps) {
     idpStatus = "manual";
     idpSummary = manualReason(`/accounts/${accountId}/access/identity_providers`, "Access: Organizations, Identity Providers, and Groups: Read", "the identity provider list", identityProviders && !identityProviders.ok ? identityProviders.error : undefined);
-  } else if (idps!.items.length === 0) {
+  } else if (idps.items.length === 0) {
     idpStatus = "fail";
     idpSummary = "No Zero Trust identity providers are configured, so Access cannot enforce SSO or MFA-backed identity.";
   } else if (weakIdpTypes.length === idpTypes.length) {
     idpStatus = "fail";
     idpSummary = "Only the One-time PIN identity provider is configured; add an SSO or MFA-capable provider.";
   } else {
-    const partial = partialInventoryNote("identity provider", idps!);
+    const partial = partialInventoryNote("identity provider", idps);
     idpStatus = weakIdpTypes.length > 0 || partial ? "warn" : "pass";
     idpSummary = `${idpTypes.length} identity providers configured (${[...new Set(idpTypes)].join(", ")})${weakIdpTypes.length > 0 ? "; One-time PIN remains enabled alongside SSO providers" : ""}.${partial ? ` ${partial}` : ""}`;
   }
@@ -2827,7 +2827,10 @@ export async function assessCloudflareZoneSecurity(
     }
   }
 
-  const emptyZones = { emptyStatus: "manual" as CloudflareFindingStatus, emptyDetail: "No zones were visible to this token, so zone controls cannot be judged; grant Zone: Read or set account_id." };
+  const emptyZones = {
+    emptyStatus: "manual",
+    emptyDetail: "No zones were visible to this token, so zone controls cannot be judged; grant Zone: Read or set account_id.",
+  } satisfies { emptyStatus: CloudflareFindingStatus; emptyDetail: string };
   const findings = [
     aggregateZoneVerdicts("CF-ZONE-01", "WAF managed rulesets deployed", "high", 1, zonesOutcome, managedWaf, {
       ...emptyZones,
@@ -3003,7 +3006,10 @@ export async function assessCloudflareTrafficControls(
     if (!ipRulesOutcome!.ok) errors.push(`${accountLabel}/firewall/access_rules/rules: ${ipRulesOutcome!.error}`);
   }
 
-  const emptyZones = { emptyStatus: "manual" as CloudflareFindingStatus, emptyDetail: "No zones were visible to this token, so zone traffic controls cannot be judged; grant Zone: Read or set account_id." };
+  const emptyZones = {
+    emptyStatus: "manual",
+    emptyDetail: "No zones were visible to this token, so zone traffic controls cannot be judged; grant Zone: Read or set account_id.",
+  } satisfies { emptyStatus: CloudflareFindingStatus; emptyDetail: string };
   const findings: CloudflareFinding[] = [
     aggregateZoneVerdicts("CF-TRF-01", "Rate limiting coverage", "medium", 16, zonesOutcome, rateLimiting, {
       ...emptyZones,

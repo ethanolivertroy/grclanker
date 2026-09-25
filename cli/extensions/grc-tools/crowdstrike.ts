@@ -867,7 +867,7 @@ function scrubDataStrings<T>(value: T, depth = 0): T {
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return value;
   const output: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) output[key] = scrubDataStrings(entry, depth + 1);
+  for (const [key, entry] of Object.entries(value)) output[key] = scrubDataStrings(entry, depth + 1);
   return output as T;
 }
 
@@ -1107,7 +1107,7 @@ function readConfigFileText(location: string): string {
  */
 function parseConfigFileJson(location: string, text: string): unknown {
   try {
-    return JSON.parse(text) as unknown;
+    return JSON.parse(text);
   } catch (error) {
     const position = error instanceof Error ? JSON_POSITION_PATTERN.exec(error.message) : null;
     const line = position ? text.slice(0, Number(position[1])).split("\n").length : undefined;
@@ -1276,7 +1276,7 @@ function defaultSleep(ms: number): Promise<void> {
 function parseJsonBody(rawText: string): JsonRecord | undefined {
   if (rawText.length === 0) return undefined;
   try {
-    return asObject(JSON.parse(rawText) as unknown);
+    return asObject(JSON.parse(rawText));
   } catch {
     return undefined;
   }
@@ -4109,7 +4109,7 @@ function assessmentOptions(args: AssessArgs): CrowdstrikeAssessmentOptions {
 }
 
 function createClient(args: CheckAccessArgs): CrowdstrikeApiClient {
-  return new CrowdstrikeApiClient(resolveCrowdstrikeConfiguration(args as JsonRecord));
+  return new CrowdstrikeApiClient(resolveCrowdstrikeConfiguration(args));
 }
 
 const authParams = {
@@ -4296,7 +4296,7 @@ export function registerCrowdstrikeTools(pi: any): void {
     prepareArguments: normalizeExportAuditBundleArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
       try {
-        const config = resolveCrowdstrikeConfiguration(args as JsonRecord);
+        const config = resolveCrowdstrikeConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
         const result = await exportCrowdstrikeAuditBundle(new CrowdstrikeApiClient(config), config, outputRoot, assessmentOptions(args));
         return textResult(
