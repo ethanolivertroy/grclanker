@@ -18,7 +18,6 @@ import {
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
@@ -28,6 +27,7 @@ import { errorResult, formatTable, textResult } from "./shared.js";
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
 type JsonRecord = Record<string, unknown>;
+type ToolRegistrar = { registerTool: (definition: unknown) => unknown };
 
 const DEFAULT_OUTPUT_DIR = "./export/knowbe4";
 const DEFAULT_CONFIG_FILE = join(".knowbe4-inspector", "config.yaml");
@@ -4561,7 +4561,7 @@ const governanceParams = {
 };
 
 function assessmentTool(
-  pi: ExtensionAPI,
+  pi: ToolRegistrar,
   area: Knowbe4Scope,
   label: string,
   description: string,

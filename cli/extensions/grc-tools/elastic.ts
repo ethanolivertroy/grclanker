@@ -17,7 +17,6 @@ import {
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
@@ -26,6 +25,7 @@ import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
+type ToolRegistrar = { registerTool: (definition: unknown) => unknown };
 
 const DEFAULT_OUTPUT_DIR = "./export/elastic";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -4824,7 +4824,7 @@ const assessmentParams = {
 };
 
 function registerAssessmentTool(
-  pi: ExtensionAPI,
+  pi: ToolRegistrar,
   definition: {
     name: string;
     label: string;
