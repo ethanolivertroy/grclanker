@@ -9,23 +9,26 @@ import {
   createReadTool,
   createWriteTool,
   type ExtensionAPI,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { getGrclankerSettingsPath } from "../config/paths.js";
 import {
   buildComputeBackendSystemPromptNote,
   resolveComputeBackendExecution,
 } from "../pi/backend-exec.js";
-import { getComputeBackendConfigurationIssues, resolveComputeBackend } from "../pi/compute.js";
-import { cleanupParallelsSandboxes } from "../pi/parallels-sandbox.js";
-import { resetSandboxRuntime } from "../pi/sandbox.js";
+import { getComputeBackendConfigurationIssues } from "../pi/compute.js";
+import { shutdownComputeSessions } from "../pi/compute-shutdown.js";
 import { executeComputeAwareGrep } from "../pi/search-tools.js";
 import { readGrclankerSettings } from "../pi/settings.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
 import { registerAwsTools } from "./grc-tools/aws.js";
 import { registerAzureTools } from "./grc-tools/azure.js";
+import { registerBoxTools } from "./grc-tools/box.js";
 import { registerCloudflareTools } from "./grc-tools/cloudflare.js";
 import { registerCmvpTools } from "./grc-tools/cmvp.js";
+import { registerCrowdstrikeTools } from "./grc-tools/crowdstrike.js";
+import { registerDatadogTools } from "./grc-tools/datadog.js";
 import { registerDuoTools } from "./grc-tools/duo.js";
+import { registerElasticTools } from "./grc-tools/elastic.js";
 import { registerFedrampTools } from "./grc-tools/fedramp.js";
 import { registerGitHubTools } from "./grc-tools/github.js";
 import { registerGcpTools } from "./grc-tools/gcp.js";
@@ -33,16 +36,99 @@ import { registerGwsTools } from "./grc-tools/gws.js";
 import { registerGwsOperatorTools } from "./grc-tools/gws-ops.js";
 import { installGrclankerHeader } from "./grc-tools/header.js";
 import { registerKevsTools } from "./grc-tools/kevs.js";
+import { registerKnowbe4Tools } from "./grc-tools/knowbe4.js";
+import { registerLaunchdarklyTools } from "./grc-tools/launchdarkly.js";
+import { registerMulesoftTools } from "./grc-tools/mulesoft.js";
+import { registerNewrelicTools } from "./grc-tools/newrelic.js";
 import { registerOktaTools } from "./grc-tools/okta.js";
 import { registerOciTools } from "./grc-tools/oci.js";
 import { registerOscalTools } from "./grc-tools/oscal.js";
+import { registerPagerdutyTools } from "./grc-tools/pagerduty.js";
+import { registerPaloaltoTools } from "./grc-tools/paloalto.js";
+import { registerQualysTools } from "./grc-tools/qualys.js";
+import { registerSalesforceTools } from "./grc-tools/salesforce.js";
 import { registerScfTools } from "./grc-tools/scf.js";
+import { registerServicenowTools } from "./grc-tools/servicenow.js";
 import { registerSlackTools } from "./grc-tools/slack.js";
+import { registerSnowflakeTools } from "./grc-tools/snowflake.js";
+import { registerSplunkTools } from "./grc-tools/splunk.js";
+import { registerSumologicTools } from "./grc-tools/sumologic.js";
+import { registerTenableTools } from "./grc-tools/tenable.js";
 import { registerVantaTools } from "./grc-tools/vanta.js";
+import { registerVeracodeTools } from "./grc-tools/veracode.js";
 import { registerWebexTools } from "./grc-tools/webex.js";
+import { registerZendeskTools } from "./grc-tools/zendesk.js";
 import { registerZoomTools } from "./grc-tools/zoom.js";
+import { registerZscalerTools } from "./grc-tools/zscaler.js";
 
-const DOMAIN_TOOL_COUNT = 107;
+/**
+ * Domain tool registrars, kept alphabetical by integration. Add a new
+ * integration by importing its `registerXxxTools` above and inserting it here
+ * in alphabetical order; the domain tool count is derived from this list.
+ */
+const DOMAIN_TOOL_REGISTRARS: ReadonlyArray<(pi: ExtensionAPI) => void> = [
+  registerAnsibleTools,
+  registerAwsTools,
+  registerAzureTools,
+  registerBoxTools,
+  registerCloudflareTools,
+  registerCmvpTools,
+  registerCrowdstrikeTools,
+  registerDatadogTools,
+  registerDuoTools,
+  registerElasticTools,
+  registerFedrampTools,
+  registerGcpTools,
+  registerGitHubTools,
+  registerGwsOperatorTools,
+  registerGwsTools,
+  registerKevsTools,
+  registerKnowbe4Tools,
+  registerLaunchdarklyTools,
+  registerMulesoftTools,
+  registerNewrelicTools,
+  registerOciTools,
+  registerOktaTools,
+  registerOscalTools,
+  registerPagerdutyTools,
+  registerPaloaltoTools,
+  registerQualysTools,
+  registerSalesforceTools,
+  registerScfTools,
+  registerServicenowTools,
+  registerSlackTools,
+  registerSnowflakeTools,
+  registerSplunkTools,
+  registerSumologicTools,
+  registerTenableTools,
+  registerVantaTools,
+  registerVeracodeTools,
+  registerWebexTools,
+  registerZendeskTools,
+  registerZoomTools,
+  registerZscalerTools,
+];
+
+function registerDomainTools(pi: ExtensionAPI): number {
+  let count = 0;
+  const counting = new Proxy(pi, {
+    get(target, property) {
+      if (property === "registerTool") {
+        return (tool: Parameters<ExtensionAPI["registerTool"]>[0]) => {
+          count += 1;
+          return target.registerTool(tool);
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  for (const register of DOMAIN_TOOL_REGISTRARS) {
+    register(counting);
+  }
+  return count;
+}
 
 function resolveCliVersion(currentDir: string): string {
   const candidatePaths = [
@@ -195,31 +281,12 @@ export default function grcTools(pi: ExtensionAPI): void {
     return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${note}` };
   });
 
-  registerAnsibleTools(pi);
-  registerAwsTools(pi);
-  registerAzureTools(pi);
-  registerCloudflareTools(pi);
-  registerCmvpTools(pi);
-  registerDuoTools(pi);
-  registerFedrampTools(pi);
-  registerGitHubTools(pi);
-  registerGcpTools(pi);
-  registerGwsOperatorTools(pi);
-  registerGwsTools(pi);
-  registerKevsTools(pi);
-  registerOciTools(pi);
-  registerOktaTools(pi);
-  registerOscalTools(pi);
-  registerScfTools(pi);
-  registerSlackTools(pi);
-  registerVantaTools(pi);
-  registerWebexTools(pi);
-  registerZoomTools(pi);
+  const domainToolCount = registerDomainTools(pi);
 
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
     ctx.ui.setTitle?.("grclanker");
-    ctx.ui.setStatus?.("grclanker", `${DOMAIN_TOOL_COUNT} domain tools ready`);
+    ctx.ui.setStatus?.("grclanker", `${domainToolCount} domain tools ready`);
     ctx.ui.setWorkingMessage?.("Correlating evidence...");
     ctx.ui.setHiddenThinkingLabel?.("GRC analysis");
     const settings = getSettings();
@@ -237,12 +304,6 @@ export default function grcTools(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    const settings = getSettings();
-    if (resolveComputeBackend(settings) === "sandbox-runtime") {
-      await resetSandboxRuntime();
-    }
-    if (resolveComputeBackend(settings) === "parallels-vm") {
-      await cleanupParallelsSandboxes();
-    }
+    await shutdownComputeSessions(getSettings());
   });
 }

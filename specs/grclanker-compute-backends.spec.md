@@ -4,13 +4,13 @@ name: "grclanker Compute Backends"
 vendor: "grclanker"
 category: "devops-developer-platforms"
 language: "typescript"
-status: "spec-only"
+status: "implemented"
 version: "0.1"
-last_updated: "2026-04-05"
+last_updated: "2026-09-21"
 source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# grclanker Compute Backends — Architecture Specification
+# grclanker Compute Backends - Architecture Specification
 
 ## Overview
 
@@ -56,7 +56,7 @@ Use a split control-plane / execution-plane design.
 - Control plane: local `grclanker` process, prompts, extensions, UI, settings, orchestration.
 - Execution plane: backend-specific environment used for selected tool calls, build/test steps, or compute-heavy analyzers.
 
-This is a better fit than “run everything remotely” because it preserves the current local Pi ergonomics while making isolation and remote compute opt-in per workflow or per tool class.
+This is a better fit than "run everything remotely" because it preserves the current local Pi ergonomics while making isolation and remote compute opt-in per workflow or per tool class.
 
 This also follows the pattern used by Feynman: keep model/provider choice separate from execution environment choice, and present environments like Docker, Modal, and RunPod as explicit execution lanes rather than hidden runtime behavior.
 
@@ -160,7 +160,7 @@ Design notes:
 
 ### 2. Docker
 
-Docker is the best first “real environment switch” for `grclanker`.
+Docker is the best first "real environment switch" for `grclanker`.
 
 Use it for:
 
@@ -250,8 +250,8 @@ Use for:
 
 Design notes:
 
-- Pods are better for “remote workstation” workflows.
-- Serverless is better for “dispatch a job and collect output”.
+- Pods are better for "remote workstation" workflows.
+- Serverless is better for "dispatch a job and collect output".
 
 ### 6. Vercel Sandbox
 
@@ -283,7 +283,7 @@ Do not treat it as a drop-in replacement for Modal or RunPod GPUs.
 
 Build this in three phases.
 
-### Phase 1 — Local Sandboxing
+### Phase 1 - Local Sandboxing
 
 Ship:
 
@@ -300,7 +300,7 @@ Why:
 - aligns with Pi extension interception patterns
 - gives users a stronger local isolation option without introducing a hosted control plane
 
-### Phase 2 — Remote Compute
+### Phase 2 - Remote Compute
 
 Ship:
 
@@ -311,10 +311,10 @@ Ship:
 Why:
 
 - covers burst GPU and long-running GPU lanes
-- separates “secure code execution” from “heavy compute”
+- separates "secure code execution" from "heavy compute"
 - provides both stateless and persistent remote options
 
-### Phase 3 — Hosted CPU Sandboxes
+### Phase 3 - Hosted CPU Sandboxes
 
 Ship one first, not both at once:
 
@@ -413,6 +413,70 @@ grclanker env doctor
 4. `grclanker investigate` can run a shell-heavy subtask in Docker or Parallels and return synced artifacts.
 5. Remote providers stage the workspace, execute commands, and sync artifacts back reliably.
 6. GPU-oriented workflows can target Modal or RunPod without changing the local control plane.
+
+## grclanker implementation
+
+The shipped implementation lives in the CLI:
+
+- `cli/pi/execution-backend.ts`: the `ExecutionBackend` interface (`healthcheck`, `stageWorkspace`, `exec`, `snapshot`, `restore`, `teardown`), capability flags (`snapshot`, `restore`, `gpu`, `stageWorkspace`, `artifactSync`, `interactive`), the injected `CommandRunner` and `FetchLike` types, secret redaction, and the `assertExhaustive` helper used by every switch over the kind union.
+- `cli/pi/backends/`: one adapter per kind (`local.ts` for host and sandbox-runtime, `docker.ts`, `parallels.ts`, `modal.ts`, `runpod.ts` for both RunPod kinds) plus `index.ts`, the factory with an exhaustive switch and the fail-fast stubs for `vercel-sandbox` and `cloudflare-sandbox`; `modal-profile.ts` is the guarded loader for the Modal CLI profile file (`~/.modal.toml`).
+- `cli/pi/compute.ts`: the nine-kind union, routing buckets, `computeProfile`, `computeDefaults` (network policy and workspace mount mode) normalization and validation, credential detection per remote kind (environment variables, plus the CLI profile for Modal), and backend status detection.
+- `cli/pi/backend-exec.ts`: the Pi tool surface (`bash`, `read`, `write`, `edit`, `ls`, `grep`, `find`) routed through either the phase 1 adapters or a contract-backed command adapter for remote kinds.
+- `cli/pi/compute-sessions.ts` and `cli/pi/compute-shutdown.ts`: the registry of staged sessions with its synchronous exit hook, and the `session_shutdown` entry point (`shutdownComputeSessions`) that resets the sandbox runtime when preferred and tears down every registered session unconditionally.
+- `cli/pi/env.ts` and `cli/index.ts`: `grclanker env list`, `env doctor`, `env smoke-test`, `env exec`, and the `--compute <kind>` flag on `setup`, `investigate`, and `audit`.
+- `cli/tests/compute-backends.test.mjs`: unit coverage with injected runners and mocked `fetch`; `cli/scripts/compute-backends-live-smoke.mjs`: opt-in live smoke wired as `test:compute-backends:live`.
+- Docs: `src/content/docs/docs/getting-started/compute-backends.md`.
+
+## Status
+
+Status as of 2026-09-21: implemented for seven of nine kinds, with `vercel-sandbox` and `cloudflare-sandbox` shipped as fail-fast stubs.
+
+### Backend matrix
+
+| Kind | Implemented | Runtime path | Tested | Documented | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `host` | yes | Pi's native local shell operations wrapped in the output redaction guard; `createHostBackend` is a contract implementation used by tests and `env list` only | yes (contract shape, redacted stream through a real shell) | yes | phase 1 behavior unchanged apart from output redaction |
+| `sandbox-runtime` | yes | contract adapter for bash, grep, find; file tools stay local under the same FS policy | yes (FS policy, contract shape, redaction) | yes | bash now runs through the contract runner (`bash -lc` plus the sandbox wrapper) |
+| `docker` | yes | contract adapter | yes (injected runner, run-arg shape byte-identical to phase 1, computeDefaults, daemon-unreachable error, redaction, grep and find caps) | yes | `deny-all` maps to `--network none`, `ro` maps to a read-only bind mount |
+| `parallels-vm` | yes | contract adapter (replaces the phase 1 `spawnSync` clone path) | yes (injected runner: stage, exec, snapshot, restore, teardown, failure cleanup, mount mode, typed mount deadline, redaction) | yes | snapshot via `prlctl snapshot`, rollback via `prlctl snapshot-switch --id {uuid}`; `env smoke-test` exercises both |
+| `modal` | yes (CLI: `modal shell`) | contract adapter, one-shot: bash only, file tools stay local | yes (injected runner, flag shape, shlex-safe command wrapper, redaction, one-shot tool surface and smoke-test output, credentials from the environment or a `.modal.toml` profile in a temp home with planted tokens kept out of every message) | yes | `capabilities.oneShot`; credentials from `MODAL_TOKEN_*` or the active `.modal.toml` profile; no sync-back or snapshots through the CLI |
+| `runpod-serverless` | yes (HTTP: `/health`, `/run`, `/status`, `/cancel`) | contract adapter, one-shot: bash only, file tools stay local | yes (mocked fetch, typed poll timeout, redacted worker output, provider error-body table over every surface and shape, one-shot tool surface and smoke-test output) | yes | `capabilities.oneShot`; requires a worker implementing the grclanker input/output contract; 600000 ms default poll ceiling |
+| `runpod-pod` | yes (HTTP `GET /pods/{id}` plus SSH/scp) | contract adapter | yes (mocked fetch, injected runner, tracked-files staging plan against a real temp repo with planted secrets, scp-failure cleanup, local temp-copy removal failures that leave the remote session state and the original error intact, cleanup exit-code tracking at adapter, runtime, sweep, and exit-hook level, session-id validation, awaited teardown, redaction, provider error-body table over the pod lookup and ssh/scp stderr) | yes | stages the git index only (tracked files minus the `RUNPOD_STAGING_DENYLIST` paths, which cover the whole `.env*` family and every other `.gitignore` and AGENTS.md secret name case-insensitively; ignored, untracked, `.git`, symlinks, and submodule contents never leave the machine; a non-git workspace is refused); readiness in `env list`, `env doctor`, the configuration issues, and the live smoke selector requires `ssh`, `scp`, and `git` on PATH and names the missing tool; REST v1 is deprecated by RunPod; base URL isolated for the v2 move |
+| `vercel-sandbox` | stub | fails fast | yes (fails fast) | yes (marked not available) | SDK/CLI only, no npm dependency added |
+| `cloudflare-sandbox` | stub | fails fast | yes (fails fast) | yes (marked not available) | Workers SDK only, no public HTTP lifecycle API |
+
+One-shot backends: `modal` and `runpod-serverless` set `capabilities.oneShot` because every `exec` runs in a fresh container or a stateless job. The runtime offers only `bash` and user `!` commands on them; `read`, `write`, `edit`, `ls`, `grep`, and `find` are left undefined in the resolved execution so the extension falls back to its host-local tools, which keep their state on the local workspace. The system prompt note names the backend as one-shot and states the consequence (a file written by `bash` does not exist afterwards; Modal sees local edits through `--add-local`, RunPod serverless does not upload them). `env smoke-test` reports `tool_adapter=skipped (one-shot backend, stateful file operations not offered)` and the same reason for `tool_find` and `tool_grep`, never a write/read pass, and verifies only a write-then-read inside one execution (`tool_one_shot_round_trip=ok`).
+
+Credentials: remote kinds are configured through the environment variables in the backend metadata, checked by name only. Modal is the exception because its CLI also reads the profile file documented at modal.com/docs/reference/modal.config: `getComputeBackendConfigurationIssues`, `env list`, `env doctor`, and the adapter's `healthcheck` and `exec` guards accept `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` in the environment or the selected profile of `.modal.toml` (`~/.modal.toml`, or `MODAL_CONFIG_PATH`), selected the way the client does (`MODAL_PROFILE`, else the table marked `active = true`, else `default`), with each key resolved environment-first. The loader (`cli/pi/backends/modal-profile.ts`) follows the config-loader standard: `readConfigText` then a scalar-only TOML table parser, each in its own guard, keeping only whether `token_id` and `token_secret` are non-empty strings; a read failure other than ENOENT is `Unable to read Modal config file <path> (<CODE>)`, a malformed line is `Unable to parse Modal config file: invalid TOML in <path> at line N (INVALID_TOML | DUPLICATE_KEY)`, and no line text, filesystem wording, or token value reaches any message. The reported state names the source (`Found Modal CLI profile "default" in <path>.`) and never a value.
+
+Session lifecycle: `grclanker env smoke-test` and `grclanker env exec` await `teardown` in a `finally` block on success and failure; the agent session tears down every registered backend session on `session_shutdown` via `shutdownComputeSessions` (unconditional registry teardown, independent of the preferred backend in settings; the sandbox-runtime reset stays gated on that backend); a synchronous `process.on("exit")` hook running each adapter's `teardownSync` is the last resort only. A session is untracked only when its removal is confirmed: the RunPod pod adapter inspects the exit code of every `rm -rf` it issues (normal teardown and the cleanup after a failed `scp`), retries once, and raises `ExecutionBackendCleanupError` naming the pod id, the remote path, and the delete command (stderr scrubbed) while the session stays in the adapter's staged set and in the runtime registry, so the next teardown or the shutdown sweep retries it; the sweep (`teardownComputeSessions`) keeps failed handles and raises `ComputeSessionTeardownError` listing them; `withComputeBackendExecution` surfaces a cleanup failure as the result on the success path and appends it to the run's own error on the throw path; `teardownSync` inspects the exit code and writes the remnant to stderr because the process is exiting.
+
+Output hygiene: every adapter (host, sandbox-runtime, docker, parallels-vm, modal, runpod-serverless, runpod-pod) routes streamed chunks and the returned stdout/stderr through one redaction guard (`createExecutionOutputGuard`) that removes the configured credential values, `Bearer` tokens, RunPod and Modal token formats, `NAME=value` echoes of the credential variables, and PEM private key blocks; streamed output is scrubbed per completed line so a split credential is still caught, and the sink never flushes through an open PEM block: text from a `-----BEGIN ... PRIVATE KEY-----` marker is held until the matching END marker arrives (so a line-at-a-time producer cannot leak the header and body line by line), a line ending in `Bearer` is held for the token on the next line, and the held buffer is capped at 256 KiB. A block whose END never arrives (truncated key file, command killed by its timeout mid-key, or the cap) is flushed at that point with the BEGIN marker and the contiguous body-shaped lines after it (base64 of 16 or more characters, plus a trailing base64 fragment cut off by the end of the output) replaced by `[REDACTED PRIVATE KEY: unterminated block, body withheld]` (`[REDACTED PRIVATE KEY: unterminated block]` when nothing followed the marker), so the withholding is reported inline per rule 10; the first line that is not body shaped ends the run and everything from there on survives. The pattern set also covers generic credential shapes: in any `scheme://...` URL the userinfo, every query value, and the fragment are replaced (parameter names and path stay), `Cookie:` and `Set-Cookie:` header values are replaced, and credential-named fields in header, assignment, or JSON form (`X-Api-Key`, `session_id`, `token`, `api_key`, `access_token`, `client_secret`, `password`, and similar) lose their values. Error messages have a separate choke point because thrown errors bypass the output guard: the `ExecutionBackendError` constructor scrubs every message with `redactErrorMessage` (the same values and patterns, plus wholesale replacement of any HTML document with `[HTML document withheld (N chars)]` and neutralization of a truncated PEM block), every adapter error (prlctl, ssh, and scp stderr, the file tools' failing remote command, RunPod job errors) is constructed through it, and `env exec` applies it again to what it re-throws. RunPod responses go through one `readJson` that never quotes a non-JSON body: a 502 page or a login page on a 200 is reported as status, endpoint, content type, and byte length (`non-JSON text/html body (166 bytes) withheld`), a 200 with a non-JSON body is a typed error rather than a raw `SyntaxError`, and a JSON error body contributes only its message-bearing fields (other keys are named, never serialized). The `env exec` command echo goes through `redactSecrets`. `env list` and `env doctor` print variable names only; session records hold teardown handles only. File operations on non-host backends (`read`, `edit`, `write`, `ls`, `grep`, `find`) request `redactOutput: false` so a redaction marker is never written back into a file by the edit tool; `grep`, `find`, and `ls` never write back but inherit the exception so file content reads the same on every file tool.
+
+Cap and deadline exits: the RunPod serverless poll (`ExecutionBackendTimeoutError` after cancelling the job; explicit `aborted` and non-`COMPLETED` status errors) and the Parallels mount wait (`ExecutionBackendTimeoutError`, clone destroyed) never exit as success; backend `grep` reports `matchLimitReached` and backend `find` returns exactly the limit so Pi's find tool prints its results-limit warning. No adapter calls a paginated list API (RunPod pods or endpoints, `prlctl snapshot-list`).
+
+### Deviations from this spec
+
+- The contract names the final lifecycle step `teardown` rather than `cleanup`, and `snapshot`/`restore` are required members that throw a typed "not supported" error when `capabilities.snapshot` or `capabilities.restore` is false, instead of being optional.
+- `ExecutionRequest` carries `sessionId`, `onData`, and `signal` so streaming tool output and aborts work through the same contract.
+- Parallels rollback uses `prlctl snapshot-switch --id {uuid}`, which is the prlctl command for the operation this spec calls `prlctl rollback`; the adapter never synthesizes an id, it round-trips the id `prlctl snapshot` printed (braced or bare) verbatim. Guest execution still uses `prlctl exec`; the SSH guest path remains unimplemented because `prlctl exec` already covers the tool surface.
+- `host` does not run through the contract adapter at runtime. Pi's native local shell operations (shell config, process-tree kill) remain the host path so the default backend's behavior is unchanged; `createHostBackend` exists so the contract is total over the kind union and is exercised by tests.
+- The Modal `--cmd` value is a base64 wrapper rather than the raw command, because the modal client re-splits `--cmd` with `shlex`.
+- Modal is driven through the documented `modal shell` CLI rather than the Sandbox SDK or an HTTP API, because Modal does not document a public HTTP lifecycle API and the project does not add npm dependencies for this.
+- `runpod-pod` never creates or destroys pods. It operates only inside a per-session directory on a pod the operator already owns.
+- One-shot backends (`modal`, `runpod-serverless`) route `bash` only. Persistent staging plus a sync per execution would be the alternative that keeps the full tool surface remote; it is not implemented, so file tools stay host-local on those kinds.
+- `computeProfile` is validated against the selected backend's routing bucket rather than selecting a backend on its own.
+
+### Remaining work
+
+- `vercel-sandbox` and `cloudflare-sandbox` adapters (deferred; both need an SDK dependency or a hosted Worker).
+- Artifact sync-back for Modal (not exposed by `modal shell`) and automatic sync-back for RunPod pods (manual `scp` today).
+- Enforcing `computeDefaults.networkPolicy` on remote providers, which do not expose a documented per-command network policy.
+- Moving `runpod-pod` to RunPod REST API v2 before the documented v1 retirement on 2026-11-15.
+- A reference RunPod serverless worker image implementing the grclanker input/output contract.
+- Header text still reads the backend kind; per-session snapshot and artifact manifests are not surfaced in the TUI yet.
+- Routing `host` through the contract adapter (would need the host adapter to reuse Pi's shell config and process-tree kill semantics).
+- Per-tool-call snapshot and rollback inside the agent session for Parallels; today only `env smoke-test` drives `snapshot` and `restore`.
 
 ## Decision Summary
 

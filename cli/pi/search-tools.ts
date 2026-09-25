@@ -8,7 +8,7 @@ import {
   truncateLine,
   type GrepToolDetails,
   type GrepToolInput,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import type { ResolvedComputeBackendExecution } from "./backend-exec.js";
 
 const DEFAULT_GREP_LIMIT = 100;

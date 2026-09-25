@@ -1,7 +1,15 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
   GoogleWorkspaceAuditorClient,
+  assessGwsAdminAccess,
   assessGwsIdentity,
-  collectGwsIdentityData,
+  assessGwsIntegrations,
+  assessGwsMonitoring,
+  collectGwsAuditData,
+  exportGwsAuditBundle,
   resolveGwsConfiguration,
   runGwsAccessCheck,
 } from "../dist/extensions/grc-tools/gws.js";
@@ -23,6 +31,16 @@ function hasConfigHints() {
   return hasServiceAccount || hasAccessToken;
 }
 
+function logAssessment(label, assessment) {
+  log(`${label}: ${assessment.findings.length} findings`);
+  log(
+    `  Pass ${assessment.summary.Pass}, Partial ${assessment.summary.Partial}, Fail ${assessment.summary.Fail}, Manual ${assessment.summary.Manual}, Info ${assessment.summary.Info}`,
+  );
+  for (const finding of assessment.findings) {
+    log(`  - ${finding.id} ${finding.status}: ${finding.summary}`);
+  }
+}
+
 try {
   if (!hasConfigHints()) {
     log(
@@ -38,7 +56,7 @@ try {
   log(`Google Workspace org: ${access.organization}`);
   log(`Access status: ${access.status}`);
   for (const probe of access.probes) {
-    log(`- ${probe.key}: ${probe.status}`);
+    log(`- ${probe.key}: ${probe.status} (${probe.detail})`);
   }
 
   if (access.status !== "healthy") {
@@ -47,12 +65,20 @@ try {
     );
   }
 
-  const identity = await collectGwsIdentityData(client);
-  const assessment = assessGwsIdentity(identity, config);
-  log(`Identity findings: ${assessment.findings.length}`);
-  log(
-    `Summary: Pass ${assessment.summary.Pass}, Partial ${assessment.summary.Partial}, Fail ${assessment.summary.Fail}, Manual ${assessment.summary.Manual}, Info ${assessment.summary.Info}`,
-  );
+  const data = await collectGwsAuditData(client);
+  logAssessment("gws_assess_identity", assessGwsIdentity(data.identity, config));
+  logAssessment("gws_assess_admin_access", assessGwsAdminAccess(data.adminAccess, config));
+  logAssessment("gws_assess_integrations", assessGwsIntegrations(data.integrations, config));
+  logAssessment("gws_assess_monitoring", assessGwsMonitoring(data.monitoring, config));
+
+  const outputRoot = mkdtempSync(join(tmpdir(), "grclanker-gws-live-"));
+  const bundle = await exportGwsAuditBundle(client, config, outputRoot);
+  log(`gws_export_audit_bundle: ${bundle.fileCount} files, ${bundle.findingCount} findings, ${bundle.errorCount} collection errors`);
+  log(`  Output directory: ${bundle.outputDir}`);
+  log(`  Zip archive: ${bundle.zipPath}`);
+  if (bundle.findingCount !== 19) {
+    throw new Error(`Expected 19 findings in the exported bundle, received ${bundle.findingCount}.`);
+  }
   log("Live Google Workspace smoke test passed.");
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);

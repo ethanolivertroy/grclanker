@@ -5,8 +5,8 @@ vendor: "Cisco"
 category: "identity-access-management"
 language: "typescript"
 status: "implemented"
-version: "1.0"
-last_updated: "2026-04-14"
+version: "1.1"
+last_updated: "2026-09-21"
 source_repo: "https://github.com/hackIDLE/grclanker"
 legacy_repo: "https://github.com/hackIDLE/duo-sec-inspector"
 reference_docs: "https://duo.com/docs/adminapi"
@@ -345,4 +345,41 @@ goreleaser release --snapshot
 
 ## 10. Status
 
-Not yet implemented. Spec only.
+Implemented in grclanker as a native TypeScript tool family. The standalone Go CLI described in sections 7 through 9 was never built; those sections remain as historical design context.
+
+### grclanker implementation
+
+- Source: `cli/extensions/grc-tools/duo.ts` (tools `duo_check_access`, `duo_assess_authentication`, `duo_assess_admin_access`, `duo_assess_integrations`, `duo_assess_monitoring`, `duo_export_audit_bundle`)
+- Tests: `cli/tests/duo.test.mjs` (mocked Admin API coverage, verdict-safety fixtures, bundle layout)
+- Live smoke: `cli/scripts/duo-live-smoke.mjs` via `npm --prefix cli run test:duo:live`
+- Integration guide: `src/content/docs/docs/integrations/duo.md`
+- Scope: Admin API read endpoints only. The Auth API and Accounts API listed in section 2 are not used.
+
+Control coverage (20 of 20 controls have a finding; 18 are automated, control 18 is Manual by design, control 7 and the travel half of control 15 are automated only on editions that expose the fields):
+
+| # | Control | Finding | Status |
+|---|---------|---------|--------|
+| 1 | Global MFA policy | DUO-AUTH-007, DUO-AUTH-001 | Automated |
+| 2 | User enrollment completeness | DUO-AUTH-008 | Automated |
+| 3 | Bypass code audit | DUO-AUTH-006 | Automated |
+| 4 | Inactive user detection | DUO-AUTH-009 | Automated |
+| 5 | Admin role review | DUO-ADMIN-001 | Automated |
+| 6 | Trusted endpoint policy | DUO-AUTH-005 | Automated |
+| 7 | Device health requirements | DUO-INTEGRATIONS-006 | Automated (Advantage and Premier), Manual otherwise |
+| 8 | Remembered devices policy | DUO-AUTH-004 | Automated |
+| 9 | Authentication method restrictions | DUO-AUTH-002 | Automated |
+| 10 | New user policy | DUO-AUTH-003 | Automated |
+| 11 | User lockout policy | DUO-ADMIN-005 | Automated |
+| 12 | Integration policy assignments | DUO-INTEGRATIONS-001 | Automated |
+| 13 | Unprotected application detection | DUO-INTEGRATIONS-005 | Automated when applications are tagged, Manual otherwise |
+| 14 | Trust Monitor configuration | DUO-MON-002 | Automated where available |
+| 15 | Authentication log anomalies | DUO-MON-005, DUO-MON-001 | Automated (travel analysis needs access device location) |
+| 16 | Telephony credit monitoring | DUO-MON-003 | Automated |
+| 17 | U2F/WebAuthn credential inventory | DUO-AUTH-010 | Automated |
+| 18 | Offline access configuration | DUO-AUTH-011 | Manual (no documented policy section) |
+| 19 | Self-service portal policy | DUO-INTEGRATIONS-003 | Automated |
+| 20 | API permission audit | DUO-INTEGRATIONS-004 | Automated |
+
+Verdict rules: forbidden or errored calls render Manual with the endpoint, permission, and evidence to collect; empty inventories never pass by default; undated records are never counted fresh; incomplete paging caps a finding at Partial with seen and total counts; re-running the export never overwrites a prior bundle.
+
+Deferred: Auth API and Accounts API modes, telephony credit trend analysis, and Trust Monitor triage depth.

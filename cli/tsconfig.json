@@ -11,6 +11,6 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["*.ts", "pi/**/*", "extensions/**/*", "bootstrap/**/*", "config/**/*"],
+  "include": ["*.ts", "pi/**/*", "extensions/**/*", "bootstrap/**/*", "config/**/*", "agent-sdk/**/*", "flue/**/*"],
   "exclude": ["node_modules", "dist"]
 }

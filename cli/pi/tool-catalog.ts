@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import grcTools from "../extensions/grc-tools.js";
 
 export interface RegisteredToolSummary {
@@ -22,36 +22,85 @@ export interface RegisteredToolParameter {
 
 const COMPUTE_TOOL_NAMES = new Set(["bash", "read", "write", "edit", "ls", "find", "grep"]);
 
+/**
+ * Tool name prefix to display group. Keep this list alphabetical by prefix;
+ * the longest matching prefix wins, so ordering never affects resolution.
+ */
 const DOMAIN_GROUPS: Array<[prefix: string, label: string]> = [
   ["ansible_", "Ansible AAP"],
   ["aws_", "AWS"],
   ["azure_", "Azure"],
+  ["box_", "Box"],
   ["cloudflare_", "Cloudflare"],
-  ["fedramp_", "FedRAMP"],
   ["cmvp_", "CMVP"],
-  ["kevs_", "KEV / EPSS"],
-  ["scf_", "SCF"],
-  ["oscal_", "OSCAL"],
+  ["crowdstrike_", "CrowdStrike"],
+  ["datadog_", "Datadog"],
+  ["duo_", "Duo"],
+  ["elastic_", "Elastic"],
+  ["fedramp_", "FedRAMP"],
   ["gcp_", "GCP"],
-  ["gws_ops_", "Google Workspace Operator"],
-  ["gws_", "Google Workspace"],
   ["github_", "GitHub"],
+  ["gws_", "Google Workspace"],
+  ["gws_ops_", "Google Workspace Operator"],
+  ["kevs_", "KEV / EPSS"],
+  ["knowbe4_", "KnowBe4"],
+  ["launchdarkly_", "LaunchDarkly"],
+  ["mulesoft_", "MuleSoft"],
+  ["newrelic_", "New Relic"],
   ["oci_", "OCI"],
   ["okta_", "Okta"],
-  ["duo_", "Duo"],
+  ["oscal_", "OSCAL"],
+  ["pagerduty_", "PagerDuty"],
+  ["paloalto_", "Palo Alto Networks"],
+  ["qualys_", "Qualys"],
+  ["salesforce_", "Salesforce"],
+  ["scf_", "SCF"],
+  ["servicenow_", "ServiceNow"],
   ["slack_", "Slack"],
+  ["snowflake_", "Snowflake"],
+  ["splunk_", "Splunk"],
+  ["sumologic_", "Sumo Logic"],
+  ["tenable_", "Tenable"],
   ["vanta_", "Vanta"],
+  ["veracode_", "Veracode"],
   ["webex_", "Webex"],
+  ["zendesk_", "Zendesk"],
   ["zoom_", "Zoom"],
+  ["zscaler_", "Zscaler"],
 ];
 
-function resolveToolGroup(name: string): { group: string; kind: RegisteredToolSummary["kind"] } {
+export function resolveToolGroup(name: string): { group: string; kind: RegisteredToolSummary["kind"] } {
   if (COMPUTE_TOOL_NAMES.has(name)) {
     return { group: "Compute Backend", kind: "compute" };
   }
 
-  const match = DOMAIN_GROUPS.find(([prefix]) => name.startsWith(prefix));
+  let match: [prefix: string, label: string] | undefined;
+  for (const candidate of DOMAIN_GROUPS) {
+    if (!name.startsWith(candidate[0])) continue;
+    if (!match || candidate[0].length > match[0].length) match = candidate;
+  }
   return { group: match?.[1] ?? "Other Domain Tools", kind: "domain" };
+}
+
+/**
+ * Run the bundled extension against a registration-only ExtensionAPI stub and
+ * return every tool it registers, in registration order.
+ */
+export function collectRegisteredToolDefinitions(): ToolDefinition[] {
+  const registeredTools: ToolDefinition[] = [];
+
+  const api = {
+    registerTool(tool: ToolDefinition) {
+      registeredTools.push(tool);
+    },
+    on() {
+      return undefined;
+    },
+  } as unknown as ExtensionAPI;
+
+  grcTools(api);
+
+  return registeredTools;
 }
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
@@ -124,20 +173,7 @@ function getParameterSummaries(parameters: unknown): RegisteredToolParameter[] {
 }
 
 export function getRegisteredToolSummaries(): RegisteredToolSummary[] {
-  const registeredTools: ToolDefinition[] = [];
-
-  const api = {
-    registerTool(tool: ToolDefinition) {
-      registeredTools.push(tool);
-    },
-    on() {
-      return undefined;
-    },
-  } as unknown as ExtensionAPI;
-
-  grcTools(api);
-
-  return registeredTools.map((tool) => {
+  return collectRegisteredToolDefinitions().map((tool) => {
     const { group, kind } = resolveToolGroup(tool.name);
     return {
       name: tool.name,

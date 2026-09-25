@@ -36,18 +36,18 @@ function sourceBanner(
   secondary: FedrampRulesSourceStatus,
 ): string {
   const blobRef = primary.blobSha ? `\`${primary.blobSha.slice(0, 12)}\`` : "`unknown`";
-  const rulesNote =
+  const supportingNote =
     secondary.state === "ready"
-      ? "The official `FedRAMP/rules` repo exists and is ready for later integration."
+      ? "Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository."
       : secondary.state === "placeholder"
-        ? "The official `FedRAMP/rules` repo exists, but grclanker still treats `FedRAMP/docs` as the active source until structured rules land there."
-        : "The official `FedRAMP/rules` repo could not be inspected during this sync, so grclanker is grounded in `FedRAMP/docs` alone for now.";
+        ? "The official `FedRAMP/2026-markdown` repository exists, but generated narrative content was not found."
+        : "The official `FedRAMP/2026-markdown` repository could not be inspected during this sync.";
 
   return [
     `> Generated from the official [${primary.org}/${primary.repo}](${primary.repoUrl}) GitHub repo.`,
     `> Source path: [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\` at blob ${blobRef}.`,
-    `> FRMR version: \`${primary.version}\` · upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\`.`,
-    `> ${rulesNote}`,
+    `> Consolidated Rules version: \`${primary.version}\` · upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\`.`,
+    `> ${supportingNote}`,
   ].join("\n");
 }
 
@@ -66,8 +66,17 @@ function requirementMarkdown(requirement: FedrampRequirementRecord): string {
   const lines = [
     requirementBadge(requirement),
     "",
-    requirement.statement,
   ];
+
+  if (requirement.classVariants.length > 0) {
+    lines.push("Varies by certification class:", "");
+    for (const variant of requirement.classVariants) {
+      const force = variant.primaryKeyWord ? ` ${variant.primaryKeyWord}` : "";
+      lines.push(`- **Class ${variant.class}${force}:** ${variant.statement}`);
+    }
+  } else {
+    lines.push(requirement.statement);
+  }
 
   if (requirement.followingInformation.length > 0) {
     lines.push("", "Checklist items:", markdownList(requirement.followingInformation));
@@ -115,7 +124,7 @@ function processPage(
   const lines = [
     frontmatter(
       `${process.name} — FedRAMP Process`,
-      `Official FRMR-generated summary for the ${process.shortName} FedRAMP process, including applicability and requirements.`,
+      `Official Consolidated Rules summary for the ${process.shortName} FedRAMP process, including applicability and requirements.`,
     ),
     "",
     sourceBanner(primary, secondary),
@@ -128,6 +137,10 @@ function processPage(
     "",
   ];
 
+  if (process.status) {
+    lines.splice(lines.length - 1, 0, `Status: \`${process.status}\``, "");
+  }
+
   if (process.sourceUrl) {
     lines.push(`Official page: [${process.sourceUrl}](${process.sourceUrl})`, "");
   }
@@ -135,8 +148,8 @@ function processPage(
   lines.push(
     "## Effective Status",
     "",
-    `- 20x: ${process.effective["20x"]?.is ?? "n/a"}${process.effective["20x"]?.currentStatus ? ` · ${process.effective["20x"]?.currentStatus}` : ""}`,
-    `- Rev5: ${process.effective.rev5?.is ?? "n/a"}${process.effective.rev5?.currentStatus ? ` · ${process.effective.rev5?.currentStatus}` : ""}`,
+    `- 20x: ${process.effective["20x"]?.is ?? "n/a"}${process.effective["20x"]?.currentStatus ? ` · ${process.effective["20x"]?.currentStatus}` : ""}${process.effective["20x"]?.startDate ? ` · obtain ${process.effective["20x"]?.startDate}` : ""}${process.effective["20x"]?.graceDate ? ` · grace through ${process.effective["20x"]?.graceDate}` : ""}`,
+    `- Rev5: ${process.effective.rev5?.is ?? "n/a"}${process.effective.rev5?.currentStatus ? ` · ${process.effective.rev5?.currentStatus}` : ""}${process.effective.rev5?.startDate ? ` · obtain ${process.effective.rev5?.startDate}` : ""}${process.effective.rev5?.graceDate ? ` · grace through ${process.effective.rev5?.graceDate}` : ""}`,
     `- Shared requirements: ${counts.both}`,
     "",
   );
@@ -150,9 +163,11 @@ function processPage(
   }
 
   if (process.labels.length > 0) {
-    lines.push("## Label Groups", "");
+    lines.push("## Rule Subsets", "");
     for (const label of process.labels) {
-      lines.push(`- \`${label.code}\` — ${label.name}: ${label.description}`);
+      const types = label.types.length > 0 ? ` · types: ${label.types.join(", ")}` : "";
+      const classes = label.classes.length > 0 ? ` · classes: ${label.classes.join(", ")}` : "";
+      lines.push(`- \`${label.code}\` — ${label.name}: ${label.description}${types}${classes}`);
     }
     lines.push("");
   }
@@ -195,7 +210,7 @@ function ksiDomainPage(
   const lines = [
     frontmatter(
       `${domain.name} — FedRAMP KSI Domain`,
-      `Official FRMR-generated summary for the ${domain.shortName} FedRAMP key security indicator domain.`,
+      `Official Consolidated Rules summary for the ${domain.shortName} FedRAMP key security indicator domain.`,
     ),
     "",
     sourceBanner(primary, secondary),
@@ -204,17 +219,26 @@ function ksiDomainPage(
     "",
     `Domain code: \`${domain.code}\` · Domain ID: \`${domain.id}\` · Web slug: \`${domain.webName}\``,
     "",
-    "## Theme",
-    "",
-    fenceMultiline(domain.theme),
-    "",
     "## Indicators",
     "",
   ];
 
+  if (domain.theme) {
+    lines.splice(8, 0, "## Theme", "", fenceMultiline(domain.theme), "");
+  }
+
   for (const indicator of indicators) {
     const former = indicator.fka ? ` (formerly \`${indicator.fka}\`)` : "";
-    lines.push(`### \`${indicator.id}\`${former} — ${indicator.name}`, "", indicator.statement, "");
+    lines.push(`### \`${indicator.id}\`${former} — ${indicator.name}`, "");
+    if (indicator.classVariants.length > 0) {
+      lines.push("Varies by certification class:", "");
+      for (const variant of indicator.classVariants) {
+        lines.push(`- **Class ${variant.class}:** ${variant.statement}`);
+      }
+      lines.push("");
+    } else {
+      lines.push(indicator.statement, "");
+    }
     if (indicator.reference && indicator.referenceUrl) {
       lines.push(`Reference: [${indicator.reference}](${indicator.referenceUrl})`, "");
     } else if (indicator.reference) {
@@ -264,7 +288,7 @@ export function buildFedrampDocsSnapshot(
   const overview = [
     frontmatter(
       "FedRAMP Official Sources",
-      "Official GitHub-grounded FedRAMP 20x and Rev5 reference material generated from FRMR documentation.",
+      "Official GitHub-grounded FedRAMP 20x and Rev5 reference material generated from the Consolidated Rules.",
     ),
     "",
     sourceBanner(primary, secondary),
@@ -276,7 +300,7 @@ export function buildFedrampDocsSnapshot(
     "## Current Grounding",
     "",
     `- Primary source: [${primary.org}/${primary.repo}](${primary.repoUrl}) → [\`${primary.path}\`](${primary.fileHtmlUrl ?? primary.rawUrl}) on \`${primary.branch}\``,
-    `- FRMR version: \`${primary.version}\``,
+    `- Consolidated Rules version: \`${primary.version}\``,
     `- Upstream \`last_updated\`: \`${primary.upstreamLastUpdated}\``,
     `- Rev5 remains a first-class lane beside 20x in grclanker.`,
     "",
@@ -293,7 +317,7 @@ export function buildFedrampDocsSnapshot(
   const processesIndex = [
     frontmatter(
       "FedRAMP Processes",
-      "Browse official FRMR-generated FedRAMP process documents such as ADS, PVA, SCG, VDR, and CCM.",
+      "Browse official Consolidated Rules process documents such as CDS, IVV, SCG, VDR, and CCM.",
     ),
     "",
     sourceBanner(primary, secondary),
@@ -307,7 +331,7 @@ export function buildFedrampDocsSnapshot(
   const ksiIndex = [
     frontmatter(
       "FedRAMP KSI Domains",
-      "Browse official FRMR-generated FedRAMP key security indicator domains and indicator summaries.",
+      "Browse official Consolidated Rules key security indicator domains and indicator summaries.",
     ),
     "",
     sourceBanner(primary, secondary),

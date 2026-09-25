@@ -5,7 +5,7 @@ import cloudflare from '@astrojs/cloudflare';
 
 export default defineConfig({
   site: 'https://www.grclanker.com',
-
+  output: 'static',
   markdown: {
     shikiConfig: {
       theme: 'catppuccin-frappe',

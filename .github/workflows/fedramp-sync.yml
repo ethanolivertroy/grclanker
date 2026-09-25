@@ -40,7 +40,7 @@ jobs:
           body: |
             Syncs grclanker's generated FedRAMP docs snapshot from the official FedRAMP GitHub sources.
 
-            - Refreshes the FRMR-backed generated docs content
+            - Refreshes generated docs from the official FedRAMP Consolidated Rules
             - Preserves reviewed snapshot delivery for the site
             - Keeps CLI lookups and docs content aligned to the same upstream source
 

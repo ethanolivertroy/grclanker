@@ -12,7 +12,7 @@ type EmbeddedPiPackageJson = {
 };
 
 export function assertEmbeddedPiBranding(appRoot: string): void {
-  const packageRoot = join(appRoot, "node_modules", "@mariozechner", "pi-coding-agent");
+  const packageRoot = join(appRoot, "node_modules", "@earendil-works", "pi-coding-agent");
   const packageJsonPath = join(packageRoot, "package.json");
 
   if (!existsSync(packageJsonPath)) {

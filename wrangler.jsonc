@@ -1,4 +1,5 @@
 {
+<<<<<<< HEAD
 	"compatibility_date": "2026-06-09",
 	"compatibility_flags": ["global_fetch_strictly_public"],
 	"name": "grclanker",
@@ -11,3 +12,13 @@
 		"enabled": true
 	}
 }
+=======
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "grclanker",
+  "compatibility_date": "2026-07-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page"
+  }
+}
+>>>>>>> origin/main

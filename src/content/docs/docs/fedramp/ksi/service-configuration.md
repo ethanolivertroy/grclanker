@@ -1,97 +1,102 @@
 ---
 title: Service Configuration — FedRAMP KSI Domain
-description: Official FRMR-generated summary for the SVC FedRAMP key security indicator domain.
+description: Official Consolidated Rules summary for the SVC FedRAMP key security indicator domain.
 ---
 
-> Generated from the official [FedRAMP/docs](https://github.com/FedRAMP/docs) GitHub repo.
-> Source path: [`FRMR.documentation.json`](https://github.com/FedRAMP/docs/blob/main/FRMR.documentation.json) on `main` at blob `5c6bfee74029`.
-> FRMR version: `0.9.43-beta` · upstream `last_updated`: `2026-04-08`.
-> The official `FedRAMP/rules` repo exists, but grclanker still treats `FedRAMP/docs` as the active source until structured rules land there.
+> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
+> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Service Configuration
 
 Domain code: `SVC` · Domain ID: `KSI-SVC` · Web slug: `service-configuration`
 
-## Theme
-
-A secure cloud service offering will follow FedRAMP encryption policies, continuously verify information resource integrity, and restrict access to third-party information resources.
-
 ## Indicators
 
-### `KSI-SVC-ACM` (formerly `KSI-SVC-04`) — Automating Configuration Management
+### `KSI-SVC-ACM` — Automating Configuration Management
 
-Manage configuration of machine-based information resources using automation.
+The configuration of machine-based information resources is managed using automation and persistently reviewed for drift.
 
 Mapped Rev5 controls: `ac-2.4`, `cm-2`, `cm-2.2`, `cm-2.3`, `cm-6`, `cm-7.1`, `pl-9`, `pl-10`, `sa-5`, `si-5`, `sr-10`
 
-Terms: `Information Resource`, `Machine-Based (information resources)`
+Terms: `Drift`, `Information Resource`, `Machine-Based (Information Resources)`, `Persistently`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SVC-ASM` (formerly `KSI-SVC-06`) — Automating Secret Management
+### `KSI-SVC-ASM` — Automating Secret Management
 
-Automate management, protection, and regular rotation of digital keys, certificates, and other secrets.
+Management, protection, and regular rotation of digital keys, certificates, and other secrets is automated and persistently reviewed.
 
 Mapped Rev5 controls: `ac-17.2`, `ia-5.2`, `ia-5.6`, `sc-12`, `sc-17`
 
-Terms: `Regularly`
+Terms: `Persistently`, `Regularly`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SVC-EIS` (formerly `KSI-SVC-01`) — Evaluating and Improving Security
+### `KSI-SVC-EIS` — Evaluating and Improving Security
 
-Implement improvements based on persistent evaluation of information resources for opportunities to improve security.
+Information resources are persistently evaluated for opportunities to improve security and those improvements are persistently made.
 
 Mapped Rev5 controls: `cm-7.1`, `cm-12.1`, `ma-2`, `pl-8`, `sc-7`, `sc-39`, `si-2.2`, `si-4`, `sr-10`
 
 Terms: `Information Resource`, `Persistently`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SVC-PRR` (formerly `KSI-SVC-08`) — Preventing Residual Risk
+### `KSI-SVC-PRR` — Preventing Residual Risk
 
+Varies by certification class:
 
+- **Class B:** **Optional:** Plans, procedures, and the state of information resources are persistently reviewed after making changes to limit and remove unwanted residual elements that would likely negatively affect the confidentiality, integrity, or availability of federal customer data.
+- **Class C:** Plans, procedures, and the state of information resources are persistently reviewed after making changes to limit and remove unwanted residual elements that would likely negatively affect the confidentiality, integrity, or availability of federal customer data.
 
 Mapped Rev5 controls: `sc-4`
 
 Terms: `Federal Customer Data`, `Information Resource`, `Likely`, `Persistently`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SVC-RUD` (formerly `KSI-SVC-10`) — Removing Unwanted Data
+### `KSI-SVC-RUD` — Removing Unwanted Data
 
+Varies by certification class:
 
+- **Class B:** **Optional:** Unwanted federal customer data is removed promptly when requested by an agency in alignment with customer agreements, including from backups if appropriate; this typically applies when a customer spills information or when a customer seeks to remove information from a service due to a change in usage.
+- **Class C:** Unwanted federal customer data is removed promptly when requested by an agency in alignment with customer agreements, including from backups if appropriate; this typically applies when a customer spills information or when a customer seeks to remove information from a service due to a change in usage.
 
 Mapped Rev5 controls: `si-12.3`, `si-18.4`
 
 Terms: `Agency`, `Federal Customer Data`, `Promptly`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SVC-SNT` (formerly `KSI-SVC-02`) — Securing Network Traffic
+### `KSI-SVC-SIN` — Securing Information
 
-Encrypt or otherwise secure network traffic.
+Information is encrypted or otherwise secured from unwanted access or modification.
 
-Mapped Rev5 controls: `ac-1`, `ac-17.2`, `cp-9.8`, `sc-8`, `sc-8.1`, `sc-13`, `sc-20`, `sc-21`, `sc-22`, `sc-23`
+Mapped Rev5 controls: `ac-1`, `ac-17.2`, `cp-9.8`, `sc-8`, `sc-8.1`, `sc-13`, `sc-20`, `sc-21`, `sc-22`, `sc-23`, `sc-28`, `sc-28.1`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SVC-VCM` (formerly `KSI-SVC-09`) — Validating Communications
+### `KSI-SVC-VCM` — Validating Communications
 
+Varies by certification class:
 
+- **Class B:** **Optional:** The authenticity and integrity of communications between machine-based information resources is persistently validated using automation.
+- **Class C:** The authenticity and integrity of communications between machine-based information resources is persistently validated using automation.
 
 Mapped Rev5 controls: `sc-23`, `si-7.1`
 
-Terms: `Information Resource`, `Machine-Based (information resources)`, `Persistent Validation`, `Persistently`
+Terms: `Information Resource`, `Machine-Based (Information Resources)`, `Persistently`, `Validation`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SVC-VRI` (formerly `KSI-SVC-05`) — Validating Resource Integrity
+### `KSI-SVC-VRI` — Validating Resource Integrity
 
 Use cryptographic methods to validate the integrity of machine-based information resources.
 
 Mapped Rev5 controls: `cm-2.2`, `cm-8.3`, `sc-13`, `sc-23`, `si-7`, `si-7.1`, `sr-10`
 
-Terms: `Information Resource`, `Machine-Based (information resources)`, `Persistent Validation`
+Terms: `Information Resource`, `Machine-Based (Information Resources)`, `Validation`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.

@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GRCLANKER_ASCII_LOGO } from "../../logo.js";
 import { getGrclankerSettingsPath } from "../../config/paths.js";
 import { formatSystemResources, resolveComputeBackend } from "../../pi/compute.js";

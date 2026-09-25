@@ -1,6 +1,7 @@
 ---
+import { getCollection } from 'astro:content';
 import Base from './Base.astro';
-import { docsSections, getDocHref } from '../lib/docs';
+import { buildDocsSections, getDocHref } from '../lib/docs';
 
 interface Props {
   title: string;
@@ -9,6 +10,7 @@ interface Props {
 }
 
 const { title, description, currentSlug } = Astro.props;
+const docsSections = buildDocsSections(await getCollection('docs'));
 ---
 
 <Base title={title} description={description} footerVariant="default">

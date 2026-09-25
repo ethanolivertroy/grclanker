@@ -3,29 +3,36 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { ensureGrclankerHome, getGrclankerHome, getGrclankerStateDir } from "../../config/paths.js";
+import { persistentCachesEnabled } from "./shared.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SOURCE_STATUS_TTL_MS = 6 * 60 * 60 * 1000;
+const FEDRAMP_CACHE_SCHEMA_VERSION = 2;
 const GITHUB_API = "https://api.github.com";
 const GITHUB_ORG = "FedRAMP";
-
-export const FEDRAMP_DOCS_SOURCE = {
-  org: GITHUB_ORG,
-  repo: "docs",
-  branch: "main",
-  path: "FRMR.documentation.json",
-  repoUrl: "https://github.com/FedRAMP/docs",
-  rawUrl: "https://raw.githubusercontent.com/FedRAMP/docs/main/FRMR.documentation.json",
-};
 
 export const FEDRAMP_RULES_SOURCE = {
   org: GITHUB_ORG,
   repo: "rules",
   branch: "main",
+  path: "fedramp-consolidated-rules.json",
   repoUrl: "https://github.com/FedRAMP/rules",
+  rawUrl:
+    "https://raw.githubusercontent.com/FedRAMP/rules/main/fedramp-consolidated-rules.json",
 };
 
+export const FEDRAMP_MARKDOWN_SOURCE = {
+  org: GITHUB_ORG,
+  repo: "2026-markdown",
+  branch: "main",
+  repoUrl: "https://github.com/FedRAMP/2026-markdown",
+};
+
+/** @deprecated Use FEDRAMP_RULES_SOURCE. */
+export const FEDRAMP_DOCS_SOURCE = FEDRAMP_RULES_SOURCE;
+
 export type FedrampApplicability = "20x" | "rev5" | "both";
+export type FedrampCertificationClass = "A" | "B" | "C" | "D";
 export type FedrampCacheStatus = "live" | "cached" | "stale";
 export type FedrampSearchSection = "definition" | "process" | "requirement" | "ksi" | "any";
 
@@ -48,7 +55,7 @@ export interface FedrampDefinitionRecord {
   alts: string[];
   definition: string;
   updated: FedrampUpdatedNote[];
-  appliesTo: "both";
+  appliesTo: FedrampApplicability;
 }
 
 export interface FedrampProcessEffectiveWindow {
@@ -58,12 +65,20 @@ export interface FedrampProcessEffectiveWindow {
   startDate: string | null;
   endDate: string | null;
   comments: string[];
+  warnings: string[];
+  optionalAdoptionDate: string | null;
+  graceDate: string | null;
+  graceUntilNextAssessment: boolean | null;
 }
 
 export interface FedrampProcessLabelRecord {
   code: string;
   name: string;
   description: string;
+  types: string[];
+  paths: string[];
+  classes: string[];
+  affects: string[];
 }
 
 export interface FedrampAuthorityRecord {
@@ -86,7 +101,19 @@ export interface FedrampProcessRecord {
   expectedOutcomes: string[];
   authority: FedrampAuthorityRecord[];
   labels: FedrampProcessLabelRecord[];
+  status: string | null;
+  tag: string | null;
   requirementIds: string[];
+}
+
+export interface FedrampClassVariantRecord {
+  class: FedrampCertificationClass;
+  statement: string;
+  primaryKeyWord: string | null;
+  followingInformation: string[];
+  note: string | null;
+  timeframeType: string | null;
+  timeframeNum: number | null;
 }
 
 export interface FedrampRequirementRecord {
@@ -111,6 +138,7 @@ export interface FedrampRequirementRecord {
   timeframeType: string | null;
   timeframeNum: number | null;
   updated: FedrampUpdatedNote[];
+  classVariants: FedrampClassVariantRecord[];
 }
 
 export interface FedrampKsiDomainRecord {
@@ -120,6 +148,7 @@ export interface FedrampKsiDomainRecord {
   shortName: string;
   webName: string;
   theme: string;
+  status: string | null;
   appliesTo: "20x";
   indicatorIds: string[];
 }
@@ -140,6 +169,7 @@ export interface FedrampKsiIndicatorRecord {
   terms: string[];
   updated: FedrampUpdatedNote[];
   appliesTo: "20x";
+  classVariants: FedrampClassVariantRecord[];
 }
 
 export interface FedrampCatalog {
@@ -165,7 +195,7 @@ export interface FedrampPrimarySourceStatus {
   upstreamLastUpdated: string;
 }
 
-export interface FedrampRulesSourceStatus {
+export interface FedrampSupportingSourceStatus {
   org: string;
   repo: string;
   branch: string;
@@ -175,6 +205,9 @@ export interface FedrampRulesSourceStatus {
   rootEntries: string[];
   notes: string[];
 }
+
+/** @deprecated Use FedrampSupportingSourceStatus. */
+export type FedrampRulesSourceStatus = FedrampSupportingSourceStatus;
 
 export interface FedrampLoadedCatalog {
   catalog: FedrampCatalog;
@@ -202,12 +235,14 @@ export interface FedrampSearchMatch {
 }
 
 type SourceCachePayload = {
+  schemaVersion: number;
   fetchedAt: string;
   primary: FedrampPrimarySourceStatus;
-  secondary: FedrampRulesSourceStatus;
+  secondary: FedrampSupportingSourceStatus;
 };
 
 type CatalogCachePayload = {
+  schemaVersion: number;
   fetchedAt: string;
   catalog: FedrampCatalog;
   provenance: FedrampPrimarySourceStatus;
@@ -302,7 +337,12 @@ function sourcesCachePath(homeDir = getGrclankerHome()): string {
   return resolve(fedrampStateDir(homeDir), "sources.json");
 }
 
+/**
+ * Create the FedRAMP state directory unless the caller disabled persistent
+ * caches; reads tolerate a missing directory, so skipping it is safe.
+ */
 async function ensureFedrampStateDir(homeDir = getGrclankerHome()): Promise<void> {
+  if (!persistentCachesEnabled()) return;
   ensureGrclankerHome(homeDir);
   await mkdir(fedrampStateDir(homeDir), { recursive: true });
 }
@@ -313,7 +353,9 @@ async function readJsonFile<T>(path: string): Promise<T | undefined> {
   return JSON.parse(raw) as T;
 }
 
-async function writeJsonFile(path: string, value: unknown): Promise<void> {
+/** Persist a cache payload unless the caller disabled persistent caches. */
+async function writeCacheFile(path: string, value: unknown): Promise<void> {
+  if (!persistentCachesEnabled()) return;
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
@@ -338,24 +380,24 @@ async function fetchPrimarySourceMetadata(): Promise<{
 }> {
   const [repo, file] = await Promise.all([
     fetchJson<RepoOverviewResponse>(
-      `${GITHUB_API}/repos/${FEDRAMP_DOCS_SOURCE.org}/${FEDRAMP_DOCS_SOURCE.repo}`,
+      `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}`,
     ),
     fetchJson<GitHubContentFileResponse>(
-      `${GITHUB_API}/repos/${FEDRAMP_DOCS_SOURCE.org}/${FEDRAMP_DOCS_SOURCE.repo}/contents/${FEDRAMP_DOCS_SOURCE.path}?ref=${FEDRAMP_DOCS_SOURCE.branch}`,
+      `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}/contents/${FEDRAMP_RULES_SOURCE.path}?ref=${FEDRAMP_RULES_SOURCE.branch}`,
     ),
   ]);
 
   return { repo, file };
 }
 
-async function fetchRulesSourceMetadata(): Promise<FedrampRulesSourceStatus> {
+async function fetchSupportingSourceMetadata(): Promise<FedrampSupportingSourceStatus> {
   try {
     const [repo, contents] = await Promise.all([
       fetchJson<RepoOverviewResponse>(
-        `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}`,
+        `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}`,
       ),
       fetchJson<GitHubContentEntry[]>(
-        `${GITHUB_API}/repos/${FEDRAMP_RULES_SOURCE.org}/${FEDRAMP_RULES_SOURCE.repo}/contents/?ref=${FEDRAMP_RULES_SOURCE.branch}`,
+        `${GITHUB_API}/repos/${FEDRAMP_MARKDOWN_SOURCE.org}/${FEDRAMP_MARKDOWN_SOURCE.repo}/contents/?ref=${FEDRAMP_MARKDOWN_SOURCE.branch}`,
       ),
     ]);
 
@@ -363,36 +405,35 @@ async function fetchRulesSourceMetadata(): Promise<FedrampRulesSourceStatus> {
       .map((entry) => asString(entry.name))
       .filter((entry): entry is string => Boolean(entry))
       .sort((left, right) => left.localeCompare(right));
-    const substantiveEntries = rootEntries.filter(
-      (entry) => entry !== "README.md" && entry !== ".gitignore",
-    );
+    const isReady =
+      rootEntries.includes("_sources.json") ||
+      rootEntries.some((entry) => entry.endsWith(".md") && entry !== "README.md");
 
     return {
-      org: FEDRAMP_RULES_SOURCE.org,
-      repo: FEDRAMP_RULES_SOURCE.repo,
-      branch: repo.default_branch ?? FEDRAMP_RULES_SOURCE.branch,
-      repoUrl: repo.html_url ?? FEDRAMP_RULES_SOURCE.repoUrl,
+      org: FEDRAMP_MARKDOWN_SOURCE.org,
+      repo: FEDRAMP_MARKDOWN_SOURCE.repo,
+      branch: repo.default_branch ?? FEDRAMP_MARKDOWN_SOURCE.branch,
+      repoUrl: repo.html_url ?? FEDRAMP_MARKDOWN_SOURCE.repoUrl,
       repoUpdatedAt: asString(repo.updated_at),
-      state: substantiveEntries.length > 0 ? "ready" : "placeholder",
+      state: isReady ? "ready" : "placeholder",
       rootEntries,
-      notes:
-        substantiveEntries.length > 0
-          ? []
-          : [
-              "The official FedRAMP/rules repo exists, but its root contents are still placeholder-level for grclanker automation.",
-            ],
+      notes: isReady
+        ? []
+        : [
+            "The official FedRAMP/2026-markdown repo exists, but no generated narrative content was found.",
+          ],
     };
   } catch (error) {
     return {
-      org: FEDRAMP_RULES_SOURCE.org,
-      repo: FEDRAMP_RULES_SOURCE.repo,
-      branch: FEDRAMP_RULES_SOURCE.branch,
-      repoUrl: FEDRAMP_RULES_SOURCE.repoUrl,
+      org: FEDRAMP_MARKDOWN_SOURCE.org,
+      repo: FEDRAMP_MARKDOWN_SOURCE.repo,
+      branch: FEDRAMP_MARKDOWN_SOURCE.branch,
+      repoUrl: FEDRAMP_MARKDOWN_SOURCE.repoUrl,
       repoUpdatedAt: null,
       state: "unavailable",
       rootEntries: [],
       notes: [
-        `Unable to inspect FedRAMP/rules: ${error instanceof Error ? error.message : String(error)}`,
+        `Unable to inspect FedRAMP/2026-markdown: ${error instanceof Error ? error.message : String(error)}`,
       ],
     };
   }
@@ -405,23 +446,23 @@ async function fetchPrimarySourceCatalog(): Promise<{
   const emptyRepoMetadata: RepoOverviewResponse = {};
   const emptyFileMetadata: GitHubContentFileResponse = {};
   const [rawCatalog, metadata] = await Promise.all([
-    fetchJson<Record<string, unknown>>(FEDRAMP_DOCS_SOURCE.rawUrl),
+    fetchJson<Record<string, unknown>>(FEDRAMP_RULES_SOURCE.rawUrl),
     fetchPrimarySourceMetadata().catch(() => ({ repo: emptyRepoMetadata, file: emptyFileMetadata })),
   ]);
 
-  const catalog = normalizeFedrampFrmr(rawCatalog);
+  const catalog = normalizeFedrampConsolidatedRules(rawCatalog);
 
   const provenance: FedrampPrimarySourceStatus = {
-    org: FEDRAMP_DOCS_SOURCE.org,
-    repo: FEDRAMP_DOCS_SOURCE.repo,
+    org: FEDRAMP_RULES_SOURCE.org,
+    repo: FEDRAMP_RULES_SOURCE.repo,
     branch:
       asString(metadata.repo.default_branch) ??
-      FEDRAMP_DOCS_SOURCE.branch,
+      FEDRAMP_RULES_SOURCE.branch,
     repoUrl:
       asString(metadata.repo.html_url) ??
-      FEDRAMP_DOCS_SOURCE.repoUrl,
-    path: FEDRAMP_DOCS_SOURCE.path,
-    rawUrl: FEDRAMP_DOCS_SOURCE.rawUrl,
+      FEDRAMP_RULES_SOURCE.repoUrl,
+    path: FEDRAMP_RULES_SOURCE.path,
+    rawUrl: FEDRAMP_RULES_SOURCE.rawUrl,
     blobSha: asString(metadata.file.sha),
     fileHtmlUrl: asString(metadata.file.html_url),
     repoUpdatedAt: asString(metadata.repo.updated_at),
@@ -432,23 +473,178 @@ async function fetchPrimarySourceCatalog(): Promise<{
   return { catalog, provenance };
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
+}
+
+function combinedNote(record: Record<string, unknown>): string | null {
+  const notes = [asString(record.note), ...asStringArray(record.notes)].filter(
+    (value): value is string => Boolean(value),
+  );
+  return notes.length > 0 ? notes.join("\n") : null;
+}
+
+function sourceApplicability(value: string): FedrampApplicability | undefined {
+  const normalized = value.toLowerCase();
+  if (normalized === "all" || normalized === "both") return "both";
+  if (normalized === "20x" || normalized === "rev5") return normalized;
+  return undefined;
+}
+
 function effectiveWindow(value: unknown): FedrampProcessEffectiveWindow | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
+  const record = asRecord(value);
+  if (Object.keys(record).length === 0) return undefined;
+  const dates = asRecord(record.date);
+  const grace = asRecord(dates.grace);
   return {
     is: asString(record.is),
     signupUrl: asString(record.signup_url),
     currentStatus: asString(record.current_status),
-    startDate: asString(record.start_date),
-    endDate: asString(record.end_date),
+    startDate: asString(record.start_date) ?? asString(dates.obtain),
+    endDate: asString(record.end_date) ?? asString(dates.maintain),
     comments: asStringArray(record.comments),
+    warnings: asStringArray(record.warnings),
+    optionalAdoptionDate: asString(dates.optional_adoption),
+    graceDate: asString(grace.default),
+    graceUntilNextAssessment: asBoolean(grace.until_next_assessment),
   };
 }
 
-export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatalog {
+function normalizeClassVariants(value: unknown): FedrampClassVariantRecord[] {
+  const record = asRecord(value);
+  const variants: FedrampClassVariantRecord[] = [];
+  for (const key of ["a", "b", "c", "d"] as const) {
+    const item = asRecord(record[key]);
+    const statement = asString(item.statement);
+    if (!statement) continue;
+    variants.push({
+      class: key.toUpperCase() as FedrampCertificationClass,
+      statement,
+      primaryKeyWord: asString(item.force),
+      followingInformation: asStringArray(item.following_information),
+      note: combinedNote(item),
+      timeframeType: asString(item.timeframe_type),
+      timeframeNum: asFiniteNumber(item.timeframe_num),
+    });
+  }
+  return variants;
+}
+
+function aggregateStatement(
+  record: Record<string, unknown>,
+  variants: FedrampClassVariantRecord[],
+): string {
+  return (
+    asString(record.statement) ??
+    variants.map((variant) => `Class ${variant.class}: ${variant.statement}`).join("\n")
+  );
+}
+
+function aggregateKeyword(
+  record: Record<string, unknown>,
+  variants: FedrampClassVariantRecord[],
+): string | null {
+  const direct = asString(record.force) ?? asString(record.primary_key_word);
+  if (direct) return direct;
+  const keywords = uniqueStrings(
+    variants
+      .map((variant) => variant.primaryKeyWord)
+      .filter((value): value is string => Boolean(value)),
+  );
+  if (keywords.length === 1) return keywords[0]!;
+  return keywords.length > 1 ? "VARIES BY CLASS" : null;
+}
+
+function aggregateFollowingInformation(
+  record: Record<string, unknown>,
+  variants: FedrampClassVariantRecord[],
+): string[] {
+  return uniqueStrings([
+    ...asStringArray(record.following_information),
+    ...asStringArray(record.following_information_bullets),
+    ...variants.flatMap((variant) =>
+      variant.followingInformation.map((item) => `Class ${variant.class}: ${item}`),
+    ),
+  ]);
+}
+
+function commonVariantString(
+  variants: FedrampClassVariantRecord[],
+  select: (variant: FedrampClassVariantRecord) => string | null,
+): string | null {
+  const values = uniqueStrings(
+    variants.map(select).filter((value): value is string => Boolean(value)),
+  );
+  return values.length === 1 ? values[0]! : null;
+}
+
+function commonVariantNumber(
+  variants: FedrampClassVariantRecord[],
+  select: (variant: FedrampClassVariantRecord) => number | null,
+): number | null {
+  const values = Array.from(
+    new Set(variants.map(select).filter((value): value is number => value !== null)),
+  );
+  return values.length === 1 ? values[0]! : null;
+}
+
+function collectProcessLabels(
+  info: Record<string, unknown>,
+  legacyLabels: unknown,
+): FedrampProcessLabelRecord[] {
+  const labels = new Map<string, FedrampProcessLabelRecord>();
+
+  const addLabels = (value: unknown) => {
+    for (const [code, rawLabel] of Object.entries(asRecord(value))) {
+      const item = asRecord(rawLabel);
+      const applicability = asRecord(item.applicability);
+      const previous = labels.get(code);
+      labels.set(code, {
+        code,
+        name: asString(item.name) ?? previous?.name ?? code,
+        description: asString(item.description) ?? previous?.description ?? "",
+        types: uniqueStrings([...(previous?.types ?? []), ...asStringArray(applicability.types)]),
+        paths: uniqueStrings([...(previous?.paths ?? []), ...asStringArray(applicability.paths)]),
+        classes: uniqueStrings([
+          ...(previous?.classes ?? []),
+          ...asStringArray(applicability.classes),
+        ]),
+        affects: uniqueStrings([
+          ...(previous?.affects ?? []),
+          ...asStringArray(applicability.affects),
+        ]),
+      });
+    }
+  };
+
+  addLabels(legacyLabels);
+  addLabels(info.subsets);
+  addLabels(asRecord(info["20x"]).subsets);
+  addLabels(asRecord(info.rev5).subsets);
+
+  return Array.from(labels.values()).sort((left, right) => left.code.localeCompare(right.code));
+}
+
+export function normalizeFedrampConsolidatedRules(
+  raw: Record<string, unknown>,
+): FedrampCatalog {
   const infoRecord = (raw.info ?? {}) as Record<string, unknown>;
   const info: FedrampCatalogInfo = {
-    title: asString(infoRecord.title) ?? "FedRAMP Machine-Readable Documentation",
+    title: asString(infoRecord.title) ?? "FedRAMP Consolidated Rules",
     description:
       asString(infoRecord.description) ??
       "Machine-readable FedRAMP requirements, recommendations, definitions, and key security indicators.",
@@ -461,20 +657,22 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
     string,
     unknown
   >;
-  const definitionBuckets = (definitionData.both ?? {}) as Record<string, unknown>;
-
-  for (const [id, entry] of Object.entries(definitionBuckets)) {
-    if (!entry || typeof entry !== "object") continue;
-    const item = entry as Record<string, unknown>;
-    definitions.push({
-      id,
-      fka: asString(item.fka),
-      term: asString(item.term) ?? id,
-      alts: asStringArray(item.alts),
-      definition: asString(item.definition) ?? "",
-      updated: asUpdatedNotes(item.updated),
-      appliesTo: "both",
-    });
+  for (const [bucketName, rawBucket] of Object.entries(definitionData)) {
+    const appliesTo = sourceApplicability(bucketName);
+    if (!appliesTo) continue;
+    for (const [id, entry] of Object.entries(asRecord(rawBucket))) {
+      const item = asRecord(entry);
+      if (Object.keys(item).length === 0) continue;
+      definitions.push({
+        id,
+        fka: asString(item.fka),
+        term: asString(item.term) ?? id,
+        alts: asStringArray(item.alts),
+        definition: asString(item.definition) ?? "",
+        updated: asUpdatedNotes(item.updated),
+        appliesTo,
+      });
+    }
   }
 
   const processes: FedrampProcessRecord[] = [];
@@ -486,43 +684,41 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
     const record = entry as Record<string, unknown>;
     const infoRecord = (record.info ?? {}) as Record<string, unknown>;
     const frontMatter = (record.front_matter ?? {}) as Record<string, unknown>;
-    const labelsRecord = (record.labels ?? {}) as Record<string, unknown>;
     const dataRecord = (record.data ?? {}) as Record<string, unknown>;
-    const labels = Object.entries(labelsRecord)
-      .map(([code, label]) => {
-        if (!label || typeof label !== "object") return null;
-        const item = label as Record<string, unknown>;
-        return {
-          code,
-          name: asString(item.name) ?? code,
-          description: asString(item.description) ?? "",
-        };
-      })
-      .filter((value): value is FedrampProcessLabelRecord => Boolean(value));
+    const labels = collectProcessLabels(infoRecord, record.labels);
 
     const requirementIds: string[] = [];
-    const applicabilityKeys = (["both", "20x", "rev5"] as const).filter(
-      (key) => dataRecord[key] && typeof dataRecord[key] === "object",
-    );
-    const sourceUrl =
-      asString(infoRecord.web_name)
-        ? `https://fedramp.gov/docs/20x/${asString(infoRecord.web_name)}`
-        : null;
+    const applicabilityKeys = uniqueStrings(
+      Object.keys(dataRecord)
+        .filter((key) => Object.keys(asRecord(dataRecord[key])).length > 0)
+        .map((key) => sourceApplicability(key))
+        .filter((value): value is FedrampApplicability => Boolean(value)),
+    ) as FedrampApplicability[];
+    const webName = asString(infoRecord.web_name) ?? processId.toLowerCase();
+    const sourceUrl = `https://www.fedramp.gov/2026/reference/${webName}/`;
 
-    for (const appliesTo of applicabilityKeys) {
-      const applicabilityBucket = (dataRecord[appliesTo] ?? {}) as Record<string, unknown>;
+    for (const [bucketName, rawBucket] of Object.entries(dataRecord)) {
+      const appliesTo = sourceApplicability(bucketName);
+      if (!appliesTo) continue;
+      const applicabilityBucket = asRecord(rawBucket);
       for (const [labelCode, rawLabelBucket] of Object.entries(applicabilityBucket)) {
-        if (!rawLabelBucket || typeof rawLabelBucket !== "object") continue;
-        const labelBucket = rawLabelBucket as Record<string, unknown>;
+        const labelBucket = asRecord(rawLabelBucket);
+        if (Object.keys(labelBucket).length === 0) continue;
         const labelMeta = labels.find((label) => label.code === labelCode) ?? {
           code: labelCode,
           name: labelCode,
           description: "",
+          types: [],
+          paths: [],
+          classes: [],
+          affects: [],
         };
 
         for (const [requirementId, rawRequirement] of Object.entries(labelBucket)) {
-          if (!rawRequirement || typeof rawRequirement !== "object") continue;
-          const requirement = rawRequirement as Record<string, unknown>;
+          const requirement = asRecord(rawRequirement);
+          if (Object.keys(requirement).length === 0) continue;
+          const classVariants = normalizeClassVariants(requirement.varies_by_class);
+          const directNote = combinedNote(requirement);
           requirementIds.push(requirementId);
           requirements.push({
             id: requirementId,
@@ -530,30 +726,40 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
             processId,
             processName: asString(infoRecord.name) ?? processId,
             processShortName: asString(infoRecord.short_name) ?? processId,
-            processWebName: asString(infoRecord.web_name) ?? processId.toLowerCase(),
+            processWebName: webName,
             processSourceUrl: sourceUrl,
             appliesTo,
             labelCode: labelMeta.code,
             labelName: labelMeta.name,
             labelDescription: labelMeta.description,
             name: asString(requirement.name),
-            statement: asString(requirement.statement) ?? "",
-            primaryKeyWord: asString(requirement.primary_key_word),
+            statement: aggregateStatement(requirement, classVariants),
+            primaryKeyWord: aggregateKeyword(requirement, classVariants),
             affects: asStringArray(requirement.affects),
             terms: asStringArray(requirement.terms),
-            followingInformation: asStringArray(requirement.following_information),
-            note: asString(requirement.note),
-            timeframeType: asString(requirement.timeframe_type),
+            followingInformation: aggregateFollowingInformation(requirement, classVariants),
+            note: directNote ?? commonVariantString(classVariants, (variant) => variant.note),
+            timeframeType:
+              asString(requirement.timeframe_type) ??
+              commonVariantString(classVariants, (variant) => variant.timeframeType),
             timeframeNum:
-              typeof requirement.timeframe_num === "number" &&
-              Number.isFinite(requirement.timeframe_num)
-                ? requirement.timeframe_num
-                : null,
+              asFiniteNumber(requirement.timeframe_num) ??
+              commonVariantNumber(classVariants, (variant) => variant.timeframeNum),
             updated: asUpdatedNotes(requirement.updated),
+            classVariants,
           });
         }
       }
     }
+
+    const commonEffectiveRecord = asRecord(infoRecord.effective);
+    const commonEffective = Object.prototype.hasOwnProperty.call(commonEffectiveRecord, "is")
+      ? effectiveWindow(commonEffectiveRecord)
+      : undefined;
+    const legacy20xEffective = effectiveWindow(commonEffectiveRecord["20x"]);
+    const legacyRev5Effective = effectiveWindow(commonEffectiveRecord.rev5);
+    const typed20xEffective = effectiveWindow(asRecord(infoRecord["20x"]).effective);
+    const typedRev5Effective = effectiveWindow(asRecord(infoRecord.rev5).effective);
 
     processes.push({
       id: processId,
@@ -563,11 +769,11 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
       sourceUrl,
       applicability: applicabilityKeys,
       effective: {
-        both: undefined,
-        "20x": effectiveWindow(((infoRecord.effective ?? {}) as Record<string, unknown>)["20x"]),
-        rev5: effectiveWindow(((infoRecord.effective ?? {}) as Record<string, unknown>).rev5),
+        both: commonEffective,
+        "20x": typed20xEffective ?? legacy20xEffective ?? commonEffective,
+        rev5: typedRev5Effective ?? legacyRev5Effective ?? commonEffective,
       },
-      purpose: asString(frontMatter.purpose),
+      purpose: asString(infoRecord.purpose) ?? asString(frontMatter.purpose),
       expectedOutcomes: asStringArray(frontMatter.expected_outcomes),
       authority: Array.isArray(frontMatter.authority)
         ? frontMatter.authority
@@ -585,6 +791,8 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
             .filter((value): value is FedrampAuthorityRecord => Boolean(value))
         : [],
       labels,
+      status: asString(infoRecord.status),
+      tag: asString(infoRecord.tag),
       requirementIds: Array.from(new Set(requirementIds)).sort((left, right) => left.localeCompare(right)),
     });
   }
@@ -606,6 +814,7 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
     for (const [indicatorId, rawIndicator] of Object.entries(indicatorsRecord)) {
       if (!rawIndicator || typeof rawIndicator !== "object") continue;
       const indicator = rawIndicator as Record<string, unknown>;
+      const classVariants = normalizeClassVariants(indicator.varies_by_class);
       indicatorIds.push(indicatorId);
       ksiIndicators.push({
         id: indicatorId,
@@ -616,13 +825,14 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
         domainShortName: shortName,
         domainWebName: webName,
         name: asString(indicator.name) ?? indicatorId,
-        statement: asString(indicator.statement) ?? "",
+        statement: aggregateStatement(indicator, classVariants),
         reference: asString(indicator.reference),
         referenceUrl: asString(indicator.reference_url),
         controls: asStringArray(indicator.controls),
         terms: asStringArray(indicator.terms),
         updated: asUpdatedNotes(indicator.updated),
         appliesTo: "20x",
+        classVariants,
       });
     }
 
@@ -633,6 +843,7 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
       shortName,
       webName,
       theme: asString(domain.theme) ?? "",
+      status: asString(domain.status),
       appliesTo: "20x",
       indicatorIds,
     });
@@ -654,6 +865,9 @@ export function normalizeFedrampFrmr(raw: Record<string, unknown>): FedrampCatal
   };
 }
 
+/** @deprecated Use normalizeFedrampConsolidatedRules. */
+export const normalizeFedrampFrmr = normalizeFedrampConsolidatedRules;
+
 export async function loadFedrampCatalog(options?: {
   refresh?: boolean;
   homeDir?: string;
@@ -674,7 +888,12 @@ export async function loadFedrampCatalog(options?: {
 
   await ensureFedrampStateDir(homeDir);
   const cachePath = catalogCachePath(homeDir);
-  const cached = await readJsonFile<CatalogCachePayload>(cachePath);
+  const cachedPayload = await readJsonFile<CatalogCachePayload>(cachePath);
+  const cached =
+    cachedPayload?.schemaVersion === FEDRAMP_CACHE_SCHEMA_VERSION &&
+    cachedPayload.provenance.rawUrl === FEDRAMP_RULES_SOURCE.rawUrl
+      ? cachedPayload
+      : undefined;
   const cachedAge = cached ? Date.now() - Date.parse(cached.fetchedAt) : Number.POSITIVE_INFINITY;
 
   if (!options?.refresh && cached && Number.isFinite(cachedAge) && cachedAge < ttlMs) {
@@ -697,11 +916,12 @@ export async function loadFedrampCatalog(options?: {
     const live = await fetchPrimarySourceCatalog();
     const fetchedAt = new Date().toISOString();
     const payload: CatalogCachePayload = {
+      schemaVersion: FEDRAMP_CACHE_SCHEMA_VERSION,
       fetchedAt,
       catalog: live.catalog,
       provenance: live.provenance,
     };
-    await writeJsonFile(cachePath, payload);
+    await writeCacheFile(cachePath, payload);
     const value: FedrampLoadedCatalog = {
       catalog: live.catalog,
       provenance: live.provenance,
@@ -755,7 +975,12 @@ export async function inspectFedrampOfficialSources(options?: {
 
   await ensureFedrampStateDir(homeDir);
   const cachePath = sourcesCachePath(homeDir);
-  const cached = await readJsonFile<SourceCachePayload>(cachePath);
+  const cachedPayload = await readJsonFile<SourceCachePayload>(cachePath);
+  const cached =
+    cachedPayload?.schemaVersion === FEDRAMP_CACHE_SCHEMA_VERSION &&
+    cachedPayload.primary.rawUrl === FEDRAMP_RULES_SOURCE.rawUrl
+      ? cachedPayload
+      : undefined;
   const cachedAge = cached ? Date.now() - Date.parse(cached.fetchedAt) : Number.POSITIVE_INFINITY;
 
   if (!options?.refresh && cached && Number.isFinite(cachedAge) && cachedAge < SOURCE_STATUS_TTL_MS) {
@@ -777,15 +1002,16 @@ export async function inspectFedrampOfficialSources(options?: {
   try {
     const [catalog, secondary] = await Promise.all([
       loadFedrampCatalog({ refresh: options?.refresh, homeDir }),
-      fetchRulesSourceMetadata(),
+      fetchSupportingSourceMetadata(),
     ]);
     const fetchedAt = new Date().toISOString();
     const payload: SourceCachePayload = {
+      schemaVersion: FEDRAMP_CACHE_SCHEMA_VERSION,
       fetchedAt,
       primary: catalog.provenance,
       secondary,
     };
-    await writeJsonFile(cachePath, payload);
+    await writeCacheFile(cachePath, payload);
     const value: FedrampSourceStatus = {
       primary: catalog.provenance,
       secondary,
@@ -848,7 +1074,7 @@ function matchesApplicability(
 ): boolean {
   if (filter === "any") return true;
   if (recordApplicability === filter) return true;
-  return filter === "rev5" && recordApplicability === "both";
+  return (filter === "20x" || filter === "rev5") && recordApplicability === "both";
 }
 
 export function searchFedrampCatalog(
@@ -869,6 +1095,7 @@ export function searchFedrampCatalog(
 
   if (section === "any" || section === "definition") {
     for (const definition of catalog.definitions) {
+      if (!matchesApplicability(definition.appliesTo, appliesTo)) continue;
       const score = matchScore(
         [definition.id, definition.fka ?? "", definition.term, ...definition.alts, definition.definition],
         normalizedQuery,
@@ -879,7 +1106,7 @@ export function searchFedrampCatalog(
         id: definition.id,
         title: definition.term,
         summary: truncate(definition.definition),
-        appliesTo: "both",
+        appliesTo: definition.appliesTo,
         score,
       });
     }
@@ -1045,9 +1272,27 @@ function resolveUniqueMatch<T>(
 }
 
 export function resolveFedrampProcess(catalog: FedrampCatalog, query: string): FedrampProcessRecord {
+  const aliases: Record<string, string> = {
+    ads: "CDS",
+    "authorization data sharing": "CDS",
+    "authorization-data-sharing": "CDS",
+    fsi: "AFC",
+    "fedramp security inbox": "AFC",
+    "fedramp-security-inbox": "AFC",
+    icp: "IEC",
+    "incident communications procedures": "IEC",
+    "incident-communications-procedures": "IEC",
+    pva: "IVV",
+    "persistent validation and assessment": "IVV",
+    "persistent-validation-and-assessment": "IVV",
+    ucm: "CMU",
+    "using cryptographic modules": "CMU",
+    "using-cryptographic-modules": "CMU",
+  };
+  const resolvedQuery = aliases[query.trim().toLowerCase()] ?? query;
   return resolveUniqueMatch(
     catalog.processes,
-    query,
+    resolvedQuery,
     (process) => [process.id, process.shortName, process.name, process.webName],
     "process",
   );

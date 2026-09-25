@@ -4,13 +4,23 @@
  * This module intentionally complements the native GWS compliance tools.
  * It shells out to `gws` when installed, runs a curated set of read-only
  * investigation commands, and packages the resulting evidence for operators.
+ *
+ * Command shapes, flags, exit codes, and environment variables are taken from
+ * the published googleworkspace/cli README
+ * (https://github.com/googleworkspace/cli#readme): `gws <service> <resource>
+ * <method> --params '<json>'`, `--version`, structured exit codes 0-5, and the
+ * GOOGLE_WORKSPACE_CLI_TOKEN > GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE > stored
+ * credential precedence. The `admin-reports` alias is registered in
+ * crates/google-workspace/src/services.rs; the `service:version` form is parsed
+ * by parse_service_and_version in crates/google-workspace-cli/src/main.rs.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream, existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { projectActivitySnapshot, projectAlertSnapshot, redactKnownValues, redactSecrets, scrubText } from "./gws.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -23,14 +33,38 @@ const DEFAULT_LOOKBACK_DAYS = 14;
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_RESULTS_LIMIT = 250;
 const GWS_BIN_ENV_KEYS = ["GRCLANKER_GWS_BIN"] as const;
+const CAPTURE_PROJECTION_NOTE =
+  "The stored capture is projected to the documented Reports API activity fields (id, actor, ipAddress, events[].type and name); event parameters are not stored and credential-like values are redacted. Re-run the recorded command for parameter detail.";
+/**
+ * The published `gws` prints two lines for `--version`: `gws <CARGO_PKG_VERSION>` and then the fixed disclaimer
+ * `This is not an officially supported Google product.` (crates/google-workspace-cli/src/main.rs, the `is_version_flag`
+ * branch; the disclaimer line was added in 0.3.5, CHANGELOG entry 1991d53). Only the first line is matched. A Cargo
+ * pre-release or build suffix is accepted so the line is still recognized, but it is never rendered: no published
+ * release carries one, and a suffix of that grammar could carry a token fragment. The rendered version is therefore
+ * always `major.minor.patch`, digits and dots only, at most six digits per component.
+ */
+const VERSION_FIRST_LINE_PATTERN = /^gws\s+v?(\d{1,6}\.\d{1,6}\.\d{1,6})(?:-[0-9A-Za-z.-]{1,64})?(?:\+[0-9A-Za-z.-]{1,64})?$/;
+/** A bare version core anywhere in output whose first line is not the documented one; digits and dots only. */
+const VERSION_CORE_PATTERN = /(?<![\d.])\d{1,6}\.\d{1,6}\.\d{1,6}(?![\d.])/;
+
+/**
+ * The one scrub every CLI-produced string passes through before it can become an error message, a tool result, or a
+ * log line: the inspector's text scrubber removes credential shapes (bearer and OAuth tokens, `key=value` pairs whose
+ * key names a credential, URL query strings), then every value held by the CLI's own environment is replaced wherever
+ * it appears. Applied where the error is built, so no consumer can receive the unscrubbed text.
+ */
+export function scrubCliText(text: string, knownSecrets: string[] = []): string {
+  return redactKnownValues(scrubText(text), knownSecrets) as string;
+}
 
 export class GwsCliCommandError extends Error {
   kind: GwsCliErrorKind;
   command: string;
   exitCode?: number;
 
-  constructor(kind: GwsCliErrorKind, message: string, command: string, exitCode?: number) {
-    super(message);
+  /** The message is scrubbed at construction, so `error.message` is already safe for every consumer. */
+  constructor(kind: GwsCliErrorKind, message: string, command: string, exitCode?: number, knownSecrets: string[] = []) {
+    super(scrubCliText(message, knownSecrets));
     this.name = "GwsCliCommandError";
     this.kind = kind;
     this.command = command;
@@ -75,6 +109,8 @@ interface GwsCliCommandRequest {
   executable: GwsCliExecutable;
   args: string[];
   env: NodeJS.ProcessEnv;
+  /** `gws --version` prints plain text; every curated API command must return JSON. */
+  expectJson?: boolean;
 }
 
 interface GwsCliExecution {
@@ -118,17 +154,40 @@ interface GwsOpsActivityRecord {
   source?: string;
 }
 
-interface GwsOpsActivityResult {
+interface GwsOpsActivityResultBase {
   title: string;
   category: ActivityCategory;
-  mode: GwsOpsMode;
-  count: number;
   command: GwsOpsCommandPreview;
-  raw?: unknown;
-  records?: GwsOpsActivityRecord[];
+  /** `complete: ...`, `partial: ...`, or `not collected: ...`, always naming what the CLI call did or did not return. */
+  status: string;
   notes: string[];
   text: string;
 }
+
+/** The records one executed CLI call returned, with the page cursor that decides whether they are the whole population. */
+interface GwsOpsActivityExecution extends GwsOpsActivityResultBase {
+  mode: "execute";
+  count: number;
+  /** False when the CLI response carried a nextPageToken, so the page is a partial view. */
+  complete: boolean;
+  nextPageToken?: string;
+  raw: unknown;
+  records: GwsOpsActivityRecord[];
+}
+
+/** A dry run never called the CLI, so every record-derived field is null beside a not-collected status, never 0 or []. */
+interface GwsOpsActivityPreview extends GwsOpsActivityResultBase {
+  mode: "dry_run";
+  count: null;
+  complete: null;
+  nextPageToken: null;
+  raw: null;
+  records: null;
+}
+
+type GwsOpsActivityResult = GwsOpsActivityExecution | GwsOpsActivityPreview;
+
+const PREVIEW_STATUS = "not collected: dry run previewed the command and did not execute it, so no records were requested";
 
 interface GwsOpsBundleResult {
   outputDir: string;
@@ -172,21 +231,25 @@ function buildCommandString(executable: string, args: string[]): string {
   return [executable, ...args].map(shellEscape).join(" ");
 }
 
+/**
+ * A single invocation prints one JSON document; `--page-all` prints one JSON
+ * object per line (NDJSON, per the README pagination table). Try the whole
+ * document first, then fall back to line-wise parsing.
+ */
 function parseStructuredOutput(stdout: string): unknown {
   const trimmed = stdout.trim();
   if (!trimmed) return undefined;
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+  try {
     return JSON.parse(trimmed) as unknown;
+  } catch (documentError) {
+    const lines = trimmed
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length < 2) throw documentError;
+    const parsed = lines.map((line) => JSON.parse(line) as unknown);
+    return parsed;
   }
-
-  const lines = trimmed
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length === 0) return undefined;
-
-  const parsed = lines.map((line) => JSON.parse(line) as unknown);
-  return parsed.length === 1 ? parsed[0] : parsed;
 }
 
 function mapExitCodeToKind(exitCode: number): GwsCliErrorKind {
@@ -207,6 +270,15 @@ function mapExitCodeToKind(exitCode: number): GwsCliErrorKind {
 function formatErrorMessage(result: GwsCliExecution): string {
   const parts = [result.stderr.trim(), result.stdout.trim()].filter(Boolean);
   return parts[0] ?? "gws returned a non-zero exit code without additional output.";
+}
+
+/**
+ * A JSON parse failure is described without the parser's own message, which quotes the first characters of stdout and
+ * so could repeat the start of whatever the CLI printed there.
+ */
+function describeParseFailure(error: unknown, stdout: string): string {
+  const name = error instanceof Error ? error.name : "Error";
+  return `gws returned success, but grclanker could not parse the output as structured JSON (${name} while reading ${stdout.length} character(s) of stdout; the output is not repeated here).`;
 }
 
 function findExecutableOnPath(command: string): string | undefined {
@@ -279,7 +351,9 @@ function buildGwsCliInstallGuidance(): string {
 
 export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
   const { executable, args, env } = request;
+  const expectJson = request.expectJson !== false;
   const command = buildCommandString(executable.displayExecutable, args);
+  const knownSecrets = knownSecretValues(env);
 
   return await new Promise<GwsCliExecution>((resolvePromise, rejectPromise) => {
     const child = spawn(executable.executable, args, {
@@ -314,7 +388,7 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
         args,
         command,
         stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        stderr: scrubCliText(stderr.trim(), knownSecrets),
         exitCode: exitCode ?? 1,
       };
 
@@ -325,8 +399,14 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
             formatErrorMessage(execution),
             command,
             execution.exitCode,
+            knownSecrets,
           ),
         );
+        return;
+      }
+
+      if (!expectJson) {
+        resolvePromise(execution);
         return;
       }
 
@@ -336,9 +416,10 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
         rejectPromise(
           new GwsCliCommandError(
             "internal",
-            `gws returned success, but grclanker could not parse the output as structured JSON: ${summarizeError(error)}`,
+            describeParseFailure(error, execution.stdout),
             command,
             execution.exitCode,
+            knownSecrets,
           ),
         );
         return;
@@ -348,6 +429,23 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
     });
   });
 };
+
+/**
+ * The published gws source registers no `alertcenter` service alias
+ * (crates/google-workspace/src/services.rs), so a validation failure on the
+ * Alert Center command is explained instead of surfacing as a bare exit code.
+ */
+function explainAlertCenterFailure(error: unknown): unknown {
+  if (error instanceof GwsCliCommandError && error.kind === "validation") {
+    return new GwsCliCommandError(
+      "validation",
+      `${error.message} The installed gws build rejected the alertcenter:v1beta1 service (exit 3, validation error); the published googleworkspace/cli source registers no alertcenter alias. Use gws_assess_monitoring for native Alert Center API coverage.`,
+      error.command,
+      error.exitCode,
+    );
+  }
+  return error;
+}
 
 function buildRunnerEnv(args: GwsCliContext, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const merged = { ...env };
@@ -366,15 +464,38 @@ async function runGwsVersion(
   if (!executable.installed) {
     throw new GwsCliCommandError("missing", buildGwsCliInstallGuidance(), executable.displayExecutable);
   }
+  const runnerEnv = buildRunnerEnv(args, env);
   const result = await runner({
     executable,
     args: ["--version"],
-    env: buildRunnerEnv(args, env),
+    env: runnerEnv,
+    expectJson: false,
   });
   return {
-    version: result.stdout.trim() || "unknown",
+    version: projectVersionOutput(result.stdout, knownSecretValues(runnerEnv)),
     command: result.command,
   };
+}
+
+/**
+ * The version is the one CLI-produced string that reaches a tool result without a JSON projection. The output is
+ * scrubbed, its first line is matched against the documented `gws <version>` line, and only the numeric core is
+ * rendered: the pre-release or build suffix, the disclaimer line, and anything else the binary printed are never
+ * repeated. Output whose first line is not the documented one yields a bare version core found anywhere in it plus a
+ * note, or a descriptor that gives only the output length.
+ */
+function projectVersionOutput(stdout: string, knownSecrets: string[]): string {
+  const printed = stdout.trim();
+  const scrubbed = scrubCliText(printed, knownSecrets);
+  if (scrubbed.length === 0) return "unknown (--version printed nothing)";
+  const firstLine = scrubbed.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  const documented = VERSION_FIRST_LINE_PATTERN.exec(firstLine);
+  if (documented) return `gws ${documented[1]}`;
+  const core = VERSION_CORE_PATTERN.exec(scrubbed);
+  if (core) {
+    return `gws ${core[0]} (the rest of the --version output did not match the documented \`gws <version>\` first line and is not repeated here)`;
+  }
+  return `unrecognized (--version printed ${printed.length} character(s) without a version number; the output is not repeated here)`;
 }
 
 function isoLookback(days: number): string {
@@ -389,6 +510,40 @@ function normalizeMaxResults(value: unknown): number {
   const numeric = asNumber(value);
   if (!numeric) return DEFAULT_MAX_RESULTS;
   return Math.max(1, Math.min(MAX_RESULTS_LIMIT, Math.trunc(numeric)));
+}
+
+/** Values from the CLI's own environment that a capture might echo back; scrubbed wherever they appear. */
+function knownSecretValues(env: NodeJS.ProcessEnv): string[] {
+  return Object.entries(env)
+    .filter(([key, value]) => typeof value === "string" && key.startsWith("GOOGLE_WORKSPACE_CLI_") && /TOKEN|SECRET|PASSWORD|KEY/.test(key))
+    .map(([, value]) => value as string);
+}
+
+/**
+ * Captures are projected to the documented Reports or Alert Center fields page by
+ * page (alert `data` payloads and event parameters are dropped), then credential-like
+ * keys and known environment values are redacted. Nothing unprojected is ever written.
+ */
+function sanitizeCapture(
+  parsed: unknown,
+  keys: string[],
+  project: (record: JsonRecord) => JsonRecord,
+  secrets: string[],
+): unknown {
+  const pages = pagesFromOutput(parsed, keys).map((page) => {
+    const output: JsonRecord = {};
+    for (const key of keys) {
+      const value = page[key];
+      if (Array.isArray(value)) output[key] = value.map((item) => project(asRecord(item)));
+    }
+    if (page.nextPageToken !== undefined) output.nextPageToken = page.nextPageToken;
+    return output;
+  });
+  return redactKnownValues(redactSecrets(pages.length === 1 ? pages[0] : pages), secrets);
+}
+
+function sanitizeRecords(records: GwsOpsActivityRecord[], secrets: string[]): GwsOpsActivityRecord[] {
+  return redactKnownValues(redactSecrets(records), secrets) as GwsOpsActivityRecord[];
 }
 
 function normalizeLookbackDays(value: unknown): number {
@@ -465,43 +620,143 @@ async function executePreview(
     } catch (error) {
       throw new GwsCliCommandError(
         "internal",
-        `gws returned success, but grclanker could not parse the output as structured JSON: ${summarizeError(error)}`,
+        describeParseFailure(error, result.stdout),
         result.command,
         result.exitCode,
+        knownSecretValues(env),
       );
     }
   }
   return result;
 }
 
-function recordsFromObject(parsed: unknown, keys: string[]): JsonRecord[] {
+/**
+ * `--page-all` emits one JSON object per page (NDJSON); a single invocation
+ * returns one page object. Both shapes normalize to a list of page objects.
+ */
+function pagesFromOutput(parsed: unknown, keys: string[]): JsonRecord[] {
   if (Array.isArray(parsed)) {
-    return parsed.map((item) => asRecord(item));
+    const records = parsed.map((item) => asRecord(item));
+    const looksLikePages = records.length > 0 && records.every((record) => keys.some((key) => Array.isArray(record[key])));
+    return looksLikePages ? records : [{ [keys[0]]: records }];
   }
-  const record = asRecord(parsed);
-  for (const key of keys) {
-    const value = record[key];
-    if (Array.isArray(value)) {
-      return value.map((item) => asRecord(item));
+  return [asRecord(parsed)];
+}
+
+function recordsFromObject(parsed: unknown, keys: string[]): JsonRecord[] {
+  const records: JsonRecord[] = [];
+  for (const page of pagesFromOutput(parsed, keys)) {
+    for (const key of keys) {
+      const value = page[key];
+      if (Array.isArray(value)) {
+        records.push(...value.map((item) => asRecord(item)));
+        break;
+      }
     }
   }
-  return [];
+  return records;
 }
 
+/** The last page's nextPageToken (documented on every list response) marks a partial view. */
+function trailingPageToken(parsed: unknown, keys: string[]): string | undefined {
+  const pages = pagesFromOutput(parsed, keys);
+  const last = pages[pages.length - 1];
+  return last ? asString(last.nextPageToken) : undefined;
+}
+
+function completenessNote(nextPageToken: string | undefined, count: number): string {
+  return nextPageToken
+    ? `Partial view: the CLI response carried a nextPageToken after ${count} record(s); more records exist beyond this page (re-run with a larger max_results or use --page-all).`
+    : `Complete: the CLI response carried no nextPageToken, so the ${count} record(s) are the whole population for this query.`;
+}
+
+/** The status of an executed call, worded like the inspector's: `complete: ...` or `partial: at least N; ...`. */
+function executionStatus(nextPageToken: string | undefined, count: number): string {
+  return nextPageToken
+    ? `partial: at least ${count}; the CLI response carried a nextPageToken after ${count} record(s), so more records exist beyond this page`
+    : `complete: the CLI response carried no nextPageToken, so the ${count} record(s) are the whole population for this query`;
+}
+
+function buildPreviewResult(
+  title: string,
+  category: ActivityCategory,
+  command: GwsOpsCommandPreview,
+  notes: string[],
+): GwsOpsActivityPreview {
+  return {
+    title,
+    category,
+    mode: "dry_run",
+    status: PREVIEW_STATUS,
+    count: null,
+    complete: null,
+    nextPageToken: null,
+    raw: null,
+    records: null,
+    command,
+    notes,
+    text: [
+      title,
+      `Command: ${command.command}`,
+      `Status: ${PREVIEW_STATUS}`,
+      "",
+      ...notes.map((note) => `- ${note}`),
+    ].join("\n"),
+  };
+}
+
+/** The bundle only ever packages executed calls; a preview carries no records, so it is refused rather than counted as 0. */
+function executedResult(result: GwsOpsActivityResult): GwsOpsActivityExecution {
+  switch (result.mode) {
+    case "execute":
+      return result;
+    case "dry_run":
+      throw new Error(`${result.title} was previewed rather than executed, so it has no records to bundle.`);
+    default: {
+      const exhaustive: never = result;
+      throw new Error(`Unhandled activity result ${String(exhaustive)}`);
+    }
+  }
+}
+
+/** The clamp is stated in the notes so a request for 1000 is never silently reported as 250. */
+function maxResultsNote(value: unknown, label: string): string {
+  const requested = asNumber(value);
+  const effective = normalizeMaxResults(value);
+  if (requested !== undefined && Math.trunc(requested) > MAX_RESULTS_LIMIT) {
+    return `${label}: ${effective} (requested ${Math.trunc(requested)}, clamped to the bridge limit of ${MAX_RESULTS_LIMIT}; the underlying API allows more, so re-run with --page-all for the full population)`;
+  }
+  return `${label}: ${effective}`;
+}
+
+/**
+ * Alert fields per the Alert Center Alert resource
+ * (https://developers.google.com/workspace/admin/alertcenter/reference/rest/v1beta1/alerts):
+ * alertId, createTime, updateTime, type, source, and metadata.{status,severity,assignee}.
+ */
 function normalizeAlertRecords(parsed: unknown): GwsOpsActivityRecord[] {
-  return recordsFromObject(parsed, ["alerts", "items"]).map((alert) => ({
-    id: asString(alert.alertId) ?? asString(alert.name),
-    timestamp: asString(alert.createTime) ?? asString(alert.updateTime),
-    detail: asString(alert.type) ?? asString(alert.alertSubtype),
-    severity: asString(alert.severity),
-    status: asString(alert.state) ?? asString(alert.status),
-    source: asString(alert.source),
-    actor: asString(asRecord(alert.metadata).assignee) ?? asString(asRecord(alert.assignee).email),
-    application: "alertcenter",
-    eventNames: asString(alert.type) ? [alert.type as string] : [],
-  }));
+  return recordsFromObject(parsed, ["alerts"]).map((alert) => {
+    const metadata = asRecord(alert.metadata);
+    return {
+      id: asString(alert.alertId),
+      timestamp: asString(alert.createTime) ?? asString(alert.updateTime),
+      detail: asString(alert.type),
+      severity: asString(metadata.severity),
+      status: asString(metadata.status),
+      source: asString(alert.source),
+      actor: asString(metadata.assignee),
+      application: "alertcenter",
+      eventNames: asString(alert.type) ? [alert.type as string] : [],
+    };
+  });
 }
 
+/**
+ * Activity fields per the Reports API Activity resource
+ * (https://developers.google.com/workspace/admin/reports/reference/rest/v1/activities/list):
+ * id.{time,uniqueQualifier}, actor.{email,callerType,applicationInfo.applicationName},
+ * events[].name, and the top-level ipAddress.
+ */
 function normalizeActivityRecords(parsed: unknown, applicationName: "admin" | "token"): GwsOpsActivityRecord[] {
   return recordsFromObject(parsed, ["items"]).map((item) => {
     const id = asRecord(item.id);
@@ -514,7 +769,7 @@ function normalizeActivityRecords(parsed: unknown, applicationName: "admin" | "t
       actor: asString(actor.email) ?? asString(actor.callerType),
       application: asString(applicationInfo.applicationName) ?? applicationName,
       eventNames: events,
-      detail: asString(actor.ipAddress),
+      detail: asString(item.ipAddress),
     };
   });
 }
@@ -621,7 +876,7 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   const suffixes = ["", "-2", "-3", "-4", "-5", "-6"];
   for (const suffix of suffixes) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    if (!existsSync(candidate) && !existsSync(`${candidate}.zip`)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -638,8 +893,8 @@ async function writeSecureTextFile(rootDir: string, relativePathname: string, co
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
+    const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
     output.on("error", rejectPromise);
@@ -672,7 +927,7 @@ function buildBundleReadme(): string {
   return [
     "# Google Workspace CLI Operator Evidence Bundle",
     "",
-    "- `raw/` contains the structured JSON returned by the Google Workspace CLI.",
+    "- `raw/` contains the Google Workspace CLI response projected to the documented Reports API and Alert Center fields; alert data payloads and event parameters are not stored, and credential-like keys plus known environment values are redacted.",
     "- `analysis/` contains normalized investigation summaries prepared for GRC review.",
     "- `commands.json` records the exact read-only commands grclanker executed.",
     "- `summary.md` is the quickest human-readable starting point.",
@@ -741,43 +996,44 @@ export async function investigateGwsAlerts(
     asString(args.filter)
       ? `Alert filter passed through to gws: ${args.filter!.trim()}`
       : "No Alert Center filter was supplied; this query relies on page-size bounds instead of a time filter.",
+    maxResultsNote(args.max_results, "Page size"),
   ];
 
   if (mode === "dry_run") {
-    return {
-      title: "Google Workspace alert investigation (preview)",
-      category: "alerts",
-      mode,
-      count: 0,
-      command,
-      notes: [
-        "Dry-run mode only previewed the read-only Alert Center command.",
-        ...notes,
-      ],
-      text: [
-        "Google Workspace alert investigation (preview)",
-        `Command: ${command.command}`,
-        "",
-        ...notes.map((note) => `- ${note}`),
-      ].join("\n"),
-    };
+    return buildPreviewResult("Google Workspace alert investigation (preview)", "alerts", command, [
+      "Dry-run mode only previewed the read-only Alert Center command.",
+      "The published googleworkspace/cli source registers no alertcenter service alias; if the installed build rejects the command (exit 3), use gws_assess_monitoring instead.",
+      ...notes,
+    ]);
   }
 
-  const execution = await executePreview(command, args, runner, env);
-  const records = normalizeAlertRecords(execution.parsed);
+  let execution: GwsCliExecution;
+  try {
+    execution = await executePreview(command, args, runner, env);
+  } catch (error) {
+    throw explainAlertCenterFailure(error);
+  }
+  const secrets = knownSecretValues(env);
+  const records = sanitizeRecords(normalizeAlertRecords(execution.parsed), secrets);
+  const nextPageToken = trailingPageToken(execution.parsed, ["alerts"]);
+  const allNotes = [
+    ...notes,
+    completenessNote(nextPageToken, records.length),
+    "These records are projected from the Google Workspace CLI Alert Center response to its documented fields; alert data payloads are not stored and credential-like values are redacted.",
+  ];
   return {
     title: "Google Workspace alert investigation",
     category: "alerts",
     mode,
+    status: executionStatus(nextPageToken, records.length),
     count: records.length,
+    complete: nextPageToken === undefined,
+    nextPageToken,
     command,
-    raw: execution.parsed,
+    raw: sanitizeCapture(execution.parsed, ["alerts"], projectAlertSnapshot, secrets),
     records,
-    notes: [
-      ...notes,
-      "These records come directly from the Google Workspace CLI Alert Center response.",
-    ],
-    text: renderActivityText("Google Workspace alert investigation", records, notes),
+    notes: allNotes,
+    text: renderActivityText("Google Workspace alert investigation", records, allNotes),
   };
 }
 
@@ -795,41 +1051,34 @@ export async function traceGwsAdminActivity(
   const mode: GwsOpsMode = normalizeDryRun(args.dry_run) ? "dry_run" : "execute";
   const notes = [
     `Lookback window: ${normalizeLookbackDays(args.lookback_days)} day(s)`,
-    `Max results: ${normalizeMaxResults(args.max_results)}`,
+    maxResultsNote(args.max_results, "Max results"),
   ];
 
   if (mode === "dry_run") {
-    return {
-      title: "Google Workspace admin activity trace (preview)",
-      category: "admin_activity",
-      mode,
-      count: 0,
-      command,
-      notes: [
-        "Dry-run mode only previewed the read-only Admin Reports command.",
-        ...notes,
-      ],
-      text: [
-        "Google Workspace admin activity trace (preview)",
-        `Command: ${command.command}`,
-        "",
-        ...notes.map((note) => `- ${note}`),
-      ].join("\n"),
-    };
+    return buildPreviewResult("Google Workspace admin activity trace (preview)", "admin_activity", command, [
+      "Dry-run mode only previewed the read-only Admin Reports command.",
+      ...notes,
+    ]);
   }
 
   const execution = await executePreview(command, args, runner, env);
-  const records = normalizeActivityRecords(execution.parsed, "admin");
+  const secrets = knownSecretValues(env);
+  const records = sanitizeRecords(normalizeActivityRecords(execution.parsed, "admin"), secrets);
+  const nextPageToken = trailingPageToken(execution.parsed, ["items"]);
+  const allNotes = [...notes, completenessNote(nextPageToken, records.length), CAPTURE_PROJECTION_NOTE];
   return {
     title: "Google Workspace admin activity trace",
     category: "admin_activity",
     mode,
+    status: executionStatus(nextPageToken, records.length),
     count: records.length,
+    complete: nextPageToken === undefined,
+    nextPageToken,
     command,
-    raw: execution.parsed,
+    raw: sanitizeCapture(execution.parsed, ["items"], projectActivitySnapshot, secrets),
     records,
-    notes,
-    text: renderActivityText("Google Workspace admin activity trace", records, notes),
+    notes: allNotes,
+    text: renderActivityText("Google Workspace admin activity trace", records, allNotes),
   };
 }
 
@@ -847,47 +1096,40 @@ export async function reviewGwsTokenActivity(
   const mode: GwsOpsMode = normalizeDryRun(args.dry_run) ? "dry_run" : "execute";
   const notes = [
     `Lookback window: ${normalizeLookbackDays(args.lookback_days)} day(s)`,
-    `Max results: ${normalizeMaxResults(args.max_results)}`,
+    maxResultsNote(args.max_results, "Max results"),
     "This workflow focuses on token and OAuth activity telemetry, not a full tenant-wide token inventory clone.",
     "Use gws_assess_integrations when you need the broader native compliance view.",
   ];
 
   if (mode === "dry_run") {
-    return {
-      title: "Google Workspace token activity review (preview)",
-      category: "token_activity",
-      mode,
-      count: 0,
-      command,
-      notes: [
-        "Dry-run mode only previewed the read-only Admin Reports token query.",
-        ...notes,
-      ],
-      text: [
-        "Google Workspace token activity review (preview)",
-        `Command: ${command.command}`,
-        "",
-        ...notes.map((note) => `- ${note}`),
-      ].join("\n"),
-    };
+    return buildPreviewResult("Google Workspace token activity review (preview)", "token_activity", command, [
+      "Dry-run mode only previewed the read-only Admin Reports token query.",
+      ...notes,
+    ]);
   }
 
   const execution = await executePreview(command, args, runner, env);
-  const records = normalizeActivityRecords(execution.parsed, "token");
+  const secrets = knownSecretValues(env);
+  const records = sanitizeRecords(normalizeActivityRecords(execution.parsed, "token"), secrets);
+  const nextPageToken = trailingPageToken(execution.parsed, ["items"]);
+  const allNotes = [...notes, completenessNote(nextPageToken, records.length), CAPTURE_PROJECTION_NOTE];
   return {
     title: "Google Workspace token activity review",
     category: "token_activity",
     mode,
+    status: executionStatus(nextPageToken, records.length),
     count: records.length,
+    complete: nextPageToken === undefined,
+    nextPageToken,
     command,
-    raw: execution.parsed,
+    raw: sanitizeCapture(execution.parsed, ["items"], projectActivitySnapshot, secrets),
     records,
-    notes,
-    text: renderActivityText("Google Workspace token activity review", records, notes),
+    notes: allNotes,
+    text: renderActivityText("Google Workspace token activity review", records, allNotes),
   };
 }
 
-function buildBundleSummary(results: GwsOpsActivityResult[]): string {
+function buildBundleSummary(results: GwsOpsActivityExecution[]): string {
   return [
     "# Google Workspace CLI Operator Evidence Summary",
     "",
@@ -895,7 +1137,9 @@ function buildBundleSummary(results: GwsOpsActivityResult[]): string {
       `## ${result.title}`,
       "",
       `- Category: ${result.category}`,
+      `- Status: ${result.status}`,
       `- Records: ${result.count}`,
+      `- Complete page: ${result.complete ? "yes" : "no (nextPageToken present)"}`,
       `- Command: ${result.command.command}`,
       "",
       ...result.notes.map((note) => `- ${note}`),
@@ -928,9 +1172,9 @@ export async function collectGwsOperatorEvidenceBundle(
     };
   }
 
-  const alerts = await investigateGwsAlerts(args, runner, env);
-  const adminActivity = await traceGwsAdminActivity(workflowArgs, runner, env);
-  const tokenActivity = await reviewGwsTokenActivity(workflowArgs, runner, env);
+  const alerts = executedResult(await investigateGwsAlerts(args, runner, env));
+  const adminActivity = executedResult(await traceGwsAdminActivity(workflowArgs, runner, env));
+  const tokenActivity = executedResult(await reviewGwsTokenActivity(workflowArgs, runner, env));
   const results = [alerts, adminActivity, tokenActivity];
 
   const outputRoot = args.output_dir?.trim() || DEFAULT_OUTPUT_DIR;
@@ -947,9 +1191,12 @@ export async function collectGwsOperatorEvidenceBundle(
   for (const result of results) {
     await writeSecureTextFile(outputDir, `analysis/${result.category}.json`, serializeJson({
       title: result.title,
+      status: result.status,
       count: result.count,
+      complete: result.complete,
+      nextPageToken: result.nextPageToken ?? null,
       notes: result.notes,
-      records: result.records ?? [],
+      records: result.records,
     }));
     await writeSecureTextFile(outputDir, `raw/${result.category}.json`, serializeJson({
       command: result.command,
@@ -975,15 +1222,30 @@ export async function collectGwsOperatorEvidenceBundle(
   };
 }
 
+/** A preview renders null for every record-derived field beside its not-collected status; only an executed call renders counts. */
 function renderActivityToolResult(result: GwsOpsActivityResult) {
   return textResult(result.text, {
     category: result.category,
     mode: result.mode,
+    status: result.status,
     count: result.count,
+    complete: result.complete,
+    next_page_token: result.nextPageToken ?? null,
     command: result.command.command,
-    records: result.records ?? [],
+    records: result.records,
     notes: result.notes,
   });
+}
+
+/** Every tool error result is built here so the CLI's stderr, or any other error text, is scrubbed before the agent sees it. */
+function renderToolError(prefix: string, error: unknown, tool: string) {
+  return errorResult(
+    scrubCliText(`${prefix}: ${summarizeError(error)}`, knownSecretValues(process.env)),
+    {
+      tool,
+      kind: error instanceof GwsCliCommandError ? error.kind : "internal",
+    },
+  );
 }
 
 function normalizeBaseArgs(args: Record<string, unknown>): GwsOpsBaseArgs {
@@ -1115,13 +1377,7 @@ export function registerGwsOperatorTools(pi: any): void {
           notes: result.notes,
         });
       } catch (error) {
-        return errorResult(
-          `Google Workspace CLI bridge check failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_check_cli",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace CLI bridge check failed", error, "gws_ops_check_cli");
       }
     },
   });
@@ -1145,13 +1401,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderActivityToolResult(await investigateGwsAlerts(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace alert investigation failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_investigate_alerts",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace alert investigation failed", error, "gws_ops_investigate_alerts");
       }
     },
   });
@@ -1167,13 +1417,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderActivityToolResult(await traceGwsAdminActivity(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace admin activity trace failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_trace_admin_activity",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace admin activity trace failed", error, "gws_ops_trace_admin_activity");
       }
     },
   });
@@ -1189,13 +1433,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderActivityToolResult(await reviewGwsTokenActivity(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace token activity review failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_review_tokens",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace token activity review failed", error, "gws_ops_review_tokens");
       }
     },
   });
@@ -1223,13 +1461,7 @@ export function registerGwsOperatorTools(pi: any): void {
       try {
         return renderBundleResult(await collectGwsOperatorEvidenceBundle(args));
       } catch (error) {
-        return errorResult(
-          `Google Workspace operator evidence collection failed: ${summarizeError(error)}`,
-          {
-            tool: "gws_ops_collect_evidence_bundle",
-            kind: error instanceof GwsCliCommandError ? error.kind : "internal",
-          },
-        );
+        return renderToolError("Google Workspace operator evidence collection failed", error, "gws_ops_collect_evidence_bundle");
       }
     },
   });

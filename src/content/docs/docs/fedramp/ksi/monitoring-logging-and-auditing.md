@@ -1,65 +1,68 @@
 ---
 title: Monitoring, Logging, and Auditing — FedRAMP KSI Domain
-description: Official FRMR-generated summary for the MLA FedRAMP key security indicator domain.
+description: Official Consolidated Rules summary for the MLA FedRAMP key security indicator domain.
 ---
 
-> Generated from the official [FedRAMP/docs](https://github.com/FedRAMP/docs) GitHub repo.
-> Source path: [`FRMR.documentation.json`](https://github.com/FedRAMP/docs/blob/main/FRMR.documentation.json) on `main` at blob `5c6bfee74029`.
-> FRMR version: `0.9.43-beta` · upstream `last_updated`: `2026-04-08`.
-> The official `FedRAMP/rules` repo exists, but grclanker still treats `FedRAMP/docs` as the active source until structured rules land there.
+> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
+> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Monitoring, Logging, and Auditing
 
 Domain code: `MLA` · Domain ID: `KSI-MLA` · Web slug: `monitoring-logging-and-auditing`
 
-## Theme
-
-A secure cloud service offering will monitor, log, and audit all important events, activity, and changes.
-
 ## Indicators
 
-### `KSI-MLA-ALA` (formerly `KSI-MLA-08`) — Authorizing Log Access
+### `KSI-MLA-ALA` — Authorizing Log Access
 
+Varies by certification class:
 
+- **Class B:** **Optional:** A least-privileged, role and attribute-based, and just-in-time access authorization model is used and persistently reviewed for access to log data based on organizationally defined data sensitivity.
+- **Class C:** A least-privileged, role and attribute-based, and just-in-time access authorization model is used and persistently reviewed for access to log data based on organizationally defined data sensitivity.
 
 Mapped Rev5 controls: `si-11`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Terms: `Persistently`
 
-### `KSI-MLA-EVC` (formerly `KSI-MLA-05`) — Evaluating Configurations
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-Persistently evaluate and test the configuration of machine-based information resources, especially infrastructure as code.
+### `KSI-MLA-EVC` — Evaluating Configurations
+
+The configuration of machine-based information resources, especially infrastructure as code, is persistently evaluated and tested.
 
 Mapped Rev5 controls: `ca-7`, `cm-2`, `cm-6`, `si-7.7`
 
-Terms: `Information Resource`, `Machine-Based (information resources)`, `Persistently`
+Terms: `Information Resource`, `Machine-Based (Information Resources)`, `Persistently`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-MLA-LET` (formerly `KSI-MLA-07`) — Logging Event Types
+### `KSI-MLA-LET` — Logging Event Types
 
-Maintain a list of information resources and event types that will be logged, monitored, and audited, then do so.
+A list of information resources and event types that will be logged, monitored, and audited is maintained and persistently reviewed to ensure these activities occur.
 
 Mapped Rev5 controls: `ac-2.4`, `ac-6.9`, `ac-17.1`, `ac-20.1`, `au-2`, `au-7.1`, `au-12`, `si-4.4`, `si-4.5`, `si-7.7`
 
-Terms: `Information Resource`
+Terms: `Information Resource`, `Persistently`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-MLA-OSM` (formerly `KSI-MLA-01`) — Operating SIEM Capability
+### `KSI-MLA-OSM` — Operating SIEM Capability
 
-Operate a Security Information and Event Management (SIEM) or similar system(s) for centralized, tamper-resistent logging of events, activities, and changes.
+A Security Information and Event Management (SIEM) or similar system(s) is used and persistently reviewed for centralized, tamper-resistant logging of events, activities, and changes.
 
 Mapped Rev5 controls: `ac-17.1`, `ac-20.1`, `au-2`, `au-3`, `au-3.1`, `au-4`, `au-5`, `au-6.1`, `au-6.3`, `au-7`, `au-7.1`, `au-8`, `au-9`, `au-11`, `ir-4.1`, `si-4.2`, `si-4.4`, `si-7.7`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Terms: `Persistently`
 
-### `KSI-MLA-RVL` (formerly `KSI-MLA-02`) — Reviewing Logs
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-Persistently review and audit logs.
+### `KSI-MLA-RVL` — Reviewing Logs
+
+Logs are persistently reviewed and audited.
 
 Mapped Rev5 controls: `ac-2.4`, `ac-6.9`, `au-2`, `au-6`, `au-6.1`, `si-4`, `si-4.4`
 
 Terms: `Persistently`
 
-Recent update: 2026-02-04 — Removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.

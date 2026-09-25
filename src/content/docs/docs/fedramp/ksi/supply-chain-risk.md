@@ -1,24 +1,20 @@
 ---
 title: Supply Chain Risk — FedRAMP KSI Domain
-description: Official FRMR-generated summary for the SCR FedRAMP key security indicator domain.
+description: Official Consolidated Rules summary for the SCR FedRAMP key security indicator domain.
 ---
 
-> Generated from the official [FedRAMP/docs](https://github.com/FedRAMP/docs) GitHub repo.
-> Source path: [`FRMR.documentation.json`](https://github.com/FedRAMP/docs/blob/main/FRMR.documentation.json) on `main` at blob `5c6bfee74029`.
-> FRMR version: `0.9.43-beta` · upstream `last_updated`: `2026-04-08`.
-> The official `FedRAMP/rules` repo exists, but grclanker still treats `FedRAMP/docs` as the active source until structured rules land there.
+> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
+> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Supply Chain Risk
 
 Domain code: `SCR` · Domain ID: `KSI-SCR` · Web slug: `supply-chain-risk`
 
-## Theme
-
-A secure cloud service offering will understand, monitor, and manage supply chain risks from third-party information resources.
-
 ## Indicators
 
-### `KSI-SCR-MIT` (formerly `KSI-TPR-03`) — Mitigating Supply Chain Risk
+### `KSI-SCR-MIT` — Mitigating Supply Chain Risk
 
 Persistently identify, review, and mitigate potential supply chain risks.
 
@@ -26,14 +22,14 @@ Mapped Rev5 controls: `ac-20`, `ra-3.1`, `sa-9`, `sa-10`, `sa-11`, `sa-15.3`, `s
 
 Terms: `Persistently`
 
-Recent update: 2026-02-04 — Renamed theme to Supply Chain Risk; removed italics and changed the ID as part of new standardization in v0.9.0-beta; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-SCR-MON` (formerly `KSI-TPR-04`) — Monitoring Supply Chain Risk
+### `KSI-SCR-MON` — Monitoring Supply Chain Risk
 
-Automatically monitor third party software information resources for upstream vulnerabilities using mechanisms that may include contractual notification requirements or active monitoring services.
+Third party software information resources are automatically monitored for upstream vulnerabilities using mechanisms that may include contractual notification requirements or active monitoring services.
 
 Mapped Rev5 controls: `ac-20`, `ca-3`, `ir-6.3`, `ps-7`, `ra-5`, `sa-9`, `si-5`, `sr-5`, `sr-6`, `sr-8`
 
 Terms: `Information Resource`, `Vulnerability`
 
-Recent update: 2026-02-09 — Renamed from incorrect KSI-RSC-MON to KSI-SCR-MON; no material changes.
+Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.

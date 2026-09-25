@@ -1,0 +1,597 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  IntegrationError,
+  LONG_TOKEN_MIN_LENGTH,
+  REDACTED,
+  describeErrorBody,
+  describeFailedResponse,
+  errorMessage,
+  redactSecretValues,
+  scrubDataText,
+  scrubError,
+  scrubErrorText,
+} from "../dist/extensions/grc-tools/hardening/error-text.js";
+import { CANARY, assertRedactionCases } from "./helpers/error-canaries.mjs";
+import { ENCODED_FORM_SECRET, ERROR_CANARY, assertNoCanaryWindowIn, assertNoFragment } from "./helpers/hardening-canaries.mjs";
+
+/**
+ * Coordinator addendum 7: a scrub in front of every error string can redact the identifying text a
+ * corollary summary must keep, so a module-wide scrub ships with a must-keep and a must-redact table
+ * as a test. Every must-keep value is asserted unchanged in isolation and inside realistic summary
+ * sentences through each scrub the library exposes; every must-redact value is asserted absent down
+ * to its 6-character windows. The rows are grouped by the addendum's categories, and the path-safety
+ * rows name the shapes the long-token rule must leave alone: URL path segments, hyphenated lowercase
+ * names, dotted hostnames, colon-separated ARNs, commands, and statements.
+ */
+const MUST_KEEP = Object.freeze([
+  // requested endpoint paths (relative paths keep a benign query; an absolute URL keeps scheme, host, and path, see below)
+  ["endpoint path", "/urlFilteringRules"],
+  ["endpoint path", "/api/v1/adminUsers?page=1&pageSize=100"],
+  ["endpoint path", "/v1/users?max_results=1000&per_page_limit_max=100&page=2"],
+  ["endpoint path", "/api/v2/tenants/acme-corp-2026/users"],
+  ["endpoint path", "/services/data/v60.0/sobjects/User/describe"],
+  ["endpoint path", "/api/now/table/sys_user_has_role?sysparm_limit=10000&sysparm_fields=user_name,role"],
+  ["endpoint path", "/admin/directory/v1/customer/my_customer/roleassignments"],
+  ["endpoint path", "/2013-04-01/hostedzone/Z0123456789ABCDEFGHIJ/rrset"],
+  ["endpoint URL", "https://zsapi.zscalerthree.net/api/v1/urlFilteringRules"],
+  ["endpoint URL", "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token"],
+  ["endpoint URL", "https://ec2-54-123-45-67.compute-1.amazonaws.com/latest/meta-data/iam/info"],
+  // tenant, region, account, and org names with digits and hyphens
+  ["tenant name", "prod-us-east-2026"],
+  ["tenant name", "acme-corp-2026"],
+  ["tenant name", "contoso.onmicrosoft.com"],
+  ["tenant name", "tenant_prod_2026"],
+  ["tenant name", "zscalerthree"],
+  ["region name", "us-east-1"],
+  ["region name", "europe-west2"],
+  ["region name", "us-central1-a"],
+  ["region name", "northamerica-northeast1"],
+  ["account name", "123456789012"],
+  ["account name", "my-project-123456"],
+  ["account name", "xy12345.us-east-2.aws"],
+  ["org name", "org-2026-security-audit"],
+  ["org name", "snapshot-1718033988749"],
+  ["org name", "my-bucket-prod-2026-logs"],
+  // principal identifiers in vendor shapes
+  ["principal", "alice.admin@example.com"],
+  ["principal", "alice.admin_example.com#EXT#@contoso.onmicrosoft.com"],
+  ["principal", "user:alice@example.com"],
+  ["principal", "serviceAccount:deploy-bot-2026@my-project-123456.iam.gserviceaccount.com"],
+  ["principal", "arn:aws:iam::123456789012:user/alice.admin"],
+  ["principal", "arn:aws:iam::123456789012:role/OrganizationAccountAccessRole"],
+  ["principal", "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_AdministratorAccess_0123456789abcdef/alice"],
+  ["principal", "2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a"],
+  ["principal", "U01ABCDEFGH"],
+  ["principal", "svc_backup_2026"],
+  ["principal", "CN=Backup Operators,OU=Groups,DC=corp,DC=example,DC=com"],
+  ["principal", "DOMAIN\\svc-backup-2026"],
+  // resource names in vendor shapes
+  ["resource", "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"],
+  ["resource", "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"],
+  ["resource", "arn:aws:s3:::my-bucket-prod-2026-logs"],
+  ["resource", "arn:aws:lambda:us-east-1:123456789012:function:rotate-keys-nightly-2026"],
+  ["resource", "IAMReadOnlyAccess"],
+  ["resource", "AmazonEC2FullAccess"],
+  ["resource", "AWSCloudTrail2024Policy"],
+  ["resource", "projects/my-project-123456/serviceAccounts/deploy-bot-2026@my-project-123456.iam.gserviceaccount.com"],
+  ["resource", "/subscriptions/2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a/resourceGroups/rg-prod-2026/providers/Microsoft.KeyVault/vaults/kv-prod-2026"],
+  // status text
+  ["status text", "Too Many Requests"],
+  ["status text", "Service Unavailable"],
+  ["status text", "Bad Gateway"],
+  ["status text", "Unauthorized"],
+  ["status text", "Forbidden"],
+  ["status text", "Internal Server Error"],
+  // finding ids
+  ["finding id", "ZIA-URL-FILTER-12"],
+  ["finding id", "AWS-IAM-04"],
+  ["finding id", "CF-IAM-04"],
+  ["finding id", "AAP-RBAC-05"],
+  ["finding id", "GWS-2SV-01"],
+  ["finding id", "OKTA-MFA-03"],
+  ["finding id", "SNOW-ACL-11"],
+  ["finding id", "M365-CA-07"],
+  ["finding id", "CIS-1.22"],
+  ["finding id", "AC-2(3)"],
+  // commands and statements
+  ["command", "gcloud compute instances list --project my-project-123456 --format json"],
+  ["command", "kubectl get pods -n kube-system --context prod-us-east-2026"],
+  ["command", 'az ad user list --filter "accountEnabled eq true" --query "[].userPrincipalName"'],
+  ["command", "aws iam list-users --max-items 1000 --region us-east-1"],
+  ["command", "oci iam user list --compartment-id ocid1.tenancy.oc1 --all"],
+  ["command", "gws users list --customer my_customer --max-results 500 --impersonate-service-account"],
+  ["command", "vault list auth/approle/role"],
+  ["statement", "SELECT user_name, sys_id FROM sys_user_has_role WHERE role = 'admin' LIMIT 10000"],
+  ["statement", "SHOW GRANTS ON ACCOUNT"],
+  ["statement", "SELECT name FROM snowflake.account_usage.users WHERE disabled = false"],
+  ["statement", "| tstats count where index=_audit by user"],
+  ["statement", "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"],
+  // standing fixed texts
+  ["fixed text", "Unable to read config file /home/user/.config/tool/credentials.json (EACCES)"],
+  ["fixed text", "Unable to parse config file: invalid YAML in /home/user/.config/tool/config.yaml at line 2, column 6 (BLOCK_AS_IMPLICIT_KEY)"],
+  ["fixed text", "GET /v1/users failed with 502 Bad Gateway: non-JSON body (text/html, 1234 bytes)"],
+  ["fixed text", "POST /oauth2/v1/token failed with 400 Bad Request: JSON body without a documented message field (2 bytes)"],
+  ["fixed text", "stopped after 500 of 1200 items with more pages available (500 item limit)"],
+  ["fixed text", "seen 40 of 120"],
+  ["fixed text", "40 seen, total unknown"],
+  ["fixed text", "not collected"],
+  ["fixed text", REDACTED],
+  // path-safety shapes the long-token rule must leave alone
+  ["path segment", "urlFilteringRules"],
+  ["path segment", "roleassignments"],
+  ["path segment", "application_default_credentials.json"],
+  ["hyphenated name", "prod-us-east-2026"],
+  ["hyphenated name", "ec2-54-123-45-67"],
+  ["hyphenated name", "eBay-enterprise-account-2026"],
+  ["hyphenated name", "x86_64-unknown-linux-gnu"],
+  ["hyphenated name", "--impersonate-service-account"],
+  ["dotted hostname", "ec2-54-123-45-67.compute-1.amazonaws.com"],
+  ["dotted hostname", "graph.microsoft.com"],
+  ["dotted hostname", "myverylongtenantname2026.zscalerbeta.net"],
+  ["colon-separated ARN", "arn:aws:iam::123456789012:role/OrganizationAccountAccessRole"],
+  ["camel and acronym word", "XMLHttpRequest"],
+  ["camel and acronym word", "getHTTPSUrl"],
+  ["camel and acronym word", "oauth2Client"],
+  ["camel and acronym word", "InvalidAuthenticationTokenProvided"],
+  ["timestamp", "2026-09-22T05:36:00.123Z"],
+  ["media type", "application/x-www-form-urlencoded"],
+  // key=value pairs whose value is a name (the AWS secret shape is matched after "=" too; a name is not that shape)
+  ["assignment", "AWS_PROFILE=prod-us-east-2026"],
+  ["assignment", "AWS_REGION=us-east-1"],
+  ["assignment", "GOOGLE_CLOUD_PROJECT=my-project-123456"],
+  ["assignment", "ROLE=OrganizationAccountAccessRole"],
+  ["assignment", "BUCKET=my-bucket-prod-2026-logs"],
+  ["assignment", "x=AWSLambdaBasicExecutionRole"],
+  ["assignment", "policy=AmazonElasticContainerRegistryPublicRead"],
+  ["assignment", "resource=arn:aws:iam::123456789012:role/OrganizationAccountAccessRole"],
+  ["assignment", "max_results_per_page=1000"],
+  // settings beside a credential word (coordinator ruling): the final segment names a setting, so the value stays
+  ["setting", "BOX_AUTH_METHOD=ccg"],
+  ["setting", "BOX_TOKEN_URL=https://api.box.com/oauth2/token"],
+  ["setting", "BOX_JWT_ALGORITHM=RS256"],
+  ["setting", "auth_method=client_secret"],
+  ["setting", "token_endpoint=https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token"],
+  ["setting", "token_uri: https://oauth2.googleapis.com/token"],
+  ["setting", "token_type=Bearer"],
+  ["setting", "grant_type=client_credentials"],
+  ["setting", "auth_mode: basic"],
+  ["setting", "oauth_signature_method=HMAC-SHA1"],
+  ["setting", "token_audience=https://api.example.com"],
+  ["setting", "jwt_issuer=https://issuer.example.com/oauth2/default"],
+  ["setting", "token_shape=jwt"],
+  ["setting", "private_key_path=/etc/grclanker/box-private.pem"],
+  ["setting", "credentials_file=./credentials.json"],
+  ["setting", "token_dir=/var/lib/grclanker/tokens"],
+  ["setting", "token_limit=5"],
+  ["setting", "session_count=3"],
+  ["setting", "secret_name=prod/grclanker/box"],
+  ["setting", "key_name=signing-2026"],
+  ["setting", "min_password_length=14"],
+  ["setting", '{"token_url":"https://api.box.com/oauth2/token","auth_method":"ccg","token_type":"Bearer"}'],
+  // identifiers: a client, key, or tenant id and a username stay; a token-shaped value under the same key goes by shape (see the must-redact rows)
+  ["identifier", "client_id=my-app-2026"],
+  ["identifier", "OKTA_CLIENT_ID=grclanker-audit-app"],
+  ["identifier", "key_id=signing-2026"],
+  ["identifier", "api_key_id: signing-2026"],
+  ["identifier", "tenant_id=2f3c1a9e-7b6d-4c5e-8f9a-0b1c2d3e4f5a"],
+  ["identifier", "username=alice.admin"],
+  ["identifier", "SPLUNK_USERNAME=admin"],
+  ["identifier", "user_name=svc-backup-2026"],
+]);
+
+/**
+ * Webhook and callback keys (coordinator ruling: credential keys whatever their suffix, because a
+ * webhook URL carries its token in its path, rule 9): the whole value goes, host and path included.
+ */
+const WEBHOOK_CARRIERS = Object.freeze([
+  (value) => `webhook_url=https://hooks.example.com/services/T000/B000/${value}`,
+  (value) => `WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/${value}`,
+  (value) => `webhookUrl: https://hooks.example.com/services/${value}`,
+  (value) => `slack_hook_url=https://hooks.slack.com/services/${value}`,
+  (value) => `callback_url=https://app.example.com/callback?code=${value}`,
+  (value) => `webhook=https://hooks.example.com/services/foo/bar/${value}`,
+  (value) => `{"webhook_url":"https://hooks.example.com/services/T000/B000/${value}"}`,
+  (value) => `the notifier rejected webhook_url=https://hooks.example.com/services/${value} with 404 Not Found`,
+]);
+
+/** Setting keys beside a credential word, with a token-shaped value that must go by shape, in the data scrubs too. */
+const SETTING_CARRIERS = Object.freeze([
+  (value) => `auth_method=${value}`,
+  (value) => `BOX_TOKEN_URL=https://api.box.com/oauth2/${value}`,
+  (value) => `private_key_id: ${value}`,
+  (value) => `api_key_id="${value}"`,
+  (value) => `{"private_key_id":"${value}","token_url":"https://api.box.com/oauth2/token"}`,
+]);
+
+/** The AWS secret access key canaries: the random-looking one, its slash and plus variants, and the group D value. */
+const AWS_SECRETS = Object.freeze([
+  ERROR_CANARY.awsSecret,
+  `${ERROR_CANARY.awsSecret.slice(0, 13)}/${ERROR_CANARY.awsSecret.slice(14, 21)}/${ERROR_CANARY.awsSecret.slice(22)}`,
+  `${ERROR_CANARY.awsSecret.slice(0, 20)}+${ERROR_CANARY.awsSecret.slice(21)}`,
+  CANARY.awsSecret,
+]);
+
+/** Assignment carriers under a key that does not name a credential, where only the secret's own shape can catch it. */
+const ASSIGNMENT_CARRIERS = Object.freeze([
+  (value) => `x=${value}`,
+  (value) => `ENV_VALUE=${value}`,
+  (value) => `description=${value} rejected`,
+  (value) => `GET /v1/users?x=${value}&page=2 failed with 403 Forbidden: non-JSON body (text/html, 512 bytes)`,
+]);
+
+/** Realistic summary sentences that place a value where a corollary summary or an error line would. */
+const SENTENCES = Object.freeze([
+  (value) => `Inventory ${value} was not readable, so the finding is manual and names it.`,
+  (value) => `GET ${value} failed with 403 Forbidden: non-JSON body (text/html, 512 bytes)`,
+  (value) => `Unread inventory: ${value} (429 Too Many Requests, seen 40 of 120).`,
+  (value) => `Finding withheld for ${value} because the read of ${value} stopped after 500 of 1200 items with more pages available.`,
+]);
+
+/** Every scrub the library exposes for error text and data text, each returning the text it produces. */
+const SCRUBS = Object.freeze([
+  ["scrubErrorText", (text) => scrubErrorText(text)],
+  ["scrubDataText", (text) => scrubDataText(text)],
+  ["scrubError", (text) => scrubError(new Error(text)).message],
+  ["errorMessage", (text) => errorMessage(new Error(text))],
+  ["IntegrationError", (text) => new IntegrationError(text).message],
+  ["redactSecretValues", (text) => redactSecretValues(text)],
+]);
+
+/**
+ * Values that are removed from error text by design because their shape is a token's: opaque
+ * identifiers travel in a validated structured field, not in the message. `scrubDataText` keeps them
+ * because in a data value they are evidence.
+ */
+const OPAQUE_IDENTIFIERS = Object.freeze([
+  ["Okta record id", "00u1abcd2EFGHijkl3m4"],
+  ["ServiceNow sys_id", "4f3a9c1b7e2d8f6a0b5c4d3e2f1a0b9c"],
+  ["EC2 instance id", "i-0abc123def456789a"],
+  ["OCID unique part", "aaaaaaaaz3k7q2m9x1c4v8b6n5p0t7r2w9y4u1i3o6"],
+  ["New Relic entity guid", "MzgwNjUyNnxBUE18QVBQTElDQVRJT058MTIzNDU2Nzg"],
+]);
+
+/**
+ * Canaries shaped like names: words joined by separators with one numeric segment (the shapes the
+ * group D fixture planted before it moved to random-looking values; these literals are this test's own
+ * fixtures). Bare, they are indistinguishable from `my-bucket-prod-2026-logs`, so the path-safe
+ * long-token rule keeps them and they are caught only where a carrier names them.
+ */
+const NAME_SHAPED_CANARIES = Object.freeze([
+  ["sess-canary-COOKIE-31415926535897", "Set-Cookie: session=sess-canary-COOKIE-31415926535897; Path=/"],
+  ["ak_canary_APIKEY_2718281828459045", "x-api-key: ak_canary_APIKEY_2718281828459045 for the caller"],
+  ["CANARY-url-token-1618033988749", "retry at https://api.example.com/v1/x?token=CANARY-url-token-1618033988749 later"],
+]);
+
+const TOKEN_SHAPED_CANARIES = Object.freeze([
+  ...Object.values(ERROR_CANARY),
+  CANARY.bearer,
+  CANARY.basic,
+  CANARY.jwt,
+  CANARY.awsAccessKeyId,
+  CANARY.awsSecret,
+]);
+
+function keepValues() {
+  return MUST_KEEP.map(([, value]) => value);
+}
+
+test("must-keep fixture: no 6-character window of a planted value occurs in a kept value or a sentence template", () => {
+  assertNoCanaryWindowIn(
+    [...keepValues(), ...SENTENCES.map((sentence) => sentence("VALUE")), ...ASSIGNMENT_CARRIERS.map((carrier) => carrier("VALUE"))],
+    [...TOKEN_SHAPED_CANARIES, ...AWS_SECRETS, ENCODED_FORM_SECRET],
+  );
+  assert.ok(MUST_KEEP.some(([, value]) => value.length >= LONG_TOKEN_MIN_LENGTH), "the table must exercise runs the long-token rule judges");
+});
+
+test("must-keep: every value comes back unchanged from every scrub, in isolation", () => {
+  for (const [category, value] of MUST_KEEP) {
+    for (const [scrubName, scrub] of SCRUBS) {
+      assert.equal(scrub(value), value, `${category} ${JSON.stringify(value)} was changed by ${scrubName}`);
+    }
+  }
+});
+
+test("must-keep: every value survives inside realistic summary sentences through every scrub", () => {
+  for (const [category, value] of MUST_KEEP) {
+    for (const sentence of SENTENCES) {
+      const text = sentence(value);
+      for (const [scrubName, scrub] of SCRUBS) {
+        assert.equal(scrub(text), text, `${category} ${JSON.stringify(value)} was changed by ${scrubName} inside ${JSON.stringify(text)}`);
+      }
+    }
+  }
+});
+
+test("must-keep: every scrub is idempotent over the table and its sentences, and the composed describers hand back fixed points", () => {
+  const texts = MUST_KEEP.flatMap(([, value]) => [value, ...SENTENCES.map((sentence) => sentence(value))]);
+  const composed = [
+    ["describeErrorBody", (text) => describeErrorBody("application/json", JSON.stringify({ message: text }))],
+    ["describeFailedResponse", (text) => describeFailedResponse({ method: "GET", endpoint: text, status: 403, statusText: "Forbidden", contentType: "text/html", body: "<html>denied</html>" })],
+  ];
+  for (const text of texts) {
+    for (const [scrubName, scrub] of SCRUBS) {
+      const once = scrub(text);
+      assert.equal(scrub(once), once, `${scrubName} is not idempotent over ${JSON.stringify(text)}`);
+    }
+    for (const [name, describe] of composed) {
+      const once = describe(text);
+      assert.ok(once.includes(text), `${name} changed the kept value inside ${JSON.stringify(once)}`);
+      assert.equal(scrubErrorText(once), once, `${name}: a second scrub changed ${JSON.stringify(once)}`);
+      assert.equal(scrubDataText(once), once, `${name}: a second data scrub changed ${JSON.stringify(once)}`);
+    }
+  }
+});
+
+test("must-keep: an absolute URL keeps scheme, host, and path and loses its query as one marker (the shared URL rule)", () => {
+  const url = "https://graph.microsoft.com/v1.0/users?$select=id,userPrincipalName&$top=999";
+  assert.equal(scrubErrorText(url), `https://graph.microsoft.com/v1.0/users?${REDACTED}`);
+  assert.equal(scrubErrorText("https://graph.microsoft.com/v1.0/users"), "https://graph.microsoft.com/v1.0/users");
+});
+
+test("must-redact: token-shaped canaries leave no 6- to 24-character fragment, bare or inside the sentences, through every error-text scrub", () => {
+  const errorTextScrubs = SCRUBS.filter(([name]) => name !== "scrubDataText" && name !== "redactSecretValues");
+  for (const canary of TOKEN_SHAPED_CANARIES) {
+    for (const [scrubName, scrub] of errorTextScrubs) {
+      const bare = scrub(canary);
+      assertNoFragment(bare, canary, { label: `${scrubName} bare` });
+      assert.ok(bare.includes(REDACTED), `${scrubName}: the marker must stand where ${canary} was: ${bare}`);
+      for (const sentence of SENTENCES) {
+        const text = sentence(canary);
+        const scrubbed = scrub(text);
+        assertNoFragment(scrubbed, canary, { label: `${scrubName} sentence` });
+        assert.ok(scrubbed.includes(REDACTED), `${scrubName}: the marker must stand in ${scrubbed}`);
+        assert.ok(scrubbed.includes("seen 40 of 120") || scrubbed.includes("failed with 403 Forbidden") || scrubbed.includes("not readable") || scrubbed.includes("more pages available"), `${scrubName}: the fixed words around the token must survive: ${scrubbed}`);
+      }
+    }
+  }
+});
+
+test("must-redact: a 40-character AWS secret after any assignment operator is removed by its shape through every scrub, including the data scrubs", () => {
+  for (const secret of AWS_SECRETS) {
+    assert.equal(secret.length, 40);
+    for (const carrier of ASSIGNMENT_CARRIERS) {
+      const text = carrier(secret);
+      const expected = carrier(REDACTED);
+      for (const [scrubName, scrub] of SCRUBS) {
+        const scrubbed = scrub(text);
+        assertNoFragment(scrubbed, secret, { label: `${scrubName} of ${text}` });
+        assert.equal(scrubbed, expected, `${scrubName}: the key and the fixed words around the marker stay`);
+      }
+      for (const sentence of SENTENCES) {
+        const scrubbed = scrubErrorText(sentence(text));
+        assertNoFragment(scrubbed, secret, { label: `sentence ${text}` });
+        assert.equal(scrubbed, sentence(expected));
+        assertNoFragment(scrubDataText(sentence(text)), secret, { label: `data sentence ${text}` });
+      }
+    }
+    const record = redactSecretValues({ description: `ENV_VALUE=${secret}`, notes: [`x=${secret}`] });
+    assertNoFragment(record, secret, { label: "record values" });
+    assert.deepEqual(record, { description: `ENV_VALUE=${REDACTED}`, notes: [`x=${REDACTED}`] });
+  }
+  for (const scrub of [scrubErrorText, scrubDataText]) {
+    assert.equal(scrub(`secret_access_key=${ERROR_CANARY.awsSecret}`), `secret_access_key=${REDACTED}`, "a credential key of 16 or more characters keeps its name in front of one marker");
+    assert.equal(scrub(`aws_secret_access_key=${CANARY.awsSecret} and more`), `aws_secret_access_key=${REDACTED} and more`);
+  }
+});
+
+test("must-redact: a configured secret leaves no fragment in any encoded form through the secrets option", () => {
+  const forms = [ENCODED_FORM_SECRET, encodeURIComponent(ENCODED_FORM_SECRET), Buffer.from(ENCODED_FORM_SECRET, "utf8").toString("base64"), JSON.stringify(ENCODED_FORM_SECRET).slice(1, -1)];
+  for (const form of forms) {
+    for (const sentence of SENTENCES) {
+      const text = sentence(form);
+      const scrubbed = scrubErrorText(text, { secrets: [ENCODED_FORM_SECRET] });
+      assertNoFragment(scrubbed, form, { label: `configured secret form ${form}` });
+      assert.equal(scrubDataText(text, { secrets: [ENCODED_FORM_SECRET] }), scrubbed, "data text applies the configured-secret rule the same way");
+      assert.equal(errorMessage(new Error(text), { secrets: [ENCODED_FORM_SECRET] }), scrubbed);
+    }
+  }
+});
+
+test("must-redact: the shared carrier cases hold for every scrub that accepts text", () => {
+  assertRedactionCases(assert, scrubErrorText);
+  assertRedactionCases(assert, scrubDataText);
+  assertRedactionCases(assert, (text) => errorMessage(new Error(text)));
+  assertRedactionCases(assert, (text) => new IntegrationError(text).message);
+  assertRedactionCases(assert, (text) => redactSecretValues(text));
+});
+
+test("boundary: name-shaped canaries are kept bare and redacted in their carriers", () => {
+  for (const [canary, carrier] of NAME_SHAPED_CANARIES) {
+    assert.equal(scrubErrorText(canary), canary, `a bare value shaped like a name is a name: ${canary}`);
+    const scrubbed = scrubErrorText(carrier);
+    assertNoFragment(scrubbed, canary, { label: `carrier ${carrier}` });
+    assert.ok(scrubbed.includes(REDACTED), scrubbed);
+  }
+});
+
+test("boundary: opaque identifiers are removed from error text and kept in data text", () => {
+  for (const [label, identifier] of OPAQUE_IDENTIFIERS) {
+    assert.ok(identifier.length >= LONG_TOKEN_MIN_LENGTH, `${label} must be long enough for the rule to judge`);
+    assert.equal(scrubErrorText(`record ${identifier} not found`), `record ${REDACTED} not found`, `${label} in error text`);
+    assert.equal(scrubDataText(`record ${identifier} not found`), `record ${identifier} not found`, `${label} in data text`);
+    assert.equal(redactSecretValues({ id: identifier }).id, identifier, `${label} as a data value`);
+  }
+});
+
+test("must-redact: a URL-valued webhook, hook, or callback key loses its whole value, a name-shaped path segment included, through every scrub; a webhook setting that is not the URL keeps its value", () => {
+  // The Codex example on #78 (r4076357762) is name-shaped in every segment; the token canary is the issued shape.
+  for (const value of ["abcdefghijkl", "T000B000XXXXXXXXXXXXXXXX", ERROR_CANARY.urlToken]) {
+    for (const carrier of WEBHOOK_CARRIERS) {
+      const text = carrier(value);
+      for (const [scrubName, scrub] of SCRUBS) {
+        const scrubbed = scrub(text);
+        assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+        assert.ok(!scrubbed.includes("hooks."), `${scrubName}: the webhook host goes with the value: ${scrubbed}`);
+        assert.ok(scrubbed.includes(REDACTED), `${scrubName}: the marker must stand in ${scrubbed}`);
+      }
+      // Codex's rendering, exactly.
+      assert.equal(scrubDataText(`webhook_url=https://hooks.example.com/services/foo/bar/${value}`), `webhook_url=${REDACTED}`);
+    }
+  }
+  // Review of #78 (01:40 rulings): the webhook exception covers the URL-valued keys; `webhook_count`,
+  // `webhook_id`, and `webhook_name` are settings whose values stay, in the data walker too.
+  assert.deepEqual(
+    redactSecretValues({
+      webhook_url: "https://hooks.example.com/services/T000/B000/abcdefghijkl",
+      webhook_path: "/services/T000/B000/abcdefghijkl",
+      webhook_count: 3,
+      webhook_id: "wh-2026-primary",
+      webhook_name: "deploy-notifier",
+      callback_url: "https://app.example.com/cb",
+    }),
+    {
+      webhook_url: REDACTED,
+      webhook_path: REDACTED,
+      webhook_count: 3,
+      webhook_id: "wh-2026-primary",
+      webhook_name: "deploy-notifier",
+      callback_url: REDACTED,
+    },
+  );
+  for (const [text, expected] of [
+    ["webhook_count=3", "webhook_count=3"],
+    ["webhook_count: 3", "webhook_count: 3"],
+    ['{"webhook_count":"3"}', '{"webhook_count":"3"}'],
+    ["webhooks_limit=25", "webhooks_limit=25"],
+    ["webhook_id=wh-2026-primary", "webhook_id=wh-2026-primary"],
+    ["webhook_path=/services/T000/B000/abcdefghijkl", `webhook_path=${REDACTED}`],
+    ["webhook_endpoint=https://hooks.example.com/services/T000/B000/abcdefghijkl", `webhook_endpoint=${REDACTED}`],
+  ]) {
+    for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), expected, `${scrubName} on ${text}`);
+  }
+});
+
+test("must-keep: the Vault AppRole lifetime, use-count, network, and accessor settings keep their values beside the bearer keys, which lose theirs whatever the shape, through every scrub", () => {
+  // Review of #78 (01:40 rulings): `secret_id_ttl`, `token_max_ttl`, `secret_id_num_uses`,
+  // `token_num_uses`, `secret_id_bound_cidrs`, `token_bound_cidrs`, `secret_id_accessor`, and
+  // `token_accessor` are the settings an assessment reports (an accessor is a UUID that looks a token
+  // up and never authenticates); `secret_id` and `token_id` are the bearer half and go in any shape.
+  const accessor = "6b1f4c2e-9d3a-4f7b-8c5e-2a1d0e9f8b7c";
+  const settings = [
+    ["secret_id_ttl", "3600"],
+    ["secret_id_num_uses", "5"],
+    ["token_max_ttl", "7200"],
+    ["token_ttl", "1800"],
+    ["token_num_uses", "0"],
+    ["secret_id_bound_cidrs", "10.0.0.0/8"],
+    ["token_bound_cidrs", "10.0.0.0/8"],
+    ["secret_id_accessor", accessor],
+    ["token_accessor", accessor],
+    ["tokenAccessor", accessor],
+    ["secretIdTtl", "3600"],
+  ];
+  const forms = [
+    (key, value) => `${key}=${value}`,
+    (key, value) => `${key}: ${value}`,
+    (key, value) => `"${key}": "${value}"`,
+    (key, value) => `{"${key}":"${value}"}`,
+    (key, value) => `\\"${key}\\": \\"${value}\\"`,
+    (key, value) => `${key}="${value}"`,
+    (key, value) => `export ${key}=${value}`,
+    (key, value) => `upstream echoed ${key}=${value} before closing`,
+    (key, value) => `{"detail":"upstream sent ${key}=${value}"}`,
+  ];
+  for (const [key, value] of settings) {
+    for (const form of forms) {
+      const text = form(key, value);
+      for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), text, `${scrubName} on ${text}`);
+    }
+  }
+  assert.deepEqual(
+    redactSecretValues({ secret_id_ttl: 3600, secret_id_num_uses: 5, token_bound_cidrs: ["10.0.0.0/8"], token_accessor: accessor, secret_id: accessor, token_id: accessor }),
+    { secret_id_ttl: 3600, secret_id_num_uses: 5, token_bound_cidrs: ["10.0.0.0/8"], token_accessor: accessor, secret_id: REDACTED, token_id: REDACTED },
+  );
+  for (const key of ["token_id", "tokenId", "TOKEN_ID", "secret_id", "VAULT_SECRET_ID"]) {
+    for (const value of [accessor, "k7Qm2xZp9vLw4nRt8sYb", "qzvkwpmtr"]) {
+      for (const form of forms) {
+        const text = form(key, value);
+        for (const [scrubName, scrub] of SCRUBS) {
+          const scrubbed = scrub(text);
+          assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+          assert.ok(scrubbed.includes(key), `${scrubName}: the key stays in ${scrubbed}`);
+        }
+      }
+    }
+  }
+  // A token id in prose is the bearer id, not a word: the prose exemption does not apply to it.
+  assert.equal(scrubErrorText("token_id: qzvkwpmtr was revoked"), `token_id: ${REDACTED} was revoked`);
+  assert.equal(scrubErrorText("token_id_count: 3 of 5"), "token_id_count: 3 of 5");
+});
+
+test("must-redact: a token-shaped value under a setting key beside a credential word goes by shape through every scrub, the data scrubs included, while the setting's name-shaped value stays", () => {
+  for (const value of [ERROR_CANARY.apiKey, "Kq7Zx2Vw9Lm4Tp8RwQ12", "0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c"]) {
+    for (const carrier of SETTING_CARRIERS) {
+      const text = carrier(value);
+      for (const [scrubName, scrub] of SCRUBS) {
+        const scrubbed = scrub(text);
+        assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+        assert.ok(scrubbed.includes(carrier(REDACTED)), `${scrubName}: only the token-shaped run goes, the key and the rest of the value stay: ${scrubbed}`);
+      }
+    }
+    assert.deepEqual(redactSecretValues({ private_key_id: value, token_url: "https://api.box.com/oauth2/token", auth_method: "ccg" }), {
+      private_key_id: REDACTED,
+      token_url: "https://api.box.com/oauth2/token",
+      auth_method: "ccg",
+    });
+  }
+  // The name-shaped identifier under the same keys stays, in data and in error text.
+  for (const text of ["private_key_id: signing-2026", 'api_key_id="signing-2026"', "auth_method=ccg"]) {
+    for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), text, `${scrubName} on ${text}`);
+  }
+  // A token-shaped identifier under a plain identifier key (no credential word) goes by shape in error text and, as documented for opaque identifiers, stays in data text.
+  assert.equal(scrubErrorText("OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9"), `OKTA_CLIENT_ID=${REDACTED}`);
+  assert.equal(scrubDataText("OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9"), "OKTA_CLIENT_ID=0oa1b2c3d4e5f6g7h8i9");
+});
+
+test("must-redact: a token-shaped value under a non-URL webhook setting goes by shape through every scrub, the data scrubs included, while the setting's count, id, and name values stay", () => {
+  // Review of #78 (01:40 rulings) and the merge bar for #81: `webhook_count`, `webhook_id`, and
+  // `webhook_name` are settings (`main` at `b47f90d` redacted them whole; the frozen harness keeps
+  // `webhook_count=3`), and a token-shaped value under one still goes as it did on `main`, so the
+  // ruling narrows the keys and not the shapes that go (`isCredentialWordSetting`).
+  const carriers = Object.freeze([
+    (key, value) => `${key}=${value}`,
+    (key, value) => `${key}: ${value}`,
+    (key, value) => `{"${key}":"${value}"}`,
+    (key, value) => `listing webhooks failed with ${key}=${value} and status 500`,
+  ]);
+  const keys = ["webhook_count", "webhook_id", "webhook_name", "webhookId", "WEBHOOK_NAME", "slack_webhook_id", "webhooks_limit"];
+  for (const value of [ERROR_CANARY.apiKey, "Kq7Zx2Vw9Lm4Tp8RwQ12", "0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c"]) {
+    for (const key of keys) {
+      for (const carrier of carriers) {
+        const text = carrier(key, value);
+        for (const [scrubName, scrub] of SCRUBS) {
+          const scrubbed = scrub(text);
+          assertNoFragment(scrubbed, value, { label: `${scrubName} on ${text}` });
+          assert.equal(scrubbed, carrier(key, REDACTED), `${scrubName}: only the token-shaped run goes, the key and the rest of the line stay: ${scrubbed}`);
+        }
+      }
+      assert.deepEqual(redactSecretValues({ [key]: value, page: 2 }), { [key]: REDACTED, page: 2 });
+    }
+  }
+  // The setting's own values stay, as the 01:40 ruling and the frozen harness require.
+  for (const [key, value] of [
+    ["webhook_count", "3"],
+    ["webhook_id", "wh-2026-primary"],
+    ["webhook_id", "6f1c2d3e-4a5b-4c6d-a7e8-9f0a1b2c3d4e"],
+    ["webhook_name", "deploy-notifier"],
+    ["webhooks_limit", "25"],
+  ]) {
+    for (const carrier of carriers) {
+      const text = carrier(key, value);
+      for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), text, `${scrubName} on ${text}`);
+    }
+  }
+});
+
+test("must-keep: a URL under a setting key passes the URL rule, userinfo and query removed and the path kept, and a webhook URL under a setting key goes only by its query", () => {
+  for (const [text, expected] of [
+    ["BOX_TOKEN_URL=https://user:pw@api.box.com/oauth2/token?client_secret=abc#frag", `BOX_TOKEN_URL=https://api.box.com/oauth2/token?${REDACTED}#${REDACTED}`],
+    ['{"token_endpoint":"https://login.microsoftonline.com/common/oauth2/v2.0/token?client_secret=abc"}', `{"token_endpoint":"https://login.microsoftonline.com/common/oauth2/v2.0/token?${REDACTED}"}`],
+    ["token_uri: https://oauth2.googleapis.com/token", "token_uri: https://oauth2.googleapis.com/token"],
+  ]) {
+    for (const [scrubName, scrub] of SCRUBS) assert.equal(scrub(text), expected, `${scrubName} on ${text}`);
+  }
+  assert.deepEqual(redactSecretValues({ token_url: "https://user:pw@api.box.com/oauth2/token?client_secret=abc" }), { token_url: `https://api.box.com/oauth2/token?${REDACTED}` });
+});

@@ -4,9 +4,17 @@ cli/.cache/
 cli/dist/
 cli/release/
 
+# Cursor Agent SDK local state (sessions, traces, evals)
+.agent-serve/
+
 # Astro
 dist/
 .astro/
+
+# Cloudflare
+.wrangler/
+.dev.vars*
+!.dev.vars.example
 
 # Generated evidence and local workspaces
 export/

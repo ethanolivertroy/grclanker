@@ -36,9 +36,9 @@ async function main() {
     [
       `Wrote ${files.length} generated FedRAMP docs file(s) to ${targetDir}.`,
       `Source: ${sourceStatus.primary.repoUrl}/${sourceStatus.primary.path}`,
-      `FRMR version: ${sourceStatus.primary.version}`,
+      `Consolidated Rules version: ${sourceStatus.primary.version}`,
       `Upstream last_updated: ${sourceStatus.primary.upstreamLastUpdated}`,
-      `Rules repo state: ${sourceStatus.secondary.state}`,
+      `Narrative source state: ${sourceStatus.secondary.state}`,
     ].join("\n") + "\n",
   );
 }

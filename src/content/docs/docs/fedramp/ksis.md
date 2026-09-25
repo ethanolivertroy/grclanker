@@ -1,20 +1,19 @@
 ---
 title: FedRAMP KSI Domains
-description: Browse official FRMR-generated FedRAMP key security indicator domains and indicator summaries.
+description: Browse official Consolidated Rules key security indicator domains and indicator summaries.
 ---
 
-> Generated from the official [FedRAMP/docs](https://github.com/FedRAMP/docs) GitHub repo.
-> Source path: [`FRMR.documentation.json`](https://github.com/FedRAMP/docs/blob/main/FRMR.documentation.json) on `main` at blob `5c6bfee74029`.
-> FRMR version: `0.9.43-beta` · upstream `last_updated`: `2026-04-08`.
-> The official `FedRAMP/rules` repo exists, but grclanker still treats `FedRAMP/docs` as the active source until structured rules land there.
+> Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
+> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # FedRAMP KSI Domains
 
-- [Authorization by FedRAMP](/docs/fedramp/ksi/authorization-by-fedramp/) — `AFR` · 10 indicators
-- [Cybersecurity Education](/docs/fedramp/ksi/cybersecurity-education/) — `CED` · 4 indicators
+- [Cybersecurity Education](/docs/fedramp/ksi/cybersecurity-education/) — `CED` · 1 indicator
 - [Change Management](/docs/fedramp/ksi/change-management/) — `CMT` · 4 indicators
 - [Cloud Native Architecture](/docs/fedramp/ksi/cloud-native-architecture/) — `CNA` · 8 indicators
-- [Identity and Access Management](/docs/fedramp/ksi/identity-and-access-management/) — `IAM` · 7 indicators
+- [Identity and Access Management](/docs/fedramp/ksi/identity-and-access-management/) — `IAM` · 6 indicators
 - [Incident Response](/docs/fedramp/ksi/incident-response/) — `INR` · 3 indicators
 - [Monitoring, Logging, and Auditing](/docs/fedramp/ksi/monitoring-logging-and-auditing/) — `MLA` · 5 indicators
 - [Policy and Inventory](/docs/fedramp/ksi/policy-and-inventory/) — `PIY` · 5 indicators

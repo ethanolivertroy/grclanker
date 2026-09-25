@@ -23,7 +23,7 @@ import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -806,7 +806,7 @@ async function createZipArchive(sourceDir: string, zipPath: string, baseDir: str
 
   await new Promise<void>((resolvePromise, rejectPromise) => {
     const output = createWriteStream(resolvedZipPath, { mode: 0o600 });
-    const archive = archiver("zip", { zlib: { level: 9 } });
+    const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
     output.on("error", rejectPromise);

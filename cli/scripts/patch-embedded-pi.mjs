@@ -191,8 +191,8 @@ function patchEmbeddedPi(rootDir) {
     throw new Error(`No package.json found under ${rootDir}`);
   }
 
-  const packageRoot = join(rootDir, "node_modules", "@mariozechner", "pi-coding-agent");
-  const piTuiRoot = join(rootDir, "node_modules", "@mariozechner", "pi-tui");
+  const packageRoot = join(rootDir, "node_modules", "@earendil-works", "pi-coding-agent");
+  const piTuiRoot = join(rootDir, "node_modules", "@earendil-works", "pi-tui");
   const packageJsonPath = join(packageRoot, "package.json");
   if (!existsSync(packageJsonPath)) {
     throw new Error(`Embedded pi package not found under ${packageRoot}`);

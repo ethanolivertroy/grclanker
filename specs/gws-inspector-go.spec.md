@@ -6,11 +6,11 @@ category: "identity-access-management"
 language: "typescript"
 status: "implemented"
 version: "1.0"
-last_updated: "2026-03-29"
-source_repo: "https://github.com/hackIDLE/gws-inspector-go"
+last_updated: "2026-09-21"
+source_repo: "https://github.com/hackIDLE/grclanker"
 ---
 
-# gws-inspector-go — Architecture Specification
+# gws-inspector-go: Architecture Specification
 
 Implemented in grclanker as the first Google Workspace tool family:
 
@@ -21,18 +21,26 @@ Implemented in grclanker as the first Google Workspace tool family:
 - `gws_assess_monitoring`
 - `gws_export_audit_bundle`
 
-The current grclanker implementation keeps the original multi-framework audit intent, but the first slice is intentionally bounded to the stable Google Workspace Admin SDK surfaces that are well suited to read-only GRC assessment:
+The current grclanker implementation keeps the original multi-framework audit intent, but the first slice is intentionally bounded to the stable Google Workspace surfaces that are well suited to read-only GRC assessment:
 
 - Admin SDK Directory API for users, roles, and role assignments
 - Admin SDK Reports API for login, admin, and token audit activity
 - Alert Center API for tenant security alerts
+- Cloud Identity Policy API for the organization-level 2-step verification policy
 - Per-user token inventory for bounded third-party OAuth review
 
 The v1 auth path centers on service-account-based domain-wide delegated access, with optional direct bearer-token support for smoke tests or externally managed auth flows.
 
+### grclanker implementation
+
+- Source: `cli/extensions/grc-tools/gws.ts`; tests: `cli/tests/gws.test.mjs`; live smoke: `cli/scripts/gws-live-smoke.mjs` (`npm --prefix cli run test:gws:live`); guide: `src/content/docs/docs/integrations/gws.md`.
+- 19 controls: `GWS-ID-001..005`, `GWS-ADMIN-001..005`, `GWS-INTEG-001..004`, `GWS-MON-001..005`, each mapped to the eight frameworks below.
+- Every request and every field read is traceable to the Admin SDK Directory, Reports, Alert Center, or Cloud Identity reference pages cited in the module header and the guide's endpoint table.
+- Verdicts follow eight safety rules with a regression test each: unreadable endpoints and empty inventories never pass, undated items are bucketed separately, partial views cap at Partial with seen counts, only documented enabling flags count, pagination runs to completion or records truncation, and re-running the export never overwrites.
+
 ## Overview
 
-Go implementation of gws-inspector — a multi-framework compliance audit tool for Google Workspace. This is a port of the Python `gws-inspector` package, providing a single-binary distribution with no runtime dependencies.
+Go implementation of gws-inspector: a multi-framework compliance audit tool for Google Workspace. This is a port of the Python `gws-inspector` package, providing a single-binary distribution with no runtime dependencies.
 
 ## Reference Implementation
 
@@ -51,7 +59,7 @@ internal/
 ├── auth/
 │   └── auth.go                 # Service account + OAuth2 authentication
 ├── client/
-│   └── client.go               # GWSClient — wraps multiple Google API services
+│   └── client.go               # GWSClient: wraps multiple Google API services
 ├── collector/
 │   └── collector.go            # GWSDataCollector → GWSData
 ├── models/
@@ -124,7 +132,7 @@ Google API packages:
 
 ## Security Controls (19 checks)
 
-Identical to the Python implementation — see the Python repo's plan for the full control-to-framework matrix.
+Identical to the Python implementation; see the Python repo's plan for the full control-to-framework matrix.
 
 ## CLI Interface
 
@@ -134,12 +142,12 @@ gws-inspector -c credentials.json -a admin@example.com -d example.com --framewor
 ```
 
 Flags:
-- `-c, --credentials` — service account JSON or OAuth client secrets
-- `-a, --admin-email` — admin email for delegation
-- `-d, --domain` — Google Workspace domain
-- `--oauth` — use OAuth flow
-- `--frameworks` — comma-separated framework list
-- `-o, --output-dir` — custom output dir
+- `-c, --credentials`: service account JSON or OAuth client secrets
+- `-a, --admin-email`: admin email for delegation
+- `-d, --domain`: Google Workspace domain
+- `--oauth`: use OAuth flow
+- `--frameworks`: comma-separated framework list
+- `-o, --output-dir`: custom output dir
 - `-V, --version`
 
 Environment variables: `GWS_CREDENTIALS_FILE`, `GWS_ADMIN_EMAIL`, `GWS_DOMAIN`
@@ -152,4 +160,32 @@ go build -o gws-inspector ./cmd/gws-inspector
 
 ## Status
 
-**Not yet implemented.** This repo contains only this specification. The Python implementation should be used as the reference for porting.
+**Implemented in grclanker (TypeScript).** The Go port described above was superseded by the native grclanker implementation in `cli/extensions/grc-tools/gws.ts`; the Python package remains the conceptual reference for the control set.
+
+### What shipped
+
+- 19 of 19 controls across `gws_assess_identity` (5), `gws_assess_admin_access` (5), `gws_assess_integrations` (4), and `gws_assess_monitoring` (5), plus `gws_check_access` and `gws_export_audit_bundle`.
+- `GWS-ID-005` (2-step verification enforced by organization policy) reads the Cloud Identity Policy API (`policies.list` filtered to `settings/security.two_step_verification*`) and evaluates `enforcedFrom`, `allowEnrollment`, and `allowedSignInFactorSet` from the published settings catalog.
+- Auth: service-account domain-wide delegation (`GWS_CREDENTIALS_FILE` or `GWS_CREDENTIALS_JSON` plus `GWS_ADMIN_EMAIL`) and direct `GWS_ACCESS_TOKEN`. The Policy API scope is requested with a separate token so tenants without it keep the other 18 controls automated.
+- Bundle layout: `core_data/` (one `{status, endpoint, data, seen, pages, truncated}` object per listing, projected to the documented fields the verdicts read and then redacted; a failed or never-attempted read writes `error` and `errorKind` with `data`, `seen`, `pages`, and `truncated` all null), `analysis/` (`findings.json` plus per-category JSON and Markdown), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` on partial collection, and a zip named after the allocated directory; reruns allocate `-2`, `-3`.
+- The `--frameworks` flag from the CLI interface above maps to the `frameworks` argument of `gws_export_audit_bundle`.
+- Verdict-safety rules 1 to 11 applied to every finding, with a regression test per rule and a four-fixture false-pass self-check (all 403, all empty, partial inventory, compliant tenant) in `cli/tests/gws.test.mjs`.
+- Rule 1 per item: the token inventory records every failed per-user `tokens.list` read with the user, and GWS-INTEG-001, GWS-INTEG-002, and GWS-INTEG-003 name the failed users and the endpoint in every branch; GWS-INTEG-002 renders its privileged counts as lower bounds when a privileged read failed and stays below Pass. `roles.list` and `roleAssignments.list` order the token sample privileged-first, so when either is unreadable GWS-INTEG-001 and GWS-INTEG-003 cap at Partial and name that endpoint in the summary.
+- Rule 9 (bundle secret hygiene) projects every `core_data/` object to documented fields, never stores Alert Center `data` or `events[].parameters[]`, and redacts credential-like keys on normalized names and `{name, value}` pairs. Findings and collection errors are redacted as objects before rendering, and every bundle file (`core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log`) passes through one text scrubber on its way to disk: the query string and fragment of every URL, bare or embedded in prose, are removed; well-known credential shapes and `key=value` or `key: value` pairs naming a credential are replaced; and the run's own bearer token, service-account key, and every token minted during the run (kept in the scrub set after a 401 evicts it from the cache) are replaced wherever they appear. API error bodies are reduced at the client to the HTTP status plus documented identifiers (`error.status`, `errors[].reason`, `details[].reason`, RFC 6749 `error`) that are bare `[A-Za-z][A-Za-z0-9_]*` values of at most 63 characters; the HTTP reason phrase comes from a fixed RFC 9110 table, the free-text `message` is never stored, and `_errors.log` names the failing endpoint per line. Third-party OAuth `displayText` is scrubbed and paired with `clientId` in the GWS-INTEG-002 evidence. An end-to-end test exports a bundle from fixtures carrying a planted secret in every carrier, including a mid-prose URL query in `displayText`, a failing endpoint whose error body carries planted values through the real client, and the run's own non-Google-shaped bearer echoed into `User.orgUnitPath` and `Alert.source` so the final write-time scrub has a negative control, and greps every file and zip entry; a second export through the real client rotates a service-account token on a 401 and confirms the evicted token is scrubbed. The tool path inherits the rule: `GwsApiError` scrubs its message in its constructor and `summarizeError` scrubs every other error, so dataset statuses, evidence lines, probes, and tool error results read `[REDACTED]` where a transport error carried a credential; `gws_check_access` and `gws_assess_*` results are redacted as objects before rendering; and a 200 whose body is not JSON is described by content type and byte count (`non-JSON text/html body (N bytes) withheld`), never quoted. Tests drive a `fetchImpl` throw carrying a bearer, an `access_token=` pair, and a URL query through every tool handler, and a `text/html` 200 carrying a canary through `fetchJson`, every tool, the `gws_check_access` probe (which reads the body and reports `error` with the same description), and the export. The service-account key loader (`readServiceAccountFromFile`, `parseServiceAccount`) reads and parses in two guarded steps: a read failure renders `unable to read <path> (<code>)` with the Node error code validated against `^E[A-Z0-9_]{1,30}$` and nothing for a non-standard error object, a parse failure renders `invalid JSON in <path>` with the size read, both through `scrubErrorText`; a test plants a fake private key line and a fake bearer on the malformed line, confirms `JSON.parse` quotes the key line, and asserts the thrown message and every tool result carry neither.
+- Rule 10 (truncation on every cap exit) gives roles (1000) and role assignments (10000) finite caps, ends a listing whose `nextPageToken` stops advancing or exceeds 1000 pages as `truncated: true`, and caps GWS-ID-001, GWS-ID-004, GWS-ADMIN-001 to 003, GWS-ADMIN-005, and GWS-INTEG-002 at Partial whenever the user, role, or role-assignment listing was truncated.
+- Rule 11 (unreadable or never-collected data renders null, never 0 or []): every snapshot count in the four assessment summaries goes through one helper (`snapshotCount` in `gws.ts`) that writes the value beside a `<field>_status` companion reading `complete`, `partial: at least N`, `unreadable`, or `not collected`, each naming the endpoint and the projected error; a count derived from several inventories is only as readable as its weakest source and is null when any of them failed or was never collected. `users_seen_partial_view` reads from the users.list collection status (`no`, `yes`, or `unreadable (...)`). Evidence lines go through the same helper family (`countLine`), so GWS-INTEG-001, GWS-INTEG-002, and GWS-INTEG-003 render `at least N (Directory tokens.list failed for K of S sampled users (user: error))` whenever any per-user read failed and `unreadable (...)` when none succeeded. `core_data/` files write the explicit marker described under the bundle layout, and `token_inventory.json` sets `truncated` to null whenever any per-user read failed. The regression sweep runs 34 denial scenarios (users, roles, role assignments, three Reports applications, alerts, policies, and tokens.list for every user, the privileged user, and the token holder, each as 403, 401, and a transport error, plus the never-collected Policy API dataset) over every finding line, snapshot field, and `core_data/` file with two generic guards, `assertNoFabricatedValues` and `assertStatusesMatchRequests`, against a fixture collector that records every endpoint it was asked to read.
+
+### Deviations from this spec
+
+- Language is TypeScript inside grclanker, not a standalone Go binary; the `cmd/` and `internal/` layout above is historical.
+- Of the six Google APIs listed, four are called (Directory, Reports, Alert Center, Cloud Identity Policy API). Chrome Policy (`chromepolicy/v1`) and Cloud Identity device management are not called because no shipped control depends on them.
+- `roles.list` is requested with `maxResults=100`, the documented maximum, rather than a shared page size.
+- Alert status is read from `metadata.status` (`NOT_STARTED`, `IN_PROGRESS`, `CLOSED`) per the Alert Center Alert resource; there is no top-level state field.
+- `RoleAssignment.assigneeType` is documented as `USER` or `GROUP`; comparisons are case-insensitive.
+- Alert Center `pageSize` has no documented maximum; grclanker requests 100 per page and follows `nextPageToken`.
+
+### Deferred
+
+- Installed-app OAuth (`--oauth` with client secrets and a stored refresh token) is not implemented; the delegated service account and access-token modes cover the automated paths. Reason: it did not fit the delivery budget for this release and requires an interactive loopback flow that the other integrations do not yet share.
+- Chrome Policy API and Cloud Identity device controls (no spec control names them yet).
+- Group membership expansion for `GWS-ADMIN-005`; group-based admin grants render Manual for a membership review.
