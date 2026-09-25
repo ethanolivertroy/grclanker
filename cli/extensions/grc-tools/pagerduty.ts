@@ -83,8 +83,8 @@ const HEADER_SEPARATOR = String.raw`\\?["']?\s*[:=]\s*\\?["']?`;
 // The next header on the same line (`; X-Api-Key: x`, `, Content-Type: x`, ` Accept: x`, a quoted or JSON-object
 // name too): a cookie or header value ends before it, so that header keeps its name and gets its own carrier treatment.
 const NEXT_HEADER_NAME = String.raw`\s*\{?\s*\\?["']?[A-Za-z][\w-]*\\?["']?\s*:`;
-// The schemes that stand as carriers in prose (the ruling's list, including PagerDuty's REST API key
-// scheme `Token token=<key>`) and the wider set recognized inside an Authorization header.
+// Only the common schemes below stand as credential carriers in prose, including PagerDuty's REST API
+// key form `Token token=<key>`; Authorization headers recognize additional schemes.
 const PROSE_AUTH_SCHEMES = "bearer|basic|digest|token|apikey|api-key";
 const HEADER_AUTH_SCHEMES = `${PROSE_AUTH_SCHEMES}|negotiate|ntlm|hmac|oauth|hoba|mutual|vapid|aws4-hmac-sha256|scram-sha-1|scram-sha-256`;
 // A quote closes a value only when a delimiter or the end of the text follows it; a quote followed by a value

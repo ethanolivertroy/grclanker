@@ -16,7 +16,7 @@
  * kind `parse` carrying the path, the format, the line and column from the parser's structured
  * position only (`YAMLError.linePos`; for `JSON.parse` the offset matched by a strict regex over the
  * message, converted against the source), and a validated code (the `YAMLParseError` code, or the
- * fixed `INVALID_YAML` / `INVALID_JSON`). Ruling: a key-word scrub at the tool boundary is no
+ * fixed `INVALID_YAML` / `INVALID_JSON`). A key-word scrub at the tool boundary is no
  * substitute for these fixed-text errors, because the exported resolvers throw before any boundary is
  * reached and a scrub cannot recognise a bare value with no key in front of it; the error message is
  * therefore built from fixed text plus path, position, and code, and nothing else.
