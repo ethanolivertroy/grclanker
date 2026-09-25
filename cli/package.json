@@ -115,7 +115,7 @@
     "@clack/prompts": "^1.6.0",
     "@earendil-works/pi-ai": "^0.80.2",
     "@earendil-works/pi-coding-agent": "^0.86.1",
-    "@flue/runtime": "^2.1.0",
+    "@flue/runtime": "^2.1.1",
     "@sinclair/typebox": "^0.34.48",
     "archiver": "^8.0.0",
     "valibot": "^1.5.0",
@@ -123,7 +123,7 @@
   },
   "devDependencies": {
     "@cursor/july": "0.2.1",
-    "@flue/cli": "^2.1.0",
+    "@flue/cli": "^2.1.1",
     "@types/archiver": "^8.0.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
