@@ -9,12 +9,6 @@
  *
  * Classification is by name segment and write verbs win: a tool whose name
  * carries any write verb is never declared read-only, whatever else it says.
- *
- * Read-only tools may still mirror public catalogs to the grclanker state
- * directory (the FedRAMP lookups cache `catalog.json` and `sources.json`).
- * `executeGrcTool` runs dry-run calls with persistent caches disabled (see
- * `runWithoutPersistentCaches` in `extensions/grc-tools/shared.ts`), so the
- * read classification holds on disk as well as for external systems.
  */
 
 const READ_ONLY_VERBS = new Set([
@@ -31,7 +25,7 @@ const READ_ONLY_VERBS = new Set([
   "validate",
 ]);
 
-/** Name segments that mark a tool as a writer; exported so tests derive expectations from the same list. */
+/** Name segments that mark a tool as a writer. */
 export const WRITE_VERBS: ReadonlySet<string> = new Set(["assemble", "collect", "create", "export", "generate", "import", "init"]);
 
 export type GrcToolEffect = "read" | undefined;

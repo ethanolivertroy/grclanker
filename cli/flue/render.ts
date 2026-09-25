@@ -1,10 +1,9 @@
 /**
  * Compose the grclanker Flue agent render from injected hooks.
  *
- * `agent.ts` passes the real `@flue/runtime` hooks; tests pass recorders.
  * Everything expensive (tool bridging, prompt loading) happens once in
  * `loadGrclankerFlueAgentOptions()`, while `renderGrclankerAgent()` stays a
- * cheap per-render declaration pass, matching Flue's re-render model.
+ * cheap per-render declaration pass.
  */
 import type { SandboxFactory, SkillDefinition, SubagentDefinition, ToolDefinition } from "@flue/runtime";
 import type { LocalSandboxOptions } from "@flue/runtime/node";
@@ -174,7 +173,6 @@ export function loadGrclankerFlueAgentOptions(input: LoadGrclankerFlueAgentOptio
   };
 }
 
-/** One agent render: declare model, sandbox, tools, skills, and subagents, then return the instructions. */
 export function renderGrclankerAgent(hooks: FlueAgentHooks, options: GrclankerFlueAgentOptions): string {
   hooks.useModel(options.model);
 

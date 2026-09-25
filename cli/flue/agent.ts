@@ -19,7 +19,7 @@ import { loadGrclankerFlueAgentOptions, renderGrclankerAgent, type GrclankerFlue
 
 // Custom providers (the local-first Ollama entry from `grclanker setup`) must
 // be registered at module scope so `flue run`, which loads only this module,
-// resolves them too. The Flue Models guide prescribes exactly this placement.
+// resolves them too.
 const customProviders = registerGrclankerProviders({ env: process.env });
 for (const warning of customProviders.warnings) console.warn(`grclanker flue: ${warning}`);
 
@@ -36,7 +36,6 @@ function getAgentOptions(): GrclankerFlueAgentOptions {
   return cachedOptions;
 }
 
-/** Load and validate the agent configuration eagerly (used by the runner to fail before the runtime starts). */
 export function prepareGrclankerAgent(): GrclankerFlueAgentOptions {
   return getAgentOptions();
 }

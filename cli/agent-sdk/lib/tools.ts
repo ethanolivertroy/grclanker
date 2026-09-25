@@ -7,17 +7,11 @@ import { getRegisteredGrcTool, type RegisteredGrcTool } from "./registry.js";
 import { errorEnvelope, toSdkToolResult } from "./results.js";
 import { toJsonSchema } from "./schema.js";
 
-/**
- * The slice of the Agent SDK `ToolContext` the adapter reads: the call id
- * and the session's dry-run flag (`SessionInfo.dryRun`, true when the host
- * answers write-classified calls instead of running them).
- */
 export interface GrcToolExecutionContext {
   toolCallId?: string;
   session?: Pick<ToolContext["session"], "dryRun">;
 }
 
-/** Server tool config accepted by `defineTool` from `@cursor/july/tools`. */
 export interface GrclankerSdkToolConfig {
   description: string;
   inputSchema: JsonSchemaObject;
@@ -33,12 +27,7 @@ export interface GrclankerSdkToolConfig {
 
 export interface ExecuteGrcToolOptions {
   toolCallId?: string;
-  /**
-   * Run the tool with on-disk caches disabled. Read-classified tools such as
-   * the FedRAMP lookups mirror public catalogs to the grclanker state
-   * directory; in a dry-run session that mirror must stay in memory so the
-   * session changes nothing on the user's disk.
-   */
+  /** Keep dry-run catalog mirrors out of the persistent state directory. */
   dryRun?: boolean;
 }
 
@@ -62,7 +51,6 @@ export function prepareGrcToolArguments(tool: RegisteredGrcTool, toolCallId: str
   return validateToolArguments(piTool, toolCall) as unknown;
 }
 
-/** Execute a registered grc tool with Agent SDK input and return the SDK envelope. */
 export async function executeGrcTool(
   tool: RegisteredGrcTool,
   input: JsonObject,
@@ -85,7 +73,6 @@ export async function executeGrcTool(
   }
 }
 
-/** Build the Agent SDK server tool config for one registered grc tool. */
 export function buildSdkToolConfig(tool: RegisteredGrcTool): GrclankerSdkToolConfig {
   return {
     description: tool.description,
@@ -97,7 +84,6 @@ export function buildSdkToolConfig(tool: RegisteredGrcTool): GrclankerSdkToolCon
   };
 }
 
-/** Look up a grclanker domain tool by name and adapt it for `defineTool`. */
 export function grclankerToolConfig(name: string): GrclankerSdkToolConfig {
   return buildSdkToolConfig(getRegisteredGrcTool(name));
 }
