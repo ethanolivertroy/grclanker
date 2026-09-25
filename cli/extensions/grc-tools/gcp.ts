@@ -3257,7 +3257,7 @@ export async function assessGcpDataProtection(
   const publicResources: JsonRecord[] = [];
   for (const result of publicBindings.data.items) {
     for (const binding of parsePolicyBindings(result.policy)) {
-      const members = asArray(binding.members).map(normalizeMember).filter((member): member is string => Boolean(member) && isPublicMember(member as string));
+      const members = asArray(binding.members).map(normalizeMember).filter((member): member is string => member !== undefined && isPublicMember(member));
       if (members.length > 0) {
         publicResources.push({ resource: asString(result.resource), assetType: asString(result.assetType), role: asString(binding.role), members });
       }
