@@ -1,12 +1,11 @@
 /**
- * Credential scrub for integration error text (rule 9, error-body credential class, and the coordinator's ruling on
- * the scrub boundary).
+ * Credential scrub for integration error text.
  *
  * Every error string the Box, Datadog, Elastic, KnowBe4, and LaunchDarkly integrations record (findings, summaries,
  * analysis objects, access surfaces, `_errors.log`, tool results, the bundle) passes through a scrubber built here.
- * The boundary is the coordinator's: a bare value shaped like a name (words joined by hyphens or underscores, digits
- * standing in whole segments, such as `prod-us-east-2026` or `sess-canary-COOKIE-31415926535897`) is
- * indistinguishable from a resource name and stays. Two guards make that safe, and both are construction requirements:
+ * A bare value shaped like a name (words joined by hyphens or underscores, digits standing in whole segments, such as
+ * `prod-us-east-2026` or `sess-canary-COOKIE-31415926535897`) is indistinguishable from a resource name and stays. Two
+ * guards make that safe, and both are construction requirements:
  *
  * 1. A value inside a carrier is removed whatever its shape: Authorization, Proxy-Authorization, Cookie, Set-Cookie,
  *    x-api-key and similar headers; cookie and session assignments; URL userinfo and query pairs; the schemes Bearer,
@@ -133,14 +132,14 @@ const CREDENTIAL_DATA_KEY_QUALIFIERS = new Set([
   "auth", "sdk", "mobile", "relay", "service", "license", "ssh", "hmac", "enrollment",
 ]);
 
-// An id that is itself the credential (rule 9): possession of a Vault AppRole `secret_id` (a UUID, which the identifier
+// An id that is itself the credential: possession of a Vault AppRole `secret_id` (a UUID, which the identifier
 // rule would otherwise keep), of a token id (`token_id`, `tokenId`: the id a token API hands back is the token as often
-// as a handle to it, so it fails closed; 01:40 rulings), or of a session id (`session_id`, `sid`, `JSESSIONID`,
+// as a handle to it, so it fails closed), or of a session id (`session_id`, `sid`, `JSESSIONID`,
 // `PHPSESSID`, `ASP.NET_SessionId`) is what authenticates. These keys are credential keys on both sides whatever the
 // value's shape, checked before the setting-suffix and identifier rules; any prefix, casing, and separator
 // (`VAULT_SECRET_ID`, `role_secret_id`, `roleSecretId`). Every other `*_id` names a thing and stays an identifier:
 // `client_id`, `enterprise_id`, `key_id`, `api_key_id`, `tenant_id`, `access_key_id` (an AWS access key id is removed by
-// its `AKIA` shape), and `secret_name` likewise (CodeRabbit on #78, r4077259415).
+// its `AKIA` shape), and `secret_name` likewise.
 const BEARER_ID_LAST_SEGMENTS = new Set(["secretid", "sid", "sessid", "sessionid", "jsessionid", "phpsessid", "aspnetsessionid"]);
 const BEARER_ID_QUALIFIERS = new Set(["secret", "session", "token"]);
 
@@ -182,7 +181,7 @@ function isNameValuePair(record: Record<string, unknown>): string | undefined {
  * (`tokens: ["..."]`), an object (`credentials: { value }`), or a number (a PIN under `password`), so no nested
  * container keeps a value its key names as a credential; the key itself survives so a reader sees the field existed.
  * Booleans and nulls pass through everywhere because they carry no secret (`serviceToken: true`), and numbers pass
- * through under every other key. The string branch runs before the depth test (gap 36): a string at any depth is
+ * through under every other key. The string branch runs before the depth test: a string at any depth is
  * scrubbed, never dropped, and a container past the cap becomes the marker whole.
  */
 function scrubDataValue(value: unknown, scrubText: (text: string, options?: ScrubTextOptions) => string, options: ScrubDataOptions, key: string | undefined, depth: number): unknown {
@@ -240,14 +239,14 @@ const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 // A relative path or bare query string: a credential-named parameter keeps its name and loses its value. The value
 // runs to the next parameter, the fragment, whitespace, or a quote or bracket that closes the text around it, and a
 // backslash ends it so a JSON-escaped closing quote is kept. A ";" inside the value is part of it, as URLSearchParams
-// reads it (`?token=<v>;<rest>` is one value and goes whole; Codex on #81): only the Cookie and Set-Cookie readers
+// reads it (`?token=<v>;<rest>` is one value and goes whole): only the Cookie and Set-Cookie readers
 // treat ";" as a boundary, and they run before this rule so a header's `; pref=w` is read as its attribute rather than
 // taken off the header as the tail of a query value.
 const QUERY_PAIR_PATTERN = /([?&])([A-Za-z0-9_.[\]-]+)=(?!\[REDACTED\])([^&#\s"'<>\\]+)/g;
 
 // A carrier name must stand on its own: preceded by neither a word character nor "-", ".", or "/", so `sdk-keys:`,
 // `environment-token`, `settings.token`, and `GET /_security/api_key: 403` are names and paths, not carriers. Three
-// positions count as standing on its own although a name character precedes them (coordinator rulings, rows A and D):
+// positions count as standing on its own although a name character precedes them:
 // - after the letters of a JSON escape written into the text (`\napi_key=`, `\r\nAuthorization:`, `\u000asdk_key=`),
 //   which is a line break or tab in the decoded text;
 // - after the one or two dashes that open a command-line flag (`--password=`, `-Dpassword=`), where the dashes start a
@@ -273,7 +272,7 @@ const NAME_CLOSE_AND_SEPARATOR = String.raw`(?:\\*["'])?\s*[:=]\s*`;
 const COOKIE_HEADER_PATTERN = new RegExp(String.raw`${NAME_START}(set-cookie|cookie)${NAME_CLOSE_AND_SEPARATOR}`, "gi");
 // A cookie pair name, a later pair or attribute name after `;`, and a bare cookie value take every RFC 6265 token
 // character (`!#$%&'*+-.^_` + "`|~" and alphanumerics: `my.sid`, `ASP.NET_SessionId`, `.AspNetCore.Session`,
-// `~sid!`; CodeRabbit on #78, r4076392614), the apostrophe included when it stands inside the token (`my'pref`,
+// `~sid!`), the apostrophe included when it stands inside the token (`my'pref`,
 // `sid=O'<v>`, `x&'*y`). A class of letters, digits, "_", and "-" alone ended the attribute scan at the "." in
 // `; my.sid=` and left that pair's value in place. The attribute class is the name class less ":", so on a compound
 // line `; Name:` is the next header and never an attribute (see FOLLOWING_HEADER_PATTERN). The bracket separators
@@ -342,7 +341,7 @@ const HEADER_BARE_VALUE_PATTERN = /[^\s,;"'<>\\]+/y;
 // username="v", realm="api", nonce="v", response="v"`, `AWS4-HMAC-SHA256 Credential=v, SignedHeaders=host;range,
 // Signature=v`, `Hawk id="v", mac="v"`): comma-separated `name=value` parameters whose values are quoted or bare. The
 // list is the credential and goes whole with the run that opens it, so the quoted value after `Token=` is never left
-// standing beside the marker (CodeRabbit on #81, r4081238237). A bare parameter value may hold ";"
+// standing beside the marker. A bare parameter value may hold ";"
 // (`SignedHeaders=host;range`) but ends before a `;Name:` token, the next header on a compound line, and before "&"
 // or "}", which close a query pair or a JSON fragment around the value. The first parameter's quoted value must begin
 // like a value: after the "=" padding of a base64 credential (`Basic YWJjZGU="}`, `Basic YWJjZGU=", "next": 1`) the
@@ -356,7 +355,7 @@ const SCHEME_TOKEN_PATTERN = /^[A-Za-z][A-Za-z0-9-]*$/;
 // The auth-params that carry a proof (an RFC 7616 `response`, an OAuth 1.0 `oauth_signature`, a MAC token's `mac`, an
 // HMAC `sig` or `hmac`, a SAML or JWT `assertion`), read as the final segment of the parameter name (`X-Amz-Signature`,
 // `oauth_signature`): a list that holds one is a credential whatever parameter it begins with, so the challenge
-// exemption of the prose scheme reader does not reach it (CodeRabbit r4081776771 on #81: `Digest realm="api",
+// exemption of the prose scheme reader does not reach it (`Digest realm="api",
 // nonce="n", response="<proof>"` kept its proof because the list began with `realm=` and no pair rule names
 // `response`). A name that only begins with one of these words is a setting (`oauth_signature_method`), a challenge's
 // `nonce`, `opaque`, and `cnonce` name no proof, and a credential-named parameter (`access_token=`, `Token=`) is
@@ -503,7 +502,7 @@ const SETTING_KEY_SUFFIXES = new Set([
   "duration", "frequency", "interval", "length",
   // The Vault AppRole and token settings an assessment reports (`secret_id_bound_cidrs`, `token_bound_cidrs`,
   // `secret_id_num_uses`) and the accessor, a UUID handle to a token or secret id that cannot be used in its place
-  // (`secret_id_accessor`, `token_accessor`; 01:40 rulings).
+  // (`secret_id_accessor`, `token_accessor`).
   "cidrs", "cidr", "uses", "accessor",
 ]);
 const THRESHOLD_KEY_PREFIX_PATTERN = /^(?:max|min)[_-]/i;
@@ -515,13 +514,13 @@ function isUnqualifiedKeyName(key: string): boolean {
   const last = segments[segments.length - 1];
   return (last === "key" || last === "keys") && !isCredentialDataKey(key);
 }
-// Incoming-webhook and callback URLs carry their credential in the path (rule 9), so these stay credential keys
+// Incoming-webhook and callback URLs carry the credential in the path, so these stay credential keys
 // whatever their suffix: `webhook_url`, `webhookUrl`, `slack_hook_url`, `callback_url`, and the bare `webhook` or
 // `webhooks` a URL stands under. Their URL value keeps only its origin and loses its path and query; a value that is
 // not a URL becomes the marker under a URL-named key (a schemeless path would keep its token) and is a webhook's name
 // under the bare key. A `webhook`-prefixed key whose last segment says what it holds is judged by that segment, not by
 // the prefix: `webhook_secret`, `webhook_token`, `webhookSigningKey` are credential keys outright and lose their value
-// whatever its shape; `webhook_name`, `webhook_id`, `webhook_count` are settings (gap 39).
+// whatever its shape; `webhook_name`, `webhook_id`, `webhook_count` are settings.
 const WEBHOOK_KEY_LAST_SEGMENTS = new Set(["url", "uri"]);
 const BARE_WEBHOOK_KEYS = new Set(["webhook", "webhooks"]);
 
@@ -827,7 +826,7 @@ function replaceCarrierValues(text: string, carrierPattern: RegExp, readValue: V
  * a scheme word opens (`auth_header: Bearer v`, `Proxy-Authorization=Basic v`, `www_authenticate`), so the word stays
  * as it does in the header itself. Under every other credential-named key the scheme word is the value's first word
  * (`sslPassword=bearer rejected`, `db_password: token`) and goes with whatever follows it, so a password that happens to
- * start with a scheme word is never written back (CodeRabbit r4078025849 on #63).
+ * start with a scheme word is never written back.
  */
 function keepsSchemeWord(key: string): boolean {
   const segments = keySegments(key);
@@ -1025,7 +1024,7 @@ const readCookieHeaderValue: ValueReader = (text, valueStart) => {
  * parameter (`Digest realm="api", nonce="n", response="<proof>"`, `Bearer realm="api", error="invalid_token",
  * mac="<proof>"`; see PROOF_PARAM_WORDS) is a credential whatever parameter it begins with and goes whole, as the same
  * list does under a header, so the rendering does not depend on the order of the parameters; a challenge without a
- * proof keeps its parameters (CodeRabbit r4081776771 on #81).
+ * proof keeps its parameters.
  */
 const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   const scheme = carrier[1];

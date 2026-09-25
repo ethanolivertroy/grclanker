@@ -1,14 +1,12 @@
 /**
- * Collection-status markers and null rendering (rule 5 partial-inventory demotion, rule 10, coordinator
- * addenda 3 and 5, the rule 1 corollary).
+ * Collection-status markers and null rendering.
  *
  * A denied, errored, or never-requested inventory must never look like an empty one. Bundle files and
  * snapshot summaries write a `NotCollectedMarker` in place of the dataset, counts and flags derived from
  * an unread inventory render as null (never 0, [], {}, or false), a value that asserts absence needs a
  * complete read, and lists that name principals as holding or lacking a property are withheld unless
- * every input was read to completion. Distilled from the ServiceNow reference implementation (#62), the
- * Qualys `Collected` and `countIfReadable` helpers (#32), and the Webex `countIfReadable` (#48). The
- * module has no dependencies so integrations can adopt it one helper at a time.
+ * every input was read to completion. The module has no dependencies so integrations can adopt it one
+ * helper at a time.
  */
 
 type JsonRecord = Record<string, unknown>;
@@ -216,7 +214,7 @@ export function countIfReadable(count: number, ...datasets: Dataset<unknown>[]):
   return datasets.every(isReadable) ? count : null;
 }
 
-/** The rule 10 progress phrase: `seen 40 of 120` when the total is known, `40 seen, total unknown` when it is not. */
+/** Progress text: `seen 40 of 120` when the total is known, `40 seen, total unknown` when it is not. */
 export function seenVersusTotal(seen: number, total: number | null | undefined): string {
   return total === null || total === undefined ? `${seen} seen, total unknown` : `seen ${seen} of ${total}`;
 }

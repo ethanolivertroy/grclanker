@@ -2,8 +2,7 @@
  * Shared hardening helpers for integration tools: the error-text sink and `IntegrationError` base class,
  * the safe config-file loaders, the collection-status markers and null-rendering helpers, the
  * pagination stop descriptions, and the same-origin guard for server-supplied next links. The
- * integrations under `cli/extensions/grc-tools/` import this index; the export surface is frozen at
- * 2b4c4c4 (#67) and only grows.
+ * integrations under `cli/extensions/grc-tools/` import this index; the export surface only grows.
  */
 export {
   IntegrationError,

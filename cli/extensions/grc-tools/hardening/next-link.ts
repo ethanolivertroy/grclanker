@@ -1,11 +1,10 @@
 /**
- * Same-origin guard for server-supplied next links (rule 9, foreign-origin next link class).
+ * Same-origin guard for server-supplied next links.
  *
  * A paginated listing hands the client its next page as a URL: a `Link: <...>; rel="next"` header,
  * HAL `_links.next.href`, OData `@odata.nextLink`, JSON:API `links.next`, a `next_page` or
  * `nextPageUrl` field. A client that follows whatever the server names and attaches its credential
- * to the request sends that credential to any origin the response chooses (CodeRabbit on #62:
- * `servicenow.ts` followed `Link rel=next` to any host with the Authorization header attached). The
+ * to the request sends that credential to any origin the response chooses. The
  * rule for every walk: a server-supplied next URL is resolved against the configured base and
  * followed only when it shares the base's origin (scheme, host, and port) and carries no userinfo;
  * otherwise the walk stops, the dataset is truncated, and the stop is described with fixed text
@@ -27,7 +26,7 @@ export const INVALID_CONFIGURED_ORIGIN_CODE = "INVALID_CONFIGURED_ORIGIN";
 
 // The origin comparison is scheme, host, and port, which distinguishes two http or https origins and
 // nothing else: hostless schemes (`blob:`, `data:`, `javascript:`) share an empty host whatever they
-// embed, so only an http or https base is a configured origin (CodeRabbit on #78).
+// embed, so only an http or https base is a configured origin.
 const HTTP_PROTOCOLS: ReadonlySet<string> = new Set(["http:", "https:"]);
 
 /**
