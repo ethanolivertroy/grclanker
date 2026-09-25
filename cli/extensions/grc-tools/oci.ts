@@ -1579,7 +1579,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.users */
   async listUsers(): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "iam", "user", "list",
@@ -1588,7 +1587,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.authenticationPolicy */
   async getAuthenticationPolicy(): Promise<JsonRecord | null> {
     return asObject(this.runJson([
       "iam", "authentication-policy", "get",
@@ -1596,7 +1594,6 @@ export class OciAuditorClient {
     ]).data) ?? null;
   }
 
-  /** OCI_SURFACE_DOCS.apiKeys */
   async listApiKeys(userOcid: string): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "iam", "user", "api-key", "list",
@@ -1604,7 +1601,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.customerSecretKeys */
   async listCustomerSecretKeys(userOcid: string): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "iam", "customer-secret-key", "list",
@@ -1612,7 +1608,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.authTokens */
   async listAuthTokens(userOcid: string): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "iam", "auth-token", "list",
@@ -1629,7 +1624,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.availabilityDomains */
   async listAvailabilityDomains(): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "iam", "availability-domain", "list",
@@ -1637,7 +1631,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.auditConfiguration */
   async getAuditConfiguration(): Promise<JsonRecord | null> {
     return asObject(this.runJson([
       "audit", "config", "get",
@@ -1645,7 +1638,6 @@ export class OciAuditorClient {
     ]).data) ?? null;
   }
 
-  /** OCI_SURFACE_DOCS.auditEvents */
   async listAuditEvents(lookbackDays = DEFAULT_LOOKBACK_DAYS): Promise<JsonRecord[]> {
     const end = this.getNow();
     const start = new Date(end.getTime() - lookbackDays * 24 * 60 * 60 * 1000);
@@ -1658,7 +1650,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.cloudGuardConfiguration */
   async getCloudGuardConfiguration(): Promise<JsonRecord | null> {
     return asObject(this.runJson([
       "cloud-guard", "configuration", "get",
@@ -1689,7 +1680,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.responderRecipes */
   async listResponderRecipes(): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "cloud-guard", "responder-recipe", "list",
@@ -1746,7 +1736,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.bastions */
   async listBastions(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "bastion", "bastion", "list",
@@ -1763,7 +1752,6 @@ export class OciAuditorClient {
     ]).data) ?? null;
   }
 
-  /** OCI_SURFACE_DOCS.bastionSessions */
   async listBastionSessions(bastionOcid: string): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "bastion", "session", "list",
@@ -1772,7 +1760,6 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.vaults */
   async listVaults(compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "kms", "management", "vault", "list",
@@ -1809,7 +1796,6 @@ export class OciAuditorClient {
     ]).data) ?? null;
   }
 
-  /** OCI_SURFACE_DOCS.keyVersions */
   async listKeyVersions(vault: JsonRecord, keyOcid: string): Promise<JsonRecord[]> {
     const managementEndpoint = asString(vault.managementEndpoint);
     if (!managementEndpoint) {
@@ -1823,13 +1809,11 @@ export class OciAuditorClient {
     ]));
   }
 
-  /** OCI_SURFACE_DOCS.objectStorageNamespace */
   async getObjectStorageNamespace(): Promise<string> {
     const response = this.runJson(["os", "ns", "get"]);
     return asString(response.data) ?? "";
   }
 
-  /** OCI_SURFACE_DOCS.buckets */
   async listBuckets(namespaceName: string, compartmentId: string = this.config.compartmentOcid): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "os", "bucket", "list",
@@ -1848,7 +1832,6 @@ export class OciAuditorClient {
     ]).data) ?? null;
   }
 
-  /** OCI_SURFACE_DOCS.preauthenticatedRequests */
   async listPreauthenticatedRequests(namespaceName: string, bucketName: string): Promise<JsonRecord[]> {
     return flattenListResponse(this.runJson([
       "os", "preauth-request", "list",

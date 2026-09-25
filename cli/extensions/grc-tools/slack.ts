@@ -1305,7 +1305,6 @@ function partialNote(seen: number, complete: boolean, total?: number, truncation
   return `${seen} seen of ${total ?? "unknown total"} (partial view, ${truncationNote(truncation)})`;
 }
 
-/** A count derived from an unreadable inventory is rendered as null; inventoryStatus carries the reason beside it. */
 function inventoryCount<T>(result: ReadResult<T>, count: number): number | null {
   return result.ok ? count : null;
 }
@@ -1315,7 +1314,6 @@ function inventoryStatus<T>(result: ReadResult<T>, endpoint: string): string {
   return result.complete ? `complete: ${endpoint}` : `partial: ${endpoint} ${truncationNote(result.truncation)}`;
 }
 
-/** Status for a read that was never issued because the inventory feeding it failed; the companion count renders null. */
 function notCollected(upstream: string, error: string, consequence: string): string {
   return `not collected: ${upstream} was unreadable (${error}), so ${consequence}`;
 }

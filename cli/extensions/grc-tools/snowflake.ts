@@ -2212,7 +2212,6 @@ function emptyOutcome(key: string, statement: string): SnowflakeStatementOutcome
   return { key, statement, status: "ok", columns: [], rows: [], numRows: 0, partitionCount: 1, fetchedPartitions: 1, truncated: false };
 }
 
-/** The outcome of a statement that did not complete: no row count, no partition count, no truncation flag. */
 function unreadOutcome(key: string, statement: string): SnowflakeStatementOutcome {
   return { key, statement, status: "error", columns: [], rows: [], numRows: null, partitionCount: null, fetchedPartitions: null, truncated: null };
 }
@@ -2222,7 +2221,6 @@ export function rowsSeen(outcome: SnowflakeStatementOutcome): number | null {
   return outcome.status === "ok" ? outcome.rows.length : null;
 }
 
-/** True when the statement completed and every partition was fetched within the row limit, so a count over its rows describes the whole inventory. */
 function fullyRead(outcome: SnowflakeStatementOutcome): boolean {
   return outcome.status === "ok" && outcome.truncated !== true;
 }
@@ -2238,12 +2236,10 @@ function countIfFullyRead(outcome: SnowflakeStatementOutcome, count: number): nu
   return fullyRead(outcome) ? count : null;
 }
 
-/** The suffix a summary gives a population under a partial read, so a count of the rows read never reads as a count for the account. */
 function amongRowsRead(outcome: SnowflakeStatementOutcome): string {
   return fullyRead(outcome) ? "" : " among the rows read";
 }
 
-/** The service-class remark in a stale-login pass: under a partial read an empty class is unread, not a count of zero for the account. */
 function serviceClassLoginNote(users: SnowflakeStatementOutcome, serviceCount: number): string {
   if (fullyRead(users)) return `${serviceCount} service-class users showed no stale logins`;
   return serviceCount === 0 ? "no service-class user was among the rows read" : `${serviceCount} service-class users among the rows read showed no stale logins`;
@@ -2648,7 +2644,6 @@ function unrecognizedUserNote(summary: UserClassSummary): string | undefined {
   return `${summary.unrecognized} users carry an unrecognized TYPE (${summary.unrecognized_types.join(", ")}) and were not classified; review them manually`;
 }
 
-/** User class counts for evidence: null under a partial user read, since a 0 there would claim an absence from the unread rows; the unrecognized type names seen stay. */
 function userClassesEvidence(users: SnowflakeStatementOutcome, summary: UserClassSummary): JsonRecord {
   return {
     person: countIfFullyRead(users, summary.person),

@@ -1778,17 +1778,14 @@ async function collectRecord(name: string, load: () => Promise<JsonRecord | unde
   }
 }
 
-/** A count or list derived from a dataset renders null when that dataset was not read. */
 function whenOk<T>(value: T, ...datasets: Array<SalesforceDataset<unknown>>): T | null {
   return datasets.every((dataset) => dataset.status === "ok") ? value : null;
 }
 
-/** A bare count of a dataset's records (not a `seen` count): unknown, so null, unless the dataset was read to completion. */
 function completeCount(value: number, dataset: SalesforceDataset<unknown>): number | null {
   return dataset.status === "ok" && !dataset.truncated ? value : null;
 }
 
-/** The dataset's read state for a summary: `partial` for a truncated read, never `ok` beside a partial inventory line. */
 function datasetState(dataset: SalesforceDataset<unknown>): DatasetStatus | "partial" {
   return dataset.status === "ok" && dataset.truncated ? "partial" : dataset.status;
 }
@@ -1803,7 +1800,6 @@ function truncatedBeforeVisibleNote(dataset: SalesforceDataset<JsonRecord[]>, re
   return `The ${dataset.name} read was truncated before any ${record} was visible (0 of ${dataset.total ?? "an unknown total of"} rows${dataset.truncationReason ? `; ${dataset.truncationReason}` : ""}), so ${property} cannot be confirmed or ruled out from the visible rows.`;
 }
 
-/** One line per dataset stating whether it was read completely, partially, or not at all. */
 /**
  * Renders one dataset state as `<name> read: <state> (<detail>)`. The word `read` keeps a
  * credential-named dataset (TenantSecret, OauthToken) from forming a `name: value` pair that the
@@ -1898,7 +1894,6 @@ function withPartialDowngrade(status: SalesforceFindingStatus, dataset: Salesfor
   return status === "pass" ? "warn" : status;
 }
 
-/** Rule 1 corollary: a verdict that also reads a secondary inventory cannot pass while that inventory is unreadable. */
 function withUnreadableDowngrade(status: SalesforceFindingStatus, ...datasets: Array<SalesforceDataset<unknown>>): SalesforceFindingStatus {
   if (datasets.every((dataset) => dataset.status === "ok")) return status;
   return status === "pass" ? "warn" : status;

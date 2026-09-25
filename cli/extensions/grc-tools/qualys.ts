@@ -354,7 +354,6 @@ function pathRecords(value: unknown, ...keys: string[]): JsonRecord[] {
   return asRecords(pathValue(value, ...keys));
 }
 
-// A ratio with a zero denominator is undefined, never 0%.
 function percent(part: number, total: number): number | null {
   if (total <= 0) return null;
   return Math.round((part / total) * 1000) / 10;
@@ -1728,7 +1727,6 @@ function isPlainRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value) && !(value instanceof Date) && !(value instanceof Disclosed);
 }
 
-// Expands every Disclosed into its value and a sibling `<field>_status`, recursing through nested records.
 function renderRecord(record: JsonRecord): JsonRecord {
   const rendered: JsonRecord = {};
   for (const [key, value] of Object.entries(record)) {
@@ -1773,7 +1771,6 @@ function withheldFor(sources: Collected | Collected[], truncatedIsUnknown = fals
   return statuses.length > 0 ? withheld(statuses.join("; ")) : undefined;
 }
 
-// A count of an inventory, or of records inside it, is unknown unless that inventory was actually read.
 function countIfReadable(source: Collected, count: number): number | Disclosed {
   const status = unavailableStatus(source);
   return status ? withheld(status) : count;
@@ -1783,7 +1780,6 @@ function sourceCount(source: Collected): number | Disclosed {
   return countIfReadable(source, source.data.length);
 }
 
-// A count joined across inventories is unknown when any of them was unreadable or blocked.
 function derivedCount(sources: Collected | Collected[], count: number): number | Disclosed {
   return withheldFor(sources) ?? count;
 }
@@ -1796,7 +1792,6 @@ function objectIfReadable(sources: Collected | Collected[], value: JsonRecord): 
   return withheldFor(sources) ?? value;
 }
 
-// A percentage is unknown when an input inventory was not read or when its denominator is zero.
 function percentIfReadable(sources: Collected | Collected[], part: number, total: number, denominator: string): number | Disclosed {
   const blocked = withheldFor(sources);
   if (blocked) return blocked;
