@@ -2814,7 +2814,8 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
   const now = Date.now();
   const describeScope = (policy: JsonRecord): string => {
     const query = asRecord(policy.policyQuery);
-    return asString(query.group) ? `group ${query.group as string}` : `orgUnit ${asString(query.orgUnit) ?? "unknown"}`;
+    const group = asString(query.group);
+    return group ? `group ${group}` : `orgUnit ${asString(query.orgUnit) ?? "unknown"}`;
   };
   const enforced = enforcement.filter((policy) => {
     const value = asRecord(asRecord(policy.setting).value);
