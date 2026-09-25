@@ -1390,7 +1390,6 @@ async function collectGroupPolicies(
   }));
 }
 
-/** Every raw surface read for the sampled groups (base and option views), for demotion and error disclosure. */
 function groupPolicySurfaces(snapshot: ZoomSnapshot): ZoomSurface<JsonRecord>[] {
   return snapshot.groupPolicies.flatMap((policy) => [...policy.settingsSurfaces, ...policy.lockSurfaces]);
 }
@@ -1555,7 +1554,6 @@ function lockNote(locked: boolean | undefined, path: string, bundle: ZoomSetting
   return `${path} lock state was not visible: ${lockVisibilityCause(bundle)}.`;
 }
 
-/** Names the unreadable lock_settings view when a lock value is missing, or the documented response when every view was readable. */
 function lockVisibilityCause(bundle: ZoomSettingsBundle): string {
   const unreadable = bundle.lockSurfaces.filter((surface) => surface.status !== "ok");
   return unreadable.length > 0
@@ -1563,7 +1561,6 @@ function lockVisibilityCause(bundle: ZoomSettingsBundle): string {
     : "lock_settings was readable but carried no value for this key";
 }
 
-/** Lock text for verdicts that require two locks at once. */
 function pairedLockNote(locks: Array<boolean | undefined>, label: string, bundle: ZoomSettingsBundle): string {
   if (locks.every((lock) => lock === true)) return `${label} are locked at account level.`;
   if (locks.some((lock) => lock === undefined)) return `${label} lock state was not fully visible: ${lockVisibilityCause(bundle)}.`;

@@ -210,35 +210,10 @@ export interface VeracodeNotCollectedMarker {
 // so the endpoint reported is the one requested; inside a URL with a scheme every path segment keeps
 // the rule because webhook URLs carry their token there.
 //
-// The pair rule (reviewer C, item G): the value under a credential-named key (a credential word
-// anywhere in the name, compound and vendor environment names included: DB_PASSWORD,
-// SPLUNK_PASSWORD, OKTA_CLIENT_TOKEN) is removed whatever its shape and length in the "key=value",
-// "key: value", "key:value", and JSON forms, in prose and inside a JSON string alike; no plain-word
-// shape exempts it. Three key classes refine that:
-// - bearer ids: a key ending in "secret_id" (VAULT_SECRET_ID, role_secret_id, secretId) or naming a
-//   session id (session_id, sid, jsessionid, phpsessid, sessid) carries a bearer credential, so its
-//   value goes whatever the shape, a UUID included; this is decided before the setting test;
-// - settings: a credential-named key whose final segment is url, uri, endpoint, method, algorithm,
-//   audience, issuer, shape, type, mode, path, file, dir, limit, count, id, name, policy, or policies
-//   (token_endpoint, auth_method, token_type, api_key_id, password_policies,
-//   X-Snowflake-Authorization-Token-Type) names a setting, and
-//   its value stays unless it is token-shaped or a configured secret;
-// - webhooks: webhook*, *hook_url, and callback_url values lose their path and query and keep the
-//   origin, because the token of a webhook URL sits in its path.
-// Identifier keys without a credential word (OKTA_CLIENT_ID, SUMO_ACCESS_ID, SNOWFLAKE_ACCOUNT,
-// X-Request-Id) are not pairs under this rule; their values are judged by shape only.
-//
-// The escape rule (reviewer C, item H): a literal JSON escape is a boundary before every carrier
-// opener, so a header line that begins after one ("request headers:\u000aAuthorization: Splunk
-// <key>", "proxy:\n\tpassword: hunter2") is scrubbed as a header line, never as the value of the
-// word before the escape; see the note above ESCAPE_LETTER.
-//
-// The quote rule (reviewer C, items F and L): a quoted carrier value is read to the closing quote that
-// matches its opener (the same quote character behind the same backslash run), so an escaped inner
-// quote at any JSON depth is inner content and goes with the value; an unterminated quote and an
-// unquoted value end at a ";" or "," before the next header token, whose name may carry any RFC 7230
-// token character, so the following header keeps its name and its own treatment; see
-// readQuotedContent and scrubCookieHeaders.
+// Credential-named values are scrubbed regardless of shape. Bearer IDs include UUIDs,
+// setting keys keep non-token values, and webhook URLs keep only their origin.
+// Literal JSON escapes delimit carriers so escaped headers are parsed independently.
+// Quoted carriers end at their matching quote; unquoted carriers stop before the next RFC 7230 header.
 // ---------------------------------------------------------------------------------------------
 
 const MIN_CONFIGURED_SECRET_LENGTH = 4;
@@ -581,8 +556,7 @@ function isRedactedPairKey(word: string, text: string, index: number): boolean {
   return REDACTED_PAIR_VALUE_PATTERN.test(text);
 }
 
-// The RFC 7230 token characters, so a following header whose name carries a "." or other token
-// punctuation (X.Api.Key) is recognised as the next header rather than swallowed (item L).
+// Use the full RFC 7230 token set so punctuation in the next header name is not swallowed.
 const NEXT_HEADER_NAME = "[!#$%&'*+.^_`|~0-9A-Za-z-]+";
 // A ";" or "," ends a carrier value when the text after it (past optional spaces) opens the next
 // header "Name:" token or a JSON fragment.

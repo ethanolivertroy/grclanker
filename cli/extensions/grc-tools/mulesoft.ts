@@ -2765,8 +2765,6 @@ export async function assessMulesoftIdentityAccess(
   return {
     category: "identity_access",
     title: "MuleSoft identity and access posture",
-    // Counts derived from a list that was not read render null rather than the empty fallback's zero; the
-    // identity provider count is a bare count of the tenant's providers, unknown from a truncated page.
     summary: {
       organization_id: config.organizationId,
       identity_providers: completeCount(providers.length, identityProviders),
@@ -3068,7 +3066,6 @@ export async function assessMulesoftApiGateway(
   return {
     category: "api_gateway",
     title: "MuleSoft API gateway and Exchange posture",
-    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
       environments_visible: derived(environments.all.length, environments.source),
@@ -3838,7 +3835,6 @@ export async function assessMulesoftRuntimeInfrastructure(
   return {
     category: "runtime_infrastructure",
     title: "MuleSoft runtime and infrastructure posture",
-    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
       environments_visible: derived(environments.all.length, environments.source),
@@ -4140,7 +4136,6 @@ export async function assessMulesoftAuditMonitoring(
   return {
     category: "audit_monitoring",
     title: "MuleSoft audit logging and monitoring posture",
-    // Counts derived from a list that was not read render null rather than the empty fallback's zero.
     summary: {
       organization_id: config.organizationId,
       audit_platforms: derived(platforms.value.length, platforms),

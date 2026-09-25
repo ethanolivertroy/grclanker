@@ -1226,14 +1226,12 @@ function partialNote(result: SurfaceResult<JsonRecord[]>, label: string): string
     : "";
 }
 
-/** Readability of a collected inventory, rendered beside every count or list derived from it. */
 function inventoryStatus(result: SurfaceResult<unknown>): JsonRecord {
   return result.ok
     ? { readable: true, truncated: result.truncated }
     : { readable: false, status: result.status ?? null, error: scrubValue(result.error) };
 }
 
-/** A count derived from one or more inventories is null, never a fabricated 0, when any of them was unreadable. */
 function countIfReadable(value: number, ...inventories: SurfaceResult<unknown>[]): number | null {
   return inventories.every((result) => result.ok) ? value : null;
 }
@@ -1345,7 +1343,6 @@ async function collectSiteSettings(
   return { readable, denied, complete, coverageNote: notes.join(""), siteListStatus, raw };
 }
 
-/** Per-site commonSettings failures for the assessment errors array, which surfaceErrors misses whenever any site answered. */
 function siteSettingsErrors(coverage: SiteSettingsCoverage): string[] {
   return coverage.denied.map((site) => `meeting_common_settings[${site.site_url}]: ${site.error}`);
 }

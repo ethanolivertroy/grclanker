@@ -1611,7 +1611,6 @@ function describeCount(count: CountResult): string {
   return `${count.table} aggregate: complete (${count.count})`;
 }
 
-/** True when every listed snapshot was read without error and its visible rows are the whole population. */
 function tablesComplete(snapshots: TableSnapshot[]): boolean {
   return snapshots.every((snapshot) => tableState(snapshot) === "complete");
 }
@@ -1638,19 +1637,16 @@ function derived<T>(value: T, ...snapshots: TableSnapshot[]): T | null {
   return value;
 }
 
-/** A boolean observation: true is a positive sighting from any read; false is an absence claim that needs a complete read. */
 function derivedFlag(value: boolean, ...snapshots: TableSnapshot[]): boolean | null {
   if (!tablesReadable(snapshots)) return null;
   if (!value && !tablesComplete(snapshots)) return null;
   return value;
 }
 
-/** The number of rows read is meaningful whenever the table was read at all; it is null when it was not. */
 function visibleRows(snapshot: TableSnapshot): number | null {
   return tableCollected(snapshot) ? snapshot.rows.length : null;
 }
 
-/** An X-Total-Count or aggregate total is reported only when the request that carries it was answered. */
 function totalRows(snapshot: TableSnapshot): number | null {
   return tableCollected(snapshot) ? snapshot.total ?? null : null;
 }
@@ -1659,7 +1655,6 @@ function countValue(count: CountResult): number | null {
   return count.error ? null : count.count ?? null;
 }
 
-/** A count of principals holding or lacking a property, unknown unless every proving table was fully read. */
 function principalCount(value: number, ...snapshots: TableSnapshot[]): number | null {
   return tablesComplete(snapshots) ? value : null;
 }
@@ -1712,7 +1707,6 @@ interface Evaluation {
   absenceClaim?: boolean;
 }
 
-/** Under a partial read, evidence values that assert absence (0, [], {}) render null because the missing rows could hold the item. */
 function withoutAbsenceClaims(evidence: JsonRecord | undefined, complete: boolean): JsonRecord {
   if (!evidence) return {};
   if (complete) return evidence;

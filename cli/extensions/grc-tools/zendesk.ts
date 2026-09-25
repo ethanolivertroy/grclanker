@@ -18,6 +18,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -2615,9 +2616,6 @@ export async function checkZendeskAccess(client: ZendeskReadClient): Promise<Zen
     .filter((surface) => surface.status === "forbidden")
     .map((surface) => `${surface.name} requires ${surface.requiredRole === "agent" ? "an agent" : surface.requiredRole === "admin" ? "an admin" : "an Enterprise admin"} credential (${surface.endpoint}).`);
   const unavailable = surfaces.filter((surface) => surface.status === "not_found").map((surface) => surface.name);
-  // A surface that failed or answered a 2xx without the documented document produced no
-  // data, so the check is limited: a healthy verdict is never rendered over a surface
-  // the run could not read.
   const unreadable = surfaces.filter((surface) => surface.status === "error").map((surface) => surface.name);
   const readableCount = surfaces.filter((surface) => surface.status === "readable").length;
   const status = coreReadable && missingPermissions.length === 0 && unreadable.length === 0 ? "healthy" : "limited";
@@ -3460,8 +3458,6 @@ export async function assessZendeskDataProtection(
   const auditSnap = await snapshot("listRecentAuditLogs", () => client.listRecentAuditLogs(DEFAULT_AUDIT_LOG_SAMPLE));
   const oldestSnap: ZendeskSnapshot<JsonRecord | undefined> = auditSnap.status === "ok"
     ? await snapshot("getOldestAuditLog", () => client.getOldestAuditLog())
-    // Not requested: the oldest-record lookup inherits the failure of the recent-log
-    // read, naming that request rather than one that was never made.
     : { status: auditSnap.status, data: undefined, error: auditSnap.error, httpStatus: auditSnap.httpStatus, endpoint: auditSnap.endpoint };
   const rolesSnap = await snapshot("listCustomRoles", () => client.listCustomRoles());
   const deletionSnap = await snapshot("listDeletionSchedules", () => client.listDeletionSchedules(resolved.maxItems));
@@ -3716,7 +3712,6 @@ export async function assessZendeskIntegrations(
     if (brands.length === 0) {
       findings.push(manualFinding(22, brandTitle, "medium", `Zero brands were visible although every account has a default brand, so the view is partial.${truncationNote("brand", brandsSnap)}`, "use an admin credential and capture Admin Center > Account > Brand management.", evidence));
     } else if (currentRole !== "admin") {
-      // A role that could not be read is not a non-admin role; the summary says which.
       const credential = currentRole === undefined ? "a credential whose role could not be read, which may list only the brands the agent belongs to" : `a non-admin credential (role ${currentRole}), which only lists brands the agent belongs to`;
       findings.push(finding(22, brandTitle, "medium", "warn", `${brands.length} brands were visible to ${credential}, so cross-brand consistency cannot be confirmed.${truncationNote("brand", brandsSnap)}`, evidence));
     } else if (isTruncated(brandsSnap)) {
@@ -4250,7 +4245,7 @@ const assessParams = {
 };
 
 function registerAssessmentTool(
-  pi: any,
+  pi: ExtensionAPI,
   name: string,
   label: string,
   description: string,

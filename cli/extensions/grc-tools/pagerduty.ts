@@ -18,7 +18,8 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type, type TSchema } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1961,7 +1962,6 @@ export async function collectPagerdutyAccessControlData(
     capture<PagerdutyCollection>(emptyCollection(), () => client.listTeams(teamLimit)),
   ]);
   const teamMembersTruncated: string[] = [];
-  // Member lists are keyed on the teams that were read; without a team list no member request is issued.
   const teamMembers = teams.error
     ? skippedSnapshot<Record<string, JsonRecord[]>>({}, "team member lists", "/teams", teams)
     : await capture<Record<string, JsonRecord[]>>({}, async () => {
@@ -2288,7 +2288,6 @@ export function assessPagerdutyIncidentResponse(data: PagerdutyIncidentResponseD
   const automationVerified = enabledWorkflows.length > 0 && enabledTriggers.length > 0 && unresolvedTriggers.length === 0;
   const triggerCounts = `${countSeen(triggers)} (${enabledTriggers.length} enabled, ${disabledTriggers.length} disabled, ${unresolvedTriggers.length} unresolved)`;
   const legacyResponsePlays = services.items.filter((service) => asArray(service.response_play).length > 0 || asObject(service.response_play));
-  // A response-play count is stated bare only from a complete service read; a partial read names the visible set.
   const responsePlayCount = !services.readable
     ? `services could not be read (${services.error}), so services still referencing one could not be counted`
     : services.complete
@@ -2528,7 +2527,6 @@ export async function collectPagerdutyOncallCoverageData(
     capture<PagerdutyCollection>(emptyCollection(), () => client.listOncalls(now, daysAhead(now, 1))),
     capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listUsers(userLimit), projectUser)),
   ]);
-  // Detail reads are keyed on the schedules that were read; without a schedule list none is issued.
   const scheduleDetails = schedules.error
     ? skippedSnapshot<JsonRecord[]>([], "schedule detail reads", "/schedules", schedules)
     : await capture<JsonRecord[]>([], async () => {
@@ -2652,7 +2650,6 @@ export function assessPagerdutyOncallCoverage(data: PagerdutyOncallCoverageData)
   const unresolvedOncallUsers = [...oncallUserIds].filter((id) => !users.items.some((user) => asString(user.id) === id));
   const scheduleNotes = partialNotes(data.scope, schedules);
   const userNotes = partialNotes(data.scope, users);
-  // Values computed from rendered schedule details depend on the schedule list and on every detail read.
   const detailed = <T>(value: T): T | null => (detailsReadable ? derived(value, schedules) : null);
 
   const scheduleGate = (): PagerdutyFindingStatus | undefined =>
@@ -3034,7 +3031,6 @@ export async function collectPagerdutyIntegrationSecurityData(
     capture<PagerdutyCollection>(emptyCollection(), () => client.listBusinessServices(businessServiceLimit)),
     capture<PagerdutyCollection>(emptyCollection(), async () => projectCollection(await client.listChangeEvents(since, now), projectChangeEvent)),
   ]);
-  // Dependency reads are keyed on the business services that were read; without that list none is issued.
   const businessServiceDependencies = businessServices.error
     ? skippedSnapshot<Record<string, JsonRecord[]>>({}, "business service dependency reads", "/business_services", businessServices)
     : await capture<Record<string, JsonRecord[]>>({}, async () => {
@@ -3758,18 +3754,18 @@ function auditLimitParam() {
 }
 
 function runAssessmentTool(
-  pi: any,
+  pi: ExtensionAPI,
   name: string,
   label: string,
   description: string,
-  extraParams: Record<string, unknown>,
+  extraParams: Record<string, TSchema>,
   run: (client: PagerdutyApiClient, options: PagerdutyAssessmentOptions) => Promise<PagerdutyAssessmentResult>,
 ): void {
   pi.registerTool({
     name,
     label,
     description,
-    parameters: Type.Object({ ...authParams, ...extraParams } as Record<string, any>),
+    parameters: Type.Object({ ...authParams, ...extraParams }),
     prepareArguments: normalizeAssessArgs,
     async execute(_toolCallId: string, args: AssessArgs) {
       try {

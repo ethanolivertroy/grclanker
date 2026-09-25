@@ -17,6 +17,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
@@ -3539,7 +3540,10 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
   }
   const scheduled = scans.data.filter((scan) => asString(asObject(scan.schedule)?.type) === "ical");
   const completed = results.status === "ok"
-    ? results.data.filter((result) => /completed/i.test(asString(result.status) ?? "") && parseTimestampMs(result.finishTime) !== undefined && daysBetween(now, parseTimestampMs(result.finishTime) as number) <= staleScanDays)
+    ? results.data.filter((result) => {
+        const finishedAt = parseTimestampMs(result.finishTime);
+        return /completed/i.test(asString(result.status) ?? "") && finishedAt !== undefined && daysBetween(now, finishedAt) <= staleScanDays;
+      })
     : [];
   let status: TenableFindingStatus;
   let summary: string;
@@ -5104,7 +5108,7 @@ async function runAssessment(kind: AssessmentKind, clients: TenableClients, opti
   }
 }
 
-function registerAssessmentTool(pi: any, kind: AssessmentKind, name: string, label: string, description: string): void {
+function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: string, label: string, description: string): void {
   pi.registerTool({
     name,
     label,
