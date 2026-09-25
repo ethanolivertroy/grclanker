@@ -1,4 +1,18 @@
 {
+<<<<<<< HEAD
+	"compatibility_date": "2026-06-09",
+	"compatibility_flags": ["global_fetch_strictly_public"],
+	"name": "grclanker",
+	"main": "@astrojs/cloudflare/entrypoints/server",
+	"assets": {
+		"directory": "./dist",
+		"binding": "ASSETS"
+	},
+	"observability": {
+		"enabled": true
+	}
+}
+=======
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "grclanker",
   "compatibility_date": "2026-07-01",
@@ -7,3 +21,4 @@
     "not_found_handling": "404-page"
   }
 }
+>>>>>>> origin/main
