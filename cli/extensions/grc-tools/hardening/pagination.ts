@@ -1,13 +1,12 @@
 /**
- * Uniform pagination stop reporting (rule 10).
+ * Uniform pagination stop reporting.
  *
  * Every pagination or collection loop that can exit on an item limit, a page cap, a time budget, a
  * cursor that does not advance, an empty page that still reports a cursor, a listing that reports
  * no total, or a server-supplied next link that may not be followed (`resolveSameOriginUrl` in
- * `next-link.ts`) must report the dataset truncated so the rule 5 partial-inventory demotion
- * applies. Only `exhausted` (no next cursor, and every reported item seen) yields a complete
- * listing. Distilled from the New Relic `describePagination` (#30). This module describes the stop;
- * it does not walk pages, because every client has its own page shape.
+ * `next-link.ts`) must report the dataset truncated so partial-inventory demotion applies. Only
+ * `exhausted` (no next cursor, and every reported item seen) yields a complete listing. This module
+ * describes the stop; it does not walk pages, because every client has its own page shape.
  */
 
 /**
@@ -31,7 +30,7 @@ export type PaginationStopKind = PaginationStop["kind"];
 export interface PaginationOutcome {
   complete: boolean;
   truncated: boolean;
-  /** Why the listing is incomplete, in the rule 10 phrasing; absent when it is complete. */
+  /** Why the listing is incomplete; absent when it is complete. */
   note?: string;
 }
 

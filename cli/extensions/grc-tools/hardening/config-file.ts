@@ -1,5 +1,5 @@
 /**
- * Safe config-file loaders (rule 9, config-loader class; coordinator addenda 6 and 6b).
+ * Safe config-file loaders.
  *
  * A malformed config file whose bad line carries a credential puts that credential into the parser's
  * message: the `yaml` package quotes the offending source line (`key: <token>: Bearer <token>`),
