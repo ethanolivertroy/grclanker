@@ -311,8 +311,10 @@ export interface DatadogInventoryGap {
   collect_manually: string;
 }
 
+type DatadogInventoryGapEvidence = JsonRecord | DatadogInventoryGap;
+
 type DatadogEvidence = JsonRecord & {
-  unreadable_inventories?: DatadogInventoryGap[];
+  unreadable_inventories?: DatadogInventoryGapEvidence[];
 };
 
 /**
@@ -1873,7 +1875,7 @@ async function loadCloudIntegrations(
   return loadSurface(`${provider}_integrations`, async () => (await load()).map((record) => projectCloudIntegration(provider, record)), errors);
 }
 
-function withUnreadableEvidence(evidence: DatadogEvidence, gaps: DatadogInventoryGap[]): DatadogEvidence {
+function withUnreadableEvidence(evidence: DatadogEvidence, gaps: DatadogInventoryGapEvidence[]): DatadogEvidence {
   return gaps.length > 0 ? { ...evidence, unreadable_inventories: gaps } : evidence;
 }
 
@@ -1888,7 +1890,7 @@ function withInventoryGaps(
   options: { essential: boolean; manualEvidence?: string[] },
 ): DatadogFinding {
   if (gaps.length === 0) return item;
-  const existing = item.evidence?.unreadable_inventories ?? [];
+  const existing = asRecordArray(item.evidence?.unreadable_inventories);
   const added = gaps.filter((gap) => !existing.some((known) => known.inventory === gap.inventory));
   const evidence = withUnreadableEvidence(item.evidence ?? {}, [...existing, ...added]);
   const caveat = gaps.map(inventoryGapCaveat).join(" ");
