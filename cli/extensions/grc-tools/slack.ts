@@ -17,7 +17,8 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type, type TSchema } from "@sinclair/typebox";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -2923,7 +2924,7 @@ type ToolName =
   | "slack_assess_channel_governance"
   | "slack_assess_monitoring";
 
-async function runAssessment(tool: ToolName, args: unknown): Promise<unknown> {
+async function runAssessment(tool: ToolName, args: unknown): Promise<ReturnType<typeof textResult>> {
   switch (tool) {
     case "slack_check_access": {
       const result = await checkSlackAccess(createClient(args as CheckAccessArgs));
@@ -2968,11 +2969,11 @@ async function runAssessment(tool: ToolName, args: unknown): Promise<unknown> {
 }
 
 function registerAssessment(
-  pi: any,
+  pi: ExtensionAPI,
   tool: ToolName,
   label: string,
   description: string,
-  parameters: unknown,
+  parameters: TSchema,
   prepareArguments: (args: unknown) => unknown,
 ): void {
   pi.registerTool({

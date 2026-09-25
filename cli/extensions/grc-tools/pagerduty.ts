@@ -18,7 +18,8 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type, type TSchema } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -3753,18 +3754,18 @@ function auditLimitParam() {
 }
 
 function runAssessmentTool(
-  pi: any,
+  pi: ExtensionAPI,
   name: string,
   label: string,
   description: string,
-  extraParams: Record<string, unknown>,
+  extraParams: Record<string, TSchema>,
   run: (client: PagerdutyApiClient, options: PagerdutyAssessmentOptions) => Promise<PagerdutyAssessmentResult>,
 ): void {
   pi.registerTool({
     name,
     label,
     description,
-    parameters: Type.Object({ ...authParams, ...extraParams } as Record<string, any>),
+    parameters: Type.Object({ ...authParams, ...extraParams }),
     prepareArguments: normalizeAssessArgs,
     async execute(_toolCallId: string, args: AssessArgs) {
       try {

@@ -17,6 +17,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -4504,7 +4505,7 @@ const assessParams = {
 };
 
 function registerAssessmentTool(
-  pi: any,
+  pi: ExtensionAPI,
   name: string,
   label: string,
   description: string,

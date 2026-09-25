@@ -17,6 +17,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
@@ -5107,7 +5108,7 @@ async function runAssessment(kind: AssessmentKind, clients: TenableClients, opti
   }
 }
 
-function registerAssessmentTool(pi: any, kind: AssessmentKind, name: string, label: string, description: string): void {
+function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: string, label: string, description: string): void {
   pi.registerTool({
     name,
     label,
