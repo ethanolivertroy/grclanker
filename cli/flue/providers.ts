@@ -5,9 +5,7 @@
  * OpenAI-compatible endpoint such as Ollama) that the Pi CLI loads on start.
  * Flue registers only Pi's built-in providers, so this module rebuilds those
  * entries with Pi's own `createProvider()` and hands them to Flue's
- * `setProvider()`, following the Flue Models guide ("Custom providers"). The
- * registration lives in the agent module so it also applies under `flue run`,
- * which loads nothing but the agent module.
+ * `setProvider()`.
  */
 import { createProvider, type Api, type Model, type Provider } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";

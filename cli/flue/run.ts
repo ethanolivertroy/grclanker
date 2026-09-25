@@ -91,11 +91,8 @@ function truncate(text: string, limit = ACTIVITY_PREVIEW_LENGTH): string {
 }
 
 /**
- * Compact one-line renderings of tool activity for stderr; other chunks are
- * silent. Tool inputs are redacted before serialization because credentials
- * (API tokens, client secrets, private keys) travel as tool arguments, and
- * tool error text loses the payload Pi's validation error echoes, plus any
- * sensitive value from the matching input that a message repeats verbatim.
+ * Compact one-line renderings of tool activity for stderr. Tool inputs and
+ * repeated sensitive values are redacted before they are written.
  */
 export function createFlueActivityFormatter(
   options: FlueActivityFormatterOptions = {},
