@@ -449,9 +449,8 @@ function explainAlertCenterFailure(error: unknown): unknown {
 
 function buildRunnerEnv(args: GwsCliContext, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const merged = { ...env };
-  if (asString(args.configDir)) {
-    merged.GOOGLE_WORKSPACE_CLI_CONFIG_DIR = args.configDir!.trim();
-  }
+  const configDir = asString(args.configDir);
+  if (configDir) merged.GOOGLE_WORKSPACE_CLI_CONFIG_DIR = configDir;
   return merged;
 }
 
@@ -747,7 +746,7 @@ function normalizeAlertRecords(parsed: unknown): GwsOpsActivityRecord[] {
       source: asString(alert.source),
       actor: asString(metadata.assignee),
       application: "alertcenter",
-      eventNames: alertType ? [alertType] : [],
+      eventNames: alertType && typeof alert.type === "string" ? [alert.type] : [],
     };
   });
 }
@@ -995,9 +994,10 @@ export async function investigateGwsAlerts(
 
   const command = buildAlertCommand(executable, args);
   const mode: GwsOpsMode = normalizeDryRun(args.dry_run) ? "dry_run" : "execute";
+  const filter = asString(args.filter);
   const notes = [
-    asString(args.filter)
-      ? `Alert filter passed through to gws: ${args.filter!.trim()}`
+    filter
+      ? `Alert filter passed through to gws: ${filter}`
       : "No Alert Center filter was supplied; this query relies on page-size bounds instead of a time filter.",
     maxResultsNote(args.max_results, "Page size"),
   ];
