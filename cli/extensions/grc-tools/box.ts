@@ -2663,7 +2663,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     const createdAt = parseIsoDate(user.created_at);
     if (createdAt && createdAt > cutoff) return false;
     const id = asString(user.id);
-    return Boolean(id) && !activeActorIds.has(id as string);
+    return id !== undefined && !activeActorIds.has(id);
   });
   const failedLoginActorIds = new Set(failedLogins.map(eventActorId).filter((id): id is string => Boolean(id)));
   const inactiveWithFailedLogins = inactiveCandidates.filter((user) => failedLoginActorIds.has(asString(user.id) ?? ""));
