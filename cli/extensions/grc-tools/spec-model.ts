@@ -113,6 +113,7 @@ export interface CheckContract {
   severity: FindingSeverity;
   owningTool: string;
   sourceSurfaceIds: readonly string[];
+  evidenceFields: readonly string[];
   criteria: VerdictCriteria;
 }
 

@@ -113,6 +113,8 @@ test("every finding publishes exact criteria, constants, and four portability ex
       for (const status of ["pass", "warn", "fail", "manual"]) {
         assert.ok(check.criteria[status].length > 20, `${check.id}: exact ${status} predicate`);
       }
+      assert.ok(check.evidenceFields.length > 0, `${check.id}: evidence schema`);
+      assert.equal(new Set(check.evidenceFields).size, check.evidenceFields.length, `${check.id}: unique evidence fields`);
       assert.deepEqual(
         check.criteria.examples.map((example) => example.kind).sort(),
         ["compliant", "noncompliant", "partial", "unreadable"],

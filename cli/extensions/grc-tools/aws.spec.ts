@@ -473,7 +473,9 @@ function awsCheck(
   sourceSurfaceIds: readonly string[],
   verdictCriteria: VerdictCriteria,
 ): CheckContract {
-  return { id, controlNumbers: AWS_FINDING_CONTROLS[id], title, severity, owningTool, sourceSurfaceIds, criteria: verdictCriteria };
+  const evidenceFields = AWS_EVIDENCE_FIELDS[id];
+  if (!evidenceFields) throw new Error(`No evidence schema exists for ${id}`);
+  return { id, controlNumbers: AWS_FINDING_CONTROLS[id], title, severity, owningTool, sourceSurfaceIds, evidenceFields, criteria: verdictCriteria };
 }
 
 const IDENTITY_TOOL = "aws_assess_identity";
@@ -481,6 +483,36 @@ const LOGGING_TOOL = "aws_assess_logging_detection";
 const ORG_TOOL = "aws_assess_org_guardrails";
 const DATA_TOOL = "aws_assess_data_protection";
 const NETWORK_TOOL = "aws_assess_network_security";
+
+export const AWS_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  "AWS-IAM-01": ["summary_readable", "account_mfa_enabled", "account_access_keys_present"],
+  "AWS-IAM-02": ["users_readable", "user_count", "users_mfa_judged", "users_without_mfa", "users_mfa_unreadable", "user_inventory_truncated"],
+  "AWS-IAM-03": ["password_policy_readable", "password_policy_configured", "password_policy"],
+  "AWS-IAM-04": ["users_readable", "keys_sampled", "keys_judged", "stale_access_keys", "users_keys_unreadable", "keys_last_used_unreadable", "user_inventory_truncated"],
+  "AWS-IAM-05": ["roles_readable", "roles_read", "privileged_roles", "roles_without_boundaries", "max_privileged_roles", "role_inventory_truncated"],
+  "AWS-IAM-06": ["users_readable", "dormant_users", "users_keys_unreadable", "user_inventory_truncated"],
+  "AWS-IAM-07": ["region", "lookup_region", "global_event_region", "global_lookup_error", "lookback_days", "window_start", "events_readable", "root_events", "root_console_logins", "root_other_events", "lookup_truncated"],
+  "AWS-IAM-08": ["policies_readable", "customer_managed_policies", "full_admin_attached", "full_admin_unattached", "service_wildcard_policies", "policies_unreadable", "policy_inventory_truncated", "inline_policies"],
+  "AWS-LOG-01": ["trails_readable", "trails"],
+  "AWS-LOG-02": ["trails_readable", "data_event_trails", "selectors_unreadable"],
+  "AWS-LOG-03": ["hub_readable", "hub_enabled", "standards_readable", "standard_count", "standards_truncated"],
+  "AWS-LOG-04": ["detectors_readable", "detector_count", "enabled_detectors", "detectors_unreadable", "detector_list_truncated"],
+  "AWS-LOG-05": ["recorders_readable", "recorder_status_readable", "recorders", "recorder_statuses"],
+  "AWS-ORG-01": ["organization_readable", "standalone", "organization", "accounts_readable", "accounts", "account_list_truncated"],
+  "AWS-ORG-02": ["scps_readable", "scp_count", "attached_scp_count", "scps_targets_unreadable", "scp_list_truncated", "sample"],
+  "AWS-ORG-03": ["analyzers_readable", "analyzers", "analyzer_list_truncated"],
+  "AWS-ORG-04": ["analyzers_readable", "analyzers_sampled", "analyzers_findings_unreadable", "analyzers_findings_truncated", "active_finding_count", "sample"],
+  "AWS-ORG-05": ["instances_readable", "identity_center_instances", "instance_list_truncated"],
+  "AWS-ORG-06": ["assessments_readable", "active_assessments", "assessments", "list_truncated"],
+  "AWS-ORG-07": ["contact_readable", "security_contact_configured", "has_name", "has_title", "email_domain", "has_phone", "billing_and_operations_contacts"],
+  "AWS-DATA-11": ["account_id", "account_block_readable", "account_block_configured", "account_flags", "buckets_readable", "buckets", "buckets_without_full_block", "buckets_without_bucket_level_block", "buckets_with_public_policy", "buckets_unreadable", "bucket_inventory_truncated"],
+  "AWS-DATA-12": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "ebs_by_region", "rds_instances", "rds_unencrypted", "rds_without_flag", "regions_with_rds_errors", "buckets_readable", "buckets", "buckets_without_default_encryption", "buckets_encryption_unreadable", "bucket_inventory_truncated", "efs"],
+  "AWS-DATA-13": ["buckets_readable", "buckets", "buckets_without_tls_deny", "buckets_policy_unreadable", "bucket_inventory_truncated", "load_balancer_tls"],
+  "AWS-DATA-22": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "keys", "customer_managed_keys", "eligible_keys", "keys_not_rotating", "keys_rotation_unreadable", "keys_manager_unreadable", "ineligible_customer_keys", "key_inventory_truncated", "regions_with_list_errors"],
+  "AWS-NET-14": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "vpcs", "vpcs_without_active_flow_logs", "vpcs_unverified", "inventory_truncated", "regions_with_vpc_errors", "regions_with_flow_log_errors"],
+  "AWS-NET-20": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "sensitive_ports", "network_acls", "permissive_network_acls", "inventory_truncated", "regions_with_errors"],
+  "AWS-NET-21": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "sensitive_ports", "security_groups", "unrestricted_security_groups", "inventory_truncated", "regions_with_errors"],
+};
 
 export const AWS_CHECKS: readonly CheckContract[] = [
   awsCheck("AWS-IAM-01", "Root account MFA and access keys", "critical", IDENTITY_TOOL, ["iam-get-account-summary"], criteria(
@@ -721,6 +753,11 @@ const AWS_EXPORT = {
     AwsAccessSurface: ["name:string", "service:string", "command:IAM action string", "region:string", "status:readable|not_readable", "count:number|null", "truncated:boolean|null", "error?:string", "error_code?:string|null", "http_status?:number|null"],
     NotCollectedMarker: ["collected:false", "command:string", "error:string|null", "error_code:string|null", "http_status:number|null"],
     RegionScope: ["regions:string[]", "regionsTotal:number|null", "regionsSeen:number", "partial:boolean", "source:arguments|describe-regions|configured-region-fallback", "error?:string"],
+    IdentitySummary: ["users", "user_inventory_truncated", "users_mfa_judged", "users_without_mfa", "keys_judged", "stale_access_keys", "keys_last_used_unreadable", "roles", "role_inventory_truncated", "privileged_roles", "roles_without_boundaries", "dormant_users", "root_console_logins", "customer_managed_policies", "full_admin_policies_attached", "collection_errors"],
+    LoggingDetectionSummary: ["trails", "compliant_trails", "security_hub_enabled", "security_hub_standards", "guardduty_detectors", "enabled_guardduty_detectors", "config_recorders", "recording_config_recorders", "collection_errors"],
+    OrgGuardrailsSummary: ["organization_visible", "accounts", "scps", "attached_scps", "analyzers", "active_analyzers", "active_external_findings", "identity_center_instances", "audit_manager_active_assessments", "security_contact_configured", "collection_errors"],
+    DataProtectionSummary: ["account_id", "regions_seen", "regions_total", "buckets", "buckets_without_full_block", "buckets_without_bucket_level_block", "buckets_with_public_policy", "buckets_without_default_encryption", "buckets_without_tls_deny", "ebs_regions_without_default_encryption", "rds_instances", "rds_unencrypted", "customer_managed_keys", "keys_not_rotating", "collection_errors"],
+    NetworkSecuritySummary: ["regions_seen", "regions_total", "vpcs", "vpcs_without_active_flow_logs", "network_acls", "permissive_network_acls", "security_groups", "unrestricted_security_groups", "collection_errors"],
   },
   jsonFormatting: "Before every JSON write, recursively scrub the complete value. Serialize with two-space indentation, preserve object insertion order, encode Date values as ISO strings through normal JSON conversion, and append exactly one newline.",
 } as const;

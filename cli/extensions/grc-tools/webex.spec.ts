@@ -338,12 +338,39 @@ function check(
   sourceSurfaceIds: readonly string[],
   verdictCriteria: VerdictCriteria,
 ): CheckContract {
-  return { id, controlNumbers, title, severity, owningTool, sourceSurfaceIds, criteria: verdictCriteria };
+  const evidenceFields = WEBEX_EVIDENCE_FIELDS[id];
+  if (!evidenceFields) throw new Error(`No evidence schema exists for ${id}`);
+  return { id, controlNumbers, title, severity, owningTool, sourceSurfaceIds, evidenceFields, criteria: verdictCriteria };
 }
 
 const IDENTITY_TOOL = "webex_assess_identity";
 const COLLAB_TOOL = "webex_assess_collaboration_governance";
 const MEETING_TOOL = "webex_assess_meeting_hybrid_security";
+
+export const WEBEX_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  "WEBEX-ID-01": ["org_id", "organization", "citation"],
+  "WEBEX-ID-02": ["admin_users", "admin_count", "people_seen", "people_truncated", "denied_endpoint", "inventory_status", "citation", "people_citation", "roles_citation", "token_type"],
+  "WEBEX-ID-03": ["citation", "token_type", "people_seen", "roles_seen", "compliance_officers", "compliance_officer_count", "people_truncated"],
+  "WEBEX-ID-04": ["token_type", "people_seen", "people_truncated", "admin_users", "admin_count", "max_admins"],
+  "WEBEX-ID-05": ["citation", "token_type", "people_seen", "people_truncated", "bots", "bot_count"],
+  "WEBEX-ID-06": ["bot_count", "people_status", "citation"],
+  "WEBEX-ID-07": ["guests", "guest_count_people", "guest_count_api", "guest_count_api_error", "guest_count_api_status", "people_seen", "people_truncated", "citation", "guest_count_citation", "token_type"],
+  "WEBEX-COLLAB-01": ["org_id", "citation"],
+  "WEBEX-COLLAB-02": ["events_readable", "events_seen", "events_status", "citation"],
+  "WEBEX-COLLAB-03": ["citation", "token_type", "recordings_seen", "deleted_recordings", "recordings_truncated"],
+  "WEBEX-COLLAB-04": ["citation", "rooms_seen", "rooms_truncated", "rooms_without_classification", "rooms_without_classification_count", "token_type", "token_probe_status"],
+  "WEBEX-COLLAB-05": ["citation", "webhooks_seen", "webhooks_truncated", "inactive_webhooks", "insecure_webhooks", "insecure_webhooks_count", "token_type", "token_probe_status"],
+  "WEBEX-COLLAB-06": ["citation", "token_type", "licenses_seen", "licenses_truncated", "total_units", "consumed_units", "unassigned_units"],
+  "WEBEX-COLLAB-07": ["citation", "token_type", "events_seen", "events_with_dates", "undated_events", "window_days", "events_truncated"],
+  "WEBEX-COLLAB-08": ["events_readable", "events_seen", "events_truncated", "events_status", "citation"],
+  "WEBEX-MTG-01": ["meeting_preferences_readable", "sites_seen", "meeting_sites_status", "citation"],
+  "WEBEX-MTG-02": ["sites", "denied_sites", "site_coverage_complete", "site_list_status", "citation", "token_type", "meetings_seen", "meetings_truncated", "meetings_status", "sampled_allow_join_without_lobby", "sampled_without_password", "personal_meeting_room_auto_lock", "meeting_preferences_status", "token_probe_status", "meetings_citation"],
+  "WEBEX-MTG-03": ["sites", "denied_sites", "site_coverage_complete", "site_list_status", "citation", "token_type", "token_probe_status"],
+  "WEBEX-MTG-04": ["citation", "token_type", "clusters_seen", "connectors_seen", "connector_versions", "undated_connectors", "non_operational", "non_operational_count"],
+  "WEBEX-MTG-05": ["citation", "token_type", "devices_seen", "devices_truncated", "personal_mode_devices", "software_versions", "software_version_count", "upgrade_channels", "upgrade_channel_count", "devices_without_upgrade_channel", "managed_by", "workspaces_seen", "workspaces_status"],
+  "WEBEX-MTG-06": ["sites", "denied_sites", "site_coverage_complete", "site_list_status", "citation", "token_type", "meetings_seen", "meetings_truncated", "meetings_status", "sampled_allow_join_without_lobby", "sampled_without_password", "personal_meeting_room_auto_lock", "meeting_preferences_status", "token_probe_status", "meetings_citation"],
+  "WEBEX-MTG-07": ["citation"],
+};
 
 export const WEBEX_CHECKS: readonly CheckContract[] = [
   check("WEBEX-ID-01", [1], "SSO enforcement", "critical", IDENTITY_TOOL, ["organization"], ALWAYS_MANUAL("Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created.")),
@@ -563,6 +590,9 @@ const WEBEX_EXPORT = {
     WebexAccessCheckResult: ["status:healthy|limited", "orgId?:string", "tokenType:person|bot|appuser|unknown", "adminCapable:boolean", "surfaces:WebexAccessSurface[]", "notes:string[]", "recommendedNextStep:string"],
     WebexAccessSurface: ["name:string", "endpoint:string", "doc:string", "status:readable|not_readable|not_configured|manual", "count?:number", "truncated?:boolean", "error?:string"],
     UnreadableSurface: ["error:scrubbed string", "status:number|null"],
+    IdentitySummary: ["org_id", "token_type", "people_seen", "people_truncated", "admin_users", "compliance_officers", "bots", "guests", "inventory_status", "pass", "warn", "fail", "manual"],
+    CollaborationGovernanceSummary: ["org_id", "token_type", "rooms_seen", "rooms_without_classification", "webhooks_seen", "insecure_webhooks", "recordings_seen", "admin_audit_events", "compliance_events", "unassigned_license_units", "total_license_units", "inventory_status", "pass", "warn", "fail", "manual"],
+    MeetingHybridSecuritySummary: ["org_id", "token_type", "sites_evaluated", "sites_denied", "meetings_seen", "hybrid_clusters", "hybrid_connectors", "non_operational_connectors", "devices_seen", "workspaces_seen", "inventory_status", "pass", "warn", "fail", "manual"],
   },
   jsonFormatting: "Before every JSON write, recursively scrub the complete value. Serialize with two-space indentation, preserve object insertion order, encode dates as ISO strings through normal JSON conversion, and append exactly one newline.",
 } as const;
