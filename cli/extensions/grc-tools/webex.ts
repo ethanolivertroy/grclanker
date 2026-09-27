@@ -379,7 +379,7 @@ const EMBEDDED_URL_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 /** Credential parameters embedded in SIP and tel URIs, for example ;pwd=1234. */
 const URI_CREDENTIAL_PARAM_PATTERN = /;(pwd|password|pin|passcode|token|secret)=[^;?#\s]*/gi;
 /** `key=value`, `key: value`, or `"key":"value"`; the key is classified by the shared segment-aware rule. */
-const CREDENTIAL_ASSIGNMENT_PATTERN = /\b"?([A-Za-z][A-Za-z0-9_.-]{0,127})"?\s*[=:]\s*"?(?:(?:bearer|basic)\s+)?[^\s"'&;,<>]+/gi;
+const CREDENTIAL_ASSIGNMENT_PATTERN = /(?<![A-Za-z0-9_./-])"?([A-Za-z][A-Za-z0-9_.-]{0,127})"?\s*[=:]\s*"?(?:(?:bearer|basic)\s+)?[^\s"'&;,<>]+/gi;
 /** A standalone `Bearer <value>` or `Basic <value>` authorization value. */
 const CREDENTIAL_SCHEME_PATTERN = /\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})/gi;
 
