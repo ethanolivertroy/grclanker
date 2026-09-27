@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the SCN FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Significant Change Notification
@@ -47,7 +47,7 @@ Providers MUST notify all necessary parties within 10 business days after finish
 Checklist items:
 - Summary of any new risks identified and/or vulnerabilities resulting from the change (if applicable)
 
-Terms: `Adaptive Change`, `All Necessary Parties`, `Provider`, `Regularly`, `Significant Change`, `Vulnerability`
+Terms: `Adaptive Change`, `All Necessary Parties`, `Regularly`, `Significant Change`, `Vulnerability`
 
 Affects: Providers
 
@@ -62,7 +62,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY include additional relevant information in Significant Change Notifications.
 
-Terms: `Provider`, `Significant Change`
+Terms: `Significant Change`
 
 Affects: Providers
 
@@ -74,7 +74,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY execute significant changes (including transformative changes) during an emergency or incident without following the Significant Change Notification rules in advance. In such emergencies, providers MUST follow all relevant procedures, notify all necessary parties, retroactively provide all Significant Change Notification materials, and complete appropriate assessment after the incident.
 
-Terms: `All Necessary Parties`, `Certification Package`, `Incident`, `Provider`, `Significant Change`, `Transformative Change`
+Terms: `All Necessary Parties`, `Certification Package`, `Incident`, `Significant Change`, `Transformative Change`
 
 Affects: Providers
 
@@ -93,7 +93,7 @@ Checklist items:
 - If it is not, is it a transformative change? --> Follow the Transformative Change rules (SCN-TRF Transformative Changes).
 - If it is not, then it is an adaptive change --> Follow the Adaptive Change rules (SCN-ADP Adaptive Changes).
 
-Terms: `Adaptive Change`, `Certification Class`, `Certification Class Change`, `Provider`, `Routine Recurring Change`, `Significant Change`, `Transformative Change`
+Terms: `Adaptive Change`, `Certification Class`, `Certification Class Change`, `Routine Recurring Change`, `Significant Change`, `Transformative Change`
 
 Affects: Providers
 
@@ -103,7 +103,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST keep 12 months of historical Significant Change Notifications available with their FedRAMP Certification Data.
 
-Terms: `Certification Data`, `Provider`, `Significant Change`
+Terms: `Certification Data`, `Significant Change`
 
 Affects: Providers
 
@@ -113,7 +113,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST make ALL Significant Change Notifications and related audit records available in human-readable and JSON formats.
 
-Terms: `Provider`, `Significant Change`
+Terms: `Significant Change`
 
 Affects: Providers
 
@@ -135,7 +135,7 @@ Checklist items:
 - Copy of the business or security impact analysis
 - Name and title of approver
 
-Terms: `Assessor`, `Provider`, `Significant Change`, `Validation`, `Verification`, `Vulnerability`
+Terms: `Significant Change`, `Validation`, `Verification`, `Vulnerability`
 
 Affects: Providers
 
@@ -147,7 +147,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST maintain auditable records of the significant change evaluation activities required by SCN-CSO-EVA (Evaluate Changes) and make them available to FedRAMP as requested.
 
-Terms: `Certification Package`, `Provider`, `Significant Change`
+Terms: `Certification Package`, `Significant Change`
 
 Affects: Providers
 
@@ -159,7 +159,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY notify necessary parties in a variety of ways as long as the mechanism for notification is clearly documented in the FedRAMP Certification Package and easily accessible.
 
-Terms: `Agency`, `Certification Package`, `Provider`
+Terms: `Certification Package`
 
 Affects: Providers
 
@@ -172,7 +172,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 FedRAMP MAY require providers to delay significant changes beyond the standard Significant Change Notification period and/or submit significant changes for approval in advance as a condition of a formal FedRAMP Corrective Action Plan or other agreement.
 
-Terms: `Provider`, `Significant Change`
+Terms: `Significant Change`
 
 Affects: FedRAMP
 
@@ -184,7 +184,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD NOT make formal Significant Change Notifications for routine recurring changes; this type of change is exempted from notification requirements.
 
-Terms: `Incident`, `Provider`, `Regularly`, `Routine Recurring Change`, `Significant Change`, `Vulnerability`
+Terms: `Incident`, `Regularly`, `Routine Recurring Change`, `Significant Change`, `Vulnerability`
 
 Affects: Providers
 
@@ -198,7 +198,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST notify all necessary parties within 5 business days after finishing transformative changes, including updates to all previously sent information.
 
-Terms: `All Necessary Parties`, `Provider`, `Transformative Change`
+Terms: `All Necessary Parties`, `Transformative Change`
 
 Affects: Providers
 
@@ -215,7 +215,7 @@ Checklist items:
 - Summary of any new risks identified and/or vulnerabilities resulting from the change (if applicable)
 - Copy of the security assessment report (if applicable)
 
-Terms: `All Necessary Parties`, `Provider`, `Transformative Change`, `Validation`, `Verification`, `Vulnerability`
+Terms: `All Necessary Parties`, `Transformative Change`, `Validation`, `Verification`, `Vulnerability`
 
 Affects: Providers
 
@@ -227,7 +227,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST notify all necessary parties of final plans for transformative changes at least 10 business days before starting transformative changes, including updates to all previously sent information.
 
-Terms: `All Necessary Parties`, `Provider`, `Transformative Change`
+Terms: `All Necessary Parties`, `Transformative Change`
 
 Affects: Providers
 
@@ -239,7 +239,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST notify all necessary parties of initial plans for transformative changes at least 30 business days before starting transformative changes, including a summary of any likely security impacts or changes in risk.
 
-Terms: `All Necessary Parties`, `Likely`, `Provider`, `Transformative Change`
+Terms: `All Necessary Parties`, `Likely`, `Transformative Change`
 
 Affects: Providers
 
@@ -251,7 +251,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD engage a third-party assessor to review the scope and impact of the planned change before starting transformative changes if human validation is necessary; such reviews SHOULD be limited to security decisions that require human validation.
 
-Terms: `Assessor`, `Cloud Service Offering`, `Provider`, `Significant Change`, `Transformative Change`, `Validation`
+Terms: `Cloud Service Offering`, `Significant Change`, `Transformative Change`, `Validation`
 
 Affects: Providers
 
@@ -263,7 +263,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST publish updated service documentation and other materials to reflect transformative changes within 30 business days after finishing transformative changes.
 
-Terms: `Certification Package`, `Provider`, `Transformative Change`
+Terms: `Certification Package`, `Transformative Change`
 
 Affects: Providers
 

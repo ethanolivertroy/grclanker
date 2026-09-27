@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the CMU FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Cryptographic Module Use
@@ -40,7 +40,7 @@ The Cryptographic Module Use rules clarify how providers should select and use c
 
 Providers SHOULD configure agency tenants by default to use cryptographic services that use cryptographic modules or update streams of cryptographic modules with active validations under the NIST Cryptographic Module Validation Program when such modules are available.
 
-Terms: `Agency`, `Provider`, `Validation`
+Terms: `Validation`
 
 Affects: Providers
 
@@ -50,7 +50,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST document the cryptographic modules used in each service (or groups of services that use the same modules) where cryptographic services are used to protect federal customer data, including whether these modules are validated under the NIST Cryptographic Module Validation Program or are update streams of such modules.
 
-Terms: `Federal Customer Data`, `Provider`, `Validation`
+Terms: `Federal Customer Data`, `Validation`
 
 Affects: Providers
 
@@ -65,7 +65,7 @@ Varies by certification class:
 - **Class C SHOULD:** Providers with Class C Certifications SHOULD use cryptographic modules or update streams of cryptographic modules with active validations under the NIST Cryptographic Module Validation Program when using cryptographic services to protect federal customer data.
 - **Class D MUST:** Providers with Class D Certifications MUST use cryptographic modules or update streams of cryptographic modules with active validations under the NIST Cryptographic Module Validation Program when using cryptographic services to protect federal customer data.
 
-Terms: `Federal Customer Data`, `Provider`, `Validation`
+Terms: `Federal Customer Data`, `Validation`
 
 Affects: Providers
 

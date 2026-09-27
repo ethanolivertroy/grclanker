@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the MAS FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Minimum Assessment Scope
@@ -40,7 +40,7 @@ The Minimum Assessment Scope rules help providers define assessment boundaries n
 
 Providers MUST clearly identify, document, and explain information flows and security categories for ALL information resources or sets of information resources in the cloud service offering.
 
-Terms: `Cloud Service Offering`, `Handle`, `Information Resource`, `Provider`, `Security Category`, `Third-Party Information Resource`
+Terms: `Cloud Service Offering`, `Handle`, `Information Resource`, `Security Category`, `Third-Party Information Resource`
 
 Affects: Providers
 
@@ -52,7 +52,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST identify a set of information resources to assess for FedRAMP Certification that includes all information resources that are likely to handle federal customer data or likely to impact the confidentiality, integrity, or availability of federal customer data handled by the cloud service offering; this set of information resources is the cloud service offering.
 
-Terms: `Agency`, `Certification Package`, `Cloud Service Offering`, `Federal Customer Data`, `Handle`, `Information Resource`, `Likely`, `Provider`
+Terms: `Certification Package`, `Cloud Service Offering`, `Federal Customer Data`, `Handle`, `Information Resource`, `Likely`
 
 Affects: Providers
 
@@ -66,7 +66,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST include metadata (including metadata about federal customer data) in the Minimum Assessment Scope ONLY IF MAS-CSO-IIR (Identify Information Resources) APPLIES.
 
-Terms: `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`, `Provider`
+Terms: `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`
 
 Affects: Providers
 
@@ -76,7 +76,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY include additional materials about other information resources that are not part of the cloud service offering in a FedRAMP Certification Package supplement; these resources will not be FedRAMP Certified and MUST be clearly marked and separated from the cloud service offering.
 
-Terms: `Agency`, `Certification Package`, `Cloud Service Offering`, `FedRAMP Certified`, `Information Resource`, `Provider`
+Terms: `Certification Package`, `Cloud Service Offering`, `FedRAMP Certified`, `Information Resource`
 
 Affects: Providers
 
@@ -94,7 +94,7 @@ Checklist items:
 - Mitigation measures in place to reduce the potential impact to federal customer data
 - Compensating controls in place to reduce the potential impact to federal customer data
 
-Terms: `Cloud Service Offering`, `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`, `Provider`, `Third-Party Information Resource`
+Terms: `Cloud Service Offering`, `Federal Customer Data`, `Information Resource`, `Initial Incident Report (IIR)`, `Third-Party Information Resource`
 
 Affects: Providers
 
