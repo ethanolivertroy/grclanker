@@ -16,7 +16,7 @@ import {
   SHARED_PAGINATION_STOP_KINDS,
   SHARED_REDACTION_RULES,
 } from "../dist/extensions/grc-tools/hardening/contract.js";
-import { collectDefinedGrcTools, evaluateVerdictCriteria, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
+import { checkContract, collectDefinedGrcTools, evaluateVerdictCriteria, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 import { resolveWebexConfiguration } from "../dist/extensions/grc-tools/webex.js";
 import {

@@ -619,7 +619,7 @@ export const AWS_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]>>
       ),
     )),
     awsRule("fail", awsNot(awsSome("trails", awsAnd(awsEq("$.is_multi_region", true), awsEq("$.validation", true), awsEq("$.is_logging", true))))),
-    awsRule("warn", awsSome("trails", awsDefined("$.status_error"))),
+    awsRule("warn", awsSome("trails", awsAnd(awsDefined("$.status_error"), awsCompare("ne", awsPath("$.status_error"), awsValue(null))))),
     awsRule("pass", { op: "always" }),
   ],
   "AWS-LOG-02": [
@@ -732,13 +732,13 @@ export const AWS_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]>>
     awsRule("pass", { op: "always" }),
   ],
   "AWS-NET-20": [
-    awsRule("manual", awsOr(awsNot(awsDefined("network_acls")), awsEq("network_acls", 0))),
+    awsRule("manual", awsOr(awsNot(awsDefined("network_acls")), awsNull("network_acls"), awsEq("network_acls", 0))),
     awsRule("fail", awsNonempty("permissive_network_acls")),
     awsRule("warn", awsOr(awsEq("partial", true), awsEq("inventory_truncated", true), awsNonempty("regions_with_errors"))),
     awsRule("pass", { op: "always" }),
   ],
   "AWS-NET-21": [
-    awsRule("manual", awsOr(awsNot(awsDefined("security_groups")), awsEq("security_groups", 0))),
+    awsRule("manual", awsOr(awsNot(awsDefined("security_groups")), awsNull("security_groups"), awsEq("security_groups", 0))),
     awsRule("fail", awsNonempty("unrestricted_security_groups")),
     awsRule("warn", awsOr(awsEq("partial", true), awsEq("inventory_truncated", true), awsNonempty("regions_with_errors"))),
     awsRule("pass", { op: "always" }),

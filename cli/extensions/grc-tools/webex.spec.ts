@@ -406,7 +406,7 @@ const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?:
 const alwaysManualRules = (note: string): readonly VerdictRule[] => [rule("manual", { op: "always" }, note)];
 const statusUnreadable = (name: string): VerdictCondition => eq(`${name}.readable`, false);
 const siteRules = (secondaryStatuses: readonly string[]): readonly VerdictRule[] => [
-  rule("manual", or(compare("eq", length("sites"), value(0)), some("sites", eq("$.status", "manual")))),
+  rule("manual", or(not(defined("sites")), compare("eq", length("sites"), value(0)), some("sites", eq("$.status", "manual")))),
   rule("fail", some("sites", eq("$.status", "fail"))),
   rule("warn", or(
     some("sites", eq("$.status", "warn")),
@@ -442,7 +442,7 @@ export const WEBEX_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]
   ],
   "WEBEX-ID-06": alwaysManualRules("Bot approval has no documented read field."),
   "WEBEX-ID-07": [
-    rule("manual", or(not(defined("guest_count_people")), eq("people_seen", 0))),
+    rule("manual", or(not(defined("guest_count_people")), { op: "null", operand: path("guest_count_people") }, eq("people_seen", 0))),
     rule("warn", or(eq("people_truncated", true), statusUnreadable("guest_count_api_status"))),
     rule("pass", { op: "always" }),
   ],
