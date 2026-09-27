@@ -75,6 +75,7 @@ function parseLinkValue(value: string): { target: string; relations: string[] } 
   if (!target || target.includes("<")) return undefined;
   cursor = targetEnd + 1;
   const relations: string[] = [];
+  let sawRelation = false;
 
   while (true) {
     cursor = skipWhitespace(value, cursor);
@@ -118,11 +119,15 @@ function parseLinkValue(value: string): { target: string; relations: string[] } 
       parameterValue = value.slice(parameterStart, cursor);
     }
 
-    if (name === "rel") {
-      relations.push(...parameterValue.split(/[ \t]+/).filter(Boolean).map((relation) => relation.toLowerCase()));
+    if (name === "rel" && !sawRelation) {
+      sawRelation = true;
+      const relationTypes = parameterValue.split(/[ \t]+/).filter(Boolean);
+      if (relationTypes.length === 0) return undefined;
+      relations.push(...relationTypes.map((relation) => relation.toLowerCase()));
     }
   }
 
+  if (!sawRelation) return undefined;
   return { target, relations };
 }
 

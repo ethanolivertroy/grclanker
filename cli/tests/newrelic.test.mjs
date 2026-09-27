@@ -970,6 +970,16 @@ test("NewrelicApiClient refuses cross-origin and userinfo REST next links", asyn
   assert.equal(malformed.result.complete, false);
   assert.match(malformed.result.note, /Link header could not be parsed/);
   assert.equal(malformed.requests.length, 1);
+
+  for (const linkHeader of [
+    '<https://attacker.example/collect>; title="missing relation"',
+    '<https://attacker.example/collect>; rel=""',
+  ]) {
+    const unusable = await walk("unused", linkHeader);
+    assert.equal(unusable.result.complete, false, linkHeader);
+    assert.match(unusable.result.note, /Link header could not be parsed/);
+    assert.equal(unusable.requests.length, 1, `an unusable relation is partial: ${linkHeader}`);
+  }
 });
 
 test("NewrelicApiClient paginates keySearch with a cursor and scopes it to account IDs", async () => {

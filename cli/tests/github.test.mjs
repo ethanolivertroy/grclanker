@@ -922,6 +922,24 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
   ).listAuditLog();
   assert.equal(finiteMalformed.truncated, true);
   assert.equal(finiteMalformedRequests.length, 1);
+
+  for (const relation of ['title="missing relation"', 'rel=""']) {
+    const unusableRequests = [];
+    await assert.rejects(
+      clientFor("https://attacker.example/collect", unusableRequests, relation).listRepositories(),
+      /Link header could not be parsed/,
+    );
+    assert.equal(unusableRequests.length, 1, `an unusable relation is incomplete: ${relation}`);
+
+    const finiteUnusableRequests = [];
+    const finiteUnusable = await clientFor(
+      "https://attacker.example/collect",
+      finiteUnusableRequests,
+      relation,
+    ).listAuditLog();
+    assert.equal(finiteUnusable.truncated, true, relation);
+    assert.equal(finiteUnusableRequests.length, 1);
+  }
 });
 
 test("GitHub assessment helpers classify sample posture correctly", () => {

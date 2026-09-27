@@ -26,8 +26,21 @@ test("parseNextLinkHeader distinguishes exhaustion from malformed headers", () =
     "<https://api.example.test/page2; rel=next",
     "<https://api.example.test/page2>; rel",
     "<https://api.example.test/page2>; rel=",
+    '<https://api.example.test/page2>; rel=""',
+    '<https://api.example.test/page2>; title="missing relation"',
     '<https://api.example.test/page2>; rel="next",',
   ]) {
     assert.deepEqual(parseNextLinkHeader(header), { kind: "unparseable" }, header);
   }
+});
+
+test("parseNextLinkHeader ignores duplicate rel parameters after the first", () => {
+  assert.deepEqual(
+    parseNextLinkHeader("<https://api.example.test/page2>; rel=prev; rel=next"),
+    { kind: "absent" },
+  );
+  assert.deepEqual(
+    parseNextLinkHeader('<https://api.example.test/page2>; rel="next prev"; rel=last'),
+    { kind: "next", target: "https://api.example.test/page2" },
+  );
 });

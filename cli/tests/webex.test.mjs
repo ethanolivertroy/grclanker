@@ -770,6 +770,15 @@ test("WebexApiClient follows only same-origin next links without userinfo", asyn
   );
   assert.equal(malformed.result.truncated, true);
   assert.equal(malformed.requests.length, 1, "an unparseable Link header is partial, not exhaustion");
+
+  for (const linkHeader of [
+    '<https://attacker.example/collect>; title="missing relation"',
+    '<https://attacker.example/collect>; rel=""',
+  ]) {
+    const unusable = await walk("unused", linkHeader);
+    assert.equal(unusable.result.truncated, true, linkHeader);
+    assert.equal(unusable.requests.length, 1, `an unusable relation is partial: ${linkHeader}`);
+  }
 });
 
 test("WebexApiClient sends max only where the reference documents it and orgId only where documented", async () => {
