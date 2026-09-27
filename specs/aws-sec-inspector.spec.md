@@ -500,35 +500,37 @@ Malformed configuration: Credential-provider errors are replaced with a fixed pr
 
 | # | Control | Finding | Verdict semantics |
 |---|---|---|---|
-| 1 | MFA Enforcement | AWS-IAM-01, AWS-IAM-02 | GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM. ListUsers is unreadable, or every sampled user's MFA-device list is unreadable. |
-| 2 | Password Policy | AWS-IAM-03 | GetAccountPasswordPolicy is unreadable. |
-| 3 | Access Key Rotation | AWS-IAM-04 | ListUsers is unreadable, every user's key list is unreadable, or every sampled key's last-use read is unreadable. |
-| 4 | Root Account Usage | AWS-IAM-01, AWS-IAM-07 | GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM. Root LookupEvents is unreadable. |
-| 5 | Unused Credentials | AWS-IAM-06 | ListUsers is unreadable. |
-| 6 | CloudTrail Enabled | AWS-LOG-01 | DescribeTrails is unreadable, or a qualifying trail exists but every qualifying logging state is unreadable. |
-| 7 | CloudTrail Log Integrity | AWS-LOG-01 | DescribeTrails is unreadable, or a qualifying trail exists but every qualifying logging state is unreadable. |
-| 8 | Security Hub Enabled | AWS-LOG-03 | DescribeHub is unreadable. |
-| 9 | GuardDuty Enabled | AWS-LOG-04 | ListDetectors is unreadable, or detector IDs exist but enablement is unreadable. |
-| 10 | Config Enabled | AWS-LOG-05 | Recorder listing or recorder-status listing is unreadable. |
-| 11 | S3 Public Access | AWS-DATA-11 | Account-level S3 Control GetPublicAccessBlock or ListBuckets is unreadable. |
-| 12 | Encryption at Rest | AWS-DATA-12 | EBS default encryption is unreadable in every assessed region or ListBuckets is unreadable. |
-| 13 | Encryption in Transit | AWS-DATA-13 | ListBuckets is unreadable or returns zero buckets; load-balancer and endpoint TLS remain manual. |
-| 14 | VPC Flow Logs | AWS-NET-14 | VPCs are unreadable in every region, no VPC exists, or every VPC's flow-log state is unreadable or missing. |
-| 15 | Cross-Account Access | AWS-ORG-03, AWS-ORG-04 | ListAnalyzers is unreadable. Analyzers are unreadable, no ACTIVE analyzer exists, or no ACTIVE analyzer has a readable findings list. |
-| 16 | SCP Enforcement | AWS-ORG-01, AWS-ORG-02 | DescribeOrganization is unreadable. ListPolicies is unreadable, or SCPs exist but target lists needed to settle attachment are unreadable. |
-| 17 | Permission Boundaries | AWS-IAM-05 | GetAccountAuthorizationDetails for roles is unreadable. |
-| 18 | Least Privilege | AWS-IAM-08 | ListPolicies is unreadable or returns zero customer-managed policies; inline policies remain manual. |
-| 19 | Logging Configuration | AWS-LOG-02 | DescribeTrails is unreadable or any required GetEventSelectors read is unreadable. |
-| 20 | Network ACLs | AWS-NET-20 | NACLs are unreadable in every region or no NACL is returned. |
-| 21 | Security Group Rules | AWS-NET-21 | Security groups are unreadable in every region or no security group is returned. |
-| 22 | KMS Key Rotation | AWS-DATA-22 | KMS lists fail in every region, no customer key exists, or no customer key can be confirmed because every KeyManager is unreadable. |
-| 23 | Identity Center Configuration | AWS-ORG-05 | ListInstances is unreadable. |
-| 24 | Audit Manager Evidence | AWS-ORG-06 | ListAssessments is unreadable; verify applicability in Audit Manager or the alternate evidence process. |
-| 25 | Account Contacts | AWS-ORG-07 | GetAlternateContact is unreadable. |
+| 1 | MFA Enforcement | AWS-IAM-01, AWS-IAM-02 | Evaluate the ordered first-match rules for AWS-IAM-01, AWS-IAM-02 below. |
+| 2 | Password Policy | AWS-IAM-03 | Evaluate the ordered first-match rules for AWS-IAM-03 below. |
+| 3 | Access Key Rotation | AWS-IAM-04 | Evaluate the ordered first-match rules for AWS-IAM-04 below. |
+| 4 | Root Account Usage | AWS-IAM-01, AWS-IAM-07 | Evaluate the ordered first-match rules for AWS-IAM-01, AWS-IAM-07 below. |
+| 5 | Unused Credentials | AWS-IAM-06 | Evaluate the ordered first-match rules for AWS-IAM-06 below. |
+| 6 | CloudTrail Enabled | AWS-LOG-01 | Evaluate the ordered first-match rules for AWS-LOG-01 below. |
+| 7 | CloudTrail Log Integrity | AWS-LOG-01 | Evaluate the ordered first-match rules for AWS-LOG-01 below. |
+| 8 | Security Hub Enabled | AWS-LOG-03 | Evaluate the ordered first-match rules for AWS-LOG-03 below. |
+| 9 | GuardDuty Enabled | AWS-LOG-04 | Evaluate the ordered first-match rules for AWS-LOG-04 below. |
+| 10 | Config Enabled | AWS-LOG-05 | Evaluate the ordered first-match rules for AWS-LOG-05 below. |
+| 11 | S3 Public Access | AWS-DATA-11 | Evaluate the ordered first-match rules for AWS-DATA-11 below. |
+| 12 | Encryption at Rest | AWS-DATA-12 | Evaluate the ordered first-match rules for AWS-DATA-12 below. |
+| 13 | Encryption in Transit | AWS-DATA-13 | Evaluate the ordered first-match rules for AWS-DATA-13 below. |
+| 14 | VPC Flow Logs | AWS-NET-14 | Evaluate the ordered first-match rules for AWS-NET-14 below. |
+| 15 | Cross-Account Access | AWS-ORG-03, AWS-ORG-04 | Evaluate the ordered first-match rules for AWS-ORG-03, AWS-ORG-04 below. |
+| 16 | SCP Enforcement | AWS-ORG-01, AWS-ORG-02 | Evaluate the ordered first-match rules for AWS-ORG-01, AWS-ORG-02 below. |
+| 17 | Permission Boundaries | AWS-IAM-05 | Evaluate the ordered first-match rules for AWS-IAM-05 below. |
+| 18 | Least Privilege | AWS-IAM-08 | Evaluate the ordered first-match rules for AWS-IAM-08 below. |
+| 19 | Logging Configuration | AWS-LOG-02 | Evaluate the ordered first-match rules for AWS-LOG-02 below. |
+| 20 | Network ACLs | AWS-NET-20 | Evaluate the ordered first-match rules for AWS-NET-20 below. |
+| 21 | Security Group Rules | AWS-NET-21 | Evaluate the ordered first-match rules for AWS-NET-21 below. |
+| 22 | KMS Key Rotation | AWS-DATA-22 | Evaluate the ordered first-match rules for AWS-DATA-22 below. |
+| 23 | Identity Center Configuration | AWS-ORG-05 | Evaluate the ordered first-match rules for AWS-ORG-05 below. |
+| 24 | Audit Manager Evidence | AWS-ORG-06 | Evaluate the ordered first-match rules for AWS-ORG-06 below. |
+| 25 | Account Contacts | AWS-ORG-07 | Evaluate the ordered first-match rules for AWS-ORG-07 below. |
 
-### Finding criteria
+### Finding notes
 
-| Finding | Severity | Owning tool | Sources | Evidence fields | Pass | Warn | Fail | Manual |
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
 |---|---|---|---|---|---|---|---|---|
 | `AWS-IAM-01` | critical | `aws_assess_identity` | `iam-get-account-summary` | `summary_readable`, `account_mfa_enabled`, `account_access_keys_present` | GetAccountSummary is readable, AccountMFAEnabled equals 1, and AccountAccessKeysPresent is absent or equals 0. | No warn verdict is emitted directly. | AccountMFAEnabled is not 1 or AccountAccessKeysPresent is greater than 0. | GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM. |
 | `AWS-IAM-02` | high | `aws_assess_identity` | `iam-list-users`, `iam-list-mfa-devices` | `users_readable`, `user_count`, `users_mfa_judged`, `users_without_mfa`, `users_mfa_unreadable`, `user_inventory_truncated` | ListUsers is readable and every sampled user whose ListMFADevices call is readable has at least one MFA device. | The pass result is demoted when the user inventory is truncated or one or more user MFA-device lists is unreadable. | At least one sampled IAM user has a readable empty MFA-device list. | ListUsers is unreadable, or every sampled user's MFA-device list is unreadable. |
@@ -557,6 +559,115 @@ Malformed configuration: Credential-provider errors are replaced with a fixed pr
 | `AWS-NET-14` | medium | `aws_assess_network_security` | `ec2-describe-vpcs`, `ec2-describe-flow-logs` | `regions_seen`, `regions_total`, `regions`, `partial`, `source`, `scope_error`, `vpcs`, `vpcs_without_active_flow_logs`, `vpcs_unverified`, `inventory_truncated`, `regions_with_vpc_errors`, `regions_with_flow_log_errors` | Every readable VPC has at least one matching flow log whose FlowLogStatus is ACTIVE. | The base pass is demoted by partial region scope, unreadable/truncated VPC or flow-log inventories, or missing FlowLogStatus on some logs. | At least one readable VPC has no ACTIVE flow log. | VPCs are unreadable in every region, no VPC exists, or every VPC's flow-log state is unreadable or missing. |
 | `AWS-NET-20` | medium | `aws_assess_network_security` | `ec2-describe-network-acls` | `regions_seen`, `regions_total`, `regions`, `partial`, `source`, `scope_error`, `sensitive_ports`, `network_acls`, `permissive_network_acls`, `inventory_truncated`, `regions_with_errors` | At least one network ACL is readable and none has an inbound allow entry from 0.0.0.0/0 or ::/0 whose protocol/range covers any configured sensitive port or all ports. | A pass is demoted by partial region scope or unreadable/truncated NACL inventories. | At least one NACL has a matching permissive inbound entry. | NACLs are unreadable in every region or no NACL is returned. |
 | `AWS-NET-21` | high | `aws_assess_network_security` | `ec2-describe-security-groups` | `regions_seen`, `regions_total`, `regions`, `partial`, `source`, `scope_error`, `sensitive_ports`, `security_groups`, `unrestricted_security_groups`, `inventory_truncated`, `regions_with_errors` | At least one security group is readable and none has an inbound IPv4 or IPv6 world source whose protocol/range covers any configured sensitive port or all ports. | A pass is demoted by partial region scope or unreadable/truncated security-group inventories. | At least one security group has a matching unrestricted inbound permission. | Security groups are unreadable in every region or no security group is returned. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `AWS-IAM-01` | 1 | manual | `summary_readable` equals false |  |
+| `AWS-IAM-01` | 2 | fail | any of (`account_mfa_enabled` does not equal 1; `account_access_keys_present` (default 0) is greater than 0) |  |
+| `AWS-IAM-01` | 3 | pass | always |  |
+| `AWS-IAM-02` | 1 | manual | any of (`users_readable` equals false; `users_mfa_judged` is null) |  |
+| `AWS-IAM-02` | 2 | fail | length of `users_without_mfa` is greater than 0 |  |
+| `AWS-IAM-02` | 3 | warn | any of (`user_inventory_truncated` equals true; length of `users_mfa_unreadable` is greater than 0) |  |
+| `AWS-IAM-02` | 4 | pass | always |  |
+| `AWS-IAM-03` | 1 | manual | `password_policy_readable` equals false |  |
+| `AWS-IAM-03` | 2 | fail | any of (`password_policy_configured` equals false; `password_policy.MinimumPasswordLength` (default 0) is less than 14; `password_policy.RequireSymbols` does not equal true; `password_policy.RequireNumbers` does not equal true; `password_policy.RequireUppercaseCharacters` does not equal true; `password_policy.RequireLowercaseCharacters` does not equal true) |  |
+| `AWS-IAM-03` | 3 | pass | always |  |
+| `AWS-IAM-04` | 1 | manual | any of (`users_readable` equals false; `keys_sampled` is null; all of (`keys_sampled` (default 0) is greater than 0; length of `keys_last_used_unreadable` equals `keys_sampled` (default 0))) |  |
+| `AWS-IAM-04` | 2 | fail | length of `stale_access_keys` is greater than 0 |  |
+| `AWS-IAM-04` | 3 | warn | any of (`user_inventory_truncated` equals true; length of `users_keys_unreadable` is greater than 0; length of `keys_last_used_unreadable` is greater than 0) |  |
+| `AWS-IAM-04` | 4 | pass | always |  |
+| `AWS-IAM-05` | 1 | manual | `roles_readable` equals false |  |
+| `AWS-IAM-05` | 2 | fail | length of `roles_without_boundaries` is greater than `max_privileged_roles` (default 5) |  |
+| `AWS-IAM-05` | 3 | warn | any of (length of `roles_without_boundaries` is greater than 0; `role_inventory_truncated` equals true) |  |
+| `AWS-IAM-05` | 4 | pass | always |  |
+| `AWS-IAM-06` | 1 | manual | `users_readable` equals false |  |
+| `AWS-IAM-06` | 2 | warn | any of (length of `dormant_users` is greater than 0; `user_inventory_truncated` equals true; length of `users_keys_unreadable` is greater than 0) |  |
+| `AWS-IAM-06` | 3 | pass | always |  |
+| `AWS-IAM-07` | 1 | manual | `events_readable` equals false |  |
+| `AWS-IAM-07` | 2 | fail | length of `root_console_logins` is greater than 0 |  |
+| `AWS-IAM-07` | 3 | warn | any of (length of `root_other_events` is greater than 0; all of (`global_lookup_error` is defined; `global_lookup_error` does not equal null); `lookup_truncated` equals true; `undated_root_events` (default 0) is greater than 0) |  |
+| `AWS-IAM-07` | 4 | pass | always |  |
+| `AWS-IAM-08` | 1 | manual | any of (`policies_readable` equals false; `customer_managed_policies` equals 0) |  |
+| `AWS-IAM-08` | 2 | fail | length of `full_admin_attached` is greater than 0 |  |
+| `AWS-IAM-08` | 3 | warn | any of (length of `full_admin_unattached` is greater than 0; length of `service_wildcard_policies` is greater than 0; length of `policies_unreadable` is greater than 0; `policy_inventory_truncated` equals true) |  |
+| `AWS-IAM-08` | 4 | pass | always |  |
+| `AWS-LOG-01` | 1 | manual | any of (`trails_readable` equals false; all of (not (some item in `trails` satisfies (all of (`$.is_multi_region` equals true; `$.validation` equals true; `$.is_logging` equals true))); some item in `trails` satisfies (all of (`$.is_multi_region` equals true; `$.validation` equals true; `$.is_logging` is null)))) |  |
+| `AWS-LOG-01` | 2 | fail | not (some item in `trails` satisfies (all of (`$.is_multi_region` equals true; `$.validation` equals true; `$.is_logging` equals true))) |  |
+| `AWS-LOG-01` | 3 | warn | some item in `trails` satisfies (all of (`$.status_error` is defined; `$.status_error` does not equal null)) |  |
+| `AWS-LOG-01` | 4 | pass | always |  |
+| `AWS-LOG-02` | 1 | manual | any of (`trails_readable` equals false; `data_event_trails` is null; all of (length of `data_event_trails` equals 0; length of `selectors_unreadable` is greater than 0)) |  |
+| `AWS-LOG-02` | 2 | warn | any of (length of `data_event_trails` equals 0; length of `selectors_unreadable` is greater than 0) |  |
+| `AWS-LOG-02` | 3 | pass | always |  |
+| `AWS-LOG-03` | 1 | manual | `hub_readable` equals false |  |
+| `AWS-LOG-03` | 2 | fail | `hub_enabled` equals false |  |
+| `AWS-LOG-03` | 3 | warn | any of (`standards_readable` equals false; `standard_count` equals 0; `standards_truncated` equals true) |  |
+| `AWS-LOG-03` | 4 | pass | always |  |
+| `AWS-LOG-04` | 1 | manual | any of (`detectors_readable` equals false; `enabled_detectors` is null; all of (`enabled_detectors` equals 0; length of `detectors_unreadable` is greater than 0)) |  |
+| `AWS-LOG-04` | 2 | fail | `enabled_detectors` equals 0 |  |
+| `AWS-LOG-04` | 3 | warn | any of (length of `detectors_unreadable` is greater than 0; `detector_list_truncated` equals true) |  |
+| `AWS-LOG-04` | 4 | pass | always |  |
+| `AWS-LOG-05` | 1 | manual | any of (`recorders_readable` equals false; all of (length of `recorders` is greater than 0; `recorder_status_readable` equals false)) |  |
+| `AWS-LOG-05` | 2 | fail | any of (length of `recorders` equals 0; not (some item in `recorder_statuses` satisfies (`$.recording` equals true))) |  |
+| `AWS-LOG-05` | 3 | pass | always |  |
+| `AWS-ORG-01` | 1 | manual | `organization_readable` equals false |  |
+| `AWS-ORG-01` | 2 | warn | any of (`standalone` equals true; `accounts_readable` equals false; `account_list_truncated` equals true) |  |
+| `AWS-ORG-01` | 3 | pass | always |  |
+| `AWS-ORG-02` | 1 | warn | `scps_readable` is null |  |
+| `AWS-ORG-02` | 2 | manual | any of (`scps_readable` equals false; `attached_scp_count` is null) |  |
+| `AWS-ORG-02` | 3 | warn | `scp_count` equals 0 |  |
+| `AWS-ORG-02` | 4 | fail | all of (`attached_scp_count` equals 0; length of `scps_targets_unreadable` equals 0) |  |
+| `AWS-ORG-02` | 5 | warn | any of (length of `scps_targets_unreadable` is greater than 0; `scp_list_truncated` equals true) |  |
+| `AWS-ORG-02` | 6 | pass | always |  |
+| `AWS-ORG-03` | 1 | manual | `analyzers_readable` equals false |  |
+| `AWS-ORG-03` | 2 | fail | not (some item in `analyzers` satisfies (`$.status` equals "ACTIVE")) |  |
+| `AWS-ORG-03` | 3 | warn | `analyzer_list_truncated` equals true |  |
+| `AWS-ORG-03` | 4 | pass | always |  |
+| `AWS-ORG-04` | 1 | manual | any of (`analyzers_readable` equals false; `analyzers_sampled` is null; `active_finding_count` is null) |  |
+| `AWS-ORG-04` | 2 | warn | any of (`active_finding_count` (default 0) is greater than 0; length of `analyzers_findings_unreadable` is greater than 0; length of `analyzers_findings_truncated` is greater than 0) |  |
+| `AWS-ORG-04` | 3 | pass | always |  |
+| `AWS-ORG-05` | 1 | manual | `instances_readable` equals false |  |
+| `AWS-ORG-05` | 2 | warn | any of (`identity_center_instances` equals 0; `instance_list_truncated` equals true) |  |
+| `AWS-ORG-05` | 3 | pass | always |  |
+| `AWS-ORG-06` | 1 | manual | `assessments_readable` equals false |  |
+| `AWS-ORG-06` | 2 | fail | `active_assessments` equals 0 |  |
+| `AWS-ORG-06` | 3 | warn | any of (`undated_assessments` (default 0) is greater than 0; `list_truncated` equals true) |  |
+| `AWS-ORG-06` | 4 | pass | always |  |
+| `AWS-ORG-07` | 1 | manual | `contact_readable` equals false |  |
+| `AWS-ORG-07` | 2 | fail | `security_contact_configured` equals false |  |
+| `AWS-ORG-07` | 3 | warn | any of (`email_domain` is null; `has_phone` does not equal true) |  |
+| `AWS-ORG-07` | 4 | pass | always |  |
+| `AWS-DATA-11` | 1 | manual | any of (`account_block_readable` equals false; `buckets_readable` equals false) |  |
+| `AWS-DATA-11` | 2 | fail | any of (`account_block_configured` equals false; all of (not (all of (`account_flags.BlockPublicAcls` equals true; `account_flags.IgnorePublicAcls` equals true; `account_flags.BlockPublicPolicy` equals true; `account_flags.RestrictPublicBuckets` equals true)); any of (length of `buckets_without_full_block` is greater than 0; length of `buckets_with_public_policy` is greater than 0))) |  |
+| `AWS-DATA-11` | 3 | warn | any of (not (all of (`account_flags.BlockPublicAcls` equals true; `account_flags.IgnorePublicAcls` equals true; `account_flags.BlockPublicPolicy` equals true; `account_flags.RestrictPublicBuckets` equals true)); length of `buckets_with_public_policy` is greater than 0; length of `buckets_unreadable` is greater than 0; `bucket_inventory_truncated` equals true) |  |
+| `AWS-DATA-11` | 4 | pass | always |  |
+| `AWS-DATA-12` | 1 | manual | any of (`buckets_readable` equals false; all of (length of `ebs_by_region` is greater than 0; every item in `ebs_by_region` satisfies (`$.EbsEncryptionByDefault` is null))) |  |
+| `AWS-DATA-12` | 2 | fail | any of (some item in `ebs_by_region` satisfies (`$.EbsEncryptionByDefault` equals false); length of `rds_unencrypted` is greater than 0; length of `buckets_without_default_encryption` is greater than 0) |  |
+| `AWS-DATA-12` | 3 | warn | any of (`partial` equals true; some item in `ebs_by_region` satisfies (`$.EbsEncryptionByDefault` is null); length of `regions_with_rds_errors` is greater than 0; length of `rds_without_flag` is greater than 0; length of `buckets_encryption_unreadable` is greater than 0; `bucket_inventory_truncated` equals true) |  |
+| `AWS-DATA-12` | 4 | pass | always |  |
+| `AWS-DATA-13` | 1 | manual | any of (`buckets_readable` equals false; `buckets` equals 0) |  |
+| `AWS-DATA-13` | 2 | fail | length of `buckets_without_tls_deny` is greater than 0 |  |
+| `AWS-DATA-13` | 3 | warn | any of (length of `buckets_policy_unreadable` is greater than 0; `bucket_inventory_truncated` equals true) |  |
+| `AWS-DATA-13` | 4 | pass | always |  |
+| `AWS-DATA-22` | 1 | manual | any of (`keys` is null; `customer_managed_keys` is null; `customer_managed_keys` equals 0) |  |
+| `AWS-DATA-22` | 2 | fail | length of `keys_not_rotating` is greater than 0 |  |
+| `AWS-DATA-22` | 3 | warn | any of (`eligible_keys` equals 0; `partial` equals true; length of `keys_rotation_unreadable` is greater than 0; length of `keys_manager_unreadable` is greater than 0; `key_inventory_truncated` equals true; length of `regions_with_list_errors` is greater than 0) |  |
+| `AWS-DATA-22` | 4 | pass | always |  |
+| `AWS-NET-14` | 1 | manual | any of (not (`vpcs` is defined); `vpcs` equals 0; `vpcs_without_active_flow_logs` is null; length of `vpcs_unverified` equals `vpcs` (default 0)) |  |
+| `AWS-NET-14` | 2 | fail | length of `vpcs_without_active_flow_logs` is greater than 0 |  |
+| `AWS-NET-14` | 3 | warn | any of (`partial` equals true; length of `vpcs_unverified` is greater than 0; `inventory_truncated` equals true; length of `regions_with_vpc_errors` is greater than 0; length of `regions_with_flow_log_errors` is greater than 0) |  |
+| `AWS-NET-14` | 4 | pass | always |  |
+| `AWS-NET-20` | 1 | manual | any of (not (`network_acls` is defined); `network_acls` is null; `network_acls` equals 0) |  |
+| `AWS-NET-20` | 2 | fail | length of `permissive_network_acls` is greater than 0 |  |
+| `AWS-NET-20` | 3 | warn | any of (`partial` equals true; `inventory_truncated` equals true; length of `regions_with_errors` is greater than 0) |  |
+| `AWS-NET-20` | 4 | pass | always |  |
+| `AWS-NET-21` | 1 | manual | any of (not (`security_groups` is defined); `security_groups` is null; `security_groups` equals 0) |  |
+| `AWS-NET-21` | 2 | fail | length of `unrestricted_security_groups` is greater than 0 |  |
+| `AWS-NET-21` | 3 | warn | any of (`partial` equals true; `inventory_truncated` equals true; length of `regions_with_errors` is greater than 0) |  |
+| `AWS-NET-21` | 4 | pass | always |  |
 
 ### Criterion constants
 
@@ -596,7 +707,9 @@ Malformed configuration: Credential-provider errors are replaced with a fixed pr
 | `AWS-NET-21` | `publicIpv6` | ::/0 |
 | `AWS-NET-21` | `defaultSensitivePorts` | 21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017 |
 
-### Criterion examples
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
 
 | Finding | Case | Input condition | Expected | Reason |
 |---|---|---|---|---|

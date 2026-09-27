@@ -331,35 +331,37 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 
 | # | Control | Finding | Verdict semantics |
 |---|---|---|---|
-| 1 | SSO enforcement | WEBEX-ID-01 | Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created. |
-| 2 | Admin MFA | WEBEX-ID-02 | Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field. |
-| 3 | Compliance officer role | WEBEX-ID-03 | People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer. |
-| 4 | External communications | WEBEX-COLLAB-01 | Export Control Hub Messaging external communication allow-list settings; no documented read endpoint exposes the policy. |
-| 5 | File sharing restrictions | WEBEX-COLLAB-02 | Export Control Hub file-sharing controls and DLP or CASB integration evidence; Events is supporting inventory only and exposes no policy-state field. |
-| 6 | Recording storage control | WEBEX-COLLAB-03 | Export Control Hub recording and messaging retention and storage settings; the admin recordings read exposes recordings but no retention or storage-location policy. |
-| 7 | Recording retention | WEBEX-COLLAB-03 | Export Control Hub recording and messaging retention and storage settings; the admin recordings read exposes recordings but no retention or storage-location policy. |
-| 8 | End-to-end meeting encryption | WEBEX-MTG-01 | Export the Control Hub meeting session type showing end-to-end encryption and the calling security configuration showing SRTP; the documented reads expose neither setting. |
-| 9 | Meeting lobby controls | WEBEX-MTG-02 | No site common settings are readable or any site omits joinBeforeHost; collect each site's Control Hub Common Settings > Security page. |
-| 10 | Meeting password required | WEBEX-MTG-06 | No site common settings are readable or any site omits requireStrongPassword; collect each site's Control Hub Common Settings > Security page. |
-| 11 | eDiscovery and legal hold | WEBEX-COLLAB-08 | Export Control Hub eDiscovery and legal-hold configuration; the public compliance guide exposes no read endpoint for configuration and events older than 90 days require Pro Pack. |
-| 12 | Data retention policy | WEBEX-COLLAB-03 | Export Control Hub recording and messaging retention and storage settings; the admin recordings read exposes recordings but no retention or storage-location policy. |
-| 13 | Guest access restrictions | WEBEX-ID-07, WEBEX-MTG-03 | GET /people is unreadable or returns zero people; export the Control Hub guest user list. No site common settings are readable or any site omits requireLoginBeforeAccess; collect each site's Control Hub Common Settings > Security page. |
-| 14 | Space classification | WEBEX-COLLAB-04 | Rooms is unreadable or empty; export Control Hub space classification settings. |
-| 15 | Hybrid cluster health | WEBEX-MTG-04 | Either inventory is unreadable, or both are empty and deployment applicability must be confirmed in Control Hub. |
-| 16 | Hybrid connector status | WEBEX-MTG-04 | Either inventory is unreadable, or both are empty and deployment applicability must be confirmed in Control Hub. |
-| 17 | Device firmware currency | WEBEX-MTG-05 | Compare inventoried software and upgrade channels with Cisco RoomOS lifecycle guidance and export the Control Hub device activation policy; documented device reads expose no end-of-life or blocking-policy field. |
-| 18 | Unmanaged device blocking | WEBEX-MTG-05 | Compare inventoried software and upgrade channels with Cisco RoomOS lifecycle guidance and export the Control Hub device activation policy; documented device reads expose no end-of-life or blocking-policy field. |
-| 19 | Bot management | WEBEX-ID-05, WEBEX-ID-06 | GET /people is unreadable or returns zero people; export Control Hub Apps > Bots. Export Control Hub Management > Apps bot management and reconcile it with WEBEX-ID-05; no documented read field exposes bot approval state. |
-| 20 | Webhook transport and signing | WEBEX-COLLAB-05 | Webhooks is unreadable or empty; collect webhook inventories from every integration owner. |
-| 21 | Messaging data loss prevention | WEBEX-COLLAB-02 | Export Control Hub file-sharing controls and DLP or CASB integration evidence; Events is supporting inventory only and exposes no policy-state field. |
-| 22 | Calling encryption | WEBEX-MTG-01 | Export the Control Hub meeting session type showing end-to-end encryption and the calling security configuration showing SRTP; the documented reads expose neither setting. |
-| 23 | Virtual background policy | WEBEX-MTG-07 | Export the Control Hub meeting settings page for virtual backgrounds; no field is exposed by meeting preferences, common settings, or session types. |
-| 24 | License utilization | WEBEX-COLLAB-06 | Licenses is unreadable, empty, or has totalUnits equal to zero; export the Control Hub subscriptions and usage report. |
-| 25 | Admin activity audit | WEBEX-ID-04, WEBEX-COLLAB-07 | People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list. Organization context is unavailable or admin audit events is unreadable; export the Control Hub admin audit log. |
+| 1 | SSO enforcement | WEBEX-ID-01 | Evaluate the ordered first-match rules for WEBEX-ID-01 below. |
+| 2 | Admin MFA | WEBEX-ID-02 | Evaluate the ordered first-match rules for WEBEX-ID-02 below. |
+| 3 | Compliance officer role | WEBEX-ID-03 | Evaluate the ordered first-match rules for WEBEX-ID-03 below. |
+| 4 | External communications | WEBEX-COLLAB-01 | Evaluate the ordered first-match rules for WEBEX-COLLAB-01 below. |
+| 5 | File sharing restrictions | WEBEX-COLLAB-02 | Evaluate the ordered first-match rules for WEBEX-COLLAB-02 below. |
+| 6 | Recording storage control | WEBEX-COLLAB-03 | Evaluate the ordered first-match rules for WEBEX-COLLAB-03 below. |
+| 7 | Recording retention | WEBEX-COLLAB-03 | Evaluate the ordered first-match rules for WEBEX-COLLAB-03 below. |
+| 8 | End-to-end meeting encryption | WEBEX-MTG-01 | Evaluate the ordered first-match rules for WEBEX-MTG-01 below. |
+| 9 | Meeting lobby controls | WEBEX-MTG-02 | Evaluate the ordered first-match rules for WEBEX-MTG-02 below. |
+| 10 | Meeting password required | WEBEX-MTG-06 | Evaluate the ordered first-match rules for WEBEX-MTG-06 below. |
+| 11 | eDiscovery and legal hold | WEBEX-COLLAB-08 | Evaluate the ordered first-match rules for WEBEX-COLLAB-08 below. |
+| 12 | Data retention policy | WEBEX-COLLAB-03 | Evaluate the ordered first-match rules for WEBEX-COLLAB-03 below. |
+| 13 | Guest access restrictions | WEBEX-ID-07, WEBEX-MTG-03 | Evaluate the ordered first-match rules for WEBEX-ID-07, WEBEX-MTG-03 below. |
+| 14 | Space classification | WEBEX-COLLAB-04 | Evaluate the ordered first-match rules for WEBEX-COLLAB-04 below. |
+| 15 | Hybrid cluster health | WEBEX-MTG-04 | Evaluate the ordered first-match rules for WEBEX-MTG-04 below. |
+| 16 | Hybrid connector status | WEBEX-MTG-04 | Evaluate the ordered first-match rules for WEBEX-MTG-04 below. |
+| 17 | Device firmware currency | WEBEX-MTG-05 | Evaluate the ordered first-match rules for WEBEX-MTG-05 below. |
+| 18 | Unmanaged device blocking | WEBEX-MTG-05 | Evaluate the ordered first-match rules for WEBEX-MTG-05 below. |
+| 19 | Bot management | WEBEX-ID-05, WEBEX-ID-06 | Evaluate the ordered first-match rules for WEBEX-ID-05, WEBEX-ID-06 below. |
+| 20 | Webhook transport and signing | WEBEX-COLLAB-05 | Evaluate the ordered first-match rules for WEBEX-COLLAB-05 below. |
+| 21 | Messaging data loss prevention | WEBEX-COLLAB-02 | Evaluate the ordered first-match rules for WEBEX-COLLAB-02 below. |
+| 22 | Calling encryption | WEBEX-MTG-01 | Evaluate the ordered first-match rules for WEBEX-MTG-01 below. |
+| 23 | Virtual background policy | WEBEX-MTG-07 | Evaluate the ordered first-match rules for WEBEX-MTG-07 below. |
+| 24 | License utilization | WEBEX-COLLAB-06 | Evaluate the ordered first-match rules for WEBEX-COLLAB-06 below. |
+| 25 | Admin activity audit | WEBEX-ID-04, WEBEX-COLLAB-07 | Evaluate the ordered first-match rules for WEBEX-ID-04, WEBEX-COLLAB-07 below. |
 
-### Finding criteria
+### Finding notes
 
-| Finding | Severity | Owning tool | Sources | Evidence fields | Pass | Warn | Fail | Manual |
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
 |---|---|---|---|---|---|---|---|---|
 | `WEBEX-ID-01` | critical | `webex_assess_identity` | `organization` | `org_id`, `organization`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created. |
 | `WEBEX-ID-02` | critical | `webex_assess_identity` | `people`, `roles` | `admin_users`, `admin_count`, `people_seen`, `people_truncated`, `denied_endpoint`, `inventory_status`, `citation`, `people_citation`, `roles_citation`, `token_type` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field. |
@@ -384,6 +386,66 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 | `WEBEX-MTG-06` | high | `webex_assess_meeting_hybrid_security` | `meeting-sites`, `meeting-common-settings`, `meetings`, `meeting-preferences`, `me` | `sites`, `denied_sites`, `site_coverage_complete`, `site_list_status`, `citation`, `token_type`, `meetings_seen`, `meetings_truncated`, `meetings_status`, `sampled_allow_join_without_lobby`, `sampled_without_password`, `personal_meeting_room_auto_lock`, `meeting_preferences_status`, `token_probe_status`, `meetings_citation` | Every readable site reports requireStrongPassword=true and passwordCriteria.minLength at least 8; site coverage and all secondary evidence are complete. | Strong passwords are required but minLength is absent or below 8, or otherwise-passing evidence has partial site or secondary coverage. | Any readable site reports requireStrongPassword=false. | No site common settings are readable or any site omits requireStrongPassword; collect each site's Control Hub Common Settings > Security page. |
 | `WEBEX-MTG-07` | low | `webex_assess_meeting_hybrid_security` | `meeting-common-settings` | `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export the Control Hub meeting settings page for virtual backgrounds; no field is exposed by meeting preferences, common settings, or session types. |
 
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `WEBEX-ID-01` | 1 | manual | always | SSO state has no documented read field. |
+| `WEBEX-ID-02` | 1 | manual | always | Administrator MFA state has no documented read field. |
+| `WEBEX-ID-03` | 1 | manual | any of (not (`people_seen` is defined); `people_seen` equals 0) |  |
+| `WEBEX-ID-03` | 2 | fail | any of (not (`compliance_officer_count` is defined); `compliance_officer_count` equals 0) |  |
+| `WEBEX-ID-03` | 3 | warn | `people_truncated` equals true |  |
+| `WEBEX-ID-03` | 4 | pass | always |  |
+| `WEBEX-ID-04` | 1 | manual | any of (`people_seen` equals 0; all of (not (`admin_users` is defined); not (`admin_count` is defined))) |  |
+| `WEBEX-ID-04` | 2 | warn | any of (`admin_count` (default -1) equals 0; all of (not (`admin_count` is defined); `admin_users` equals 0); `admin_count` (default 0) is greater than `max_admins` (default 10); `people_truncated` equals true) |  |
+| `WEBEX-ID-04` | 3 | pass | always |  |
+| `WEBEX-ID-05` | 1 | manual | not (`bot_count` is defined) |  |
+| `WEBEX-ID-05` | 2 | warn | `people_truncated` equals true |  |
+| `WEBEX-ID-05` | 3 | pass | always |  |
+| `WEBEX-ID-06` | 1 | manual | always | Bot approval has no documented read field. |
+| `WEBEX-ID-07` | 1 | manual | any of (not (`guest_count_people` is defined); `guest_count_people` is null; `people_seen` equals 0) |  |
+| `WEBEX-ID-07` | 2 | warn | any of (`people_truncated` equals true; `guest_count_api_status.readable` equals false) |  |
+| `WEBEX-ID-07` | 3 | pass | always |  |
+| `WEBEX-COLLAB-01` | 1 | manual | always | External communication policy has no documented read field. |
+| `WEBEX-COLLAB-02` | 1 | manual | always | File-sharing and DLP policy state has no documented read field. |
+| `WEBEX-COLLAB-03` | 1 | manual | always | Recording retention/storage policy has no documented read field. |
+| `WEBEX-COLLAB-04` | 1 | manual | any of (not (`rooms_seen` is defined); `rooms_seen` equals 0) |  |
+| `WEBEX-COLLAB-04` | 2 | fail | `rooms_without_classification_count` (default 0) is greater than 0 |  |
+| `WEBEX-COLLAB-04` | 3 | warn | any of (`rooms_truncated` equals true; `token_type` equals "bot"; `token_probe_status.readable` equals false) |  |
+| `WEBEX-COLLAB-04` | 4 | pass | always |  |
+| `WEBEX-COLLAB-05` | 1 | manual | any of (not (`webhooks_seen` is defined); `webhooks_seen` equals 0) |  |
+| `WEBEX-COLLAB-05` | 2 | fail | `insecure_webhooks_count` (default 0) is greater than 0 |  |
+| `WEBEX-COLLAB-05` | 3 | warn | any of (`webhooks_truncated` equals true; `token_type` equals "bot"; `token_probe_status.readable` equals false) |  |
+| `WEBEX-COLLAB-05` | 4 | pass | always |  |
+| `WEBEX-COLLAB-06` | 1 | manual | any of (not (`total_units` is defined); `total_units` equals 0) |  |
+| `WEBEX-COLLAB-06` | 2 | warn | any of (`unassigned_units` (default 0) is greater than `license_warn_threshold_units`; `licenses_truncated` equals true) | license_warn_threshold_units is total_units multiplied by maximumUnassignedRatio. |
+| `WEBEX-COLLAB-06` | 3 | pass | always |  |
+| `WEBEX-COLLAB-07` | 1 | manual | not (`events_seen` is defined) |  |
+| `WEBEX-COLLAB-07` | 2 | warn | any of (`events_seen` equals 0; `events_truncated` equals true) |  |
+| `WEBEX-COLLAB-07` | 3 | pass | always |  |
+| `WEBEX-COLLAB-08` | 1 | manual | always | eDiscovery/legal hold configuration has no documented read field. |
+| `WEBEX-MTG-01` | 1 | manual | always | Meeting E2EE and calling SRTP have no documented read field. |
+| `WEBEX-MTG-02` | 1 | manual | any of (not (`sites` is defined); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-02` | 2 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-02` | 3 | warn | any of (some item in `sites` satisfies (`$.status` equals "warn"); `site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-02` | 4 | pass | always |  |
+| `WEBEX-MTG-03` | 1 | manual | any of (not (`sites` is defined); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-03` | 2 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-03` | 3 | warn | any of (some item in `sites` satisfies (`$.status` equals "warn"); `site_coverage_complete` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-03` | 4 | pass | always |  |
+| `WEBEX-MTG-04` | 1 | manual | any of (not (`clusters_seen` is defined); not (`connectors_seen` is defined); all of (`clusters_seen` equals 0; `connectors_seen` equals 0)) |  |
+| `WEBEX-MTG-04` | 2 | fail | any of (`connectors_seen` equals 0; `non_operational_count` (default 0) is greater than 0) |  |
+| `WEBEX-MTG-04` | 3 | warn | `hybrid_lists_truncated` equals true |  |
+| `WEBEX-MTG-04` | 4 | pass | always |  |
+| `WEBEX-MTG-05` | 1 | manual | always | Firmware lifecycle and blocking policy require manual evidence. |
+| `WEBEX-MTG-06` | 1 | manual | any of (not (`sites` is defined); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-06` | 2 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-06` | 3 | warn | any of (some item in `sites` satisfies (`$.status` equals "warn"); `site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-06` | 4 | pass | always |  |
+| `WEBEX-MTG-07` | 1 | manual | always | Virtual-background policy has no documented read field. |
+
 ### Criterion constants
 
 | Finding | Name | Value |
@@ -403,7 +465,9 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 | `WEBEX-MTG-04` | `operationalStatus` | operational |
 | `WEBEX-MTG-06` | `minimumLength` | 8 |
 
-### Criterion examples
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
 
 | Finding | Case | Input condition | Expected | Reason |
 |---|---|---|---|---|
