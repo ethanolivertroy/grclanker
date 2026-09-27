@@ -203,10 +203,11 @@ function factEquals(check: BatchCheckDefinition, suffix: string, value: Portable
 }
 
 function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
+  const manualOnly = /^always return manual\b/i.test(check.decision);
   const outcomes = {
-    fail: check.outcomes?.fail ?? !/^always return manual\b/i.test(check.decision),
-    warn: check.outcomes?.warn ?? !/^always return manual\b/i.test(check.decision),
-    pass: check.outcomes?.pass ?? !/^always return manual\b/i.test(check.decision),
+    fail: check.outcomes?.fail ?? (!manualOnly && /\bfail\b/i.test(check.decision)),
+    warn: check.outcomes?.warn ?? (!manualOnly && /\bwarn\b/i.test(check.decision)),
+    pass: check.outcomes?.pass ?? (!manualOnly && /\bpass\b/i.test(check.decision)),
   };
   const rules: VerdictRule[] = [];
   if (outcomes.fail) {
@@ -356,7 +357,8 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     severity: check.severity,
     owningTool: check.owner,
     sourceSurfaceIds: check.surfaces,
-    evidenceFields: check.evidenceFields,
+    evidenceFields: [...new Set(check.evidenceFields.flatMap((field) =>
+      definition.surfaces.find((surface) => surface.id === field)?.fields ?? [field]))],
     derivedFacts: {
       [factName(check, "required_evidence_readable")]: `From the declared source surfaces, set true only when every value required by ${check.id} was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false.`,
       [factName(check, "required_evidence_complete")]: `From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false.`,
