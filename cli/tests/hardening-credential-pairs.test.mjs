@@ -14,6 +14,7 @@ import {
 } from "../dist/extensions/grc-tools/hardening/error-text.js";
 import { isSensitiveArgumentKey } from "../dist/flue/redact.js";
 import { leakedCanaryWindow } from "./helpers/error-canaries.mjs";
+import { assertUrlUserinfoBoundaryRows } from "./helpers/redaction-table.mjs";
 
 /**
  * The compound and env-style credential keys of the review of #78 (gap 1): a value under any key
@@ -770,5 +771,40 @@ test("CodeRabbit on #76: a URL's userinfo ends at the first \"/\", \"?\", or \"#
     assert.equal(redactSecretValues(text), expected, text);
     assert.equal(scrubErrorText(expected), expected, `idempotent: ${text}`);
     assert.equal(scrubDataText(expected), expected, `idempotent: ${text}`);
+  }
+});
+
+test("shared URL scrub handles raw delimiters in userinfo passwords and token-shaped bare hosts", () => {
+  for (const [name, scrub] of [
+    ["scrubErrorText", scrubErrorText],
+    ["scrubDataText", scrubDataText],
+    ["redactSecretValues", redactSecretValues],
+  ]) {
+    assertUrlUserinfoBoundaryRows(assert, scrub, { label: name });
+  }
+
+  const tokenHost = "Kq7Zx2Vw9Lm4Tp8RwQ12";
+  for (const scrub of [scrubErrorText, scrubDataText, redactSecretValues]) {
+    const output = scrub(`request to https://${tokenHost}?x@h/p failed`);
+    assert.equal(output, `request to https://${REDACTED}?${REDACTED} failed`);
+    assert.equal(scrub(output), output);
+    assert.equal(leakedCanaryWindow(typeof output === "string" ? output : JSON.stringify(output), tokenHost), undefined);
+  }
+});
+
+test("a semicolon inside a bare credential pair value is removed with the value", () => {
+  const token = "Kq7Zx2Vw9Lm4Tp8RwQ12";
+  const rows = [
+    [`password=hunter2;restofsecret`, `password=${REDACTED}`],
+    [`api_key=${token};tail`, `api_key=${REDACTED}`],
+    [`request failed with token=${token};retry-value upstream`, `request failed with token=${REDACTED} upstream`],
+    [`password=hunter2; Content-Type: application/json`, `password=${REDACTED}; Content-Type: application/json`],
+  ];
+  for (const [input, expected] of rows) {
+    for (const scrub of [scrubErrorText, scrubDataText, redactSecretValues]) {
+      const output = scrub(input);
+      assert.equal(output, expected, input);
+      assert.equal(scrub(output), output, `idempotent: ${input}`);
+    }
   }
 });

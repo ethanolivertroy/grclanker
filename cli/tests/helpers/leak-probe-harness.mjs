@@ -584,6 +584,12 @@ function credentialPairCells(options, canaries) {
     cells.push(cell("configured secret under a setting key", `auth_method=${secret}`, { planted: [secret], mustKeep: ["auth_method"] }));
     cells.push(cell("configured secret in a JSON member", `{"detail":"${secret}"}`, { planted: [secret], mustKeep: ["detail"] }));
   }
+  const semicolonHead = tokenAt(canaries, 8);
+  const semicolonTail = tokenAt(canaries, 9);
+  cells.push(cell("semicolon inside a bare prose pair value", `upstream echoed password=${semicolonHead};${semicolonTail} before closing`, {
+    planted: [semicolonHead, semicolonTail],
+    mustKeep: ["password", "before closing"],
+  }));
   return cells;
 }
 
@@ -740,6 +746,8 @@ function escapeBoundaryCells(options, canaries) {
       ["slash-escaped https URL userinfo", `https:\\/\\/svc:${value}@api.example.com\\/v1\\/items`, ["api.example.com"]],
       ["slash-escaped proxy URL userinfo", `proxy:\\/\\/svc:${value}@proxy.example.com:8080`, ["proxy.example.com"]],
       ["slash-escaped https URL query", `https:\\/\\/api.example.com\\/v1\\/items?token=${value}&x=1`, ["api.example.com"]],
+      ["raw question mark inside a userinfo password", `https://svc:${value}?7@api.example.com/v1/items`, ["api.example.com"]],
+      ["raw hash inside a userinfo password", `https://svc:${value}#7@api.example.com/v1/items`, ["api.example.com"]],
     ];
     for (const [urlName, url, keep] of urls) {
       for (const [contextName, context, contextKeep] of urlContexts) {
@@ -800,6 +808,7 @@ function quotedCompoundHeaderCells(canaries) {
   rows.push(["quoted bearer value", `Authorization: Bearer "${first}"`, [first], ["Authorization", "Bearer"]]);
   // Group D self-check: the scheme word inside the quotes stays (`Authorization: "Bearer [REDACTED]"`).
   rows.push(["quoted scheme and value", `Authorization: "Bearer ${first}"`, [first], ["Authorization", '"Bearer']]);
+  rows.push(["quoted auth parameter after a scheme", `Authorization: Snowflake Token="${first}"`, [first], ["Authorization", "Snowflake", "Token="]]);
   rows.push(["compound unquoted", `Cookie: sid=${first}; X-Api-Key: ${second}; Content-Type: application/json`, [first, second], ["Cookie", "X-Api-Key", "Content-Type: application/json"]]);
   rows.push(["compound quoted", `Cookie: sid="${first}"; X-Api-Key: "${second}"; Content-Type: "application/json"`, [first, second], ["Cookie", "X-Api-Key", 'Content-Type: "application/json"']]);
   rows.push(["compound all bare", `Cookie: ${first}; X-Api-Key: ${second}; Content-Type: application/json`, [first, second], ["Cookie", "X-Api-Key", "Content-Type: application/json"]]);
@@ -841,6 +850,10 @@ function schemeCasingCells(options, canaries) {
   }
   cells.push(cell("fixed prose Bearer token is missing", "Bearer token is missing", { mustKeep: ["Bearer token is missing"] }));
   cells.push(cell('fixed prose Bearer realm="api"', 'Bearer realm="api"', { mustKeep: ['Bearer realm="api"'] }));
+  cells.push(cell("proof parameter behind realm", `Digest realm="api", nonce="n", response="${canaries.tokens[7]}"`, {
+    planted: [canaries.tokens[7]],
+    mustKeep: ["Digest"],
+  }));
   return cells;
 }
 
@@ -929,8 +942,8 @@ function leafAt(output, depth) {
 /** The deepest nesting at which `walker` still keeps containers (the cap), or null when it keeps them up to MAX_DEPTH_PROBE. */
 async function detectCap(walker) {
   for (let depth = 1; depth <= MAX_DEPTH_PROBE; depth += 1) {
-    const output = await walker(structuredClone(nest(depth, { name: `benign-sibling-${depth}` })));
-    if (!isContainer(leafAt(output, depth))) return depth - 1;
+    const output = await walker(structuredClone({ id: "rec-1", settings: nest(depth, { name: `benign-sibling-${depth}` }) }));
+    if (!isContainer(output) || !isContainer(leafAt(output.settings, depth))) return depth - 1;
   }
   return null;
 }

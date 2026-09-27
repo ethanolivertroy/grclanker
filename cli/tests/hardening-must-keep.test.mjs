@@ -556,7 +556,7 @@ test("must-redact: a token-shaped value under a non-URL webhook setting goes by 
     (key, value) => `{"${key}":"${value}"}`,
     (key, value) => `listing webhooks failed with ${key}=${value} and status 500`,
   ]);
-  const keys = ["webhook_count", "webhook_id", "webhook_name", "webhookId", "WEBHOOK_NAME", "slack_webhook_id", "webhooks_limit"];
+  const keys = ["webhook_count", "webhook_id", "webhook_name", "webhookId", "WEBHOOK_NAME", "slack_webhook_id", "webhook_retry_count", "webhooks_limit"];
   for (const value of [ERROR_CANARY.apiKey, "Kq7Zx2Vw9Lm4Tp8RwQ12", "0f9e8d7c6b5a49382716f5e4d3c2b1a09f8e7d6c"]) {
     for (const key of keys) {
       for (const carrier of carriers) {
