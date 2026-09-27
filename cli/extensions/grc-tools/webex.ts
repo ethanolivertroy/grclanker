@@ -18,16 +18,17 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import {
   ConfigFileError,
   NextLinkError,
-  isCredentialKey,
+  parseNextLinkHeader,
   parseJsonConfigText,
   parseYamlConfigText,
   readConfigText,
   resolveSameOriginUrl,
+  type ParsedNextLink,
 } from "./hardening/index.js";
+import { createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -355,22 +356,20 @@ function parseTimeoutSeconds(value: number | undefined): number {
   return clampNumber(value, DEFAULT_TIMEOUT_MS / 1000, 1, 300) * 1000;
 }
 
-/** RFC 5988 Link header; only rel="next" is guaranteed by Webex (basics guide). */
+/** RFC 8288 Link header; only rel="next" is guaranteed by Webex (basics guide). */
 export function parseLinkHeaderNext(linkHeader: string | null): string | null {
-  if (!linkHeader) return null;
-  for (const match of linkHeader.matchAll(/<([^>]+)>\s*;\s*([^,]*)/gi)) {
-    if (/(?:^|;)\s*rel\s*=\s*"?next"?(?:\s*;|$)/i.test(match[2] ?? "")) return match[1];
-  }
-  return null;
+  const parsed = parseNextLinkHeader(linkHeader);
+  return parsed.kind === "next" ? parsed.target : null;
 }
 
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-const SECRET_KEY_PATTERN = /token|secret|password|passcode|hostpin|hostkey|authorization|accesscode|activationcode|credential/i;
 /** Policy flags from commonSettings.securityOptions that name passwords without holding one. */
 const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword|tokenType|token_type)$/;
+const WEBEX_CREDENTIAL_KEY_PATTERN = /^(hostPin|hostKey|accessCode|activationCode)$/i;
+const webexCredentialScrubber = createCredentialScrubber();
 /**
  * Any scheme-prefixed URL embedded anywhere in a string (not only a whole-value URL):
  * everything from its first ? or # carries no evidence value (RCID, MTID, token parameters).
@@ -378,10 +377,6 @@ const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePass
 const EMBEDDED_URL_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 /** Credential parameters embedded in SIP and tel URIs, for example ;pwd=1234. */
 const URI_CREDENTIAL_PARAM_PATTERN = /;(pwd|password|pin|passcode|token|secret)=[^;?#\s]*/gi;
-/** `key=value`, `key: value`, or `"key":"value"`; the key is classified by the shared segment-aware rule. */
-const CREDENTIAL_ASSIGNMENT_PATTERN = /(?<![A-Za-z0-9_./-])(["']?)([A-Za-z][A-Za-z0-9_.-]{0,127})\1\s*[=:]\s*"?(?:(?:bearer|basic)\s+)?[^\s"'&;,<>]+/gi;
-/** A standalone `Bearer <value>` or `Basic <value>` authorization value. */
-const CREDENTIAL_SCHEME_PATTERN = /\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})/gi;
 
 /**
  * Strips credential-bearing parts from a string while keeping host and path:
@@ -412,15 +407,7 @@ export function scrubValue(value: string): string {
  * ever receives an unscrubbed error string. Idempotent.
  */
 export function scrubErrorText(message: string): string {
-  return scrubValue(message)
-    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (match, quote: string, key: string) => (isCredentialKey(key) ? `${quote}${key}=[REDACTED]` : match))
-    .replace(CREDENTIAL_SCHEME_PATTERN, (match, scheme: string, value: string) => (
-      /\d|[._~+/=-]/.test(value)
-      || (/[a-z]/.test(value) && /[A-Z]/.test(value))
-      || value.length >= 20
-        ? `${scheme} [REDACTED]`
-        : match
-    ));
+  return webexCredentialScrubber.scrub(scrubValue(message));
 }
 
 function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string): string[] {
@@ -434,8 +421,8 @@ function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string
 
 /** Final bundle sink scrub: configured/runtime credential encodings plus free-text credential carriers. */
 function scrubBundleText(content: string, secrets: readonly string[]): string {
-  const scrubbed = scrubSensitiveValues(content, secrets).split(REDACTED_VALUE).join("[REDACTED]");
-  return scrubErrorText(scrubbed);
+  webexCredentialScrubber.registerSecrets(secrets);
+  return webexCredentialScrubber.scrub(scrubValue(content), { shapes: false });
 }
 
 /**
@@ -444,16 +431,11 @@ function scrubBundleText(content: string, secrets: readonly string[]): string {
  * what reaches the bundle at all.
  */
 export function redactSecrets(value: unknown, knownSecrets: readonly string[] = []): unknown {
-  if (Array.isArray(value)) return value.map((entry) => redactSecrets(entry, knownSecrets));
-  if (typeof value === "string") return scrubBundleText(value, knownSecrets);
-  const object = asObject(value);
-  if (!object) return value;
-  const output: JsonRecord = {};
-  for (const [key, entry] of Object.entries(object)) {
-    const sensitive = SECRET_KEY_PATTERN.test(key) && !POLICY_KEY_PATTERN.test(key);
-    output[key] = sensitive && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry, knownSecrets);
-  }
-  return output;
+  webexCredentialScrubber.registerSecrets(knownSecrets);
+  return webexCredentialScrubber.scrubData(value, {
+    isCredentialKey: (key) => !POLICY_KEY_PATTERN.test(key) && (isCredentialDataKey(key) || WEBEX_CREDENTIAL_KEY_PATTERN.test(key)),
+    transformString: (entry) => scrubValue(entry),
+  });
 }
 
 type FieldSpec = true | { readonly [field: string]: FieldSpec };
@@ -858,6 +840,7 @@ export class WebexApiClient {
     this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
     this.maxPages = clampNumber(options.maxPages, MAX_LIST_PAGES, 1, 100_000);
     this.accessToken = config.token;
+    webexCredentialScrubber.registerSecrets(webexCredentialValues(config, this.accessToken));
   }
 
   getResolvedConfig(): WebexResolvedConfig {
@@ -923,6 +906,7 @@ export class WebexApiClient {
     const accessToken = asString(payload.access_token);
     if (!accessToken) throw new Error("Webex token refresh response did not include access_token.");
     this.accessToken = accessToken;
+    webexCredentialScrubber.registerSecrets([accessToken]);
     return accessToken;
   }
 
@@ -931,7 +915,7 @@ export class WebexApiClient {
     return this.refreshAccessToken();
   }
 
-  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; rawText: string; nextUrl: string | null }> {
+  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; rawText: string; nextLink: ParsedNextLink }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     const endpoint = new URL(url).pathname;
@@ -967,7 +951,7 @@ export class WebexApiClient {
       return {
         payload: payload ?? {},
         rawText,
-        nextUrl: parseLinkHeaderNext(response.headers.get("link")),
+        nextLink: parseNextLinkHeader(response.headers.get("link")),
       };
     } finally {
       clearTimeout(timeout);
@@ -1004,7 +988,10 @@ export class WebexApiClient {
       const pageItems = extractItems(response.payload);
       const remaining = limit - items.length;
       items.push(...pageItems.slice(0, remaining));
-      nextUrl = response.nextUrl;
+      if (response.nextLink.kind === "unparseable") {
+        return { items, truncated: true, pageCount };
+      }
+      nextUrl = response.nextLink.kind === "next" ? response.nextLink.target : null;
       if (items.length >= limit && (nextUrl || pageItems.length > remaining)) {
         return { items, truncated: true, pageCount };
       }

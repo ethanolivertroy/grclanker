@@ -20,7 +20,7 @@ import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { NextLinkError, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
+import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -2043,10 +2043,16 @@ export class GitHubAuditorClient {
       }
       if (truncated) break;
 
-      const advertisedNext = parseNextLink(response.headers.get("link"));
-      if (advertisedNext) {
+      const parsedNext = parseNextLinkHeader(response.headers.get("link"));
+      if (parsedNext.kind === "unparseable") {
+        truncated = true;
+        truncationReason = "Link header could not be parsed";
+        nextPath = null;
+        break;
+      }
+      if (parsedNext.kind === "next") {
         try {
-          nextPath = resolveSameOriginUrl(advertisedNext, currentUrl).toString();
+          nextPath = resolveSameOriginUrl(parsedNext.target, currentUrl).toString();
         } catch (error) {
           if (!(error instanceof NextLinkError)) throw error;
           truncated = true;
@@ -2075,14 +2081,6 @@ export class GitHubAuditorClient {
 
 export function clearGitHubTokenCacheForTests(): void {
   installationTokenCache.clear();
-}
-
-function parseNextLink(linkHeader: string | null): string | null {
-  if (!linkHeader) return null;
-  for (const match of linkHeader.matchAll(/<([^>]+)>\s*;\s*([^,]*)/gi)) {
-    if (/(?:^|;)\s*rel\s*=\s*"?next"?(?:\s*;|$)/i.test(match[2] ?? "")) return match[1];
-  }
-  return null;
 }
 
 interface GraphqlPageStep {

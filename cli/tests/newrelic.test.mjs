@@ -912,7 +912,7 @@ test("NewrelicApiClient follows REST API v2 Link headers with the Api-Key header
 });
 
 test("NewrelicApiClient refuses cross-origin and userinfo REST next links", async () => {
-  async function walk(nextLink) {
+  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`) {
     const requests = [];
     const fetchImpl = async (input, init = {}) => {
       const url = new URL(input.toString());
@@ -920,7 +920,7 @@ test("NewrelicApiClient refuses cross-origin and userinfo REST next links", asyn
       if (requests.length === 1) {
         return jsonResponse(
           { users: [{ id: 1, email: "one@example.com" }] },
-          { headers: { link: `<${nextLink}>; rel="next"` } },
+          { headers: { link: linkHeader } },
         );
       }
       return jsonResponse({ users: [{ id: 2, email: "two@example.com" }] });
@@ -946,6 +946,30 @@ test("NewrelicApiClient refuses cross-origin and userinfo REST next links", asyn
   assert.equal(userinfo.result.complete, false);
   assert.match(userinfo.result.note, /carries userinfo/);
   assert.equal(userinfo.requests.length, 1);
+
+  const relationList = await walk(
+    "https://api.newrelic.com/v2/users.json?page=2",
+    '<https://api.newrelic.com/v2/users.json?page=2>; title="page two, continued"; REL="last next"',
+  );
+  assert.deepEqual(relationList.result.items.map((item) => item.id), [1, 2]);
+  assert.equal(relationList.result.complete, true);
+  assert.equal(relationList.requests.length, 2);
+
+  const quotedCommaForeign = await walk(
+    "https://attacker.example/collect",
+    '<https://attacker.example/collect>; title="page one, continued"; rel=next',
+  );
+  assert.equal(quotedCommaForeign.result.complete, false);
+  assert.match(quotedCommaForeign.result.note, /attacker\.example/);
+  assert.equal(quotedCommaForeign.requests.length, 1);
+
+  const malformed = await walk(
+    "unused",
+    '<https://api.newrelic.com/v2/users.json?page=2>; title="unterminated; rel=next',
+  );
+  assert.equal(malformed.result.complete, false);
+  assert.match(malformed.result.note, /Link header could not be parsed/);
+  assert.equal(malformed.requests.length, 1);
 });
 
 test("NewrelicApiClient paginates keySearch with a cursor and scopes it to account IDs", async () => {

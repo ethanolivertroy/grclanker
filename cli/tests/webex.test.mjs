@@ -716,7 +716,7 @@ test("WebexApiClient follows Link pagination to completion, reports truncation, 
 });
 
 test("WebexApiClient follows only same-origin next links without userinfo", async () => {
-  async function walk(nextLink) {
+  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`) {
     const requests = [];
     const fetchImpl = async (input, init = {}) => {
       const url = new URL(input.toString());
@@ -724,7 +724,7 @@ test("WebexApiClient follows only same-origin next links without userinfo", asyn
       if (requests.length === 1) {
         return jsonResponse(
           { items: [{ id: "person-1" }] },
-          { headers: { link: `<${nextLink}>; rel="next"` } },
+          { headers: { link: linkHeader } },
         );
       }
       return jsonResponse({ items: [{ id: "person-2" }] });
@@ -748,6 +748,28 @@ test("WebexApiClient follows only same-origin next links without userinfo", asyn
   assert.deepEqual(userinfo.result.items.map((item) => item.id), ["person-1"]);
   assert.equal(userinfo.result.truncated, true);
   assert.equal(userinfo.requests.length, 1, "a userinfo-bearing next link must never be requested");
+
+  const relationList = await walk(
+    "https://webexapis.com/v1/people?after=relation-list",
+    '<https://webexapis.com/v1/people?after=relation-list>; title="page two, continued"; REL="prev next"',
+  );
+  assert.deepEqual(relationList.result.items.map((item) => item.id), ["person-1", "person-2"]);
+  assert.equal(relationList.result.truncated, false);
+  assert.equal(relationList.requests.length, 2);
+
+  const quotedCommaForeign = await walk(
+    "https://attacker.example/collect",
+    '<https://attacker.example/collect>; title="page one, continued"; rel=next',
+  );
+  assert.equal(quotedCommaForeign.result.truncated, true);
+  assert.equal(quotedCommaForeign.requests.length, 1);
+
+  const malformed = await walk(
+    "unused",
+    '<https://webexapis.com/v1/people?after=2>; title="unterminated; rel=next',
+  );
+  assert.equal(malformed.result.truncated, true);
+  assert.equal(malformed.requests.length, 1, "an unparseable Link header is partial, not exhaustion");
 });
 
 test("WebexApiClient sends max only where the reference documents it and orgId only where documented", async () => {
@@ -1750,6 +1772,7 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
     Buffer.from(configuredSecret).toString("base64url"),
   ];
   assert.equal(new Set(encodedSecrets).size, 3, "the URL, base64, and base64url fixtures are distinct");
+  const alphabeticSecret = "lowercasesecret";
   const bearerSecret = "SINKBEARERm4n8b2v6c0x5";
   const assignmentSecret = "SINKASSIGNMENTp3o7i1u5y9t2";
   const baseClient = compliantClient();
@@ -1773,17 +1796,23 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
         })),
         { id: "legit-monkey", displayName: "Monkey: Business", emails: ["monkey@example.com"], type: "person", roles: [] },
         { id: "legit-basic", displayName: "Basic authentication", emails: ["basic@example.com"], type: "person", roles: [] },
+        { id: "legit-basic-title", displayName: "Basic Authentication", emails: ["basic-title@example.com"], type: "person", roles: [] },
+        { id: "legit-bearer-name", displayName: "Bearer Anderson", emails: ["anderson@example.com"], type: "person", roles: [] },
+        { id: "alphabetic-bearer", displayName: `Bearer ${alphabeticSecret}`, emails: ["secret@example.com"], type: "person", roles: [] },
       ]);
     },
   });
   const base = createTempBase("grclanker-webex-sink-redaction-");
   const result = await exportWebexAuditBundle(
     client,
-    sampleConfig({ token: configuredSecret }),
+    sampleConfig({
+      token: configuredSecret,
+      refresh: { clientId: "client-id", clientSecret: alphabeticSecret, refreshToken: "refresh-secret-value" },
+    }),
     base,
   );
 
-  const forbidden = [configuredSecret, ...encodedSecrets, bearerSecret, assignmentSecret];
+  const forbidden = [configuredSecret, ...encodedSecrets, alphabeticSecret, bearerSecret, assignmentSecret];
   for (const file of walkFiles(result.outputDir)) {
     const content = readFileSync(file, "utf8");
     for (const secret of forbidden) assert.equal(content.includes(secret), false, `${secret} leaked into ${relative(result.outputDir, file)}`);
@@ -1797,12 +1826,18 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
   const people = JSON.parse(peopleJson);
   assert.ok(people.some((person) => person.displayName === "Monkey: Business"));
   assert.ok(people.some((person) => person.displayName === "Basic authentication"));
+  assert.ok(people.some((person) => person.displayName === "Basic Authentication"));
+  assert.ok(people.some((person) => person.displayName === "Bearer Anderson"));
+  assert.ok(people.some((person) => person.id === "alphabetic-bearer" && person.displayName === "Bearer [REDACTED]"));
   for (const secret of encodedSecrets) assert.equal(peopleJson.includes(secret), false, `${secret} leaked into ${peoplePath}`);
 
   const peopleZip = readZipEntries(readFileSync(result.zipPath)).find((entry) => entry.name === peoplePath);
   assert.ok(peopleZip, `${peoplePath} must be present in the zip`);
   assert.match(peopleZip.content, /Monkey: Business/);
   assert.match(peopleZip.content, /Basic authentication/);
+  assert.match(peopleZip.content, /Basic Authentication/);
+  assert.match(peopleZip.content, /Bearer Anderson/);
+  assert.doesNotMatch(peopleZip.content, /Bearer lowercasesecret/);
   for (const secret of encodedSecrets) assert.equal(peopleZip.content.includes(secret), false, `${secret} leaked into zip:${peoplePath}`);
 });
 

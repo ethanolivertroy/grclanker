@@ -878,7 +878,7 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
   const variant = await clientFor(
     "https://api.github.com/orgs/example-org/repos?per_page=100&page=2",
     variantRequests,
-    'type="application/json"; rel=next; title="more"',
+    'type="application/json"; title="page two, continued"; rel="last next"',
   ).listRepositories();
   assert.deepEqual(variant.map((repo) => repo.full_name), ["example-org/repo-one", "example-org/repo-two"]);
   assert.equal(variantRequests.length, 2, "valid Link parameters before an unquoted rel=next are followed");
@@ -888,11 +888,40 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
     clientFor(
       "https://attacker.example/collect",
       rejectedVariantRequests,
-      'type="application/json"; rel=next',
+      'type="application/json"; title="page one, continued"; rel="next last"',
     ).listRepositories(),
     /does not share the configured origin https:\/\/api\.github\.com/,
   );
   assert.equal(rejectedVariantRequests.length, 1, "a foreign Link relation variant is rejected, not treated as exhaustion");
+
+  const malformedRequests = [];
+  await assert.rejects(
+    clientFor(
+      "unused",
+      malformedRequests,
+      'title="unterminated; rel=next',
+    ).listRepositories(),
+    /Link header could not be parsed/,
+  );
+  assert.equal(malformedRequests.length, 1, "an unparseable Link header is incomplete, not exhaustion");
+
+  const finiteRejectedRequests = [];
+  const finiteRejected = await clientFor(
+    "https://attacker.example/collect",
+    finiteRejectedRequests,
+    'title="page one, continued"; rel="next last"',
+  ).listAuditLog();
+  assert.equal(finiteRejected.truncated, true);
+  assert.equal(finiteRejectedRequests.length, 1);
+
+  const finiteMalformedRequests = [];
+  const finiteMalformed = await clientFor(
+    "unused",
+    finiteMalformedRequests,
+    'title="unterminated; rel=next',
+  ).listAuditLog();
+  assert.equal(finiteMalformed.truncated, true);
+  assert.equal(finiteMalformedRequests.length, 1);
 });
 
 test("GitHub assessment helpers classify sample posture correctly", () => {

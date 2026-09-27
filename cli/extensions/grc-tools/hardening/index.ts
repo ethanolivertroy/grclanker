@@ -69,3 +69,6 @@ export type { PaginationOutcome, PaginationStop, PaginationStopKind } from "./pa
 
 export { INVALID_CONFIGURED_ORIGIN_CODE, NEXT_LINK_REJECTED_CODE, NextLinkError, nextLinkStop, originOf, resolveSameOriginUrl } from "./next-link.js";
 export type { NextLinkRejection } from "./next-link.js";
+
+export { parseNextLinkHeader } from "./link-header.js";
+export type { ParsedNextLink } from "./link-header.js";
