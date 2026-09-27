@@ -104,6 +104,7 @@ import {
   AWS_REQUIRED_OUTPUT_MEMBERS,
   AWS_REQUIRED_PUBLIC_ACCESS_FLAGS,
   AWS_SPEC,
+  AWS_VERDICT_VALUES,
 } from "./aws.spec.js";
 import type {
   AwsControlDescriptor,
@@ -154,8 +155,8 @@ const DEFAULT_ROOT_LOOKBACK_DAYS: number = AWS_DEFAULTS.rootLookbackDays;
 export const ROOT_EVENT_REGION = AWS_DEFAULTS.rootEventRegion;
 const DEFAULT_CONCURRENCY: number = AWS_DEFAULTS.concurrency;
 const DEFAULT_SENSITIVE_PORTS: number[] = [...AWS_DEFAULTS.sensitivePorts];
-const ANY_IPV4 = "0.0.0.0/0";
-const ANY_IPV6 = "::/0";
+const ANY_IPV4 = AWS_VERDICT_VALUES.publicIpv4Cidr;
+const ANY_IPV6 = AWS_VERDICT_VALUES.publicIpv6Cidr;
 const REQUIRED_PUBLIC_ACCESS_FLAGS = AWS_REQUIRED_PUBLIC_ACCESS_FLAGS;
 
 export function buildAwsMappings(controlNumber: number): string[] {
@@ -1754,7 +1755,8 @@ export function statementDeniesInsecureTransport(statement: JsonRecord): boolean
     const operandRecord = asObject(operands);
     if (!operandRecord) continue;
     for (const [key, value] of Object.entries(operandRecord)) {
-      if (key.toLowerCase() === "aws:securetransport" && conditionValues(value).includes("false")) {
+      if (key.toLowerCase() === AWS_VERDICT_VALUES.secureTransportConditionKey.toLowerCase()
+        && conditionValues(value).includes(AWS_VERDICT_VALUES.secureTransportDeniedValue)) {
         return true;
       }
     }
@@ -1985,7 +1987,7 @@ function hasAdministratorPolicy(role: JsonRecord): boolean {
   const attached = Array.isArray(role.AttachedManagedPolicies) ? role.AttachedManagedPolicies : [];
   if (attached.some((policy) => {
     const item = asObject(policy);
-    return asString(item?.PolicyName) === "AdministratorAccess";
+    return asString(item?.PolicyName) === AWS_VERDICT_VALUES.administratorPolicyName;
   })) {
     return true;
   }
@@ -2826,7 +2828,7 @@ function classifyPolicyStatements(document: JsonRecord | null): { fullAdmin: num
   let fullAdmin = 0;
   let serviceWildcard = 0;
   for (const statement of normalizeStatements(document, "iam-url-encoded")) {
-    if (asString(statement.Effect)?.toLowerCase() !== "allow") continue;
+    if (asString(statement.Effect)?.toLowerCase() !== AWS_VERDICT_VALUES.allowedNetworkAction) continue;
     if (matchesWildcard(statement.Action) && matchesWildcard(statement.Resource)) {
       fullAdmin += 1;
     } else if (isServiceWildcardAction(statement.Action) && matchesWildcard(statement.Resource)) {
@@ -3092,20 +3094,18 @@ export async function assessAwsIdentity(
   if (summaryRead.error) {
     rootMfaStatus = "manual";
     rootMfaSummary = `The IAM account summary could not be read (${summaryRead.error}); verify root MFA and the absence of root access keys under IAM > Dashboard.`;
-  } else if (accountMfaEnabled !== 1 || (accountAccessKeysPresent ?? 0) > 0) {
+  } else if (accountMfaEnabled !== AWS_VERDICT_VALUES.accountMfaEnabled
+    || (accountAccessKeysPresent ?? AWS_VERDICT_VALUES.accountAccessKeysPresent) > AWS_VERDICT_VALUES.accountAccessKeysPresent) {
     rootMfaStatus = "fail";
-    rootMfaSummary = `Root MFA enabled=${accountMfaEnabled === 1}; root access keys present=${accountAccessKeysPresent ?? "unknown (AccountAccessKeysPresent missing from the summary)"}.`;
+    rootMfaSummary = `Root MFA enabled=${accountMfaEnabled === AWS_VERDICT_VALUES.accountMfaEnabled}; root access keys present=${accountAccessKeysPresent ?? "unknown (AccountAccessKeysPresent missing from the summary)"}.`;
   } else {
     rootMfaStatus = "pass";
     rootMfaSummary = "Root account shows MFA enabled and no access keys present.";
   }
 
-  const passwordComplexityPresent = [
-    passwordPolicy?.RequireSymbols,
-    passwordPolicy?.RequireNumbers,
-    passwordPolicy?.RequireUppercaseCharacters,
-    passwordPolicy?.RequireLowercaseCharacters,
-  ].every((value) => value === true);
+  const passwordComplexityPresent = AWS_VERDICT_VALUES.passwordComplexityFields
+    .map((field) => passwordPolicy?.[field])
+    .every((value) => value === true);
   const passwordMinimumLength = asNumber(passwordPolicy?.MinimumPasswordLength) ?? 0;
   let passwordStatus: AwsFinding["status"];
   let passwordSummary: string;
@@ -3116,7 +3116,7 @@ export async function assessAwsIdentity(
     passwordStatus = "fail";
     passwordSummary = "No account password policy is configured (GetAccountPasswordPolicy returned NoSuchEntity).";
   } else {
-    passwordStatus = passwordMinimumLength < 14 || !passwordComplexityPresent ? "fail" : "pass";
+    passwordStatus = passwordMinimumLength < AWS_VERDICT_VALUES.minimumPasswordLength || !passwordComplexityPresent ? "fail" : "pass";
     passwordSummary = `Minimum length ${passwordMinimumLength} with complexity requirements present=${passwordComplexityPresent}.`;
   }
 
@@ -3217,8 +3217,8 @@ export async function assessAwsIdentity(
   // read from us-east-1 because root ConsoleLogin is a global event delivered only there.
   const rootLookupRegion = rootActivity.lookupRegion;
   const rootEventList = rootEvents.value?.items ?? [];
-  const rootConsoleLogins = rootEventList.filter((event) => asString(event.EventName) === "ConsoleLogin");
-  const rootOtherEvents = rootEventList.filter((event) => asString(event.EventName) !== "ConsoleLogin");
+  const rootConsoleLogins = rootEventList.filter((event) => asString(event.EventName) === AWS_VERDICT_VALUES.rootConsoleLoginEvent);
+  const rootOtherEvents = rootEventList.filter((event) => asString(event.EventName) !== AWS_VERDICT_VALUES.rootConsoleLoginEvent);
   const undatedRootEvents = rootEventList.filter((event) => extractTimestamp(event.EventTime) === undefined);
   let rootStatus: AwsFinding["status"];
   let rootSummary: string;
@@ -3466,7 +3466,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
     id: detectorId,
     detail: await attemptAwsRead(`guardduty:GetDetector ${labelIdentifier(detectorId)}`, () => client.getDetector(detectorId), errors),
   }));
-  const enabledDetectors = detectors.filter((detector) => asString(detector.detail.value?.Status) === "ENABLED");
+  const enabledDetectors = detectors.filter((detector) => asString(detector.detail.value?.Status) === AWS_VERDICT_VALUES.enabledGuardDutyStatus);
   const unreadableDetectors = detectors.filter((detector) => detector.detail.error);
   const detectorsAllUnreadable = detectors.length > 0 && unreadableDetectors.length === detectors.length;
   let detectorStatus: AwsFinding["status"];
@@ -3661,7 +3661,7 @@ export async function assessAwsOrgGuardrails(
   const scpTargetsAllUnreadable = scpTargets.length > 0 && unreadableScps.length === scpTargets.length;
 
   const analyzerList = analyzers.value?.items ?? [];
-  const activeAnalyzers = analyzerList.filter((analyzer) => asString(analyzer.status) === "ACTIVE");
+  const activeAnalyzers = analyzerList.filter((analyzer) => asString(analyzer.status) === AWS_VERDICT_VALUES.activeAnalyzerStatus);
   const findingLists = await mapWithConcurrency(activeAnalyzers, DEFAULT_CONCURRENCY, async (analyzer) => {
     const analyzerArn = asString(analyzer.arn) ?? "";
     const name = asString(analyzer.name) ?? analyzerArn;
@@ -3679,7 +3679,7 @@ export async function assessAwsOrgGuardrails(
     .flatMap((item) => (item.findings.value?.items ?? []).map((entry): JsonRecord => ({ ...entry, analyzer: item.name })))
     .filter((entry) => {
       const status = asString(entry.status)?.toUpperCase();
-      return !status || status === "ACTIVE";
+      return !status || status === AWS_VERDICT_VALUES.activeFindingStatus;
     });
   const identityCenterList = identityCenterInstances.value?.items ?? [];
 
@@ -4082,10 +4082,10 @@ export async function assessAwsDataProtection(
       const keyId = asString(key.KeyId) ?? asString(key.KeyArn) ?? "";
       const metadata = await attemptAwsRead(`kms:DescribeKey ${region}/${keyId}`, () => client.describeKmsKey(region, keyId), errors);
       const manager = asString(metadata.value?.KeyManager);
-      const eligible = manager === "CUSTOMER"
-        && asString(metadata.value?.KeyState) === "Enabled"
-        && asString(metadata.value?.KeySpec) === "SYMMETRIC_DEFAULT"
-        && asString(metadata.value?.Origin) === "AWS_KMS";
+      const eligible = manager === AWS_VERDICT_VALUES.customerKeyManager
+        && asString(metadata.value?.KeyState) === AWS_VERDICT_VALUES.eligibleKeyState
+        && asString(metadata.value?.KeySpec) === AWS_VERDICT_VALUES.eligibleKeySpec
+        && asString(metadata.value?.Origin) === AWS_VERDICT_VALUES.eligibleKeyOrigin;
       const rotation = eligible
         ? await attemptAwsRead(`kms:GetKeyRotationStatus ${region}/${keyId}`, () => client.getKeyRotationStatus(region, keyId), errors)
         : undefined;
@@ -4253,7 +4253,7 @@ export async function assessAwsDataProtection(
   const keyRows = regionResults.flatMap((result) => result.keys);
   const kmsListErrors = regionResults.filter((result) => result.kmsKeys.error);
   const kmsListsAllFailed = regionResults.length > 0 && kmsListErrors.length === regionResults.length;
-  const customerKeys = keyRows.filter((key) => key.manager === "CUSTOMER");
+  const customerKeys = keyRows.filter((key) => key.manager === AWS_VERDICT_VALUES.customerKeyManager);
   const managerUnknown = keyRows.filter((key) => key.manager === undefined);
   // Key classification counts are unknown, not zero, when DescribeKey failed for every listed key.
   const keyMetadataUnknown = kmsListsAllFailed || (keyRows.length > 0 && managerUnknown.length === keyRows.length);
@@ -4431,7 +4431,7 @@ export function permissiveNaclEntries(acl: JsonRecord, sensitivePorts: number[])
   const permissive: JsonRecord[] = [];
   for (const entry of entries) {
     if (entry.Egress !== false) continue;
-    if (asString(entry.RuleAction)?.toLowerCase() !== "allow") continue;
+    if (asString(entry.RuleAction)?.toLowerCase() !== AWS_VERDICT_VALUES.allowedNetworkAction) continue;
     const anySource = asString(entry.CidrBlock) === ANY_IPV4 || asString(entry.Ipv6CidrBlock) === ANY_IPV6;
     if (!anySource) continue;
     const coverage = protocolCoversPorts(asString(entry.Protocol));
@@ -4517,7 +4517,7 @@ export async function assessAwsNetworkSecurity(
     return vpcs.map((vpc) => {
       const vpcId = asString(vpc.VpcId) ?? "";
       const matching = flowLogs.filter((flowLog) => asString(flowLog.ResourceId) === vpcId);
-      const active = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === "ACTIVE");
+      const active = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === AWS_VERDICT_VALUES.activeFlowLogStatus);
       const statusUnknown = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === undefined);
       return {
         region: result.region,

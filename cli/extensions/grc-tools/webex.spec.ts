@@ -4,6 +4,7 @@ import type {
   ControlContract,
   FrameworkKey,
   IntegrationSpecContract,
+  RequestContract,
   VerdictCriteria,
 } from "./spec-model.js";
 
@@ -43,6 +44,7 @@ export const WEBEX_DOCS = {
 } as const;
 
 export const WEBEX_ENDPOINTS = {
+  tokenRefresh: "/access_token",
   me: "/people/me",
   organizations: "/organizations",
   organization: "/organizations/{orgId}",
@@ -65,6 +67,19 @@ export const WEBEX_ENDPOINTS = {
   webhooks: "/webhooks",
 } as const;
 
+export const WEBEX_VERDICT_VALUES = {
+  minimumMeetingPasswordLength: 8,
+  maximumUnassignedLicenseRatio: 0.2,
+  adminAuditWindowDays: 30,
+  operationalConnectorStatus: "operational",
+  secureWebhookPrefix: "https://",
+  inactiveWebhookStatus: "inactive",
+  botPersonType: "bot",
+  guestPersonType: "appuser",
+  complianceOfficerRolePattern: "compliance officer",
+  administratorRolePattern: "administrator",
+} as const;
+
 export const WEBEX_DEFAULTS = {
   outputDir: "./export/webex",
   timeoutMs: 30_000,
@@ -73,7 +88,7 @@ export const WEBEX_DEFAULTS = {
   maxRetryAfterMs: 30_000,
   max429Retries: 2,
   maxListPages: 1000,
-  minimumMeetingPasswordLength: 8,
+  minimumMeetingPasswordLength: WEBEX_VERDICT_VALUES.minimumMeetingPasswordLength,
   peopleLimit: 1000,
   eventLimit: 500,
   licenseLimit: 200,
@@ -84,7 +99,7 @@ export const WEBEX_DEFAULTS = {
   roomLimit: 500,
   genericLimit: 200,
   maxAdmins: 10,
-  adminAuditWindowDays: 30,
+  adminAuditWindowDays: WEBEX_VERDICT_VALUES.adminAuditWindowDays,
 } as const;
 
 export const WEBEX_PAGE_MAX = {
@@ -100,18 +115,36 @@ export const WEBEX_PAGE_MAX = {
 } as const;
 
 export const WEBEX_SCOPES = {
+  ownDetailsRead: "spark:people_read",
   peopleRead: "spark-admin:people_read",
   organizationsRead: "spark-admin:organizations_read",
   rolesRead: "spark-admin:roles_read",
   licensesRead: "spark-admin:licenses_read",
   devicesRead: "spark-admin:devices_read",
+  workspacesRead: "spark-admin:workspaces_read",
   hybridRead: "spark-admin:hybrid_clusters_read",
   eventsRead: "spark-compliance:events_read",
+  adminAuditRead: "audit:events_read",
+  adminRecordingsRead: "spark-compliance:recordings_read",
+  guestIssuerRead: "guest-issuer:read",
+  roomsRead: "spark:rooms_read",
+  webhooksRead: "spark:webhooks_read",
   meetingScheduleRead: "meeting:schedules_read or meeting:admin_schedule_read",
   meetingAdminScheduleRead: "meeting:admin_schedule_read",
-  meetingRecordingsRead: "meeting:admin_recordings_read",
   meetingPreferencesRead: "meeting:preferences_read or meeting:admin_preferences_read",
   meetingAdminPreferencesRead: "meeting:admin_preferences_read",
+  meetingAdminConfigRead: "meeting:admin_config_read",
+} as const;
+
+export const WEBEX_ENV = {
+  token: "WEBEX_TOKEN",
+  clientId: "WEBEX_CLIENT_ID",
+  clientSecret: "WEBEX_CLIENT_SECRET",
+  refreshToken: "WEBEX_REFRESH_TOKEN",
+  orgId: "WEBEX_ORG_ID",
+  apiBaseUrl: "WEBEX_API_BASE_URL",
+  timeout: "WEBEX_TIMEOUT",
+  configFile: "WEBEX_CONFIG_FILE",
 } as const;
 
 export const WEBEX_FRAMEWORK_LABELS: Record<WebexFrameworkKey, string> = {
@@ -261,19 +294,40 @@ const WEBEX_CONTROLS: ControlContract[] = CONTROL_TITLES.map((title, index) => (
   frameworks: WEBEX_CONTROL_FRAMEWORKS[index + 1],
 }));
 
-const AUTOMATED_CRITERIA: VerdictCriteria = {
-  pass: "Every required source is complete and the observed settings satisfy the check.",
-  warn: "The evidence is partial, scope-limited, or requires reviewer attention without proving noncompliance.",
-  fail: "Complete readable evidence proves that the required setting is absent or noncompliant.",
-  manual: "A required source is unreadable, denied, not requested, or not exposed by a documented read interface.",
-};
+function criteria(
+  pass: string,
+  warn: string,
+  fail: string,
+  manual: string,
+  constants: VerdictCriteria["constants"] = {},
+  emitted: { compliant?: "pass" | "manual"; noncompliant?: "fail" | "warn" | "manual"; partial?: "warn" | "manual" } = {},
+): VerdictCriteria {
+  const compliant = emitted.compliant ?? "pass";
+  const noncompliant = emitted.noncompliant ?? "fail";
+  const partial = emitted.partial ?? "warn";
+  return {
+    pass,
+    warn,
+    fail,
+    manual,
+    constants,
+    examples: [
+      { kind: "compliant", input: pass, expected: compliant, reason: compliant === "pass" ? "Complete evidence satisfies the pass predicate." : "The setting has no documented read interface, so compliant evidence remains manual." },
+      { kind: "noncompliant", input: fail, expected: noncompliant, reason: `The noncompliant predicate emits ${noncompliant}.` },
+      { kind: "partial", input: warn, expected: partial, reason: `The partial case emits ${partial}.` },
+      { kind: "unreadable", input: manual, expected: "manual", reason: "The required source cannot be evaluated automatically." },
+    ],
+  };
+}
 
-const MANUAL_CRITERIA: VerdictCriteria = {
-  pass: "Not emitted automatically. A reviewer may record pass only after examining the named administrative evidence.",
-  warn: "Readable supporting inventory is incomplete or indicates that manual review is still required.",
-  fail: "Not emitted automatically unless a documented read surface directly proves noncompliance.",
-  manual: "Collect the administrative evidence named by the finding because no documented read interface settles the control.",
-};
+const ALWAYS_MANUAL = (instruction: string): VerdictCriteria => criteria(
+  "No automatic pass is emitted.",
+  "No automatic warn is emitted unless supporting inventory is partial.",
+  "No automatic fail is emitted.",
+  instruction,
+  {},
+  { compliant: "manual", noncompliant: "manual", partial: "manual" },
+);
 
 function check(
   id: string,
@@ -282,9 +336,9 @@ function check(
   severity: CheckContract["severity"],
   owningTool: string,
   sourceSurfaceIds: readonly string[],
-  manual = false,
+  verdictCriteria: VerdictCriteria,
 ): CheckContract {
-  return { id, controlNumbers, title, severity, owningTool, sourceSurfaceIds, criteria: manual ? MANUAL_CRITERIA : AUTOMATED_CRITERIA };
+  return { id, controlNumbers, title, severity, owningTool, sourceSurfaceIds, criteria: verdictCriteria };
 }
 
 const IDENTITY_TOOL = "webex_assess_identity";
@@ -292,28 +346,105 @@ const COLLAB_TOOL = "webex_assess_collaboration_governance";
 const MEETING_TOOL = "webex_assess_meeting_hybrid_security";
 
 export const WEBEX_CHECKS: readonly CheckContract[] = [
-  check("WEBEX-ID-01", [1], "SSO enforcement", "critical", IDENTITY_TOOL, ["organization"], true),
-  check("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", IDENTITY_TOOL, ["people", "roles"], true),
-  check("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", IDENTITY_TOOL, ["people", "roles"]),
-  check("WEBEX-ID-04", [25], "Administrative privilege concentration", "medium", IDENTITY_TOOL, ["people", "roles"]),
-  check("WEBEX-ID-05", [19], "Bot account inventory", "medium", IDENTITY_TOOL, ["people"]),
-  check("WEBEX-ID-06", [19], "Bot approval state", "medium", IDENTITY_TOOL, ["people"], true),
-  check("WEBEX-ID-07", [13], "Guest account inventory", "medium", IDENTITY_TOOL, ["people", "guest-count"]),
-  check("WEBEX-COLLAB-01", [4], "External communications policy", "high", COLLAB_TOOL, ["organization"], true),
-  check("WEBEX-COLLAB-02", [5, 21], "File sharing restrictions and messaging DLP", "high", COLLAB_TOOL, ["events"], true),
-  check("WEBEX-COLLAB-03", [6, 7, 12], "Recording storage and retention governance", "medium", COLLAB_TOOL, ["admin-recordings"], true),
-  check("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", COLLAB_TOOL, ["rooms", "me"]),
-  check("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", COLLAB_TOOL, ["webhooks", "me"]),
-  check("WEBEX-COLLAB-06", [24], "License utilization review", "low", COLLAB_TOOL, ["licenses"]),
-  check("WEBEX-COLLAB-07", [25], "Admin activity audit visibility", "high", COLLAB_TOOL, ["admin-audit-events"]),
-  check("WEBEX-COLLAB-08", [11], "eDiscovery and legal hold capability", "high", COLLAB_TOOL, ["events"], true),
-  check("WEBEX-MTG-01", [8, 22], "Meeting E2EE and calling SRTP defaults", "high", MEETING_TOOL, ["meeting-preferences", "meeting-common-settings"], true),
-  check("WEBEX-MTG-02", [9], "Meeting lobby and join-before-host defaults", "high", MEETING_TOOL, ["meeting-sites", "meeting-common-settings", "meetings", "meeting-preferences", "me"]),
-  check("WEBEX-MTG-03", [13], "Guest meeting access policy", "medium", MEETING_TOOL, ["meeting-sites", "meeting-common-settings", "me"]),
-  check("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", MEETING_TOOL, ["hybrid-clusters", "hybrid-connectors"]),
-  check("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", MEETING_TOOL, ["devices", "workspaces"], true),
-  check("WEBEX-MTG-06", [10], "Meeting password policy", "high", MEETING_TOOL, ["meeting-sites", "meeting-common-settings", "meetings", "meeting-preferences", "me"]),
-  check("WEBEX-MTG-07", [23], "Virtual background policy", "low", MEETING_TOOL, ["meeting-common-settings"], true),
+  check("WEBEX-ID-01", [1], "SSO enforcement", "critical", IDENTITY_TOOL, ["organization"], ALWAYS_MANUAL("Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created.")),
+  check("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", IDENTITY_TOOL, ["people", "roles"], ALWAYS_MANUAL("Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field.")),
+  check("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", IDENTITY_TOOL, ["people", "roles"], criteria(
+    "People and roles are readable, the people population is nonempty and complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively.",
+    "At least one Compliance Officer is visible, but the people listing is truncated.",
+    "People and roles are readable and the nonempty people population contains no Compliance Officer.",
+    "People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer.",
+    { roleNameContains: WEBEX_VERDICT_VALUES.complianceOfficerRolePattern },
+  )),
+  check("WEBEX-ID-04", [25], "Administrative privilege concentration", "medium", IDENTITY_TOOL, ["people", "roles"], criteria(
+    "People and roles are readable and complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins.",
+    "No administrator is visible, the people list is truncated, or administrator count exceeds max_admins; max_admins defaults to 10.",
+    "No fail verdict is emitted; concentration above the threshold requires review rather than proving noncompliance.",
+    "People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list.",
+    { administratorRoleContains: WEBEX_VERDICT_VALUES.administratorRolePattern, defaultMaxAdmins: WEBEX_DEFAULTS.maxAdmins },
+    { noncompliant: "warn" },
+  )),
+  check("WEBEX-ID-05", [19], "Bot account inventory", "medium", IDENTITY_TOOL, ["people"], criteria(
+    "GET /people is readable, nonempty and complete; inventory records every Person.type equal to 'bot'.",
+    "GET /people is readable and nonempty but truncated.",
+    "No fail verdict is emitted because bot presence is an inventory for comparison with the approved register.",
+    "GET /people is unreadable or returns zero people; export Control Hub Apps > Bots.",
+    { botPersonType: WEBEX_VERDICT_VALUES.botPersonType },
+    { noncompliant: "warn" },
+  )),
+  check("WEBEX-ID-06", [19], "Bot approval state", "medium", IDENTITY_TOOL, ["people"], ALWAYS_MANUAL("Export Control Hub Management > Apps bot management and reconcile it with WEBEX-ID-05; no documented read field exposes bot approval state.")),
+  check("WEBEX-ID-07", [13], "Guest account inventory", "medium", IDENTITY_TOOL, ["people", "guest-count"], criteria(
+    "GET /people is readable, nonempty and complete, GET /guests/count is readable, and Person.type='appuser' records are inventoried for reconciliation with WEBEX-MTG-03.",
+    "The people listing is truncated or GET /guests/count is unreadable, so the otherwise complete inventory cannot pass.",
+    "No fail verdict is emitted because the inventory does not itself settle guest-access policy.",
+    "GET /people is unreadable or returns zero people; export the Control Hub guest user list.",
+    { guestPersonType: WEBEX_VERDICT_VALUES.guestPersonType },
+    { noncompliant: "warn" },
+  )),
+  check("WEBEX-COLLAB-01", [4], "External communications policy", "high", COLLAB_TOOL, ["organization"], ALWAYS_MANUAL("Export Control Hub Messaging external communication allow-list settings; no documented read endpoint exposes the policy.")),
+  check("WEBEX-COLLAB-02", [5, 21], "File sharing restrictions and messaging DLP", "high", COLLAB_TOOL, ["events"], ALWAYS_MANUAL("Export Control Hub file-sharing controls and DLP or CASB integration evidence; Events is supporting inventory only and exposes no policy-state field.")),
+  check("WEBEX-COLLAB-03", [6, 7, 12], "Recording storage and retention governance", "medium", COLLAB_TOOL, ["admin-recordings"], ALWAYS_MANUAL("Export Control Hub recording and messaging retention and storage settings; the admin recordings read exposes recordings but no retention or storage-location policy.")),
+  check("WEBEX-COLLAB-04", [14], "Space classification coverage", "medium", COLLAB_TOOL, ["rooms", "me"], criteria(
+    "Rooms is readable and nonempty, every visible room has classificationId, the listing is complete, and token type is verified as non-bot.",
+    "Every visible room has classificationId but the listing is truncated, the token is a bot, or GET /people/me cannot prove token type.",
+    "At least one visible room lacks classificationId.",
+    "Rooms is unreadable or empty; export Control Hub space classification settings.",
+    {},
+  )),
+  check("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", COLLAB_TOOL, ["webhooks", "me"], criteria(
+    "Webhooks is readable and nonempty, every visible webhook targetUrl starts with 'https://' and has a nonempty secret, the list is complete, and token type is verified as non-bot.",
+    "Every visible webhook is secure but the list is truncated, the token is a bot, or token type cannot be verified.",
+    "At least one visible webhook lacks an HTTPS targetUrl or a nonempty signing secret.",
+    "Webhooks is unreadable or empty; collect webhook inventories from every integration owner.",
+    { secureTargetPrefix: WEBEX_VERDICT_VALUES.secureWebhookPrefix },
+  )),
+  check("WEBEX-COLLAB-06", [24], "License utilization review", "low", COLLAB_TOOL, ["licenses"], criteria(
+    "Licenses is readable and complete, totalUnits is positive, and unassigned units divided by total units is at most 0.20.",
+    "The unassigned ratio exceeds 0.20 or the license listing is truncated.",
+    "No fail verdict is emitted; excess unassigned capacity is a review condition.",
+    "Licenses is unreadable, empty, or has totalUnits equal to zero; export the Control Hub subscriptions and usage report.",
+    { maximumUnassignedRatio: WEBEX_VERDICT_VALUES.maximumUnassignedLicenseRatio },
+    { noncompliant: "warn" },
+  )),
+  check("WEBEX-COLLAB-07", [25], "Admin activity audit visibility", "high", COLLAB_TOOL, ["admin-audit-events"], criteria(
+    "Admin audit events is readable, nonempty and complete for the last 30 days.",
+    "The read returns zero events or is truncated; confirm the log is populated and reviewed.",
+    "No fail verdict is emitted because an empty window needs reviewer confirmation.",
+    "Organization context is unavailable or admin audit events is unreadable; export the Control Hub admin audit log.",
+    { windowDays: WEBEX_VERDICT_VALUES.adminAuditWindowDays },
+    { noncompliant: "warn" },
+  )),
+  check("WEBEX-COLLAB-08", [11], "eDiscovery and legal hold capability", "high", COLLAB_TOOL, ["events"], ALWAYS_MANUAL("Export Control Hub eDiscovery and legal-hold configuration; the public compliance guide exposes no read endpoint for configuration and events older than 90 days require Pro Pack.")),
+  check("WEBEX-MTG-01", [8, 22], "Meeting E2EE and calling SRTP defaults", "high", MEETING_TOOL, ["meeting-preferences", "meeting-common-settings"], ALWAYS_MANUAL("Export the Control Hub meeting session type showing end-to-end encryption and the calling security configuration showing SRTP; the documented reads expose neither setting.")),
+  check("WEBEX-MTG-02", [9], "Meeting lobby and join-before-host defaults", "high", MEETING_TOOL, ["meeting-sites", "meeting-common-settings", "meetings", "meeting-preferences", "me"], criteria(
+    "Every readable site reports joinBeforeHost=false, audioBeforeHost=false and unlistAllMeetings=true; the site list and all sites are complete; meetings, meeting preferences and token type are readable.",
+    "joinBeforeHost=false but audioBeforeHost is absent or unlistAllMeetings is not true, or otherwise-passing evidence has partial site or secondary coverage.",
+    "Any site reports joinBeforeHost=true or audioBeforeHost=true.",
+    "No site common settings are readable or any site omits joinBeforeHost; collect each site's Control Hub Common Settings > Security page.",
+    { joinBeforeHost: false, audioBeforeHost: false, unlistAllMeetings: true },
+  )),
+  check("WEBEX-MTG-03", [13], "Guest meeting access policy", "medium", MEETING_TOOL, ["meeting-sites", "meeting-common-settings", "me"], criteria(
+    "Every readable site reports requireLoginBeforeAccess=true, site coverage is complete, and token type is readable.",
+    "All readable sites require login but site coverage or token-type evidence is partial.",
+    "Any readable site reports requireLoginBeforeAccess=false.",
+    "No site common settings are readable or any site omits requireLoginBeforeAccess; collect each site's Control Hub Common Settings > Security page.",
+    { requireLoginBeforeAccess: true },
+  )),
+  check("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", MEETING_TOOL, ["hybrid-clusters", "hybrid-connectors"], criteria(
+    "Both inventories are readable, at least one connector exists, every connector status equals 'operational', and neither listing is truncated.",
+    "Every connector is operational but either listing is truncated.",
+    "Clusters exist with no connectors, or any connector status is not 'operational'.",
+    "Either inventory is unreadable, or both are empty and deployment applicability must be confirmed in Control Hub.",
+    { operationalStatus: WEBEX_VERDICT_VALUES.operationalConnectorStatus },
+  )),
+  check("WEBEX-MTG-05", [17, 18], "Device firmware and management posture", "high", MEETING_TOOL, ["devices", "workspaces"], ALWAYS_MANUAL("Compare inventoried software and upgrade channels with Cisco RoomOS lifecycle guidance and export the Control Hub device activation policy; documented device reads expose no end-of-life or blocking-policy field.")),
+  check("WEBEX-MTG-06", [10], "Meeting password policy", "high", MEETING_TOOL, ["meeting-sites", "meeting-common-settings", "meetings", "meeting-preferences", "me"], criteria(
+    "Every readable site reports requireStrongPassword=true and passwordCriteria.minLength at least 8; site coverage and all secondary evidence are complete.",
+    "Strong passwords are required but minLength is absent or below 8, or otherwise-passing evidence has partial site or secondary coverage.",
+    "Any readable site reports requireStrongPassword=false.",
+    "No site common settings are readable or any site omits requireStrongPassword; collect each site's Control Hub Common Settings > Security page.",
+    { minimumLength: WEBEX_VERDICT_VALUES.minimumMeetingPasswordLength },
+  )),
+  check("WEBEX-MTG-07", [23], "Virtual background policy", "low", MEETING_TOOL, ["meeting-common-settings"], ALWAYS_MANUAL("Export the Control Hub meeting settings page for virtual backgrounds; no field is exposed by meeting preferences, common settings, or session types.")),
 ];
 
 const API_SURFACE_INPUTS = [
@@ -339,6 +470,64 @@ const API_SURFACE_INPUTS = [
   ["webhooks", WEBEX_ENDPOINTS.webhooks, WEBEX_DOCS.webhooksList, "webhooks"],
 ] as const;
 
+const WEBEX_GET_HEADERS = ["Accept: application/json", "Authorization: Bearer <access token>"] as const;
+
+function webexRequest(
+  parameters: RequestContract["parameters"] = [],
+  responseShape = "JSON object; list operations read the items array and also accept a top-level array.",
+): RequestContract {
+  return {
+    clientRegion: "The configured Webex API origin; there is no regional client selection.",
+    headers: WEBEX_GET_HEADERS,
+    parameters,
+    responseShape,
+  };
+}
+
+const orgIdParameter = { name: "orgId", location: "query", required: false, value: "Configured organization identifier", when: "Only when org_id is configured." } as const;
+const listLimitParameter = (maximum: number) => ({ name: "max", location: "query" as const, required: false, value: String(maximum), when: "Sent on every page for this surface." });
+
+export const WEBEX_REQUESTS: Readonly<Record<string, RequestContract>> = {
+  "token-refresh": {
+    clientRegion: "The configured Webex API origin.",
+    headers: ["Content-Type: application/x-www-form-urlencoded", "Accept: application/json"],
+    parameters: [
+      { name: "grant_type", location: "form-body", required: true, value: "refresh_token" },
+      { name: "client_id", location: "form-body", required: true, value: "Configured client identifier" },
+      { name: "client_secret", location: "form-body", required: true, value: "Configured client secret" },
+      { name: "refresh_token", location: "form-body", required: true, value: "Configured refresh token" },
+    ],
+    responseShape: "JSON object containing a nonempty access_token string.",
+  },
+  me: webexRequest(),
+  organizations: webexRequest(),
+  organization: webexRequest([{ name: "orgId", location: "path", required: true, value: "URL-encoded organization identifier" }]),
+  people: webexRequest([orgIdParameter, listLimitParameter(WEBEX_PAGE_MAX.people)]),
+  roles: webexRequest(),
+  licenses: webexRequest([orgIdParameter]),
+  events: webexRequest([listLimitParameter(WEBEX_PAGE_MAX.events)]),
+  "admin-audit-events": webexRequest([
+    { name: "orgId", location: "query", required: true, value: "Resolved organization identifier" },
+    { name: "from", location: "query", required: true, value: `Current time minus ${WEBEX_VERDICT_VALUES.adminAuditWindowDays} days, ISO 8601` },
+    { name: "to", location: "query", required: true, value: "Current time, ISO 8601" },
+    listLimitParameter(WEBEX_PAGE_MAX.adminAudit),
+  ]),
+  "admin-recordings": webexRequest([listLimitParameter(WEBEX_PAGE_MAX.adminRecordings)]),
+  "guest-count": webexRequest([], "A bare decimal count in text/plain or a JSON object containing one numeric value."),
+  "hybrid-clusters": webexRequest([orgIdParameter]),
+  "hybrid-connectors": webexRequest([orgIdParameter]),
+  meetings: webexRequest([listLimitParameter(WEBEX_PAGE_MAX.meetings)]),
+  "meeting-preferences": webexRequest(),
+  "meeting-sites": webexRequest(),
+  "meeting-common-settings": webexRequest([
+    { name: "siteUrl", location: "query", required: false, value: "One site URL from meeting-sites", when: "Once per listed site; omit only for the preferred-site fallback." },
+  ]),
+  devices: webexRequest([orgIdParameter, listLimitParameter(WEBEX_PAGE_MAX.devices)]),
+  workspaces: webexRequest([orgIdParameter, listLimitParameter(WEBEX_PAGE_MAX.workspaces)]),
+  rooms: webexRequest([listLimitParameter(WEBEX_PAGE_MAX.rooms)]),
+  webhooks: webexRequest([listLimitParameter(WEBEX_PAGE_MAX.webhooks)]),
+};
+
 const WEBEX_EXPORT = {
   files: [
     "QUICK_REFERENCE.md",
@@ -352,9 +541,30 @@ const WEBEX_EXPORT = {
     "compliance/{framework}/{report}.md",
   ],
   conditionalFiles: ["_errors.log"],
+  artifacts: [
+    { path: "QUICK_REFERENCE.md", format: "markdown", requiredWhen: "Always", schema: "Heading, five bundle-orientation bullets, then a four-step recommended reading order.", serialization: "UTF-8 with a trailing newline." },
+    { path: "metadata.json", format: "json", requiredWhen: "Always", schema: "Object: generated_at string, org_id string|null, token_type person|bot|appuser|unknown, source_chain string[], config_file basename|string|null.", serialization: "Scrub recursively, then two-space JSON with insertion-order keys and one trailing newline." },
+    { path: "core_data/access.json", format: "json", requiredWhen: "Always", schema: "WebexAccessCheckResult record described below.", serialization: "Scrub recursively, then two-space JSON with insertion-order keys and one trailing newline." },
+    { path: "core_data/{category}/{surface}.json", format: "json", requiredWhen: "For every collected assessment surface", schema: "Readable surface: projected object or array using that surface allowlist. Unreadable surface: {error: scrubbed string, status: number|null}.", serialization: "Project first, scrub recursively, then two-space JSON with one trailing newline." },
+    { path: "analysis/{category}.json", format: "json", requiredWhen: "For identity, collaboration-governance and meeting-hybrid-security", schema: "Object: title string, category string, summary object, findings WebexFinding[], errors string[].", serialization: "Scrub recursively, then two-space JSON with insertion-order keys and one trailing newline." },
+    { path: "analysis/findings.json", format: "json", requiredWhen: "Always", schema: "Array of WebexFinding records in assessment order: identity, collaboration governance, meeting/hybrid.", serialization: "Scrub recursively, then two-space JSON with one trailing newline." },
+    { path: "compliance/executive_summary.md", format: "markdown", requiredWhen: "Always", schema: "Org and generated timestamp; Result Counts; Highest Priority Findings sorted by status rank and capped at 12; optional Partial Collection Warnings.", serialization: "UTF-8 Markdown with one trailing newline." },
+    { path: "compliance/unified_compliance_matrix.md", format: "markdown", requiredWhen: "Always", schema: "Finding, spec control, uppercase status, then one column for each of eight frameworks.", serialization: "UTF-8 Markdown table with one trailing newline." },
+    { path: "compliance/{framework}/{report}.md", format: "markdown", requiredWhen: "One file for every configured framework", schema: "Framework heading, mapped-finding count, then Requirement, Finding, Status, Title, Summary table.", serialization: "UTF-8 Markdown with one trailing newline." },
+    { path: "_errors.log", format: "text", requiredWhen: "At least one assessment collection error exists", schema: "Deduplicated lines prefixed by assessment category, one error per line.", serialization: "UTF-8 text with one final newline." },
+    { path: "{allocated-bundle-name}.zip", format: "zip", requiredWhen: "Always after directory files are complete", schema: "Archive contains every bundle file under relative paths with no enclosing bundle directory.", serialization: "Zip archive paired to the exact allocated directory basename; credentials are scrubbed before files enter the archive." },
+  ],
   overwritePolicy: "Allocate a new suffixed bundle directory on every rerun; never replace an earlier bundle.",
   pathSafetyPolicy: "Reject traversal, output roots outside the configured parent, symlink roots, and symlinked parent directories.",
   archivePairing: "Write a zip archive beside the bundle directory using the exact allocated directory name plus .zip.",
+  recordSchemas: {
+    WebexFinding: ["id:string", "control:number[]", "title:string", "severity:critical|high|medium|low|info", "status:pass|warn|fail|manual", "summary:string", "evidence?:object", "mappings:string[]", "frameworks:{fedramp,cmmc,soc2,cis,pci_dss,disa_stig,irap,ismap}:string[]"],
+    WebexAssessment: ["title:string", "category:string", "summary:object", "findings:WebexFinding[]", "errors:string[]", "rawData:surface-name -> projected value or unreadable marker"],
+    WebexAccessCheckResult: ["status:healthy|limited", "orgId?:string", "tokenType:person|bot|appuser|unknown", "adminCapable:boolean", "surfaces:WebexAccessSurface[]", "notes:string[]", "recommendedNextStep:string"],
+    WebexAccessSurface: ["name:string", "endpoint:string", "doc:string", "status:readable|not_readable|not_configured|manual", "count?:number", "truncated?:boolean", "error?:string"],
+    UnreadableSurface: ["error:scrubbed string", "status:number|null"],
+  },
+  jsonFormatting: "Before every JSON write, recursively scrub the complete value. Serialize with two-space indentation, preserve object insertion order, encode dates as ISO strings through normal JSON conversion, and append exactly one newline.",
 } as const;
 
 export const WEBEX_SPEC: IntegrationSpecContract = {
@@ -370,39 +580,65 @@ export const WEBEX_SPEC: IntegrationSpecContract = {
   },
   sourceModule: "cli/extensions/grc-tools/webex.spec.ts",
   baseServices: ["https://webexapis.com/v1"],
-  apiSurfaces: API_SURFACE_INPUTS.map(([id, path, documentationUrl, projection]) => ({
-    id,
-    kind: "rest",
-    method: "GET",
-    path,
-    baseService: "https://webexapis.com/v1",
-    documentationUrl,
-    fieldsConsumed: flattenedFields(WEBEX_SURFACE_FIELDS[projection]),
-    intent: id === "me" ? "auth-only" : "read",
-  })),
+  apiSurfaces: [
+    {
+      id: "token-refresh",
+      kind: "rest",
+      method: "POST",
+      path: WEBEX_ENDPOINTS.tokenRefresh,
+      baseService: "https://webexapis.com/v1",
+      documentationUrl: WEBEX_DOCS.integrations,
+      fieldsConsumed: ["access_token"],
+      projectionStage: "Authentication only. The access token is never exported.",
+      request: WEBEX_REQUESTS["token-refresh"],
+      intent: "auth-only",
+    },
+    ...API_SURFACE_INPUTS.map(([id, path, documentationUrl, projection]) => ({
+      id,
+      kind: "rest" as const,
+      method: "GET" as const,
+      path,
+      baseService: "https://webexapis.com/v1",
+      documentationUrl,
+      fieldsConsumed: flattenedFields(WEBEX_SURFACE_FIELDS[projection]),
+      projectionStage: "Fields name the normalized record written under core_data after allowlist projection and secret scrubbing.",
+      request: WEBEX_REQUESTS[id],
+      intent: id === "me" ? "auth-only" as const : "read" as const,
+    })),
+  ],
   authentication: {
     modes: ["Existing OAuth access token", "OAuth refresh-token exchange for an integration or service application"],
     credentialPrecedence: ["Explicit tool arguments", "Environment variables", "Configured file", "Default user configuration file"],
-    environmentVariables: ["WEBEX_TOKEN", "WEBEX_CLIENT_ID", "WEBEX_CLIENT_SECRET", "WEBEX_REFRESH_TOKEN", "WEBEX_ORG_ID", "WEBEX_BASE_URL", "WEBEX_CONFIG_FILE"],
+    environmentVariables: Object.values(WEBEX_ENV),
     configLocations: ["Path named by WEBEX_CONFIG_FILE", "~/.config/webex-sec-inspector/config.json", "~/.config/webex-sec-inspector/config.yaml", "~/.config/webex-sec-inspector/config.yml"],
     variants: ["Person token", "Guest token", "Bot token", "Integration token", "Service application token"],
+    refreshRequest: "POST /access_token with application/x-www-form-urlencoded grant_type=refresh_token, client_id, client_secret and refresh_token; require a JSON access_token.",
+    configFields: ["token", "client_id", "client_secret", "refresh_token", "org_id", "base_url", "timeout_seconds"],
+    malformedConfigBehavior: "Reject unreadable, invalid, or non-object JSON/YAML with a fixed Webex configuration error. Never include parser text, source text, or credential values.",
   },
   permissions: [
-    { id: "people-read", kind: "oauth-scope", value: WEBEX_SCOPES.peopleRead, unlocks: ["people", "me"] },
+    { id: "own-details-read", kind: "oauth-scope", value: WEBEX_SCOPES.ownDetailsRead, unlocks: ["me"] },
+    { id: "people-read", kind: "oauth-scope", value: WEBEX_SCOPES.peopleRead, unlocks: ["people"] },
     { id: "organizations-read", kind: "oauth-scope", value: WEBEX_SCOPES.organizationsRead, unlocks: ["organizations", "organization"] },
     { id: "roles-read", kind: "oauth-scope", value: WEBEX_SCOPES.rolesRead, unlocks: ["roles"] },
     { id: "licenses-read", kind: "oauth-scope", value: WEBEX_SCOPES.licensesRead, unlocks: ["licenses"] },
-    { id: "devices-read", kind: "oauth-scope", value: WEBEX_SCOPES.devicesRead, unlocks: ["devices", "workspaces"] },
+    { id: "devices-read", kind: "oauth-scope", value: WEBEX_SCOPES.devicesRead, unlocks: ["devices"] },
+    { id: "workspaces-read", kind: "oauth-scope", value: WEBEX_SCOPES.workspacesRead, unlocks: ["workspaces"] },
     { id: "hybrid-read", kind: "oauth-scope", value: WEBEX_SCOPES.hybridRead, unlocks: ["hybrid-clusters", "hybrid-connectors"] },
-    { id: "events-read", kind: "oauth-scope", value: WEBEX_SCOPES.eventsRead, unlocks: ["events", "admin-audit-events"] },
-    { id: "meetings-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingAdminScheduleRead, unlocks: ["meetings"] },
-    { id: "recordings-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingRecordingsRead, unlocks: ["admin-recordings"] },
-    { id: "preferences-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingAdminPreferencesRead, unlocks: ["meeting-preferences", "meeting-sites", "meeting-common-settings"] },
+    { id: "events-read", kind: "oauth-scope", value: WEBEX_SCOPES.eventsRead, unlocks: ["events"] },
+    { id: "admin-audit-read", kind: "oauth-scope", value: WEBEX_SCOPES.adminAuditRead, unlocks: ["admin-audit-events"] },
+    { id: "meetings-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingScheduleRead, unlocks: ["meetings"] },
+    { id: "recordings-read", kind: "oauth-scope", value: WEBEX_SCOPES.adminRecordingsRead, unlocks: ["admin-recordings"] },
+    { id: "guest-count-read", kind: "oauth-scope", value: WEBEX_SCOPES.guestIssuerRead, unlocks: ["guest-count"] },
+    { id: "preferences-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingPreferencesRead, unlocks: ["meeting-preferences", "meeting-sites"] },
+    { id: "meeting-config-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingAdminConfigRead, unlocks: ["meeting-common-settings"] },
+    { id: "rooms-read", kind: "oauth-scope", value: WEBEX_SCOPES.roomsRead, unlocks: ["rooms"] },
+    { id: "webhooks-read", kind: "oauth-scope", value: WEBEX_SCOPES.webhooksRead, unlocks: ["webhooks"] },
     { id: "pro-pack", kind: "plan", value: "Webex Pro Pack", unlocks: ["events", "admin-audit-events"], notes: "Some compliance and longer-retention evidence depends on the tenant plan." },
   ],
   pagination: [
     {
-      surfaceIds: ["people", "licenses", "events", "admin-audit-events", "admin-recordings", "hybrid-clusters", "hybrid-connectors", "meetings", "meeting-sites", "devices", "workspaces", "rooms", "webhooks"],
+      surfaceIds: ["organizations", "people", "roles", "licenses", "events", "admin-audit-events", "admin-recordings", "hybrid-clusters", "hybrid-connectors", "meetings", "meeting-sites", "devices", "workspaces", "rooms", "webhooks"],
       cursorFields: ["Link header rel=next"],
       pageSize: null,
       itemCap: null,
@@ -429,18 +665,26 @@ export const WEBEX_SPEC: IntegrationSpecContract = {
     notConfigured: "The surface requires tenant or organization context that was not configured or discoverable.",
   },
   redaction: {
-    sharedContractVersion: "1.0",
+    sharedContractVersion: "1.1",
     projections: Object.fromEntries(Object.entries(WEBEX_SURFACE_FIELDS).map(([surface, fields]) => [surface, flattenedFields(fields)])),
+    projectionStage: "Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys are then redacted recursively, and every JSON write scrubs the complete value again.",
     sensitiveFields: ["token", "client_secret", "refresh_token", "password", "secret", "targetUrl query", "downloadUrl query", "playbackUrl query", "webLink query"],
     benignExceptions: ["Documented resource identifiers", "Organization identifiers", "Site host names"],
     credentialFormats: ["Bearer credentials", "OAuth client secrets", "Refresh tokens", "Webhook signing secrets", "Meeting passwords", "Credential-bearing URL parameters"],
+    integrationRules: [
+      "A key containing token, secret, password, passcode, hostpin, hostkey, authorization, accesscode, activationcode, or credential is replaced with [REDACTED], except passwordCriteria, requireStrongPassword, and excludePassword policy objects.",
+      "Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, and SIP URI pwd/password/pin/passcode/token/secret parameters are replaced.",
+      "Webhook targetUrl, recording downloadUrl/playbackUrl, meeting webLink, and other URL-valued exported strings retain scheme, host and path but lose query, fragment and user information.",
+      "Configured token, client secret and refresh token values are removed from error text before status/length rendering; non-JSON bodies are represented only by media type and byte length.",
+      "Projection retains password and secret fields only so their presence is represented as [REDACTED], never their value.",
+    ],
   },
   output: WEBEX_EXPORT,
   tools: [
-    { name: "webex_check_access", checkIds: [] },
-    { name: IDENTITY_TOOL, checkIds: WEBEX_CHECKS.filter((item) => item.owningTool === IDENTITY_TOOL).map((item) => item.id) },
-    { name: COLLAB_TOOL, checkIds: WEBEX_CHECKS.filter((item) => item.owningTool === COLLAB_TOOL).map((item) => item.id) },
-    { name: MEETING_TOOL, checkIds: WEBEX_CHECKS.filter((item) => item.owningTool === MEETING_TOOL).map((item) => item.id) },
-    { name: "webex_export_audit_bundle", checkIds: WEBEX_CHECKS.map((item) => item.id), output: WEBEX_EXPORT },
+    { name: "webex_check_access", checkIds: [], resultSchema: "Text table plus structured fields {tool, status, orgId?, tokenType, adminCapable, surfaces, notes, recommendedNextStep}." },
+    { name: IDENTITY_TOOL, checkIds: WEBEX_CHECKS.filter((item) => item.owningTool === IDENTITY_TOOL).map((item) => item.id), resultSchema: "Text summary/table plus structured fields {tool, title, category, summary, findings, errors, rawData}." },
+    { name: COLLAB_TOOL, checkIds: WEBEX_CHECKS.filter((item) => item.owningTool === COLLAB_TOOL).map((item) => item.id), resultSchema: "Text summary/table plus structured fields {tool, title, category, summary, findings, errors, rawData}." },
+    { name: MEETING_TOOL, checkIds: WEBEX_CHECKS.filter((item) => item.owningTool === MEETING_TOOL).map((item) => item.id), resultSchema: "Text summary/table plus structured fields {tool, title, category, summary, findings, errors, rawData}." },
+    { name: "webex_export_audit_bundle", checkIds: WEBEX_CHECKS.map((item) => item.id), resultSchema: "Text export receipt plus structured fields {tool, output_dir, zip_path, finding_count, file_count, error_count}.", output: WEBEX_EXPORT },
   ],
 };

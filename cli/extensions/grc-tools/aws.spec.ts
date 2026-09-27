@@ -3,6 +3,7 @@ import type {
   ControlContract,
   FrameworkKey,
   IntegrationSpecContract,
+  RequestContract,
   VerdictCriteria,
 } from "./spec-model.js";
 
@@ -46,6 +47,29 @@ export const AWS_DEFAULTS = {
   rootEventRegion: "us-east-1",
   concurrency: 8,
   sensitivePorts: [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017],
+} as const;
+
+export const AWS_VERDICT_VALUES = {
+  minimumPasswordLength: 14,
+  passwordComplexityFields: ["RequireSymbols", "RequireNumbers", "RequireUppercaseCharacters", "RequireLowercaseCharacters"],
+  accountMfaEnabled: 1,
+  accountAccessKeysPresent: 0,
+  administratorPolicyName: "AdministratorAccess",
+  rootConsoleLoginEvent: "ConsoleLogin",
+  enabledGuardDutyStatus: "ENABLED",
+  activeAnalyzerStatus: "ACTIVE",
+  activeFindingStatus: "ACTIVE",
+  activeAssessmentStatus: "ACTIVE",
+  activeFlowLogStatus: "ACTIVE",
+  customerKeyManager: "CUSTOMER",
+  eligibleKeyState: "Enabled",
+  eligibleKeySpec: "SYMMETRIC_DEFAULT",
+  eligibleKeyOrigin: "AWS_KMS",
+  publicIpv4Cidr: "0.0.0.0/0",
+  publicIpv6Cidr: "::/0",
+  allowedNetworkAction: "allow",
+  secureTransportConditionKey: "aws:SecureTransport",
+  secureTransportDeniedValue: "false",
 } as const;
 
 export const AWS_REQUIRED_PUBLIC_ACCESS_FLAGS = [
@@ -189,19 +213,35 @@ interface AwsOperationContract {
   service: string;
   operation: string;
   action: string;
+  documentationNamespace: string;
+  documentationUrl?: string;
   fields: readonly string[];
 }
 
-function operation(service: string, operationName: string, fields: readonly string[], actionPrefix = service): AwsOperationContract {
+interface AwsOperationOptions {
+  id?: string;
+  action?: string;
+  documentationNamespace?: string;
+  documentationUrl?: string;
+}
+
+function operation(
+  service: string,
+  operationName: string,
+  fields: readonly string[],
+  options: AwsOperationOptions = {},
+): AwsOperationContract {
   const stableOperationId = operationName
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1-$2")
     .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
     .toLowerCase();
   return {
-    id: `${service}-${stableOperationId}`,
+    id: options.id ?? `${service}-${stableOperationId}`,
     service,
     operation: operationName,
-    action: `${actionPrefix}:${operationName}`,
+    action: options.action ?? `${service}:${operationName}`,
+    documentationNamespace: options.documentationNamespace ?? service,
+    documentationUrl: options.documentationUrl,
     fields,
   };
 }
@@ -233,11 +273,16 @@ export const AWS_OPERATIONS: readonly AwsOperationContract[] = [
   operation("organizations", "ListTargetsForPolicy", ["Targets.TargetId", "Targets.Name", "Targets.Type"]),
   operation("access-analyzer", "ListAnalyzers", ["analyzers.arn", "analyzers.name", "analyzers.status", "analyzers.type"]),
   operation("access-analyzer", "ListFindings", ["findings.id", "findings.resource", "findings.resourceType", "findings.status", "findings.createdAt", "findings.updatedAt"]),
-  operation("sso-admin", "ListInstances", ["Instances.InstanceArn", "Instances.IdentityStoreId", "Instances.Name", "Instances.Status"], "sso"),
+  operation("sso-admin", "ListInstances", ["Instances.InstanceArn", "Instances.IdentityStoreId", "Instances.Name", "Instances.Status"], { action: "sso:ListInstances" }),
   operation("auditmanager", "ListAssessments", ["assessmentMetadata.id", "assessmentMetadata.name", "assessmentMetadata.status"]),
   operation("account", "GetAlternateContact", ["AlternateContact.Name", "AlternateContact.Title", "AlternateContact.EmailAddress", "AlternateContact.PhoneNumber"]),
   operation("ec2", "DescribeRegions", ["Regions.RegionName", "Regions.OptInStatus"]),
-  operation("s3", "GetAccountPublicAccessBlock", ["PublicAccessBlockConfiguration"], "s3"),
+  operation("s3-control", "GetPublicAccessBlock", ["PublicAccessBlockConfiguration"], {
+    id: "s3-get-account-public-access-block",
+    action: "s3:GetAccountPublicAccessBlock",
+    documentationNamespace: "s3-control",
+    documentationUrl: "https://docs.aws.amazon.com/AmazonS3/latest/API/API_control_GetPublicAccessBlock.html",
+  }),
   operation("s3", "ListBuckets", ["Buckets.Name", "Buckets.CreationDate", "ContinuationToken"]),
   operation("s3", "GetPublicAccessBlock", ["PublicAccessBlockConfiguration"]),
   operation("s3", "GetBucketPolicyStatus", ["PolicyStatus.IsPublic"]),
@@ -258,7 +303,116 @@ export const AWS_IAM_ACTIONS: Readonly<Record<string, string>> = Object.freeze(
   Object.fromEntries(AWS_OPERATIONS.map((entry) => [entry.id, entry.action])),
 );
 
+const requestParameter = (
+  name: string,
+  required: boolean,
+  value: string,
+  when?: string,
+): RequestContract["parameters"][number] => ({
+  name,
+  location: "operation-input",
+  required,
+  value,
+  ...(when ? { when } : {}),
+});
+
+const AWS_REQUEST_PARAMETERS: Readonly<Record<string, RequestContract["parameters"]>> = {
+  "iam-list-users": [requestParameter("Marker", false, "Previous page marker"), requestParameter("MaxItems", true, "min(100, remaining item budget)")],
+  "iam-list-mfa-devices": [requestParameter("UserName", true, "Current IAM user name")],
+  "iam-list-access-keys": [requestParameter("UserName", true, "Current IAM user name")],
+  "iam-get-access-key-last-used": [requestParameter("AccessKeyId", true, "Current access key identifier")],
+  "iam-get-account-authorization-details": [
+    requestParameter("Filter", true, "['Role']"),
+    requestParameter("Marker", false, "Previous page marker"),
+    requestParameter("MaxItems", true, "min(100, remaining item budget)"),
+  ],
+  "iam-list-policies": [
+    requestParameter("Scope", true, "Local"),
+    requestParameter("OnlyAttached", true, "false"),
+    requestParameter("Marker", false, "Previous page marker"),
+    requestParameter("MaxItems", true, "100"),
+  ],
+  "iam-get-policy-version": [
+    requestParameter("PolicyArn", true, "ARN from ListPolicies"),
+    requestParameter("VersionId", true, "DefaultVersionId from ListPolicies, falling back to v1 only when absent"),
+  ],
+  "cloudtrail-lookup-events": [
+    requestParameter("LookupAttributes", true, "[{AttributeKey: Username, AttributeValue: root}]"),
+    requestParameter("StartTime", true, "Current time minus lookback_days, clamped to the 90-day service history"),
+    requestParameter("EndTime", true, "Current time"),
+    requestParameter("MaxResults", true, "50"),
+    requestParameter("NextToken", false, "Previous page token"),
+  ],
+  "cloudtrail-describe-trails": [requestParameter("includeShadowTrails", true, "false")],
+  "cloudtrail-get-trail-status": [requestParameter("Name", true, "TrailARN, falling back to Name")],
+  "cloudtrail-get-event-selectors": [requestParameter("TrailName", true, "TrailARN, falling back to Name")],
+  "securityhub-get-enabled-standards": [requestParameter("MaxResults", true, "100"), requestParameter("NextToken", false, "Previous page token")],
+  "guardduty-list-detectors": [requestParameter("MaxResults", true, "50"), requestParameter("NextToken", false, "Previous page token")],
+  "guardduty-get-detector": [requestParameter("DetectorId", true, "Identifier from ListDetectors")],
+  "organizations-list-accounts": [requestParameter("NextToken", false, "Previous page token"), requestParameter("MaxResults", true, "min(20, remaining item budget)")],
+  "organizations-list-policies": [
+    requestParameter("Filter", true, "SERVICE_CONTROL_POLICY"),
+    requestParameter("NextToken", false, "Previous page token"),
+    requestParameter("MaxResults", true, "20"),
+  ],
+  "organizations-list-targets-for-policy": [
+    requestParameter("PolicyId", true, "Identifier from ListPolicies"),
+    requestParameter("NextToken", false, "Previous page token"),
+  ],
+  "access-analyzer-list-analyzers": [requestParameter("nextToken", false, "Previous page token"), requestParameter("maxResults", true, "100")],
+  "access-analyzer-list-findings": [
+    requestParameter("analyzerArn", true, "ARN of each ACTIVE analyzer"),
+    requestParameter("maxResults", true, "min(100, remaining finding budget)"),
+    requestParameter("nextToken", false, "Previous page token"),
+  ],
+  "sso-admin-list-instances": [requestParameter("MaxResults", true, "100"), requestParameter("NextToken", false, "Previous page token")],
+  "auditmanager-list-assessments": [
+    requestParameter("status", true, AWS_VERDICT_VALUES.activeAssessmentStatus),
+    requestParameter("maxResults", true, "100"),
+    requestParameter("nextToken", false, "Previous page token"),
+  ],
+  "account-get-alternate-contact": [requestParameter("AlternateContactType", true, "SECURITY")],
+  "ec2-describe-regions": [requestParameter("Filters", true, "opt-in-status in [opt-in-not-required, opted-in]")],
+  "s3-get-account-public-access-block": [requestParameter("AccountId", true, "Account from GetCallerIdentity, falling back to account_id configuration")],
+  "s3-list-buckets": [requestParameter("ContinuationToken", false, "Previous page token"), requestParameter("MaxBuckets", true, "min(1000, remaining item budget)")],
+  "s3-get-public-access-block": [requestParameter("Bucket", true, "Bucket name from ListBuckets")],
+  "s3-get-bucket-policy-status": [requestParameter("Bucket", true, "Bucket name from ListBuckets")],
+  "s3-get-bucket-encryption": [requestParameter("Bucket", true, "Bucket name from ListBuckets")],
+  "s3-get-bucket-policy": [requestParameter("Bucket", true, "Bucket name from ListBuckets")],
+  "ec2-describe-vpcs": [requestParameter("NextToken", false, "Previous page token"), requestParameter("MaxResults", true, "1000")],
+  "ec2-describe-flow-logs": [requestParameter("NextToken", false, "Previous page token"), requestParameter("MaxResults", true, "1000")],
+  "ec2-describe-network-acls": [requestParameter("NextToken", false, "Previous page token"), requestParameter("MaxResults", true, "1000")],
+  "ec2-describe-security-groups": [requestParameter("NextToken", false, "Previous page token"), requestParameter("MaxResults", true, "1000")],
+  "rds-describe-db-instances": [requestParameter("Marker", false, "Previous page marker"), requestParameter("MaxRecords", true, "100")],
+  "kms-list-keys": [requestParameter("Marker", false, "Previous page marker"), requestParameter("Limit", true, "1000")],
+  "kms-describe-key": [requestParameter("KeyId", true, "KeyId from ListKeys")],
+  "kms-get-key-rotation-status": [requestParameter("KeyId", true, "Eligible KeyId from DescribeKey")],
+};
+
+function awsClientRegion(surfaceId: string): string {
+  if (surfaceId === "cloudtrail-lookup-events") {
+    return `${AWS_DEFAULTS.rootEventRegion} for global root activity, then the configured region only as a fallback when the global lookup fails and differs.`;
+  }
+  if (/^(?:ec2|rds|kms)-/.test(surfaceId)) return "Each assessed region; DescribeRegions itself uses the configured region.";
+  return "The configured home region.";
+}
+
+export const AWS_REQUESTS: Readonly<Record<string, RequestContract>> = Object.freeze(Object.fromEntries(
+  AWS_OPERATIONS.map((entry) => [
+    entry.id,
+    {
+      clientRegion: awsClientRegion(entry.id),
+      headers: ["Service request signed with AWS Signature Version 4 by the resolved credential provider."],
+      parameters: AWS_REQUEST_PARAMETERS[entry.id] ?? [],
+      responseShape: Object.entries(AWS_REQUIRED_OUTPUT_MEMBERS[entry.operation] ?? {})
+        .map(([name, kind]) => `${name}: ${kind}`)
+        .join(", ") || "The documented service response shape.",
+    },
+  ]),
+));
+
 function docsUrl(entry: AwsOperationContract): string {
+  if (entry.documentationUrl) return entry.documentationUrl;
   const serviceDocs: Record<string, string> = {
     "access-analyzer": "access-analyzer",
     account: "accounts",
@@ -276,7 +430,7 @@ function docsUrl(entry: AwsOperationContract): string {
     "sso-admin": "singlesignon",
     sts: "STS",
   };
-  return `https://docs.aws.amazon.com/${serviceDocs[entry.service]}/latest/APIReference/API_${entry.operation}.html`;
+  return `https://docs.aws.amazon.com/${serviceDocs[entry.documentationNamespace]}/latest/APIReference/API_${entry.operation}.html`;
 }
 
 const AWS_CONTROLS: ControlContract[] = Object.entries(AWS_CONTROL_CATALOG).map(([number, descriptor]) => ({
@@ -285,52 +439,245 @@ const AWS_CONTROLS: ControlContract[] = Object.entries(AWS_CONTROL_CATALOG).map(
   frameworks: descriptor.frameworks,
 }));
 
-const CRITERIA: VerdictCriteria = {
-  pass: "Every required source is complete and the observed configuration satisfies the check.",
-  warn: "The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance.",
-  fail: "Complete readable evidence proves that the required configuration is absent or noncompliant.",
-  manual: "A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict.",
-};
+function criteria(
+  pass: string,
+  warn: string,
+  fail: string,
+  manual: string,
+  constants: VerdictCriteria["constants"] = {},
+  emitted: { compliant?: "pass" | "manual"; noncompliant?: "fail" | "warn" | "manual"; partial?: "warn" | "manual" } = {},
+): VerdictCriteria {
+  const compliant = emitted.compliant ?? "pass";
+  const noncompliant = emitted.noncompliant ?? "fail";
+  const partial = emitted.partial ?? "warn";
+  return {
+    pass,
+    warn,
+    fail,
+    manual,
+    constants,
+    examples: [
+      { kind: "compliant", input: pass, expected: compliant, reason: `The compliant predicate emits ${compliant}.` },
+      { kind: "noncompliant", input: fail, expected: noncompliant, reason: `The noncompliant predicate emits ${noncompliant}.` },
+      { kind: "partial", input: warn, expected: partial, reason: `The partial predicate emits ${partial}.` },
+      { kind: "unreadable", input: manual, expected: "manual", reason: "The required evidence cannot be evaluated automatically." },
+    ],
+  };
+}
 
-const CHECK_INPUTS = [
-  ["AWS-IAM-01", "Root account MFA and access keys", "critical", "aws_assess_identity", ["iam-get-account-summary"]],
-  ["AWS-IAM-02", "IAM user MFA coverage", "high", "aws_assess_identity", ["iam-list-users", "iam-list-mfa-devices"]],
-  ["AWS-IAM-03", "Password policy strength", "high", "aws_assess_identity", ["iam-get-account-password-policy"]],
-  ["AWS-IAM-04", "Access key rotation", "high", "aws_assess_identity", ["iam-list-users", "iam-list-access-keys", "iam-get-access-key-last-used"]],
-  ["AWS-IAM-05", "Privileged role boundaries", "medium", "aws_assess_identity", ["iam-get-account-authorization-details"]],
-  ["AWS-IAM-06", "Dormant IAM users", "low", "aws_assess_identity", ["iam-list-users", "iam-list-access-keys", "iam-get-access-key-last-used"]],
-  ["AWS-IAM-07", "Root account activity", "high", "aws_assess_identity", ["cloudtrail-lookup-events"]],
-  ["AWS-IAM-08", "Customer-managed policy wildcards", "high", "aws_assess_identity", ["iam-list-policies", "iam-get-policy-version"]],
-  ["AWS-LOG-01", "Multi-region CloudTrail with validation", "critical", "aws_assess_logging_detection", ["cloudtrail-describe-trails", "cloudtrail-get-trail-status"]],
-  ["AWS-LOG-02", "CloudTrail data events", "high", "aws_assess_logging_detection", ["cloudtrail-get-event-selectors"]],
-  ["AWS-LOG-03", "Security Hub enablement", "high", "aws_assess_logging_detection", ["securityhub-describe-hub", "securityhub-get-enabled-standards"]],
-  ["AWS-LOG-04", "GuardDuty detectors", "high", "aws_assess_logging_detection", ["guardduty-list-detectors", "guardduty-get-detector"]],
-  ["AWS-LOG-05", "AWS Config recording", "high", "aws_assess_logging_detection", ["config-describe-configuration-recorders", "config-describe-configuration-recorder-status"]],
-  ["AWS-ORG-01", "Organizations visibility", "medium", "aws_assess_org_guardrails", ["organizations-describe-organization", "organizations-list-accounts"]],
-  ["AWS-ORG-02", "Service control policies", "high", "aws_assess_org_guardrails", ["organizations-list-policies", "organizations-list-targets-for-policy"]],
-  ["AWS-ORG-03", "Access Analyzer enablement", "high", "aws_assess_org_guardrails", ["access-analyzer-list-analyzers"]],
-  ["AWS-ORG-04", "External access findings", "high", "aws_assess_org_guardrails", ["access-analyzer-list-findings"]],
-  ["AWS-ORG-05", "Identity Center visibility", "medium", "aws_assess_org_guardrails", ["sso-admin-list-instances"]],
-  ["AWS-ORG-06", "Audit Manager active assessments", "medium", "aws_assess_org_guardrails", ["auditmanager-list-assessments"]],
-  ["AWS-ORG-07", "Account security contact", "medium", "aws_assess_org_guardrails", ["account-get-alternate-contact"]],
-  ["AWS-DATA-11", "S3 Block Public Access", "critical", "aws_assess_data_protection", ["s3-get-account-public-access-block", "s3-list-buckets", "s3-get-public-access-block", "s3-get-bucket-policy-status"]],
-  ["AWS-DATA-12", "Encryption at rest defaults", "high", "aws_assess_data_protection", ["ec2-get-ebs-encryption-by-default", "s3-get-bucket-encryption", "rds-describe-db-instances"]],
-  ["AWS-DATA-13", "S3 TLS-only bucket policies", "high", "aws_assess_data_protection", ["s3-get-bucket-policy"]],
-  ["AWS-DATA-22", "KMS customer-managed key rotation", "high", "aws_assess_data_protection", ["kms-list-keys", "kms-describe-key", "kms-get-key-rotation-status"]],
-  ["AWS-NET-14", "VPC Flow Logs coverage", "high", "aws_assess_network_security", ["ec2-describe-vpcs", "ec2-describe-flow-logs"]],
-  ["AWS-NET-20", "Network ACL inbound exposure", "high", "aws_assess_network_security", ["ec2-describe-network-acls"]],
-  ["AWS-NET-21", "Security group inbound exposure", "high", "aws_assess_network_security", ["ec2-describe-security-groups"]],
-] as const;
+function awsCheck(
+  id: string,
+  title: string,
+  severity: CheckContract["severity"],
+  owningTool: string,
+  sourceSurfaceIds: readonly string[],
+  verdictCriteria: VerdictCriteria,
+): CheckContract {
+  return { id, controlNumbers: AWS_FINDING_CONTROLS[id], title, severity, owningTool, sourceSurfaceIds, criteria: verdictCriteria };
+}
 
-export const AWS_CHECKS: readonly CheckContract[] = CHECK_INPUTS.map(([id, title, severity, owningTool, sourceSurfaceIds]) => ({
-  id,
-  controlNumbers: AWS_FINDING_CONTROLS[id],
-  title,
-  severity,
-  owningTool,
-  sourceSurfaceIds,
-  criteria: CRITERIA,
-}));
+const IDENTITY_TOOL = "aws_assess_identity";
+const LOGGING_TOOL = "aws_assess_logging_detection";
+const ORG_TOOL = "aws_assess_org_guardrails";
+const DATA_TOOL = "aws_assess_data_protection";
+const NETWORK_TOOL = "aws_assess_network_security";
+
+export const AWS_CHECKS: readonly CheckContract[] = [
+  awsCheck("AWS-IAM-01", "Root account MFA and access keys", "critical", IDENTITY_TOOL, ["iam-get-account-summary"], criteria(
+    "GetAccountSummary is readable, AccountMFAEnabled equals 1, and AccountAccessKeysPresent is absent or equals 0.",
+    "No warn verdict is emitted directly.",
+    "AccountMFAEnabled is not 1 or AccountAccessKeysPresent is greater than 0.",
+    "GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM.",
+    { mfaEnabled: AWS_VERDICT_VALUES.accountMfaEnabled, accessKeysPresent: AWS_VERDICT_VALUES.accountAccessKeysPresent },
+  )),
+  awsCheck("AWS-IAM-02", "IAM user MFA coverage", "high", IDENTITY_TOOL, ["iam-list-users", "iam-list-mfa-devices"], criteria(
+    "ListUsers is readable and every sampled user whose ListMFADevices call is readable has at least one MFA device.",
+    "The pass result is demoted when the user inventory is truncated or one or more user MFA-device lists is unreadable.",
+    "At least one sampled IAM user has a readable empty MFA-device list.",
+    "ListUsers is unreadable, or every sampled user's MFA-device list is unreadable.",
+  )),
+  awsCheck("AWS-IAM-03", "Password policy strength", "high", IDENTITY_TOOL, ["iam-get-account-password-policy"], criteria(
+    "A password policy exists, MinimumPasswordLength is at least 14, and RequireSymbols, RequireNumbers, RequireUppercaseCharacters, and RequireLowercaseCharacters are all true.",
+    "No warn verdict is emitted directly.",
+    "No password policy exists, minimum length is below 14, or any required complexity flag is not true.",
+    "GetAccountPasswordPolicy is unreadable.",
+    { minimumLength: AWS_VERDICT_VALUES.minimumPasswordLength, requiredComplexityFields: AWS_VERDICT_VALUES.passwordComplexityFields },
+  )),
+  awsCheck("AWS-IAM-04", "Access key rotation", "high", IDENTITY_TOOL, ["iam-list-users", "iam-list-access-keys", "iam-get-access-key-last-used"], criteria(
+    "ListUsers is readable and no judged access key is older than stale_days since LastUsedDate, or since CreateDate when never used; stale_days defaults to 90.",
+    "The pass result is demoted when users are truncated or any user's key list or any sampled key's last-use read is unreadable.",
+    "At least one judged key exceeds stale_days.",
+    "ListUsers is unreadable, every user's key list is unreadable, or every sampled key's last-use read is unreadable.",
+    { defaultStaleDays: AWS_DEFAULTS.staleDays },
+  )),
+  awsCheck("AWS-IAM-05", "Privileged role boundaries", "medium", IDENTITY_TOOL, ["iam-get-account-authorization-details"], criteria(
+    "The role inventory is readable and no role with AdministratorAccess or an inline Allow Action='*' Resource='*' policy lacks PermissionsBoundary.",
+    "One to max_privileged_roles privileged roles lack boundaries, or an otherwise-passing role inventory is truncated; max_privileged_roles defaults to 5.",
+    "More than max_privileged_roles privileged roles lack permission boundaries.",
+    "GetAccountAuthorizationDetails for roles is unreadable.",
+    { administratorPolicyName: AWS_VERDICT_VALUES.administratorPolicyName, defaultMaximum: AWS_DEFAULTS.maxPrivilegedRoles },
+  )),
+  awsCheck("AWS-IAM-06", "Dormant IAM users", "low", IDENTITY_TOOL, ["iam-list-users", "iam-list-access-keys", "iam-get-access-key-last-used"], criteria(
+    "ListUsers is readable and no user has PasswordLastUsed older than stale_days and no user with no password activity is proven to have zero access keys.",
+    "At least one user appears dormant, or an otherwise-passing user/key inventory is partial; stale_days defaults to 90.",
+    "No fail verdict is emitted; dormant users require review.",
+    "ListUsers is unreadable.",
+    { defaultStaleDays: AWS_DEFAULTS.staleDays },
+    { noncompliant: "warn" },
+  )),
+  awsCheck("AWS-IAM-07", "Root account activity", "high", IDENTITY_TOOL, ["cloudtrail-lookup-events"], criteria(
+    "No CloudTrail event attributed to username root is found in the lookback window, first queried in us-east-1.",
+    "No root ConsoleLogin exists but another root API event exists, or an otherwise-passing lookup is truncated, contains undated events, or falls back after the us-east-1 lookup fails.",
+    "At least one root ConsoleLogin event exists.",
+    "Root LookupEvents is unreadable.",
+    { consoleLoginEventName: AWS_VERDICT_VALUES.rootConsoleLoginEvent, defaultLookbackDays: AWS_DEFAULTS.rootLookbackDays, globalRegion: AWS_DEFAULTS.rootEventRegion },
+  )),
+  awsCheck("AWS-IAM-08", "Customer-managed policy wildcards", "high", IDENTITY_TOOL, ["iam-list-policies", "iam-get-policy-version"], criteria(
+    "At least one customer-managed policy is readable and none has an Allow statement with wildcard Action and wildcard Resource.",
+    "An unattached policy grants Action='*' and Resource='*', a policy grants a service-wide action such as service:* on Resource='*', or an otherwise-passing inventory is partial.",
+    "An attached policy or permission-boundary policy has an Allow statement with Action='*' and Resource='*'.",
+    "ListPolicies is unreadable or returns zero customer-managed policies; inline policies remain manual.",
+    { wildcard: "*" },
+  )),
+  awsCheck("AWS-LOG-01", "Multi-region CloudTrail with validation", "critical", LOGGING_TOOL, ["cloudtrail-describe-trails", "cloudtrail-get-trail-status"], criteria(
+    "At least one trail has IsMultiRegionTrail=true, LogFileValidationEnabled=true and GetTrailStatus.IsLogging=true.",
+    "A pass is demoted when GetTrailStatus is unreadable for any trail.",
+    "Trails are readable but no trail satisfies all three required values.",
+    "DescribeTrails is unreadable, or a qualifying trail exists but every qualifying logging state is unreadable.",
+  )),
+  awsCheck("AWS-LOG-02", "CloudTrail data events", "medium", LOGGING_TOOL, ["cloudtrail-describe-trails", "cloudtrail-get-event-selectors"], criteria(
+    "At least one readable trail has a nonempty EventSelectors.DataResources list or any AdvancedEventSelectors entry.",
+    "Trails and selectors are readable but no data-event selector exists.",
+    "No fail verdict is emitted; absent data events are a review condition.",
+    "DescribeTrails is unreadable or any required GetEventSelectors read is unreadable.",
+    {},
+    { noncompliant: "warn", partial: "manual" },
+  )),
+  awsCheck("AWS-LOG-03", "Security Hub enablement", "high", LOGGING_TOOL, ["securityhub-describe-hub", "securityhub-get-enabled-standards"], criteria(
+    "DescribeHub confirms a hub and GetEnabledStandards returns at least one standards subscription.",
+    "The hub exists but standards are unreadable, empty, or truncated.",
+    "DescribeHub reports that the hub is not subscribed.",
+    "DescribeHub is unreadable.",
+  )),
+  awsCheck("AWS-LOG-04", "GuardDuty detectors", "high", LOGGING_TOOL, ["guardduty-list-detectors", "guardduty-get-detector"], criteria(
+    "At least one listed detector has GetDetector.Status equal to ENABLED.",
+    "A pass is demoted when detector listing is truncated or any detector detail is unreadable.",
+    "No detector exists, or all readable detectors have a status other than ENABLED.",
+    "ListDetectors is unreadable, or detector IDs exist but enablement is unreadable.",
+    { enabledStatus: AWS_VERDICT_VALUES.enabledGuardDutyStatus },
+  )),
+  awsCheck("AWS-LOG-05", "AWS Config recording", "high", LOGGING_TOOL, ["config-describe-configuration-recorders", "config-describe-configuration-recorder-status"], criteria(
+    "At least one configuration recorder has a same-name status with recording=true.",
+    "No warn verdict is emitted directly.",
+    "No configuration recorder exists, or recorders exist but none reports recording=true.",
+    "Recorder listing or recorder-status listing is unreadable.",
+  )),
+  awsCheck("AWS-ORG-01", "Organizations visibility", "medium", ORG_TOOL, ["organizations-describe-organization", "organizations-list-accounts"], criteria(
+    "DescribeOrganization returns an organization; account listing may be readable or unreadable, but a pass is demoted if accounts are unreadable or truncated.",
+    "The account is standalone, or organization visibility passes while member accounts are unreadable or truncated.",
+    "No fail verdict is emitted directly.",
+    "DescribeOrganization is unreadable.",
+    {},
+    { noncompliant: "warn" },
+  )),
+  awsCheck("AWS-ORG-02", "Service control policies", "high", ORG_TOOL, ["organizations-list-policies", "organizations-list-targets-for-policy"], criteria(
+    "At least one SERVICE_CONTROL_POLICY exists and at least one policy has one or more targets.",
+    "The account is standalone, no SCP exists, or a pass is demoted by unreadable/truncated policy or target lists.",
+    "SCPs exist, every target list is readable, and no SCP has a root, OU, or account target.",
+    "ListPolicies is unreadable, or SCPs exist but target lists needed to settle attachment are unreadable.",
+    { filter: "SERVICE_CONTROL_POLICY" },
+  )),
+  awsCheck("AWS-ORG-03", "Access Analyzer enablement", "high", ORG_TOOL, ["access-analyzer-list-analyzers"], criteria(
+    "At least one analyzer has status ACTIVE.",
+    "A pass is demoted when the analyzer listing is truncated.",
+    "The analyzer listing is readable and contains no ACTIVE analyzer.",
+    "ListAnalyzers is unreadable.",
+    { activeStatus: AWS_VERDICT_VALUES.activeAnalyzerStatus },
+  )),
+  awsCheck("AWS-ORG-04", "External access findings", "dynamic", ORG_TOOL, ["access-analyzer-list-analyzers", "access-analyzer-list-findings"], criteria(
+    "At least one ACTIVE analyzer has a readable, complete findings list and no returned finding has missing status or status ACTIVE; severity is low.",
+    "At least one active external finding is returned; severity is high. A pass is also demoted by unreadable or truncated findings from another ACTIVE analyzer.",
+    "No fail verdict is emitted; active external access is a review condition.",
+    "Analyzers are unreadable, no ACTIVE analyzer exists, or no ACTIVE analyzer has a readable findings list.",
+    { activeAnalyzerStatus: AWS_VERDICT_VALUES.activeAnalyzerStatus, activeFindingStatus: AWS_VERDICT_VALUES.activeFindingStatus },
+    { noncompliant: "warn" },
+  )),
+  awsCheck("AWS-ORG-05", "Identity Center visibility", "low", ORG_TOOL, ["sso-admin-list-instances"], criteria(
+    "ListInstances returns at least one IAM Identity Center instance.",
+    "No instance is visible, or an otherwise-passing list is truncated.",
+    "No fail verdict is emitted.",
+    "ListInstances is unreadable.",
+    {},
+    { noncompliant: "warn" },
+  )),
+  awsCheck("AWS-ORG-06", "Audit Manager active assessments", "medium", ORG_TOOL, ["auditmanager-list-assessments"], criteria(
+    "ListAssessments(status=ACTIVE) returns at least one assessment with a creation or update timestamp and the list is complete.",
+    "A pass is demoted when any assessment lacks both timestamps or the list is truncated.",
+    "The read is successful but returns zero ACTIVE assessments.",
+    "ListAssessments is unreadable; verify applicability in Audit Manager or the alternate evidence process.",
+    { requestedStatus: AWS_VERDICT_VALUES.activeAssessmentStatus },
+  )),
+  awsCheck("AWS-ORG-07", "Account security contact", "medium", ORG_TOOL, ["account-get-alternate-contact"], criteria(
+    "GetAlternateContact(SECURITY) returns a contact with nonempty EmailAddress and PhoneNumber.",
+    "A SECURITY contact exists but email or phone is missing.",
+    "GetAlternateContact reports ResourceNotFoundException, meaning no SECURITY contact exists.",
+    "GetAlternateContact is unreadable.",
+    { contactType: "SECURITY" },
+  )),
+  awsCheck("AWS-DATA-11", "S3 Block Public Access", "critical", DATA_TOOL, ["s3-get-account-public-access-block", "s3-list-buckets", "s3-get-public-access-block", "s3-get-bucket-policy-status"], criteria(
+    "All four account Block Public Access flags are true, no readable bucket policy evaluates public, all bucket reads are complete, and no bucket public-access detail is unreadable.",
+    "The account block is incomplete but every bucket has all four bucket flags and no public policy, or the account block is complete but a policy evaluates public; a pass is also demoted by partial bucket evidence.",
+    "The account block is absent, or incomplete while any bucket lacks a full bucket block or has a public policy.",
+    "Account-level S3 Control GetPublicAccessBlock or ListBuckets is unreadable.",
+    { requiredFlags: AWS_REQUIRED_PUBLIC_ACCESS_FLAGS },
+  )),
+  awsCheck("AWS-DATA-12", "Encryption at rest defaults", "high", DATA_TOOL, ["ec2-get-ebs-encryption-by-default", "s3-get-bucket-encryption", "rds-describe-db-instances"], criteria(
+    "Every readable assessed region has EbsEncryptionByDefault=true, every bucket has at least one default SSEAlgorithm, and every RDS instance with a readable StorageEncrypted field reports true.",
+    "The base pass is demoted by partial region scope, unreadable regional/bucket sources, truncated inventories, or any RDS instance missing StorageEncrypted.",
+    "Any readable region reports EbsEncryptionByDefault=false, any bucket lacks default encryption, or any RDS instance reports StorageEncrypted=false.",
+    "EBS default encryption is unreadable in every assessed region or ListBuckets is unreadable.",
+  )),
+  awsCheck("AWS-DATA-13", "S3 TLS-only bucket policies", "high", DATA_TOOL, ["s3-list-buckets", "s3-get-bucket-policy"], criteria(
+    "Every listed bucket has a Deny statement whose condition requires aws:SecureTransport=false; bucket and policy reads are complete.",
+    "The pass is demoted when any bucket policy is unreadable or the bucket list is truncated.",
+    "At least one readable bucket lacks the required Deny statement.",
+    "ListBuckets is unreadable or returns zero buckets; load-balancer and endpoint TLS remain manual.",
+    { conditionKey: AWS_VERDICT_VALUES.secureTransportConditionKey, deniedValue: AWS_VERDICT_VALUES.secureTransportDeniedValue },
+  )),
+  awsCheck("AWS-DATA-22", "KMS customer-managed key rotation", "medium", DATA_TOOL, ["kms-list-keys", "kms-describe-key", "kms-get-key-rotation-status"], criteria(
+    "Every eligible key reports KeyRotationEnabled=true. Eligibility requires KeyManager=CUSTOMER, KeyState=Enabled, KeySpec=SYMMETRIC_DEFAULT and Origin=AWS_KMS.",
+    "Customer keys exist but none is eligible for automatic rotation, or a pass is demoted by unreadable/truncated regional scope, key metadata, or rotation status.",
+    "At least one eligible key reports KeyRotationEnabled=false.",
+    "KMS lists fail in every region, no customer key exists, or no customer key can be confirmed because every KeyManager is unreadable.",
+    {
+      keyManager: AWS_VERDICT_VALUES.customerKeyManager,
+      keyState: AWS_VERDICT_VALUES.eligibleKeyState,
+      keySpec: AWS_VERDICT_VALUES.eligibleKeySpec,
+      keyOrigin: AWS_VERDICT_VALUES.eligibleKeyOrigin,
+    },
+  )),
+  awsCheck("AWS-NET-14", "VPC Flow Logs coverage", "medium", NETWORK_TOOL, ["ec2-describe-vpcs", "ec2-describe-flow-logs"], criteria(
+    "Every readable VPC has at least one matching flow log whose FlowLogStatus is ACTIVE.",
+    "The base pass is demoted by partial region scope, unreadable/truncated VPC or flow-log inventories, or missing FlowLogStatus on some logs.",
+    "At least one readable VPC has no ACTIVE flow log.",
+    "VPCs are unreadable in every region, no VPC exists, or every VPC's flow-log state is unreadable or missing.",
+    { activeStatus: AWS_VERDICT_VALUES.activeFlowLogStatus },
+  )),
+  awsCheck("AWS-NET-20", "Network ACL inbound exposure", "medium", NETWORK_TOOL, ["ec2-describe-network-acls"], criteria(
+    "At least one network ACL is readable and none has an inbound allow entry from 0.0.0.0/0 or ::/0 whose protocol/range covers any configured sensitive port or all ports.",
+    "A pass is demoted by partial region scope or unreadable/truncated NACL inventories.",
+    "At least one NACL has a matching permissive inbound entry.",
+    "NACLs are unreadable in every region or no NACL is returned.",
+    { publicIpv4: AWS_VERDICT_VALUES.publicIpv4Cidr, publicIpv6: AWS_VERDICT_VALUES.publicIpv6Cidr, defaultSensitivePorts: AWS_DEFAULTS.sensitivePorts },
+  )),
+  awsCheck("AWS-NET-21", "Security group inbound exposure", "high", NETWORK_TOOL, ["ec2-describe-security-groups"], criteria(
+    "At least one security group is readable and none has an inbound IPv4 or IPv6 world source whose protocol/range covers any configured sensitive port or all ports.",
+    "A pass is demoted by partial region scope or unreadable/truncated security-group inventories.",
+    "At least one security group has a matching unrestricted inbound permission.",
+    "Security groups are unreadable in every region or no security group is returned.",
+    { publicIpv4: AWS_VERDICT_VALUES.publicIpv4Cidr, publicIpv6: AWS_VERDICT_VALUES.publicIpv6Cidr, defaultSensitivePorts: AWS_DEFAULTS.sensitivePorts },
+  )),
+];
 
 const AWS_EXPORT = {
   files: [
@@ -350,9 +697,32 @@ const AWS_EXPORT = {
     "compliance/frameworks/{framework}.md",
   ],
   conditionalFiles: ["_errors.log"],
+  artifacts: [
+    { path: "README.md", format: "markdown", requiredWhen: "Always", schema: "Evidence-bundle heading, Contents list, and credential-resolution notice.", serialization: "UTF-8 with a trailing newline." },
+    { path: "QUICK_REFERENCE.md", format: "markdown", requiredWhen: "Always", schema: "Access summary, finding counts, Where to look, and every finding ID/title/status.", serialization: "UTF-8 with a trailing newline." },
+    { path: "metadata.json", format: "json", requiredWhen: "Always", schema: "Object: region, profile|null, account_id|null, account_id_hint|null, source_chain string[], generated_at ISO string, finding/control counts, pass/warn/fail/manual counts, options object with effective limits and regions.", serialization: "Snapshot scrub, two-space JSON, insertion-order keys, one trailing newline." },
+    { path: "core_data/access.json", format: "json", requiredWhen: "Always", schema: "AwsAccessCheckResult record described below.", serialization: "Snapshot scrub, two-space JSON, insertion-order keys, one trailing newline." },
+    { path: "analysis/findings.json", format: "json", requiredWhen: "Always", schema: "Array of AwsFinding records in category order: identity, logging-detection, org-guardrails, data-protection, network-security.", serialization: "Snapshot scrub, two-space JSON, one trailing newline." },
+    { path: "analysis/{category}.json", format: "json", requiredWhen: "One each for identity, logging-detection, org-guardrails, data-protection and network-security", schema: "AwsAssessmentResult: title, summary, findings, optional errors.", serialization: "Snapshot scrub, two-space JSON, insertion-order keys, one trailing newline." },
+    { path: "analysis/summary.json", format: "json", requiredWhen: "Always", schema: "Object: findings, controls_covered, pass, warn, fail, manual, categories[{category,pass,warn,fail,manual}].", serialization: "Snapshot scrub, two-space JSON, one trailing newline." },
+    { path: "compliance/executive_summary.md", format: "markdown", requiredWhen: "Always", schema: "Run metadata; Result Counts; up to 10 fail/warn findings ordered by status then severity; Manual Evidence Required; optional Collection Warnings.", serialization: "UTF-8 Markdown with one trailing newline." },
+    { path: "compliance/unified_compliance_matrix.md", format: "markdown", requiredWhen: "Always", schema: "Finding, Controls, Title, Status, Severity and eight framework columns; pipe/newline escaped.", serialization: "UTF-8 Markdown table with one trailing newline." },
+    { path: "compliance/frameworks/{framework}.md", format: "markdown", requiredWhen: "One file for every configured framework", schema: "Framework heading, mapped finding/status counts, then Finding, Title, Status, Severity, Mapping, Summary table.", serialization: "UTF-8 Markdown with one trailing newline." },
+    { path: "_errors.log", format: "text", requiredWhen: "At least one collection error or truncation warning exists", schema: "Deduplicated sanitized collection messages, one per line.", serialization: "UTF-8 text with one final newline." },
+    { path: "{allocated-bundle-name}.zip", format: "zip", requiredWhen: "Always after directory files are complete", schema: "Archive contains every bundle file under relative paths with no enclosing bundle directory.", serialization: "Zip archive paired to the exact allocated directory basename; only already-scrubbed files enter the archive." },
+  ],
   overwritePolicy: "Allocate a new suffixed bundle directory on every rerun; never replace an earlier bundle.",
   pathSafetyPolicy: "Reject traversal, output roots outside the configured parent, symlink roots, and symlinked parent directories.",
   archivePairing: "Write a zip archive beside the bundle directory using the exact allocated directory name plus .zip.",
+  recordSchemas: {
+    AwsFinding: ["id:string", "title:string", "severity:critical|high|medium|low|info", "status:pass|warn|fail|manual", "summary:string", "evidence?:object", "mappings:string[]"],
+    AwsAssessmentResult: ["title:string", "summary:object", "findings:AwsFinding[]", "errors?:string[]"],
+    AwsAccessCheckResult: ["status:healthy|limited", "accountId?:string", "arn?:string", "surfaces:AwsAccessSurface[]", "notes:string[]", "recommendedNextStep:string"],
+    AwsAccessSurface: ["name:string", "service:string", "command:IAM action string", "region:string", "status:readable|not_readable", "count:number|null", "truncated:boolean|null", "error?:string", "error_code?:string|null", "http_status?:number|null"],
+    NotCollectedMarker: ["collected:false", "command:string", "error:string|null", "error_code:string|null", "http_status:number|null"],
+    RegionScope: ["regions:string[]", "regionsTotal:number|null", "regionsSeen:number", "partial:boolean", "source:arguments|describe-regions|configured-region-fallback", "error?:string"],
+  },
+  jsonFormatting: "Before every JSON write, recursively scrub the complete value. Serialize with two-space indentation, preserve object insertion order, encode Date values as ISO strings through normal JSON conversion, and append exactly one newline.",
 } as const;
 
 export const AWS_SPEC: IntegrationSpecContract = {
@@ -372,22 +742,29 @@ export const AWS_SPEC: IntegrationSpecContract = {
     id: entry.id,
     kind: "sdk",
     operation: entry.operation,
+    sdkService: entry.service,
+    iamAction: entry.action,
+    documentationNamespace: entry.documentationNamespace,
     baseService: entry.service,
     documentationUrl: docsUrl(entry),
     fieldsConsumed: entry.fields,
+    projectionStage: "Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported.",
+    request: AWS_REQUESTS[entry.id],
     intent: entry.operation === "GetCallerIdentity" ? "auth-only" : "read",
   })),
   authentication: {
     modes: ["AWS default credential provider chain", "Named shared-configuration profile"],
     credentialPrecedence: ["Named profile argument or AWS_PROFILE", "Environment credentials", "Shared credentials and configuration files", "Container credentials", "Instance role credentials"],
-    environmentVariables: ["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION"],
+    environmentVariables: ["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ACCOUNT_ID"],
     configLocations: ["~/.aws/credentials", "~/.aws/config"],
     variants: ["Long-lived access keys", "Temporary session credentials", "Identity Center cached session", "Container role", "Instance role"],
+    configFields: ["region", "profile", "account_id"],
+    malformedConfigBehavior: "Credential-provider errors are replaced with a fixed provider name and sanitized code/status; raw provider and shared-file parser messages are never emitted.",
   },
   permissions: AWS_OPERATIONS.map((entry) => ({ id: entry.id, kind: "iam-action", value: entry.action, unlocks: [entry.id] })),
   pagination: [
     {
-      surfaceIds: AWS_OPERATIONS.filter((entry) => ["ListUsers", "ListPolicies", "GetAccountAuthorizationDetails"].includes(entry.operation)).map((entry) => entry.id),
+      surfaceIds: ["iam-list-users", "iam-list-policies", "iam-get-account-authorization-details"],
       cursorFields: ["Marker", "IsTruncated"],
       pageSize: 100,
       itemCap: null,
@@ -396,7 +773,7 @@ export const AWS_SPEC: IntegrationSpecContract = {
       stopConditions: ["IsTruncated is false", "Configured item cap", "Page cap", "Missing or repeated marker"],
     },
     {
-      surfaceIds: AWS_OPERATIONS.filter((entry) => ["LookupEvents", "GetEnabledStandards", "ListDetectors", "ListAccounts", "ListTargetsForPolicy", "ListAnalyzers", "ListFindings", "ListInstances", "ListAssessments", "DescribeVpcs", "DescribeFlowLogs", "DescribeNetworkAcls", "DescribeSecurityGroups"].includes(entry.operation)).map((entry) => entry.id),
+      surfaceIds: ["cloudtrail-lookup-events", "securityhub-get-enabled-standards", "guardduty-list-detectors", "organizations-list-accounts", "organizations-list-policies", "organizations-list-targets-for-policy", "access-analyzer-list-analyzers", "access-analyzer-list-findings", "sso-admin-list-instances", "auditmanager-list-assessments", "ec2-describe-vpcs", "ec2-describe-flow-logs", "ec2-describe-network-acls", "ec2-describe-security-groups"],
       cursorFields: ["NextToken", "nextToken"],
       pageSize: null,
       itemCap: null,
@@ -414,13 +791,22 @@ export const AWS_SPEC: IntegrationSpecContract = {
       stopConditions: ["No continuation token", "Bucket cap", "Page cap", "Missing or repeated token"],
     },
     {
-      surfaceIds: ["rds-describe-db-instances", "kms-list-keys"],
-      cursorFields: ["Marker", "NextMarker", "Truncated"],
+      surfaceIds: ["rds-describe-db-instances"],
+      cursorFields: ["Marker"],
       pageSize: 100,
       itemCap: null,
       pageCap: AWS_DEFAULTS.maxPagesPerList,
       totalSemantics: "No total is returned; only exhaustion proves completeness.",
       stopConditions: ["No marker", "Configured item cap", "Page cap", "Missing or repeated marker"],
+    },
+    {
+      surfaceIds: ["kms-list-keys"],
+      cursorFields: ["Marker request", "NextMarker response when Truncated=true"],
+      pageSize: 1000,
+      itemCap: AWS_DEFAULTS.keyLimit,
+      pageCap: AWS_DEFAULTS.maxPagesPerList,
+      totalSemantics: "KMS returns no total; only Truncated=false proves exhaustion.",
+      stopConditions: ["Truncated is false", "Configured key cap", "Page cap", "Missing or repeated NextMarker"],
     },
   ],
   rateLimits: [{
@@ -441,19 +827,30 @@ export const AWS_SPEC: IntegrationSpecContract = {
     notConfigured: "A service or regional surface was outside the explicitly configured assessment scope.",
   },
   redaction: {
-    sharedContractVersion: "1.0",
+    sharedContractVersion: "1.1",
     projections: Object.fromEntries(AWS_OPERATIONS.map((entry) => [entry.id, entry.fields])),
+    projectionStage: "Each service response is normalized to the listed members before assessment. Findings and summaries contain only normalized evidence. Every JSON artifact is recursively snapshot-scrubbed again at the write sink.",
     sensitiveFields: ["AccessKeyId", "SecretAccessKey", "SessionToken", "Authorization", "Cookie", "Policy credentials", "AlternateContact.EmailAddress", "AlternateContact.PhoneNumber"],
     benignExceptions: ["Masked access key identifiers", "Resource ARNs", "Account identifiers", "Region names", "Policy names"],
     credentialFormats: ["AWS access key identifiers", "AWS secret access keys", "Session tokens", "Signature Version 4 authorization values", "Shared-configuration credential values", "Private key material"],
+    integrationRules: [
+      "Register AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN from the environment at client construction, then register SecretAccessKey and SessionToken returned by the resolved credential provider before a signed request.",
+      "Replace AWS access-key identifiers shaped like AKIA or ASIA plus 16 uppercase letters/digits, 40-character secret keys, Signature Version 4 Signature/Credential proofs, session tokens, authorization values, cookies, private-key material and credential assignments.",
+      "Under snapshot keys ending in token, secret, password, credential, authorization, private key, secret key, session token, or bearer-id variants, replace every nonempty value or subtree with [REDACTED]. Keep null, undefined and the empty string to preserve absence.",
+      "Snapshot recursion keeps scalar values through depth 32; a container deeper than 32 is replaced whole with [REDACTED].",
+      "Mask access-key identifiers in findings as first four characters + **** + last four; identifiers of eight characters or fewer become ****.",
+      "Preserve resource ARNs, account and region identifiers, policy names, status/code tokens, setting booleans and numeric limits unless they contain a registered configured secret.",
+      "Never copy an HTTP response body into an error. Record fixed operation, region, sanitized error code, HTTP status, content type and byte length only.",
+    ],
   },
   output: AWS_EXPORT,
   tools: [
-    { name: "aws_check_access", checkIds: [] },
+    { name: "aws_check_access", checkIds: [], resultSchema: "Text table plus structured fields {tool, status, accountId?, arn?, surfaces, notes, recommendedNextStep}." },
     ...["aws_assess_identity", "aws_assess_logging_detection", "aws_assess_org_guardrails", "aws_assess_data_protection", "aws_assess_network_security"].map((name) => ({
       name,
       checkIds: AWS_CHECKS.filter((item) => item.owningTool === name).map((item) => item.id),
+      resultSchema: "Text summary/table plus structured fields {tool, title, summary, findings, errors?}.",
     })),
-    { name: "aws_export_audit_bundle", checkIds: AWS_CHECKS.map((item) => item.id), output: AWS_EXPORT },
+    { name: "aws_export_audit_bundle", checkIds: AWS_CHECKS.map((item) => item.id), resultSchema: "Text export receipt plus structured fields {tool, output_dir, zip_path, finding_count, file_count, error_count}.", output: AWS_EXPORT },
   ],
 };

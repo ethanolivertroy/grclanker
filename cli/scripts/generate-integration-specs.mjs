@@ -5,6 +5,7 @@ import {
   SHARED_COLLECTION_STATES,
   SHARED_INTEGRATION_CONTRACT_VERSION,
   SHARED_INTEGRATION_REQUIREMENTS,
+  SHARED_REDACTION_RULES,
 } from "../dist/extensions/grc-tools/hardening/contract.js";
 import { collectDefinedGrcTools } from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
@@ -71,11 +72,11 @@ function renderTools(spec, tools) {
   const lines = [
     "## Tools",
     "",
-    "| Tool | Purpose | Finding IDs |",
-    "|---|---|---|",
+    "| Tool | Purpose | Finding IDs | Result shape |",
+    "|---|---|---|---|",
   ];
   for (const { definition, contract } of tools) {
-    lines.push(`| \`${definition.name}\` | ${escapeCell(definition.description)} | ${listCell(contract.checkIds)} |`);
+    lines.push(`| \`${definition.name}\` | ${escapeCell(definition.description)} | ${listCell(contract.checkIds)} | ${escapeCell(contract.resultSchema ?? "Registered tool result")} |`);
   }
   lines.push("", "### Parameters", "");
   for (const { definition } of tools) {
@@ -104,6 +105,11 @@ function renderAuthentication(spec) {
     `Configuration locations: ${auth.configLocations.join(", ")}`,
     "",
     `Credential and deployment variants: ${auth.variants.join(", ")}`,
+    "",
+    `Configuration fields: ${listCell(auth.configFields)}`,
+    "",
+    `Malformed configuration: ${auth.malformedConfigBehavior}`,
+    ...(auth.refreshRequest ? ["", `Credential refresh: ${auth.refreshRequest}`] : []),
   ].join("\n");
 }
 
@@ -118,15 +124,35 @@ function renderPermissions(spec) {
 }
 
 function renderSurfaces(spec) {
-  return [
+  const surfaceTable = [
     "## API surfaces",
     "",
-    "| ID | Interface | Read operation | Service | Intent | Fields consumed | Reference |",
-    "|---|---|---|---|---|---|---|",
+    "| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |",
+    "|---|---|---|---|---|---|---|---|---|",
     ...spec.apiSurfaces.map((surface) => {
       const operation = surface.kind === "rest" ? `${surface.method} ${surface.path}` : surface.operation;
-      return `| \`${surface.id}\` | ${surface.kind === "rest" ? "HTTP" : "service operation"} | \`${escapeCell(operation)}\` | ${escapeCell(surface.baseService)} | ${escapeCell(surface.intent)} | ${listCell(surface.fieldsConsumed)} | [Official documentation](${surface.documentationUrl}) |`;
+      return `| \`${surface.id}\` | ${surface.kind === "rest" ? "HTTP" : "service operation"} | \`${escapeCell(operation)}\` | ${escapeCell(surface.sdkService ?? surface.baseService)} | ${surface.iamAction ? `\`${escapeCell(surface.iamAction)}\`` : "N/A"} | ${escapeCell(surface.intent)} | ${escapeCell(surface.projectionStage)} | ${listCell(surface.fieldsConsumed)} | [Official documentation](${surface.documentationUrl}) |`;
     }),
+  ];
+  const requestRows = spec.apiSurfaces.flatMap((surface) => {
+    const base = [
+      `| \`${surface.id}\` | client | ${escapeCell(surface.request.clientRegion)} | yes |`,
+      `| \`${surface.id}\` | headers | ${escapeCell(surface.request.headers.join("; ") || "None")} | yes |`,
+      `| \`${surface.id}\` | response | ${escapeCell(surface.request.responseShape)} | yes |`,
+    ];
+    return [
+      ...base,
+      ...surface.request.parameters.map((parameter) => `| \`${surface.id}\` | ${escapeCell(`${parameter.location}:${parameter.name}`)} | ${escapeCell(parameter.value)}${parameter.when ? `; ${escapeCell(parameter.when)}` : ""} | ${parameter.required ? "yes" : "no"} |`),
+    ];
+  });
+  return [
+    ...surfaceTable,
+    "",
+    "### Request construction",
+    "",
+    "| Surface | Input | Exact value or rule | Required |",
+    "|---|---|---|---|",
+    ...requestRows,
   ].join("\n");
 }
 
@@ -159,6 +185,10 @@ function renderChecks(spec) {
     control.number,
     spec.checks.filter((check) => check.controlNumbers.includes(control.number)),
   ]));
+  const constantRows = spec.checks.flatMap((check) => Object.entries(check.criteria.constants)
+    .map(([name, value]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(Array.isArray(value) ? value.join(", ") : value)} |`));
+  const exampleRows = spec.checks.flatMap((check) => check.criteria.examples
+    .map((example) => `| \`${check.id}\` | ${example.kind} | ${escapeCell(example.input)} | ${example.expected} | ${escapeCell(example.reason)} |`));
   return [
     "## Checks",
     "",
@@ -179,6 +209,18 @@ function renderChecks(spec) {
     "| Finding | Severity | Owning tool | Sources | Pass | Warn | Fail | Manual |",
     "|---|---|---|---|---|---|---|---|",
     ...spec.checks.map((check) => `| \`${check.id}\` | ${check.severity} | \`${check.owningTool}\` | ${listCell(check.sourceSurfaceIds)} | ${escapeCell(check.criteria.pass)} | ${escapeCell(check.criteria.warn)} | ${escapeCell(check.criteria.fail)} | ${escapeCell(check.criteria.manual)} |`),
+    "",
+    "### Criterion constants",
+    "",
+    "| Finding | Name | Value |",
+    "|---|---|---|",
+    ...(constantRows.length > 0 ? constantRows : ["| None |  |  |"]),
+    "",
+    "### Criterion examples",
+    "",
+    "| Finding | Case | Input condition | Expected | Reason |",
+    "|---|---|---|---|---|",
+    ...exampleRows,
     "",
     "### Compliance framework mappings",
     "",
@@ -212,11 +254,17 @@ function renderRedaction(spec) {
     "",
     `Shared contract version: ${spec.redaction.sharedContractVersion}.`,
     "",
+    `Projection stage: ${spec.redaction.projectionStage}`,
+    "",
     `Sensitive fields and values: ${spec.redaction.sensitiveFields.join(", ")}`,
     "",
     `Credential formats: ${spec.redaction.credentialFormats.join(", ")}`,
     "",
     `Reviewed benign exceptions: ${spec.redaction.benignExceptions.join(", ")}`,
+    "",
+    "Integration-specific rules:",
+    "",
+    bullets(spec.redaction.integrationRules),
     "",
     "Projected fields by surface:",
     "",
@@ -237,6 +285,22 @@ function renderExport(spec) {
     "Conditional paths:",
     "",
     bullets(spec.output.conditionalFiles.map((path) => `\`${path}\``)),
+    "",
+    "### Artifact schemas",
+    "",
+    "| Path | Format | Required when | Schema | Serialization |",
+    "|---|---|---|---|---|",
+    ...spec.output.artifacts.map((artifact) => `| \`${artifact.path}\` | ${artifact.format} | ${escapeCell(artifact.requiredWhen)} | ${escapeCell(artifact.schema)} | ${escapeCell(artifact.serialization)} |`),
+    "",
+    "### Record schemas",
+    "",
+    ...Object.entries(spec.output.recordSchemas).flatMap(([name, fields]) => [
+      `#### ${name}`,
+      "",
+      ...fields.map((field) => `- \`${field}\``),
+      "",
+    ]),
+    `JSON formatting: ${spec.output.jsonFormatting}`,
     "",
     `Overwrite policy: ${spec.output.overwritePolicy}`,
     "",
@@ -262,7 +326,7 @@ export function renderIntegrationSpec(entry, narrative, tools) {
     formatFrontmatter(spec),
     "",
     generatedMarker,
-    `> Generated from \`${spec.sourceModule}\` and registered tool definitions by \`npm --prefix cli run sync:integration-specs\`. Edit the metadata or narrative source, not this file.`,
+    "> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.",
     "",
     `# ${spec.identity.displayName}`,
     "",
@@ -319,7 +383,7 @@ export function renderSharedContract() {
     "---",
     "",
     "<!-- generated shared integration contract -->",
-    "> Generated from the shared hardening vocabulary and credential scrubber contract by `npm --prefix cli run sync:integration-specs`. Edit those sources, not this file.",
+    "> Generated from the executable shared hardening vocabulary and credential scrubber contract. Edit those sources, not this file.",
     "",
     "# Shared integration contract",
     "",
@@ -328,6 +392,12 @@ export function renderSharedContract() {
     `Contract version: ${SHARED_INTEGRATION_CONTRACT_VERSION}`,
     "",
     ...sections.flatMap(([heading, requirements]) => [`## ${heading}`, "", ...requirements.map((requirement) => `- ${requirement}`), ""]),
+    "## Exact redaction rules",
+    "",
+    "| Rule | Match | Replacement | Must keep |",
+    "|---|---|---|---|",
+    ...SHARED_REDACTION_RULES.map((rule) => `| \`${rule.id}\` | ${escapeCell(rule.match)} | ${escapeCell(rule.replacement)} | ${escapeCell(rule.preserve)} |`),
+    "",
     "## Collection-state vocabulary",
     "",
     SHARED_COLLECTION_STATES.map((state) => `- \`${state.replaceAll("_", " ")}\``).join("\n"),

@@ -26,11 +26,13 @@ import {
   WEBEX_DEFAULTS,
   WEBEX_DOCS,
   WEBEX_ENDPOINTS,
+  WEBEX_ENV,
   WEBEX_FRAMEWORK_LABELS,
   WEBEX_PAGE_MAX,
   WEBEX_SCOPES,
   WEBEX_SPEC,
   WEBEX_SURFACE_FIELDS,
+  WEBEX_VERDICT_VALUES,
 } from "./webex.spec.js";
 import type {
   WebexFieldSpec,
@@ -560,7 +562,7 @@ function loadConfigFile(pathname: string): JsonRecord {
  * are optional.
  */
 function discoverConfigFile(env: NodeJS.ProcessEnv, homeDir: string, explicitPath?: string): string | undefined {
-  const requestedPath = explicitPath ?? asString(env.WEBEX_CONFIG_FILE);
+  const requestedPath = explicitPath ?? asString(env[WEBEX_ENV.configFile]);
   if (requestedPath) {
     if (!existsSync(requestedPath)) throw new Error(scrubErrorText(`Webex config file not found: ${requestedPath}`));
     return requestedPath;
@@ -599,13 +601,13 @@ export function resolveWebexConfiguration(
     return fileValue;
   };
 
-  const token = pick("token", "WEBEX_TOKEN", "token", "token");
-  const clientId = pick("client_id", "WEBEX_CLIENT_ID", "client_id", "client-id");
-  const clientSecret = pick("client_secret", "WEBEX_CLIENT_SECRET", "client_secret", "client-secret");
-  const refreshToken = pick("refresh_token", "WEBEX_REFRESH_TOKEN", "refresh_token", "refresh-token");
-  const orgId = pick("org_id", "WEBEX_ORG_ID", "org_id", "org");
-  const baseUrl = pick("base_url", "WEBEX_API_BASE_URL", "base_url", "base-url") ?? "https://webexapis.com/v1";
-  const timeoutSeconds = asNumber(input.timeout_seconds) ?? asNumber(env.WEBEX_TIMEOUT) ?? asNumber(fileValues.timeout_seconds);
+  const token = pick("token", WEBEX_ENV.token, "token", "token");
+  const clientId = pick("client_id", WEBEX_ENV.clientId, "client_id", "client-id");
+  const clientSecret = pick("client_secret", WEBEX_ENV.clientSecret, "client_secret", "client-secret");
+  const refreshToken = pick("refresh_token", WEBEX_ENV.refreshToken, "refresh_token", "refresh-token");
+  const orgId = pick("org_id", WEBEX_ENV.orgId, "org_id", "org");
+  const baseUrl = pick("base_url", WEBEX_ENV.apiBaseUrl, "base_url", "base-url") ?? "https://webexapis.com/v1";
+  const timeoutSeconds = asNumber(input.timeout_seconds) ?? asNumber(env[WEBEX_ENV.timeout]) ?? asNumber(fileValues.timeout_seconds);
 
   const refresh = clientId && clientSecret && refreshToken ? { clientId, clientSecret, refreshToken } : undefined;
   if (!token && !refresh) {
@@ -688,7 +690,7 @@ export class WebexApiClient {
       client_secret: refresh.clientSecret,
       refresh_token: refresh.refreshToken,
     });
-    const response = await this.fetchImpl(this.buildUrl("/access_token"), {
+    const response = await this.fetchImpl(this.buildUrl(WEBEX_ENDPOINTS.tokenRefresh), {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
       body: body.toString(),
@@ -697,13 +699,13 @@ export class WebexApiClient {
     const payload = parseJsonObject(rawText);
     if (!response.ok) {
       const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
-      throw new WebexApiError(`Webex token refresh failed (${response.status})${detail ? `: ${detail}` : ""}`, response.status, "/access_token");
+      throw new WebexApiError(`Webex token refresh failed (${response.status})${detail ? `: ${detail}` : ""}`, response.status, WEBEX_ENDPOINTS.tokenRefresh);
     }
     if (payload === undefined) {
       throw new WebexApiError(
         `Webex token refresh returned ${describeErrorBody(undefined, rawText, response.headers.get("content-type"))} with status ${response.status}`,
         response.status,
-        "/access_token",
+        WEBEX_ENDPOINTS.tokenRefresh,
       );
     }
     const accessToken = asString(payload.access_token);
@@ -1099,7 +1101,7 @@ function tokenProbeInventory(me: SurfaceResult<JsonRecord>, tokenType: WebexToke
   const result: SurfaceResult<unknown> = tokenType === "unknown" && me.ok ? { ok: false, error: "the response carried no Person.type" } : me;
   return {
     endpoint: "GET /people/me",
-    scope: "spark:people_read",
+    scope: WEBEX_SCOPES.ownDetailsRead,
     result,
     consequence: "the token type could not be verified and a bot token's partial view cannot be excluded",
   };
@@ -1451,7 +1453,7 @@ export async function checkWebexAccess(client: WebexClientLike): Promise<WebexAc
     recommendedNextStep:
       status === "healthy"
         ? "Run webex_assess_identity, webex_assess_collaboration_governance, webex_assess_meeting_hybrid_security, or webex_export_audit_bundle."
-        : "Provide an admin, integration, or Service App token with spark-admin:people_read, spark-admin:roles_read, spark-admin:licenses_read, spark-admin:organizations_read, spark-admin:devices_read, spark-admin:hybrid_clusters_read, spark-compliance:events_read, spark-compliance:recordings_read, audit:events_read, meeting:admin_config_read, and guest-issuer:read.",
+        : `Provide an admin, integration, or Service App token with ${WEBEX_SCOPES.peopleRead}, ${WEBEX_SCOPES.rolesRead}, ${WEBEX_SCOPES.licensesRead}, ${WEBEX_SCOPES.organizationsRead}, ${WEBEX_SCOPES.devicesRead}, ${WEBEX_SCOPES.hybridRead}, ${WEBEX_SCOPES.eventsRead}, ${WEBEX_SCOPES.adminRecordingsRead}, ${WEBEX_SCOPES.adminAuditRead}, ${WEBEX_SCOPES.meetingAdminConfigRead}, and ${WEBEX_SCOPES.guestIssuerRead}.`,
   };
 }
 
@@ -1478,11 +1480,11 @@ export async function assessWebexIdentity(
   const surfaces: SurfaceSet = { me, organizations: orgs, people, roles, organization, guest_count: guestCount };
 
   const roleMap = roleMapFromRoles(surfaceItems(roles));
-  const humans = surfaceItems(people).filter((person) => !["bot", "appuser"].includes(asString(person.type) ?? ""));
-  const bots = surfaceItems(people).filter((person) => asString(person.type) === "bot");
-  const guests = surfaceItems(people).filter((person) => asString(person.type) === "appuser");
-  const adminUsers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => /administrator/i.test(role)));
-  const complianceOfficers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => /compliance officer/i.test(role)));
+  const humans = surfaceItems(people).filter((person) => ![WEBEX_VERDICT_VALUES.botPersonType, WEBEX_VERDICT_VALUES.guestPersonType].includes(asString(person.type) ?? ""));
+  const bots = surfaceItems(people).filter((person) => asString(person.type) === WEBEX_VERDICT_VALUES.botPersonType);
+  const guests = surfaceItems(people).filter((person) => asString(person.type) === WEBEX_VERDICT_VALUES.guestPersonType);
+  const adminUsers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => role.toLowerCase().includes(WEBEX_VERDICT_VALUES.administratorRolePattern)));
+  const complianceOfficers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => role.toLowerCase().includes(WEBEX_VERDICT_VALUES.complianceOfficerRolePattern)));
   const peoplePartial = partialNote(people, "people");
   const orgLabel = organization.ok ? asString(organization.data.displayName) ?? orgId ?? "org" : orgId ?? "org";
 
@@ -1592,7 +1594,7 @@ export async function assessWebexIdentity(
   const guestCountValue = guestCount.ok ? asNumber(guestCount.data.count) : undefined;
   const guestCountInventory: SecondaryInventory = {
     endpoint: "GET /guests/count",
-    scope: "guest-issuer:read",
+    scope: WEBEX_SCOPES.guestIssuerRead,
     result: guestCount,
     consequence: "the guest-issuer count could not be reconciled with the people-based inventory",
   };
@@ -1729,9 +1731,9 @@ export async function assessWebexCollaborationGovernance(
   const webhookItems = surfaceItems(webhooks);
   const insecureWebhooks = webhookItems.filter((webhook) => {
     const targetUrl = asString(webhook.targetUrl) ?? "";
-    return !targetUrl.startsWith("https://") || !asString(webhook.secret);
+    return !targetUrl.startsWith(WEBEX_VERDICT_VALUES.secureWebhookPrefix) || !asString(webhook.secret);
   });
-  const inactiveWebhooks = webhookItems.filter((webhook) => asString(webhook.status) === "inactive");
+  const inactiveWebhooks = webhookItems.filter((webhook) => asString(webhook.status) === WEBEX_VERDICT_VALUES.inactiveWebhookStatus);
   let webhookFinding: WebexFinding;
   if (!webhooks.ok) {
     webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "manual",
@@ -1770,7 +1772,7 @@ export async function assessWebexCollaborationGovernance(
       { licenses_seen: licenseItems.length, citation: WEBEX_DOCS.licensesList });
   } else {
     licenseFinding = finding("WEBEX-COLLAB-06", [24], "License utilization review", "low",
-      unassignedRatio <= 0.2 ? (licenses.truncated ? "warn" : "pass") : "warn",
+      unassignedRatio <= WEBEX_VERDICT_VALUES.maximumUnassignedLicenseRatio ? (licenses.truncated ? "warn" : "pass") : "warn",
       `${unassigned} of ${totalUnits} license units are unassigned (${Math.round(unassignedRatio * 100)}%, threshold 20%) across ${licenseItems.length} licenses.${partialNote(licenses, "licenses")}`,
       { total_units: totalUnits, consumed_units: consumedUnits, unassigned_units: unassigned, licenses_seen: licenseItems.length, licenses_truncated: licenses.truncated });
   }
@@ -1910,7 +1912,7 @@ export async function assessWebexMeetingHybridSecurity(
 
   const clusterItems = surfaceItems(hybridClusters);
   const connectorItems = surfaceItems(hybridConnectors);
-  const nonOperational = connectorItems.filter((connector) => asString(connector.status) !== "operational");
+  const nonOperational = connectorItems.filter((connector) => asString(connector.status) !== WEBEX_VERDICT_VALUES.operationalConnectorStatus);
   const undatedConnectors = connectorItems.filter((connector) => !asDate(connector.created));
   let hybridFinding: WebexFinding;
   if (!hybridClusters.ok || !hybridConnectors.ok) {
