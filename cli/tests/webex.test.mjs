@@ -717,7 +717,7 @@ test("WebexApiClient stops an empty page that still advertises a next link", asy
 });
 
 test("WebexApiClient follows only same-origin next links without userinfo", async () => {
-  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`) {
+  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`, finalLinkHeader) {
     const requests = [];
     const fetchImpl = async (input, init = {}) => {
       const url = new URL(input.toString());
@@ -728,7 +728,10 @@ test("WebexApiClient follows only same-origin next links without userinfo", asyn
           { headers: { link: linkHeader } },
         );
       }
-      return jsonResponse({ items: [{ id: "person-2" }] });
+      return jsonResponse(
+        { items: [{ id: "person-2" }] },
+        finalLinkHeader ? { headers: { link: finalLinkHeader } } : {},
+      );
     };
     const result = await new WebexApiClient(sampleConfig({ token: "webex-pagination-token" }), { fetchImpl }).listPeople(10);
     return { requests, result };
@@ -750,12 +753,20 @@ test("WebexApiClient follows only same-origin next links without userinfo", asyn
   assert.equal(userinfo.result.truncated, true);
   assert.equal(userinfo.requests.length, 1, "a userinfo-bearing next link must never be requested");
 
-  const noNextRelation = await walk(
-    "unused",
-    '<https://webexapis.com/v1/people?after=previous>; rel="prev last"',
-  );
-  assert.equal(noNextRelation.result.truncated, true);
-  assert.equal(noNextRelation.requests.length, 1, "a present Link header without rel=next is partial");
+  for (const finalLinkHeader of [
+    '<https://webexapis.com/v1/people?after=first>; rel="prev first"',
+    '<https://webexapis.com/v1/people?after=last>; rel="last"',
+    '<https://webexapis.com/v1/people?after=previous>; rel="prev"',
+  ]) {
+    const finalPage = await walk(
+      "https://webexapis.com/v1/people?after=second",
+      '<https://webexapis.com/v1/people?after=second>; rel="next"',
+      finalLinkHeader,
+    );
+    assert.deepEqual(finalPage.result.items.map((item) => item.id), ["person-1", "person-2"]);
+    assert.equal(finalPage.result.truncated, false, finalLinkHeader);
+    assert.equal(finalPage.requests.length, 2);
+  }
 
   const repeated = await walk("https://webexapis.com/v1/people?max=100&orgId=org-123");
   assert.equal(repeated.result.truncated, true);

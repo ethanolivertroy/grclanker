@@ -912,7 +912,7 @@ test("NewrelicApiClient follows REST API v2 Link headers with the Api-Key header
 });
 
 test("NewrelicApiClient refuses cross-origin and userinfo REST next links", async () => {
-  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`, firstUsers = [{ id: 1, email: "one@example.com" }]) {
+  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`, firstUsers = [{ id: 1, email: "one@example.com" }], finalLinkHeader) {
     const requests = [];
     const fetchImpl = async (input, init = {}) => {
       const url = new URL(input.toString());
@@ -923,7 +923,10 @@ test("NewrelicApiClient refuses cross-origin and userinfo REST next links", asyn
           { headers: { link: linkHeader } },
         );
       }
-      return jsonResponse({ users: [{ id: 2, email: "two@example.com" }] });
+      return jsonResponse(
+        { users: [{ id: 2, email: "two@example.com" }] },
+        finalLinkHeader ? { headers: { link: finalLinkHeader } } : {},
+      );
     };
     const result = await new NewrelicApiClient(sampleConfig(), { fetchImpl }).listRestUsers();
     return { requests, result };
@@ -947,13 +950,22 @@ test("NewrelicApiClient refuses cross-origin and userinfo REST next links", asyn
   assert.match(userinfo.result.note, /carries userinfo/);
   assert.equal(userinfo.requests.length, 1);
 
-  const noNextRelation = await walk(
-    "unused",
-    '<https://api.newrelic.com/v2/users.json?page=previous>; rel="prev last"',
-  );
-  assert.equal(noNextRelation.result.complete, false);
-  assert.match(noNextRelation.result.note, /no rel=next relation/);
-  assert.equal(noNextRelation.requests.length, 1);
+  for (const finalLinkHeader of [
+    '<https://api.newrelic.com/v2/users.json?page=1>; rel="prev first"',
+    '<https://api.newrelic.com/v2/users.json?page=2>; rel="last"',
+    '<https://api.newrelic.com/v2/users.json?page=1>; rel="prev"',
+  ]) {
+    const finalPage = await walk(
+      "https://api.newrelic.com/v2/users.json?page=2",
+      '<https://api.newrelic.com/v2/users.json?page=2>; rel="next"',
+      [{ id: 1, email: "one@example.com" }],
+      finalLinkHeader,
+    );
+    assert.deepEqual(finalPage.result.items.map((item) => item.id), [1, 2]);
+    assert.equal(finalPage.result.complete, true, finalLinkHeader);
+    assert.equal(finalPage.result.note, undefined);
+    assert.equal(finalPage.requests.length, 2);
+  }
 
   const repeated = await walk("https://api.newrelic.com/v2/users.json");
   assert.equal(repeated.result.complete, false);

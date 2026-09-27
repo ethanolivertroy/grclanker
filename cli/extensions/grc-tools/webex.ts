@@ -1001,7 +1001,7 @@ export class WebexApiClient {
       const pageItems = extractItems(response.payload);
       const remaining = limit - items.length;
       items.push(...pageItems.slice(0, remaining));
-      if (response.nextLink.kind === "unparseable" || response.nextLink.kind === "no_next") {
+      if (response.nextLink.kind === "unparseable") {
         return { items, truncated: true, pageCount };
       }
       nextUrl = response.nextLink.kind === "next" ? response.nextLink.target : null;

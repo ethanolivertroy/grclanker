@@ -1770,9 +1770,6 @@ export class NewrelicApiClient {
       if (nextLink.kind === "unparseable") {
         return { items, complete: false, note: `stopped after ${items.length} items because the Link header could not be parsed` };
       }
-      if (nextLink.kind === "no_next") {
-        return { items, complete: false, note: `stopped after ${items.length} items because the Link header had no rel=next relation` };
-      }
       if (nextLink.kind === "absent") {
         url = undefined;
       } else {

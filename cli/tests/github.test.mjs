@@ -828,7 +828,7 @@ test("GitHubAuditorClient handles installation token refresh, rate limits, and p
 });
 
 test("GitHubAuditorClient follows only same-origin REST next links without userinfo", async () => {
-  function clientFor(nextLink, requests, relation = 'rel="next"', firstRecords = [{ full_name: "example-org/repo-one" }]) {
+  function clientFor(nextLink, requests, relation = 'rel="next"', firstRecords = [{ full_name: "example-org/repo-one" }], finalRelation) {
     return new GitHubAuditorClient(createSampleConfig(), async (input, init = {}) => {
       const url = new URL(input.toString());
       requests.push({ url, authorization: init.headers?.Authorization });
@@ -846,7 +846,13 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
       }
       return new Response(
         JSON.stringify([{ full_name: "example-org/repo-two" }]),
-        { status: 200, headers: { "content-type": "application/json" } },
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            ...(finalRelation ? { link: `<${url.origin}${url.pathname}?page=1>; ${finalRelation}` } : {}),
+          },
+        },
       );
     });
   }
@@ -874,25 +880,29 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
   );
   assert.equal(userinfoRequests.length, 1, "a userinfo-bearing next link must never be requested");
 
-  const noNextRequests = [];
-  await assert.rejects(
-    clientFor(
-      "https://api.github.com/orgs/example-org/repos?page=previous",
-      noNextRequests,
-      'rel="prev last"',
-    ).listRepositories(),
-    /Link header had no rel=next relation/,
-  );
-  assert.equal(noNextRequests.length, 1);
+  for (const finalRelation of ['rel="prev first"', 'rel="last"', 'rel="prev"']) {
+    const finalPageRequests = [];
+    const finalPage = await clientFor(
+      "https://api.github.com/orgs/example-org/repos?page=2",
+      finalPageRequests,
+      'rel="next"',
+      [{ full_name: "example-org/repo-one" }],
+      finalRelation,
+    ).listRepositories();
+    assert.deepEqual(finalPage.map((repo) => repo.full_name), ["example-org/repo-one", "example-org/repo-two"]);
+    assert.equal(finalPageRequests.length, 2);
 
-  const finiteNoNextRequests = [];
-  const finiteNoNext = await clientFor(
-    "https://api.github.com/orgs/example-org/audit-log?page=previous",
-    finiteNoNextRequests,
-    'rel="prev last"',
-  ).listAuditLog();
-  assert.equal(finiteNoNext.truncated, true);
-  assert.equal(finiteNoNextRequests.length, 1);
+    const finiteFinalRequests = [];
+    const finiteFinal = await clientFor(
+      "https://api.github.com/orgs/example-org/audit-log?page=2",
+      finiteFinalRequests,
+      'rel="next"',
+      [{ action: "repo.create" }],
+      finalRelation,
+    ).listAuditLog();
+    assert.equal(finiteFinal.truncated, false, finalRelation);
+    assert.equal(finiteFinalRequests.length, 2);
+  }
 
   const emptyNextRequests = [];
   await assert.rejects(

@@ -2050,12 +2050,6 @@ export class GitHubAuditorClient {
         nextPath = null;
         break;
       }
-      if (parsedNext.kind === "no_next") {
-        truncated = true;
-        truncationReason = "Link header had no rel=next relation";
-        nextPath = null;
-        break;
-      }
       if (parsedNext.kind === "next") {
         try {
           nextPath = resolveSameOriginUrl(parsedNext.target, currentUrl).toString();
