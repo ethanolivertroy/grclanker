@@ -116,6 +116,16 @@ test("every finding publishes exact criteria, constants, and four portability ex
       assert.ok(check.evidenceFields.length > 0, `${check.id}: evidence schema`);
       assert.equal(new Set(check.evidenceFields).size, check.evidenceFields.length, `${check.id}: unique evidence fields`);
       assert.deepEqual(
+        Object.fromEntries(check.criteria.rules.map((rule) => [rule.status, rule.description])),
+        {
+          manual: check.criteria.manual,
+          fail: check.criteria.fail,
+          warn: check.criteria.warn,
+          pass: check.criteria.pass,
+        },
+        `${check.id}: rendered criteria come from runtime rules`,
+      );
+      assert.deepEqual(
         check.criteria.examples.map((example) => example.kind).sort(),
         ["compliant", "noncompliant", "partial", "unreadable"],
         `${check.id}: example classes`,
@@ -166,6 +176,10 @@ test("request and pagination metadata matches the concrete pilot clients", () =>
   const webexPaged = WEBEX_SPEC.pagination[0].surfaceIds;
   assert.ok(webexPaged.includes("organizations"));
   assert.ok(webexPaged.includes("roles"));
+  assert.deepEqual(WEBEX_SPEC.pagination[0].stopConditions, ["No next link", "Configured item cap", "Page cap"]);
+  assert.equal(WEBEX_SPEC.knownGaps.length, 2);
+  assert.match(WEBEX_SPEC.knownGaps[0], /cross-origin/);
+  assert.match(WEBEX_SPEC.knownGaps[1], /second whole-value credential scrub/);
 });
 
 test("Webex environment and scope metadata is the runtime source of truth", () => {

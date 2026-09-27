@@ -337,6 +337,7 @@ export function renderIntegrationSpec(entry, narrative, tools) {
     "## Shared integration contract",
     "",
     `This specification requires [shared integration contract version ${SHARED_INTEGRATION_CONTRACT_VERSION}](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.`,
+    ...(spec.knownGaps.length > 0 ? ["", "## Known runtime gaps", "", ...spec.knownGaps.map((gap) => `- ${gap}`)] : []),
     "",
     renderTools(spec, tools),
     "",

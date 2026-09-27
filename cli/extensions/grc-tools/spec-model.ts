@@ -193,6 +193,7 @@ export interface IntegrationSpecContract {
   controls: readonly ControlContract[];
   checks: readonly CheckContract[];
   collectionStates: CollectionStateContract;
+  knownGaps: readonly string[];
   redaction: RedactionContract;
   output: ExportContract;
   tools: readonly PublishedToolContract[];
@@ -247,16 +248,6 @@ export function checkContract(spec: IntegrationSpecContract, checkId: string): C
   const contract = spec.checks.find((check) => check.id === checkId);
   if (!contract) throw new Error(`No integration contract exists for check ${checkId}`);
   return contract;
-}
-
-export function criterionConstant<T extends PortableValue>(
-  spec: IntegrationSpecContract,
-  checkId: string,
-  name: string,
-): T {
-  const value = checkContract(spec, checkId).criteria.constants[name];
-  if (value === undefined) throw new Error(`Check ${checkId} has no criterion constant ${name}`);
-  return value as T;
 }
 
 export function evaluateVerdictCriteria(criteria: VerdictCriteria, facts: VerdictFacts): EvaluatedFindingStatus {

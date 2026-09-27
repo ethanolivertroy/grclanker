@@ -46,6 +46,8 @@ import {
   statementDeniesInsecureTransport,
   unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
+import { AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
+import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
 import {
   AWS_CANARIES,
   CANARY_URL,
@@ -2434,6 +2436,20 @@ async function runAllAssessments(client) {
     "network-security": await assessAwsNetworkSecurity(client),
   };
 }
+
+test("metadata decision rules independently reproduce every compliant AWS runtime verdict", async () => {
+  const outputs = await runAllAssessments(compliantBundleClient());
+  for (const assessment of Object.values(outputs).filter((output) => Array.isArray(output.findings))) {
+    for (const finding of assessment.findings) {
+      const contract = checkContract(AWS_SPEC, finding.id);
+      assert.equal(
+        evaluateVerdictCriteria(contract.criteria, finding.evidence ?? {}),
+        finding.status,
+        finding.id,
+      );
+    }
+  }
+});
 
 /** Flattens an output tree into dotted leaf paths; empty arrays and objects are leaves so a collapse to [] or {} is visible. */
 function leafValues(value, path = "", out = new Map()) {

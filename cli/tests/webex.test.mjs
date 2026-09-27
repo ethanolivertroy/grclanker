@@ -35,6 +35,8 @@ import {
   scrubErrorText,
   scrubValue,
 } from "../dist/extensions/grc-tools/webex.js";
+import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
+import { WEBEX_SPEC } from "../dist/extensions/grc-tools/webex.spec.js";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(TEST_DIR, "..", "..");
@@ -439,6 +441,30 @@ async function allAssessments(client) {
     await assessWebexMeetingHybridSecurity(client),
   ];
 }
+
+test("metadata decision rules independently reproduce every compliant Webex runtime verdict", async () => {
+  for (const assessment of await allAssessments(compliantClient())) {
+    for (const finding of assessment.findings) {
+      const contract = checkContract(WEBEX_SPEC, finding.id);
+      assert.equal(
+        evaluateVerdictCriteria(contract.criteria, finding.evidence ?? {}),
+        finding.status,
+        finding.id,
+      );
+    }
+  }
+});
+
+test("metadata rules preserve runtime treatment of a truncated role catalog", async () => {
+  const base = compliantClient();
+  const identity = await assessWebexIdentity(compliantClient({
+    async listRoles() {
+      return page((await base.listRoles()).items, true);
+    },
+  }));
+  assert.equal(byId(identity.findings, "WEBEX-ID-03").status, "pass");
+  assert.equal(byId(identity.findings, "WEBEX-ID-04").status, "pass");
+});
 
 function findingsOf(assessments) {
   return assessments.flatMap((item) => item.findings);

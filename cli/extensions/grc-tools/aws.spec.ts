@@ -276,7 +276,7 @@ export const AWS_OPERATIONS: readonly AwsOperationContract[] = [
   operation("access-analyzer", "ListAnalyzers", ["analyzers.arn", "analyzers.name", "analyzers.status", "analyzers.type"]),
   operation("access-analyzer", "ListFindings", ["findings.id", "findings.resource", "findings.resourceType", "findings.status", "findings.createdAt", "findings.updatedAt"]),
   operation("sso-admin", "ListInstances", ["Instances.InstanceArn", "Instances.IdentityStoreId", "Instances.Name", "Instances.Status"], { action: "sso:ListInstances" }),
-  operation("auditmanager", "ListAssessments", ["assessmentMetadata.id", "assessmentMetadata.name", "assessmentMetadata.status"]),
+  operation("auditmanager", "ListAssessments", ["assessmentMetadata.id", "assessmentMetadata.name", "assessmentMetadata.status", "assessmentMetadata.complianceType", "assessmentMetadata.creationTime", "assessmentMetadata.lastUpdated"]),
   operation("account", "GetAlternateContact", ["AlternateContact.Name", "AlternateContact.Title", "AlternateContact.EmailAddress", "AlternateContact.PhoneNumber"]),
   operation("ec2", "DescribeRegions", ["Regions.RegionName", "Regions.OptInStatus"]),
   operation("s3-control", "GetPublicAccessBlock", ["PublicAccessBlockConfiguration"], {
@@ -1079,6 +1079,7 @@ export const AWS_SPEC: IntegrationSpecContract = {
     notRequested: "A child operation was never issued because its parent inventory was unreadable; name the parent and invent no status.",
     notConfigured: "A service or regional surface was outside the explicitly configured assessment scope.",
   },
+  knownGaps: [],
   redaction: {
     sharedContractVersion: "1.1",
     projections: Object.fromEntries(AWS_OPERATIONS.map((entry) => [entry.id, entry.fields])),
