@@ -230,10 +230,16 @@ test("request and pagination metadata matches the concrete pilot clients", () =>
   const webexPaged = WEBEX_SPEC.pagination[0].surfaceIds;
   assert.ok(webexPaged.includes("organizations"));
   assert.ok(webexPaged.includes("roles"));
-  assert.deepEqual(WEBEX_SPEC.pagination[0].stopConditions, ["No next link", "Configured item cap", "Page cap"]);
-  assert.equal(WEBEX_SPEC.knownGaps.length, 2);
-  assert.match(WEBEX_SPEC.knownGaps[0], /cross-origin/);
-  assert.match(WEBEX_SPEC.knownGaps[1], /second whole-value credential scrub/);
+  assert.deepEqual(WEBEX_SPEC.pagination[0].stopConditions, [
+    "No next link",
+    "Malformed RFC 8288 Link header",
+    "Configured item cap",
+    "Page cap",
+    "Cross-origin next link",
+    "Next link carrying user information",
+  ]);
+  assert.deepEqual(WEBEX_SPEC.knownGaps, []);
+  assert.match(WEBEX_SPEC.redaction.projectionStage, /scrubbed again .* every bundle write sink/);
 });
 
 test("Webex environment and scope metadata is the runtime source of truth", () => {
