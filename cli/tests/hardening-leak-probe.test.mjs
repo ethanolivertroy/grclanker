@@ -331,7 +331,7 @@ test("leak-probe harness: the class table names all ten classes", () => {
   assert.deepEqual([...BEARER_ID_KEYS], ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "roleSecretId", "token_id", "tokenId"]);
   assert.deepEqual([...SESSION_ID_KEYS], ["session_id", "sid", "jsessionid", "PHPSESSID"]);
   assert.equal(FIXED_PASSWORDS.length, 12);
-  assert.deepEqual(SETTING_SUFFIX_CONTROLS.map(([key]) => key), ["secret_id_ttl", "secret_id_num_uses", "token_max_ttl", "token_num_uses", "secret_id_bound_cidrs", "token_bound_cidrs", "webhook_count"]);
+  assert.deepEqual(SETTING_SUFFIX_CONTROLS.map(([key]) => key), ["secret_id_ttl", "secret_id_num_uses", "token_max_ttl", "token_num_uses", "secret_id_bound_cidrs", "token_bound_cidrs", "webhook_count", "webhook_retry_count"]);
   assert.deepEqual(SETTING_SUFFIX_UUID_CONTROL_KEYS, ["secret_id_accessor", "token_accessor"]);
   assert.deepEqual([...FIXED_SCHEME_WORDS], ["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk", "Snowflake", "AWS4-HMAC-SHA256"]);
   assert.deepEqual([...INFORMATIONAL_ESCAPE_FORMS], ["%0A", "%0D%0A", "%09", "\\x0a", "\\x09", "\\x0d\\x0a"]);

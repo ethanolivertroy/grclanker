@@ -128,6 +128,7 @@ export const SETTING_SUFFIX_CONTROLS = Object.freeze([
   Object.freeze(["secret_id_bound_cidrs", "10.0.0.0/8"]),
   Object.freeze(["token_bound_cidrs", "10.0.0.0/8"]),
   Object.freeze(["webhook_count", "3"]),
+  Object.freeze(["webhook_retry_count", "3"]),
 ]);
 
 /**
@@ -589,6 +590,10 @@ function credentialPairCells(options, canaries) {
   cells.push(cell("semicolon inside a bare prose pair value", `upstream echoed password=${semicolonHead};${semicolonTail} before closing`, {
     planted: [semicolonHead, semicolonTail],
     mustKeep: ["password", "before closing"],
+  }));
+  cells.push(cell("semicolon inside a URL query value", `GET /v1/users?token=${semicolonHead};${semicolonTail} failed`, {
+    planted: [semicolonHead, semicolonTail],
+    mustKeep: ["GET /v1/users?token=", " failed"],
   }));
   return cells;
 }
