@@ -133,19 +133,19 @@ test("every finding publishes exact criteria, constants, and four portability ex
 
 test("ordered decision rules cover reachable boundaries and precedence", () => {
   const cases = [
-    [AWS_SPEC, "AWS-IAM-05", { roles_readable: true, roles_without_boundaries: Array(6).fill("role"), max_privileged_roles: 5 }, "fail"],
+    [AWS_SPEC, "AWS-IAM-05", { roles_readable: true, roles_without_boundaries: Array(6).fill("role"), roles_without_boundaries_count: 6, max_privileged_roles: 5 }, "fail"],
     [AWS_SPEC, "AWS-LOG-01", { trails_readable: true, trails: [] }, "fail"],
     [AWS_SPEC, "AWS-LOG-04", { detectors_readable: true, enabled_detectors: 0, detectors_unreadable: [] }, "fail"],
     [AWS_SPEC, "AWS-ORG-02", { scps_readable: true, scp_count: 1, attached_scp_count: 0, scps_targets_unreadable: [] }, "fail"],
-    [AWS_SPEC, "AWS-NET-14", { vpcs: 1, vpcs_without_active_flow_logs: [], vpcs_unverified: [{}] }, "manual"],
-    [AWS_SPEC, "AWS-IAM-05", { roles_readable: false, roles_without_boundaries: Array(6).fill("role"), max_privileged_roles: 5 }, "manual"],
-    [AWS_SPEC, "AWS-IAM-05", { roles_readable: true, roles_without_boundaries: Array(6).fill("role"), max_privileged_roles: 5, role_inventory_truncated: true }, "fail"],
+    [AWS_SPEC, "AWS-NET-14", { vpcs: 1, vpcs_without_active_flow_logs: [], vpcs_unverified: [{}], vpcs_unverified_count: 1 }, "manual"],
+    [AWS_SPEC, "AWS-IAM-05", { roles_readable: false, roles_without_boundaries: Array(6).fill("role"), roles_without_boundaries_count: 6, max_privileged_roles: 5 }, "manual"],
+    [AWS_SPEC, "AWS-IAM-05", { roles_readable: true, roles_without_boundaries: Array(6).fill("role"), roles_without_boundaries_count: 6, max_privileged_roles: 5, role_inventory_truncated: true }, "fail"],
     [WEBEX_SPEC, "WEBEX-COLLAB-04", { rooms_seen: 1, rooms_without_classification_count: 1, rooms_truncated: true }, "fail"],
     [WEBEX_SPEC, "WEBEX-COLLAB-05", { webhooks_seen: 1, insecure_webhooks_count: 1, webhooks_truncated: true }, "fail"],
     [WEBEX_SPEC, "WEBEX-MTG-04", { clusters_seen: 1, connectors_seen: 0, hybrid_lists_truncated: true }, "fail"],
     [WEBEX_SPEC, "WEBEX-MTG-02", { sites: [{ status: "manual" }, { status: "fail" }], site_coverage_complete: false, token_probe_status: { readable: false } }, "fail"],
     [AWS_SPEC, "AWS-LOG-02", { trails_readable: true, data_event_trails: ["org-trail"], selectors_unreadable: ["regional-trail"] }, "warn"],
-    [AWS_SPEC, "AWS-NET-14", { vpcs: 1, vpcs_without_active_flow_logs: [{ vpc_id: "vpc-1" }], vpcs_unverified: [], partial: true }, "fail"],
+    [AWS_SPEC, "AWS-NET-14", { vpcs: 1, vpcs_without_active_flow_logs: [{ vpc_id: "vpc-1" }], vpcs_unverified: [], vpcs_unverified_count: 0, partial: true }, "fail"],
     [AWS_SPEC, "AWS-LOG-04", { detectors_readable: false, enabled_detectors: 0, detectors_unreadable: [] }, "manual"],
   ];
   for (const [spec, id, facts, expected] of cases) {

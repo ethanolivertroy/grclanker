@@ -547,7 +547,8 @@ test("decision facts preserve cardinality beyond 25-item evidence samples", asyn
       return paged(vpcs);
     },
     async describeFlowLogs() {
-      return paged(flowLogs);
+      void flowLogs;
+      throw accessDenied();
     },
   }), { regions: ["us-east-1"] });
   const flowCoverage = findingById(unverifiedVpcs, "AWS-NET-14");
