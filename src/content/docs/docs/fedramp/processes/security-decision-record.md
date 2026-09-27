@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the SDR FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Security Decision Record
@@ -51,7 +51,7 @@ Checklist items:
 - Any responses or clarifications to the comments in the independent verification or validation.
 - Rule-specific artifacts (if applicable).
 
-Terms: `Artifacts`, `Provider`, `Security Decision Record (SDR)`, `Validation`, `Verification`
+Terms: `Artifacts`, `Security Decision Record (SDR)`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -66,7 +66,7 @@ Checklist items:
 - Date and time of last update
 - Source of update
 
-Terms: `Provider`, `Security Decision Record (SDR)`
+Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
@@ -90,7 +90,7 @@ Checklist items:
 - Class C: Summary of metric up to the past year (where available)
 - Class C: All daily metric data up to the past year (where available)
 
-Terms: `Provider`, `Security Decision Record (SDR)`
+Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
@@ -107,7 +107,7 @@ Checklist items:
 - Verification that the automation in place is accurate and sufficient to demonstrate appropriate measures for the Key Security Indicator, or that automation is not necessary for each measure.
 - Validation that the measures are accurately produced and are in place and working as intended, or that the reason for not having them is valid.
 
-Terms: `Persistently`, `Provider`, `Validation`, `Verification`
+Terms: `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -130,7 +130,7 @@ Checklist items:
 - Any responses or clarifications to the comments in the independent verification or validation.
 - Control-specific artifacts (if applicable).
 
-Terms: `Artifacts`, `Cloud Service Offering`, `Provider`, `Validation`, `Verification`
+Terms: `Artifacts`, `Cloud Service Offering`, `Validation`, `Verification`
 
 Affects: Providers
 

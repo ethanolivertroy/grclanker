@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the FRC FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # FedRAMP Certification
@@ -32,8 +32,8 @@ This ruleset explains how cloud service offerings obtain and maintain FedRAMP Ce
 
 - `APP` — Applying for FedRAMP Certification: These rules apply to cloud service providers who have met all other relevant rules and are ready to apply for any FedRAMP Certification. · types: 20x, Rev5 · classes: A, B, C, D
 - `APS` — Applying for FedRAMP Certification with an Agency Sponsor: These rules apply to cloud service providers with an Agency Sponsor who have met all other relevant rules and are ready to apply for any FedRAMP Certification. · types: Rev5 · classes: B, C, D
-- `CCL` — Changing Certification Class: These rules apply to cloud service providers when changing their FedRAMP Certification Class. · types: Rev5 · classes: A, B, C, D
-- `CLA` — FedRAMP Class A Certification Rules: These are specific rules that apply to providers seeking FedRAMP Class A Certifications. · types: 20x, Rev5 · classes: A
+- `CCL` — Changing Certification Class: These rules apply to cloud service providers when changing their FedRAMP Certification Class. · types: Rev5 · classes: B, C, D
+- `CLA` — FedRAMP Class A Certification Rules: These are specific rules that apply to providers seeking FedRAMP Class A Certifications. · types: 20x · classes: A
 - `CSF` — Rev5-Specific Provider Responsibilities: These rules apply to providers for FedRAMP Rev5 Certifications. · types: Rev5 · classes: B, C, D
 - `CSO` — General Provider Responsibilities: These rules apply to cloud service providers obtaining and maintaining any FedRAMP Certification. · types: 20x, Rev5 · classes: A, B, C, D
 - `CSX` — 20x-Specific Provider Responsibilities: These rules apply to providers for FedRAMP 20x Certifications. · types: 20x · classes: B, C, D
@@ -46,8 +46,6 @@ This ruleset explains how cloud service offerings obtain and maintain FedRAMP Ce
 
 Providers MUST complete the FedRAMP Certification Application Form in full to request an initial assessment by FedRAMP.
 
-Terms: `Provider`
-
 Affects: Providers
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -56,7 +54,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST supply a fresh initial FedRAMP Certification Package that shows the current status of the cloud service offering as verified and validated by the provider within the previous 7 days.
 
-Terms: `Certification Package`, `Cloud Service Offering`, `Provider`, `Validation`, `Verification`
+Terms: `Certification Package`, `Cloud Service Offering`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -71,7 +69,7 @@ Varies by certification class:
 - **Class C MUST:** Providers seeking Class C Certification MUST supply a fresh initial FedRAMP independent assessment that was completed by a FedRAMP Recognized independent assessment service within the previous 3 months.
 - **Class D MUST:** Providers seeking Class D Certification MUST supply a fresh initial FedRAMP independent assessment that was completed by a FedRAMP Recognized independent assessment service within the previous 3 months.
 
-Terms: `FedRAMP Independent Assessment`, `FedRAMP Recognized`, `Provider`
+Terms: `FedRAMP Independent Assessment`, `FedRAMP Recognized`
 
 Affects: Providers
 
@@ -89,8 +87,6 @@ Checklist items:
 - FedRAMP Marketplace: MKT-IIP-AGU (Agency Use Cases)
 - FedRAMP Marketplace: MKT-IIP-DCP (Demonstrating Continuous Progress)
 
-Terms: `Agency`, `Provider`
-
 Affects: Providers
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -98,8 +94,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 ### `FRC-APP-NTP` MUST NOT — No Third-Party Applicants
 
 Providers MUST NOT use a third party to apply for a FedRAMP Certification on their behalf; this includes independent assessment services.
-
-Terms: `Provider`
 
 Affects: Providers
 
@@ -112,7 +106,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY freshen a stale initial independent verification and validation assessment by having a FedRAMP Recognized independent assessment service review any changes between the original assessment and the current status of the cloud service offering in place of a full re-assessment, UNLESS the stale assessment is more than 9 months old.
 
-Terms: `Cloud Service Offering`, `FedRAMP Recognized`, `Provider`, `Validation`, `Verification`
+Terms: `Cloud Service Offering`, `FedRAMP Recognized`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -122,7 +116,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers seeking a FedRAMP Rev5 Agency Certification MUST have completed the Authorization to Operate (ATO) process with their agency sponsor for the cloud service offering, concluding with a formal signed ATO letter that the agency has sent over official government channels to FedRAMP.
 
-Terms: `Agency`, `Cloud Service Offering`, `Provider`
+Terms: `Cloud Service Offering`
 
 Affects: Providers
 
@@ -132,7 +126,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST apply for a new FedRAMP Certification to downgrade their Certification Class.
 
-Terms: `All Necessary Parties`, `Certification Class`, `Provider`
+Terms: `All Necessary Parties`, `Certification Class`
 
 Affects: Providers
 
@@ -145,7 +139,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD notify all necessary parties at least 120 days in advance of an intended downgrade or cancellation of FedRAMP Certification.
 
-Terms: `Agency`, `All Necessary Parties`, `Provider`
+Terms: `All Necessary Parties`
 
 Affects: Providers
 
@@ -157,7 +151,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST apply for a new FedRAMP Certification to upgrade their Certification Class; all applicable requirements MUST be met in advance.
 
-Terms: `Certification Class`, `Provider`
+Terms: `Certification Class`
 
 Affects: Providers
 
@@ -175,7 +169,7 @@ Checklist items:
 - SOC 2 Type II
 - GovRAMP at any Impact Level
 
-Terms: `Provider`, `Security Category`
+Terms: `Security Category`
 
 Affects: Providers
 
@@ -190,7 +184,7 @@ Checklist items:
 - FedRAMP Ready: Readiness Assessment Report, Security Assessment Plan, and any other materials required by FedRAMP.
 - GovRAMP: Readiness Assessment Report, Security Assessment Plan, and any other materials required by GovRAMP.
 
-Terms: `All Necessary Parties`, `Provider`, `Verification`
+Terms: `All Necessary Parties`, `Verification`
 
 Affects: Providers
 
@@ -200,7 +194,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers seeking a FedRAMP Class A Certification MAY have the FedRAMP Certification Package independently verified and validated by a FedRAMP Recognized assessor before submission to FedRAMP.
 
-Terms: `Assessor`, `Certification Package`, `FedRAMP Recognized`, `Provider`, `Validation`, `Verification`
+Terms: `Certification Package`, `FedRAMP Recognized`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -235,15 +229,15 @@ Checklist items:
 - Key Security Indicators: KSI-INR-RIR (Reviewing Incident Response Procedures)
 - Key Security Indicators: KSI-SVC-SIN (Securing Information)
 
-Terms: `Agency`, `Artifacts`, `Certification Data`, `Certification Package`, `Certification Type`, `FedRAMP Security Inbox`, `Final Incident Report (FIR)`, `Incident`, `Information Resource`, `Initial Incident Report (IIR)`, `Ongoing Certification Report (OCR)`, `Provider`, `Trust Center`, `Validation`, `Verification`, `Vulnerability`, `Vulnerability Detection`, `Vulnerability Response`
+Terms: `Artifacts`, `Certification Data`, `Certification Package`, `Certification Path`, `Certification Type`, `FedRAMP Security Inbox`, `Final Incident Report (FIR)`, `Incident`, `Information Resource`, `Initial Incident Report (IIR)`, `Ongoing Certification Report (OCR)`, `Trust Center`, `Validation`, `Verification`, `Vulnerability`, `Vulnerability Detection`, `Vulnerability Response`
 
 Affects: Providers
 
 Note: Some of these specific FedRAMP rules may not have similar counterparts in external frameworks and providers will need to implement new processes to follow these rules.
 In general, for each of these FedRAMP requirements, providers should include a sufficiently detailed summary that reviewers will not need to dig into the related security framework materials to understand the related decisions - just saying "see SOC 2 report" is not particularly helpful.
-Information about how the provider addresses the included Key Security Indicators are required for both Rev5 and 20x Class A Certifications.
+Information about how the provider addresses the included Key Security Indicators are required to receive a class A certification even if the provider intends to pursue a Rev 5 Program Certification path in the future.
 
-Recent update: 2026-07-01 — Removed reference to Independent Verification and Validation: IVV-CSF-AIA (Annual Independent Assessments for Rev5); Removed CDS-CSO-AVR (Availability Reporting) since this rule is defined as SHOULD and included in FRC-CLA-RFR (Recommended FedRAMP Rules for Class A)
+Recent update: 2026-07-14 — Clarified that providers MUST address the Key Security Indicators even if they intend to pursue a Rev 5 Program Certification path in the future.
 
 ### `FRC-CLA-OFR` MAY — Address Optional FedRAMP Rules for Class A
 
@@ -260,7 +254,7 @@ Checklist items:
 - Vulnerability Evaluation and Reporting: VER-TFR-MRH (Historical Activity)
 - Vulnerability Evaluation and Reporting: VER-TFR-NRI (Non-Internet-Reachable Incidents)
 
-Terms: `Certification Data`, `FedRAMP Independent Assessment`, `Incident`, `Provider`, `Quarterly Review`, `Security Decision Record (SDR)`, `Validation`, `Verification`, `Vulnerability`
+Terms: `Certification Data`, `FedRAMP Independent Assessment`, `Incident`, `Quarterly Review`, `Security Decision Record (SDR)`, `Validation`, `Verification`, `Vulnerability`
 
 Affects: Providers
 
@@ -283,7 +277,7 @@ Checklist items:
 - Vulnerability Detection and Response: VDR-TFR-PVR (Mitigation and Remediation Expectations)
 - Vulnerability Evaluation and Reporting: VER-TFR-EVU (Evaluate Vulnerabilities Quickly)
 
-Terms: `Certification Data`, `Certification Package`, `Drift`, `Incident`, `Initial Incident Report (IIR)`, `Ongoing Incident Report (OIR)`, `Persistently`, `Provider`, `Validation`, `Verification`, `Vulnerability`, `Vulnerability Detection`, `Vulnerability Response`
+Terms: `Certification Data`, `Certification Package`, `Drift`, `Incident`, `Initial Incident Report (IIR)`, `Ongoing Incident Report (OIR)`, `Persistently`, `Validation`, `Verification`, `Vulnerability`, `Vulnerability Detection`, `Vulnerability Response`
 
 Affects: Providers
 
@@ -293,7 +287,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST identify a target FedRAMP Certification Profile and apply all relevant FedRAMP Practices to the cloud service offering.
 
-Terms: `Certification Profile`, `Cloud Service Offering`, `FedRAMP Practices`, `Handle`, `Information Resource`, `Provider`, `Security Category`, `Third-Party Information Resource`
+Terms: `Certification Profile`, `Cloud Service Offering`, `FedRAMP Practices`, `Handle`, `Information Resource`, `Security Category`, `Third-Party Information Resource`
 
 Affects: Providers
 
@@ -305,7 +299,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST supply machine-readable information in JSON documents that are valid against the corresponding JSON schema when a rule contains a FedRAMP JSON schema, UNLESS otherwise specified in the rule.
 
-Terms: `Machine-Readable`, `Provider`
+Terms: `Machine-Readable`
 
 Affects: Providers
 
@@ -317,7 +311,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST maintain responsibility and accountability for the accuracy and completeness of all information in the FedRAMP Certification Package, especially when they engage a third party (such as an independent assessor, advisory service, or external tools) to supply information on their behalf.
 
-Terms: `Assessor`, `Certification Package`, `Provider`
+Terms: `Certification Package`
 
 Affects: Providers
 
@@ -328,21 +322,21 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 Providers seeking a Certification MUST supply a complete FedRAMP Certification Package to FedRAMP for initial certification; the FedRAMP Certification Package MUST include at least the following information:
 
 Checklist items:
-- A Certification Package Overview
-- A Security Decision Record
+- Information about the Cloud Service Offering following CPO-CSO-OVR (Overview of the Cloud Service Offering)
+- Implementation, Validation, and Assessment information for each relevant FedRAMP requirement/control/ksi as defined in SDR-CSO-FRR (FedRAMP Rules)
 - A real or example Ongoing Certification Report following CCM-OCR-AVL (Report Availability)
 
-Terms: `Certification Package`, `FedRAMP Certification Report`, `Initial Certification`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Provider`, `Security Decision Record (SDR)`
+Terms: `Certification Package`, `Cloud Service Offering`, `FedRAMP Certification Report`, `Initial Certification`, `Ongoing Certification`, `Ongoing Certification Report (OCR)`, `Security Decision Record (SDR)`, `Validation`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update: 2026-06-25 — Removed dangling mention of Class B from a last-minute merger of rules; apologies for confusion, this rule applies to all classes.
 
 ### `FRC-CSO-POP` MUST NOT — Pick One Program Certification Type
 
 Providers MUST NOT seek both FedRAMP Rev5 Program Certification and FedRAMP 20x Program Certification for the same cloud service offering; pick one type.
 
-Terms: `Agency`, `Cloud Service Offering`, `Provider`
+Terms: `Cloud Service Offering`
 
 Affects: Providers
 
@@ -356,7 +350,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD apply ALL Key Security Indicators to ALL aspects of their cloud service offering that are within the FedRAMP Minimum Assessment Scope.
 
-Terms: `Cloud Service Offering`, `Provider`
+Terms: `Cloud Service Offering`
 
 Affects: Providers
 
@@ -371,7 +365,7 @@ Varies by certification class:
 - **Class C MUST:** Providers seeking 20x Class C Certification MUST supply historical metrics including status from persistent validation over at least the past 6 months for all Key Security Indicators.
 - **Class D MUST:** Providers seeking 20x Class D Certification MUST provide historical metrics including status from persistent validation over at least the past 18 months for all Key Security Indicators.
 
-Terms: `Initial Certification`, `Persistently`, `Provider`, `Validation`
+Terms: `Initial Certification`, `Persistently`, `Validation`
 
 Affects: Providers
 
@@ -388,7 +382,7 @@ Varies by certification class:
 - **Class C MUST:** Providers seeking 20x Class C Certification MUST implement automated methods to persistently verify and validate the accuracy and completeness of Key Security Indicators with at least 2 automated methods for each Key Security Indicator.
 - **Class D MUST:** Providers seeking 20x Class D Certification MUST implement automated methods to persistently verify and validate the accuracy and completeness of Key Security Indicators with at least 4 automated methods for each Key Security Indicator.
 
-Terms: `Persistently`, `Provider`, `Validation`, `Verification`
+Terms: `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -403,7 +397,7 @@ Varies by certification class:
 - **Class C SHOULD:** Providers seeking 20x Class C Certification SHOULD implement automated methods to persistently verify and validate the accuracy and completeness of the Security Decision Record for FedRAMP rules when applicable.
 - **Class D SHOULD:** Providers seeking 20x Class D Certification SHOULD implement automated methods to persistently verify and validate the accuracy and completeness of the Security Decision Record for FedRAMP rules when applicable.
 
-Terms: `Persistently`, `Provider`, `Security Decision Record (SDR)`, `Validation`, `Verification`
+Terms: `Persistently`, `Security Decision Record (SDR)`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -417,7 +411,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST assign all organization-defined control parameters, following FedRAMP Rev5 Controls Guidance, and ensure that all control parameter assignments are documented in the Security Decision Record (SDR).
 
-Terms: `Provider`, `Security Decision Record (SDR)`
+Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
@@ -431,7 +425,7 @@ Varies by certification class:
 - **Class C MUST:** Providers seeking FedRAMP Rev5 Class C Certification MUST include at least the following NIST SP 800-53 Rev. 5 controls in their Security Decision Record:
 - **Class D MUST:** Providers seeking FedRAMP Rev5 Class D Certification MUST include at least the following NIST SP 800-53 Rev. 5 controls in their Security Decision Record:
 
-Terms: `Provider`, `Security Decision Record (SDR)`
+Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
@@ -441,8 +435,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST follow FedRAMP Rev5 Controls Guidance for the implementation and documentation of all applicable controls.
 
-Terms: `Provider`
-
 Affects: Providers
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -450,8 +442,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 ### `FRC-CSF-RDY` MUST — FedRAMP Ready Conversion
 
 Providers with FedRAMP Rev5 Ready status MUST convert to a FedRAMP Certification by whichever of the follow dates is later: the expiration of their annual assessment or November 17, 2026 (the legacy FedRAMP Ready status will be entirely removed on December 31, 2027).
-
-Terms: `Provider`
 
 Affects: Providers
 

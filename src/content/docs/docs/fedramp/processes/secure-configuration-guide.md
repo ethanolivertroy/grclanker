@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the SCG FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Secure Configuration Guide
@@ -41,7 +41,7 @@ The Secure Configuration Guide rules help agencies and other customers understan
 
 Providers MUST include instructions in the FedRAMP Certification Package that explain how to obtain and use the Secure Configuration Guide.
 
-Terms: `Certification Package`, `Provider`
+Terms: `Certification Package`
 
 Affects: Providers
 
@@ -52,8 +52,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 ### `SCG-CSO-PUB` SHOULD — Public Secure Configuration Guidance
 
 Providers SHOULD make the Secure Configuration Guide available publicly.
-
-Terms: `Provider`
 
 Affects: Providers
 
@@ -68,7 +66,7 @@ Checklist items:
 - Required: Explanations of security-related settings that can be operated only by top-level administrative accounts and their security implications.
 - Recommended: Explanations of security-related settings that can be operated only by privileged accounts and their security implications.
 
-Terms: `Cloud Service Offering`, `Privileged Account`, `Provider`, `Top-Level Administrative Account`
+Terms: `Cloud Service Offering`, `Privileged Account`, `Top-Level Administrative Account`
 
 Affects: Providers
 
@@ -81,7 +79,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD set all settings to their recommended secure defaults for top-level administrative accounts and privileged accounts when initially provisioned.
 
-Terms: `Privileged Account`, `Provider`, `Top-Level Administrative Account`
+Terms: `Privileged Account`, `Top-Level Administrative Account`
 
 Affects: Providers
 
@@ -91,8 +89,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD offer the capability to view and adjust security settings via an API or similar capability.
 
-Terms: `Provider`
-
 Affects: Providers
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -101,7 +97,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD offer the capability to compare all current settings for top-level administrative accounts and privileged accounts to the recommended secure defaults.
 
-Terms: `Privileged Account`, `Provider`, `Top-Level Administrative Account`
+Terms: `Privileged Account`, `Top-Level Administrative Account`
 
 Affects: Providers
 
@@ -111,7 +107,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD offer the capability to export all security settings in a machine-readable format.
 
-Terms: `Machine-Readable`, `Provider`
+Terms: `Machine-Readable`
 
 Affects: Providers
 
@@ -121,7 +117,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD also provide the Secure Configuration Guide in a machine-readable format that can be used by customers or third-party tools to compare against current settings.
 
-Terms: `Machine-Readable`, `Provider`
+Terms: `Machine-Readable`
 
 Affects: Providers
 
@@ -131,7 +127,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD provide versioning and a release history for recommended secure default settings for top-level administrative accounts and privileged accounts as they are adjusted over time.
 
-Terms: `Privileged Account`, `Provider`, `Top-Level Administrative Account`
+Terms: `Privileged Account`, `Top-Level Administrative Account`
 
 Affects: Providers
 
