@@ -28,7 +28,7 @@ import {
   resolveSameOriginUrl,
   type ParsedNextLink,
 } from "./hardening/index.js";
-import { createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
+import { REDACTED, createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
 import { checkContract, defineGrcTool, evaluateVerdictCriteria, toolContract } from "./spec-model.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import {
@@ -317,6 +317,17 @@ export function scrubValue(value: string): string {
     .replace(URI_CREDENTIAL_PARAM_PATTERN, "");
 }
 
+function scrubWebexDataString(value: string, key: string | undefined): string {
+  const scrubbed = scrubValue(value);
+  if (key?.replace(/[^a-z0-9]/gi, "").toLowerCase() !== "targeturl") return scrubbed;
+  try {
+    const url = new URL(scrubbed);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.host ? url.origin : REDACTED;
+  } catch {
+    return REDACTED;
+  }
+}
+
 /**
  * The one scrub applied where error strings are created: the WebexApiError
  * constructor (every API failure) and errorMessage (every other thrown value
@@ -354,7 +365,7 @@ export function redactSecrets(value: unknown, knownSecrets: readonly string[] = 
   webexCredentialScrubber.registerSecrets(knownSecrets);
   return webexCredentialScrubber.scrubData(value, {
     isCredentialKey: (key) => !POLICY_KEY_PATTERN.test(key) && (isCredentialDataKey(key) || WEBEX_CREDENTIAL_KEY_PATTERN.test(key)),
-    transformString: (entry) => scrubValue(entry),
+    transformString: scrubWebexDataString,
   });
 }
 
@@ -794,11 +805,13 @@ export class WebexApiClient {
     const limit = clampNumber(options.limit, DEFAULT_GENERIC_LIMIT, 1, 50_000);
     const pageQuery: JsonRecord = options.pageMax === undefined ? {} : { max: clampNumber(options.pageMax, 100, 1, 1000) };
     const items: JsonRecord[] = [];
+    const visited = new Set<string>();
     let pageCount = 0;
     let nextUrl: string | null = this.buildUrl(path, { ...pageQuery, ...query });
 
     while (nextUrl) {
       const currentUrl: string = nextUrl;
+      visited.add(currentUrl);
       const response = await this.fetchJson(currentUrl);
       pageCount += 1;
       const pageItems = extractItems(response.payload);
@@ -808,6 +821,9 @@ export class WebexApiClient {
         return { items, truncated: true, pageCount };
       }
       nextUrl = response.nextLink.kind === "next" ? response.nextLink.target : null;
+      if (nextUrl && pageItems.length === 0) {
+        return { items, truncated: true, pageCount };
+      }
       if (items.length >= limit && (nextUrl || pageItems.length > remaining)) {
         return { items, truncated: true, pageCount };
       }
@@ -819,6 +835,9 @@ export class WebexApiClient {
           nextUrl = resolveSameOriginUrl(nextUrl, currentUrl).toString();
         } catch (error) {
           if (!(error instanceof NextLinkError)) throw error;
+          return { items, truncated: true, pageCount };
+        }
+        if (visited.has(nextUrl)) {
           return { items, truncated: true, pageCount };
         }
       }
@@ -1782,7 +1801,7 @@ export async function assessWebexCollaborationGovernance(
     webhookFinding = finding("WEBEX-COLLAB-05", [20], "Webhook HTTPS and signing secret", "high", "fail",
       `${insecureWebhooks.length} of ${webhookItems.length} visible webhooks lack an https targetUrl or a secret.${partialNote(webhooks, "webhooks")}`,
       {
-        insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => ({ id: asString(item.id), name: asString(item.name), target_url: scrubValue(asString(item.targetUrl) ?? "") })),
+        insecure_webhooks: insecureWebhooks.slice(0, 25).map((item) => ({ id: asString(item.id), name: asString(item.name), target_url: scrubWebexDataString(asString(item.targetUrl) ?? "", "targetUrl") })),
         insecure_webhooks_count: insecureWebhooks.length,
         webhooks_seen: webhookItems.length,
       });

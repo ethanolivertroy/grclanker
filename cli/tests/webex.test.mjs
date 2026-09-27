@@ -286,6 +286,7 @@ const FAKE_SECRETS = {
   pmr_sip_pwd: "FAKE-PMR-SIP-PWD-z7a8b9",
   pmr_access_code: "FAKE-PMR-ACCESS-CODE-c1d2e3",
   webhook_secret: "FAKE-WEBHOOK-SECRET-f4g5h6",
+  webhook_path_token: "FAKE-WEBHOOK-PATH-TOKEN-h5i6j7",
   webhook_url_token: "FAKE-WEBHOOK-URL-TOKEN-i7j8k9",
   connector_bind_credential: "FAKE-BIND-CREDENTIAL-l1m2n3",
   device_activation_code: "FAKE-ACTIVATION-CODE-o4p5q6",
@@ -360,7 +361,7 @@ function secretClient() {
     async listWebhooks() {
       return page([{
         id: "hook-1", name: "Notifier", resource: "messages", event: "created", status: "active",
-        targetUrl: `https://example.com/hook?token=${FAKE_SECRETS.webhook_url_token}`,
+        targetUrl: `https://example.com:8443/hook/${FAKE_SECRETS.webhook_path_token}?token=${FAKE_SECRETS.webhook_url_token}`,
         secret: FAKE_SECRETS.webhook_secret,
       }]);
     },
@@ -707,7 +708,7 @@ test("WebexApiClient refreshes an access token through POST /access_token and re
   );
 });
 
-test("WebexApiClient follows Link pagination to completion, reports truncation, and sends bearer auth", async () => {
+test("WebexApiClient stops an empty page that still advertises a next link", async () => {
   const seen = [];
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
@@ -727,10 +728,10 @@ test("WebexApiClient follows Link pagination to completion, reports truncation, 
   const client = new WebexApiClient(sampleConfig({ token: "webex-test" }), { fetchImpl });
   const people = await client.listPeople(10);
 
-  assert.deepEqual(people.items.map((person) => person.id), ["person-1", "person-2", "person-3"]);
-  assert.equal(people.truncated, false);
-  assert.equal(people.pageCount, 3);
-  assert.deepEqual(seen.map((request) => request.auth), Array(3).fill("Bearer webex-test"));
+  assert.deepEqual(people.items.map((person) => person.id), ["person-1"]);
+  assert.equal(people.truncated, true);
+  assert.equal(people.pageCount, 2);
+  assert.deepEqual(seen.map((request) => request.auth), Array(2).fill("Bearer webex-test"));
   assert.equal(seen[0].max, "100");
   assert.equal(seen[0].orgId, "org-123");
 
@@ -742,7 +743,7 @@ test("WebexApiClient follows Link pagination to completion, reports truncation, 
 });
 
 test("WebexApiClient follows only same-origin next links without userinfo", async () => {
-  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`) {
+  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`, finalLinkHeader) {
     const requests = [];
     const fetchImpl = async (input, init = {}) => {
       const url = new URL(input.toString());
@@ -753,7 +754,10 @@ test("WebexApiClient follows only same-origin next links without userinfo", asyn
           { headers: { link: linkHeader } },
         );
       }
-      return jsonResponse({ items: [{ id: "person-2" }] });
+      return jsonResponse(
+        { items: [{ id: "person-2" }] },
+        finalLinkHeader ? { headers: { link: finalLinkHeader } } : {},
+      );
     };
     const result = await new WebexApiClient(sampleConfig({ token: "webex-pagination-token" }), { fetchImpl }).listPeople(10);
     return { requests, result };
@@ -774,6 +778,25 @@ test("WebexApiClient follows only same-origin next links without userinfo", asyn
   assert.deepEqual(userinfo.result.items.map((item) => item.id), ["person-1"]);
   assert.equal(userinfo.result.truncated, true);
   assert.equal(userinfo.requests.length, 1, "a userinfo-bearing next link must never be requested");
+
+  for (const finalLinkHeader of [
+    '<https://webexapis.com/v1/people?after=first>; rel="prev first"',
+    '<https://webexapis.com/v1/people?after=last>; rel="last"',
+    '<https://webexapis.com/v1/people?after=previous>; rel="prev"',
+  ]) {
+    const finalPage = await walk(
+      "https://webexapis.com/v1/people?after=second",
+      '<https://webexapis.com/v1/people?after=second>; rel="next"',
+      finalLinkHeader,
+    );
+    assert.deepEqual(finalPage.result.items.map((item) => item.id), ["person-1", "person-2"]);
+    assert.equal(finalPage.result.truncated, false, finalLinkHeader);
+    assert.equal(finalPage.requests.length, 2);
+  }
+
+  const repeated = await walk("https://webexapis.com/v1/people?max=100&orgId=org-123");
+  assert.equal(repeated.result.truncated, true);
+  assert.equal(repeated.requests.length, 1, "a repeated next URL is partial and is not fetched again");
 
   const relationList = await walk(
     "https://webexapis.com/v1/people?after=relation-list",
@@ -1800,7 +1823,7 @@ test("rule 9: no fake secret from any carrier reaches any bundle file or any zip
   assert.equal(meetings[0].unlockedMeetingJoinSecurity, "allowJoinWithLobby");
   assert.deepEqual(Object.keys(meetings[0]).filter((key) => ["hostKey", "meetingNumber", "phoneAndVideoSystemPassword", "sipAddress"].includes(key)), []);
   const webhooks = JSON.parse(read("core_data/collaboration-governance/webhooks.json"));
-  assert.equal(webhooks[0].targetUrl, "https://example.com/hook");
+  assert.equal(webhooks[0].targetUrl, "https://example.com:8443");
   assert.equal(webhooks[0].secret, "[REDACTED]");
   const people = JSON.parse(read("core_data/identity/people.json"));
   assert.deepEqual(Object.keys(people[0]).sort(), ["created", "displayName", "emails", "id", "roles", "type"]);
@@ -2120,6 +2143,10 @@ test("projectSurface fails closed: unlisted keys are dropped, nested objects nee
     }]),
     [{ siteUrl: "a.webex.com", securityOptions: { joinBeforeHost: false, requireStrongPassword: true, passwordCriteria: { minLength: 8, disallowValues: ["password"] } } }],
   );
+  assert.deepEqual(
+    projectSurface("webhooks", [{ id: "hook-1", targetUrl: "https://example.com:8443/hooks/SECRET-PATH?token=SECRET-QUERY", status: "active" }]),
+    [{ id: "hook-1", targetUrl: "https://example.com:8443", status: "active" }],
+  );
   assert.deepEqual(projectSurface("guest_count", { count: 3, raw: { body: "3" } }), { count: 3 });
   assert.deepEqual(projectSurface("organization", "not-an-object"), undefined);
 
@@ -2137,14 +2164,14 @@ test("WebexApiClient stops an endless rel=next chain at the page ceiling and rep
   let calls = 0;
   const fetchImpl = async () => {
     calls += 1;
-    return jsonResponse({ items: [] }, { headers: { link: `<https://webexapis.com/v1/people?after=page${calls}>; rel="next"` } });
+    return jsonResponse({ items: [{ id: `person-${calls}` }] }, { headers: { link: `<https://webexapis.com/v1/people?after=page${calls}>; rel="next"` } });
   };
   const capped = await new WebexApiClient(sampleConfig(), { fetchImpl, maxPages: 5 }).listPeople();
-  assert.deepEqual(capped, { items: [], truncated: true, pageCount: 5 });
+  assert.deepEqual(capped, { items: Array.from({ length: 5 }, (_, index) => ({ id: `person-${index + 1}` })), truncated: true, pageCount: 5 });
   assert.equal(calls, 5);
 
   calls = 0;
-  const defaulted = await new WebexApiClient(sampleConfig(), { fetchImpl }).listRoles();
+  const defaulted = await new WebexApiClient(sampleConfig(), { fetchImpl }).listRoles(5000);
   assert.equal(defaulted.truncated, true);
   assert.equal(defaulted.pageCount, 1000);
   assert.equal(calls, 1000);
@@ -2153,12 +2180,12 @@ test("WebexApiClient stops an endless rel=next chain at the page ceiling and rep
   const repeated = await new WebexApiClient(sampleConfig(), {
     fetchImpl: async () => {
       calls += 1;
-      return jsonResponse({ items: [] }, { headers: { link: '<https://webexapis.com/v1/roles?cursor=same>; rel="next"' } });
+      return jsonResponse({ items: [{ id: `role-${calls}` }] }, { headers: { link: '<https://webexapis.com/v1/roles?cursor=same>; rel="next"' } });
     },
     maxPages: 3,
   }).listRoles();
-  assert.deepEqual(repeated, { items: [], truncated: true, pageCount: 3 }, "the current runtime reaches the page cap rather than stopping immediately on a repeated empty cursor");
-  assert.equal(calls, 3);
+  assert.deepEqual(repeated, { items: [{ id: "role-1" }, { id: "role-2" }], truncated: true, pageCount: 2 }, "the repeated next URL stops before a third request");
+  assert.equal(calls, 2);
 
   calls = 0;
   const finished = await new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ items: [{ id: "a" }] }), maxPages: 1 }).listRoles();
@@ -2183,7 +2210,7 @@ test("evidence slices capped at 25 entries carry the matching total and scrubbed
   assert.equal(webhooks.status, "fail");
   assert.equal(webhooks.evidence.insecure_webhooks.length, 25);
   assert.equal(webhooks.evidence.insecure_webhooks_count, 30);
-  assert.equal(webhooks.evidence.insecure_webhooks[0].target_url, "http://example.com/hook1");
+  assert.equal(webhooks.evidence.insecure_webhooks[0].target_url, "http://example.com");
   assert.ok(!JSON.stringify(collaboration).includes("FAKE-URL-TOKEN"));
 
   const meeting = await assessWebexMeetingHybridSecurity(compliantClient({

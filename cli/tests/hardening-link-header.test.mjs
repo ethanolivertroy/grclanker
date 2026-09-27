@@ -20,6 +20,8 @@ test("parseNextLinkHeader distinguishes exhaustion from malformed headers", () =
     parseNextLinkHeader('<https://api.example.test/page1>; rel="prev last"'),
     { kind: "absent" },
   );
+  assert.deepEqual(parseNextLinkHeader("<https://api.example.test/page1>; rel=last"), { kind: "absent" });
+  assert.deepEqual(parseNextLinkHeader("<https://api.example.test/page1>; rel=prev"), { kind: "absent" });
   for (const header of [
     "",
     '<https://api.example.test/page2>; title="unterminated; rel=next',

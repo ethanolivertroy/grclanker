@@ -2060,6 +2060,12 @@ export class GitHubAuditorClient {
           nextPath = null;
           break;
         }
+        if (pageRecords.length === 0) {
+          truncated = true;
+          truncationReason = "an empty page still advertised a Link rel=next page";
+          nextPath = null;
+          break;
+        }
       } else {
         nextPath = null;
       }

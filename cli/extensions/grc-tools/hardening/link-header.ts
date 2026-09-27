@@ -142,5 +142,7 @@ export function parseNextLinkHeader(header: string | null | undefined): ParsedNe
     if (!parsed) return { kind: "unparseable" };
     if (nextTarget === undefined && parsed.relations.includes("next")) nextTarget = parsed.target;
   }
+  // A well-formed header containing only prev/first/last relations describes a
+  // normal final page, equivalent to an absent Link header for pagination.
   return nextTarget === undefined ? { kind: "absent" } : { kind: "next", target: nextTarget };
 }
