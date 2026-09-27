@@ -43,6 +43,8 @@ export interface BatchCheckDefinition {
   owner: string;
   surfaces?: readonly string[];
   frameworks?: Partial<Record<FrameworkKey, readonly string[]>>;
+  evidenceFields?: readonly string[];
+  decision: string;
 }
 
 export interface BatchSpecDefinition {
@@ -93,9 +95,9 @@ function frameworkMap(values: BatchCheckDefinition["frameworks"] = {}): Record<F
 
 function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
   return {
-    pass: `Complete, readable evidence satisfies the runtime predicates for ${check.title}; partial, denied, missing, or null evidence cannot select this outcome.`,
-    warn: `Readable evidence establishes an incomplete or review-required posture for ${check.title}, including any runtime sampling or truncation limitation.`,
-    fail: `Readable evidence establishes a configured violation of ${check.title}; this outcome has first-match precedence over partial-evidence warnings.`,
+    pass: `The portable derivation for ${check.title} returns pass from complete, readable evidence.`,
+    warn: `The portable derivation for ${check.title} returns warn, or a pass is demoted because a required source is partial or truncated.`,
+    fail: `The portable derivation for ${check.title} returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings.`,
     manual: `The required evidence for ${check.title} is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict.`,
     constants: {
       passStatus: "pass",
@@ -106,13 +108,13 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     examples: [
       {
         kind: "compliant",
-        input: "All required source reads are complete and the evidence-specific runtime evaluation returns pass.",
+        input: `All required source reads are complete and this derivation returns pass: ${check.decision}`,
         expected: "pass",
         reason: "A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence.",
       },
       {
         kind: "noncompliant",
-        input: "A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail.",
+        input: `A complete source read satisfies the fail branch of this derivation: ${check.decision}`,
         expected: "fail",
         reason: "A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence.",
       },
@@ -183,6 +185,14 @@ const OUTPUT_FILES = [
 ] as const;
 
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {
+  for (const check of definition.checks) {
+    if (!check.decision.trim()) {
+      throw new Error(`${check.id} requires a portable decision derivation`);
+    }
+    if (/\b(?:TypeScript|JavaScript|buildFinding|cli\/|runtime predicates?)\b/i.test(check.decision)) {
+      throw new Error(`${check.id} decision derivation contains an implementation-specific reference`);
+    }
+  }
   const controls = [...new Map(
     [...definition.checks]
       .sort((left, right) => left.control - right.control)
@@ -217,9 +227,9 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     severity: check.severity,
     owningTool: check.owner,
     sourceSurfaceIds: check.surfaces ?? surfaceIds,
-    evidenceFields: ["decision_status"],
+    evidenceFields: check.evidenceFields ?? ["decision_status"],
     derivedFacts: {
-      decision_status: "Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass.",
+      decision_status: `Using complete source cardinalities, ${check.decision} Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail.`,
     },
     criteria: criterion(check),
   }));

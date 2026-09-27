@@ -28,7 +28,35 @@ const rows = [
   ["ZOOM-MTG-10", 4, "Recording consent disclaimer shown to participants", "high", "zoom_assess_meeting_security"],
 ] as const;
 
-const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, owner]) => ({ id, control, title, severity, owner }));
+const decisions = [
+  "return fail when any active user has a login type other than 101, pass when every user in a complete non-empty inventory is SSO-only, and warn for unknown login types or partial evidence.",
+  "return pass for two-factor mode all with complete roles or mode role covering every admin role, fail for none or an uncovered admin role, warn for group mode or partial roles, and manual for absent or undocumented settings.",
+  "return fail when any managed domain is not verified, pass when every domain in a complete non-empty inventory is verified, warn for truncation, and manual when no domain is returned.",
+  "return pass when complete admin-role membership contains at most the configured administrator maximum and warn when it exceeds that maximum or role evidence is partial.",
+  "return fail when any active user uses a password or social login, pass when every login code in a complete non-empty inventory is documented and neither category, and warn for unknown, other, or partial evidence.",
+  "return fail when client or web inactivity sign-out is disabled, warn when either exceeds the configured maximum, pass when both positive values are within it, and manual when neither setting is exposed.",
+  "always return manual because the account settings API exposes no account vanity URL field.",
+  "return pass when the non-empty trusted-domain inventory contains no wildcard, fail when any wildcard exists, and manual when the inventory is empty or unreadable.",
+  "return fail when in-meeting file transfer is enabled, pass when disabled, locked, and no group relaxes it, and warn when disabled but unlocked or group evidence is incomplete.",
+  "return fail when cloud recording is enabled without auto-delete, pass when auto-delete days are at or below the configured maximum, locked, and not relaxed by a group, warn for missing days, excessive retention, or incomplete enforcement, and manual when cloud recording is disabled.",
+  "return pass when both auto-call and ad-hoc Zoom Phone recording policies expose enable flags and are locked, warn when either is unlocked, and manual when Phone or either policy is unavailable.",
+  "return pass when a complete admin-operation-log window is non-empty and every row is dated, and warn when the window is empty, truncated, or contains undated rows.",
+  "return pass when every IM group in a complete non-empty inventory is normal or restricted without master-account search, warn for shared, unknown, cross-account, or partial groups, and manual when no group exists.",
+  "return fail when add-contact or chat-with-others policy allows anyone, pass when both are organization-restricted, locked, and not relaxed by groups, warn when restrictions are not fully locked, and manual for absent policy fields.",
+  "always return manual because the account settings API documents no account-level Team Chat encryption setting.",
+  "return fail when new scheduled meetings do not require a password, pass when the requirement is true, locked, and not relaxed by groups, and warn when compliant but not fully enforced.",
+  "return fail when waiting room is disabled, pass when enabled, locked, and not relaxed by groups, and warn when enabled but not fully enforced.",
+  "return fail when screen sharing is enabled for all participants, pass when disabled or host-only and locked without relaxed groups, warn when compliant but not fully enforced, and manual for absent or undocumented values.",
+  "return fail when local recording is enabled, pass when disabled, locked, and not relaxed by groups, and warn when disabled but not fully enforced.",
+  "return fail when end-to-end encrypted meetings are unavailable, pass when available, default, locked, and not relaxed by groups, and warn when available but not default or not fully enforced.",
+  "return fail when passcodes are embedded in join links, pass when embedding is disabled, locked, and not relaxed by groups, and warn when disabled but not fully enforced.",
+  "return fail when PMI is used for scheduled or instant meetings, pass when PMI is disabled or unused and both controls are locked without relaxed groups, and warn when compliant but not fully enforced.",
+  "return fail when meeting authentication is disabled, pass when enabled, locked, and not relaxed by groups, and warn when enabled but not fully enforced.",
+  "return fail when custom data-center routing is disabled, pass when enabled with a non-empty region list, locked, and not relaxed by groups, and warn when regions are absent or enforcement is incomplete.",
+  "return pass when every participant sees the recording disclaimer, warn for guest-only, unknown, or group-relaxed settings, fail when the legacy disclaimer is explicitly false, and manual when no documented setting is exposed.",
+] as const;
+
+const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, owner], index) => ({ id, control, title, severity, owner, decision: decisions[index] }));
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 export const ZOOM_RUNTIME_BEHAVIOR = [

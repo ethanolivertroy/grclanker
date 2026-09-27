@@ -35,12 +35,48 @@ const checkRows = [
   ["SLACK-MON-06", 13, "SIEM streaming evidence", "medium", "slack_assess_monitoring"],
 ] as const;
 
-const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, severity, owner]) => ({
+const decisions = [
+  "return fail when any active human user has has_2fa=false, pass when every active human in a complete non-empty inventory has has_2fa=true, and warn for empty, unknown, or partial enrollment evidence.",
+  "return warn when any active guest exists or the inventory is empty or partial, and pass only when a complete non-empty human inventory contains no active guest.",
+  "return fail when readable SCIM configuration has zero users, pass when the complete SCIM user inventory is non-empty, and warn when that non-empty inventory is partial.",
+  "return fail when any SCIM-active user is deactivated in Slack, pass when complete non-empty SCIM and Slack inventories have no mismatch, and warn for partial or empty comparison evidence.",
+  "return pass when a complete non-empty human inventory exposes deactivated users for review, and warn when the inventory is empty or partial.",
+  "return fail when any workspace exceeds the configured administrator maximum, pass when every workspace and admin list is complete and within it, and warn for partial coverage.",
+  "return fail when any active organization user has has_sso=false, pass when every active user in a complete non-empty inventory has has_sso=true, and warn for empty, unknown, or partial SSO evidence.",
+  "return fail when any sampled user session exceeds the configured hour maximum, pass when every active user has an explicit duration within it, warn for inherited defaults or sampled or partial coverage, and manual when no duration can be read.",
+  "always return manual because Slack exposes session duration but no idle-timeout setting.",
+  "return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence.",
+  "always return manual because mobile-specific session and jailbreak controls are not exposed by the read API.",
+  "return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings.",
+  "return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster.",
+  "always return manual because the API can probe analytics export but cannot list which administrators hold analytics access.",
+  "return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial.",
+  "return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy.",
+  "return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence.",
+  "return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial.",
+  "always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status.",
+  "return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value.",
+  "always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation.",
+  "return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search.",
+  "return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences.",
+  "return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage.",
+  "always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting.",
+  "always return manual because admin team settings expose no link-preview or URL-unfurl control.",
+  "return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated.",
+  "return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial.",
+  "return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial.",
+  "return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none.",
+  "return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial.",
+  "always return manual because the pull-based Audit Logs API does not report SIEM streaming or export destinations.",
+] as const;
+
+const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, severity, owner], index) => ({
   id,
   control,
   title,
   severity,
   owner,
+  decision: decisions[index],
 }));
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 

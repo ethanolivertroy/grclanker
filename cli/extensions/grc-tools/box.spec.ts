@@ -21,6 +21,34 @@ const ownerFor = (control: number): string => identity.has(control)
       ? "box_assess_data_governance"
       : "box_assess_shield_monitoring";
 
+const decisions = [
+  "return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required.",
+  "return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled.",
+  "return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced.",
+  "return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence.",
+  "return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists.",
+  "return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized.",
+  "return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled.",
+  "always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links.",
+  "return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent.",
+  "return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual.",
+  "return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none.",
+  "return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy.",
+  "return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists.",
+  "return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none.",
+  "return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists.",
+  "return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption.",
+  "return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum.",
+  "return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed.",
+  "always return manual because app creation events and Shield integration lists do not expose the app approval policy.",
+  "return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms.",
+  "return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight.",
+  "return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized.",
+  "always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced.",
+  "return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete.",
+  "return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event.",
+] as const;
+
 const checks: BatchCheckDefinition[] = controls.map((title, index) => {
   const control = index + 1;
   return {
@@ -29,6 +57,7 @@ const checks: BatchCheckDefinition[] = controls.map((title, index) => {
     title,
     severity: [1, 2].includes(control) ? "critical" : [3, 4, 6, 14, 16, 17, 21, 25].includes(control) ? "high" : "medium",
     owner: ownerFor(control),
+    decision: decisions[index],
   };
 });
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);

@@ -83,6 +83,7 @@ test("ordered rules preserve runtime statuses byte-for-byte and enforce first-ma
 });
 
 test("every rule has boundary coverage and null, missing, denied, or unreadable evidence cannot pass", () => {
+  const derivations = new Set();
   for (const [spec] of batch) {
     validateDecisionInputs(spec);
     for (const check of spec.checks) {
@@ -94,7 +95,12 @@ test("every rule has boundary coverage and null, missing, denied, or unreadable 
       assert.equal(evaluateVerdictCriteria(check.criteria, { decision_status: "warn" }), "warn", `${check.id}: warn boundary`);
       assert.equal(evaluateVerdictCriteria(check.criteria, { decision_status: "pass" }), "pass", `${check.id}: pass boundary`);
       assert.match(check.derivedFacts.decision_status, /complete cardinalities/);
+      assert.match(check.derivedFacts.decision_status, /\breturn (?:pass|fail|warn|manual)\b/i, `${check.id}: substantive derivation`);
+      assert.ok(check.derivedFacts.decision_status.length > 240, `${check.id}: derivation length`);
+      assert.ok(!derivations.has(check.derivedFacts.decision_status), `${check.id}: unique derivation`);
+      derivations.add(check.derivedFacts.decision_status);
       assert.doesNotMatch(check.derivedFacts.decision_status, /25-item|slice\(/);
+      assert.doesNotMatch(check.derivedFacts.decision_status, /\b(?:TypeScript|JavaScript|buildFinding|cli\/|runtime predicates?)\b/i);
     }
   }
 });
@@ -137,6 +143,7 @@ test("generated batch specs are portable and contain no repository-language leak
     assert.doesNotMatch(markdown, /\b(?:TypeScript|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments|cli\/extensions)\b/);
     for (const check of entry.contract.checks) {
       assert.match(markdown, new RegExp(`\\| \\\`${check.id}\\\` \\| 1 \\| fail \\|`));
+      assert.ok(markdown.includes(check.derivedFacts.decision_status), `${check.id}: exact portable derivation rendered`);
     }
   }
 });

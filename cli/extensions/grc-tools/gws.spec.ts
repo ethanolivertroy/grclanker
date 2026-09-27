@@ -37,6 +37,36 @@ const owners: Record<keyof typeof groups, string> = {
   MON: "gws_assess_monitoring",
 };
 
+const decisions = {
+  ID: [
+    "for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent.",
+    "for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent.",
+    "return fail when more than 10 percent of active users have no login within the configured stale period, warn when one through 10 percent are dormant or login dates are missing, and pass when none are dormant or undated.",
+    "return pass when every super admin enforces 2-step verification and has recent activity, fail when any super admin lacks enforced 2-step verification, and warn for stale, undated, or partial evidence.",
+    "return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable.",
+  ],
+  ADMIN: [
+    "return pass when the complete privileged inventory has at most two super admins, warn with three through five, and fail above five.",
+    "return fail when any privileged user is suspended or archived and pass when none is, with partial evidence demoting pass to warn.",
+    "return pass when at least one active delegated role assignment exists outside the Super Admin role, warn when none exists or role evidence is partial, and manual when role definitions or assignments are unavailable.",
+    "return pass when the complete admin-audit lookback contains activity, warn when it is empty or truncated, and manual when the audit read is denied or unreadable.",
+    "always return manual when group-based role assignments exist because expanded group membership is not collected; return pass only when complete role-assignment evidence proves no group-based grant.",
+  ],
+  INTEG: [
+    "return pass when every required per-user token read completes and at least one token is inventoried, warn when the complete inventory is empty, and manual when any token read is denied, failed, unattributed, or skipped.",
+    "return fail when any privileged user has more than the configured token threshold, warn when any has a smaller non-zero exposure or reads are partial, and pass when complete reads show no excessive privileged exposure.",
+    "return fail when any visible application grant contains a high-risk scope, warn when high-scope applications remain below the configured count or token evidence is partial, and pass when complete token evidence contains none.",
+    "return pass when the complete token audit lookback contains at least one event, warn when it is empty or truncated, and manual when token audit telemetry is unreadable.",
+  ],
+  MON: [
+    "return pass when the Alert Center endpoint is readable, including a complete empty alert inventory, warn when its inventory is truncated, and manual when access is denied or unreadable.",
+    "return fail when open suspicious-login alerts exceed the configured threshold, warn when one through the threshold remain or alert evidence is partial, and pass when the complete inventory contains none.",
+    "return pass when the complete admin-audit lookback contains events, warn when the window is empty or truncated, and manual when the Reports read is unavailable.",
+    "return pass when the complete token-audit lookback contains events, warn when the window is empty or truncated, and manual when the Reports read is unavailable.",
+    "return fail when open alerts exceed the configured backlog threshold, warn when a non-zero backlog is within the threshold or the inventory is partial, and pass when a complete inventory has no open alerts.",
+  ],
+} as const;
+
 let control = 0;
 const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([key, titles]) => {
   const group = key as keyof typeof groups;
@@ -46,6 +76,7 @@ const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([key, tit
     title,
     severity: /Privileged|Super admin|2-step|Suspicious|Alert Center/i.test(title) ? "high" : "medium",
     owner: owners[group],
+    decision: decisions[group][index],
   }));
 });
 

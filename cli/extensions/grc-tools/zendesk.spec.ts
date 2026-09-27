@@ -20,6 +20,35 @@ const ownerFor = (control: number): string => [1, 2, 3, 4, 5, 21].includes(contr
     : [9, 10, 11, 12, 18, 19, 20].includes(control)
       ? "zendesk_assess_data_protection"
       : "zendesk_assess_integrations";
+
+const decisions = [
+  "return pass when team-member SSO is enforced, Zendesk password login is disabled, and at least one SSO method is enabled; warn when SSO is enforced without a method or while password login remains enabled; and fail when SSO is not enforced.",
+  "return fail when any active team member explicitly lacks 2FA or account enforcement is disabled without enforced SSO, pass when enforcement is enabled and every member in a complete inventory reports 2FA enabled, warn for missing enrollment flags or partial coverage, and manual when MFA depends on the identity provider.",
+  "return pass for the Recommended preset or a Custom policy with length at least 12, complexity at least two, mixed case, at most ten failed attempts, email-local-part rejection, and history at least five or unlimited; warn for High or a deficient Custom policy, and fail for every lower preset.",
+  "return pass when IP restriction is enabled with at least one range, warn when enabled with no range, and fail when disabled.",
+  "return pass when positive agent and applicable mobile inactivity timeouts are at or below the configured threshold, fail when the agent timeout is zero or above three times the threshold, and warn for every other threshold violation.",
+  "return fail when any populated custom role grants administrator-equivalent permissions, warn for partial inventories, unassigned administrator-equivalent roles, or an all-unrestricted agent population, and pass when complete role and team inventories show none.",
+  "return fail when active administrators exceed the configured threshold, warn when any administrator is stale, undated, or the inventory is partial, and pass when the non-empty complete inventory is within the threshold and all administrators are recent.",
+  "return pass when complete inventories contain more than one group and at least one membership, and warn when only one group exists, no membership exists, or either inventory is truncated.",
+  "return pass when the recent audit-log endpoint returns at least one entry and fills or cleanly completes its 25-entry sample, warn when paging cuts that sample short, and manual when the endpoint is unavailable or a completed sample is unexpectedly empty.",
+  "return pass when the dated oldest audit entry is at least the configured retention age and warn when it is younger; an absent or undated oldest entry is manual.",
+  "always return manual because the published Account Settings and Security Settings APIs expose no HIPAA or Advanced Data Privacy and Protection field.",
+  "return fail when a complete deletion-schedule inventory is empty or has no active schedule, pass when it has a conditioned active ticket schedule and all companion evidence is complete, and warn for truncation, no active ticket schedule, or any active schedule without conditions.",
+  "return pass when API-token authentication is disabled and audit evidence is complete, warn when it is enabled but the event history shows no outstanding token, and manual when enabled tokens remain or account settings or token history are unavailable.",
+  "return fail when any OAuth client is unscoped or has a non-local HTTP redirect, pass when complete client and token inventories are empty or all clients are scoped with HTTPS redirects and every token is expiring and recently used, and warn for public, privileged, non-expiring, stale, undated, hidden, partial, or unreadable token evidence.",
+  "return pass when complete installation and owned-app inventories prove no installed apps, warn when the installation inventory truncates before its first app, and manual when any installation exists because the API does not prove that marketplace permissions were reviewed.",
+  "return pass when the complete owned-app inventory is empty, warn when any owned app is deprecated or obsolete or the inventory truncates before its first app, and manual for other non-empty inventories because manifest scope review is not automated.",
+  "return pass when account settings report the sandbox feature enabled, warn when disabled, and manual when the flag is absent.",
+  "return pass when authenticated attachment downloads are enabled and every listed CDN host uses HTTPS, warn when authentication is enabled but any CDN host is insecure, and fail when authenticated downloads are disabled.",
+  "always return manual because the API exposes attachment size and email-attachment posture but not allowed file types or malicious-attachment detection.",
+  "return pass when the complete suspended-ticket queue is empty or every queued ticket is dated and newer than the configured age, and warn for stale, undated, or partial queue evidence.",
+  "return pass when end users have enforced SSO with a method, password login under Recommended or High, or SSO-only login; warn for enforced SSO without a method or a weaker password preset, fail when no login method exists, and keep anonymous-ticket submission as a named manual limitation.",
+  "return pass when an administrator reads every active brand and all have one known help-center state, warn for a non-admin view, truncation, or mixed or unknown states, and manual when no brand is visible.",
+  "return pass when the complete sharing-agreement inventory is empty, warn when any agreement is failed, ssl_error, or configuration_error or the inventory truncates before its first record, and manual when accepted or pending external agreements require business review.",
+  "return fail when any active target or webhook uses a non-HTTPS endpoint, pass when complete readable inventories contain no active destination or every destination is HTTPS and every webhook has authentication, and warn for missing, partial, or unauthenticated destination evidence.",
+  "return fail when any active trigger or automation sends ticket data to an HTTP destination, pass when the complete non-empty rule inventory has no external notification action and destination lookups are complete, warn for external actions or partial evidence, and manual when no active rule is visible or either rule inventory is unavailable.",
+] as const;
+
 const checks: BatchCheckDefinition[] = titles.map((title, index) => {
   const control = index + 1;
   return {
@@ -28,6 +57,7 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
     title,
     severity: [1, 2, 6, 11].includes(control) ? "critical" : [3, 4, 7, 9, 12, 13, 14, 21, 24, 25].includes(control) ? "high" : "medium",
     owner: ownerFor(control),
+    decision: decisions[index],
   };
 });
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
