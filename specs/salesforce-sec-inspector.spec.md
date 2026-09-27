@@ -214,45 +214,112 @@ Credential refresh: POST /services/oauth2/token with the selected JWT bearer, re
 
 | Kind | Permission, role, or plan | Unlocks | Notes |
 |---|---|---|---|
-| role | `API Enabled` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `View Setup and Configuration` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `View Health Check` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `View All Users` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `Manage MFA in API` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `Metadata API read privileges` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `View Event Log Files where licensed` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `API Enabled` | `limits`, `organization`, `health-check`, `health-check-risks`, `users`, `profiles`, `permission-sets`, `permission-set-assignments`, `two-factor-methods`, `field-permissions`, `tenant-secrets`, `certificates`, `connected-applications`, `oauth-tokens`, `caller-permissions`, `login-history`, `setup-audit-trail`, `event-log-files` |  |
+| role | `View Setup and Configuration` | `organization`, `users`, `profiles`, `permission-sets`, `permission-set-assignments`, `field-permissions`, `tenant-secrets`, `certificates`, `connected-applications`, `oauth-tokens`, `caller-permissions`, `setup-audit-trail` |  |
+| role | `View Health Check` | `health-check`, `health-check-risks` |  |
+| role | `Manage Multi-Factor Authentication in API` | `two-factor-methods` |  |
+| role | `Modify Metadata Through Metadata API Functions` | `security-settings`, `my-domain-settings`, `profile-metadata` | The runtime performs only readMetadata and listMetadata calls. |
+| license | `Event Monitoring plus View Event Log Files` | `event-log-files` |  |
 
 ## API surfaces
 
 | ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
 |---|---|---|---|---|---|---|---|---|
-| `standard-query` | HTTP | `GET /services/data/v64.0/query` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `records`, `totalSize`, `done`, `nextRecordsUrl` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_query.htm) |
-| `tooling-query` | HTTP | `GET /services/data/v64.0/tooling/query` | Salesforce Tooling API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `records`, `totalSize`, `done`, `nextRecordsUrl` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/intro_rest_resources.htm) |
-| `metadata-read` | HTTP | `POST /services/Soap/m/64.0` | Salesforce Metadata API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `SecuritySettings`, `MyDomainSettings`, `Profile`, `ConnectedApp` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_readMetadata.htm) |
-| `limits` | HTTP | `GET /services/data/v64.0/limits` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `DailyApiRequests`, `HourlyODataCallout`, `DailyAsyncApexExecutions` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_limits.htm) |
+| `limits` | HTTP | `GET /services/data/v{version}/limits` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `organization` | HTTP | `GET /services/data/v{version}/query?q=Organization` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `health-check` | HTTP | `GET /services/data/v{version}/tooling/query?q=SecurityHealthCheck` | Salesforce Tooling API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `health-check-risks` | HTTP | `GET /services/data/v{version}/tooling/query?q=SecurityHealthCheckRisks` | Salesforce Tooling API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `security-settings` | HTTP | `POST /services/Soap/m/{version} readMetadata(SecuritySettings)` | Salesforce Metadata API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `my-domain-settings` | HTTP | `POST /services/Soap/m/{version} readMetadata(MyDomainSettings)` | Salesforce Metadata API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `users` | HTTP | `GET /services/data/v{version}/query?q=User` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `profiles` | HTTP | `GET /services/data/v{version}/query?q=Profile` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `profile-metadata` | HTTP | `POST /services/Soap/m/{version} listMetadata(Profile)+readMetadata(Profile)` | Salesforce Metadata API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `permission-sets` | HTTP | `GET /services/data/v{version}/query?q=PermissionSet` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `permission-set-assignments` | HTTP | `GET /services/data/v{version}/query?q=PermissionSetAssignment` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `two-factor-methods` | HTTP | `GET /services/data/v{version}/query?q=TwoFactorMethodsInfo` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `field-permissions` | HTTP | `GET /services/data/v{version}/query?q=FieldPermissions` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `tenant-secrets` | HTTP | `GET /services/data/v{version}/query?q=TenantSecret` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `certificates` | HTTP | `GET /services/data/v{version}/tooling/query?q=Certificate` | Salesforce Tooling API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `connected-applications` | HTTP | `GET /services/data/v{version}/query?q=ConnectedApplication` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `oauth-tokens` | HTTP | `GET /services/data/v{version}/query?q=OauthToken` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `caller-permissions` | HTTP | `GET /services/data/v{version}/query?q=UserPermissionAccess` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `login-history` | HTTP | `GET /services/data/v{version}/query?q=LoginHistory` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `setup-audit-trail` | HTTP | `GET /services/data/v{version}/query?q=SetupAuditTrail` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
+| `event-log-files` | HTTP | `GET /services/data/v{version}/query?q=EventLogFile` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `selected fields named in the runtime SOQL or Metadata API request` | [Official documentation](https://developer.salesforce.com/docs/platform/) |
 
 ### Request construction
 
 | Surface | Input | Exact value or rule | Required |
 |---|---|---|---|
-| `standard-query` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
-| `standard-query` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `standard-query` | response | A JSON object or list containing only the documented records, totalSize, done, nextRecordsUrl members consumed by verdicts. | yes |
-| `tooling-query` | client | Use the configured Salesforce Tooling API origin; never follow a server link to a different origin. | yes |
-| `tooling-query` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `tooling-query` | response | A JSON object or list containing only the documented records, totalSize, done, nextRecordsUrl members consumed by verdicts. | yes |
-| `metadata-read` | client | Use the configured Salesforce Metadata API origin; never follow a server link to a different origin. | yes |
-| `metadata-read` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `metadata-read` | response | A JSON object or list containing only the documented SecuritySettings, MyDomainSettings, Profile, ConnectedApp members consumed by verdicts. | yes |
 | `limits` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
 | `limits` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `limits` | response | A JSON object or list containing only the documented DailyApiRequests, HourlyODataCallout, DailyAsyncApexExecutions members consumed by verdicts. | yes |
+| `limits` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `organization` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `organization` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `organization` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `health-check` | client | Use the configured Salesforce Tooling API origin; never follow a server link to a different origin. | yes |
+| `health-check` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `health-check` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `health-check-risks` | client | Use the configured Salesforce Tooling API origin; never follow a server link to a different origin. | yes |
+| `health-check-risks` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `health-check-risks` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `security-settings` | client | Use the configured Salesforce Metadata API origin; never follow a server link to a different origin. | yes |
+| `security-settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `security-settings` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `my-domain-settings` | client | Use the configured Salesforce Metadata API origin; never follow a server link to a different origin. | yes |
+| `my-domain-settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `my-domain-settings` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `users` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `profiles` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `profiles` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `profiles` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `profile-metadata` | client | Use the configured Salesforce Metadata API origin; never follow a server link to a different origin. | yes |
+| `profile-metadata` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `profile-metadata` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `permission-sets` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `permission-sets` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `permission-sets` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `permission-set-assignments` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `permission-set-assignments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `permission-set-assignments` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `two-factor-methods` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `two-factor-methods` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `two-factor-methods` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `field-permissions` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `field-permissions` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `field-permissions` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `tenant-secrets` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `tenant-secrets` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `tenant-secrets` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `certificates` | client | Use the configured Salesforce Tooling API origin; never follow a server link to a different origin. | yes |
+| `certificates` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `certificates` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `connected-applications` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `connected-applications` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `connected-applications` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `oauth-tokens` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `oauth-tokens` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `oauth-tokens` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `caller-permissions` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `caller-permissions` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `caller-permissions` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `login-history` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `login-history` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `login-history` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `setup-audit-trail` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `setup-audit-trail` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `setup-audit-trail` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
+| `event-log-files` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `event-log-files` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `event-log-files` | response | A JSON object or list containing only the documented selected fields named in the runtime SOQL or Metadata API request members consumed by verdicts. | yes |
 
 ## Pagination
 
 | Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
 |---|---|---|---|---|---|---|
-| `standard-query`, `tooling-query`, `metadata-read`, `limits` | `nextRecordsUrl`, `done`, `totalSize` | 2000 | 2000 | none | totalSize is authoritative when present; done=true and seen equal total prove completion. | done true with matching total; Configured row cap; Repeated nextRecordsUrl; Empty page with continuation; Missing or larger total; Rejected cross-origin or user-information cursor |
+| `organization`, `health-check`, `health-check-risks`, `users`, `profiles`, `permission-sets`, `permission-set-assignments`, `two-factor-methods`, `field-permissions`, `tenant-secrets`, `certificates`, `connected-applications`, `oauth-tokens`, `caller-permissions`, `login-history`, `setup-audit-trail`, `event-log-files` | `nextRecordsUrl`, `done`, `totalSize` | service default | 2000 | none | totalSize is authoritative when present; done=true and seen equal total prove completion. | done true with matching total; Configured row cap; Repeated nextRecordsUrl; Empty page with continuation; Missing or larger total; Rejected cross-origin or user-information cursor |
 
 ## Rate limits
 
@@ -293,26 +360,26 @@ These notes explain intent only. The ordered rule table is normative.
 
 | Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
 |---|---|---|---|---|---|---|---|---|
-| `SF-01` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Health Check score returns pass from complete, readable evidence. | The portable derivation for Health Check score returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Health Check score returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Health Check score is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-02` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Session timeout returns pass from complete, readable evidence. | The portable derivation for Session timeout returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Session timeout returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Session timeout is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-03` | high | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Password policy returns pass from complete, readable evidence. | The portable derivation for Password policy returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Password policy returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Password policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-04` | critical | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for MFA enforcement returns pass from complete, readable evidence. | The portable derivation for MFA enforcement returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for MFA enforcement returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for MFA enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-05` | high | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for IP range restrictions returns pass from complete, readable evidence. | The portable derivation for IP range restrictions returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for IP range restrictions returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for IP range restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-06` | high | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Login hour restrictions returns pass from complete, readable evidence. | The portable derivation for Login hour restrictions returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Login hour restrictions returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Login hour restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-07` | medium | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for API access controls returns pass from complete, readable evidence. | The portable derivation for API access controls returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for API access controls returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for API access controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-08` | medium | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Field-level security returns pass from complete, readable evidence. | The portable derivation for Field-level security returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Field-level security returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Field-level security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-09` | high | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Permission set review returns pass from complete, readable evidence. | The portable derivation for Permission set review returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Permission set review returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Permission set review is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-10` | high | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Profile permissions returns pass from complete, readable evidence. | The portable derivation for Profile permissions returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Profile permissions returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Profile permissions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-11` | high | `salesforce_assess_monitoring_integrations` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Connected app OAuth policies returns pass from complete, readable evidence. | The portable derivation for Connected app OAuth policies returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Connected app OAuth policies returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Connected app OAuth policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-12` | high | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Sharing settings returns pass from complete, readable evidence. | The portable derivation for Sharing settings returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Sharing settings returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Sharing settings is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-13` | medium | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Guest user access returns pass from complete, readable evidence. | The portable derivation for Guest user access returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Guest user access returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Guest user access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-14` | medium | `salesforce_assess_monitoring_integrations` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Login forensics returns pass from complete, readable evidence. | The portable derivation for Login forensics returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Login forensics returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Login forensics is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-15` | medium | `salesforce_assess_monitoring_integrations` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Setup change tracking returns pass from complete, readable evidence. | The portable derivation for Setup change tracking returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Setup change tracking returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Setup change tracking is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-16` | high | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Data encryption status returns pass from complete, readable evidence. | The portable derivation for Data encryption status returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Data encryption status returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Data encryption status is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-17` | high | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Certificate management returns pass from complete, readable evidence. | The portable derivation for Certificate management returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Certificate management returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Certificate management is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-18` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for My Domain enforcement returns pass from complete, readable evidence. | The portable derivation for My Domain enforcement returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for My Domain enforcement returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for My Domain enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-19` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for Clickjack protection returns pass from complete, readable evidence. | The portable derivation for Clickjack protection returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Clickjack protection returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Clickjack protection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SF-20` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | The portable derivation for CSRF protection returns pass from complete, readable evidence. | The portable derivation for CSRF protection returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for CSRF protection returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for CSRF protection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-01` | medium | `salesforce_assess_platform_security` | `health-check` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for a Health Check score of at least 90, warn from 70 through 89, fail below 70, and manual when SecurityHealthCheck exposes no score. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for a Health Check score of at least 90, warn from 70 through 89, fail below 70, and manual when SecurityHealthCheck exposes no score. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for a Health Check score of at least 90, warn from 70 through 89, fail below 70, and manual when SecurityHealthCheck exposes no score. | The required evidence for Health Check score is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-02` | medium | `salesforce_assess_platform_security` | `security-settings` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when session timeout is at most 120 minutes, forced logout is enabled, and sessions are locked to the originating IP; warn when only the IP lock is missing, fail for an excessive timeout or disabled forced logout, and manual for absent values. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when session timeout is at most 120 minutes, forced logout is enabled, and sessions are locked to the originating IP; warn when only the IP lock is missing, fail for an excessive timeout or disabled forced logout, and manual for absent values. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when session timeout is at most 120 minutes, forced logout is enabled, and sessions are locked to the originating IP; warn when only the IP lock is missing, fail for an excessive timeout or disabled forced logout, and manual for absent values. | The required evidence for Session timeout is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-03` | high | `salesforce_assess_platform_security` | `security-settings` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: evaluate minimum length 12, strongest complexity, expiration at most 90 days, and history at least five; return pass with no gap, warn with one gap, fail with two or more gaps, and manual when a required field is absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: evaluate minimum length 12, strongest complexity, expiration at most 90 days, and history at least five; return pass with no gap, warn with one gap, fail with two or more gaps, and manual when a required field is absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: evaluate minimum length 12, strongest complexity, expiration at most 90 days, and history at least five; return pass with no gap, warn with one gap, fail with two or more gaps, and manual when a required field is absent. | The required evidence for Password policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-04` | critical | `salesforce_assess_identity_access` | `security-settings`, `users`, `profiles`, `two-factor-methods` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when direct-UI MFA is not required or more than 25 percent of visible active standard users lack a registered method, warn for a smaller unenrolled population or partial reads, and pass when complete evidence shows MFA required and every user enrolled. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when direct-UI MFA is not required or more than 25 percent of visible active standard users lack a registered method, warn for a smaller unenrolled population or partial reads, and pass when complete evidence shows MFA required and every user enrolled. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when direct-UI MFA is not required or more than 25 percent of visible active standard users lack a registered method, warn for a smaller unenrolled population or partial reads, and pass when complete evidence shows MFA required and every user enrolled. | The required evidence for MFA enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-05` | high | `salesforce_assess_platform_security` | `security-settings`, `profiles`, `profile-metadata` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every sensitive profile has login IP ranges, per-request enforcement is enabled, and an org-wide trusted range exists; fail when none exists at either level, and warn or manual for mixed, unresolved, or unreadable coverage. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every sensitive profile has login IP ranges, per-request enforcement is enabled, and an org-wide trusted range exists; fail when none exists at either level, and warn or manual for mixed, unresolved, or unreadable coverage. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every sensitive profile has login IP ranges, per-request enforcement is enabled, and an org-wide trusted range exists; fail when none exists at either level, and warn or manual for mixed, unresolved, or unreadable coverage. | The required evidence for IP range restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-06` | high | `salesforce_assess_identity_access` | `profiles`, `profile-metadata` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every sensitive profile restricts login hours every day, fail when none does, and warn when only some do or profile resolution is incomplete. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every sensitive profile restricts login hours every day, fail when none does, and warn when only some do or profile resolution is incomplete. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every sensitive profile restricts login hours every day, fail when none does, and warn when only some do or profile resolution is incomplete. | The required evidence for Login hour restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-07` | medium | `salesforce_assess_identity_access` | `users`, `profiles` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when no visible active user is assigned a profile with API Enabled, warn when such users are below the configured ratio or evidence is partial, and fail when the configured excessive-access threshold is crossed. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when no visible active user is assigned a profile with API Enabled, warn when such users are below the configured ratio or evidence is partial, and fail when the configured excessive-access threshold is crossed. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when no visible active user is assigned a profile with API Enabled, warn when such users are below the configured ratio or evidence is partial, and fail when the configured excessive-access threshold is crossed. | The required evidence for API access controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-08` | medium | `salesforce_assess_data_protection` | `field-permissions` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any sensitive-name field is broadly readable by more than five profile or permission-set grants, warn for narrower grants or partial rows, and manual when no field matches the classification patterns. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any sensitive-name field is broadly readable by more than five profile or permission-set grants, warn for narrower grants or partial rows, and manual when no field matches the classification patterns. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any sensitive-name field is broadly readable by more than five profile or permission-set grants, warn for narrower grants or partial rows, and manual when no field matches the classification patterns. | The required evidence for Field-level security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-09` | high | `salesforce_assess_identity_access` | `permission-sets`, `permission-set-assignments` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when no permission set grants elevated permissions, warn when elevated sets are assigned within the configured administrator threshold or evidence is partial, fail above the threshold, and manual when the standard inventory is implausibly empty. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when no permission set grants elevated permissions, warn when elevated sets are assigned within the configured administrator threshold or evidence is partial, fail above the threshold, and manual when the standard inventory is implausibly empty. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when no permission set grants elevated permissions, warn when elevated sets are assigned within the configured administrator threshold or evidence is partial, fail above the threshold, and manual when the standard inventory is implausibly empty. | The required evidence for Permission set review is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-10` | high | `salesforce_assess_identity_access` | `users`, `profiles` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when active administrator-profile users exceed the configured maximum, warn for stale, undated, or partial administrator evidence, and pass when the complete recent population is within the maximum. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when active administrator-profile users exceed the configured maximum, warn for stale, undated, or partial administrator evidence, and pass when the complete recent population is within the maximum. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when active administrator-profile users exceed the configured maximum, warn for stale, undated, or partial administrator evidence, and pass when the complete recent population is within the maximum. | The required evidence for Profile permissions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-11` | high | `salesforce_assess_monitoring_integrations` | `connected-applications`, `oauth-tokens` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when more than half of connected apps allow user self-authorization, warn for a smaller open set or when visible policies require pre-approval because scopes remain unreadable, and manual when no app or no policy flag is visible. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when more than half of connected apps allow user self-authorization, warn for a smaller open set or when visible policies require pre-approval because scopes remain unreadable, and manual when no app or no policy flag is visible. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when more than half of connected apps allow user self-authorization, warn for a smaller open set or when visible policies require pre-approval because scopes remain unreadable, and manual when no app or no policy flag is visible. | The required evidence for Connected app OAuth policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-12` | high | `salesforce_assess_data_protection` | `organization` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when at least three standard objects have public organization-wide defaults, warn for one or two public defaults or for private defaults whose custom objects and sharing rules remain manual, and manual when no default-access field is exposed. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when at least three standard objects have public organization-wide defaults, warn for one or two public defaults or for private defaults whose custom objects and sharing rules remain manual, and manual when no default-access field is exposed. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when at least three standard objects have public organization-wide defaults, warn for one or two public defaults or for private defaults whose custom objects and sharing rules remain manual, and manual when no default-access field is exposed. | The required evidence for Sharing settings is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-13` | medium | `salesforce_assess_identity_access` | `users`, `profiles` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any active guest user has API Enabled or elevated data permissions, warn when other active guests exist or coverage is partial, and pass when a complete user inventory has no active guest. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any active guest user has API Enabled or elevated data permissions, warn when other active guests exist or coverage is partial, and pass when a complete user inventory has no active guest. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any active guest user has API Enabled or elevated data permissions, warn when other active guests exist or coverage is partial, and pass when a complete user inventory has no active guest. | The required evidence for Guest user access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-14` | medium | `salesforce_assess_monitoring_integrations` | `login-history` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail for severe login forensics such as a failure ratio above the configured threshold, repeated-source failures, or legacy TLS, warn for lesser anomalies, undated rows, or partial reads, and pass when the complete non-empty window has none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail for severe login forensics such as a failure ratio above the configured threshold, repeated-source failures, or legacy TLS, warn for lesser anomalies, undated rows, or partial reads, and pass when the complete non-empty window has none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail for severe login forensics such as a failure ratio above the configured threshold, repeated-source failures, or legacy TLS, warn for lesser anomalies, undated rows, or partial reads, and pass when the complete non-empty window has none. | The required evidence for Login forensics is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-15` | medium | `salesforce_assess_monitoring_integrations` | `setup-audit-trail`, `event-log-files` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when complete setup-audit and Event Monitoring evidence is readable and no collection gap exists, warn for high-risk changes or partial or absent EventLogFile evidence, and manual when the active-org audit window is unreadable or implausibly empty. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when complete setup-audit and Event Monitoring evidence is readable and no collection gap exists, warn for high-risk changes or partial or absent EventLogFile evidence, and manual when the active-org audit window is unreadable or implausibly empty. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when complete setup-audit and Event Monitoring evidence is readable and no collection gap exists, warn for high-risk changes or partial or absent EventLogFile evidence, and manual when the active-org audit window is unreadable or implausibly empty. | The required evidence for Setup change tracking is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-16` | high | `salesforce_assess_data_protection` | `tenant-secrets` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when a readable complete TenantSecret inventory has no active key, warn when active keys are undated, older than 365 days, or partial, pass for complete recent active keys, and manual when Shield encryption is unavailable or scoped out. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when a readable complete TenantSecret inventory has no active key, warn when active keys are undated, older than 365 days, or partial, pass for complete recent active keys, and manual when Shield encryption is unavailable or scoped out. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when a readable complete TenantSecret inventory has no active key, warn when active keys are undated, older than 365 days, or partial, pass for complete recent active keys, and manual when Shield encryption is unavailable or scoped out. | The required evidence for Data encryption status is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-17` | high | `salesforce_assess_data_protection` | `certificates` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any certificate is expired or has a key under 2048 bits, warn for near expiry, missing dates, exportable private keys, pending chains, or partial evidence, pass when all certificates are valid and managed, and manual when none is returned. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any certificate is expired or has a key under 2048 bits, warn for near expiry, missing dates, exportable private keys, pending chains, or partial evidence, pass when all certificates are valid and managed, and manual when none is returned. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any certificate is expired or has a key under 2048 bits, warn for near expiry, missing dates, exportable private keys, pending chains, or partial evidence, pass when all certificates are valid and managed, and manual when none is returned. | The required evidence for Certificate management is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-18` | medium | `salesforce_assess_platform_security` | `my-domain-settings` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when My Domain is absent or still permits login.salesforce.com, pass when it is enforced for UI and API login, warn when API login is not restricted, and manual when the enforcement flag is absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when My Domain is absent or still permits login.salesforce.com, pass when it is enforced for UI and API login, warn when API login is not restricted, and manual when the enforcement flag is absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when My Domain is absent or still permits login.salesforce.com, pass when it is enforced for UI and API login, warn when API login is not restricted, and manual when the enforcement flag is absent. | The required evidence for My Domain enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-19` | medium | `salesforce_assess_platform_security` | `security-settings` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent. | The required evidence for Clickjack protection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-20` | medium | `salesforce_assess_platform_security` | `security-settings` | `selected fields named in the runtime SOQL or Metadata API request`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent. | The required evidence for CSRF protection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
 ### Ordered decision rules
 
@@ -320,196 +387,251 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 
 | Finding | Order | Outcome | First-match condition | Explanatory note |
 |---|---|---|---|---|
-| `SF-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-09` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-09` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-09` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-09` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-10` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-10` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-10` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-10` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-11` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-11` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-11` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-11` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-12` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-12` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-12` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-12` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-13` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-13` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-13` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-13` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-14` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-14` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-14` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-14` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-15` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-15` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-15` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-15` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-16` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-16` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-16` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-16` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-17` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-17` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-17` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-17` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-18` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-18` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-18` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-18` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-19` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-19` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-19` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-19` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SF-20` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SF-20` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SF-20` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SF-20` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-01` | 1 | fail | `sf_01_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-01` | 2 | manual | any of (`sf_01_required_evidence_readable` equals false; not (`sf_01_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-01` | 3 | warn | any of (`sf_01_warning_matches` equals true; `sf_01_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-01` | 4 | pass | all of (`sf_01_compliant_matches` equals true; `sf_01_required_evidence_readable` equals true; `sf_01_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-01` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-02` | 1 | fail | `sf_02_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-02` | 2 | manual | any of (`sf_02_required_evidence_readable` equals false; not (`sf_02_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-02` | 3 | warn | any of (`sf_02_warning_matches` equals true; `sf_02_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-02` | 4 | pass | all of (`sf_02_compliant_matches` equals true; `sf_02_required_evidence_readable` equals true; `sf_02_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-02` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-03` | 1 | fail | `sf_03_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-03` | 2 | manual | any of (`sf_03_required_evidence_readable` equals false; not (`sf_03_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-03` | 3 | warn | any of (`sf_03_warning_matches` equals true; `sf_03_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-03` | 4 | pass | all of (`sf_03_compliant_matches` equals true; `sf_03_required_evidence_readable` equals true; `sf_03_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-03` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-04` | 1 | fail | `sf_04_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-04` | 2 | manual | any of (`sf_04_required_evidence_readable` equals false; not (`sf_04_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-04` | 3 | warn | any of (`sf_04_warning_matches` equals true; `sf_04_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-04` | 4 | pass | all of (`sf_04_compliant_matches` equals true; `sf_04_required_evidence_readable` equals true; `sf_04_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-04` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-05` | 1 | fail | `sf_05_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-05` | 2 | manual | any of (`sf_05_required_evidence_readable` equals false; not (`sf_05_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-05` | 3 | warn | any of (`sf_05_warning_matches` equals true; `sf_05_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-05` | 4 | pass | all of (`sf_05_compliant_matches` equals true; `sf_05_required_evidence_readable` equals true; `sf_05_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-05` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-06` | 1 | fail | `sf_06_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-06` | 2 | manual | any of (`sf_06_required_evidence_readable` equals false; not (`sf_06_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-06` | 3 | warn | any of (`sf_06_warning_matches` equals true; `sf_06_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-06` | 4 | pass | all of (`sf_06_compliant_matches` equals true; `sf_06_required_evidence_readable` equals true; `sf_06_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-06` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-07` | 1 | fail | `sf_07_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-07` | 2 | manual | any of (`sf_07_required_evidence_readable` equals false; not (`sf_07_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-07` | 3 | warn | any of (`sf_07_warning_matches` equals true; `sf_07_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-07` | 4 | pass | all of (`sf_07_compliant_matches` equals true; `sf_07_required_evidence_readable` equals true; `sf_07_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-07` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-08` | 1 | fail | `sf_08_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-08` | 2 | manual | any of (`sf_08_required_evidence_readable` equals false; not (`sf_08_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-08` | 3 | warn | any of (`sf_08_warning_matches` equals true; `sf_08_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-08` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-09` | 1 | fail | `sf_09_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-09` | 2 | manual | any of (`sf_09_required_evidence_readable` equals false; not (`sf_09_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-09` | 3 | warn | any of (`sf_09_warning_matches` equals true; `sf_09_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-09` | 4 | pass | all of (`sf_09_compliant_matches` equals true; `sf_09_required_evidence_readable` equals true; `sf_09_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-09` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-10` | 1 | fail | `sf_10_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-10` | 2 | manual | any of (`sf_10_required_evidence_readable` equals false; not (`sf_10_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-10` | 3 | warn | any of (`sf_10_warning_matches` equals true; `sf_10_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-10` | 4 | pass | all of (`sf_10_compliant_matches` equals true; `sf_10_required_evidence_readable` equals true; `sf_10_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-10` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-11` | 1 | fail | `sf_11_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-11` | 2 | manual | any of (`sf_11_required_evidence_readable` equals false; not (`sf_11_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-11` | 3 | warn | any of (`sf_11_warning_matches` equals true; `sf_11_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-11` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-12` | 1 | fail | `sf_12_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-12` | 2 | manual | any of (`sf_12_required_evidence_readable` equals false; not (`sf_12_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-12` | 3 | warn | any of (`sf_12_warning_matches` equals true; `sf_12_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-12` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-13` | 1 | fail | `sf_13_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-13` | 2 | manual | any of (`sf_13_required_evidence_readable` equals false; not (`sf_13_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-13` | 3 | warn | any of (`sf_13_warning_matches` equals true; `sf_13_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-13` | 4 | pass | all of (`sf_13_compliant_matches` equals true; `sf_13_required_evidence_readable` equals true; `sf_13_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-13` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-14` | 1 | fail | `sf_14_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-14` | 2 | manual | any of (`sf_14_required_evidence_readable` equals false; not (`sf_14_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-14` | 3 | warn | any of (`sf_14_warning_matches` equals true; `sf_14_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-14` | 4 | pass | all of (`sf_14_compliant_matches` equals true; `sf_14_required_evidence_readable` equals true; `sf_14_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-14` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-15` | 1 | manual | any of (`sf_15_required_evidence_readable` equals false; not (`sf_15_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-15` | 2 | warn | any of (`sf_15_warning_matches` equals true; `sf_15_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-15` | 3 | pass | all of (`sf_15_compliant_matches` equals true; `sf_15_required_evidence_readable` equals true; `sf_15_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-15` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-16` | 1 | fail | `sf_16_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-16` | 2 | manual | any of (`sf_16_required_evidence_readable` equals false; not (`sf_16_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-16` | 3 | warn | any of (`sf_16_warning_matches` equals true; `sf_16_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-16` | 4 | pass | all of (`sf_16_compliant_matches` equals true; `sf_16_required_evidence_readable` equals true; `sf_16_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-16` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-17` | 1 | fail | `sf_17_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-17` | 2 | manual | any of (`sf_17_required_evidence_readable` equals false; not (`sf_17_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-17` | 3 | warn | any of (`sf_17_warning_matches` equals true; `sf_17_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-17` | 4 | pass | all of (`sf_17_compliant_matches` equals true; `sf_17_required_evidence_readable` equals true; `sf_17_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-17` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-18` | 1 | fail | `sf_18_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-18` | 2 | manual | any of (`sf_18_required_evidence_readable` equals false; not (`sf_18_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-18` | 3 | warn | any of (`sf_18_warning_matches` equals true; `sf_18_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-18` | 4 | pass | all of (`sf_18_compliant_matches` equals true; `sf_18_required_evidence_readable` equals true; `sf_18_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-18` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-19` | 1 | fail | `sf_19_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-19` | 2 | manual | any of (`sf_19_required_evidence_readable` equals false; not (`sf_19_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-19` | 3 | warn | any of (`sf_19_warning_matches` equals true; `sf_19_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SF-19` | 4 | pass | all of (`sf_19_compliant_matches` equals true; `sf_19_required_evidence_readable` equals true; `sf_19_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-19` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SF-20` | 1 | fail | `sf_20_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SF-20` | 2 | manual | any of (`sf_20_required_evidence_readable` equals false; not (`sf_20_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SF-20` | 3 | pass | all of (`sf_20_compliant_matches` equals true; `sf_20_required_evidence_readable` equals true; `sf_20_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SF-20` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
 
 ### Derived decision facts
 
 | Finding | Input | Portable derivation |
 |---|---|---|
-| `SF-01` | `decision_status` | Using complete source cardinalities, return pass for a Health Check score of at least 90, warn from 70 through 89, fail below 70, and manual when SecurityHealthCheck exposes no score. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-02` | `decision_status` | Using complete source cardinalities, return pass when session timeout is at most 120 minutes, forced logout is enabled, and sessions are locked to the originating IP; warn when only the IP lock is missing, fail for an excessive timeout or disabled forced logout, and manual for absent values. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-03` | `decision_status` | Using complete source cardinalities, evaluate minimum length 12, strongest complexity, expiration at most 90 days, and history at least five; return pass with no gap, warn with one gap, fail with two or more gaps, and manual when a required field is absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-04` | `decision_status` | Using complete source cardinalities, return fail when direct-UI MFA is not required or more than 25 percent of visible active standard users lack a registered method, warn for a smaller unenrolled population or partial reads, and pass when complete evidence shows MFA required and every user enrolled. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-05` | `decision_status` | Using complete source cardinalities, return pass when every sensitive profile has login IP ranges, per-request enforcement is enabled, and an org-wide trusted range exists; fail when none exists at either level, and warn or manual for mixed, unresolved, or unreadable coverage. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-06` | `decision_status` | Using complete source cardinalities, return pass when every sensitive profile restricts login hours every day, fail when none does, and warn when only some do or profile resolution is incomplete. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-07` | `decision_status` | Using complete source cardinalities, return pass when no visible active user is assigned a profile with API Enabled, warn when such users are below the configured ratio or evidence is partial, and fail when the configured excessive-access threshold is crossed. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-08` | `decision_status` | Using complete source cardinalities, return fail when any sensitive-name field is broadly readable by more than five profile or permission-set grants, warn for narrower grants or partial rows, and manual when no field matches the classification patterns. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-09` | `decision_status` | Using complete source cardinalities, return pass when no permission set grants elevated permissions, warn when elevated sets are assigned within the configured administrator threshold or evidence is partial, fail above the threshold, and manual when the standard inventory is implausibly empty. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-10` | `decision_status` | Using complete source cardinalities, return fail when active administrator-profile users exceed the configured maximum, warn for stale, undated, or partial administrator evidence, and pass when the complete recent population is within the maximum. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-11` | `decision_status` | Using complete source cardinalities, return fail when more than half of connected apps allow user self-authorization, warn for a smaller open set or when visible policies require pre-approval because scopes remain unreadable, and manual when no app or no policy flag is visible. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-12` | `decision_status` | Using complete source cardinalities, return fail when at least three standard objects have public organization-wide defaults, warn for one or two public defaults or for private defaults whose custom objects and sharing rules remain manual, and manual when no default-access field is exposed. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-13` | `decision_status` | Using complete source cardinalities, return fail when any active guest user has API Enabled or elevated data permissions, warn when other active guests exist or coverage is partial, and pass when a complete user inventory has no active guest. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-14` | `decision_status` | Using complete source cardinalities, return fail for severe login forensics such as a failure ratio above the configured threshold, repeated-source failures, or legacy TLS, warn for lesser anomalies, undated rows, or partial reads, and pass when the complete non-empty window has none. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-15` | `decision_status` | Using complete source cardinalities, return pass when complete setup-audit and Event Monitoring evidence is readable and no collection gap exists, warn for high-risk changes or partial or absent EventLogFile evidence, and manual when the active-org audit window is unreadable or implausibly empty. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-16` | `decision_status` | Using complete source cardinalities, return fail when a readable complete TenantSecret inventory has no active key, warn when active keys are undated, older than 365 days, or partial, pass for complete recent active keys, and manual when Shield encryption is unavailable or scoped out. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-17` | `decision_status` | Using complete source cardinalities, return fail when any certificate is expired or has a key under 2048 bits, warn for near expiry, missing dates, exportable private keys, pending chains, or partial evidence, pass when all certificates are valid and managed, and manual when none is returned. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-18` | `decision_status` | Using complete source cardinalities, return fail when My Domain is absent or still permits login.salesforce.com, pass when it is enforced for UI and API login, warn when API login is not restricted, and manual when the enforcement flag is absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-19` | `decision_status` | Using complete source cardinalities, return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SF-20` | `decision_status` | Using complete source cardinalities, return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
+| `SF-01` | `sf_01_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-01 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-01` | `sf_01_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-01` | `sf_01_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass for a Health Check score of at least 90, warn from 70 through 89, fail below 70, and manual when SecurityHealthCheck exposes no score. |
+| `SF-01` | `sf_01_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass for a Health Check score of at least 90, warn from 70 through 89, fail below 70, and manual when SecurityHealthCheck exposes no score. |
+| `SF-01` | `sf_01_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass for a Health Check score of at least 90, warn from 70 through 89, fail below 70, and manual when SecurityHealthCheck exposes no score. |
+| `SF-02` | `sf_02_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-02 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-02` | `sf_02_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-02` | `sf_02_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when session timeout is at most 120 minutes, forced logout is enabled, and sessions are locked to the originating IP; warn when only the IP lock is missing, fail for an excessive timeout or disabled forced logout, and manual for absent values. |
+| `SF-02` | `sf_02_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when session timeout is at most 120 minutes, forced logout is enabled, and sessions are locked to the originating IP; warn when only the IP lock is missing, fail for an excessive timeout or disabled forced logout, and manual for absent values. |
+| `SF-02` | `sf_02_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when session timeout is at most 120 minutes, forced logout is enabled, and sessions are locked to the originating IP; warn when only the IP lock is missing, fail for an excessive timeout or disabled forced logout, and manual for absent values. |
+| `SF-03` | `sf_03_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-03 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-03` | `sf_03_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-03` | `sf_03_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: evaluate minimum length 12, strongest complexity, expiration at most 90 days, and history at least five; return pass with no gap, warn with one gap, fail with two or more gaps, and manual when a required field is absent. |
+| `SF-03` | `sf_03_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: evaluate minimum length 12, strongest complexity, expiration at most 90 days, and history at least five; return pass with no gap, warn with one gap, fail with two or more gaps, and manual when a required field is absent. |
+| `SF-03` | `sf_03_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: evaluate minimum length 12, strongest complexity, expiration at most 90 days, and history at least five; return pass with no gap, warn with one gap, fail with two or more gaps, and manual when a required field is absent. |
+| `SF-04` | `sf_04_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-04 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-04` | `sf_04_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-04` | `sf_04_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when direct-UI MFA is not required or more than 25 percent of visible active standard users lack a registered method, warn for a smaller unenrolled population or partial reads, and pass when complete evidence shows MFA required and every user enrolled. |
+| `SF-04` | `sf_04_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when direct-UI MFA is not required or more than 25 percent of visible active standard users lack a registered method, warn for a smaller unenrolled population or partial reads, and pass when complete evidence shows MFA required and every user enrolled. |
+| `SF-04` | `sf_04_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when direct-UI MFA is not required or more than 25 percent of visible active standard users lack a registered method, warn for a smaller unenrolled population or partial reads, and pass when complete evidence shows MFA required and every user enrolled. |
+| `SF-05` | `sf_05_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-05 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-05` | `sf_05_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-05` | `sf_05_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when every sensitive profile has login IP ranges, per-request enforcement is enabled, and an org-wide trusted range exists; fail when none exists at either level, and warn or manual for mixed, unresolved, or unreadable coverage. |
+| `SF-05` | `sf_05_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when every sensitive profile has login IP ranges, per-request enforcement is enabled, and an org-wide trusted range exists; fail when none exists at either level, and warn or manual for mixed, unresolved, or unreadable coverage. |
+| `SF-05` | `sf_05_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when every sensitive profile has login IP ranges, per-request enforcement is enabled, and an org-wide trusted range exists; fail when none exists at either level, and warn or manual for mixed, unresolved, or unreadable coverage. |
+| `SF-06` | `sf_06_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-06 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-06` | `sf_06_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-06` | `sf_06_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when every sensitive profile restricts login hours every day, fail when none does, and warn when only some do or profile resolution is incomplete. |
+| `SF-06` | `sf_06_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when every sensitive profile restricts login hours every day, fail when none does, and warn when only some do or profile resolution is incomplete. |
+| `SF-06` | `sf_06_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when every sensitive profile restricts login hours every day, fail when none does, and warn when only some do or profile resolution is incomplete. |
+| `SF-07` | `sf_07_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-07 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-07` | `sf_07_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-07` | `sf_07_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when no visible active user is assigned a profile with API Enabled, warn when such users are below the configured ratio or evidence is partial, and fail when the configured excessive-access threshold is crossed. |
+| `SF-07` | `sf_07_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when no visible active user is assigned a profile with API Enabled, warn when such users are below the configured ratio or evidence is partial, and fail when the configured excessive-access threshold is crossed. |
+| `SF-07` | `sf_07_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when no visible active user is assigned a profile with API Enabled, warn when such users are below the configured ratio or evidence is partial, and fail when the configured excessive-access threshold is crossed. |
+| `SF-08` | `sf_08_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-08 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-08` | `sf_08_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-08` | `sf_08_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when any sensitive-name field is broadly readable by more than five profile or permission-set grants, warn for narrower grants or partial rows, and manual when no field matches the classification patterns. |
+| `SF-08` | `sf_08_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when any sensitive-name field is broadly readable by more than five profile or permission-set grants, warn for narrower grants or partial rows, and manual when no field matches the classification patterns. |
+| `SF-08` | `sf_08_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when any sensitive-name field is broadly readable by more than five profile or permission-set grants, warn for narrower grants or partial rows, and manual when no field matches the classification patterns. |
+| `SF-09` | `sf_09_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-09 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-09` | `sf_09_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-09` | `sf_09_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when no permission set grants elevated permissions, warn when elevated sets are assigned within the configured administrator threshold or evidence is partial, fail above the threshold, and manual when the standard inventory is implausibly empty. |
+| `SF-09` | `sf_09_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when no permission set grants elevated permissions, warn when elevated sets are assigned within the configured administrator threshold or evidence is partial, fail above the threshold, and manual when the standard inventory is implausibly empty. |
+| `SF-09` | `sf_09_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when no permission set grants elevated permissions, warn when elevated sets are assigned within the configured administrator threshold or evidence is partial, fail above the threshold, and manual when the standard inventory is implausibly empty. |
+| `SF-10` | `sf_10_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-10 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-10` | `sf_10_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-10` | `sf_10_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when active administrator-profile users exceed the configured maximum, warn for stale, undated, or partial administrator evidence, and pass when the complete recent population is within the maximum. |
+| `SF-10` | `sf_10_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when active administrator-profile users exceed the configured maximum, warn for stale, undated, or partial administrator evidence, and pass when the complete recent population is within the maximum. |
+| `SF-10` | `sf_10_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when active administrator-profile users exceed the configured maximum, warn for stale, undated, or partial administrator evidence, and pass when the complete recent population is within the maximum. |
+| `SF-11` | `sf_11_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-11 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-11` | `sf_11_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-11` | `sf_11_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when more than half of connected apps allow user self-authorization, warn for a smaller open set or when visible policies require pre-approval because scopes remain unreadable, and manual when no app or no policy flag is visible. |
+| `SF-11` | `sf_11_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when more than half of connected apps allow user self-authorization, warn for a smaller open set or when visible policies require pre-approval because scopes remain unreadable, and manual when no app or no policy flag is visible. |
+| `SF-11` | `sf_11_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when more than half of connected apps allow user self-authorization, warn for a smaller open set or when visible policies require pre-approval because scopes remain unreadable, and manual when no app or no policy flag is visible. |
+| `SF-12` | `sf_12_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-12 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-12` | `sf_12_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-12` | `sf_12_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when at least three standard objects have public organization-wide defaults, warn for one or two public defaults or for private defaults whose custom objects and sharing rules remain manual, and manual when no default-access field is exposed. |
+| `SF-12` | `sf_12_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when at least three standard objects have public organization-wide defaults, warn for one or two public defaults or for private defaults whose custom objects and sharing rules remain manual, and manual when no default-access field is exposed. |
+| `SF-12` | `sf_12_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when at least three standard objects have public organization-wide defaults, warn for one or two public defaults or for private defaults whose custom objects and sharing rules remain manual, and manual when no default-access field is exposed. |
+| `SF-13` | `sf_13_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-13 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-13` | `sf_13_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-13` | `sf_13_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when any active guest user has API Enabled or elevated data permissions, warn when other active guests exist or coverage is partial, and pass when a complete user inventory has no active guest. |
+| `SF-13` | `sf_13_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when any active guest user has API Enabled or elevated data permissions, warn when other active guests exist or coverage is partial, and pass when a complete user inventory has no active guest. |
+| `SF-13` | `sf_13_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when any active guest user has API Enabled or elevated data permissions, warn when other active guests exist or coverage is partial, and pass when a complete user inventory has no active guest. |
+| `SF-14` | `sf_14_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-14 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-14` | `sf_14_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-14` | `sf_14_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail for severe login forensics such as a failure ratio above the configured threshold, repeated-source failures, or legacy TLS, warn for lesser anomalies, undated rows, or partial reads, and pass when the complete non-empty window has none. |
+| `SF-14` | `sf_14_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail for severe login forensics such as a failure ratio above the configured threshold, repeated-source failures, or legacy TLS, warn for lesser anomalies, undated rows, or partial reads, and pass when the complete non-empty window has none. |
+| `SF-14` | `sf_14_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail for severe login forensics such as a failure ratio above the configured threshold, repeated-source failures, or legacy TLS, warn for lesser anomalies, undated rows, or partial reads, and pass when the complete non-empty window has none. |
+| `SF-15` | `sf_15_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-15 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-15` | `sf_15_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-15` | `sf_15_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when complete setup-audit and Event Monitoring evidence is readable and no collection gap exists, warn for high-risk changes or partial or absent EventLogFile evidence, and manual when the active-org audit window is unreadable or implausibly empty. |
+| `SF-15` | `sf_15_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when complete setup-audit and Event Monitoring evidence is readable and no collection gap exists, warn for high-risk changes or partial or absent EventLogFile evidence, and manual when the active-org audit window is unreadable or implausibly empty. |
+| `SF-15` | `sf_15_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when complete setup-audit and Event Monitoring evidence is readable and no collection gap exists, warn for high-risk changes or partial or absent EventLogFile evidence, and manual when the active-org audit window is unreadable or implausibly empty. |
+| `SF-16` | `sf_16_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-16 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-16` | `sf_16_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-16` | `sf_16_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when a readable complete TenantSecret inventory has no active key, warn when active keys are undated, older than 365 days, or partial, pass for complete recent active keys, and manual when Shield encryption is unavailable or scoped out. |
+| `SF-16` | `sf_16_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when a readable complete TenantSecret inventory has no active key, warn when active keys are undated, older than 365 days, or partial, pass for complete recent active keys, and manual when Shield encryption is unavailable or scoped out. |
+| `SF-16` | `sf_16_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when a readable complete TenantSecret inventory has no active key, warn when active keys are undated, older than 365 days, or partial, pass for complete recent active keys, and manual when Shield encryption is unavailable or scoped out. |
+| `SF-17` | `sf_17_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-17 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-17` | `sf_17_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-17` | `sf_17_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when any certificate is expired or has a key under 2048 bits, warn for near expiry, missing dates, exportable private keys, pending chains, or partial evidence, pass when all certificates are valid and managed, and manual when none is returned. |
+| `SF-17` | `sf_17_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when any certificate is expired or has a key under 2048 bits, warn for near expiry, missing dates, exportable private keys, pending chains, or partial evidence, pass when all certificates are valid and managed, and manual when none is returned. |
+| `SF-17` | `sf_17_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when any certificate is expired or has a key under 2048 bits, warn for near expiry, missing dates, exportable private keys, pending chains, or partial evidence, pass when all certificates are valid and managed, and manual when none is returned. |
+| `SF-18` | `sf_18_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-18 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-18` | `sf_18_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-18` | `sf_18_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when My Domain is absent or still permits login.salesforce.com, pass when it is enforced for UI and API login, warn when API login is not restricted, and manual when the enforcement flag is absent. |
+| `SF-18` | `sf_18_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when My Domain is absent or still permits login.salesforce.com, pass when it is enforced for UI and API login, warn when API login is not restricted, and manual when the enforcement flag is absent. |
+| `SF-18` | `sf_18_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when My Domain is absent or still permits login.salesforce.com, pass when it is enforced for UI and API login, warn when API login is not restricted, and manual when the enforcement flag is absent. |
+| `SF-19` | `sf_19_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-19 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-19` | `sf_19_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-19` | `sf_19_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent. |
+| `SF-19` | `sf_19_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent. |
+| `SF-19` | `sf_19_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent. |
+| `SF-20` | `sf_20_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SF-20 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SF-20` | `sf_20_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SF-20` | `sf_20_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent. |
+| `SF-20` | `sf_20_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent. |
+| `SF-20` | `sf_20_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent. |
 
 ### Criterion constants
 
 | Finding | Name | Value |
 |---|---|---|
-| `SF-01` | `passStatus` | pass |
-| `SF-01` | `warnStatus` | warn |
-| `SF-01` | `failStatus` | fail |
-| `SF-01` | `manualStatus` | manual |
-| `SF-02` | `passStatus` | pass |
-| `SF-02` | `warnStatus` | warn |
-| `SF-02` | `failStatus` | fail |
-| `SF-02` | `manualStatus` | manual |
-| `SF-03` | `passStatus` | pass |
-| `SF-03` | `warnStatus` | warn |
-| `SF-03` | `failStatus` | fail |
-| `SF-03` | `manualStatus` | manual |
-| `SF-04` | `passStatus` | pass |
-| `SF-04` | `warnStatus` | warn |
-| `SF-04` | `failStatus` | fail |
-| `SF-04` | `manualStatus` | manual |
-| `SF-05` | `passStatus` | pass |
-| `SF-05` | `warnStatus` | warn |
-| `SF-05` | `failStatus` | fail |
-| `SF-05` | `manualStatus` | manual |
-| `SF-06` | `passStatus` | pass |
-| `SF-06` | `warnStatus` | warn |
-| `SF-06` | `failStatus` | fail |
-| `SF-06` | `manualStatus` | manual |
-| `SF-07` | `passStatus` | pass |
-| `SF-07` | `warnStatus` | warn |
-| `SF-07` | `failStatus` | fail |
-| `SF-07` | `manualStatus` | manual |
-| `SF-08` | `passStatus` | pass |
-| `SF-08` | `warnStatus` | warn |
-| `SF-08` | `failStatus` | fail |
-| `SF-08` | `manualStatus` | manual |
-| `SF-09` | `passStatus` | pass |
-| `SF-09` | `warnStatus` | warn |
-| `SF-09` | `failStatus` | fail |
-| `SF-09` | `manualStatus` | manual |
-| `SF-10` | `passStatus` | pass |
-| `SF-10` | `warnStatus` | warn |
-| `SF-10` | `failStatus` | fail |
-| `SF-10` | `manualStatus` | manual |
-| `SF-11` | `passStatus` | pass |
-| `SF-11` | `warnStatus` | warn |
-| `SF-11` | `failStatus` | fail |
-| `SF-11` | `manualStatus` | manual |
-| `SF-12` | `passStatus` | pass |
-| `SF-12` | `warnStatus` | warn |
-| `SF-12` | `failStatus` | fail |
-| `SF-12` | `manualStatus` | manual |
-| `SF-13` | `passStatus` | pass |
-| `SF-13` | `warnStatus` | warn |
-| `SF-13` | `failStatus` | fail |
-| `SF-13` | `manualStatus` | manual |
-| `SF-14` | `passStatus` | pass |
-| `SF-14` | `warnStatus` | warn |
-| `SF-14` | `failStatus` | fail |
-| `SF-14` | `manualStatus` | manual |
-| `SF-15` | `passStatus` | pass |
-| `SF-15` | `warnStatus` | warn |
-| `SF-15` | `failStatus` | fail |
-| `SF-15` | `manualStatus` | manual |
-| `SF-16` | `passStatus` | pass |
-| `SF-16` | `warnStatus` | warn |
-| `SF-16` | `failStatus` | fail |
-| `SF-16` | `manualStatus` | manual |
-| `SF-17` | `passStatus` | pass |
-| `SF-17` | `warnStatus` | warn |
-| `SF-17` | `failStatus` | fail |
-| `SF-17` | `manualStatus` | manual |
-| `SF-18` | `passStatus` | pass |
-| `SF-18` | `warnStatus` | warn |
-| `SF-18` | `failStatus` | fail |
-| `SF-18` | `manualStatus` | manual |
-| `SF-19` | `passStatus` | pass |
-| `SF-19` | `warnStatus` | warn |
-| `SF-19` | `failStatus` | fail |
-| `SF-19` | `manualStatus` | manual |
-| `SF-20` | `passStatus` | pass |
-| `SF-20` | `warnStatus` | warn |
-| `SF-20` | `failStatus` | fail |
-| `SF-20` | `manualStatus` | manual |
+| `SF-01` | `requiredEvidenceReadable` | true |
+| `SF-01` | `requiredEvidenceComplete` | true |
+| `SF-02` | `requiredEvidenceReadable` | true |
+| `SF-02` | `requiredEvidenceComplete` | true |
+| `SF-03` | `requiredEvidenceReadable` | true |
+| `SF-03` | `requiredEvidenceComplete` | true |
+| `SF-04` | `requiredEvidenceReadable` | true |
+| `SF-04` | `requiredEvidenceComplete` | true |
+| `SF-05` | `requiredEvidenceReadable` | true |
+| `SF-05` | `requiredEvidenceComplete` | true |
+| `SF-06` | `requiredEvidenceReadable` | true |
+| `SF-06` | `requiredEvidenceComplete` | true |
+| `SF-07` | `requiredEvidenceReadable` | true |
+| `SF-07` | `requiredEvidenceComplete` | true |
+| `SF-08` | `requiredEvidenceReadable` | true |
+| `SF-08` | `requiredEvidenceComplete` | true |
+| `SF-09` | `requiredEvidenceReadable` | true |
+| `SF-09` | `requiredEvidenceComplete` | true |
+| `SF-10` | `requiredEvidenceReadable` | true |
+| `SF-10` | `requiredEvidenceComplete` | true |
+| `SF-11` | `requiredEvidenceReadable` | true |
+| `SF-11` | `requiredEvidenceComplete` | true |
+| `SF-12` | `requiredEvidenceReadable` | true |
+| `SF-12` | `requiredEvidenceComplete` | true |
+| `SF-13` | `requiredEvidenceReadable` | true |
+| `SF-13` | `requiredEvidenceComplete` | true |
+| `SF-14` | `requiredEvidenceReadable` | true |
+| `SF-14` | `requiredEvidenceComplete` | true |
+| `SF-15` | `requiredEvidenceReadable` | true |
+| `SF-15` | `requiredEvidenceComplete` | true |
+| `SF-16` | `requiredEvidenceReadable` | true |
+| `SF-16` | `requiredEvidenceComplete` | true |
+| `SF-17` | `requiredEvidenceReadable` | true |
+| `SF-17` | `requiredEvidenceComplete` | true |
+| `SF-18` | `requiredEvidenceReadable` | true |
+| `SF-18` | `requiredEvidenceComplete` | true |
+| `SF-19` | `requiredEvidenceReadable` | true |
+| `SF-19` | `requiredEvidenceComplete` | true |
+| `SF-20` | `requiredEvidenceReadable` | true |
+| `SF-20` | `requiredEvidenceComplete` | true |
 
 ### Illustrative criterion notes
 
@@ -602,26 +724,26 @@ Examples are explanatory, not normative. The ordered first-match conditions abov
 
 | # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | Health Check score | - | - | - | - | - | - | - | - |
-| 2 | Session timeout | - | - | - | - | - | - | - | - |
-| 3 | Password policy | - | - | - | - | - | - | - | - |
-| 4 | MFA enforcement | - | - | - | - | - | - | - | - |
-| 5 | IP range restrictions | - | - | - | - | - | - | - | - |
-| 6 | Login hour restrictions | - | - | - | - | - | - | - | - |
-| 7 | API access controls | - | - | - | - | - | - | - | - |
-| 8 | Field-level security | - | - | - | - | - | - | - | - |
-| 9 | Permission set review | - | - | - | - | - | - | - | - |
-| 10 | Profile permissions | - | - | - | - | - | - | - | - |
-| 11 | Connected app OAuth policies | - | - | - | - | - | - | - | - |
-| 12 | Sharing settings | - | - | - | - | - | - | - | - |
-| 13 | Guest user access | - | - | - | - | - | - | - | - |
-| 14 | Login forensics | - | - | - | - | - | - | - | - |
-| 15 | Setup change tracking | - | - | - | - | - | - | - | - |
-| 16 | Data encryption status | - | - | - | - | - | - | - | - |
-| 17 | Certificate management | - | - | - | - | - | - | - | - |
-| 18 | My Domain enforcement | - | - | - | - | - | - | - | - |
-| 19 | Clickjack protection | - | - | - | - | - | - | - | - |
-| 20 | CSRF protection | - | - | - | - | - | - | - | - |
+| 1 | Health Check score | CA-2 | L2 CA.L2-3.12.1 | CC4.1 | 1.1 | 11.3.1 | SRG-APP-000516 | ISM-1526 | 11.3.1 |
+| 2 | Session timeout | AC-12 | L2 AC.L2-3.1.10 | CC6.1 | 2.1 | 8.2.8 | SRG-APP-000295 | ISM-1164 | 8.2.8 |
+| 3 | Password policy | IA-5(1) | L2 IA.L2-3.5.7 | CC6.1 | 2.2 | 8.3.6 | SRG-APP-000164 | ISM-0421 | 8.3.6 |
+| 4 | MFA enforcement | IA-2(1) | L2 IA.L2-3.5.3 | CC6.1 | 2.3 | 8.4.1 | SRG-APP-000149 | ISM-1401 | 8.4.1 |
+| 5 | IP range restrictions | AC-3, SC-7 | L2 SC.L2-3.13.1 | CC6.6 | 2.4 | 1.3.1 | SRG-APP-000142 | ISM-1416 | 1.3.1 |
+| 6 | Login hour restrictions | AC-2(5) | L2 AC.L2-3.1.8 | CC6.1 | 2.5 | 7.2.1 | SRG-APP-000025 | ISM-0988 | 7.2.1 |
+| 7 | API access controls | AC-3 | L2 AC.L2-3.1.2 | CC6.3 | 3.1 | 7.2.2 | SRG-APP-000033 | ISM-1508 | 7.2.2 |
+| 8 | Field-level security | AC-3 | L2 AC.L2-3.1.3 | CC6.1 | 3.2 | 7.2.1 | SRG-APP-000033 | ISM-0405 | 7.2.1 |
+| 9 | Permission set review | AC-6(1) | L2 AC.L2-3.1.5 | CC6.3 | 3.3 | 7.2.2 | SRG-APP-000340 | ISM-1508 | 7.2.2 |
+| 10 | Profile permissions | AC-6(5) | L2 AC.L2-3.1.6 | CC6.3 | 3.4 | 7.2.1 | SRG-APP-000340 | ISM-1508 | 7.2.1 |
+| 11 | Connected app OAuth policies | AC-3 | L2 AC.L2-3.1.2 | CC6.1 | 4.1 | 6.4.1 | SRG-APP-000033 | ISM-1508 | 6.4.1 |
+| 12 | Sharing settings | AC-4 | L2 AC.L2-3.1.3 | CC6.1 | 3.5 | 7.2.1 | SRG-APP-000038 | ISM-0405 | 7.2.1 |
+| 13 | Guest user access | AC-14 | L2 AC.L2-3.1.1 | CC6.1 | 3.6 | 7.2.5 | SRG-APP-000033 | ISM-1508 | 7.2.5 |
+| 14 | Login forensics | AU-6 | L2 AU.L2-3.3.5 | CC7.2 | 5.1 | 10.6.1 | SRG-APP-000343 | ISM-0580 | 10.6.1 |
+| 15 | Setup change tracking | AU-2, AU-3 | L2 AU.L2-3.3.1 | CC7.2 | 5.2 | 10.2.1 | SRG-APP-000089 | ISM-0580 | 10.2.1 |
+| 16 | Data encryption status | SC-28(1) | L2 SC.L2-3.13.16 | CC6.1 | 6.1 | 3.4.1 | SRG-APP-000231 | ISM-0457 | 3.4.1 |
+| 17 | Certificate management | SC-17 | L2 SC.L2-3.13.10 | CC6.1 | 6.2 | 4.1.1 | SRG-APP-000514 | ISM-1139 | 4.1.1 |
+| 18 | My Domain enforcement | IA-8 | L2 IA.L2-3.5.2 | CC6.1 | 2.6 | 2.2.1 | SRG-APP-000516 | ISM-1590 | 2.2.1 |
+| 19 | Clickjack protection | SC-18 | L2 SC.L2-3.13.1 | CC6.1 | 7.1 | 6.2.4 | SRG-APP-000516 | ISM-1486 | 6.2.4 |
+| 20 | CSRF protection | SC-18 | L2 SC.L2-3.13.1 | CC6.1 | 7.2 | 6.2.4 | SRG-APP-000516 | ISM-1486 | 6.2.4 |
 
 ## Collection states
 
@@ -656,17 +778,61 @@ Projected fields by surface:
 
 | Surface | Allowed fields |
 |---|---|
-| `standard-query` | `records`, `totalSize`, `done`, `nextRecordsUrl` |
-| `tooling-query` | `records`, `totalSize`, `done`, `nextRecordsUrl` |
-| `metadata-read` | `SecuritySettings`, `MyDomainSettings`, `Profile`, `ConnectedApp` |
-| `limits` | `DailyApiRequests`, `HourlyODataCallout`, `DailyAsyncApexExecutions` |
+| `limits` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `organization` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `health-check` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `health-check-risks` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `security-settings` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `my-domain-settings` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `users` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `profiles` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `profile-metadata` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `permission-sets` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `permission-set-assignments` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `two-factor-methods` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `field-permissions` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `tenant-secrets` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `certificates` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `connected-applications` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `oauth-tokens` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `caller-permissions` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `login-history` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `setup-audit-trail` | `selected fields named in the runtime SOQL or Metadata API request` |
+| `event-log-files` | `selected fields named in the runtime SOQL or Metadata API request` |
 
 ## Export layout
 
 Required paths:
 
-- `core_data/access.json`
+- `metadata.json`
+- `QUICK_REFERENCE.md`
+- `core_data/access_check.json`
+- `core_data/organization.json`
+- `core_data/security_health_check.json`
+- `core_data/security_health_check_risks.json`
+- `core_data/security_settings.json`
+- `core_data/my_domain_settings.json`
+- `core_data/users.json`
+- `core_data/profiles.json`
+- `core_data/profile_metadata.json`
+- `core_data/permission_sets.json`
+- `core_data/permission_set_assignments.json`
+- `core_data/two_factor_methods_info.json`
+- `core_data/field_permissions_sensitive.json`
+- `core_data/tenant_secrets.json`
+- `core_data/certificates.json`
+- `core_data/connected_applications.json`
+- `core_data/oauth_tokens.json`
+- `core_data/caller_permissions.json`
+- `core_data/login_history.json`
+- `core_data/setup_audit_trail.json`
+- `core_data/event_log_files.json`
+- `analysis/platform_security.json`
+- `analysis/identity_access.json`
+- `analysis/data_protection.json`
+- `analysis/monitoring_integrations.json`
 - `analysis/findings.json`
+- `analysis/summary.json`
 - `compliance/executive_summary.md`
 - `compliance/unified_compliance_matrix.md`
 - `compliance/fedramp/fedramp_compliance_report.md`
@@ -677,7 +843,6 @@ Required paths:
 - `compliance/disa_stig/stig_compliance_checklist.md`
 - `compliance/irap/irap_compliance_report.md`
 - `compliance/ismap/ismap_compliance_report.md`
-- `QUICK_REFERENCE.md`
 
 Conditional paths:
 
@@ -687,27 +852,58 @@ Conditional paths:
 
 | Path | Format | Required when | Schema | Serialization |
 |---|---|---|---|---|
-| `core_data/{dataset}.json` | json | The dataset is part of the assessment, including explicit not-collected markers. | Projected source records or a structured unavailable marker; unavailable values remain null. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `analysis/findings.json` | json | Always. | Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `compliance/executive_summary.md` | markdown | Always. | Human-readable counts and findings grouped by status. | UTF-8 Markdown. |
-| `compliance/unified_compliance_matrix.md` | markdown | Always. | Finding-to-framework mapping matrix. | UTF-8 Markdown. |
-| `compliance/{framework}/{report}.md` | markdown | Always for each supported framework. | Framework-specific finding rows and mappings. | UTF-8 Markdown. |
-| `QUICK_REFERENCE.md` | markdown | Always. | Bundle navigation and operator next steps. | UTF-8 Markdown. |
-| `_errors.log` | text | At least one collection read failed, was denied, or was incomplete. | Scrubbed collection error summaries without response bodies or credentials. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `core_data/access_check.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/organization.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/security_health_check.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/security_health_check_risks.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/security_settings.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/my_domain_settings.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/users.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/profiles.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/profile_metadata.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/permission_sets.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/permission_set_assignments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/two_factor_methods_info.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/field_permissions_sensitive.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/tenant_secrets.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/certificates.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/connected_applications.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/oauth_tokens.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/caller_permissions.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/login_history.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/setup_audit_trail.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/event_log_files.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/platform_security.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity_access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/data_protection.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/monitoring_integrations.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/summary.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis/cis_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 
 ### Record schemas
 
 #### finding
 
 - `id`
-- `control`
 - `title`
 - `severity`
 - `status`
 - `summary`
 - `evidence`
-- `mappings`
-- `manualEvidence`
+- `framework mappings`
 
 #### collection_marker
 
@@ -715,25 +911,8 @@ Conditional paths:
 - `status`
 - `endpoint`
 - `error`
-- `reason`
 
-#### access_surface
-
-- `name`
-- `endpoint`
-- `status`
-- `count`
-- `error`
-
-#### assessment
-
-- `area`
-- `title`
-- `summary`
-- `findings`
-- `errors`
-
-#### bundle_manifest
+#### bundle_result
 
 - `outputDir`
 - `zipPath`
@@ -741,10 +920,10 @@ Conditional paths:
 - `findingCount`
 - `errorCount`
 
-JSON formatting: UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
 
-Overwrite policy: Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.
+Overwrite policy: Allocate a new {organization}-audit-bundle directory with a numeric suffix when needed; never overwrite a prior directory.
 
 Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
 
-Archive pairing: Create salesforce-audit.zip beside the allocated salesforce-audit directory, applying the same suffix to both.
+Archive pairing: Write a sibling zip named from the exact allocated bundle-directory basename plus .zip.

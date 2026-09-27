@@ -3975,7 +3975,7 @@ function createClient(args: AuthArgs): ServicenowApiClient {
 const authParams = {
   instance: Type.Optional(Type.String({ description: "ServiceNow instance name (for https://<instance>.service-now.com). Defaults to SERVICENOW_INSTANCE." })),
   instance_url: Type.Optional(Type.String({ description: "Full instance URL. Defaults to SERVICENOW_URL, or is derived from the instance name." })),
-  auth_method: Type.Optional(Type.String({ description: "basic, oauth, or mtls. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided." })),
+  auth_method: Type.Optional(Type.String({ description: "basic or oauth. The legacy mtls selector is recognized only to return an unsupported-mode error. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided." })),
   username: Type.Optional(Type.String({ description: "Audit account user name for basic auth or the OAuth password grant. Defaults to SERVICENOW_USERNAME." })),
   password: Type.Optional(Type.String({ description: "Audit account password. Defaults to SERVICENOW_PASSWORD." })),
   client_id: Type.Optional(Type.String({ description: "OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID." })),

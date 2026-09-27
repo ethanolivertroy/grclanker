@@ -35,7 +35,8 @@ This specification requires [shared integration contract version 1.1](./integrat
 - Table API rows and Aggregate API counts are cross-checked; missing totals, ACL-filtered visibility, truncation, denied reads, and skipped child requests prevent pass.
 - Encoded-query pagination uses sysparm_offset plus X-Total-Count, rejects foreign next links, and preserves exact seen, total, page, and stop-reason evidence.
 - MFA, encryption, script, IP, email, and outbound TLS controls use documented properties and tables available to the runtime; unavailable Instance Security Center and product-specific proofs remain manual.
-- mTLS transport and several Instance Security Center, Scan, DKIM, adaptive MFA, MID, and retention proofs remain manual.
+- The configuration parser recognizes the legacy mtls selector only to reject it with an explicit unsupported-mode error; no mTLS transport is implemented.
+- Several Instance Security Center, Scan, DKIM, adaptive MFA, MID mutual-authentication, and retention proofs remain manual.
 
 ## Tools
 
@@ -56,7 +57,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `instance` | string | no | ServiceNow instance name (for https://<instance>.service-now.com). Defaults to SERVICENOW_INSTANCE. |
 | `instance_url` | string | no | Full instance URL. Defaults to SERVICENOW_URL, or is derived from the instance name. |
-| `auth_method` | string | no | basic, oauth, or mtls. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
+| `auth_method` | string | no | basic or oauth. The legacy mtls selector is recognized only to return an unsupported-mode error. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
 | `username` | string | no | Audit account user name for basic auth or the OAuth password grant. Defaults to SERVICENOW_USERNAME. |
 | `password` | string | no | Audit account password. Defaults to SERVICENOW_PASSWORD. |
 | `client_id` | string | no | OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID. |
@@ -74,7 +75,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `instance` | string | no | ServiceNow instance name (for https://<instance>.service-now.com). Defaults to SERVICENOW_INSTANCE. |
 | `instance_url` | string | no | Full instance URL. Defaults to SERVICENOW_URL, or is derived from the instance name. |
-| `auth_method` | string | no | basic, oauth, or mtls. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
+| `auth_method` | string | no | basic or oauth. The legacy mtls selector is recognized only to return an unsupported-mode error. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
 | `username` | string | no | Audit account user name for basic auth or the OAuth password grant. Defaults to SERVICENOW_USERNAME. |
 | `password` | string | no | Audit account password. Defaults to SERVICENOW_PASSWORD. |
 | `client_id` | string | no | OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID. |
@@ -97,7 +98,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `instance` | string | no | ServiceNow instance name (for https://<instance>.service-now.com). Defaults to SERVICENOW_INSTANCE. |
 | `instance_url` | string | no | Full instance URL. Defaults to SERVICENOW_URL, or is derived from the instance name. |
-| `auth_method` | string | no | basic, oauth, or mtls. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
+| `auth_method` | string | no | basic or oauth. The legacy mtls selector is recognized only to return an unsupported-mode error. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
 | `username` | string | no | Audit account user name for basic auth or the OAuth password grant. Defaults to SERVICENOW_USERNAME. |
 | `password` | string | no | Audit account password. Defaults to SERVICENOW_PASSWORD. |
 | `client_id` | string | no | OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID. |
@@ -117,7 +118,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `instance` | string | no | ServiceNow instance name (for https://<instance>.service-now.com). Defaults to SERVICENOW_INSTANCE. |
 | `instance_url` | string | no | Full instance URL. Defaults to SERVICENOW_URL, or is derived from the instance name. |
-| `auth_method` | string | no | basic, oauth, or mtls. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
+| `auth_method` | string | no | basic or oauth. The legacy mtls selector is recognized only to return an unsupported-mode error. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
 | `username` | string | no | Audit account user name for basic auth or the OAuth password grant. Defaults to SERVICENOW_USERNAME. |
 | `password` | string | no | Audit account password. Defaults to SERVICENOW_PASSWORD. |
 | `client_id` | string | no | OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID. |
@@ -136,7 +137,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `instance` | string | no | ServiceNow instance name (for https://<instance>.service-now.com). Defaults to SERVICENOW_INSTANCE. |
 | `instance_url` | string | no | Full instance URL. Defaults to SERVICENOW_URL, or is derived from the instance name. |
-| `auth_method` | string | no | basic, oauth, or mtls. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
+| `auth_method` | string | no | basic or oauth. The legacy mtls selector is recognized only to return an unsupported-mode error. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
 | `username` | string | no | Audit account user name for basic auth or the OAuth password grant. Defaults to SERVICENOW_USERNAME. |
 | `password` | string | no | Audit account password. Defaults to SERVICENOW_PASSWORD. |
 | `client_id` | string | no | OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID. |
@@ -155,7 +156,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 |---|---|---|---|
 | `instance` | string | no | ServiceNow instance name (for https://<instance>.service-now.com). Defaults to SERVICENOW_INSTANCE. |
 | `instance_url` | string | no | Full instance URL. Defaults to SERVICENOW_URL, or is derived from the instance name. |
-| `auth_method` | string | no | basic, oauth, or mtls. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
+| `auth_method` | string | no | basic or oauth. The legacy mtls selector is recognized only to return an unsupported-mode error. Defaults to SERVICENOW_AUTH_METHOD or is inferred from the credentials provided. |
 | `username` | string | no | Audit account user name for basic auth or the OAuth password grant. Defaults to SERVICENOW_USERNAME. |
 | `password` | string | no | Audit account password. Defaults to SERVICENOW_PASSWORD. |
 | `client_id` | string | no | OAuth application registry client ID. Defaults to SERVICENOW_CLIENT_ID. |
@@ -182,7 +183,6 @@ Supported modes:
 - Basic username and password
 - OAuth client credentials or refresh token
 - Explicit OAuth access token
-- mTLS configuration metadata
 
 Credential precedence, highest first:
 
@@ -208,44 +208,157 @@ Credential refresh: POST /oauth_token.do with client_credentials or refresh_toke
 
 | Kind | Permission, role, or plan | Unlocks | Notes |
 |---|---|---|---|
-| role | `Read access to sys_user, role, ACL, property, audit, update-set, dictionary, plugin, and MID Server tables` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `Aggregate API count visibility matching Table API row visibility` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `Table API read ACLs for every listed table` | `users`, `privileged-assignments`, `role-inheritance`, `identity-properties`, `password-policies`, `sso-providers`, `ldap-servers`, `certificates`, `oauth-entities`, `mfa-criteria`, `hardening-properties`, `debug-properties`, `eval-scripts`, `ip-access`, `ip-authenticator-plugin`, `email-accounts`, `acls`, `acl-roles`, `public-pages`, `encryption-contexts`, `crypto-modules`, `encrypted-fields`, `audit-dictionary`, `update-sets`, `sensitive-update-xml`, `mid-servers`, `mid-properties`, `plugins` | The exact ServiceNow roles are instance-specific because table and field ACLs can be customized. |
+| role | `Aggregate API count ACLs matching the Table API population` | `role-inheritance-count`, `acl-count`, `recent-audit-count`, `recent-transaction-count`, `update-set-count` |  |
+| role | `security_admin where protected security tables require elevation` | `acls`, `acl-roles`, `acl-count` | Elevation does not replace each table's read ACL. |
 
 ## API surfaces
 
 | ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
 |---|---|---|---|---|---|---|---|---|
-| `table-api` | HTTP | `GET /api/now/table/{table}` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `result`, `sys_id`, `sys_updated_on`, `active`, `name`, `value` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
-| `aggregate-api` | HTTP | `GET /api/now/stats/{table}` | ServiceNow Aggregate API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `result.stats.count` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_AggregateAPI.html) |
-| `system-properties` | HTTP | `GET /api/now/table/sys_properties` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `value`, `description`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-platform-security/page/administer/security/reference/security-properties.html) |
-| `access-controls` | HTTP | `GET /api/now/table/sys_security_acl` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `operation`, `active`, `admin_overrides`, `requires_role`, `script` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-platform-security/page/administer/contextual-security/concept/access-control-rules.html) |
-| `audit` | HTTP | `GET /api/now/table/sys_audit` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `documentkey`, `tablename`, `fieldname`, `oldvalue`, `newvalue`, `sys_created_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-platform-administration/page/administer/security/concept/c_SystemAuditLog.html) |
+| `users` | HTTP | `GET /api/now/table/sys_user` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `user_name`, `active`, `last_login_time`, `web_service_access_only`, `internal_integration_user`, `enable_multifactor_authn`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `privileged-assignments` | HTTP | `GET /api/now/table/sys_user_has_role` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `user`, `user.user_name`, `user.active`, `user.web_service_access_only`, `user.internal_integration_user`, `role`, `role.name` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `role-inheritance` | HTTP | `GET /api/now/table/sys_user_role_contains` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `role`, `role.name`, `contains`, `contains.name` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `role-inheritance-count` | HTTP | `GET /api/now/stats/sys_user_role_contains` | ServiceNow Aggregate API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `result.stats.count` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_AggregateAPI.html) |
+| `identity-properties` | HTTP | `GET /api/now/table/sys_properties` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `value`, `description`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `password-policies` | HTTP | `GET /api/now/table/password_policy` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `active`, `minimum_password_length`, `maximum_password_length`, `strength`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `sso-providers` | HTTP | `GET /api/now/table/sso_properties` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `active`, `default`, `auto_redirect_idp`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `ldap-servers` | HTTP | `GET /api/now/table/ldap_server_config` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `active`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `certificates` | HTTP | `GET /api/now/table/sys_certificate` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `active`, `valid_from`, `expires`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `oauth-entities` | HTTP | `GET /api/now/table/oauth_entity` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `type`, `active`, `client_id`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `mfa-criteria` | HTTP | `GET /api/now/table/multi_factor_criteria` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `active`, `order`, `roles`, `multi_factor_roles`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `hardening-properties` | HTTP | `GET /api/now/table/sys_properties` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `value`, `description`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `debug-properties` | HTTP | `GET /api/now/table/sys_properties` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `value`, `description`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `eval-scripts` | HTTP | `GET /api/now/table/sys_script` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `collection`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `ip-access` | HTTP | `GET /api/now/table/ip_access` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `type`, `direction`, `active`, `range_start`, `range_end`, `description`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `ip-authenticator-plugin` | HTTP | `GET /api/now/table/sys_plugins` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `source`, `active`, `state`, `version`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `email-accounts` | HTTP | `GET /api/now/table/sys_email_account` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `type`, `active`, `connection_security`, `enable_ssl`, `enable_tls`, `authentication`, `server`, `port`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `acls` | HTTP | `GET /api/now/table/sys_security_acl` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `operation`, `type`, `active`, `admin_overrides`, `condition-present`, `script-present`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `acl-roles` | HTTP | `GET /api/now/table/sys_security_acl_role` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `sys_security_acl`, `sys_user_role`, `sys_user_role.name` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `acl-count` | HTTP | `GET /api/now/stats/sys_security_acl` | ServiceNow Aggregate API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `result.stats.count` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_AggregateAPI.html) |
+| `public-pages` | HTTP | `GET /api/now/table/sys_public` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `page`, `active`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `encryption-contexts` | HTTP | `GET /api/now/table/sys_encryption_context` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `type`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `crypto-modules` | HTTP | `GET /api/now/table/sys_kmf_crypto_module` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `module_name`, `state`, `sys_scope`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `encrypted-fields` | HTTP | `GET /api/now/table/sys_dictionary` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `element`, `internal_type` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `audit-dictionary` | HTTP | `GET /api/now/table/sys_dictionary` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `audit`, `attributes` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `recent-audit-count` | HTTP | `GET /api/now/stats/sys_audit` | ServiceNow Aggregate API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `result.stats.count` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_AggregateAPI.html) |
+| `recent-transaction-count` | HTTP | `GET /api/now/stats/syslog_transaction` | ServiceNow Aggregate API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `result.stats.count` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_AggregateAPI.html) |
+| `update-sets` | HTTP | `GET /api/now/table/sys_update_set` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `state`, `application`, `sys_created_by`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `update-set-count` | HTTP | `GET /api/now/stats/sys_update_set` | ServiceNow Aggregate API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `result.stats.count` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_AggregateAPI.html) |
+| `sensitive-update-xml` | HTTP | `GET /api/now/table/sys_update_xml` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `type`, `target_name`, `action`, `update_set`, `update_set.name`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `mid-servers` | HTTP | `GET /api/now/table/ecc_agent` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `status`, `validated`, `version`, `host_name`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `mid-properties` | HTTP | `GET /api/now/table/sys_properties` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `value`, `description`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
+| `plugins` | HTTP | `GET /api/now/table/sys_plugins` | ServiceNow Table API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `sys_id`, `name`, `source`, `active`, `state`, `version`, `sys_updated_on` | [Official documentation](https://www.servicenow.com/docs/bundle/zurich-api-reference/page/integrate/inbound-rest/concept/c_TableAPI.html) |
 
 ### Request construction
 
 | Surface | Input | Exact value or rule | Required |
 |---|---|---|---|
-| `table-api` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
-| `table-api` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `table-api` | response | A JSON object or list containing only the documented result, sys_id, sys_updated_on, active, name, value members consumed by verdicts. | yes |
-| `aggregate-api` | client | Use the configured ServiceNow Aggregate API origin; never follow a server link to a different origin. | yes |
-| `aggregate-api` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `aggregate-api` | response | A JSON object or list containing only the documented result.stats.count members consumed by verdicts. | yes |
-| `system-properties` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
-| `system-properties` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `system-properties` | response | A JSON object or list containing only the documented name, value, description, sys_updated_on members consumed by verdicts. | yes |
-| `access-controls` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
-| `access-controls` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `access-controls` | response | A JSON object or list containing only the documented sys_id, name, operation, active, admin_overrides, requires_role, script members consumed by verdicts. | yes |
-| `audit` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
-| `audit` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `audit` | response | A JSON object or list containing only the documented documentkey, tablename, fieldname, oldvalue, newvalue, sys_created_on members consumed by verdicts. | yes |
+| `users` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented sys_id, user_name, active, last_login_time, web_service_access_only, internal_integration_user, enable_multifactor_authn, sys_updated_on members consumed by verdicts. | yes |
+| `privileged-assignments` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `privileged-assignments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `privileged-assignments` | response | A JSON object or list containing only the documented sys_id, user, user.user_name, user.active, user.web_service_access_only, user.internal_integration_user, role, role.name members consumed by verdicts. | yes |
+| `role-inheritance` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `role-inheritance` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `role-inheritance` | response | A JSON object or list containing only the documented sys_id, role, role.name, contains, contains.name members consumed by verdicts. | yes |
+| `role-inheritance-count` | client | Use the configured ServiceNow Aggregate API origin; never follow a server link to a different origin. | yes |
+| `role-inheritance-count` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `role-inheritance-count` | response | A JSON object or list containing only the documented result.stats.count members consumed by verdicts. | yes |
+| `identity-properties` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `identity-properties` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `identity-properties` | response | A JSON object or list containing only the documented sys_id, name, value, description, sys_updated_on members consumed by verdicts. | yes |
+| `password-policies` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `password-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `password-policies` | response | A JSON object or list containing only the documented sys_id, name, active, minimum_password_length, maximum_password_length, strength, sys_updated_on members consumed by verdicts. | yes |
+| `sso-providers` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `sso-providers` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `sso-providers` | response | A JSON object or list containing only the documented sys_id, name, active, default, auto_redirect_idp, sys_updated_on members consumed by verdicts. | yes |
+| `ldap-servers` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `ldap-servers` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `ldap-servers` | response | A JSON object or list containing only the documented sys_id, name, active, sys_updated_on members consumed by verdicts. | yes |
+| `certificates` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `certificates` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `certificates` | response | A JSON object or list containing only the documented sys_id, name, active, valid_from, expires, sys_updated_on members consumed by verdicts. | yes |
+| `oauth-entities` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `oauth-entities` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `oauth-entities` | response | A JSON object or list containing only the documented sys_id, name, type, active, client_id, sys_updated_on members consumed by verdicts. | yes |
+| `mfa-criteria` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `mfa-criteria` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `mfa-criteria` | response | A JSON object or list containing only the documented sys_id, name, active, order, roles, multi_factor_roles, sys_updated_on members consumed by verdicts. | yes |
+| `hardening-properties` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `hardening-properties` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `hardening-properties` | response | A JSON object or list containing only the documented sys_id, name, value, description, sys_updated_on members consumed by verdicts. | yes |
+| `debug-properties` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `debug-properties` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `debug-properties` | response | A JSON object or list containing only the documented sys_id, name, value, description, sys_updated_on members consumed by verdicts. | yes |
+| `eval-scripts` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `eval-scripts` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `eval-scripts` | response | A JSON object or list containing only the documented sys_id, name, collection, sys_updated_on members consumed by verdicts. | yes |
+| `ip-access` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `ip-access` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `ip-access` | response | A JSON object or list containing only the documented sys_id, type, direction, active, range_start, range_end, description, sys_updated_on members consumed by verdicts. | yes |
+| `ip-authenticator-plugin` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `ip-authenticator-plugin` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `ip-authenticator-plugin` | response | A JSON object or list containing only the documented sys_id, name, source, active, state, version, sys_updated_on members consumed by verdicts. | yes |
+| `email-accounts` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `email-accounts` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `email-accounts` | response | A JSON object or list containing only the documented sys_id, name, type, active, connection_security, enable_ssl, enable_tls, authentication, server, port, sys_updated_on members consumed by verdicts. | yes |
+| `acls` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `acls` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `acls` | response | A JSON object or list containing only the documented sys_id, name, operation, type, active, admin_overrides, condition-present, script-present, sys_updated_on members consumed by verdicts. | yes |
+| `acl-roles` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `acl-roles` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `acl-roles` | response | A JSON object or list containing only the documented sys_id, sys_security_acl, sys_user_role, sys_user_role.name members consumed by verdicts. | yes |
+| `acl-count` | client | Use the configured ServiceNow Aggregate API origin; never follow a server link to a different origin. | yes |
+| `acl-count` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `acl-count` | response | A JSON object or list containing only the documented result.stats.count members consumed by verdicts. | yes |
+| `public-pages` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `public-pages` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `public-pages` | response | A JSON object or list containing only the documented sys_id, page, active, sys_updated_on members consumed by verdicts. | yes |
+| `encryption-contexts` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `encryption-contexts` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `encryption-contexts` | response | A JSON object or list containing only the documented sys_id, name, type, sys_updated_on members consumed by verdicts. | yes |
+| `crypto-modules` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `crypto-modules` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `crypto-modules` | response | A JSON object or list containing only the documented sys_id, name, module_name, state, sys_scope, sys_updated_on members consumed by verdicts. | yes |
+| `encrypted-fields` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `encrypted-fields` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `encrypted-fields` | response | A JSON object or list containing only the documented sys_id, name, element, internal_type members consumed by verdicts. | yes |
+| `audit-dictionary` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `audit-dictionary` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `audit-dictionary` | response | A JSON object or list containing only the documented sys_id, name, audit, attributes members consumed by verdicts. | yes |
+| `recent-audit-count` | client | Use the configured ServiceNow Aggregate API origin; never follow a server link to a different origin. | yes |
+| `recent-audit-count` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `recent-audit-count` | response | A JSON object or list containing only the documented result.stats.count members consumed by verdicts. | yes |
+| `recent-transaction-count` | client | Use the configured ServiceNow Aggregate API origin; never follow a server link to a different origin. | yes |
+| `recent-transaction-count` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `recent-transaction-count` | response | A JSON object or list containing only the documented result.stats.count members consumed by verdicts. | yes |
+| `update-sets` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `update-sets` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `update-sets` | response | A JSON object or list containing only the documented sys_id, name, state, application, sys_created_by, sys_updated_on members consumed by verdicts. | yes |
+| `update-set-count` | client | Use the configured ServiceNow Aggregate API origin; never follow a server link to a different origin. | yes |
+| `update-set-count` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `update-set-count` | response | A JSON object or list containing only the documented result.stats.count members consumed by verdicts. | yes |
+| `sensitive-update-xml` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `sensitive-update-xml` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `sensitive-update-xml` | response | A JSON object or list containing only the documented sys_id, name, type, target_name, action, update_set, update_set.name, sys_updated_on members consumed by verdicts. | yes |
+| `mid-servers` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `mid-servers` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `mid-servers` | response | A JSON object or list containing only the documented sys_id, name, status, validated, version, host_name, sys_updated_on members consumed by verdicts. | yes |
+| `mid-properties` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `mid-properties` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `mid-properties` | response | A JSON object or list containing only the documented sys_id, name, value, description, sys_updated_on members consumed by verdicts. | yes |
+| `plugins` | client | Use the configured ServiceNow Table API origin; never follow a server link to a different origin. | yes |
+| `plugins` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `plugins` | response | A JSON object or list containing only the documented sys_id, name, source, active, state, version, sys_updated_on members consumed by verdicts. | yes |
 
 ## Pagination
 
 | Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
 |---|---|---|---|---|---|---|
-| `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `sysparm_offset`, `sysparm_limit`, `X-Total-Count`, `Link rel=next` | 500 | 10000 | none | X-Total-Count or Aggregate count is authoritative; absent or mismatched totals prevent proven exhaustion. | Seen count reaches authoritative total; Short page with authoritative completion; Configured item cap; Empty page before total; Repeated offset; Missing total; Rejected next link |
+| `users`, `privileged-assignments`, `role-inheritance`, `identity-properties`, `password-policies`, `sso-providers`, `ldap-servers`, `certificates`, `oauth-entities`, `mfa-criteria`, `hardening-properties`, `debug-properties`, `eval-scripts`, `ip-access`, `ip-authenticator-plugin`, `email-accounts`, `acls`, `acl-roles`, `public-pages`, `encryption-contexts`, `crypto-modules`, `encrypted-fields`, `audit-dictionary`, `update-sets`, `sensitive-update-xml`, `mid-servers`, `mid-properties`, `plugins` | `sysparm_offset`, `sysparm_limit`, `X-Total-Count`, `Link rel=next` | 500 | 10000 | none | X-Total-Count or Aggregate count is authoritative; absent or mismatched totals prevent proven exhaustion. | Seen count reaches authoritative total; Short page with authoritative completion; Configured item cap; Empty page before total; Repeated offset; Missing total; Rejected next link |
 
 ## Rate limits
 
@@ -286,26 +399,26 @@ These notes explain intent only. The ordered rule table is normative.
 
 | Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
 |---|---|---|---|---|---|---|---|---|
-| `SNOW-01` | high | `servicenow_assess_platform_hardening` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Instance security properties returns pass from complete, readable evidence. | The portable derivation for Instance security properties returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Instance security properties returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Instance security properties is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-02` | high | `servicenow_assess_access_control` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for ACL rule completeness returns pass from complete, readable evidence. | The portable derivation for ACL rule completeness returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for ACL rule completeness returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for ACL rule completeness is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-03` | high | `servicenow_assess_identity_access` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Role hierarchy audit returns pass from complete, readable evidence. | The portable derivation for Role hierarchy audit returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Role hierarchy audit returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Role hierarchy audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-04` | high | `servicenow_assess_identity_access` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for User access review returns pass from complete, readable evidence. | The portable derivation for User access review returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for User access review returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for User access review is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-05` | medium | `servicenow_assess_platform_hardening` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Session timeout configuration returns pass from complete, readable evidence. | The portable derivation for Session timeout configuration returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Session timeout configuration returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Session timeout configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-06` | high | `servicenow_assess_identity_access` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Password policy enforcement returns pass from complete, readable evidence. | The portable derivation for Password policy enforcement returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Password policy enforcement returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Password policy enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-07` | critical | `servicenow_assess_identity_access` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for MFA enforcement returns pass from complete, readable evidence. | The portable derivation for MFA enforcement returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for MFA enforcement returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for MFA enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-08` | high | `servicenow_assess_identity_access` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for LDAP and SSO integration returns pass from complete, readable evidence. | The portable derivation for LDAP and SSO integration returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for LDAP and SSO integration returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for LDAP and SSO integration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-09` | medium | `servicenow_assess_operations_governance` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Encryption at rest returns pass from complete, readable evidence. | The portable derivation for Encryption at rest returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Encryption at rest returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Encryption at rest is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-10` | high | `servicenow_assess_operations_governance` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Audit logging configuration returns pass from complete, readable evidence. | The portable derivation for Audit logging configuration returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Audit logging configuration returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Audit logging configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-11` | high | `servicenow_assess_access_control` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Table-level access controls returns pass from complete, readable evidence. | The portable derivation for Table-level access controls returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Table-level access controls returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Table-level access controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-12` | high | `servicenow_assess_platform_hardening` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Script execution restrictions returns pass from complete, readable evidence. | The portable derivation for Script execution restrictions returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Script execution restrictions returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Script execution restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-13` | high | `servicenow_assess_platform_hardening` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Instance hardening returns pass from complete, readable evidence. | The portable derivation for Instance hardening returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Instance hardening returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Instance hardening is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-14` | high | `servicenow_assess_identity_access` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Integration user permissions returns pass from complete, readable evidence. | The portable derivation for Integration user permissions returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Integration user permissions returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Integration user permissions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-15` | medium | `servicenow_assess_operations_governance` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Update set management returns pass from complete, readable evidence. | The portable derivation for Update set management returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Update set management returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Update set management is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-16` | medium | `servicenow_assess_platform_hardening` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Debug mode verification returns pass from complete, readable evidence. | The portable derivation for Debug mode verification returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Debug mode verification returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Debug mode verification is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-17` | medium | `servicenow_assess_platform_hardening` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for IP access restrictions returns pass from complete, readable evidence. | The portable derivation for IP access restrictions returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for IP access restrictions returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for IP access restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-18` | medium | `servicenow_assess_platform_hardening` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Email security returns pass from complete, readable evidence. | The portable derivation for Email security returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Email security returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Email security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-19` | medium | `servicenow_assess_operations_governance` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for MID Server security returns pass from complete, readable evidence. | The portable derivation for MID Server security returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for MID Server security returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for MID Server security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SNOW-20` | medium | `servicenow_assess_operations_governance` | `table-api`, `aggregate-api`, `system-properties`, `access-controls`, `audit` | `decision_status` | The portable derivation for Plugin inventory and licensing returns pass from complete, readable evidence. | The portable derivation for Plugin inventory and licensing returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Plugin inventory and licensing returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Plugin inventory and licensing is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-01` | high | `servicenow_assess_platform_hardening` | `hardening-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete security-property set enables the documented secure defaults, fail when any required property is explicitly insecure, and warn when optional hardening is absent or evidence is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete security-property set enables the documented secure defaults, fail when any required property is explicitly insecure, and warn when optional hardening is absent or evidence is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete security-property set enables the documented secure defaults, fail when any required property is explicitly insecure, and warn when optional hardening is absent or evidence is partial. | The required evidence for Instance security properties is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-02` | high | `servicenow_assess_access_control` | `acls`, `acl-roles`, `acl-count`, `public-pages` | `sys_id`, `name`, `operation`, `type`, `active`, `admin_overrides`, `condition-present`, `script-present`, `sys_updated_on`, `sys_security_acl`, `sys_user_role`, `sys_user_role.name`, `result.stats.count`, `page`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any active ACL lacks both a role and a condition or script, warn when questionable ACLs remain or ACL and role joins are partial, and pass when every active ACL has an explicit restriction. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any active ACL lacks both a role and a condition or script, warn when questionable ACLs remain or ACL and role joins are partial, and pass when every active ACL has an explicit restriction. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any active ACL lacks both a role and a condition or script, warn when questionable ACLs remain or ACL and role joins are partial, and pass when every active ACL has an explicit restriction. | The required evidence for ACL rule completeness is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-03` | high | `servicenow_assess_identity_access` | `role-inheritance`, `role-inheritance-count` | `sys_id`, `role`, `role.name`, `contains`, `contains.name`, `result.stats.count`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when administrator-equivalent roles exceed the configured population threshold, warn for broad inheritance, stale assignments, or partial role data, and pass when complete role and assignment evidence stays within the threshold. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when administrator-equivalent roles exceed the configured population threshold, warn for broad inheritance, stale assignments, or partial role data, and pass when complete role and assignment evidence stays within the threshold. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when administrator-equivalent roles exceed the configured population threshold, warn for broad inheritance, stale assignments, or partial role data, and pass when complete role and assignment evidence stays within the threshold. | The required evidence for Role hierarchy audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-04` | high | `servicenow_assess_identity_access` | `users`, `privileged-assignments` | `sys_id`, `user_name`, `active`, `last_login_time`, `web_service_access_only`, `internal_integration_user`, `enable_multifactor_authn`, `sys_updated_on`, `user`, `user.user_name`, `user.active`, `user.web_service_access_only`, `user.internal_integration_user`, `role`, `role.name`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when active privileged users exceed the configured maximum or include stale accounts beyond the configured age, warn for undated users or partial evidence, and pass when the complete population is bounded and recent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when active privileged users exceed the configured maximum or include stale accounts beyond the configured age, warn for undated users or partial evidence, and pass when the complete population is bounded and recent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when active privileged users exceed the configured maximum or include stale accounts beyond the configured age, warn for undated users or partial evidence, and pass when the complete population is bounded and recent. | The required evidence for User access review is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-05` | medium | `servicenow_assess_platform_hardening` | `hardening-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable. | The required evidence for Session timeout configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-06` | high | `servicenow_assess_identity_access` | `identity-properties`, `password-policies` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `active`, `minimum_password_length`, `maximum_password_length`, `strength`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent. | The required evidence for Password policy enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-07` | critical | `servicenow_assess_identity_access` | `identity-properties`, `users`, `privileged-assignments`, `mfa-criteria` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `user_name`, `active`, `last_login_time`, `web_service_access_only`, `internal_integration_user`, `enable_multifactor_authn`, `user`, `user.user_name`, `user.active`, `user.web_service_access_only`, `user.internal_integration_user`, `role`, `role.name`, `order`, `roles`, `multi_factor_roles`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable. | The required evidence for MFA enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-08` | high | `servicenow_assess_identity_access` | `sso-providers`, `ldap-servers`, `identity-properties`, `certificates` | `sys_id`, `name`, `active`, `default`, `auto_redirect_idp`, `sys_updated_on`, `value`, `description`, `valid_from`, `expires`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read. | The required evidence for LDAP and SSO integration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-09` | medium | `servicenow_assess_operations_governance` | `encryption-contexts`, `crypto-modules`, `encrypted-fields` | `sys_id`, `name`, `type`, `sys_updated_on`, `module_name`, `state`, `sys_scope`, `element`, `internal_type`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable. | The required evidence for Encryption at rest is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-10` | high | `servicenow_assess_operations_governance` | `audit-dictionary`, `recent-audit-count`, `recent-transaction-count` | `sys_id`, `name`, `audit`, `attributes`, `result.stats.count`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable. | The required evidence for Audit logging configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-11` | high | `servicenow_assess_access_control` | `acls`, `acl-roles`, `acl-count` | `sys_id`, `name`, `operation`, `type`, `active`, `admin_overrides`, `condition-present`, `script-present`, `sys_updated_on`, `sys_security_acl`, `sys_user_role`, `sys_user_role.name`, `result.stats.count`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected. | The required evidence for Table-level access controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-12` | high | `servicenow_assess_platform_hardening` | `hardening-properties`, `eval-scripts` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `collection`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent. | The required evidence for Script execution restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-13` | high | `servicenow_assess_platform_hardening` | `hardening-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial. | The required evidence for Instance hardening is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-14` | high | `servicenow_assess_identity_access` | `users`, `privileged-assignments`, `oauth-entities` | `sys_id`, `user_name`, `active`, `last_login_time`, `web_service_access_only`, `internal_integration_user`, `enable_multifactor_authn`, `sys_updated_on`, `user`, `user.user_name`, `user.active`, `user.web_service_access_only`, `user.internal_integration_user`, `role`, `role.name`, `name`, `type`, `client_id`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities. | The required evidence for Integration user permissions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-15` | medium | `servicenow_assess_operations_governance` | `update-sets`, `update-set-count`, `sensitive-update-xml` | `sys_id`, `name`, `state`, `application`, `sys_created_by`, `sys_updated_on`, `result.stats.count`, `type`, `target_name`, `action`, `update_set`, `update_set.name`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable. | The required evidence for Update set management is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-16` | medium | `servicenow_assess_platform_hardening` | `hardening-properties`, `debug-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable. | The required evidence for Debug mode verification is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-17` | medium | `servicenow_assess_platform_hardening` | `hardening-properties`, `ip-access`, `ip-authenticator-plugin` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `type`, `direction`, `active`, `range_start`, `range_end`, `source`, `state`, `version`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable. | The required evidence for IP access restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-18` | medium | `servicenow_assess_platform_hardening` | `hardening-properties`, `email-accounts` | `sys_id`, `name`, `value`, `description`, `sys_updated_on`, `type`, `active`, `connection_security`, `enable_ssl`, `enable_tls`, `authentication`, `server`, `port`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent. | The required evidence for Email security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-19` | medium | `servicenow_assess_operations_governance` | `mid-servers`, `mid-properties` | `sys_id`, `name`, `status`, `validated`, `version`, `host_name`, `sys_updated_on`, `value`, `description`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable. | The required evidence for MID Server security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SNOW-20` | medium | `servicenow_assess_operations_governance` | `plugins` | `sys_id`, `name`, `source`, `active`, `state`, `version`, `sys_updated_on`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API. | The required evidence for Plugin inventory and licensing is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
 ### Ordered decision rules
 
@@ -313,196 +426,252 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 
 | Finding | Order | Outcome | First-match condition | Explanatory note |
 |---|---|---|---|---|
-| `SNOW-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-09` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-09` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-09` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-09` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-10` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-10` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-10` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-10` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-11` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-11` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-11` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-11` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-12` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-12` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-12` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-12` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-13` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-13` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-13` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-13` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-14` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-14` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-14` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-14` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-15` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-15` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-15` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-15` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-16` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-16` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-16` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-16` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-17` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-17` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-17` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-17` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-18` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-18` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-18` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-18` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-19` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-19` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-19` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-19` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `SNOW-20` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `SNOW-20` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `SNOW-20` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `SNOW-20` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SNOW-01` | 1 | fail | `snow_01_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-01` | 2 | manual | any of (`snow_01_required_evidence_readable` equals false; not (`snow_01_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-01` | 3 | warn | any of (`snow_01_warning_matches` equals true; `snow_01_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-01` | 4 | pass | all of (`snow_01_compliant_matches` equals true; `snow_01_required_evidence_readable` equals true; `snow_01_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-01` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-02` | 1 | fail | `snow_02_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-02` | 2 | manual | any of (`snow_02_required_evidence_readable` equals false; not (`snow_02_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-02` | 3 | warn | any of (`snow_02_warning_matches` equals true; `snow_02_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-02` | 4 | pass | all of (`snow_02_compliant_matches` equals true; `snow_02_required_evidence_readable` equals true; `snow_02_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-02` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-03` | 1 | fail | `snow_03_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-03` | 2 | manual | any of (`snow_03_required_evidence_readable` equals false; not (`snow_03_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-03` | 3 | warn | any of (`snow_03_warning_matches` equals true; `snow_03_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-03` | 4 | pass | all of (`snow_03_compliant_matches` equals true; `snow_03_required_evidence_readable` equals true; `snow_03_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-03` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-04` | 1 | fail | `snow_04_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-04` | 2 | manual | any of (`snow_04_required_evidence_readable` equals false; not (`snow_04_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-04` | 3 | warn | any of (`snow_04_warning_matches` equals true; `snow_04_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-04` | 4 | pass | all of (`snow_04_compliant_matches` equals true; `snow_04_required_evidence_readable` equals true; `snow_04_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-04` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-05` | 1 | fail | `snow_05_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-05` | 2 | manual | any of (`snow_05_required_evidence_readable` equals false; not (`snow_05_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-05` | 3 | warn | any of (`snow_05_warning_matches` equals true; `snow_05_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-05` | 4 | pass | all of (`snow_05_compliant_matches` equals true; `snow_05_required_evidence_readable` equals true; `snow_05_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-05` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-06` | 1 | fail | `snow_06_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-06` | 2 | manual | any of (`snow_06_required_evidence_readable` equals false; not (`snow_06_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-06` | 3 | warn | any of (`snow_06_warning_matches` equals true; `snow_06_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-06` | 4 | pass | all of (`snow_06_compliant_matches` equals true; `snow_06_required_evidence_readable` equals true; `snow_06_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-06` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-07` | 1 | fail | `snow_07_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-07` | 2 | manual | any of (`snow_07_required_evidence_readable` equals false; not (`snow_07_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-07` | 3 | warn | any of (`snow_07_warning_matches` equals true; `snow_07_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-07` | 4 | pass | all of (`snow_07_compliant_matches` equals true; `snow_07_required_evidence_readable` equals true; `snow_07_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-07` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-08` | 1 | manual | any of (`snow_08_required_evidence_readable` equals false; not (`snow_08_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-08` | 2 | warn | any of (`snow_08_warning_matches` equals true; `snow_08_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-08` | 3 | pass | all of (`snow_08_compliant_matches` equals true; `snow_08_required_evidence_readable` equals true; `snow_08_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-08` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-09` | 1 | fail | `snow_09_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-09` | 2 | manual | any of (`snow_09_required_evidence_readable` equals false; not (`snow_09_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-09` | 3 | warn | any of (`snow_09_warning_matches` equals true; `snow_09_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-09` | 4 | pass | all of (`snow_09_compliant_matches` equals true; `snow_09_required_evidence_readable` equals true; `snow_09_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-09` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-10` | 1 | fail | `snow_10_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-10` | 2 | manual | any of (`snow_10_required_evidence_readable` equals false; not (`snow_10_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-10` | 3 | warn | any of (`snow_10_warning_matches` equals true; `snow_10_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-10` | 4 | pass | all of (`snow_10_compliant_matches` equals true; `snow_10_required_evidence_readable` equals true; `snow_10_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-10` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-11` | 1 | fail | `snow_11_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-11` | 2 | manual | any of (`snow_11_required_evidence_readable` equals false; not (`snow_11_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-11` | 3 | warn | any of (`snow_11_warning_matches` equals true; `snow_11_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-11` | 4 | pass | all of (`snow_11_compliant_matches` equals true; `snow_11_required_evidence_readable` equals true; `snow_11_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-11` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-12` | 1 | fail | `snow_12_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-12` | 2 | manual | any of (`snow_12_required_evidence_readable` equals false; not (`snow_12_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-12` | 3 | warn | any of (`snow_12_warning_matches` equals true; `snow_12_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-12` | 4 | pass | all of (`snow_12_compliant_matches` equals true; `snow_12_required_evidence_readable` equals true; `snow_12_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-12` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-13` | 1 | fail | `snow_13_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-13` | 2 | manual | any of (`snow_13_required_evidence_readable` equals false; not (`snow_13_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-13` | 3 | warn | any of (`snow_13_warning_matches` equals true; `snow_13_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-13` | 4 | pass | all of (`snow_13_compliant_matches` equals true; `snow_13_required_evidence_readable` equals true; `snow_13_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-13` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-14` | 1 | fail | `snow_14_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-14` | 2 | manual | any of (`snow_14_required_evidence_readable` equals false; not (`snow_14_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-14` | 3 | warn | any of (`snow_14_warning_matches` equals true; `snow_14_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-14` | 4 | pass | all of (`snow_14_compliant_matches` equals true; `snow_14_required_evidence_readable` equals true; `snow_14_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-14` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-15` | 1 | manual | any of (`snow_15_required_evidence_readable` equals false; not (`snow_15_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-15` | 2 | warn | any of (`snow_15_warning_matches` equals true; `snow_15_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-15` | 3 | pass | all of (`snow_15_compliant_matches` equals true; `snow_15_required_evidence_readable` equals true; `snow_15_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-15` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-16` | 1 | fail | `snow_16_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-16` | 2 | manual | any of (`snow_16_required_evidence_readable` equals false; not (`snow_16_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-16` | 3 | pass | all of (`snow_16_compliant_matches` equals true; `snow_16_required_evidence_readable` equals true; `snow_16_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-16` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-17` | 1 | fail | `snow_17_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-17` | 2 | manual | any of (`snow_17_required_evidence_readable` equals false; not (`snow_17_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-17` | 3 | warn | any of (`snow_17_warning_matches` equals true; `snow_17_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-17` | 4 | pass | all of (`snow_17_compliant_matches` equals true; `snow_17_required_evidence_readable` equals true; `snow_17_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-17` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-18` | 1 | fail | `snow_18_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-18` | 2 | manual | any of (`snow_18_required_evidence_readable` equals false; not (`snow_18_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-18` | 3 | warn | any of (`snow_18_warning_matches` equals true; `snow_18_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-18` | 4 | pass | all of (`snow_18_compliant_matches` equals true; `snow_18_required_evidence_readable` equals true; `snow_18_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-18` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-19` | 1 | fail | `snow_19_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `SNOW-19` | 2 | manual | any of (`snow_19_required_evidence_readable` equals false; not (`snow_19_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-19` | 3 | warn | any of (`snow_19_warning_matches` equals true; `snow_19_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-19` | 4 | pass | all of (`snow_19_compliant_matches` equals true; `snow_19_required_evidence_readable` equals true; `snow_19_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-19` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `SNOW-20` | 1 | manual | any of (`snow_20_required_evidence_readable` equals false; not (`snow_20_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `SNOW-20` | 2 | warn | any of (`snow_20_warning_matches` equals true; `snow_20_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `SNOW-20` | 3 | pass | all of (`snow_20_compliant_matches` equals true; `snow_20_required_evidence_readable` equals true; `snow_20_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `SNOW-20` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
 
 ### Derived decision facts
 
 | Finding | Input | Portable derivation |
 |---|---|---|
-| `SNOW-01` | `decision_status` | Using complete source cardinalities, return pass when the complete security-property set enables the documented secure defaults, fail when any required property is explicitly insecure, and warn when optional hardening is absent or evidence is partial. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-02` | `decision_status` | Using complete source cardinalities, return fail when any active ACL lacks both a role and a condition or script, warn when questionable ACLs remain or ACL and role joins are partial, and pass when every active ACL has an explicit restriction. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-03` | `decision_status` | Using complete source cardinalities, return fail when administrator-equivalent roles exceed the configured population threshold, warn for broad inheritance, stale assignments, or partial role data, and pass when complete role and assignment evidence stays within the threshold. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-04` | `decision_status` | Using complete source cardinalities, return fail when active privileged users exceed the configured maximum or include stale accounts beyond the configured age, warn for undated users or partial evidence, and pass when the complete population is bounded and recent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-05` | `decision_status` | Using complete source cardinalities, return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-06` | `decision_status` | Using complete source cardinalities, return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-07` | `decision_status` | Using complete source cardinalities, return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-08` | `decision_status` | Using complete source cardinalities, return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-09` | `decision_status` | Using complete source cardinalities, return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-10` | `decision_status` | Using complete source cardinalities, return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-11` | `decision_status` | Using complete source cardinalities, return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-12` | `decision_status` | Using complete source cardinalities, return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-13` | `decision_status` | Using complete source cardinalities, return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-14` | `decision_status` | Using complete source cardinalities, return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-15` | `decision_status` | Using complete source cardinalities, return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-16` | `decision_status` | Using complete source cardinalities, return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-17` | `decision_status` | Using complete source cardinalities, return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-18` | `decision_status` | Using complete source cardinalities, return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-19` | `decision_status` | Using complete source cardinalities, return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `SNOW-20` | `decision_status` | Using complete source cardinalities, return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
+| `SNOW-01` | `snow_01_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-01 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-01` | `snow_01_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-01` | `snow_01_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the complete security-property set enables the documented secure defaults, fail when any required property is explicitly insecure, and warn when optional hardening is absent or evidence is partial. |
+| `SNOW-01` | `snow_01_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the complete security-property set enables the documented secure defaults, fail when any required property is explicitly insecure, and warn when optional hardening is absent or evidence is partial. |
+| `SNOW-01` | `snow_01_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the complete security-property set enables the documented secure defaults, fail when any required property is explicitly insecure, and warn when optional hardening is absent or evidence is partial. |
+| `SNOW-02` | `snow_02_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-02 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-02` | `snow_02_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-02` | `snow_02_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when any active ACL lacks both a role and a condition or script, warn when questionable ACLs remain or ACL and role joins are partial, and pass when every active ACL has an explicit restriction. |
+| `SNOW-02` | `snow_02_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when any active ACL lacks both a role and a condition or script, warn when questionable ACLs remain or ACL and role joins are partial, and pass when every active ACL has an explicit restriction. |
+| `SNOW-02` | `snow_02_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when any active ACL lacks both a role and a condition or script, warn when questionable ACLs remain or ACL and role joins are partial, and pass when every active ACL has an explicit restriction. |
+| `SNOW-03` | `snow_03_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-03 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-03` | `snow_03_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-03` | `snow_03_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when administrator-equivalent roles exceed the configured population threshold, warn for broad inheritance, stale assignments, or partial role data, and pass when complete role and assignment evidence stays within the threshold. |
+| `SNOW-03` | `snow_03_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when administrator-equivalent roles exceed the configured population threshold, warn for broad inheritance, stale assignments, or partial role data, and pass when complete role and assignment evidence stays within the threshold. |
+| `SNOW-03` | `snow_03_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when administrator-equivalent roles exceed the configured population threshold, warn for broad inheritance, stale assignments, or partial role data, and pass when complete role and assignment evidence stays within the threshold. |
+| `SNOW-04` | `snow_04_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-04 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-04` | `snow_04_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-04` | `snow_04_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when active privileged users exceed the configured maximum or include stale accounts beyond the configured age, warn for undated users or partial evidence, and pass when the complete population is bounded and recent. |
+| `SNOW-04` | `snow_04_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when active privileged users exceed the configured maximum or include stale accounts beyond the configured age, warn for undated users or partial evidence, and pass when the complete population is bounded and recent. |
+| `SNOW-04` | `snow_04_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when active privileged users exceed the configured maximum or include stale accounts beyond the configured age, warn for undated users or partial evidence, and pass when the complete population is bounded and recent. |
+| `SNOW-05` | `snow_05_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-05 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-05` | `snow_05_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-05` | `snow_05_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable. |
+| `SNOW-05` | `snow_05_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable. |
+| `SNOW-05` | `snow_05_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable. |
+| `SNOW-06` | `snow_06_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-06 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-06` | `snow_06_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-06` | `snow_06_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent. |
+| `SNOW-06` | `snow_06_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent. |
+| `SNOW-06` | `snow_06_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent. |
+| `SNOW-07` | `snow_07_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-07 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-07` | `snow_07_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-07` | `snow_07_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable. |
+| `SNOW-07` | `snow_07_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable. |
+| `SNOW-07` | `snow_07_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable. |
+| `SNOW-08` | `snow_08_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-08 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-08` | `snow_08_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-08` | `snow_08_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read. |
+| `SNOW-08` | `snow_08_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read. |
+| `SNOW-08` | `snow_08_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read. |
+| `SNOW-09` | `snow_09_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-09 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-09` | `snow_09_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-09` | `snow_09_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable. |
+| `SNOW-09` | `snow_09_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable. |
+| `SNOW-09` | `snow_09_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable. |
+| `SNOW-10` | `snow_10_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-10 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-10` | `snow_10_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-10` | `snow_10_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable. |
+| `SNOW-10` | `snow_10_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable. |
+| `SNOW-10` | `snow_10_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable. |
+| `SNOW-11` | `snow_11_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-11 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-11` | `snow_11_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-11` | `snow_11_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected. |
+| `SNOW-11` | `snow_11_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected. |
+| `SNOW-11` | `snow_11_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected. |
+| `SNOW-12` | `snow_12_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-12 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-12` | `snow_12_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-12` | `snow_12_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent. |
+| `SNOW-12` | `snow_12_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent. |
+| `SNOW-12` | `snow_12_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent. |
+| `SNOW-13` | `snow_13_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-13 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-13` | `snow_13_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-13` | `snow_13_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial. |
+| `SNOW-13` | `snow_13_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial. |
+| `SNOW-13` | `snow_13_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial. |
+| `SNOW-14` | `snow_14_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-14 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-14` | `snow_14_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-14` | `snow_14_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities. |
+| `SNOW-14` | `snow_14_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities. |
+| `SNOW-14` | `snow_14_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities. |
+| `SNOW-15` | `snow_15_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-15 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-15` | `snow_15_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-15` | `snow_15_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable. |
+| `SNOW-15` | `snow_15_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable. |
+| `SNOW-15` | `snow_15_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable. |
+| `SNOW-16` | `snow_16_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-16 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-16` | `snow_16_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-16` | `snow_16_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable. |
+| `SNOW-16` | `snow_16_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable. |
+| `SNOW-16` | `snow_16_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable. |
+| `SNOW-17` | `snow_17_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-17 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-17` | `snow_17_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-17` | `snow_17_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable. |
+| `SNOW-17` | `snow_17_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable. |
+| `SNOW-17` | `snow_17_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable. |
+| `SNOW-18` | `snow_18_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-18 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-18` | `snow_18_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-18` | `snow_18_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent. |
+| `SNOW-18` | `snow_18_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent. |
+| `SNOW-18` | `snow_18_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent. |
+| `SNOW-19` | `snow_19_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-19 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-19` | `snow_19_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-19` | `snow_19_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable. |
+| `SNOW-19` | `snow_19_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable. |
+| `SNOW-19` | `snow_19_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable. |
+| `SNOW-20` | `snow_20_required_evidence_readable` | From the declared source surfaces, set true only when every value required by SNOW-20 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `SNOW-20` | `snow_20_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `SNOW-20` | `snow_20_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API. |
+| `SNOW-20` | `snow_20_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API. |
+| `SNOW-20` | `snow_20_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API. |
 
 ### Criterion constants
 
 | Finding | Name | Value |
 |---|---|---|
-| `SNOW-01` | `passStatus` | pass |
-| `SNOW-01` | `warnStatus` | warn |
-| `SNOW-01` | `failStatus` | fail |
-| `SNOW-01` | `manualStatus` | manual |
-| `SNOW-02` | `passStatus` | pass |
-| `SNOW-02` | `warnStatus` | warn |
-| `SNOW-02` | `failStatus` | fail |
-| `SNOW-02` | `manualStatus` | manual |
-| `SNOW-03` | `passStatus` | pass |
-| `SNOW-03` | `warnStatus` | warn |
-| `SNOW-03` | `failStatus` | fail |
-| `SNOW-03` | `manualStatus` | manual |
-| `SNOW-04` | `passStatus` | pass |
-| `SNOW-04` | `warnStatus` | warn |
-| `SNOW-04` | `failStatus` | fail |
-| `SNOW-04` | `manualStatus` | manual |
-| `SNOW-05` | `passStatus` | pass |
-| `SNOW-05` | `warnStatus` | warn |
-| `SNOW-05` | `failStatus` | fail |
-| `SNOW-05` | `manualStatus` | manual |
-| `SNOW-06` | `passStatus` | pass |
-| `SNOW-06` | `warnStatus` | warn |
-| `SNOW-06` | `failStatus` | fail |
-| `SNOW-06` | `manualStatus` | manual |
-| `SNOW-07` | `passStatus` | pass |
-| `SNOW-07` | `warnStatus` | warn |
-| `SNOW-07` | `failStatus` | fail |
-| `SNOW-07` | `manualStatus` | manual |
-| `SNOW-08` | `passStatus` | pass |
-| `SNOW-08` | `warnStatus` | warn |
-| `SNOW-08` | `failStatus` | fail |
-| `SNOW-08` | `manualStatus` | manual |
-| `SNOW-09` | `passStatus` | pass |
-| `SNOW-09` | `warnStatus` | warn |
-| `SNOW-09` | `failStatus` | fail |
-| `SNOW-09` | `manualStatus` | manual |
-| `SNOW-10` | `passStatus` | pass |
-| `SNOW-10` | `warnStatus` | warn |
-| `SNOW-10` | `failStatus` | fail |
-| `SNOW-10` | `manualStatus` | manual |
-| `SNOW-11` | `passStatus` | pass |
-| `SNOW-11` | `warnStatus` | warn |
-| `SNOW-11` | `failStatus` | fail |
-| `SNOW-11` | `manualStatus` | manual |
-| `SNOW-12` | `passStatus` | pass |
-| `SNOW-12` | `warnStatus` | warn |
-| `SNOW-12` | `failStatus` | fail |
-| `SNOW-12` | `manualStatus` | manual |
-| `SNOW-13` | `passStatus` | pass |
-| `SNOW-13` | `warnStatus` | warn |
-| `SNOW-13` | `failStatus` | fail |
-| `SNOW-13` | `manualStatus` | manual |
-| `SNOW-14` | `passStatus` | pass |
-| `SNOW-14` | `warnStatus` | warn |
-| `SNOW-14` | `failStatus` | fail |
-| `SNOW-14` | `manualStatus` | manual |
-| `SNOW-15` | `passStatus` | pass |
-| `SNOW-15` | `warnStatus` | warn |
-| `SNOW-15` | `failStatus` | fail |
-| `SNOW-15` | `manualStatus` | manual |
-| `SNOW-16` | `passStatus` | pass |
-| `SNOW-16` | `warnStatus` | warn |
-| `SNOW-16` | `failStatus` | fail |
-| `SNOW-16` | `manualStatus` | manual |
-| `SNOW-17` | `passStatus` | pass |
-| `SNOW-17` | `warnStatus` | warn |
-| `SNOW-17` | `failStatus` | fail |
-| `SNOW-17` | `manualStatus` | manual |
-| `SNOW-18` | `passStatus` | pass |
-| `SNOW-18` | `warnStatus` | warn |
-| `SNOW-18` | `failStatus` | fail |
-| `SNOW-18` | `manualStatus` | manual |
-| `SNOW-19` | `passStatus` | pass |
-| `SNOW-19` | `warnStatus` | warn |
-| `SNOW-19` | `failStatus` | fail |
-| `SNOW-19` | `manualStatus` | manual |
-| `SNOW-20` | `passStatus` | pass |
-| `SNOW-20` | `warnStatus` | warn |
-| `SNOW-20` | `failStatus` | fail |
-| `SNOW-20` | `manualStatus` | manual |
+| `SNOW-01` | `requiredEvidenceReadable` | true |
+| `SNOW-01` | `requiredEvidenceComplete` | true |
+| `SNOW-02` | `requiredEvidenceReadable` | true |
+| `SNOW-02` | `requiredEvidenceComplete` | true |
+| `SNOW-03` | `requiredEvidenceReadable` | true |
+| `SNOW-03` | `requiredEvidenceComplete` | true |
+| `SNOW-04` | `requiredEvidenceReadable` | true |
+| `SNOW-04` | `requiredEvidenceComplete` | true |
+| `SNOW-05` | `requiredEvidenceReadable` | true |
+| `SNOW-05` | `requiredEvidenceComplete` | true |
+| `SNOW-06` | `requiredEvidenceReadable` | true |
+| `SNOW-06` | `requiredEvidenceComplete` | true |
+| `SNOW-07` | `requiredEvidenceReadable` | true |
+| `SNOW-07` | `requiredEvidenceComplete` | true |
+| `SNOW-08` | `requiredEvidenceReadable` | true |
+| `SNOW-08` | `requiredEvidenceComplete` | true |
+| `SNOW-09` | `requiredEvidenceReadable` | true |
+| `SNOW-09` | `requiredEvidenceComplete` | true |
+| `SNOW-10` | `requiredEvidenceReadable` | true |
+| `SNOW-10` | `requiredEvidenceComplete` | true |
+| `SNOW-11` | `requiredEvidenceReadable` | true |
+| `SNOW-11` | `requiredEvidenceComplete` | true |
+| `SNOW-12` | `requiredEvidenceReadable` | true |
+| `SNOW-12` | `requiredEvidenceComplete` | true |
+| `SNOW-13` | `requiredEvidenceReadable` | true |
+| `SNOW-13` | `requiredEvidenceComplete` | true |
+| `SNOW-14` | `requiredEvidenceReadable` | true |
+| `SNOW-14` | `requiredEvidenceComplete` | true |
+| `SNOW-15` | `requiredEvidenceReadable` | true |
+| `SNOW-15` | `requiredEvidenceComplete` | true |
+| `SNOW-16` | `requiredEvidenceReadable` | true |
+| `SNOW-16` | `requiredEvidenceComplete` | true |
+| `SNOW-17` | `requiredEvidenceReadable` | true |
+| `SNOW-17` | `requiredEvidenceComplete` | true |
+| `SNOW-18` | `requiredEvidenceReadable` | true |
+| `SNOW-18` | `requiredEvidenceComplete` | true |
+| `SNOW-19` | `requiredEvidenceReadable` | true |
+| `SNOW-19` | `requiredEvidenceComplete` | true |
+| `SNOW-20` | `requiredEvidenceReadable` | true |
+| `SNOW-20` | `requiredEvidenceComplete` | true |
 
 ### Illustrative criterion notes
 
@@ -595,26 +764,26 @@ Examples are explanatory, not normative. The ordered first-match conditions abov
 
 | # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | Instance security properties | - | - | - | - | - | - | - | - |
-| 2 | ACL rule completeness | - | - | - | - | - | - | - | - |
-| 3 | Role hierarchy audit | - | - | - | - | - | - | - | - |
-| 4 | User access review | - | - | - | - | - | - | - | - |
-| 5 | Session timeout configuration | - | - | - | - | - | - | - | - |
-| 6 | Password policy enforcement | - | - | - | - | - | - | - | - |
-| 7 | MFA enforcement | - | - | - | - | - | - | - | - |
-| 8 | LDAP and SSO integration | - | - | - | - | - | - | - | - |
-| 9 | Encryption at rest | - | - | - | - | - | - | - | - |
-| 10 | Audit logging configuration | - | - | - | - | - | - | - | - |
-| 11 | Table-level access controls | - | - | - | - | - | - | - | - |
-| 12 | Script execution restrictions | - | - | - | - | - | - | - | - |
-| 13 | Instance hardening | - | - | - | - | - | - | - | - |
-| 14 | Integration user permissions | - | - | - | - | - | - | - | - |
-| 15 | Update set management | - | - | - | - | - | - | - | - |
-| 16 | Debug mode verification | - | - | - | - | - | - | - | - |
-| 17 | IP access restrictions | - | - | - | - | - | - | - | - |
-| 18 | Email security | - | - | - | - | - | - | - | - |
-| 19 | MID Server security | - | - | - | - | - | - | - | - |
-| 20 | Plugin inventory and licensing | - | - | - | - | - | - | - | - |
+| 1 | Instance security properties | CM-6 | 3.4.2 | CC6.1 | 5.1 | 2.2.1 | SRG-APP-000384 | ISM-1624 | CPS.CM-6 |
+| 2 | ACL rule completeness | AC-3 | 3.1.2 | CC6.1 | n/a | 7.1.1 | SRG-APP-000033 | ISM-0405 | CPS.AC-3 |
+| 3 | Role hierarchy audit | AC-6(1) | 3.1.5 | CC6.3 | n/a | 7.1.1 | SRG-APP-000340 | ISM-1507 | CPS.AC-6 |
+| 4 | User access review | AC-2(3) | 3.1.12 | CC6.2 | 5.3 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
+| 5 | Session timeout configuration | AC-12 | 3.1.10 | CC6.1 | 16.4 | 8.2.8 | SRG-APP-000295 | ISM-1164 | CPS.AC-7 |
+| 6 | Password policy enforcement | IA-5(1) | 3.5.7 | CC6.1 | 5.2 | 8.3.6 | SRG-APP-000164 | ISM-0421 | CPS.IA-5 |
+| 7 | MFA enforcement | IA-2(1) | 3.5.3 | CC6.1 | 6.3 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.AT-2 |
+| 8 | LDAP and SSO integration | IA-2(12) | 3.5.3 | CC6.1 | 16.2 | 8.4.1 | SRG-APP-000395 | ISM-1546 | CPS.IA-2 |
+| 9 | Encryption at rest | SC-28 | 3.13.16 | CC6.1 | n/a | 3.4.1 | SRG-APP-000429 | ISM-0457 | CPS.SC-28 |
+| 10 | Audit logging configuration | AU-3 | 3.3.1 | CC7.2 | 8.5 | 10.2.1 | SRG-APP-000095 | ISM-0580 | CPS.AU-3 |
+| 11 | Table-level access controls | AC-3(7) | 3.1.2 | CC6.1 | n/a | 7.1.2 | SRG-APP-000033 | ISM-0405 | CPS.AC-3 |
+| 12 | Script execution restrictions | CM-7(2) | 3.4.8 | CC6.8 | n/a | 6.2.4 | SRG-APP-000141 | ISM-1624 | CPS.CM-7 |
+| 13 | Instance hardening | CM-6(1) | 3.4.2 | CC6.1 | n/a | 2.2.1 | SRG-APP-000384 | ISM-1624 | CPS.CM-6 |
+| 14 | Integration user permissions | AC-6(10) | 3.1.7 | CC6.3 | n/a | 7.1.2 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
+| 15 | Update set management | CM-3 | 3.4.3 | CC8.1 | n/a | 6.5.1 | SRG-APP-000380 | ISM-1624 | CPS.CM-3 |
+| 16 | Debug mode verification | CM-7 | 3.4.7 | CC6.1 | n/a | 2.2.1 | SRG-APP-000141 | ISM-1624 | CPS.CM-7 |
+| 17 | IP access restrictions | AC-17(1) | 3.1.12 | CC6.6 | n/a | 1.3.1 | SRG-APP-000142 | ISM-1528 | CPS.AC-17 |
+| 18 | Email security | SC-8 | 3.13.8 | CC6.7 | n/a | 4.1.1 | SRG-APP-000411 | ISM-0572 | CPS.SC-8 |
+| 19 | MID Server security | SC-7(7) | 3.13.6 | CC6.6 | n/a | 1.3.2 | SRG-APP-000001 | ISM-1528 | CPS.SC-7 |
+| 20 | Plugin inventory and licensing | CM-7(4) | 3.4.8 | CC6.8 | n/a | 2.2.1 | SRG-APP-000386 | ISM-1624 | CPS.CM-7 |
 
 ## Collection states
 
@@ -649,18 +818,86 @@ Projected fields by surface:
 
 | Surface | Allowed fields |
 |---|---|
-| `table-api` | `result`, `sys_id`, `sys_updated_on`, `active`, `name`, `value` |
-| `aggregate-api` | `result.stats.count` |
-| `system-properties` | `name`, `value`, `description`, `sys_updated_on` |
-| `access-controls` | `sys_id`, `name`, `operation`, `active`, `admin_overrides`, `requires_role`, `script` |
-| `audit` | `documentkey`, `tablename`, `fieldname`, `oldvalue`, `newvalue`, `sys_created_on` |
+| `users` | `sys_id`, `user_name`, `active`, `last_login_time`, `web_service_access_only`, `internal_integration_user`, `enable_multifactor_authn`, `sys_updated_on` |
+| `privileged-assignments` | `sys_id`, `user`, `user.user_name`, `user.active`, `user.web_service_access_only`, `user.internal_integration_user`, `role`, `role.name` |
+| `role-inheritance` | `sys_id`, `role`, `role.name`, `contains`, `contains.name` |
+| `role-inheritance-count` | `result.stats.count` |
+| `identity-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on` |
+| `password-policies` | `sys_id`, `name`, `active`, `minimum_password_length`, `maximum_password_length`, `strength`, `sys_updated_on` |
+| `sso-providers` | `sys_id`, `name`, `active`, `default`, `auto_redirect_idp`, `sys_updated_on` |
+| `ldap-servers` | `sys_id`, `name`, `active`, `sys_updated_on` |
+| `certificates` | `sys_id`, `name`, `active`, `valid_from`, `expires`, `sys_updated_on` |
+| `oauth-entities` | `sys_id`, `name`, `type`, `active`, `client_id`, `sys_updated_on` |
+| `mfa-criteria` | `sys_id`, `name`, `active`, `order`, `roles`, `multi_factor_roles`, `sys_updated_on` |
+| `hardening-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on` |
+| `debug-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on` |
+| `eval-scripts` | `sys_id`, `name`, `collection`, `sys_updated_on` |
+| `ip-access` | `sys_id`, `type`, `direction`, `active`, `range_start`, `range_end`, `description`, `sys_updated_on` |
+| `ip-authenticator-plugin` | `sys_id`, `name`, `source`, `active`, `state`, `version`, `sys_updated_on` |
+| `email-accounts` | `sys_id`, `name`, `type`, `active`, `connection_security`, `enable_ssl`, `enable_tls`, `authentication`, `server`, `port`, `sys_updated_on` |
+| `acls` | `sys_id`, `name`, `operation`, `type`, `active`, `admin_overrides`, `condition-present`, `script-present`, `sys_updated_on` |
+| `acl-roles` | `sys_id`, `sys_security_acl`, `sys_user_role`, `sys_user_role.name` |
+| `acl-count` | `result.stats.count` |
+| `public-pages` | `sys_id`, `page`, `active`, `sys_updated_on` |
+| `encryption-contexts` | `sys_id`, `name`, `type`, `sys_updated_on` |
+| `crypto-modules` | `sys_id`, `name`, `module_name`, `state`, `sys_scope`, `sys_updated_on` |
+| `encrypted-fields` | `sys_id`, `name`, `element`, `internal_type` |
+| `audit-dictionary` | `sys_id`, `name`, `audit`, `attributes` |
+| `recent-audit-count` | `result.stats.count` |
+| `recent-transaction-count` | `result.stats.count` |
+| `update-sets` | `sys_id`, `name`, `state`, `application`, `sys_created_by`, `sys_updated_on` |
+| `update-set-count` | `result.stats.count` |
+| `sensitive-update-xml` | `sys_id`, `name`, `type`, `target_name`, `action`, `update_set`, `update_set.name`, `sys_updated_on` |
+| `mid-servers` | `sys_id`, `name`, `status`, `validated`, `version`, `host_name`, `sys_updated_on` |
+| `mid-properties` | `sys_id`, `name`, `value`, `description`, `sys_updated_on` |
+| `plugins` | `sys_id`, `name`, `source`, `active`, `state`, `version`, `sys_updated_on` |
 
 ## Export layout
 
 Required paths:
 
-- `core_data/access.json`
+- `metadata.json`
+- `QUICK_REFERENCE.md`
+- `core_data/access_check.json`
+- `core_data/sys_user.json`
+- `core_data/sys_user_has_role_privileged.json`
+- `core_data/sys_user_role_contains.json`
+- `core_data/sys_user_role_contains_count.json`
+- `core_data/sys_properties_identity.json`
+- `core_data/password_policy.json`
+- `core_data/sso_properties.json`
+- `core_data/ldap_server_config.json`
+- `core_data/sys_certificate.json`
+- `core_data/oauth_entity.json`
+- `core_data/multi_factor_criteria.json`
+- `core_data/sys_properties_hardening.json`
+- `core_data/sys_properties_debug.json`
+- `core_data/sys_script_eval.json`
+- `core_data/ip_access.json`
+- `core_data/sys_plugins_ip_authenticator.json`
+- `core_data/sys_email_account.json`
+- `core_data/sys_security_acl.json`
+- `core_data/sys_security_acl_role.json`
+- `core_data/sys_security_acl_count.json`
+- `core_data/sys_public.json`
+- `core_data/sys_encryption_context.json`
+- `core_data/sys_kmf_crypto_module.json`
+- `core_data/sys_dictionary_encrypted.json`
+- `core_data/sys_dictionary_audit.json`
+- `core_data/sys_audit_count.json`
+- `core_data/syslog_transaction_count.json`
+- `core_data/sys_update_set_in_progress.json`
+- `core_data/sys_update_set_count.json`
+- `core_data/sys_update_xml_sensitive.json`
+- `core_data/ecc_agent.json`
+- `core_data/sys_properties_mid.json`
+- `core_data/sys_plugins.json`
+- `analysis/identity_access.json`
+- `analysis/platform_hardening.json`
+- `analysis/access_control.json`
+- `analysis/operations_governance.json`
 - `analysis/findings.json`
+- `analysis/summary.json`
 - `compliance/executive_summary.md`
 - `compliance/unified_compliance_matrix.md`
 - `compliance/fedramp/fedramp_compliance_report.md`
@@ -671,7 +908,6 @@ Required paths:
 - `compliance/disa_stig/stig_compliance_checklist.md`
 - `compliance/irap/irap_compliance_report.md`
 - `compliance/ismap/ismap_compliance_report.md`
-- `QUICK_REFERENCE.md`
 
 Conditional paths:
 
@@ -681,27 +917,71 @@ Conditional paths:
 
 | Path | Format | Required when | Schema | Serialization |
 |---|---|---|---|---|
-| `core_data/{dataset}.json` | json | The dataset is part of the assessment, including explicit not-collected markers. | Projected source records or a structured unavailable marker; unavailable values remain null. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `analysis/findings.json` | json | Always. | Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `compliance/executive_summary.md` | markdown | Always. | Human-readable counts and findings grouped by status. | UTF-8 Markdown. |
-| `compliance/unified_compliance_matrix.md` | markdown | Always. | Finding-to-framework mapping matrix. | UTF-8 Markdown. |
-| `compliance/{framework}/{report}.md` | markdown | Always for each supported framework. | Framework-specific finding rows and mappings. | UTF-8 Markdown. |
-| `QUICK_REFERENCE.md` | markdown | Always. | Bundle navigation and operator next steps. | UTF-8 Markdown. |
-| `_errors.log` | text | At least one collection read failed, was denied, or was incomplete. | Scrubbed collection error summaries without response bodies or credentials. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `core_data/access_check.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_user.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_user_has_role_privileged.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_user_role_contains.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_user_role_contains_count.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_properties_identity.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/password_policy.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sso_properties.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/ldap_server_config.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_certificate.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/oauth_entity.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/multi_factor_criteria.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_properties_hardening.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_properties_debug.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_script_eval.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/ip_access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_plugins_ip_authenticator.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_email_account.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_security_acl.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_security_acl_role.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_security_acl_count.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_public.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_encryption_context.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_kmf_crypto_module.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_dictionary_encrypted.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_dictionary_audit.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_audit_count.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/syslog_transaction_count.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_update_set_in_progress.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_update_set_count.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_update_xml_sensitive.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/ecc_agent.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_properties_mid.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/sys_plugins.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity_access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/platform_hardening.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/access_control.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/operations_governance.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/summary.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis/cis_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 
 ### Record schemas
 
 #### finding
 
 - `id`
-- `control`
 - `title`
 - `severity`
 - `status`
 - `summary`
 - `evidence`
-- `mappings`
-- `manualEvidence`
+- `framework mappings`
 
 #### collection_marker
 
@@ -709,25 +989,8 @@ Conditional paths:
 - `status`
 - `endpoint`
 - `error`
-- `reason`
 
-#### access_surface
-
-- `name`
-- `endpoint`
-- `status`
-- `count`
-- `error`
-
-#### assessment
-
-- `area`
-- `title`
-- `summary`
-- `findings`
-- `errors`
-
-#### bundle_manifest
+#### bundle_result
 
 - `outputDir`
 - `zipPath`
@@ -735,10 +998,10 @@ Conditional paths:
 - `findingCount`
 - `errorCount`
 
-JSON formatting: UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
 
-Overwrite policy: Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.
+Overwrite policy: Allocate a new {instance}-audit-bundle directory with a numeric suffix when needed; never overwrite a prior directory.
 
 Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
 
-Archive pairing: Create servicenow-audit.zip beside the allocated servicenow-audit directory, applying the same suffix to both.
+Archive pairing: Write a sibling zip named from the exact allocated bundle-directory basename plus .zip.

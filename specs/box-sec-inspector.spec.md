@@ -225,44 +225,100 @@ Credential refresh: POST https://api.box.com/oauth2/token using the selected JWT
 
 | Kind | Permission, role, or plan | Unlocks | Notes |
 |---|---|---|---|
-| role | `Box application access to enterprise users, groups, events, policies, legal holds, terms, and enterprise configuration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
-| role | `Box Shield or governance plan entitlements for gated surfaces` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `Box application scopes and enterprise authorization for users, groups, events, governance, and enterprise configuration` | `current-user`, `enterprise-configuration`, `users`, `groups`, `events`, `device-pinners`, `retention-policies`, `retention-assignments`, `legal-hold-policies`, `legal-hold-assignments`, `shield-barriers`, `shield-barrier-segments`, `shield-lists`, `allowlist-entries`, `allowlist-exempt-targets`, `metadata-templates`, `classification-template`, `terms-of-service` |  |
+| license | `Box Governance entitlement` | `retention-policies`, `retention-assignments`, `legal-hold-policies`, `legal-hold-assignments` |  |
+| license | `Box Shield entitlement` | `shield-barriers`, `shield-barrier-segments`, `shield-lists` |  |
 
 ## API surfaces
 
 | ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
 |---|---|---|---|---|---|---|---|---|
-| `enterprise-users` | HTTP | `GET /2.0/users` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `login`, `role`, `status`, `is_exempt_from_login_verification`, `is_external_collab_restricted` | [Official documentation](https://developer.box.com/reference/get-users/) |
-| `enterprise-config` | HTTP | `GET /2.0/enterprise/configuration` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `user_settings`, `security`, `content_and_sharing` | [Official documentation](https://developer.box.com/reference/get-enterprise-configuration/) |
-| `enterprise-events` | HTTP | `GET /2.0/events` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `event_id`, `event_type`, `created_at`, `created_by`, `source`, `additional_details` | [Official documentation](https://developer.box.com/reference/get-events/) |
-| `retention-policies` | HTTP | `GET /2.0/retention_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `policy_name`, `policy_type`, `retention_length`, `status` | [Official documentation](https://developer.box.com/reference/get-retention-policies/) |
-| `legal-hold-policies` | HTTP | `GET /2.0/legal_hold_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `policy_name`, `status`, `created_at` | [Official documentation](https://developer.box.com/reference/get-legal-hold-policies/) |
+| `current-user` | HTTP | `GET /2.0/users/me` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `enterprise-configuration` | HTTP | `GET /2.0/enterprise_configurations/{enterpriseId}` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `users` | HTTP | `GET /2.0/users` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `groups` | HTTP | `GET /2.0/groups` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `events` | HTTP | `GET /2.0/events` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `device-pinners` | HTTP | `GET /2.0/enterprises/{enterpriseId}/device_pinners` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `retention-policies` | HTTP | `GET /2.0/retention_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `retention-assignments` | HTTP | `GET /2.0/retention_policies/{policyId}/assignments` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `legal-hold-policies` | HTTP | `GET /2.0/legal_hold_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `legal-hold-assignments` | HTTP | `GET /2.0/legal_hold_policy_assignments` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `shield-barriers` | HTTP | `GET /2.0/shield_information_barriers` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `shield-barrier-segments` | HTTP | `GET /2.0/shield_information_barrier_segments` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `shield-lists` | HTTP | `GET /2.0/shield_lists` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `allowlist-entries` | HTTP | `GET /2.0/collaboration_whitelist_entries` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `allowlist-exempt-targets` | HTTP | `GET /2.0/collaboration_whitelist_exempt_targets` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `metadata-templates` | HTTP | `GET /2.0/metadata_templates/enterprise` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `classification-template` | HTTP | `GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `terms-of-service` | HTTP | `GET /2.0/terms_of_services` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
 
 ### Request construction
 
 | Surface | Input | Exact value or rule | Required |
 |---|---|---|---|
-| `enterprise-users` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
-| `enterprise-users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `enterprise-users` | response | A JSON object or list containing only the documented id, login, role, status, is_exempt_from_login_verification, is_external_collab_restricted members consumed by verdicts. | yes |
-| `enterprise-config` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
-| `enterprise-config` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `enterprise-config` | response | A JSON object or list containing only the documented user_settings, security, content_and_sharing members consumed by verdicts. | yes |
-| `enterprise-events` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
-| `enterprise-events` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `enterprise-events` | response | A JSON object or list containing only the documented event_id, event_type, created_at, created_by, source, additional_details members consumed by verdicts. | yes |
+| `current-user` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `current-user` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `current-user` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `enterprise-configuration` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `enterprise-configuration` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `enterprise-configuration` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `users` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `groups` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `groups` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `groups` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `events` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `events` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `events` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `device-pinners` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `device-pinners` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `device-pinners` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
 | `retention-policies` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
 | `retention-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `retention-policies` | response | A JSON object or list containing only the documented id, policy_name, policy_type, retention_length, status members consumed by verdicts. | yes |
+| `retention-policies` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `retention-assignments` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `retention-assignments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `retention-assignments` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
 | `legal-hold-policies` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
 | `legal-hold-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
-| `legal-hold-policies` | response | A JSON object or list containing only the documented id, policy_name, status, created_at members consumed by verdicts. | yes |
+| `legal-hold-policies` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `legal-hold-assignments` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `legal-hold-assignments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `legal-hold-assignments` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `shield-barriers` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `shield-barriers` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `shield-barriers` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `shield-barrier-segments` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `shield-barrier-segments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `shield-barrier-segments` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `shield-lists` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `shield-lists` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `shield-lists` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `allowlist-entries` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `allowlist-entries` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `allowlist-entries` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `allowlist-exempt-targets` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `allowlist-exempt-targets` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `allowlist-exempt-targets` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `metadata-templates` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `metadata-templates` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `metadata-templates` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `classification-template` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `classification-template` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `classification-template` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `terms-of-service` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `terms-of-service` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `terms-of-service` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
 
 ## Pagination
 
 | Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
 |---|---|---|---|---|---|---|
-| `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `next_marker`, `offset`, `total_count`, `next_stream_position` | 100 | caller limit | none | Offset totals and event stream positions are checked independently; a remaining marker or total above seen records is truncated. | No next marker or total reached; Configured item cap; Fixed assignment cap; Repeated marker or stream position; Empty page with continuation; Event page budget |
+| `users`, `device-pinners`, `retention-policies`, `retention-assignments`, `legal-hold-policies`, `legal-hold-assignments`, `shield-barriers`, `shield-barrier-segments`, `allowlist-entries`, `allowlist-exempt-targets`, `metadata-templates` | `next_marker` | 1000 | caller limit | none | Completion requires next_marker exhaustion; a cap with a remaining marker is incomplete. | No next_marker; Configured record cap; Repeated marker; Empty page with marker |
+| `groups` | `offset`, `limit`, `total_count` | 1000 | caller limit | none | total_count is authoritative; seen below total is incomplete. | Seen reaches total; Configured cap; Offset fails to advance; Empty page before total |
+| `events` | `next_stream_position`, `stream_position` | 500 | caller limit | none | The event stream has no total; the walker requires an empty page and advancing stream positions. | Empty page; Configured event cap; Repeated position; Fresh position adds no unseen event; Page budget |
+| `shield-lists`, `terms-of-service`, `current-user`, `enterprise-configuration`, `classification-template` | None | service default | caller limit | none | Single request; a successful response is complete. | Single response |
 
 ## Rate limits
 
@@ -308,31 +364,31 @@ These notes explain intent only. The ordered rule table is normative.
 
 | Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
 |---|---|---|---|---|---|---|---|---|
-| `BOX-01` | critical | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for SSO enforcement returns pass from complete, readable evidence. | The portable derivation for SSO enforcement returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for SSO enforcement returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for SSO enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-02` | critical | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for 2FA for admins returns pass from complete, readable evidence. | The portable derivation for 2FA for admins returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for 2FA for admins returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for 2FA for admins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-03` | high | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for 2FA for all users returns pass from complete, readable evidence. | The portable derivation for 2FA for all users returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for 2FA for all users returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for 2FA for all users is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-04` | high | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for External collaboration restrictions returns pass from complete, readable evidence. | The portable derivation for External collaboration restrictions returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for External collaboration restrictions returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for External collaboration restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-05` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Collaboration allowlist audit returns pass from complete, readable evidence. | The portable derivation for Collaboration allowlist audit returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Collaboration allowlist audit returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Collaboration allowlist audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-06` | high | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Sharing link policies returns pass from complete, readable evidence. | The portable derivation for Sharing link policies returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Sharing link policies returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Sharing link policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-07` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Shared link expiration returns pass from complete, readable evidence. | The portable derivation for Shared link expiration returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Shared link expiration returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Shared link expiration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-08` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Shared link password policy returns pass from complete, readable evidence. | The portable derivation for Shared link password policy returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Shared link password policy returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Shared link password policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-09` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Watermarking enabled returns pass from complete, readable evidence. | The portable derivation for Watermarking enabled returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Watermarking enabled returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Watermarking enabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-10` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Device trust and pins returns pass from complete, readable evidence. | The portable derivation for Device trust and pins returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Device trust and pins returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Device trust and pins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-11` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Classification labels returns pass from complete, readable evidence. | The portable derivation for Classification labels returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Classification labels returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Classification labels is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-12` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Retention policies returns pass from complete, readable evidence. | The portable derivation for Retention policies returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Retention policies returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Retention policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-13` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Legal hold policies returns pass from complete, readable evidence. | The portable derivation for Legal hold policies returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Legal hold policies returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Legal hold policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-14` | high | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Shield smart access policies returns pass from complete, readable evidence. | The portable derivation for Shield smart access policies returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Shield smart access policies returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Shield smart access policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-15` | medium | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Shield information barriers returns pass from complete, readable evidence. | The portable derivation for Shield information barriers returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Shield information barriers returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Shield information barriers is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-16` | high | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Enterprise event streaming returns pass from complete, readable evidence. | The portable derivation for Enterprise event streaming returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Enterprise event streaming returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Enterprise event streaming is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-17` | high | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Admin role minimization returns pass from complete, readable evidence. | The portable derivation for Admin role minimization returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Admin role minimization returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Admin role minimization is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-18` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Co-admin permission scoping returns pass from complete, readable evidence. | The portable derivation for Co-admin permission scoping returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Co-admin permission scoping returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Co-admin permission scoping is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-19` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for App approval process returns pass from complete, readable evidence. | The portable derivation for App approval process returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for App approval process returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for App approval process is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-20` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Custom terms of service returns pass from complete, readable evidence. | The portable derivation for Custom terms of service returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Custom terms of service returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Custom terms of service is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-21` | high | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Password policy strength returns pass from complete, readable evidence. | The portable derivation for Password policy strength returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Password policy strength returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Password policy strength is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-22` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Session duration limits returns pass from complete, readable evidence. | The portable derivation for Session duration limits returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Session duration limits returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Session duration limits is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-23` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for IP allowlisting returns pass from complete, readable evidence. | The portable derivation for IP allowlisting returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for IP allowlisting returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for IP allowlisting is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-24` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Inactive user detection returns pass from complete, readable evidence. | The portable derivation for Inactive user detection returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Inactive user detection returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Inactive user detection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `BOX-25` | high | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | The portable derivation for Content access monitoring returns pass from complete, readable evidence. | The portable derivation for Content access monitoring returns warn, or a pass is demoted because a required source is partial or truncated. | The portable derivation for Content access monitoring returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings. | The required evidence for Content access monitoring is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-01` | critical | `box_assess_identity_access` | `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | The required evidence for SSO enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-02` | critical | `box_assess_identity_access` | `enterprise-configuration`, `users` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | The required evidence for 2FA for admins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-03` | high | `box_assess_identity_access` | `enterprise-configuration`, `users` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | The required evidence for 2FA for all users is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-04` | high | `box_assess_sharing_collaboration` | `enterprise-configuration`, `allowlist-entries` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | The required evidence for External collaboration restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-05` | medium | `box_assess_sharing_collaboration` | `enterprise-configuration`, `allowlist-entries`, `allowlist-exempt-targets` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists. | The required evidence for Collaboration allowlist audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-06` | high | `box_assess_sharing_collaboration` | `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | The required evidence for Sharing link policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-07` | medium | `box_assess_sharing_collaboration` | `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | The required evidence for Shared link expiration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-08` | medium | `box_assess_sharing_collaboration` | None | `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | The required evidence for Shared link password policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-09` | medium | `box_assess_sharing_collaboration` | `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | The required evidence for Watermarking enabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-10` | medium | `box_assess_data_governance` | `device-pinners` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | The required evidence for Device trust and pins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-11` | medium | `box_assess_data_governance` | `classification-template`, `metadata-templates` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | The required evidence for Classification labels is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-12` | medium | `box_assess_data_governance` | `retention-policies`, `retention-assignments` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | The required evidence for Retention policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-13` | medium | `box_assess_data_governance` | `legal-hold-policies`, `legal-hold-assignments` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | The required evidence for Legal hold policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-14` | high | `box_assess_shield_monitoring` | `enterprise-configuration`, `shield-lists` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | The required evidence for Shield smart access policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-15` | medium | `box_assess_shield_monitoring` | `shield-barriers`, `shield-barrier-segments` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists. | The required evidence for Shield information barriers is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-16` | high | `box_assess_shield_monitoring` | `events` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | The required evidence for Enterprise event streaming is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-17` | high | `box_assess_identity_access` | `users` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | The required evidence for Admin role minimization is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-18` | medium | `box_assess_identity_access` | `users` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed. | The required evidence for Co-admin permission scoping is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-19` | medium | `box_assess_sharing_collaboration` | `events`, `shield-lists` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | The required evidence for App approval process is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-20` | medium | `box_assess_sharing_collaboration` | `terms-of-service` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | The required evidence for Custom terms of service is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-21` | high | `box_assess_identity_access` | `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | The required evidence for Password policy strength is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-22` | medium | `box_assess_identity_access` | `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | The required evidence for Session duration limits is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-23` | medium | `box_assess_identity_access` | `shield-lists` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | The required evidence for IP allowlisting is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-24` | medium | `box_assess_identity_access` | `users`, `events` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | The required evidence for Inactive user detection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-25` | high | `box_assess_shield_monitoring` | `shield-lists`, `events` | `projected fields consumed by the corresponding runtime assessment`, `complete_source_counts` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | The required evidence for Content access monitoring is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
 ### Ordered decision rules
 
@@ -340,241 +396,296 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 
 | Finding | Order | Outcome | First-match condition | Explanatory note |
 |---|---|---|---|---|
-| `BOX-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-09` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-09` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-09` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-09` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-10` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-10` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-10` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-10` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-11` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-11` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-11` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-11` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-12` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-12` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-12` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-12` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-13` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-13` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-13` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-13` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-14` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-14` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-14` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-14` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-15` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-15` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-15` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-15` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-16` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-16` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-16` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-16` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-17` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-17` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-17` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-17` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-18` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-18` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-18` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-18` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-19` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-19` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-19` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-19` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-20` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-20` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-20` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-20` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-21` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-21` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-21` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-21` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-22` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-22` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-22` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-22` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-23` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-23` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-23` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-23` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-24` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-24` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-24` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-24` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
-| `BOX-25` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
-| `BOX-25` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
-| `BOX-25` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
-| `BOX-25` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-01` | 1 | fail | `box_01_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-01` | 2 | manual | any of (`box_01_required_evidence_readable` equals false; not (`box_01_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-01` | 3 | warn | any of (`box_01_warning_matches` equals true; `box_01_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-01` | 4 | pass | all of (`box_01_compliant_matches` equals true; `box_01_required_evidence_readable` equals true; `box_01_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-01` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-02` | 1 | fail | `box_02_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-02` | 2 | manual | any of (`box_02_required_evidence_readable` equals false; not (`box_02_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-02` | 3 | warn | any of (`box_02_warning_matches` equals true; `box_02_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-02` | 4 | pass | all of (`box_02_compliant_matches` equals true; `box_02_required_evidence_readable` equals true; `box_02_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-02` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-03` | 1 | fail | `box_03_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-03` | 2 | manual | any of (`box_03_required_evidence_readable` equals false; not (`box_03_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-03` | 3 | warn | any of (`box_03_warning_matches` equals true; `box_03_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-03` | 4 | pass | all of (`box_03_compliant_matches` equals true; `box_03_required_evidence_readable` equals true; `box_03_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-03` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-04` | 1 | fail | `box_04_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-04` | 2 | manual | any of (`box_04_required_evidence_readable` equals false; not (`box_04_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-04` | 3 | warn | any of (`box_04_warning_matches` equals true; `box_04_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-04` | 4 | pass | all of (`box_04_compliant_matches` equals true; `box_04_required_evidence_readable` equals true; `box_04_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-04` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-05` | 1 | fail | `box_05_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-05` | 2 | manual | any of (`box_05_required_evidence_readable` equals false; not (`box_05_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-05` | 3 | warn | any of (`box_05_warning_matches` equals true; `box_05_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-05` | 4 | pass | all of (`box_05_compliant_matches` equals true; `box_05_required_evidence_readable` equals true; `box_05_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-05` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-06` | 1 | fail | `box_06_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-06` | 2 | manual | any of (`box_06_required_evidence_readable` equals false; not (`box_06_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-06` | 3 | warn | any of (`box_06_warning_matches` equals true; `box_06_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-06` | 4 | pass | all of (`box_06_compliant_matches` equals true; `box_06_required_evidence_readable` equals true; `box_06_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-06` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-07` | 1 | fail | `box_07_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-07` | 2 | manual | any of (`box_07_required_evidence_readable` equals false; not (`box_07_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-07` | 3 | warn | any of (`box_07_warning_matches` equals true; `box_07_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-07` | 4 | pass | all of (`box_07_compliant_matches` equals true; `box_07_required_evidence_readable` equals true; `box_07_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-07` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-08` | 1 | manual | any of (`box_08_required_evidence_readable` equals false; not (`box_08_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-08` | 2 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-09` | 1 | fail | `box_09_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-09` | 2 | manual | any of (`box_09_required_evidence_readable` equals false; not (`box_09_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-09` | 3 | warn | any of (`box_09_warning_matches` equals true; `box_09_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-09` | 4 | pass | all of (`box_09_compliant_matches` equals true; `box_09_required_evidence_readable` equals true; `box_09_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-09` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-10` | 1 | manual | any of (`box_10_required_evidence_readable` equals false; not (`box_10_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-10` | 2 | warn | any of (`box_10_warning_matches` equals true; `box_10_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-10` | 3 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-11` | 1 | fail | `box_11_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-11` | 2 | manual | any of (`box_11_required_evidence_readable` equals false; not (`box_11_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-11` | 3 | pass | all of (`box_11_compliant_matches` equals true; `box_11_required_evidence_readable` equals true; `box_11_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-11` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-12` | 1 | fail | `box_12_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-12` | 2 | manual | any of (`box_12_required_evidence_readable` equals false; not (`box_12_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-12` | 3 | warn | any of (`box_12_warning_matches` equals true; `box_12_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-12` | 4 | pass | all of (`box_12_compliant_matches` equals true; `box_12_required_evidence_readable` equals true; `box_12_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-12` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-13` | 1 | manual | any of (`box_13_required_evidence_readable` equals false; not (`box_13_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-13` | 2 | warn | any of (`box_13_warning_matches` equals true; `box_13_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-13` | 3 | pass | all of (`box_13_compliant_matches` equals true; `box_13_required_evidence_readable` equals true; `box_13_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-13` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-14` | 1 | fail | `box_14_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-14` | 2 | manual | any of (`box_14_required_evidence_readable` equals false; not (`box_14_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-14` | 3 | pass | all of (`box_14_compliant_matches` equals true; `box_14_required_evidence_readable` equals true; `box_14_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-14` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-15` | 1 | manual | any of (`box_15_required_evidence_readable` equals false; not (`box_15_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-15` | 2 | warn | any of (`box_15_warning_matches` equals true; `box_15_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-15` | 3 | pass | all of (`box_15_compliant_matches` equals true; `box_15_required_evidence_readable` equals true; `box_15_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-15` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-16` | 1 | manual | any of (`box_16_required_evidence_readable` equals false; not (`box_16_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-16` | 2 | warn | any of (`box_16_warning_matches` equals true; `box_16_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-16` | 3 | pass | all of (`box_16_compliant_matches` equals true; `box_16_required_evidence_readable` equals true; `box_16_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-16` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-17` | 1 | manual | any of (`box_17_required_evidence_readable` equals false; not (`box_17_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-17` | 2 | warn | any of (`box_17_warning_matches` equals true; `box_17_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-17` | 3 | pass | all of (`box_17_compliant_matches` equals true; `box_17_required_evidence_readable` equals true; `box_17_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-17` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-18` | 1 | manual | any of (`box_18_required_evidence_readable` equals false; not (`box_18_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-18` | 2 | pass | all of (`box_18_compliant_matches` equals true; `box_18_required_evidence_readable` equals true; `box_18_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-18` | 3 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-19` | 1 | manual | any of (`box_19_required_evidence_readable` equals false; not (`box_19_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-19` | 2 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-20` | 1 | fail | `box_20_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-20` | 2 | manual | any of (`box_20_required_evidence_readable` equals false; not (`box_20_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-20` | 3 | pass | all of (`box_20_compliant_matches` equals true; `box_20_required_evidence_readable` equals true; `box_20_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-20` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-21` | 1 | fail | `box_21_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-21` | 2 | manual | any of (`box_21_required_evidence_readable` equals false; not (`box_21_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-21` | 3 | warn | any of (`box_21_warning_matches` equals true; `box_21_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-21` | 4 | pass | all of (`box_21_compliant_matches` equals true; `box_21_required_evidence_readable` equals true; `box_21_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-21` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-22` | 1 | fail | `box_22_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-22` | 2 | manual | any of (`box_22_required_evidence_readable` equals false; not (`box_22_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-22` | 3 | warn | any of (`box_22_warning_matches` equals true; `box_22_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-22` | 4 | pass | all of (`box_22_compliant_matches` equals true; `box_22_required_evidence_readable` equals true; `box_22_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-22` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-23` | 1 | manual | any of (`box_23_required_evidence_readable` equals false; not (`box_23_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-23` | 2 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-24` | 1 | fail | `box_24_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-24` | 2 | manual | any of (`box_24_required_evidence_readable` equals false; not (`box_24_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-24` | 3 | warn | any of (`box_24_warning_matches` equals true; `box_24_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-24` | 4 | pass | all of (`box_24_compliant_matches` equals true; `box_24_required_evidence_readable` equals true; `box_24_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-24` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `BOX-25` | 1 | fail | `box_25_failure_matches` equals true | A violation proved by readable evidence has first-match precedence over partial companion evidence. |
+| `BOX-25` | 2 | manual | any of (`box_25_required_evidence_readable` equals false; not (`box_25_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
+| `BOX-25` | 3 | warn | any of (`box_25_warning_matches` equals true; `box_25_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
+| `BOX-25` | 4 | pass | all of (`box_25_compliant_matches` equals true; `box_25_required_evidence_readable` equals true; `box_25_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `BOX-25` | 5 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
 
 ### Derived decision facts
 
 | Finding | Input | Portable derivation |
 |---|---|---|
-| `BOX-01` | `decision_status` | Using complete source cardinalities, return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-02` | `decision_status` | Using complete source cardinalities, return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-03` | `decision_status` | Using complete source cardinalities, return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-04` | `decision_status` | Using complete source cardinalities, return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-05` | `decision_status` | Using complete source cardinalities, return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-06` | `decision_status` | Using complete source cardinalities, return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-07` | `decision_status` | Using complete source cardinalities, return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-08` | `decision_status` | Using complete source cardinalities, always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-09` | `decision_status` | Using complete source cardinalities, return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-10` | `decision_status` | Using complete source cardinalities, return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-11` | `decision_status` | Using complete source cardinalities, return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-12` | `decision_status` | Using complete source cardinalities, return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-13` | `decision_status` | Using complete source cardinalities, return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-14` | `decision_status` | Using complete source cardinalities, return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-15` | `decision_status` | Using complete source cardinalities, return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-16` | `decision_status` | Using complete source cardinalities, return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-17` | `decision_status` | Using complete source cardinalities, return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-18` | `decision_status` | Using complete source cardinalities, return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-19` | `decision_status` | Using complete source cardinalities, always return manual because app creation events and Shield integration lists do not expose the app approval policy. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-20` | `decision_status` | Using complete source cardinalities, return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-21` | `decision_status` | Using complete source cardinalities, return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-22` | `decision_status` | Using complete source cardinalities, return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-23` | `decision_status` | Using complete source cardinalities, always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-24` | `decision_status` | Using complete source cardinalities, return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
-| `BOX-25` | `decision_status` | Using complete source cardinalities, return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail. |
+| `BOX-01` | `box_01_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-01 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-01` | `box_01_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-01` | `box_01_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. |
+| `BOX-01` | `box_01_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. |
+| `BOX-01` | `box_01_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. |
+| `BOX-02` | `box_02_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-02 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-02` | `box_02_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-02` | `box_02_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. |
+| `BOX-02` | `box_02_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. |
+| `BOX-02` | `box_02_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. |
+| `BOX-03` | `box_03_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-03 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-03` | `box_03_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-03` | `box_03_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. |
+| `BOX-03` | `box_03_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. |
+| `BOX-03` | `box_03_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. |
+| `BOX-04` | `box_04_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-04 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-04` | `box_04_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-04` | `box_04_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. |
+| `BOX-04` | `box_04_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. |
+| `BOX-04` | `box_04_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. |
+| `BOX-05` | `box_05_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-05 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-05` | `box_05_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-05` | `box_05_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists. |
+| `BOX-05` | `box_05_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists. |
+| `BOX-05` | `box_05_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions, or an empty allowlist while allowlist-only mode is selected, and pass when complete entries are recent non-public domains without exemptions or no allowlist is required and none exists. |
+| `BOX-06` | `box_06_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-06 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-06` | `box_06_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-06` | `box_06_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. |
+| `BOX-06` | `box_06_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. |
+| `BOX-06` | `box_06_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. |
+| `BOX-07` | `box_07_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-07 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-07` | `box_07_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-07` | `box_07_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. |
+| `BOX-07` | `box_07_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. |
+| `BOX-07` | `box_07_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. |
+| `BOX-08` | `box_08_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-08 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-08` | `box_08_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-08` | `box_08_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. |
+| `BOX-08` | `box_08_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. |
+| `BOX-08` | `box_08_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. |
+| `BOX-09` | `box_09_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-09 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-09` | `box_09_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-09` | `box_09_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. |
+| `BOX-09` | `box_09_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. |
+| `BOX-09` | `box_09_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. |
+| `BOX-10` | `box_10_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-10 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-10` | `box_10_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-10` | `box_10_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. |
+| `BOX-10` | `box_10_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. |
+| `BOX-10` | `box_10_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. |
+| `BOX-11` | `box_11_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-11 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-11` | `box_11_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-11` | `box_11_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. |
+| `BOX-11` | `box_11_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. |
+| `BOX-11` | `box_11_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. |
+| `BOX-12` | `box_12_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-12 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-12` | `box_12_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-12` | `box_12_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. |
+| `BOX-12` | `box_12_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. |
+| `BOX-12` | `box_12_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. |
+| `BOX-13` | `box_13_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-13 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-13` | `box_13_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-13` | `box_13_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. |
+| `BOX-13` | `box_13_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. |
+| `BOX-13` | `box_13_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. |
+| `BOX-14` | `box_14_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-14 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-14` | `box_14_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-14` | `box_14_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. |
+| `BOX-14` | `box_14_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. |
+| `BOX-14` | `box_14_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. |
+| `BOX-15` | `box_15_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-15 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-15` | `box_15_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-15` | `box_15_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists. |
+| `BOX-15` | `box_15_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists. |
+| `BOX-15` | `box_15_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists. |
+| `BOX-16` | `box_16_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-16 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-16` | `box_16_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-16` | `box_16_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. |
+| `BOX-16` | `box_16_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. |
+| `BOX-16` | `box_16_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. |
+| `BOX-17` | `box_17_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-17 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-17` | `box_17_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-17` | `box_17_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. |
+| `BOX-17` | `box_17_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. |
+| `BOX-17` | `box_17_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. |
+| `BOX-18` | `box_18_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-18 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-18` | `box_18_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-18` | `box_18_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed. |
+| `BOX-18` | `box_18_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed. |
+| `BOX-18` | `box_18_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed. |
+| `BOX-19` | `box_19_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-19 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-19` | `box_19_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-19` | `box_19_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: always return manual because app creation events and Shield integration lists do not expose the app approval policy. |
+| `BOX-19` | `box_19_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: always return manual because app creation events and Shield integration lists do not expose the app approval policy. |
+| `BOX-19` | `box_19_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: always return manual because app creation events and Shield integration lists do not expose the app approval policy. |
+| `BOX-20` | `box_20_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-20 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-20` | `box_20_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-20` | `box_20_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. |
+| `BOX-20` | `box_20_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. |
+| `BOX-20` | `box_20_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. |
+| `BOX-21` | `box_21_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-21 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-21` | `box_21_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-21` | `box_21_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. |
+| `BOX-21` | `box_21_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. |
+| `BOX-21` | `box_21_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. |
+| `BOX-22` | `box_22_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-22 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-22` | `box_22_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-22` | `box_22_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. |
+| `BOX-22` | `box_22_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. |
+| `BOX-22` | `box_22_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. |
+| `BOX-23` | `box_23_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-23 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-23` | `box_23_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-23` | `box_23_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. |
+| `BOX-23` | `box_23_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. |
+| `BOX-23` | `box_23_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. |
+| `BOX-24` | `box_24_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-24 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-24` | `box_24_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-24` | `box_24_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. |
+| `BOX-24` | `box_24_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. |
+| `BOX-24` | `box_24_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. |
+| `BOX-25` | `box_25_required_evidence_readable` | From the declared source surfaces, set true only when every value required by BOX-25 was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false. |
+| `BOX-25` | `box_25_required_evidence_complete` | From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false. |
+| `BOX-25` | `box_25_failure_matches` | Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. |
+| `BOX-25` | `box_25_warning_matches` | Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. |
+| `BOX-25` | `box_25_compliant_matches` | Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. |
 
 ### Criterion constants
 
 | Finding | Name | Value |
 |---|---|---|
-| `BOX-01` | `passStatus` | pass |
-| `BOX-01` | `warnStatus` | warn |
-| `BOX-01` | `failStatus` | fail |
-| `BOX-01` | `manualStatus` | manual |
-| `BOX-02` | `passStatus` | pass |
-| `BOX-02` | `warnStatus` | warn |
-| `BOX-02` | `failStatus` | fail |
-| `BOX-02` | `manualStatus` | manual |
-| `BOX-03` | `passStatus` | pass |
-| `BOX-03` | `warnStatus` | warn |
-| `BOX-03` | `failStatus` | fail |
-| `BOX-03` | `manualStatus` | manual |
-| `BOX-04` | `passStatus` | pass |
-| `BOX-04` | `warnStatus` | warn |
-| `BOX-04` | `failStatus` | fail |
-| `BOX-04` | `manualStatus` | manual |
-| `BOX-05` | `passStatus` | pass |
-| `BOX-05` | `warnStatus` | warn |
-| `BOX-05` | `failStatus` | fail |
-| `BOX-05` | `manualStatus` | manual |
-| `BOX-06` | `passStatus` | pass |
-| `BOX-06` | `warnStatus` | warn |
-| `BOX-06` | `failStatus` | fail |
-| `BOX-06` | `manualStatus` | manual |
-| `BOX-07` | `passStatus` | pass |
-| `BOX-07` | `warnStatus` | warn |
-| `BOX-07` | `failStatus` | fail |
-| `BOX-07` | `manualStatus` | manual |
-| `BOX-08` | `passStatus` | pass |
-| `BOX-08` | `warnStatus` | warn |
-| `BOX-08` | `failStatus` | fail |
-| `BOX-08` | `manualStatus` | manual |
-| `BOX-09` | `passStatus` | pass |
-| `BOX-09` | `warnStatus` | warn |
-| `BOX-09` | `failStatus` | fail |
-| `BOX-09` | `manualStatus` | manual |
-| `BOX-10` | `passStatus` | pass |
-| `BOX-10` | `warnStatus` | warn |
-| `BOX-10` | `failStatus` | fail |
-| `BOX-10` | `manualStatus` | manual |
-| `BOX-11` | `passStatus` | pass |
-| `BOX-11` | `warnStatus` | warn |
-| `BOX-11` | `failStatus` | fail |
-| `BOX-11` | `manualStatus` | manual |
-| `BOX-12` | `passStatus` | pass |
-| `BOX-12` | `warnStatus` | warn |
-| `BOX-12` | `failStatus` | fail |
-| `BOX-12` | `manualStatus` | manual |
-| `BOX-13` | `passStatus` | pass |
-| `BOX-13` | `warnStatus` | warn |
-| `BOX-13` | `failStatus` | fail |
-| `BOX-13` | `manualStatus` | manual |
-| `BOX-14` | `passStatus` | pass |
-| `BOX-14` | `warnStatus` | warn |
-| `BOX-14` | `failStatus` | fail |
-| `BOX-14` | `manualStatus` | manual |
-| `BOX-15` | `passStatus` | pass |
-| `BOX-15` | `warnStatus` | warn |
-| `BOX-15` | `failStatus` | fail |
-| `BOX-15` | `manualStatus` | manual |
-| `BOX-16` | `passStatus` | pass |
-| `BOX-16` | `warnStatus` | warn |
-| `BOX-16` | `failStatus` | fail |
-| `BOX-16` | `manualStatus` | manual |
-| `BOX-17` | `passStatus` | pass |
-| `BOX-17` | `warnStatus` | warn |
-| `BOX-17` | `failStatus` | fail |
-| `BOX-17` | `manualStatus` | manual |
-| `BOX-18` | `passStatus` | pass |
-| `BOX-18` | `warnStatus` | warn |
-| `BOX-18` | `failStatus` | fail |
-| `BOX-18` | `manualStatus` | manual |
-| `BOX-19` | `passStatus` | pass |
-| `BOX-19` | `warnStatus` | warn |
-| `BOX-19` | `failStatus` | fail |
-| `BOX-19` | `manualStatus` | manual |
-| `BOX-20` | `passStatus` | pass |
-| `BOX-20` | `warnStatus` | warn |
-| `BOX-20` | `failStatus` | fail |
-| `BOX-20` | `manualStatus` | manual |
-| `BOX-21` | `passStatus` | pass |
-| `BOX-21` | `warnStatus` | warn |
-| `BOX-21` | `failStatus` | fail |
-| `BOX-21` | `manualStatus` | manual |
-| `BOX-22` | `passStatus` | pass |
-| `BOX-22` | `warnStatus` | warn |
-| `BOX-22` | `failStatus` | fail |
-| `BOX-22` | `manualStatus` | manual |
-| `BOX-23` | `passStatus` | pass |
-| `BOX-23` | `warnStatus` | warn |
-| `BOX-23` | `failStatus` | fail |
-| `BOX-23` | `manualStatus` | manual |
-| `BOX-24` | `passStatus` | pass |
-| `BOX-24` | `warnStatus` | warn |
-| `BOX-24` | `failStatus` | fail |
-| `BOX-24` | `manualStatus` | manual |
-| `BOX-25` | `passStatus` | pass |
-| `BOX-25` | `warnStatus` | warn |
-| `BOX-25` | `failStatus` | fail |
-| `BOX-25` | `manualStatus` | manual |
+| `BOX-01` | `requiredEvidenceReadable` | true |
+| `BOX-01` | `requiredEvidenceComplete` | true |
+| `BOX-02` | `requiredEvidenceReadable` | true |
+| `BOX-02` | `requiredEvidenceComplete` | true |
+| `BOX-03` | `requiredEvidenceReadable` | true |
+| `BOX-03` | `requiredEvidenceComplete` | true |
+| `BOX-04` | `requiredEvidenceReadable` | true |
+| `BOX-04` | `requiredEvidenceComplete` | true |
+| `BOX-05` | `requiredEvidenceReadable` | true |
+| `BOX-05` | `requiredEvidenceComplete` | true |
+| `BOX-06` | `requiredEvidenceReadable` | true |
+| `BOX-06` | `requiredEvidenceComplete` | true |
+| `BOX-07` | `requiredEvidenceReadable` | true |
+| `BOX-07` | `requiredEvidenceComplete` | true |
+| `BOX-08` | `requiredEvidenceReadable` | true |
+| `BOX-08` | `requiredEvidenceComplete` | true |
+| `BOX-09` | `requiredEvidenceReadable` | true |
+| `BOX-09` | `requiredEvidenceComplete` | true |
+| `BOX-10` | `requiredEvidenceReadable` | true |
+| `BOX-10` | `requiredEvidenceComplete` | true |
+| `BOX-11` | `requiredEvidenceReadable` | true |
+| `BOX-11` | `requiredEvidenceComplete` | true |
+| `BOX-12` | `requiredEvidenceReadable` | true |
+| `BOX-12` | `requiredEvidenceComplete` | true |
+| `BOX-13` | `requiredEvidenceReadable` | true |
+| `BOX-13` | `requiredEvidenceComplete` | true |
+| `BOX-14` | `requiredEvidenceReadable` | true |
+| `BOX-14` | `requiredEvidenceComplete` | true |
+| `BOX-15` | `requiredEvidenceReadable` | true |
+| `BOX-15` | `requiredEvidenceComplete` | true |
+| `BOX-16` | `requiredEvidenceReadable` | true |
+| `BOX-16` | `requiredEvidenceComplete` | true |
+| `BOX-17` | `requiredEvidenceReadable` | true |
+| `BOX-17` | `requiredEvidenceComplete` | true |
+| `BOX-18` | `requiredEvidenceReadable` | true |
+| `BOX-18` | `requiredEvidenceComplete` | true |
+| `BOX-19` | `requiredEvidenceReadable` | true |
+| `BOX-19` | `requiredEvidenceComplete` | true |
+| `BOX-20` | `requiredEvidenceReadable` | true |
+| `BOX-20` | `requiredEvidenceComplete` | true |
+| `BOX-21` | `requiredEvidenceReadable` | true |
+| `BOX-21` | `requiredEvidenceComplete` | true |
+| `BOX-22` | `requiredEvidenceReadable` | true |
+| `BOX-22` | `requiredEvidenceComplete` | true |
+| `BOX-23` | `requiredEvidenceReadable` | true |
+| `BOX-23` | `requiredEvidenceComplete` | true |
+| `BOX-24` | `requiredEvidenceReadable` | true |
+| `BOX-24` | `requiredEvidenceComplete` | true |
+| `BOX-25` | `requiredEvidenceReadable` | true |
+| `BOX-25` | `requiredEvidenceComplete` | true |
 
 ### Illustrative criterion notes
 
@@ -687,31 +798,31 @@ Examples are explanatory, not normative. The ordered first-match conditions abov
 
 | # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | SSO enforcement | - | - | - | - | - | - | - | - |
-| 2 | 2FA for admins | - | - | - | - | - | - | - | - |
-| 3 | 2FA for all users | - | - | - | - | - | - | - | - |
-| 4 | External collaboration restrictions | - | - | - | - | - | - | - | - |
-| 5 | Collaboration allowlist audit | - | - | - | - | - | - | - | - |
-| 6 | Sharing link policies | - | - | - | - | - | - | - | - |
-| 7 | Shared link expiration | - | - | - | - | - | - | - | - |
-| 8 | Shared link password policy | - | - | - | - | - | - | - | - |
-| 9 | Watermarking enabled | - | - | - | - | - | - | - | - |
-| 10 | Device trust and pins | - | - | - | - | - | - | - | - |
-| 11 | Classification labels | - | - | - | - | - | - | - | - |
-| 12 | Retention policies | - | - | - | - | - | - | - | - |
-| 13 | Legal hold policies | - | - | - | - | - | - | - | - |
-| 14 | Shield smart access policies | - | - | - | - | - | - | - | - |
-| 15 | Shield information barriers | - | - | - | - | - | - | - | - |
-| 16 | Enterprise event streaming | - | - | - | - | - | - | - | - |
-| 17 | Admin role minimization | - | - | - | - | - | - | - | - |
-| 18 | Co-admin permission scoping | - | - | - | - | - | - | - | - |
-| 19 | App approval process | - | - | - | - | - | - | - | - |
-| 20 | Custom terms of service | - | - | - | - | - | - | - | - |
-| 21 | Password policy strength | - | - | - | - | - | - | - | - |
-| 22 | Session duration limits | - | - | - | - | - | - | - | - |
-| 23 | IP allowlisting | - | - | - | - | - | - | - | - |
-| 24 | Inactive user detection | - | - | - | - | - | - | - | - |
-| 25 | Content access monitoring | - | - | - | - | - | - | - | - |
+| 1 | SSO enforcement | IA-2 | AC.L2-3.1.1 | CC6.1 | 1.1 | 8.3.1 | SRG-APP-000148 | ISM-1557 | CPS-04 |
+| 2 | 2FA for admins | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.1 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
+| 3 | 2FA for all users | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.2 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
+| 4 | External collaboration restrictions | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.1 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
+| 5 | Collaboration allowlist audit | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.2 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
+| 6 | Sharing link policies | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.3 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 7 | Shared link expiration | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.4 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 8 | Shared link password policy | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.5 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 9 | Watermarking enabled | SC-28 | SC.L2-3.13.16 | CC6.7 | 3.1 | 3.4 | SRG-APP-000231 | ISM-0457 | CPS-09 |
+| 10 | Device trust and pins | IA-3 | IA.L2-3.5.1 | CC6.1 | 1.2 | 2.4 | SRG-APP-000158 | ISM-1482 | CPS-04 |
+| 11 | Classification labels | MP-4 | MP.L2-3.8.5 | CC6.7 | 3.2 | 9.6.1 | SRG-APP-000231 | ISM-0272 | CPS-09 |
+| 12 | Retention policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.1 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
+| 13 | Legal hold policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.2 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
+| 14 | Shield smart access policies | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.6 | 7.2.1 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 15 | Shield information barriers | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.7 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
+| 16 | Enterprise event streaming | AU-2 | AU.L2-3.3.1 | CC7.2 | 8.3 | 10.2.1 | SRG-APP-000089 | ISM-0580 | CPS-10 |
+| 17 | Admin role minimization | AC-6(5) | AC.L2-3.1.5 | CC6.3 | 6.8 | 7.2.2 | SRG-APP-000340 | ISM-1507 | CPS-07 |
+| 18 | Co-admin permission scoping | AC-6 | AC.L2-3.1.5 | CC6.3 | 6.9 | 7.2.2 | SRG-APP-000340 | ISM-0432 | CPS-07 |
+| 19 | App approval process | CM-7(5) | CM.L2-3.4.8 | CC8.1 | 10.1 | 6.3.2 | SRG-APP-000386 | ISM-1490 | CPS-12 |
+| 20 | Custom terms of service | PS-6 | AT.L2-3.2.1 | CC1.4 | 11.1 | 12.6.1 | SRG-APP-000516 | ISM-0252 | CPS-13 |
+| 21 | Password policy strength | IA-5(1) | IA.L2-3.5.7 | CC6.1 | 5.1 | 8.3.6 | SRG-APP-000166 | ISM-0421 | CPS-05 |
+| 22 | Session duration limits | AC-11 | AC.L2-3.1.10 | CC6.1 | 7.1 | 8.2.8 | SRG-APP-000190 | ISM-0853 | CPS-08 |
+| 23 | IP allowlisting | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.1 | 1.3.2 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 24 | Inactive user detection | AC-2(3) | AC.L2-3.1.1 | CC6.2 | 7.2 | 8.1.4 | SRG-APP-000025 | ISM-1404 | CPS-07 |
+| 25 | Content access monitoring | AU-6 | AU.L2-3.3.5 | CC7.2 | 8.4 | 10.6.1 | SRG-APP-000108 | ISM-0580 | CPS-10 |
 
 ## Collection states
 
@@ -746,18 +857,57 @@ Projected fields by surface:
 
 | Surface | Allowed fields |
 |---|---|
-| `enterprise-users` | `id`, `login`, `role`, `status`, `is_exempt_from_login_verification`, `is_external_collab_restricted` |
-| `enterprise-config` | `user_settings`, `security`, `content_and_sharing` |
-| `enterprise-events` | `event_id`, `event_type`, `created_at`, `created_by`, `source`, `additional_details` |
-| `retention-policies` | `id`, `policy_name`, `policy_type`, `retention_length`, `status` |
-| `legal-hold-policies` | `id`, `policy_name`, `status`, `created_at` |
+| `current-user` | `projected fields consumed by the corresponding runtime assessment` |
+| `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment` |
+| `users` | `projected fields consumed by the corresponding runtime assessment` |
+| `groups` | `projected fields consumed by the corresponding runtime assessment` |
+| `events` | `projected fields consumed by the corresponding runtime assessment` |
+| `device-pinners` | `projected fields consumed by the corresponding runtime assessment` |
+| `retention-policies` | `projected fields consumed by the corresponding runtime assessment` |
+| `retention-assignments` | `projected fields consumed by the corresponding runtime assessment` |
+| `legal-hold-policies` | `projected fields consumed by the corresponding runtime assessment` |
+| `legal-hold-assignments` | `projected fields consumed by the corresponding runtime assessment` |
+| `shield-barriers` | `projected fields consumed by the corresponding runtime assessment` |
+| `shield-barrier-segments` | `projected fields consumed by the corresponding runtime assessment` |
+| `shield-lists` | `projected fields consumed by the corresponding runtime assessment` |
+| `allowlist-entries` | `projected fields consumed by the corresponding runtime assessment` |
+| `allowlist-exempt-targets` | `projected fields consumed by the corresponding runtime assessment` |
+| `metadata-templates` | `projected fields consumed by the corresponding runtime assessment` |
+| `classification-template` | `projected fields consumed by the corresponding runtime assessment` |
+| `terms-of-service` | `projected fields consumed by the corresponding runtime assessment` |
 
 ## Export layout
 
 Required paths:
 
-- `core_data/access.json`
+- `core_data/access_check.json`
+- `core_data/enterprise_configuration.json`
+- `core_data/current_user.json`
+- `core_data/users.json`
+- `core_data/groups.json`
+- `core_data/enterprise_events_activity.json`
+- `core_data/enterprise_events_sharing.json`
+- `core_data/enterprise_events_shield.json`
+- `core_data/device_pinners.json`
+- `core_data/classification_template.json`
+- `core_data/metadata_templates.json`
+- `core_data/retention_policies.json`
+- `core_data/retention_policy_assignments.json`
+- `core_data/legal_hold_policies.json`
+- `core_data/legal_hold_policy_assignments.json`
+- `core_data/shield_information_barriers.json`
+- `core_data/shield_information_barrier_segments.json`
+- `core_data/shield_lists.json`
+- `core_data/collaboration_allowlist_entries.json`
+- `core_data/collaboration_allowlist_exempt_targets.json`
+- `core_data/terms_of_services.json`
+- `core_data/collection_status.json`
+- `analysis/identity_access.json`
+- `analysis/sharing_collaboration.json`
+- `analysis/data_governance.json`
+- `analysis/shield_monitoring.json`
 - `analysis/findings.json`
+- `analysis/summary.json`
 - `compliance/executive_summary.md`
 - `compliance/unified_compliance_matrix.md`
 - `compliance/fedramp/fedramp_compliance_report.md`
@@ -769,6 +919,7 @@ Required paths:
 - `compliance/irap/irap_compliance_report.md`
 - `compliance/ismap/ismap_compliance_report.md`
 - `QUICK_REFERENCE.md`
+- `metadata.json`
 
 Conditional paths:
 
@@ -778,27 +929,59 @@ Conditional paths:
 
 | Path | Format | Required when | Schema | Serialization |
 |---|---|---|---|---|
-| `core_data/{dataset}.json` | json | The dataset is part of the assessment, including explicit not-collected markers. | Projected source records or a structured unavailable marker; unavailable values remain null. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `analysis/findings.json` | json | Always. | Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `compliance/executive_summary.md` | markdown | Always. | Human-readable counts and findings grouped by status. | UTF-8 Markdown. |
-| `compliance/unified_compliance_matrix.md` | markdown | Always. | Finding-to-framework mapping matrix. | UTF-8 Markdown. |
-| `compliance/{framework}/{report}.md` | markdown | Always for each supported framework. | Framework-specific finding rows and mappings. | UTF-8 Markdown. |
-| `QUICK_REFERENCE.md` | markdown | Always. | Bundle navigation and operator next steps. | UTF-8 Markdown. |
-| `_errors.log` | text | At least one collection read failed, was denied, or was incomplete. | Scrubbed collection error summaries without response bodies or credentials. | UTF-8 text. |
+| `core_data/access_check.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_configuration.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/current_user.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/users.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/groups.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_events_activity.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_events_sharing.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_events_shield.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/device_pinners.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/classification_template.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/metadata_templates.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/retention_policies.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/retention_policy_assignments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/legal_hold_policies.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/legal_hold_policy_assignments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/shield_information_barriers.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/shield_information_barrier_segments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/shield_lists.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/collaboration_allowlist_entries.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/collaboration_allowlist_exempt_targets.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/terms_of_services.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/collection_status.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity_access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/sharing_collaboration.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/data_governance.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/shield_monitoring.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/summary.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis/cis_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 
 ### Record schemas
 
 #### finding
 
 - `id`
-- `control`
 - `title`
 - `severity`
 - `status`
 - `summary`
 - `evidence`
-- `mappings`
-- `manualEvidence`
+- `framework mappings`
 
 #### collection_marker
 
@@ -806,25 +989,8 @@ Conditional paths:
 - `status`
 - `endpoint`
 - `error`
-- `reason`
 
-#### access_surface
-
-- `name`
-- `endpoint`
-- `status`
-- `count`
-- `error`
-
-#### assessment
-
-- `area`
-- `title`
-- `summary`
-- `findings`
-- `errors`
-
-#### bundle_manifest
+#### bundle_result
 
 - `outputDir`
 - `zipPath`
@@ -832,10 +998,10 @@ Conditional paths:
 - `findingCount`
 - `errorCount`
 
-JSON formatting: UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
 
-Overwrite policy: Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.
+Overwrite policy: Allocate a new <enterprise>-audit-bundle directory and numeric suffix without overwriting either directory or archive.
 
 Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
 
-Archive pairing: Create box-audit.zip beside the allocated box-audit directory, applying the same suffix to both.
+Archive pairing: Create <allocated-directory>.zip beside the allocated enterprise audit directory.

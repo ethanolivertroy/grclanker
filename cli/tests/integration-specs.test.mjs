@@ -375,6 +375,7 @@ test("every generated pilot spec has one registry owner and llms.txt lists every
 
   const llms = await readFile(resolve(repoRoot, "public/llms.txt"), "utf8");
   const listed = [...llms.matchAll(/\/specs\/([^)\s]+\.spec\.md)\)/g)].map((match) => match[1]).sort();
+  assert.equal(listed.length, new Set(listed).size, "llms.txt contains no duplicate spec catalog entries");
   assert.deepEqual([...new Set(listed)], names);
   assert.doesNotMatch(llms, /Each spec describes a Go CLI/);
 });
