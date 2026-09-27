@@ -85,10 +85,10 @@ export const WEBEX_VERDICT_VALUES = {
 } as const;
 
 export const WEBEX_RUNTIME_BEHAVIOR = {
-  webhookUrlProjection: "retain scheme, host, port, and path while removing user information, query, and fragment",
-  relationlessLink: "A Link value without any rel parameter is classified as unparseable, and the walk stops truncated",
-  repeatedCursor: "A repeated next URL is not detected immediately; the walk continues until the item cap or 1,000-page cap",
-  emptyPageWithNext: "An empty page carrying rel=next is not detected immediately; the walk continues until the item cap or 1,000-page cap",
+  webhookUrlProjection: "retain only scheme, host, and port while removing user information, path, query, and fragment",
+  relationlessLink: "A Link value with a missing or empty rel parameter is malformed and stops the walk truncated; a well-formed Link header with no rel=next relation proves the final page and completes the walk",
+  repeatedCursor: "A repeated next URL is detected before it is requested again, and the walk stops truncated",
+  emptyPageWithNext: "An empty page carrying rel=next stops the walk truncated before the advertised next URL is requested",
   malformedLink: "Any Link header value rejected by the current parser stops the walk truncated",
   crossOriginLink: "A cross-origin next URL is rejected before a second request and the walk stops truncated",
   userinfoLink: "A next URL carrying user information is rejected before a second request and the walk stops truncated",
@@ -814,6 +814,8 @@ export const WEBEX_SPEC: IntegrationSpecContract = {
         WEBEX_RUNTIME_BEHAVIOR.malformedLink,
         "Configured item cap",
         "Page cap",
+        WEBEX_RUNTIME_BEHAVIOR.repeatedCursor,
+        WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext,
         WEBEX_RUNTIME_BEHAVIOR.crossOriginLink,
         WEBEX_RUNTIME_BEHAVIOR.userinfoLink,
       ],
@@ -836,21 +838,18 @@ export const WEBEX_SPEC: IntegrationSpecContract = {
     notRequested: "A dependent request was never issued because its parent inventory was unreadable; name the parent and invent no status.",
     notConfigured: "The surface requires tenant or organization context that was not configured or discoverable.",
   },
-  knownGaps: [
-    `TODO after the follow-up Webex pagination fix lands: ${WEBEX_RUNTIME_BEHAVIOR.relationlessLink}. ${WEBEX_RUNTIME_BEHAVIOR.repeatedCursor}. ${WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext}. These are temporary exceptions to the shared pagination contract.`,
-    `TODO after the follow-up Webex URL-projection fix lands: webhook and callback URL fields currently ${WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection}. This is a temporary exception to the shared origin-only webhook/callback rule.`,
-  ],
+  knownGaps: [],
   redaction: {
     sharedContractVersion: "1.1",
     projections: Object.fromEntries(Object.entries(WEBEX_SURFACE_FIELDS).map(([surface, fields]) => [surface, flattenedFields(fields)])),
     projectionStage: "Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys and values are scrubbed recursively during projection, then the complete value is scrubbed again with configured and runtime credentials at every bundle write sink.",
-    sensitiveFields: ["token", "client_secret", "refresh_token", "password", "secret", "targetUrl query", "downloadUrl query", "playbackUrl query", "webLink query"],
+    sensitiveFields: ["token", "client_secret", "refresh_token", "password", "secret", "targetUrl user information/path/query/fragment", "downloadUrl query", "playbackUrl query", "webLink query"],
     benignExceptions: ["Documented resource identifiers", "Organization identifiers", "Site host names"],
     credentialFormats: ["Bearer credentials", "OAuth client secrets", "Refresh tokens", "Webhook signing secrets", "Meeting passwords", "Credential-bearing URL parameters"],
     integrationRules: [
       "A key containing token, secret, password, passcode, hostpin, hostkey, authorization, accesscode, activationcode, or credential is replaced with [REDACTED], except passwordCriteria, requireStrongPassword, and excludePassword policy objects.",
       "Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, SIP URI pwd/password/pin/passcode/token/secret parameters, and configured credentials in encoded forms are replaced.",
-      `Webhook and callback URL fields currently ${WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection}. Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink follow the same retention rule.`,
+      `Webhook and callback URL fields ${WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection}. Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink retain scheme, host, port, and path while removing user information, query, and fragment.`,
       "Configured token, client secret, refresh token, and refreshed access token values are registered with the shared scrubber before error rendering and bundle writes; non-JSON bodies are represented only by media type and byte length.",
       "Projection retains password and secret fields only so their presence is represented as [REDACTED], never their value.",
       "Every text artifact passes through carrier/configured-secret scrubbing at the write sink. Every JSON artifact passes through recursive data scrubbing before serialization.",

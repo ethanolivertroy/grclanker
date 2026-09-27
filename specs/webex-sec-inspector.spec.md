@@ -44,11 +44,6 @@ Keep the API client, evidence projection, verdict evaluation, and bundle writer 
 
 This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-## Known runtime gaps
-
-- TODO after the follow-up Webex pagination fix lands: A Link value without any rel parameter is classified as unparseable, and the walk stops truncated. A repeated next URL is not detected immediately; the walk continues until the item cap or 1,000-page cap. An empty page carrying rel=next is not detected immediately; the walk continues until the item cap or 1,000-page cap. These are temporary exceptions to the shared pagination contract.
-- TODO after the follow-up Webex URL-projection fix lands: webhook and callback URL fields currently retain scheme, host, port, and path while removing user information, query, and fragment. This is a temporary exception to the shared origin-only webhook/callback rule.
-
 ## Tools
 
 | Tool | Purpose | Finding IDs | Result shape |
@@ -317,7 +312,7 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 
 | Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
 |---|---|---|---|---|---|---|
-| `organizations`, `people`, `roles`, `licenses`, `events`, `admin-audit-events`, `admin-recordings`, `hybrid-clusters`, `hybrid-connectors`, `meetings`, `meeting-sites`, `devices`, `workspaces`, `rooms`, `webhooks` | `Link header rel=next` | service default | caller limit | 1000 | The service does not provide a dependable total for these walks; report items seen and whether exhaustion was proven. | No Link header or a parsed Link header with no rel=next; Any Link header value rejected by the current parser stops the walk truncated; Configured item cap; Page cap; A cross-origin next URL is rejected before a second request and the walk stops truncated; A next URL carrying user information is rejected before a second request and the walk stops truncated |
+| `organizations`, `people`, `roles`, `licenses`, `events`, `admin-audit-events`, `admin-recordings`, `hybrid-clusters`, `hybrid-connectors`, `meetings`, `meeting-sites`, `devices`, `workspaces`, `rooms`, `webhooks` | `Link header rel=next` | service default | caller limit | 1000 | The service does not provide a dependable total for these walks; report items seen and whether exhaustion was proven. | No Link header or a parsed Link header with no rel=next; Any Link header value rejected by the current parser stops the walk truncated; Configured item cap; Page cap; A repeated next URL is detected before it is requested again, and the walk stops truncated; An empty page carrying rel=next stops the walk truncated before the advertised next URL is requested; A cross-origin next URL is rejected before a second request and the walk stops truncated; A next URL carrying user information is rejected before a second request and the walk stops truncated |
 
 ## Rate limits
 
@@ -617,7 +612,7 @@ Shared contract version: 1.1.
 
 Projection stage: Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys and values are scrubbed recursively during projection, then the complete value is scrubbed again with configured and runtime credentials at every bundle write sink.
 
-Sensitive fields and values: token, client_secret, refresh_token, password, secret, targetUrl query, downloadUrl query, playbackUrl query, webLink query
+Sensitive fields and values: token, client_secret, refresh_token, password, secret, targetUrl user information/path/query/fragment, downloadUrl query, playbackUrl query, webLink query
 
 Credential formats: Bearer credentials, OAuth client secrets, Refresh tokens, Webhook signing secrets, Meeting passwords, Credential-bearing URL parameters
 
@@ -627,7 +622,7 @@ Integration-specific rules:
 
 - A key containing token, secret, password, passcode, hostpin, hostkey, authorization, accesscode, activationcode, or credential is replaced with [REDACTED], except passwordCriteria, requireStrongPassword, and excludePassword policy objects.
 - Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, SIP URI pwd/password/pin/passcode/token/secret parameters, and configured credentials in encoded forms are replaced.
-- Webhook and callback URL fields currently retain scheme, host, port, and path while removing user information, query, and fragment. Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink follow the same retention rule.
+- Webhook and callback URL fields retain only scheme, host, and port while removing user information, path, query, and fragment. Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink retain scheme, host, port, and path while removing user information, query, and fragment.
 - Configured token, client secret, refresh token, and refreshed access token values are registered with the shared scrubber before error rendering and bundle writes; non-JSON bodies are represented only by media type and byte length.
 - Projection retains password and secret fields only so their presence is represented as [REDACTED], never their value.
 - Every text artifact passes through carrier/configured-secret scrubbing at the write sink. Every JSON artifact passes through recursive data scrubbing before serialization.

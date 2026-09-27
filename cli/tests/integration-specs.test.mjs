@@ -237,21 +237,21 @@ test("request and pagination metadata matches the concrete pilot clients", () =>
     WEBEX_RUNTIME_BEHAVIOR.malformedLink,
     "Configured item cap",
     "Page cap",
+    WEBEX_RUNTIME_BEHAVIOR.repeatedCursor,
+    WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext,
     WEBEX_RUNTIME_BEHAVIOR.crossOriginLink,
     WEBEX_RUNTIME_BEHAVIOR.userinfoLink,
   ]);
   assert.deepEqual(parseNextLinkHeader("<https://webexapis.com/v1/people?page=2>"), { kind: "unparseable" });
-  assert.match(WEBEX_RUNTIME_BEHAVIOR.relationlessLink, /classified as unparseable/);
-  assert.match(WEBEX_RUNTIME_BEHAVIOR.repeatedCursor, /not detected immediately/);
-  assert.match(WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext, /not detected immediately/);
-  assert.equal(WEBEX_SPEC.knownGaps.length, 2);
-  assert.match(WEBEX_SPEC.knownGaps[0], /temporary exceptions to the shared pagination contract/);
-  assert.match(WEBEX_SPEC.knownGaps[1], /origin-only webhook\/callback rule/);
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.relationlessLink, /missing or empty rel parameter is malformed.*no rel=next relation proves the final page/);
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.repeatedCursor, /detected before it is requested again.*stops truncated/);
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext, /stops the walk truncated before.*next URL is requested/);
+  assert.equal(WEBEX_SPEC.knownGaps.length, 0);
   assert.equal(
     redactSecrets({ targetUrl: "https://example.com/hook/path?token=canary-value" }).targetUrl,
-    "https://example.com/hook/path",
+    "https://example.com",
   );
-  assert.match(WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection, /scheme, host, port, and path/);
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection, /only scheme, host, and port/);
   assert.match(WEBEX_SPEC.redaction.projectionStage, /scrubbed again .* every bundle write sink/);
 });
 

@@ -2180,12 +2180,12 @@ test("WebexApiClient stops an endless rel=next chain at the page ceiling and rep
   const repeated = await new WebexApiClient(sampleConfig(), {
     fetchImpl: async () => {
       calls += 1;
-      return jsonResponse({ items: [] }, { headers: { link: '<https://webexapis.com/v1/roles?cursor=same>; rel="next"' } });
+      return jsonResponse({ items: [{ id: `role-${calls}` }] }, { headers: { link: '<https://webexapis.com/v1/roles?cursor=same>; rel="next"' } });
     },
     maxPages: 3,
   }).listRoles();
-  assert.deepEqual(repeated, { items: [], truncated: true, pageCount: 3 }, "the current runtime reaches the page cap rather than stopping immediately on a repeated empty cursor");
-  assert.equal(calls, 3);
+  assert.deepEqual(repeated, { items: [{ id: "role-1" }, { id: "role-2" }], truncated: true, pageCount: 2 }, "the repeated next URL stops before a third request");
+  assert.equal(calls, 2);
 
   calls = 0;
   const finished = await new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ items: [{ id: "a" }] }), maxPages: 1 }).listRoles();
