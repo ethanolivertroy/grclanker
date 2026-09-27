@@ -18,7 +18,17 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ConfigFileError, parseJsonConfigText, parseYamlConfigText, readConfigText } from "./hardening/index.js";
+import {
+  ConfigFileError,
+  NextLinkError,
+  parseNextLinkHeader,
+  parseJsonConfigText,
+  parseYamlConfigText,
+  readConfigText,
+  resolveSameOriginUrl,
+  type ParsedNextLink,
+} from "./hardening/index.js";
+import { createCredentialScrubber, isCredentialDataKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -346,23 +356,20 @@ function parseTimeoutSeconds(value: number | undefined): number {
   return clampNumber(value, DEFAULT_TIMEOUT_MS / 1000, 1, 300) * 1000;
 }
 
-/** RFC 5988 Link header; only rel="next" is guaranteed by Webex (basics guide). */
+/** RFC 8288 Link header; only rel="next" is guaranteed by Webex (basics guide). */
 export function parseLinkHeaderNext(linkHeader: string | null): string | null {
-  if (!linkHeader) return null;
-  for (const part of linkHeader.split(",")) {
-    const match = part.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
-    if (match?.[1]) return match[1];
-  }
-  return null;
+  const parsed = parseNextLinkHeader(linkHeader);
+  return parsed.kind === "next" ? parsed.target : null;
 }
 
 function serializeJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-const SECRET_KEY_PATTERN = /token|secret|password|passcode|hostpin|hostkey|authorization|accesscode|activationcode|credential/i;
 /** Policy flags from commonSettings.securityOptions that name passwords without holding one. */
-const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword)$/;
+const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword|tokenType|token_type)$/;
+const WEBEX_CREDENTIAL_KEY_PATTERN = /^(hostPin|hostKey|accessCode|activationCode)$/i;
+const webexCredentialScrubber = createCredentialScrubber();
 /**
  * Any scheme-prefixed URL embedded anywhere in a string (not only a whole-value URL):
  * everything from its first ? or # carries no evidence value (RCID, MTID, token parameters).
@@ -370,15 +377,6 @@ const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePass
 const EMBEDDED_URL_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 /** Credential parameters embedded in SIP and tel URIs, for example ;pwd=1234. */
 const URI_CREDENTIAL_PARAM_PATTERN = /;(pwd|password|pin|passcode|token|secret)=[^;?#\s]*/gi;
-/** Key names whose assigned value in free text is treated as a credential. */
-const CREDENTIAL_KEY_WORDS = "token|secret|passw(?:or)?d|pwd|pin|passcode|session|sid|api[_-]?key|apikey|key|bearer|basic|authorization|auth|cookie|credential|access[_-]?key|signature";
-/** `key=value`, `key: value`, or `"key":"value"` where the key names a credential; the value may itself start with Bearer or Basic. */
-const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
-  `\\b"?([A-Za-z0-9_.-]*(?:${CREDENTIAL_KEY_WORDS})[A-Za-z0-9_.-]*)"?\\s*[=:]\\s*"?(?:(?:bearer|basic)\\s+)?[^\\s"'&;,<>]+`,
-  "gi",
-);
-/** A standalone `Bearer <value>` or `Basic <value>` authorization value. */
-const CREDENTIAL_SCHEME_PATTERN = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 
 /**
  * Strips credential-bearing parts from a string while keeping host and path:
@@ -409,9 +407,22 @@ export function scrubValue(value: string): string {
  * ever receives an unscrubbed error string. Idempotent.
  */
 export function scrubErrorText(message: string): string {
-  return scrubValue(message)
-    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (_match, key: string) => `${key}=[REDACTED]`)
-    .replace(CREDENTIAL_SCHEME_PATTERN, (_match, scheme: string) => `${scheme} [REDACTED]`);
+  return webexCredentialScrubber.scrub(scrubValue(message));
+}
+
+function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string): string[] {
+  return [
+    config.token,
+    config.refresh?.clientSecret,
+    config.refresh?.refreshToken,
+    accessToken,
+  ].filter((value): value is string => typeof value === "string" && value.length >= 4);
+}
+
+/** Final bundle sink scrub: configured/runtime credential encodings plus free-text credential carriers. */
+function scrubBundleText(content: string, secrets: readonly string[]): string {
+  webexCredentialScrubber.registerSecrets(secrets);
+  return webexCredentialScrubber.scrub(scrubValue(content), { shapes: false });
 }
 
 /**
@@ -419,17 +430,12 @@ export function scrubErrorText(message: string): string {
  * first is the per-surface allowlist in WEBEX_SURFACE_FIELDS, which decides
  * what reaches the bundle at all.
  */
-export function redactSecrets(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactSecrets);
-  if (typeof value === "string") return scrubValue(value);
-  const object = asObject(value);
-  if (!object) return value;
-  const output: JsonRecord = {};
-  for (const [key, entry] of Object.entries(object)) {
-    const sensitive = SECRET_KEY_PATTERN.test(key) && !POLICY_KEY_PATTERN.test(key);
-    output[key] = sensitive && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry);
-  }
-  return output;
+export function redactSecrets(value: unknown, knownSecrets: readonly string[] = []): unknown {
+  webexCredentialScrubber.registerSecrets(knownSecrets);
+  return webexCredentialScrubber.scrubData(value, {
+    isCredentialKey: (key) => !POLICY_KEY_PATTERN.test(key) && (isCredentialDataKey(key) || WEBEX_CREDENTIAL_KEY_PATTERN.test(key)),
+    transformString: (entry) => scrubValue(entry),
+  });
 }
 
 type FieldSpec = true | { readonly [field: string]: FieldSpec };
@@ -834,10 +840,15 @@ export class WebexApiClient {
     this.sleep = options.sleep ?? ((ms) => new Promise((done) => setTimeout(done, ms)));
     this.maxPages = clampNumber(options.maxPages, MAX_LIST_PAGES, 1, 100_000);
     this.accessToken = config.token;
+    webexCredentialScrubber.registerSecrets(webexCredentialValues(config, this.accessToken));
   }
 
   getResolvedConfig(): WebexResolvedConfig {
     return this.config;
+  }
+
+  knownSecrets(): string[] {
+    return webexCredentialValues(this.config, this.accessToken);
   }
 
   getNow(): Date {
@@ -895,6 +906,7 @@ export class WebexApiClient {
     const accessToken = asString(payload.access_token);
     if (!accessToken) throw new Error("Webex token refresh response did not include access_token.");
     this.accessToken = accessToken;
+    webexCredentialScrubber.registerSecrets([accessToken]);
     return accessToken;
   }
 
@@ -903,7 +915,7 @@ export class WebexApiClient {
     return this.refreshAccessToken();
   }
 
-  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; rawText: string; nextUrl: string | null }> {
+  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; rawText: string; nextLink: ParsedNextLink }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     const endpoint = new URL(url).pathname;
@@ -939,7 +951,7 @@ export class WebexApiClient {
       return {
         payload: payload ?? {},
         rawText,
-        nextUrl: parseLinkHeaderNext(response.headers.get("link")),
+        nextLink: parseNextLinkHeader(response.headers.get("link")),
       };
     } finally {
       clearTimeout(timeout);
@@ -970,17 +982,29 @@ export class WebexApiClient {
     let nextUrl: string | null = this.buildUrl(path, { ...pageQuery, ...query });
 
     while (nextUrl) {
-      const response = await this.fetchJson(nextUrl);
+      const currentUrl: string = nextUrl;
+      const response = await this.fetchJson(currentUrl);
       pageCount += 1;
       const pageItems = extractItems(response.payload);
       const remaining = limit - items.length;
       items.push(...pageItems.slice(0, remaining));
-      nextUrl = response.nextUrl;
+      if (response.nextLink.kind === "unparseable") {
+        return { items, truncated: true, pageCount };
+      }
+      nextUrl = response.nextLink.kind === "next" ? response.nextLink.target : null;
       if (items.length >= limit && (nextUrl || pageItems.length > remaining)) {
         return { items, truncated: true, pageCount };
       }
       if (nextUrl && pageCount >= this.maxPages) {
         return { items, truncated: true, pageCount };
+      }
+      if (nextUrl) {
+        try {
+          nextUrl = resolveSameOriginUrl(nextUrl, currentUrl).toString();
+        } catch (error) {
+          if (!(error instanceof NextLinkError)) throw error;
+          return { items, truncated: true, pageCount };
+        }
       }
     }
 
@@ -1110,7 +1134,7 @@ type WebexClientLike = Pick<
   | "listWorkspaces"
   | "listRooms"
   | "listWebhooks"
->;
+> & { knownSecrets?: () => string[] };
 
 function errorStatus(error: unknown): number | undefined {
   if (error instanceof WebexApiError) return error.status;
@@ -2315,42 +2339,47 @@ export async function exportWebexAuditBundle(
   const assessments = [identity, collaboration, meetingHybrid];
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((item) => `${assessment.category}: ${item}`)))];
+  const secrets = client.knownSecrets?.() ?? webexCredentialValues(config);
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(
     outputRoot,
     `${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`,
   );
+  const writeText = (relativePathname: string, content: string): Promise<void> =>
+    writeSecureTextFile(outputDir, relativePathname, scrubBundleText(content, secrets));
+  const writeJson = (relativePathname: string, value: unknown): Promise<void> =>
+    writeSecureTextFile(outputDir, relativePathname, serializeJson(redactSecrets(value, secrets)));
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await writeText("QUICK_REFERENCE.md", buildQuickReference());
+  await writeJson("metadata.json", {
     generated_at: new Date().toISOString(),
     org_id: config.orgId ?? access.orgId ?? null,
     token_type: access.tokenType,
     source_chain: config.sourceChain,
     config_file: config.configFile ? basename(config.configFile) : null,
-  }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  });
+  await writeJson("core_data/access.json", access);
   for (const assessment of assessments) {
     for (const [name, value] of Object.entries(assessment.rawData)) {
-      await writeSecureTextFile(outputDir, `core_data/${assessment.category}/${name}.json`, serializeJson(value));
+      await writeJson(`core_data/${assessment.category}/${name}.json`, value);
     }
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+    await writeJson(`analysis/${assessment.category}.json`, {
       title: assessment.title,
       category: assessment.category,
       summary: assessment.summary,
       findings: assessment.findings,
       errors: assessment.errors,
-    }));
+    });
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  await writeJson("analysis/findings.json", findings);
+  await writeText("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await writeText("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const key of Object.keys(FRAMEWORK_REPORT_PATHS) as WebexFrameworkKey[]) {
-    await writeSecureTextFile(outputDir, FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
+    await writeText(FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
   }
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await writeText("_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = `${outputDir}.zip`;
