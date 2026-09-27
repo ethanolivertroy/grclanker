@@ -85,13 +85,13 @@ export const WEBEX_VERDICT_VALUES = {
 } as const;
 
 export const WEBEX_RUNTIME_BEHAVIOR = {
-  webhookUrlProjection: "Keep scheme, host, port, and path; remove user information, query, and fragment.",
-  relationlessLink: "A Link value without any rel parameter is classified as unparseable, and the walk stops truncated.",
-  repeatedCursor: "A repeated next URL is not detected immediately; the walk continues until the item cap or 1,000-page cap.",
-  emptyPageWithNext: "An empty page carrying rel=next is not detected immediately; the walk continues until the item cap or 1,000-page cap.",
-  malformedLink: "Any Link header value rejected by the current parser stops the walk truncated.",
-  crossOriginLink: "A cross-origin next URL is rejected before a second request and the walk stops truncated.",
-  userinfoLink: "A next URL carrying user information is rejected before a second request and the walk stops truncated.",
+  webhookUrlProjection: "retain scheme, host, port, and path while removing user information, query, and fragment",
+  relationlessLink: "A Link value without any rel parameter is classified as unparseable, and the walk stops truncated",
+  repeatedCursor: "A repeated next URL is not detected immediately; the walk continues until the item cap or 1,000-page cap",
+  emptyPageWithNext: "An empty page carrying rel=next is not detected immediately; the walk continues until the item cap or 1,000-page cap",
+  malformedLink: "Any Link header value rejected by the current parser stops the walk truncated",
+  crossOriginLink: "A cross-origin next URL is rejected before a second request and the walk stops truncated",
+  userinfoLink: "A next URL carrying user information is rejected before a second request and the walk stops truncated",
 } as const;
 
 export const WEBEX_DEFAULTS = {
@@ -837,8 +837,8 @@ export const WEBEX_SPEC: IntegrationSpecContract = {
     notConfigured: "The surface requires tenant or organization context that was not configured or discoverable.",
   },
   knownGaps: [
-    `TODO after the follow-up Webex pagination fix lands: ${WEBEX_RUNTIME_BEHAVIOR.relationlessLink} ${WEBEX_RUNTIME_BEHAVIOR.repeatedCursor} ${WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext} These are temporary exceptions to the shared pagination contract.`,
-    `TODO after the follow-up Webex URL-projection fix lands: webhook and callback URL fields currently ${WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection.toLowerCase()} This is a temporary exception to the shared origin-only webhook/callback rule.`,
+    `TODO after the follow-up Webex pagination fix lands: ${WEBEX_RUNTIME_BEHAVIOR.relationlessLink}. ${WEBEX_RUNTIME_BEHAVIOR.repeatedCursor}. ${WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext}. These are temporary exceptions to the shared pagination contract.`,
+    `TODO after the follow-up Webex URL-projection fix lands: webhook and callback URL fields currently ${WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection}. This is a temporary exception to the shared origin-only webhook/callback rule.`,
   ],
   redaction: {
     sharedContractVersion: "1.1",
@@ -850,7 +850,7 @@ export const WEBEX_SPEC: IntegrationSpecContract = {
     integrationRules: [
       "A key containing token, secret, password, passcode, hostpin, hostkey, authorization, accesscode, activationcode, or credential is replaced with [REDACTED], except passwordCriteria, requireStrongPassword, and excludePassword policy objects.",
       "Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, SIP URI pwd/password/pin/passcode/token/secret parameters, and configured credentials in encoded forms are replaced.",
-      `Webhook and callback URL fields currently ${WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection.toLowerCase()} Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink follow the same scheme/host/port/path retention.`,
+      `Webhook and callback URL fields currently ${WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection}. Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink follow the same retention rule.`,
       "Configured token, client secret, refresh token, and refreshed access token values are registered with the shared scrubber before error rendering and bundle writes; non-JSON bodies are represented only by media type and byte length.",
       "Projection retains password and secret fields only so their presence is represented as [REDACTED], never their value.",
       "Every text artifact passes through carrier/configured-secret scrubbing at the write sink. Every JSON artifact passes through recursive data scrubbing before serialization.",
