@@ -349,9 +349,8 @@ function parseTimeoutSeconds(value: number | undefined): number {
 /** RFC 5988 Link header; only rel="next" is guaranteed by Webex (basics guide). */
 export function parseLinkHeaderNext(linkHeader: string | null): string | null {
   if (!linkHeader) return null;
-  for (const part of linkHeader.split(",")) {
-    const match = part.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
-    if (match?.[1]) return match[1];
+  for (const match of linkHeader.matchAll(/<([^>]+)>\s*;\s*([^,]*)/gi)) {
+    if (/(?:^|;)\s*rel\s*=\s*"?next"?(?:\s*;|$)/i.test(match[2] ?? "")) return match[1];
   }
   return null;
 }
@@ -362,7 +361,7 @@ function serializeJson(value: unknown): string {
 
 const SECRET_KEY_PATTERN = /token|secret|password|passcode|hostpin|hostkey|authorization|accesscode|activationcode|credential/i;
 /** Policy flags from commonSettings.securityOptions that name passwords without holding one. */
-const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword)$/;
+const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePassword|tokenType|token_type)$/;
 /**
  * Any scheme-prefixed URL embedded anywhere in a string (not only a whole-value URL):
  * everything from its first ? or # carries no evidence value (RCID, MTID, token parameters).
