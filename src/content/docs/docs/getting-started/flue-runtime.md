@@ -1,9 +1,9 @@
 ---
 title: Flue Runtime
-description: Run the grclanker GRC agent, its 241 domain tools, workflow prompts, and personas under the Flue Framework with grclanker flue run or the official flue run CLI.
+description: Run all 241 grclanker domain tools, including 35 implemented integration specs, under the Flue Framework.
 ---
 
-grclanker ships as a Pi-based CLI. The same GRC agent can also run as a [Flue Framework](https://flueframework.com/) agent. Flue is itself built on Pi, so the tools and prompts carry over without changing what they do.
+grclanker ships as a Pi-based CLI. The same GRC agent can also run as a [Flue Framework](https://flueframework.com/) agent. Flue is itself built on Pi, so all 35 implemented integration specs, the full 241-tool registry, and the shipped prompts carry over without changing what they do.
 
 ## What the adapter maps
 

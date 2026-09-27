@@ -52,16 +52,20 @@ const workflowCards = [
 
 const releaseFacts = [
   {
-    label: 'Local-first setup',
-    detail: 'Run grclanker setup. Choose local Ollama + Gemma 4 or save a hosted provider and model.',
+    label: '241 domain tools',
+    detail: 'Native checks, assessments, and evidence exports cover all 35 repository spec integrations, plus CMVP, KEV, EPSS, FedRAMP, Vanta, SCF, and OSCAL.',
   },
   {
-    label: 'What ships in 0.0.1',
-    detail: '241 domain tools, two agents, and four structured workflows around CMVP, KEV, EPSS, official FedRAMP GitHub-grounded 20x and Rev5 lookups, FedRAMP readiness, ADS package planning, starter bundles, portable public trust-center site generation, read-only compliance assessments for AWS, Azure, GCP, OCI, Cloudflare, Webex, Zoom, Ansible AAP, Duo, Okta, GitHub, Google Workspace, Slack, Box, CrowdStrike, Datadog, Elastic, KnowBe4, LaunchDarkly, MuleSoft, New Relic, PagerDuty, Palo Alto Networks, Qualys, Salesforce, ServiceNow, Snowflake, Splunk, Sumo Logic, Tenable, Veracode, Zendesk, and Zscaler, optional Google Workspace CLI operator evidence workflows, Vanta access checks, SCF crosswalks, trestle-backed OSCAL workspaces, and posture triage.',
+    label: 'Three runtime paths',
+    detail: 'Use the Pi terminal CLI, run the same agent from source with the Cursor Agent SDK, or use the bundled Flue runner and official Flue CLI.',
   },
   {
-    label: 'Specs as inputs',
-    detail: `Point grclanker at any of the ${specCount} repo specs when you want it to build one.`,
+    label: 'Hardened evidence',
+    detail: 'Runtime adapters classify read effects, approval-gate writers, and redact credential-shaped arguments. Integration exports scrub sensitive values and avoid overwriting prior bundles.',
+  },
+  {
+    label: 'Implemented specs',
+    detail: `All ${specCount} repository specs now have native tool families and remain reusable build plans for extending grclanker or another agent.`,
   },
 ];
 
@@ -94,7 +98,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
 );
 ---
 
-<Base title="grclanker: Put a Clanker on Your Compliance" description="CMVP certificates, KEV feeds, EPSS scores, framework mappings. One terminal session. Nothing leaves your machine.">
+<Base title="grclanker: Put a Clanker on Your Compliance" description="241 domain tools across 35 implemented integrations, with Pi, Cursor Agent SDK, and Flue runtime paths.">
   <section class="relative overflow-hidden border-b border-surface0/60">
     <div class="absolute inset-0 w-full h-full">
       <img src="/hero/command-center.webp" alt="Clanker command center" class="w-full h-full object-cover object-center" loading="eager" />
@@ -108,7 +112,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
             Your compliance evidence is scattered.<br />Put a clanker on it.
           </h1>
           <p class="mx-auto mt-5 max-w-2xl text-base md:text-lg text-subtext1 leading-relaxed italic hero-copy-lede">
-            CMVP certificates, KEV feeds, EPSS scores, framework mappings. One terminal session. Nothing leaves your machine.
+            241 domain tools. 35 implemented integrations. Pi, Cursor Agent SDK, and Flue runtime paths.
           </p>
         </div>
 
@@ -236,7 +240,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
         <div class="hero-briefing-top">
           <div>
             <h2 class="font-semibold text-sm tracking-widest uppercase text-blue">What You Ask → What It Does</h2>
-            <p class="text-subtext0 text-sm mt-1 italic">What 0.0.1 does well.</p>
+            <p class="text-subtext0 text-sm mt-1 italic">Shipped behavior, not a roadmap.</p>
           </div>
           <div class="hero-briefing-version">0.0.1 experimental</div>
         </div>
@@ -255,7 +259,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
 
           <aside class="hero-briefing-side" aria-label="Release details">
             <p class="hero-briefing-kicker">
-              First release. Tight scope. More is coming.
+              Local-first when you want it. Hosted when you choose it.
             </p>
 
             <div class="hero-fact-list">

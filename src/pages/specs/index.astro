@@ -7,7 +7,7 @@ const specs = loadSpecs();
 const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
 ---
 
-<Base title="Specs — grclanker" description="Browse raw GRC automation specs, copy the URL, and hand the file to any agent.">
+<Base title="Specs: grclanker" description="Browse the 35 implemented GRC integration specs, inspect the shipped tool families, or reuse a raw spec with any agent.">
   <section class="relative overflow-hidden border-b border-surface0/60">
     <div class="absolute inset-0 w-full h-full">
       <img src="/hero/holographic.webp" alt="Spec catalog cockpit display" class="w-full h-full object-cover object-center" loading="eager" />
@@ -17,8 +17,11 @@ const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
     <div class="relative z-10 max-w-content mx-auto px-6 pt-14 pb-14 md:pt-18 md:pb-18">
       <div class="max-w-3xl mx-auto text-center">
         <h1 class="font-bold text-3xl sm:text-4xl md:text-5xl text-text leading-tight hero-text-shadow">
-          Bring your own clanker. Build your own compliance.
+          35 integration specs. 35 native implementations.
         </h1>
+        <p class="mx-auto mt-4 max-w-2xl text-base text-subtext1 leading-relaxed italic">
+          Inspect what shipped, or reuse the raw build plan with any agent.
+        </p>
       </div>
 
       <div class="mt-8 max-w-3xl mx-auto">
@@ -55,7 +58,7 @@ const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
         <div class="max-w-2xl">
           <h2 class="font-semibold text-sm tracking-widest uppercase text-blue mb-2">Use With Any Agent</h2>
           <p class="text-subtext1 text-sm leading-relaxed italic">
-            The long-form command examples live in the docs now so the catalog can stay focused on raw spec discovery and copy flow.
+            Each spec now has a native grclanker tool family. The raw files remain portable inputs for extensions, independent implementations, and review.
           </p>
         </div>
         <a href="/docs/specs/using-specs-as-inputs" class="spec-action-btn spec-action-btn-primary self-start md:self-auto">

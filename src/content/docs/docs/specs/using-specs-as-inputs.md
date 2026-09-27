@@ -1,9 +1,9 @@
 ---
 title: Using Specs as Inputs
-description: Treat the repo’s spec files as build inputs for the companion instead of as a separate product.
+description: Inspect, extend, or reimplement the 35 shipped integration tool families from their repository specs.
 ---
 
-The spec library is still a core surface of the project. The difference now is that the companion is the front door and the specs are one of the things it can work on directly.
+All 35 integration specs in `/specs` now have native implementations in grclanker. The raw files remain useful as design records and portable build inputs.
 
 ## What a spec is
 
@@ -17,15 +17,21 @@ Each spec in `/specs` is a build plan for a GRC automation tool. The file descri
 - build sequence
 - current status
 
-## Use a repo-local spec directly
+## Start with the shipped implementation
+
+Use `grclanker tools` or the [tool catalog](/docs/tools/catalog/) to find the native tool family. Each integration guide documents authentication, collected surfaces, findings, export behavior, and limitations.
+
+## Extend from a repository spec
+
+Ask an agent to compare the spec with the existing implementation before changing it:
 
 ```bash
-grclanker "read specs/aws-sec-inspector.spec.md and build the tool"
+grclanker "read specs/aws-sec-inspector.spec.md, inspect the existing AWS tools, and propose an extension"
 ```
 
 ## Use any agent or interface
 
-If you are not using grclanker directly, the examples below show the same spec handoff pattern across terminal agents, IDE agents, chat UIs, and simple programmatic flows.
+The examples below show the same spec handoff pattern across terminal agents, IDE agents, chat UIs, and programmatic flows. A spec can still seed an independent implementation, but it is no longer only a roadmap.
 
 ## Browse the raw catalog
 
@@ -34,4 +40,4 @@ If you are not using grclanker directly, the examples below show the same spec h
 
 ## Why this matters
 
-This is the bridge between the older “spec-only” site and the companion-first product shape. You no longer need to treat the specs as a separate product line. Install grclanker, then point it at the spec you want to execute against.
+The spec states intent and constraints. The native tool family shows the shipped behavior. Use both when reviewing coverage or planning a change.
