@@ -18,14 +18,15 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import {
   ConfigFileError,
   NextLinkError,
+  isCredentialKey,
   parseJsonConfigText,
   parseYamlConfigText,
   readConfigText,
   resolveSameOriginUrl,
-  scrubDataText as scrubSharedDataText,
 } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -377,15 +378,10 @@ const POLICY_KEY_PATTERN = /^(passwordCriteria|requireStrongPassword|excludePass
 const EMBEDDED_URL_PATTERN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]+/gi;
 /** Credential parameters embedded in SIP and tel URIs, for example ;pwd=1234. */
 const URI_CREDENTIAL_PARAM_PATTERN = /;(pwd|password|pin|passcode|token|secret)=[^;?#\s]*/gi;
-/** Key names whose assigned value in free text is treated as a credential. */
-const CREDENTIAL_KEY_WORDS = "token|secret|passw(?:or)?d|pwd|pin|passcode|session|sid|api[_-]?key|apikey|key|bearer|basic|authorization|auth|cookie|credential|access[_-]?key|signature";
-/** `key=value`, `key: value`, or `"key":"value"` where the key names a credential; the value may itself start with Bearer or Basic. */
-const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(
-  `\\b"?([A-Za-z0-9_.-]*(?:${CREDENTIAL_KEY_WORDS})[A-Za-z0-9_.-]*)"?\\s*[=:]\\s*"?(?:(?:bearer|basic)\\s+)?[^\\s"'&;,<>]+`,
-  "gi",
-);
+/** `key=value`, `key: value`, or `"key":"value"`; the key is classified by the shared segment-aware rule. */
+const CREDENTIAL_ASSIGNMENT_PATTERN = /\b"?([A-Za-z][A-Za-z0-9_.-]{0,127})"?\s*[=:]\s*"?(?:(?:bearer|basic)\s+)?[^\s"'&;,<>]+/gi;
 /** A standalone `Bearer <value>` or `Basic <value>` authorization value. */
-const CREDENTIAL_SCHEME_PATTERN = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+const CREDENTIAL_SCHEME_PATTERN = /\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})/gi;
 
 /**
  * Strips credential-bearing parts from a string while keeping host and path:
@@ -417,8 +413,14 @@ export function scrubValue(value: string): string {
  */
 export function scrubErrorText(message: string): string {
   return scrubValue(message)
-    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (_match, key: string) => `${key}=[REDACTED]`)
-    .replace(CREDENTIAL_SCHEME_PATTERN, (_match, scheme: string) => `${scheme} [REDACTED]`);
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (match, key: string) => (isCredentialKey(key) ? `${key}=[REDACTED]` : match))
+    .replace(CREDENTIAL_SCHEME_PATTERN, (match, scheme: string, value: string) => (
+      /\d|[._~+/=-]/.test(value)
+      || (/[a-z]/.test(value) && /[A-Z]/.test(value))
+      || value.length >= 20
+        ? `${scheme} [REDACTED]`
+        : match
+    ));
 }
 
 function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string): string[] {
@@ -432,7 +434,8 @@ function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string
 
 /** Final bundle sink scrub: configured/runtime credential encodings plus free-text credential carriers. */
 function scrubBundleText(content: string, secrets: readonly string[]): string {
-  return scrubValue(scrubSharedDataText(content, { secrets: [...secrets] }));
+  const scrubbed = scrubSensitiveValues(content, secrets).split(REDACTED_VALUE).join("[REDACTED]");
+  return scrubErrorText(scrubbed);
 }
 
 /**
