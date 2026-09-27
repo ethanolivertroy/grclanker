@@ -114,6 +114,7 @@ export interface BatchSpecDefinition {
 export interface BatchOutputDefinition {
   files: readonly string[];
   conditionalFiles?: readonly string[];
+  conditionalFileConditions?: Readonly<Record<string, string>>;
   overwritePolicy: string;
   archivePairing: string;
   jsonFormatting?: string;
@@ -128,7 +129,9 @@ export function buildBatchOutputContract(definition: BatchOutputDefinition): Exp
       : path.endsWith(".md")
         ? "markdown" as const
         : "text" as const,
-    requiredWhen: conditional.has(path) ? "Only under the runtime condition stated for this conditional file." : "Always.",
+    requiredWhen: conditional.has(path)
+      ? definition.conditionalFileConditions?.[path] ?? "Only under the runtime condition stated for this conditional file."
+      : "Always.",
     schema: path.startsWith("core_data/")
       ? "The projected runtime dataset or its explicit unavailable marker."
       : path.startsWith("analysis/")
