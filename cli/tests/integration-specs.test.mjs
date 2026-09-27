@@ -240,7 +240,16 @@ test("export contracts include the files asserted by pilot bundle tests", () => 
   assert.ok(bySlug["aws-sec-inspector"].conditionalFiles.includes("_errors.log"));
   assert.ok(bySlug["webex-sec-inspector"].conditionalFiles.includes("_errors.log"));
   for (const [slug, output] of Object.entries(bySlug)) {
-    assert.ok(output.artifacts.length >= output.files.length, `${slug}: artifact schemas`);
+    const artifactCovers = (file) => output.artifacts.some((artifact) => {
+      const pattern = artifact.path
+        .split(/(\{[^}]+\})/)
+        .map((part) => part.startsWith("{") ? "[^/]+" : part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("");
+      return new RegExp(`^${pattern}$`).test(file);
+    });
+    for (const file of [...output.files, ...output.conditionalFiles]) {
+      assert.ok(artifactCovers(file), `${slug}: schema for ${file}`);
+    }
     assert.ok(Object.keys(output.recordSchemas).length >= 5, `${slug}: record schemas`);
     assert.match(output.jsonFormatting, /two-space/);
   }
