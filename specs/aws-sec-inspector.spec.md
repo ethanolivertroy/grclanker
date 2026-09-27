@@ -576,13 +576,13 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `AWS-IAM-03` | 1 | manual | `password_policy_readable` equals false |  |
 | `AWS-IAM-03` | 2 | fail | any of (`password_policy_configured` equals false; `password_policy.MinimumPasswordLength` (default 0) is less than 14; `password_policy.RequireSymbols` does not equal true; `password_policy.RequireNumbers` does not equal true; `password_policy.RequireUppercaseCharacters` does not equal true; `password_policy.RequireLowercaseCharacters` does not equal true) |  |
 | `AWS-IAM-03` | 3 | pass | always |  |
-| `AWS-IAM-04` | 1 | manual | any of (`users_readable` equals false; `keys_sampled` is null; all of (`keys_sampled` (default 0) is greater than 0; length of `keys_last_used_unreadable` equals `keys_sampled` (default 0))) |  |
+| `AWS-IAM-04` | 1 | manual | any of (`users_readable` equals false; `keys_sampled` is null; all of (`keys_sampled` (default 0) is greater than 0; `keys_last_used_unreadable_count` (default 0) equals `keys_sampled` (default 0))) |  |
 | `AWS-IAM-04` | 2 | fail | length of `stale_access_keys` is greater than 0 |  |
 | `AWS-IAM-04` | 3 | warn | any of (`user_inventory_truncated` equals true; length of `users_keys_unreadable` is greater than 0; length of `keys_last_used_unreadable` is greater than 0) |  |
 | `AWS-IAM-04` | 4 | pass | always |  |
 | `AWS-IAM-05` | 1 | manual | `roles_readable` equals false |  |
-| `AWS-IAM-05` | 2 | fail | length of `roles_without_boundaries` is greater than `max_privileged_roles` (default 5) |  |
-| `AWS-IAM-05` | 3 | warn | any of (length of `roles_without_boundaries` is greater than 0; `role_inventory_truncated` equals true) |  |
+| `AWS-IAM-05` | 2 | fail | `roles_without_boundaries_count` (default 0) is greater than `max_privileged_roles` (default 5) |  |
+| `AWS-IAM-05` | 3 | warn | any of (`roles_without_boundaries_count` (default 0) is greater than 0; `role_inventory_truncated` equals true) |  |
 | `AWS-IAM-05` | 4 | pass | always |  |
 | `AWS-IAM-06` | 1 | manual | `users_readable` equals false |  |
 | `AWS-IAM-06` | 2 | warn | any of (length of `dormant_users` is greater than 0; `user_inventory_truncated` equals true; length of `users_keys_unreadable` is greater than 0) |  |
@@ -656,7 +656,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `AWS-DATA-22` | 2 | fail | length of `keys_not_rotating` is greater than 0 |  |
 | `AWS-DATA-22` | 3 | warn | any of (`eligible_keys` equals 0; `partial` equals true; length of `keys_rotation_unreadable` is greater than 0; length of `keys_manager_unreadable` is greater than 0; `key_inventory_truncated` equals true; length of `regions_with_list_errors` is greater than 0) |  |
 | `AWS-DATA-22` | 4 | pass | always |  |
-| `AWS-NET-14` | 1 | manual | any of (not (`vpcs` is present and non-null); `vpcs` equals 0; `vpcs_without_active_flow_logs` is null; length of `vpcs_unverified` equals `vpcs` (default 0)) |  |
+| `AWS-NET-14` | 1 | manual | any of (not (`vpcs` is present and non-null); `vpcs` equals 0; `vpcs_without_active_flow_logs` is null; `vpcs_unverified_count` (default 0) equals `vpcs` (default 0)) |  |
 | `AWS-NET-14` | 2 | fail | length of `vpcs_without_active_flow_logs` is greater than 0 |  |
 | `AWS-NET-14` | 3 | warn | any of (`partial` equals true; length of `vpcs_unverified` is greater than 0; `inventory_truncated` equals true; length of `regions_with_vpc_errors` is greater than 0; length of `regions_with_flow_log_errors` is greater than 0) |  |
 | `AWS-NET-14` | 4 | pass | always |  |
@@ -673,8 +673,11 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 
 | Finding | Input | Portable derivation |
 |---|---|---|
+| `AWS-IAM-04` | `keys_last_used_unreadable_count` | Count every sampled access key whose GetAccessKeyLastUsed read is unavailable, before the evidence list is capped at 25. |
+| `AWS-IAM-05` | `roles_without_boundaries_count` | Count every privileged role without PermissionsBoundary, before the evidence list is capped at 25. |
 | `AWS-IAM-07` | `undated_root_events` | Count entries returned by LookupEvents whose EventTime is absent or cannot be parsed as a date. |
 | `AWS-ORG-06` | `undated_assessments` | Count ACTIVE assessment records for which both lastUpdated and creationTime are absent or cannot be parsed as dates. |
+| `AWS-NET-14` | `vpcs_unverified_count` | Count every VPC whose flow-log inventory is unreadable or whose matching flow logs have no ACTIVE status and at least one missing FlowLogStatus, before the evidence list is capped at 25. |
 
 ### Criterion constants
 

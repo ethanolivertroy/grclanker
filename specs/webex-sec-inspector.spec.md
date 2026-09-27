@@ -44,11 +44,6 @@ Keep the API client, evidence projection, verdict evaluation, and bundle writer 
 
 This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-## Known runtime gaps
-
-- TODO after the separate Webex pagination-hardening change lands on main: the current runtime follows a Link rel=next URL unchanged and stops only when the link disappears, the item cap is reached, or the 1,000-page cap is reached. It does not yet reject cross-origin or userinfo-bearing links or stop immediately on repeated cursors or empty pages with a next link. This is a temporary exception to shared contract 1.1.
-- TODO after the separate Webex sink-redaction change lands on main: the current runtime allowlist-projects and key-redacts collected surfaces, scrubs URL query/user information, and scrubs errors, but serializeJson does not run a second whole-value credential scrub immediately before writing. Exported webhook and callback URLs keep scheme, host and path rather than the shared rule's scheme-and-host-only form. These are temporary exceptions to the shared URL and two-pass sink rules.
-
 ## Tools
 
 | Tool | Purpose | Finding IDs | Result shape |
@@ -317,7 +312,7 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 
 | Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
 |---|---|---|---|---|---|---|
-| `organizations`, `people`, `roles`, `licenses`, `events`, `admin-audit-events`, `admin-recordings`, `hybrid-clusters`, `hybrid-connectors`, `meetings`, `meeting-sites`, `devices`, `workspaces`, `rooms`, `webhooks` | `Link header rel=next` | service default | caller limit | 1000 | The service does not provide a dependable total for these walks; report items seen and whether exhaustion was proven. | No next link; Configured item cap; Page cap |
+| `organizations`, `people`, `roles`, `licenses`, `events`, `admin-audit-events`, `admin-recordings`, `hybrid-clusters`, `hybrid-connectors`, `meetings`, `meeting-sites`, `devices`, `workspaces`, `rooms`, `webhooks` | `Link header rel=next` | service default | caller limit | 1000 | The service does not provide a dependable total for these walks; report items seen and whether exhaustion was proven. | No next link; Malformed RFC 8288 Link header; Configured item cap; Page cap; Cross-origin next link; Next link carrying user information |
 
 ## Rate limits
 
@@ -615,7 +610,7 @@ Examples are explanatory, not normative. The ordered first-match conditions abov
 
 Shared contract version: 1.1.
 
-Projection stage: Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys are redacted recursively during projection. The current write sink serializes that prepared value directly; see the temporary sink-redaction gap.
+Projection stage: Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys and values are scrubbed recursively during projection, then the complete value is scrubbed again with configured and runtime credentials at every bundle write sink.
 
 Sensitive fields and values: token, client_secret, refresh_token, password, secret, targetUrl query, downloadUrl query, playbackUrl query, webLink query
 
@@ -626,10 +621,11 @@ Reviewed benign exceptions: Documented resource identifiers, Organization identi
 Integration-specific rules:
 
 - A key containing token, secret, password, passcode, hostpin, hostkey, authorization, accesscode, activationcode, or credential is replaced with [REDACTED], except passwordCriteria, requireStrongPassword, and excludePassword policy objects.
-- Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, and SIP URI pwd/password/pin/passcode/token/secret parameters are replaced.
-- Webhook targetUrl, recording downloadUrl/playbackUrl, meeting webLink, and other URL-valued exported strings retain scheme, host and path but lose query, fragment and user information.
-- Configured token, client secret and refresh token carriers are removed from error text before status/length rendering; non-JSON bodies are represented only by media type and byte length.
+- Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, SIP URI pwd/password/pin/passcode/token/secret parameters, and configured credentials in encoded forms are replaced.
+- Webhook and callback URL fields retain only scheme and host. Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink retain scheme, host and path but lose query, fragment and user information.
+- Configured token, client secret, refresh token, and refreshed access token values are registered with the shared scrubber before error rendering and bundle writes; non-JSON bodies are represented only by media type and byte length.
 - Projection retains password and secret fields only so their presence is represented as [REDACTED], never their value.
+- Every text artifact passes through carrier/configured-secret scrubbing at the write sink. Every JSON artifact passes through recursive data scrubbing before serialization.
 
 Projected fields by surface:
 
@@ -679,11 +675,11 @@ Conditional paths:
 | Path | Format | Required when | Schema | Serialization |
 |---|---|---|---|---|
 | `QUICK_REFERENCE.md` | markdown | Always | Heading, five bundle-orientation bullets, then a four-step recommended reading order. | UTF-8 with a trailing newline. |
-| `metadata.json` | json | Always | Object: generated_at string, org_id string\|null, token_type person\|bot\|appuser\|unknown, source_chain string[], config_file basename\|string\|null. | Two-space JSON with insertion-order keys and one trailing newline. |
-| `core_data/access.json` | json | Always | WebexAccessCheckResult record described below. | Errors are scrubbed during collection; serialize the prepared value as two-space JSON with one trailing newline. |
-| `core_data/{category}/{surface}.json` | json | For every collected assessment surface | Readable surface: projected object or array using that surface allowlist. Unreadable surface: {error: scrubbed string, status: number\|null}. | Project and key-redact the collected surface, then serialize as two-space JSON with one trailing newline. |
-| `analysis/{category}.json` | json | For identity, collaboration-governance and meeting-hybrid-security | Object: title string, category string, summary object, findings WebexFinding[], errors string[]. | Serialize the normalized assessment as two-space JSON with insertion-order keys and one trailing newline. |
-| `analysis/findings.json` | json | Always | Array of WebexFinding records in assessment order: identity, collaboration governance, meeting/hybrid. | Serialize normalized findings as two-space JSON with one trailing newline. |
+| `metadata.json` | json | Always | Object: generated_at string, org_id string\|null, token_type person\|bot\|appuser\|unknown, source_chain string[], config_file basename\|string\|null. | Recursively scrub with configured/runtime secrets, then serialize as two-space JSON with insertion-order keys and one trailing newline. |
+| `core_data/access.json` | json | Always | WebexAccessCheckResult record described below. | Scrub errors during collection, recursively scrub the complete value at the sink, then serialize as two-space JSON with one trailing newline. |
+| `core_data/{category}/{surface}.json` | json | For every collected assessment surface | Readable surface: projected object or array using that surface allowlist. Unreadable surface: {error: scrubbed string, status: number\|null}. | Project the collected surface, recursively scrub with configured/runtime secrets, then serialize as two-space JSON with one trailing newline. |
+| `analysis/{category}.json` | json | For identity, collaboration-governance and meeting-hybrid-security | Object: title string, category string, summary object, findings WebexFinding[], errors string[]. | Recursively scrub the normalized assessment at the sink, then serialize as two-space JSON with insertion-order keys and one trailing newline. |
+| `analysis/findings.json` | json | Always | Array of WebexFinding records in assessment order: identity, collaboration governance, meeting/hybrid. | Recursively scrub normalized findings at the sink, then serialize as two-space JSON with one trailing newline. |
 | `compliance/executive_summary.md` | markdown | Always | Org and generated timestamp; Result Counts; Highest Priority Findings sorted by status rank and capped at 12; optional Partial Collection Warnings. | UTF-8 Markdown with one trailing newline. |
 | `compliance/unified_compliance_matrix.md` | markdown | Always | Finding, spec control, uppercase status, then one column for each of eight frameworks. | UTF-8 Markdown table with one trailing newline. |
 | `compliance/{framework}/{report}.md` | markdown | One file for every configured framework | Framework heading, mapped-finding count, then Requirement, Finding, Status, Title, Summary table. | UTF-8 Markdown with one trailing newline. |
@@ -791,7 +787,7 @@ Conditional paths:
 - `fail`
 - `manual`
 
-JSON formatting: Serialize the already normalized/projected value with two-space indentation, preserve object insertion order, encode dates as ISO strings through the platform JSON conversion, and append exactly one newline. The current runtime has no second sink-level scrub; see Known gaps.
+JSON formatting: Recursively scrub the complete normalized/projected value with configured and runtime credentials immediately before writing. Serialize with two-space indentation, preserve object insertion order, encode dates as ISO strings through the platform JSON conversion, and append exactly one newline.
 
 Overwrite policy: Allocate a new suffixed bundle directory on every rerun; never replace an earlier bundle.
 
