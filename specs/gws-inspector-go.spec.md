@@ -691,6 +691,10 @@ Required paths:
 - `analysis/monitoring.md`
 - `compliance/executive_summary.md`
 - `compliance/unified_compliance_matrix.md`
+- `QUICK_REFERENCE.md`
+
+Conditional paths:
+
 - `compliance/fedramp/fedramp_compliance_report.md`
 - `compliance/cmmc/cmmc_compliance_report.md`
 - `compliance/soc2/soc2_compliance_report.md`
@@ -699,10 +703,6 @@ Required paths:
 - `compliance/disa_stig/stig_compliance_checklist.md`
 - `compliance/irap/irap_compliance_report.md`
 - `compliance/ismap/ismap_compliance_report.md`
-- `QUICK_REFERENCE.md`
-
-Conditional paths:
-
 - `_errors.log`
 
 ### Artifact schemas
@@ -729,16 +729,16 @@ Conditional paths:
 | `analysis/monitoring.md` | markdown | Always. | Runtime assessment or finding records. | UTF-8 text. |
 | `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
 | `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/cis/cis_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
-| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
 | `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
-| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | When the effective framework selection includes fedramp. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | When the effective framework selection includes cmmc. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | When the effective framework selection includes soc2. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis/cis_compliance_report.md` | markdown | When the effective framework selection includes cis. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | When the effective framework selection includes pci_dss. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | When the effective framework selection includes disa_stig. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | When the effective framework selection includes irap. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | When the effective framework selection includes ismap. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | When at least one collection error or truncation warning exists. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 
 ### Record schemas
 
