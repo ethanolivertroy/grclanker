@@ -16,7 +16,18 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ConfigFileError, describePagination, readYamlConfig, type ConfigFileFailureKind, type ConfigFileResult, type PaginationStop } from "./hardening/index.js";
+import {
+  ConfigFileError,
+  NextLinkError,
+  describePagination,
+  parseNextLinkHeader,
+  readYamlConfig,
+  resolveSameOriginUrl,
+  type ConfigFileFailureKind,
+  type ConfigFileResult,
+  type ParsedNextLink,
+  type PaginationStop,
+} from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -895,15 +906,6 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
-function parseLinkNext(linkHeader: string | null): string | undefined {
-  if (!linkHeader) return undefined;
-  for (const part of linkHeader.split(",")) {
-    const match = part.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
-    if (match) return match[1];
-  }
-  return undefined;
-}
-
 /**
  * aiNotifications.destinations and aiNotifications.channels document a per-account `error { details }` object beside
  * the entities list. A non-null error makes the account unreadable instead of an empty inventory.
@@ -1732,8 +1734,8 @@ export class NewrelicApiClient {
     return url.toString();
   }
 
-  async restGet(pathOrUrl: string, query: JsonRecord = {}): Promise<{ payload: JsonRecord; nextUrl?: string }> {
-    const url = this.buildRestUrl(pathOrUrl, query);
+  async restGet(pathOrUrl: string, query: JsonRecord = {}): Promise<{ payload: JsonRecord; nextLink: ParsedNextLink }> {
+    const url = resolveSameOriginUrl(this.buildRestUrl(pathOrUrl, query), this.config.restBaseUrl).toString();
     const response = await this.requestWithRetry(url, {
       method: "GET",
       headers: {
@@ -1749,7 +1751,7 @@ export class NewrelicApiClient {
       const detail = title ?? describeOpaqueBody(response, rawText, parsed ? "JSON error body without a documented error.title" : "non-JSON error body");
       throw this.failure(`REST API v2 request failed for GET ${new URL(url).pathname} (${httpStatusLabel(response)})`, detail);
     }
-    return { payload: parsed ?? {}, nextUrl: parseLinkNext(response.headers.get("link")) };
+    return { payload: parsed ?? {}, nextLink: parseNextLinkHeader(response.headers.get("link")) };
   }
 
   async restList(path: string, collectionKey: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
@@ -1757,12 +1759,25 @@ export class NewrelicApiClient {
     let url: string | undefined = path;
     let limitReached = false;
     for (let page = 0; url && page < MAX_PAGES && items.length < limit; page += 1) {
-      const { payload, nextUrl } = await this.restGet(url);
+      const currentUrl = this.buildRestUrl(url);
+      const { payload, nextLink } = await this.restGet(currentUrl);
       const pageItems = asRecords(payload[collectionKey]);
       const kept = pageItems.slice(0, Math.max(0, limit - items.length));
       items.push(...kept);
       if (kept.length < pageItems.length) limitReached = true;
-      url = nextUrl;
+      if (nextLink.kind === "unparseable") {
+        return { items, complete: false, note: `stopped after ${items.length} items because the Link header could not be parsed` };
+      }
+      if (nextLink.kind === "absent") {
+        url = undefined;
+      } else {
+        try {
+          url = resolveSameOriginUrl(nextLink.target, currentUrl).toString();
+        } catch (error) {
+          if (!(error instanceof NextLinkError)) throw error;
+          return { items, complete: false, note: `stopped after ${items.length} items because ${error.message}` };
+        }
+      }
     }
     if (limitReached) {
       return { items, complete: false, note: `stopped after ${items.length} items at the ${limit} item limit with more items available` };

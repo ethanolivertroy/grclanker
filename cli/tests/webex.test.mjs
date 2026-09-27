@@ -741,6 +741,72 @@ test("WebexApiClient follows Link pagination to completion, reports truncation, 
   assert.equal(parseLinkHeaderNext('<https://a/prev>; rel="prev"'), null);
 });
 
+test("WebexApiClient follows only same-origin next links without userinfo", async () => {
+  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`) {
+    const requests = [];
+    const fetchImpl = async (input, init = {}) => {
+      const url = new URL(input.toString());
+      requests.push({ url, authorization: init.headers?.authorization });
+      if (requests.length === 1) {
+        return jsonResponse(
+          { items: [{ id: "person-1" }] },
+          { headers: { link: linkHeader } },
+        );
+      }
+      return jsonResponse({ items: [{ id: "person-2" }] });
+    };
+    const result = await new WebexApiClient(sampleConfig({ token: "webex-pagination-token" }), { fetchImpl }).listPeople(10);
+    return { requests, result };
+  }
+
+  const sameOrigin = await walk("https://webexapis.com/v1/people?after=safe");
+  assert.deepEqual(sameOrigin.result.items.map((item) => item.id), ["person-1", "person-2"]);
+  assert.equal(sameOrigin.result.truncated, false);
+  assert.equal(sameOrigin.requests.length, 2);
+  assert.equal(sameOrigin.requests[1].authorization, "Bearer webex-pagination-token");
+
+  const crossOrigin = await walk("https://attacker.example/collect");
+  assert.deepEqual(crossOrigin.result.items.map((item) => item.id), ["person-1"]);
+  assert.equal(crossOrigin.result.truncated, true);
+  assert.equal(crossOrigin.requests.length, 1, "the bearer token must never be sent off-origin");
+
+  const userinfo = await walk("https://svc:password@webexapis.com/v1/people?after=unsafe");
+  assert.deepEqual(userinfo.result.items.map((item) => item.id), ["person-1"]);
+  assert.equal(userinfo.result.truncated, true);
+  assert.equal(userinfo.requests.length, 1, "a userinfo-bearing next link must never be requested");
+
+  const relationList = await walk(
+    "https://webexapis.com/v1/people?after=relation-list",
+    '<https://webexapis.com/v1/people?after=relation-list>; title="page two, continued"; REL="prev next"',
+  );
+  assert.deepEqual(relationList.result.items.map((item) => item.id), ["person-1", "person-2"]);
+  assert.equal(relationList.result.truncated, false);
+  assert.equal(relationList.requests.length, 2);
+
+  const quotedCommaForeign = await walk(
+    "https://attacker.example/collect",
+    '<https://attacker.example/collect>; title="page one, continued"; rel=next',
+  );
+  assert.equal(quotedCommaForeign.result.truncated, true);
+  assert.equal(quotedCommaForeign.requests.length, 1);
+
+  const malformed = await walk(
+    "unused",
+    '<https://webexapis.com/v1/people?after=2>; title="unterminated; rel=next',
+  );
+  assert.equal(malformed.result.truncated, true);
+  assert.equal(malformed.requests.length, 1, "an unparseable Link header is partial, not exhaustion");
+
+  for (const linkHeader of [
+    '<https://attacker.example/collect>; title="missing relation"',
+    '<https://attacker.example/collect>; rel=""',
+  ]) {
+    const unusable = await walk("unused", linkHeader);
+    assert.equal(unusable.result.truncated, true, linkHeader);
+    assert.equal(unusable.requests.length, 1, `an unusable relation is partial: ${linkHeader}`);
+  }
+});
+
 test("WebexApiClient sends max only where the reference documents it and orgId only where documented", async () => {
   const seen = [];
   const fetchImpl = async (input) => {
@@ -1749,6 +1815,83 @@ test("rule 9: no fake secret from any carrier reaches any bundle file or any zip
   assert.equal(findings.find((item) => item.id === "WEBEX-MTG-02").status, "pass");
 });
 
+test("exportWebexAuditBundle applies configured-secret and credential-carrier redaction at the write sink", async () => {
+  const configuredSecret = "S3cr3t???Value";
+  const encodedSecrets = [
+    encodeURIComponent(configuredSecret),
+    Buffer.from(configuredSecret).toString("base64"),
+    Buffer.from(configuredSecret).toString("base64url"),
+  ];
+  assert.equal(new Set(encodedSecrets).size, 3, "the URL, base64, and base64url fixtures are distinct");
+  const alphabeticSecret = "lowercasesecret";
+  const bearerSecret = "SINKBEARERm4n8b2v6c0x5";
+  const assignmentSecret = "SINKASSIGNMENTp3o7i1u5y9t2";
+  const baseClient = compliantClient();
+  const client = compliantClient({
+    async getMe() {
+      return {
+        ...(await baseClient.getMe()),
+        displayName: configuredSecret,
+      };
+    },
+    async listPeople() {
+      const people = await baseClient.listPeople();
+      return page([
+        ...people.items.map((person, index) => ({
+          ...person,
+          displayName: index === 0
+            ? `Bearer ${bearerSecret}`
+            : index === 1
+              ? `token=${assignmentSecret}`
+              : encodedSecrets[index - 2] ?? person.displayName,
+        })),
+        { id: "legit-monkey", displayName: "Monkey: Business", emails: ["monkey@example.com"], type: "person", roles: [] },
+        { id: "legit-basic", displayName: "Basic authentication", emails: ["basic@example.com"], type: "person", roles: [] },
+        { id: "legit-basic-title", displayName: "Basic Authentication", emails: ["basic-title@example.com"], type: "person", roles: [] },
+        { id: "legit-bearer-name", displayName: "Bearer Anderson", emails: ["anderson@example.com"], type: "person", roles: [] },
+        { id: "alphabetic-bearer", displayName: `Bearer ${alphabeticSecret}`, emails: ["secret@example.com"], type: "person", roles: [] },
+      ]);
+    },
+  });
+  const base = createTempBase("grclanker-webex-sink-redaction-");
+  const result = await exportWebexAuditBundle(
+    client,
+    sampleConfig({
+      token: configuredSecret,
+      refresh: { clientId: "client-id", clientSecret: alphabeticSecret, refreshToken: "refresh-secret-value" },
+    }),
+    base,
+  );
+
+  const forbidden = [configuredSecret, ...encodedSecrets, alphabeticSecret, bearerSecret, assignmentSecret];
+  for (const file of walkFiles(result.outputDir)) {
+    const content = readFileSync(file, "utf8");
+    for (const secret of forbidden) assert.equal(content.includes(secret), false, `${secret} leaked into ${relative(result.outputDir, file)}`);
+  }
+  for (const entry of readZipEntries(readFileSync(result.zipPath))) {
+    for (const secret of forbidden) assert.equal(entry.content.includes(secret), false, `${secret} leaked into zip:${entry.name}`);
+  }
+
+  const peoplePath = "core_data/identity/people.json";
+  const peopleJson = readFileSync(join(result.outputDir, peoplePath), "utf8");
+  const people = JSON.parse(peopleJson);
+  assert.ok(people.some((person) => person.displayName === "Monkey: Business"));
+  assert.ok(people.some((person) => person.displayName === "Basic authentication"));
+  assert.ok(people.some((person) => person.displayName === "Basic Authentication"));
+  assert.ok(people.some((person) => person.displayName === "Bearer Anderson"));
+  assert.ok(people.some((person) => person.id === "alphabetic-bearer" && person.displayName === "Bearer [REDACTED]"));
+  for (const secret of encodedSecrets) assert.equal(peopleJson.includes(secret), false, `${secret} leaked into ${peoplePath}`);
+
+  const peopleZip = readZipEntries(readFileSync(result.zipPath)).find((entry) => entry.name === peoplePath);
+  assert.ok(peopleZip, `${peoplePath} must be present in the zip`);
+  assert.match(peopleZip.content, /Monkey: Business/);
+  assert.match(peopleZip.content, /Basic authentication/);
+  assert.match(peopleZip.content, /Basic Authentication/);
+  assert.match(peopleZip.content, /Bearer Anderson/);
+  assert.doesNotMatch(peopleZip.content, /Bearer lowercasesecret/);
+  for (const secret of encodedSecrets) assert.equal(peopleZip.content.includes(secret), false, `${secret} leaked into zip:${peoplePath}`);
+});
+
 /** Rule 9 error path: one canary per carrier that only an error response can bring into the bundle. */
 const ERROR_CANARIES = {
   json_message_url_token: "FAKE-ERROR-URL-TOKEN-c1a2n3",
@@ -1803,16 +1946,16 @@ test("scrubErrorText is the one scrub for error strings: unanchored URL queries,
   assert.equal(scrubValue("see https://h/x?token=abc; then https://h/y?token=def, done"), "see https://h/x; then https://h/y, done");
   assert.equal(scrubValue("prefix https://h/x?q=1 sip:u@h;pwd=9;transport=tls"), "prefix https://h/x sip:u@h;transport=tls");
 
-  assert.equal(scrubErrorText("Authorization: Bearer abc123def456ghi"), "Authorization=[REDACTED]");
+  assert.equal(scrubErrorText("Authorization: Bearer abc123def456ghi"), "Authorization: Bearer [REDACTED]");
   assert.equal(scrubErrorText("upstream bearer=FAKE-1234 failed"), "upstream bearer=[REDACTED] failed");
   assert.equal(scrubErrorText("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig expired"), "Bearer [REDACTED] expired");
-  assert.equal(scrubErrorText("Set-Cookie: session=s7e8s9; Path=/"), "Set-Cookie=[REDACTED]; Path=/", "a credential-named header takes its whole value");
+  assert.equal(scrubErrorText("Set-Cookie: session=s7e8s9; Path=/"), "Set-Cookie: [REDACTED]", "a credential-named header takes its whole value");
   assert.equal(scrubErrorText("cookie session=s7e8s9; Path=/"), "cookie session=[REDACTED]; Path=/");
-  assert.equal(scrubErrorText("JSESSIONID=abc123; sid: 42"), "JSESSIONID=[REDACTED]; sid=[REDACTED]");
-  assert.equal(scrubErrorText("X-Api-Key: k1e2y3 rejected"), "X-Api-Key=[REDACTED] rejected");
-  assert.equal(scrubErrorText('body {"access_token":"tok123","expires_in":3600}'), 'body {"access_token=[REDACTED]","expires_in":3600}');
+  assert.equal(scrubErrorText("JSESSIONID=abc123; sid: 42"), "JSESSIONID=[REDACTED]; sid: [REDACTED]");
+  assert.equal(scrubErrorText("X-Api-Key: k1e2y3 rejected"), "X-Api-Key: [REDACTED] rejected");
+  assert.equal(scrubErrorText('body {"access_token":"tok123","expires_in":3600}'), 'body {"access_token":"[REDACTED]","expires_in":3600}');
   assert.equal(scrubErrorText("client_secret=s3cr3t&grant_type=refresh_token&refresh_token=r7"), "client_secret=[REDACTED]&grant_type=refresh_token&refresh_token=[REDACTED]");
-  assert.equal(scrubErrorText("password: hunter2, pwd=x1, passcode=9, api_key=k, apikey=k2, credential=c, signature=s"), "password=[REDACTED], pwd=[REDACTED], passcode=[REDACTED], api_key=[REDACTED], apikey=[REDACTED], credential=[REDACTED], signature=[REDACTED]");
+  assert.equal(scrubErrorText("password: hunter2, pwd=x1, passcode=9, api_key=k, apikey=k2, credential=c, signature=s"), "password: [REDACTED], pwd=[REDACTED], passcode=[REDACTED], api_key=[REDACTED], apikey=[REDACTED], credential=[REDACTED], signature=[REDACTED]");
   assert.equal(scrubErrorText("Webex request failed (403 Forbidden) for /people: see https://idbroker.webex.com/authorize?token=abc to continue"), "Webex request failed (403 Forbidden) for /people: see https://idbroker.webex.com/authorize to continue");
 
   const plain = [
@@ -1828,7 +1971,7 @@ test("scrubErrorText is the one scrub for error strings: unanchored URL queries,
   }
 
   const error = new WebexApiError("Webex request failed (401 Unauthorized) for /people: Authorization: Bearer abc123def456ghi at https://h/x?token=t", 401, "/people");
-  assert.equal(error.message, "Webex request failed (401 Unauthorized) for /people: Authorization=[REDACTED] at https://h/x", "the constructor scrubs, so no consumer can receive an unscrubbed API error");
+  assert.equal(error.message, "Webex request failed (401 Unauthorized) for /people: Authorization: Bearer [REDACTED] at https://h/x", "the constructor scrubs, so no consumer can receive an unscrubbed API error");
   assert.equal(error.status, 401);
   assert.equal(error.endpoint, "/people");
 });
@@ -1892,8 +2035,8 @@ test("fetchJson never places a response body in an error string: non-JSON bodies
   });
   const identity = await assessWebexIdentity(networkFailure);
   const rolesError = identity.errors.find((item) => item.startsWith("roles: "));
-  assert.equal(rolesError, "roles: connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization=[REDACTED]", "non-API errors are scrubbed where they become surface errors");
-  assert.deepEqual(identity.summary.inventory_status.roles, { readable: false, status: null, error: "connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization=[REDACTED]" });
+  assert.equal(rolesError, "roles: connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization: Bearer [REDACTED]", "non-API errors are scrubbed where they become surface errors");
+  assert.deepEqual(identity.summary.inventory_status.roles, { readable: false, status: null, error: "connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization: Bearer [REDACTED]" });
   assert.equal(byId(identity.findings, "WEBEX-ID-02").evidence.admin_count, null);
   const rendered = JSON.stringify(identity);
   for (const canary of [ERROR_CANARIES.network_url_token, ERROR_CANARIES.network_bearer]) assert.ok(!rendered.includes(canary), `${canary} must not reach any assessment field`);

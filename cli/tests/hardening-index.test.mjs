@@ -6,10 +6,19 @@ import * as collectionStatus from "../dist/extensions/grc-tools/hardening/collec
 import * as configFile from "../dist/extensions/grc-tools/hardening/config-file.js";
 import * as contract from "../dist/extensions/grc-tools/hardening/contract.js";
 import * as errorText from "../dist/extensions/grc-tools/hardening/error-text.js";
+import * as linkHeader from "../dist/extensions/grc-tools/hardening/link-header.js";
 import * as nextLink from "../dist/extensions/grc-tools/hardening/next-link.js";
 import * as pagination from "../dist/extensions/grc-tools/hardening/pagination.js";
 
-const MODULES = { "collection-status": collectionStatus, "config-file": configFile, contract, "error-text": errorText, "next-link": nextLink, pagination };
+const MODULES = {
+  "collection-status": collectionStatus,
+  "config-file": configFile,
+  contract,
+  "error-text": errorText,
+  "link-header": linkHeader,
+  "next-link": nextLink,
+  pagination,
+};
 
 test("the hardening index re-exports every runtime export of every module, each exactly once", () => {
   const seen = new Map();

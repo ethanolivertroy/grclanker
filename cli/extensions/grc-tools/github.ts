@@ -20,7 +20,7 @@ import { STATUS_CODES } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { systemErrorCode } from "./hardening/index.js";
+import { NextLinkError, parseNextLinkHeader, resolveSameOriginUrl, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -264,6 +264,7 @@ export interface GitHubEnterpriseIdentitySnapshot {
 export interface GitHubPaginatedRecords {
   records: JsonRecord[];
   truncated: boolean;
+  truncationReason?: string;
 }
 
 export interface GitHubAuditLogSnapshot {
@@ -2003,9 +2004,9 @@ export class GitHubAuditorClient {
   // Unlimited lists have no truncation channel, so the only truncated exit they can hit (a Link
   // header that repeats a page) surfaces as an error and the dependent dataset renders Manual.
   private async paginate(pathname: string): Promise<JsonRecord[]> {
-    const { records, truncated } = await this.paginateWithStatus(pathname, Number.POSITIVE_INFINITY);
+    const { records, truncated, truncationReason } = await this.paginateWithStatus(pathname, Number.POSITIVE_INFINITY);
     if (truncated) {
-      throw new Error(`GitHub pagination for ${pathname} repeated a page already fetched (Link rel="next" loop); inventory incomplete after ${records.length} record(s)`);
+      throw new Error(`GitHub pagination for ${pathname} stopped before completion after ${records.length} record(s)${truncationReason ? `: ${truncationReason}` : ""}`);
     }
     return records;
   }
@@ -2026,9 +2027,11 @@ export class GitHubAuditorClient {
     const visited = new Set<string>();
     let nextPath: string | null = pathname;
     let truncated = false;
+    let truncationReason: string | undefined;
 
     while (nextPath) {
-      visited.add(this.buildUrl(nextPath));
+      const currentUrl = this.buildUrl(nextPath);
+      visited.add(currentUrl);
       const { response, payload } = await this.requestJson(nextPath);
       const pageRecords = extractRecords(payload);
       for (const record of pageRecords) {
@@ -2040,7 +2043,26 @@ export class GitHubAuditorClient {
       }
       if (truncated) break;
 
-      nextPath = parseNextLink(response.headers.get("link"));
+      const parsedNext = parseNextLinkHeader(response.headers.get("link"));
+      if (parsedNext.kind === "unparseable") {
+        truncated = true;
+        truncationReason = "Link header could not be parsed";
+        nextPath = null;
+        break;
+      }
+      if (parsedNext.kind === "next") {
+        try {
+          nextPath = resolveSameOriginUrl(parsedNext.target, currentUrl).toString();
+        } catch (error) {
+          if (!(error instanceof NextLinkError)) throw error;
+          truncated = true;
+          truncationReason = error.message;
+          nextPath = null;
+          break;
+        }
+      } else {
+        nextPath = null;
+      }
       if (nextPath && collected.length >= limit) {
         truncated = true;
         break;
@@ -2048,22 +2070,17 @@ export class GitHubAuditorClient {
       // A next link that points back at a page already fetched can never complete the inventory.
       if (nextPath && visited.has(this.buildUrl(nextPath))) {
         truncated = true;
+        truncationReason = "Link rel=\"next\" repeated a page already fetched";
         break;
       }
     }
 
-    return { records: collected, truncated };
+    return { records: collected, truncated, truncationReason };
   }
 }
 
 export function clearGitHubTokenCacheForTests(): void {
   installationTokenCache.clear();
-}
-
-function parseNextLink(linkHeader: string | null): string | null {
-  if (!linkHeader) return null;
-  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/i);
-  return match?.[1] ?? null;
 }
 
 interface GraphqlPageStep {

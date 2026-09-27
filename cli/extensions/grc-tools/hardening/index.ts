@@ -78,3 +78,6 @@ export {
   SHARED_PAGINATION_STOP_KINDS,
   SHARED_REDACTION_RULES,
 } from "./contract.js";
+
+export { parseNextLinkHeader } from "./link-header.js";
+export type { ParsedNextLink } from "./link-header.js";

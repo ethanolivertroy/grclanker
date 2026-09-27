@@ -827,6 +827,121 @@ test("GitHubAuditorClient handles installation token refresh, rate limits, and p
   assert.equal(state.rulesetRateLimitCount, 1);
 });
 
+test("GitHubAuditorClient follows only same-origin REST next links without userinfo", async () => {
+  function clientFor(nextLink, requests, relation = 'rel="next"') {
+    return new GitHubAuditorClient(createSampleConfig(), async (input, init = {}) => {
+      const url = new URL(input.toString());
+      requests.push({ url, authorization: init.headers?.Authorization });
+      if (requests.length === 1) {
+        return new Response(
+          JSON.stringify([{ full_name: "example-org/repo-one" }]),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              link: `<${nextLink}>; ${relation}`,
+            },
+          },
+        );
+      }
+      return new Response(
+        JSON.stringify([{ full_name: "example-org/repo-two" }]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+  }
+
+  const sameOriginRequests = [];
+  const sameOrigin = await clientFor(
+    "https://api.github.com/orgs/example-org/repos?per_page=100&page=2",
+    sameOriginRequests,
+  ).listRepositories();
+  assert.deepEqual(sameOrigin.map((repo) => repo.full_name), ["example-org/repo-one", "example-org/repo-two"]);
+  assert.equal(sameOriginRequests.length, 2);
+  assert.equal(sameOriginRequests[1].authorization, "Bearer ghp_test");
+
+  const crossOriginRequests = [];
+  await assert.rejects(
+    clientFor("https://attacker.example/collect", crossOriginRequests).listRepositories(),
+    /does not share the configured origin https:\/\/api\.github\.com/,
+  );
+  assert.equal(crossOriginRequests.length, 1, "the GitHub token must never be sent off-origin");
+
+  const userinfoRequests = [];
+  await assert.rejects(
+    clientFor("https://svc:password@api.github.com/orgs/example-org/repos?page=2", userinfoRequests).listRepositories(),
+    /carries userinfo/,
+  );
+  assert.equal(userinfoRequests.length, 1, "a userinfo-bearing next link must never be requested");
+
+  const variantRequests = [];
+  const variant = await clientFor(
+    "https://api.github.com/orgs/example-org/repos?per_page=100&page=2",
+    variantRequests,
+    'type="application/json"; title="page two, continued"; rel="last next"',
+  ).listRepositories();
+  assert.deepEqual(variant.map((repo) => repo.full_name), ["example-org/repo-one", "example-org/repo-two"]);
+  assert.equal(variantRequests.length, 2, "valid Link parameters before an unquoted rel=next are followed");
+
+  const rejectedVariantRequests = [];
+  await assert.rejects(
+    clientFor(
+      "https://attacker.example/collect",
+      rejectedVariantRequests,
+      'type="application/json"; title="page one, continued"; rel="next last"',
+    ).listRepositories(),
+    /does not share the configured origin https:\/\/api\.github\.com/,
+  );
+  assert.equal(rejectedVariantRequests.length, 1, "a foreign Link relation variant is rejected, not treated as exhaustion");
+
+  const malformedRequests = [];
+  await assert.rejects(
+    clientFor(
+      "unused",
+      malformedRequests,
+      'title="unterminated; rel=next',
+    ).listRepositories(),
+    /Link header could not be parsed/,
+  );
+  assert.equal(malformedRequests.length, 1, "an unparseable Link header is incomplete, not exhaustion");
+
+  const finiteRejectedRequests = [];
+  const finiteRejected = await clientFor(
+    "https://attacker.example/collect",
+    finiteRejectedRequests,
+    'title="page one, continued"; rel="next last"',
+  ).listAuditLog();
+  assert.equal(finiteRejected.truncated, true);
+  assert.equal(finiteRejectedRequests.length, 1);
+
+  const finiteMalformedRequests = [];
+  const finiteMalformed = await clientFor(
+    "unused",
+    finiteMalformedRequests,
+    'title="unterminated; rel=next',
+  ).listAuditLog();
+  assert.equal(finiteMalformed.truncated, true);
+  assert.equal(finiteMalformedRequests.length, 1);
+
+  for (const relation of ['title="missing relation"', 'rel=""']) {
+    const unusableRequests = [];
+    await assert.rejects(
+      clientFor("https://attacker.example/collect", unusableRequests, relation).listRepositories(),
+      /Link header could not be parsed/,
+    );
+    assert.equal(unusableRequests.length, 1, `an unusable relation is incomplete: ${relation}`);
+
+    const finiteUnusableRequests = [];
+    const finiteUnusable = await clientFor(
+      "https://attacker.example/collect",
+      finiteUnusableRequests,
+      relation,
+    ).listAuditLog();
+    assert.equal(finiteUnusable.truncated, true, relation);
+    assert.equal(finiteUnusableRequests.length, 1);
+  }
+});
+
 test("GitHub assessment helpers classify sample posture correctly", () => {
   const config = createSampleConfig();
   const orgAccess = assessGitHubOrgAccess(createOrgAccessData(), config);

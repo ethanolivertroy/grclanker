@@ -1511,6 +1511,59 @@ test("QualysApiClient follows WARNING/URL continuation, retries 409 with X-RateL
   await assert.rejects(() => qpsError.searchWebApps(), /WAS module is not enabled/);
 });
 
+test("QualysApiClient follows only same-origin WARNING/URL continuations without userinfo", async () => {
+  async function walk(nextLink) {
+    const requests = [];
+    const client = new QualysApiClient(sampleConfig(), {
+      fetchImpl: async (input, init = {}) => {
+        const url = new URL(input.toString());
+        requests.push({ url, authorization: init.headers.get("Authorization") });
+        if (requests.length === 1) {
+          return xmlResponse(`<HOST_LIST_OUTPUT><RESPONSE><HOST_LIST><HOST><ID>1</ID></HOST></HOST_LIST><WARNING><CODE>1980</CODE><TEXT>truncated</TEXT><URL><![CDATA[${nextLink}]]></URL></WARNING></RESPONSE></HOST_LIST_OUTPUT>`);
+        }
+        return xmlResponse("<HOST_LIST_OUTPUT><RESPONSE><HOST_LIST><HOST><ID>2</ID></HOST></HOST_LIST></RESPONSE></HOST_LIST_OUTPUT>");
+      },
+      sleepImpl: async () => {},
+    });
+    const result = await client.listHosts(50);
+    return { requests, result };
+  }
+
+  const sameOrigin = await walk("https://qualysapi.qualys.com/api/2.0/fo/asset/host/?action=list&id_min=2");
+  assert.deepEqual(sameOrigin.result.items.map((host) => host.ID), ["1", "2"]);
+  assert.equal(sameOrigin.result.truncated, false);
+  assert.equal(sameOrigin.requests.length, 2);
+  assert.equal(sameOrigin.requests[1].authorization, `Basic ${Buffer.from("acme_api:s3cret-value").toString("base64")}`);
+
+  const crossOrigin = await walk("https://attacker.example/collect");
+  assert.deepEqual(crossOrigin.result.items.map((host) => host.ID), ["1"]);
+  assert.equal(crossOrigin.result.truncated, true);
+  assert.match(crossOrigin.result.truncationReason, /attacker\.example/);
+  assert.equal(crossOrigin.requests.length, 1);
+
+  const userinfo = await walk("https://svc:password@qualysapi.qualys.com/api/2.0/fo/asset/host/?action=list&id_min=2");
+  assert.deepEqual(userinfo.result.items.map((host) => host.ID), ["1"]);
+  assert.equal(userinfo.result.truncated, true);
+  assert.match(userinfo.result.truncationReason, /carries userinfo/);
+  assert.equal(userinfo.requests.length, 1);
+});
+
+test("QualysApiClient marks an empty page with a WARNING/URL continuation truncated", async () => {
+  let requests = 0;
+  const client = new QualysApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      requests += 1;
+      return xmlResponse("<HOST_LIST_OUTPUT><RESPONSE><HOST_LIST /><WARNING><CODE>1980</CODE><TEXT>truncated</TEXT><URL><![CDATA[?id_min=2]]></URL></WARNING></RESPONSE></HOST_LIST_OUTPUT>");
+    },
+    sleepImpl: async () => {},
+  });
+
+  const result = await client.listHosts(50);
+  assert.equal(requests, 1, "the stalled walk stops before requesting another empty page");
+  assert.equal(result.truncated, true);
+  assert.match(result.truncationReason, /empty page.*WARNING\/URL continuation/);
+});
+
 test("rule 7: QualysApiClient runs pagination to completion or records truncation instead of trusting the first page", async () => {
   const client = routedClient(partialRouter);
 
