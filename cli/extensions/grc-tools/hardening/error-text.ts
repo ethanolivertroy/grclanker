@@ -121,9 +121,11 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 // solidus `\/`: a JSON encoder may write every "/" of a URL as `\/`, so
 // `https:\/\/svc:<value>@api.example.com\/v1\/items` is the same URL and loses its userinfo, query, and
 // fragment the same way, its escaped separators kept as written.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\[[0-9A-Fa-f:.]+\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
 const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+const HOST_AND_PORT_PATTERN = /^(?:\[[^\]\s]*\]|[^:\[\]@\\]+)(?::\d*)?$/;
+const PATH_START_PATTERN = /\\?\//;
 
 // A relative path or bare query string: the named parameter keeps its name, the value goes. A
 // backslash ends the value so a JSON-escaped closing quote is kept. A ";" does not end it:
@@ -219,7 +221,7 @@ const AUTH_PARAM_BARE_VALUE_PATTERN = /[^\s,"'<>()[\]{}\\]+/y;
 // value also stops at "&" and the closing brackets of a JSON or query fragment. A backslash ends both
 // so a JSON-escaped closing quote is kept, and neither can begin at "[" so the marker is never a value.
 const HEADER_BARE_VALUE_PATTERN = /[^\s,;"'<>()[\]{}\\]+/y;
-const PAIR_BARE_VALUE_PATTERN = /[^\s"',;&<>()[\]{}\\]+/y;
+const PAIR_BARE_VALUE_PATTERN = /[^\s"',&<>()[\]{}\\]+/y;
 // Punctuation that closes a clause rather than a value (`password: <value>.`, `token=<value>:`); it is
 // left standing after the marker so the sentence keeps its shape.
 const CLAUSE_PUNCTUATION_PATTERN = /[.:]+$/;
@@ -540,7 +542,7 @@ function isCredentialWordSetting(key: string): boolean {
   const segments = keySegments(key);
   if (segments.length < 2) return false;
   const stem = segments.slice(0, -1).join("_");
-  return namesCredential(stem) || WEBHOOK_KEY_PATTERN.test(stem);
+  return namesCredential(stem) || WEBHOOK_KEY_PATTERN.test(stem) || segments.slice(0, -1).some((segment) => /^webhooks?$/.test(segment));
 }
 
 /**
@@ -622,13 +624,35 @@ function scrubConfiguredSecrets(text: string, secrets: ScrubErrorTextOptions["se
   return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED);
 }
 
+function splitAuthorityPort(authority: string): { host: string; port: string } {
+  if (authority.startsWith("[")) {
+    const close = authority.indexOf("]");
+    if (close < 0) return { host: authority, port: "" };
+    const port = authority.slice(close + 1);
+    return /^:\d+$/.test(port) ? { host: authority.slice(0, close + 1), port } : { host: authority, port: "" };
+  }
+  const port = /:\d+$/.exec(authority)?.[0] ?? "";
+  return { host: port ? authority.slice(0, -port.length) : authority, port };
+}
+
 function scrubEmbeddedUrl(match: string): string {
   const trailing = TRAILING_PUNCTUATION_PATTERN.exec(match)?.[0] ?? "";
   const url = match.slice(0, match.length - trailing.length);
   const parts = URL_PARTS_PATTERN.exec(url);
   if (!parts) return match;
   const [, scheme, hostAndPath, query, fragment] = parts;
-  return `${scheme}${hostAndPath}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}${trailing}`;
+  const pathStart = hostAndPath.search(PATH_START_PATTERN);
+  const tail = `${query ?? ""}${fragment ?? ""}`;
+  const at = tail.indexOf("@");
+  if (pathStart === -1 && at !== -1 && !HOST_AND_PORT_PATTERN.test(hostAndPath)) {
+    return `${scheme}${tail.slice(at + 1)}`.replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl) + trailing;
+  }
+  const authority = pathStart === -1 ? hostAndPath : hostAndPath.slice(0, pathStart);
+  const { host, port } = splitAuthorityPort(authority);
+  const scrubbedHostAndPath = !host.startsWith("[") && !host.includes(".") && looksLikeToken(host)
+    ? `${REDACTED}${port}${pathStart === -1 ? "" : hostAndPath.slice(pathStart)}`
+    : hostAndPath;
+  return `${scheme}${scrubbedHostAndPath}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}${trailing}`;
 }
 
 function scrubQueryPair(match: string, separator: string, key: string): string {
@@ -805,7 +829,17 @@ function replaceCarrierValues(text: string, carrierPattern: RegExp, readValue: V
 function readBareValue(text: string, index: number, barePattern: RegExp): string | null {
   const bare = stickyExec(barePattern, text, index);
   if (bare === null) return null;
-  const value = bare.replace(CLAUSE_PUNCTUATION_PATTERN, "");
+  let value = bare;
+  if (barePattern === PAIR_BARE_VALUE_PATTERN) {
+    if (value.endsWith(";")) value = value.slice(0, -1);
+    for (let semicolon = value.indexOf(";"); semicolon >= 0; semicolon = value.indexOf(";", semicolon + 1)) {
+      if (stickyExec(FOLLOWING_HEADER_PATTERN, text, index + semicolon) !== null) {
+        value = value.slice(0, semicolon);
+        break;
+      }
+    }
+  }
+  value = value.replace(CLAUSE_PUNCTUATION_PATTERN, "");
   if (value.length === 0 || value.startsWith("=") || isBlankOrScrubbed(value) || JSON_LITERAL_PATTERN.test(value)) return null;
   return value;
 }

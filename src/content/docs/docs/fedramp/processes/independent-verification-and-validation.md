@@ -4,8 +4,8 @@ description: Official Consolidated Rules summary for the IVV FedRAMP process, in
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `7d628b63fdd9`.
-> Consolidated Rules version: `2026.07.02.02` · upstream `last_updated`: `2026-07-02`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
+> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Independent Verification and Validation
@@ -43,7 +43,7 @@ This ruleset explains the expectations for independent verification and validati
 
 Providers MUST document and explain the use of representative samples during verification and validation when using representative samples as allowed by IVV-CSO-USR (Use Representative Samples).
 
-Terms: `Provider`, `Validation`, `Verification`
+Terms: `Validation`, `Verification`
 
 Affects: Providers
 
@@ -58,7 +58,7 @@ Varies by certification class:
 - **Class C MUST:** Providers with Class C Certifications MUST persistently complete an independent verification and validation assessment of all applicable FedRAMP rules with a FedRAMP Recognized independent assessment service OR FedRAMP at least once per year; this is a FedRAMP independent assessment.
 - **Class D MUST:** Providers with Class D Certifications MUST persistently complete an independent verification and validation assessment of all applicable FedRAMP rules with a FedRAMP Recognized independent assessment service OR FedRAMP at least once per year; this is a FedRAMP independent assessment.
 
-Terms: `Certification Class`, `FedRAMP Independent Assessment`, `FedRAMP Recognized`, `Persistently`, `Provider`, `Validation`, `Verification`
+Terms: `Certification Class`, `FedRAMP Independent Assessment`, `FedRAMP Recognized`, `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -75,7 +75,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST supply the results of FedRAMP independent assessments in their FedRAMP Certification Package without inappropriate modification.
 
-Terms: `Certification Package`, `FedRAMP Independent Assessment`, `Provider`, `Verification`
+Terms: `Certification Package`, `FedRAMP Independent Assessment`, `Verification`
 
 Affects: Providers
 
@@ -88,7 +88,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY ask for and accept advice from their assessor during assessment regarding techniques and procedures that will improve their security posture or the effectiveness, clarity, and accuracy of their verification, validation and reporting procedures, UNLESS doing so is likely to compromise the objectivity and integrity of the assessment.
 
-Terms: `Assessor`, `Likely`, `Provider`, `Validation`, `Verification`
+Terms: `Likely`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -98,7 +98,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST supply evidence to all necessary assessors of the effectiveness of the measures that have been implemented to meet FedRAMP Practices; this evidence is the result of validation.
 
-Terms: `All Necessary Assessors`, `Assessor`, `FedRAMP Practices`, `Provider`, `Validation`
+Terms: `All Necessary Assessors`, `FedRAMP Practices`, `Validation`
 
 Affects: Providers
 
@@ -110,7 +110,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST supply evidence to all necessary assessors of the implementation of the measures that have been documented to meet FedRAMP Practices; this evidence is the result of verification.
 
-Terms: `All Necessary Assessors`, `Assessor`, `FedRAMP Practices`, `Provider`, `Verification`
+Terms: `All Necessary Assessors`, `FedRAMP Practices`, `Verification`
 
 Affects: Providers
 
@@ -122,7 +122,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD supply all necessary assessors with technical explanations, demonstrations, and other relevant supporting information about the technical capabilities they employ to address FedRAMP rules; this SHOULD be supplied as necessary to ensure the assessor can effectively complete verification and validation.
 
-Terms: `All Necessary Assessors`, `Assessor`, `Provider`, `Validation`, `Verification`
+Terms: `All Necessary Assessors`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -132,7 +132,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MAY use representative samples as appropriate during verification and validation.
 
-Terms: `Persistently`, `Provider`, `Validation`, `Verification`
+Terms: `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -144,8 +144,6 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors SHOULD engage provider experts in discussion to understand the decisions made by the provider and inform expert qualitative assessment, and SHOULD perform independent research to test such information as part of the expert qualitative assessment process.
 
-Terms: `Assessor`, `Provider`
-
 Affects: Assessors
 
 Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
@@ -154,7 +152,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST supply the provider with an overall summary of the verification and validation assessment results, including any resulting failures or areas of dispute; this summary will be included by the provider in the FedRAMP Certification Package Overview for the cloud service offering.
 
-Terms: `Assessor`, `Certification Package`, `Cloud Service Offering`, `Provider`, `Validation`, `Verification`
+Terms: `Certification Package`, `Cloud Service Offering`, `Validation`, `Verification`
 
 Affects: Assessors
 
@@ -166,7 +164,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MAY share advice with providers they are assessing about techniques and procedures that will improve the provider's security posture or the effectiveness, clarity, and accuracy of their verification, validation and reporting procedures, UNLESS doing so is likely to compromise the objectivity and integrity of the assessment.
 
-Terms: `Assessor`, `Likely`, `Provider`, `Validation`, `Verification`
+Terms: `Likely`, `Validation`, `Verification`
 
 Affects: Assessors
 
@@ -176,7 +174,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST supply the provider with a high-level summary of their assessment process and findings for each FedRAMP Practice; this summary will be included by the provider in the FedRAMP Security Decision Record for the cloud service offering.
 
-Terms: `Assessor`, `Cloud Service Offering`, `FedRAMP Practices`, `Provider`, `Security Decision Record (SDR)`
+Terms: `Cloud Service Offering`, `FedRAMP Practices`, `Security Decision Record (SDR)`
 
 Affects: Assessors
 
@@ -188,7 +186,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST validate the effectiveness of the implemented measures to ensure they have the intended outcome for meeting FedRAMP Practices.
 
-Terms: `Assessor`, `FedRAMP Practices`, `Validation`
+Terms: `FedRAMP Practices`, `Validation`
 
 Affects: Assessors
 
@@ -200,7 +198,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST verify that the measures implemented by the cloud service offering matches the measures they documented to meet FedRAMP Practices.
 
-Terms: `Assessor`, `Cloud Service Offering`, `FedRAMP Practices`, `Verification`
+Terms: `Cloud Service Offering`, `FedRAMP Practices`, `Verification`
 
 Affects: Assessors
 
@@ -212,7 +210,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Assessors MUST verify that information supplied during a FedRAMP independent assessment is included in the FedRAMP Certification Package by the provider without inappropriate modification.
 
-Terms: `Assessor`, `Certification Package`, `FedRAMP Independent Assessment`, `Provider`, `Verification`
+Terms: `Certification Package`, `FedRAMP Independent Assessment`, `Verification`
 
 Affects: Assessors
 
@@ -231,7 +229,7 @@ Varies by certification class:
 - **Class C MUST:** Providers with 20x Class C Certifications MUST include all Key Security Indicators in a FedRAMP independent assessment at least once per year.
 - **Class D MUST:** Providers with 20x Class D Certifications MUST include all Key Security Indicators in a FedRAMP independent assessment at least once per year.
 
-Terms: `FedRAMP Independent Assessment`, `Persistently`, `Provider`, `Validation`, `Verification`
+Terms: `FedRAMP Independent Assessment`, `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
@@ -245,7 +243,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST have Rev5 Controls with negative findings from the previous FedRAMP independent assessment included in the next FedRAMP independent assessment.
 
-Terms: `FedRAMP Independent Assessment`, `Provider`
+Terms: `FedRAMP Independent Assessment`
 
 Affects: Providers
 
@@ -259,7 +257,7 @@ Varies by certification class:
 - **Class C MUST:** Providers with Rev5 Class C Certifications MUST include the following Rev5 Controls in a FedRAMP independent assessment at least once per year:
 - **Class D MUST:** Providers with Rev5 Class D Certifications MUST include the following Rev5 Controls in a FedRAMP independent assessment at least once per year:
 
-Terms: `FedRAMP Independent Assessment`, `Provider`
+Terms: `FedRAMP Independent Assessment`
 
 Affects: Providers
 
@@ -271,9 +269,11 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers MUST have all applicable Rev5 Controls included in FedRAMP independent assessments every 3 years but are not required to have all Rev5 Controls included in the same FedRAMP independent assessment.
 
-Terms: `FedRAMP Independent Assessment`, `Provider`
+Terms: `FedRAMP Independent Assessment`
 
 Affects: Providers
+
+Structured timeframe: `3` years
 
 Note: Traditionally this has been done by reviewing a rotating selection of Rev5 Controls at each annual assessment, however this requirement is a ceiling and not a floor. See IVV-CSF-PCA (Preferred Control Assessment) for FedRAMP's recommended approach to Rev5 control assessments.
 
@@ -283,7 +283,7 @@ Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules 
 
 Providers SHOULD include all applicable Rev5 Controls in each FedRAMP independent assessment.
 
-Terms: `FedRAMP Independent Assessment`, `Provider`
+Terms: `FedRAMP Independent Assessment`
 
 Affects: Providers
 
