@@ -1,9 +1,9 @@
 ---
 title: Cursor Agent SDK
-description: Run all 241 grclanker domain tools, including 35 implemented integration specs, as a Cursor Agent SDK agent built on @cursor/july.
+description: Run all 241 grclanker domain tools as a Cursor Agent SDK agent built on @cursor/july.
 ---
 
-grclanker ships a Cursor Agent SDK project next to the Pi terminal CLI. It is built on [`@cursor/july`](https://www.npmjs.com/package/@cursor/july), the early-alpha package behind the `agent-sdk` CLI. It lives in `cli/agent-sdk/` and adapts the bundled extension instead of duplicating it, so all 35 implemented integration specs stay on the same 241-tool registry.
+grclanker ships a Cursor Agent SDK project next to the Pi terminal CLI. It is built on [`@cursor/july`](https://www.npmjs.com/package/@cursor/july), the early-alpha package behind the `agent-sdk` CLI. It lives in `cli/agent-sdk/` and adapts the bundled 241-tool domain registry instead of duplicating it. Separately, each of the 35 integrations has a repository spec under `/specs`; those files document the integrations and are not runtime registry entries.
 
 ## What the agent exposes
 

@@ -1,9 +1,9 @@
 ---
 title: Using Specs as Inputs
-description: Inspect, extend, or reimplement the 35 shipped integration tool families from their repository specs.
+description: Inspect, extend, or reimplement 35 shipped integrations using the repository spec for each one.
 ---
 
-All 35 integration specs in `/specs` now have native implementations in grclanker. The raw files remain useful as design records and portable build inputs.
+grclanker ships 35 integrations, each with a repository spec under `/specs`. The raw files remain useful as design records and portable build inputs; they are not runtime registry entries.
 
 ## What a spec is
 

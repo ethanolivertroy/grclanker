@@ -37,7 +37,7 @@ vanta_export_audit {"audit_id":"audit_123"}
 
 ## Export layout
 
-The default output root is `./export/vanta`. Each run allocates a new audit directory and matching zip instead of overwriting an earlier export.
+The default output root is `./export/vanta`. The audit directory name is deterministic: customer, framework, and the first eight characters of the audit ID. Re-exporting the same audit to the same root reuses that directory and replaces the paired zip. Choose a different `output_dir` or move the completed package first when prior exports must be preserved.
 
 An export contains:
 
@@ -49,7 +49,7 @@ An export contains:
 - `_errors.log` when individual downloads fail
 - a zip archive paired with the output directory
 
-Directories use mode `0700` and files use `0600`. The exporter rejects symlinked output paths and symlinks encountered while creating the zip. Treat the package as sensitive audit evidence and store or share it accordingly.
+Directories use mode `0700` and files use `0600`. The exporter rejects symlinked output paths and symlinks found during its pre-archive scan. Treat the package as sensitive audit evidence and store or share it accordingly.
 
 ## Live smoke
 
