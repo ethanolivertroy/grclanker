@@ -9,6 +9,7 @@ import {
   AWS_SPEC,
   AWS_VERDICT_VALUES,
 } from "../dist/extensions/grc-tools/aws.spec.js";
+import { parseNextLinkHeader } from "../dist/extensions/grc-tools/hardening/link-header.js";
 import {
   SHARED_COLLECTION_STATES,
   SHARED_DATASET_STATES,
@@ -18,9 +19,10 @@ import {
 } from "../dist/extensions/grc-tools/hardening/contract.js";
 import { checkContract, collectDefinedGrcTools, evaluateVerdictCriteria, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
-import { resolveWebexConfiguration } from "../dist/extensions/grc-tools/webex.js";
+import { redactSecrets, resolveWebexConfiguration } from "../dist/extensions/grc-tools/webex.js";
 import {
   WEBEX_ENV,
+  WEBEX_RUNTIME_BEHAVIOR,
   WEBEX_SCOPES,
   WEBEX_SPEC,
   WEBEX_VERDICT_VALUES,
@@ -231,14 +233,25 @@ test("request and pagination metadata matches the concrete pilot clients", () =>
   assert.ok(webexPaged.includes("organizations"));
   assert.ok(webexPaged.includes("roles"));
   assert.deepEqual(WEBEX_SPEC.pagination[0].stopConditions, [
-    "No next link",
-    "Malformed RFC 8288 Link header",
+    "No Link header or a parsed Link header with no rel=next",
+    WEBEX_RUNTIME_BEHAVIOR.malformedLink,
     "Configured item cap",
     "Page cap",
-    "Cross-origin next link",
-    "Next link carrying user information",
+    WEBEX_RUNTIME_BEHAVIOR.crossOriginLink,
+    WEBEX_RUNTIME_BEHAVIOR.userinfoLink,
   ]);
-  assert.deepEqual(WEBEX_SPEC.knownGaps, []);
+  assert.deepEqual(parseNextLinkHeader("<https://webexapis.com/v1/people?page=2>"), { kind: "unparseable" });
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.relationlessLink, /classified as unparseable/);
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.repeatedCursor, /not detected immediately/);
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.emptyPageWithNext, /not detected immediately/);
+  assert.equal(WEBEX_SPEC.knownGaps.length, 2);
+  assert.match(WEBEX_SPEC.knownGaps[0], /temporary exceptions to the shared pagination contract/);
+  assert.match(WEBEX_SPEC.knownGaps[1], /origin-only webhook\/callback rule/);
+  assert.equal(
+    redactSecrets({ targetUrl: "https://example.com/hook/path?token=canary-value" }).targetUrl,
+    "https://example.com/hook/path",
+  );
+  assert.match(WEBEX_RUNTIME_BEHAVIOR.webhookUrlProjection, /scheme, host, port, and path/);
   assert.match(WEBEX_SPEC.redaction.projectionStage, /scrubbed again .* every bundle write sink/);
 });
 
