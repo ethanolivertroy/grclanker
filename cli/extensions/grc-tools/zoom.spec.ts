@@ -164,7 +164,7 @@ export const ZOOM_SPEC = buildBatchIntegrationSpec({
   credentialFormats: ["Zoom OAuth bearer tokens", "OAuth client secrets", "meeting start and join URLs"],
   output: buildBatchOutputContract({
     files: [
-      "README.md", "QUICK_REFERENCE.md", "metadata.json", "core_data/access.json", "core_data/current_user.json",
+      "README.md", "QUICK_REFERENCE.md", "metadata.json", "summary.md", "core_data/access.json", "core_data/current_user.json",
       "core_data/account_settings.json", "core_data/account_lock_settings.json", "core_data/users.json", "core_data/roles.json",
       "core_data/groups.json", "core_data/im_groups.json", "core_data/managed_domains.json", "core_data/trusted_domains.json",
       "core_data/operation_logs.json", "core_data/phone_account_settings.json", "analysis/findings.json", "analysis/identity.json",

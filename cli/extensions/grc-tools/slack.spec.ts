@@ -189,10 +189,10 @@ export const SLACK_SPEC = buildBatchIntegrationSpec({
   output: buildBatchOutputContract({
     files: [
       "README.md", "QUICK_REFERENCE.md", "metadata.json", "core_data/access.json", "core_data/identity.json",
-      "core_data/admin_access.json", "core_data/integrations.json", "core_data/channel_governance.json", "core_data/monitoring.json",
-      "analysis/identity.json", "analysis/admin_access.json", "analysis/integrations.json", "analysis/channel_governance.json",
-      "analysis/monitoring.json", "reports/identity.md", "reports/admin_access.md", "reports/integrations.md",
-      "reports/channel_governance.md", "reports/monitoring.md", "analysis/findings.json",
+      "core_data/admin-access.json", "core_data/integrations.json", "core_data/channel-governance.json", "core_data/monitoring.json",
+      "analysis/identity.json", "analysis/admin-access.json", "analysis/integrations.json", "analysis/channel-governance.json",
+      "analysis/monitoring.json", "reports/identity.md", "reports/admin-access.md", "reports/integrations.md",
+      "reports/channel-governance.md", "reports/monitoring.md", "analysis/findings.json",
       "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md", "compliance/fedramp.md",
       "compliance/cmmc.md", "compliance/soc-2.md", "compliance/cis.md", "compliance/pci-dss.md",
       "compliance/stig.md", "compliance/irap.md", "compliance/ismap.md",
