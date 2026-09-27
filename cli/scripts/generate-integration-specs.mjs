@@ -13,7 +13,10 @@ import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-r
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 export const repoRoot = resolve(scriptDir, "../..");
 export const sharedContractPath = resolve(repoRoot, "specs/integration-contract.md");
+export const llmsPath = resolve(repoRoot, "public/llms.txt");
 const generatedMarker = "<!-- generated integration spec -->";
+const llmsCatalogStart = "<!-- generated integration registry start -->";
+const llmsCatalogEnd = "<!-- generated integration registry end -->";
 const reservedHeading = /^#{1,6}\s+(?:Tools|Authentication|API surfaces|Checks|Pagination|Hardening|Export layout)\b/im;
 const frameworkColumns = [
   ["fedramp", "FedRAMP"],
@@ -456,6 +459,22 @@ export async function renderAllIntegrationSpecs() {
     validateDecisionInputs(entry.contract);
     outputs.set(resolve(repoRoot, entry.outputPath), renderIntegrationSpec(entry, narrative, tools));
   }
+  const llms = await readFile(llmsPath, "utf8");
+  const generatedCatalog = [
+    llmsCatalogStart,
+    "### Generated portable contracts",
+    "",
+    ...PUBLISHED_INTEGRATION_SPECS.map((entry) =>
+      `- [${entry.contract.identity.displayName}](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/${entry.outputPath}): ${entry.contract.identity.summary}`),
+    llmsCatalogEnd,
+  ].join("\n");
+  const blockPattern = new RegExp(`${llmsCatalogStart}[\\s\\S]*?${llmsCatalogEnd}`);
+  outputs.set(
+    llmsPath,
+    blockPattern.test(llms)
+      ? llms.replace(blockPattern, generatedCatalog)
+      : `${llms.trimEnd()}\n\n${generatedCatalog}\n`,
+  );
   return outputs;
 }
 
