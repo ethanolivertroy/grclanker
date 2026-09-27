@@ -94,7 +94,7 @@ test("every rule has boundary coverage and null, missing, denied, or unreadable 
       assert.equal(evaluateVerdictCriteria(check.criteria, { decision_status: "fail" }), "fail", `${check.id}: fail boundary`);
       assert.equal(evaluateVerdictCriteria(check.criteria, { decision_status: "warn" }), "warn", `${check.id}: warn boundary`);
       assert.equal(evaluateVerdictCriteria(check.criteria, { decision_status: "pass" }), "pass", `${check.id}: pass boundary`);
-      assert.match(check.derivedFacts.decision_status, /complete cardinalities/);
+      assert.match(check.derivedFacts.decision_status, /complete source cardinalities/);
       assert.match(check.derivedFacts.decision_status, /\breturn (?:pass|fail|warn|manual)\b/i, `${check.id}: substantive derivation`);
       assert.ok(check.derivedFacts.decision_status.length > 240, `${check.id}: derivation length`);
       assert.ok(!derivations.has(check.derivedFacts.decision_status), `${check.id}: unique derivation`);
