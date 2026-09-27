@@ -44,6 +44,11 @@ Keep the API client, evidence projection, verdict evaluation, and bundle writer 
 
 This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
+## Known runtime gaps
+
+- TODO after the separate Webex pagination-hardening change lands on main: the current runtime follows a Link rel=next URL unchanged and stops only when the link disappears, the item cap is reached, or the 1,000-page cap is reached. It does not yet reject cross-origin or userinfo-bearing links or stop immediately on repeated cursors or empty pages with a next link. This is a temporary exception to shared contract 1.1.
+- TODO after the separate Webex sink-redaction change lands on main: the current runtime allowlist-projects and key-redacts collected surfaces, scrubs URL query/user information, and scrubs errors, but serializeJson does not run a second whole-value credential scrub immediately before writing. Exported webhook and callback URLs keep scheme, host and path rather than the shared rule's scheme-and-host-only form. These are temporary exceptions to the shared URL and two-pass sink rules.
+
 ## Tools
 
 | Tool | Purpose | Finding IDs | Result shape |
@@ -312,7 +317,7 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 
 | Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
 |---|---|---|---|---|---|---|
-| `organizations`, `people`, `roles`, `licenses`, `events`, `admin-audit-events`, `admin-recordings`, `hybrid-clusters`, `hybrid-connectors`, `meetings`, `meeting-sites`, `devices`, `workspaces`, `rooms`, `webhooks` | `Link header rel=next` | service default | caller limit | 1000 | The service does not provide a dependable total for these walks; report items seen and whether exhaustion was proven. | No next link; Configured item cap; Page cap; Repeated next link; Empty page with next link; Rejected cross-origin or userinfo-bearing next link |
+| `organizations`, `people`, `roles`, `licenses`, `events`, `admin-audit-events`, `admin-recordings`, `hybrid-clusters`, `hybrid-connectors`, `meetings`, `meeting-sites`, `devices`, `workspaces`, `rooms`, `webhooks` | `Link header rel=next` | service default | caller limit | 1000 | The service does not provide a dependable total for these walks; report items seen and whether exhaustion was proven. | No next link; Configured item cap; Page cap |
 
 ## Rate limits
 
@@ -358,8 +363,8 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 |---|---|---|---|---|---|---|---|---|
 | `WEBEX-ID-01` | critical | `webex_assess_identity` | `organization` | `org_id`, `organization`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created. |
 | `WEBEX-ID-02` | critical | `webex_assess_identity` | `people`, `roles` | `admin_users`, `admin_count`, `people_seen`, `people_truncated`, `denied_endpoint`, `inventory_status`, `citation`, `people_citation`, `roles_citation`, `token_type` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field. |
-| `WEBEX-ID-03` | high | `webex_assess_identity` | `people`, `roles` | `citation`, `token_type`, `people_seen`, `roles_seen`, `compliance_officers`, `compliance_officer_count`, `people_truncated` | People and roles are readable, the people population is nonempty and complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively. | At least one Compliance Officer is visible, but the people listing is truncated. | People and roles are readable and the nonempty people population contains no Compliance Officer. | People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer. |
-| `WEBEX-ID-04` | medium | `webex_assess_identity` | `people`, `roles` | `token_type`, `people_seen`, `people_truncated`, `admin_users`, `admin_count`, `max_admins` | People and roles are readable and complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins. | No administrator is visible, the people list is truncated, or administrator count exceeds max_admins; max_admins defaults to 10. | No fail verdict is emitted; concentration above the threshold requires review rather than proving noncompliance. | People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list. |
+| `WEBEX-ID-03` | high | `webex_assess_identity` | `people`, `roles` | `citation`, `token_type`, `people_seen`, `roles_seen`, `compliance_officers`, `compliance_officer_count`, `people_truncated` | People and roles are readable, the people population is nonempty, the people listing is complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively. Role-list truncation does not demote this runtime finding. | At least one Compliance Officer is visible, but the people listing is truncated. | People and roles are readable and the nonempty people population contains no Compliance Officer. | People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer. |
+| `WEBEX-ID-04` | medium | `webex_assess_identity` | `people`, `roles` | `token_type`, `people_seen`, `people_truncated`, `admin_users`, `admin_count`, `max_admins` | People and roles are readable, the people listing is complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins. Role-list truncation does not demote this runtime finding. | No administrator is visible, the people list is truncated, or administrator count exceeds max_admins; max_admins defaults to 10. | No fail verdict is emitted; concentration above the threshold requires review rather than proving noncompliance. | People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list. |
 | `WEBEX-ID-05` | medium | `webex_assess_identity` | `people` | `citation`, `token_type`, `people_seen`, `people_truncated`, `bots`, `bot_count` | GET /people is readable, nonempty and complete; inventory records every Person.type equal to 'bot'. | GET /people is readable and nonempty but truncated. | No fail verdict is emitted because bot presence is an inventory for comparison with the approved register. | GET /people is unreadable or returns zero people; export Control Hub Apps > Bots. |
 | `WEBEX-ID-06` | medium | `webex_assess_identity` | `people` | `bot_count`, `people_status`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Management > Apps bot management and reconcile it with WEBEX-ID-05; no documented read field exposes bot approval state. |
 | `WEBEX-ID-07` | medium | `webex_assess_identity` | `people`, `guest-count` | `guests`, `guest_count_people`, `guest_count_api`, `guest_count_api_error`, `guest_count_api_status`, `people_seen`, `people_truncated`, `citation`, `guest_count_citation`, `token_type` | GET /people is readable, nonempty and complete, GET /guests/count is readable, and Person.type='appuser' records are inventoried for reconciliation with WEBEX-MTG-03. | The people listing is truncated or GET /guests/count is unreadable, so the otherwise complete inventory cannot pass. | No fail verdict is emitted because the inventory does not itself settle guest-access policy. | GET /people is unreadable or returns zero people; export the Control Hub guest user list. |
@@ -410,11 +415,11 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 | `WEBEX-ID-02` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
 | `WEBEX-ID-02` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
 | `WEBEX-ID-02` | unreadable | Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field. | manual | The required source cannot be evaluated automatically. |
-| `WEBEX-ID-03` | compliant | People and roles are readable, the people population is nonempty and complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-ID-03` | compliant | People and roles are readable, the people population is nonempty, the people listing is complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively. Role-list truncation does not demote this runtime finding. | pass | Complete evidence satisfies the pass predicate. |
 | `WEBEX-ID-03` | noncompliant | People and roles are readable and the nonempty people population contains no Compliance Officer. | fail | The noncompliant predicate emits fail. |
 | `WEBEX-ID-03` | partial | At least one Compliance Officer is visible, but the people listing is truncated. | warn | The partial case emits warn. |
 | `WEBEX-ID-03` | unreadable | People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer. | manual | The required source cannot be evaluated automatically. |
-| `WEBEX-ID-04` | compliant | People and roles are readable and complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-ID-04` | compliant | People and roles are readable, the people listing is complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins. Role-list truncation does not demote this runtime finding. | pass | Complete evidence satisfies the pass predicate. |
 | `WEBEX-ID-04` | noncompliant | No fail verdict is emitted; concentration above the threshold requires review rather than proving noncompliance. | warn | The noncompliant predicate emits warn. |
 | `WEBEX-ID-04` | partial | No administrator is visible, the people list is truncated, or administrator count exceeds max_admins; max_admins defaults to 10. | warn | The partial case emits warn. |
 | `WEBEX-ID-04` | unreadable | People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list. | manual | The required source cannot be evaluated automatically. |
@@ -536,7 +541,7 @@ Credential refresh: POST /access_token with application/x-www-form-urlencoded gr
 
 Shared contract version: 1.1.
 
-Projection stage: Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys are then redacted recursively, and every JSON write scrubs the complete value again.
+Projection stage: Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys are redacted recursively during projection. The current write sink serializes that prepared value directly; see the temporary sink-redaction gap.
 
 Sensitive fields and values: token, client_secret, refresh_token, password, secret, targetUrl query, downloadUrl query, playbackUrl query, webLink query
 
@@ -549,7 +554,7 @@ Integration-specific rules:
 - A key containing token, secret, password, passcode, hostpin, hostkey, authorization, accesscode, activationcode, or credential is replaced with [REDACTED], except passwordCriteria, requireStrongPassword, and excludePassword policy objects.
 - Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, and SIP URI pwd/password/pin/passcode/token/secret parameters are replaced.
 - Webhook targetUrl, recording downloadUrl/playbackUrl, meeting webLink, and other URL-valued exported strings retain scheme, host and path but lose query, fragment and user information.
-- Configured token, client secret and refresh token values are removed from error text before status/length rendering; non-JSON bodies are represented only by media type and byte length.
+- Configured token, client secret and refresh token carriers are removed from error text before status/length rendering; non-JSON bodies are represented only by media type and byte length.
 - Projection retains password and secret fields only so their presence is represented as [REDACTED], never their value.
 
 Projected fields by surface:
@@ -600,11 +605,11 @@ Conditional paths:
 | Path | Format | Required when | Schema | Serialization |
 |---|---|---|---|---|
 | `QUICK_REFERENCE.md` | markdown | Always | Heading, five bundle-orientation bullets, then a four-step recommended reading order. | UTF-8 with a trailing newline. |
-| `metadata.json` | json | Always | Object: generated_at string, org_id string\|null, token_type person\|bot\|appuser\|unknown, source_chain string[], config_file basename\|string\|null. | Scrub recursively, then two-space JSON with insertion-order keys and one trailing newline. |
-| `core_data/access.json` | json | Always | WebexAccessCheckResult record described below. | Scrub recursively, then two-space JSON with insertion-order keys and one trailing newline. |
-| `core_data/{category}/{surface}.json` | json | For every collected assessment surface | Readable surface: projected object or array using that surface allowlist. Unreadable surface: {error: scrubbed string, status: number\|null}. | Project first, scrub recursively, then two-space JSON with one trailing newline. |
-| `analysis/{category}.json` | json | For identity, collaboration-governance and meeting-hybrid-security | Object: title string, category string, summary object, findings WebexFinding[], errors string[]. | Scrub recursively, then two-space JSON with insertion-order keys and one trailing newline. |
-| `analysis/findings.json` | json | Always | Array of WebexFinding records in assessment order: identity, collaboration governance, meeting/hybrid. | Scrub recursively, then two-space JSON with one trailing newline. |
+| `metadata.json` | json | Always | Object: generated_at string, org_id string\|null, token_type person\|bot\|appuser\|unknown, source_chain string[], config_file basename\|string\|null. | Two-space JSON with insertion-order keys and one trailing newline. |
+| `core_data/access.json` | json | Always | WebexAccessCheckResult record described below. | Errors are scrubbed during collection; serialize the prepared value as two-space JSON with one trailing newline. |
+| `core_data/{category}/{surface}.json` | json | For every collected assessment surface | Readable surface: projected object or array using that surface allowlist. Unreadable surface: {error: scrubbed string, status: number\|null}. | Project and key-redact the collected surface, then serialize as two-space JSON with one trailing newline. |
+| `analysis/{category}.json` | json | For identity, collaboration-governance and meeting-hybrid-security | Object: title string, category string, summary object, findings WebexFinding[], errors string[]. | Serialize the normalized assessment as two-space JSON with insertion-order keys and one trailing newline. |
+| `analysis/findings.json` | json | Always | Array of WebexFinding records in assessment order: identity, collaboration governance, meeting/hybrid. | Serialize normalized findings as two-space JSON with one trailing newline. |
 | `compliance/executive_summary.md` | markdown | Always | Org and generated timestamp; Result Counts; Highest Priority Findings sorted by status rank and capped at 12; optional Partial Collection Warnings. | UTF-8 Markdown with one trailing newline. |
 | `compliance/unified_compliance_matrix.md` | markdown | Always | Finding, spec control, uppercase status, then one column for each of eight frameworks. | UTF-8 Markdown table with one trailing newline. |
 | `compliance/{framework}/{report}.md` | markdown | One file for every configured framework | Framework heading, mapped-finding count, then Requirement, Finding, Status, Title, Summary table. | UTF-8 Markdown with one trailing newline. |
@@ -712,7 +717,7 @@ Conditional paths:
 - `fail`
 - `manual`
 
-JSON formatting: Before every JSON write, recursively scrub the complete value. Serialize with two-space indentation, preserve object insertion order, encode dates as ISO strings through normal JSON conversion, and append exactly one newline.
+JSON formatting: Serialize the already normalized/projected value with two-space indentation, preserve object insertion order, encode dates as ISO strings through the platform JSON conversion, and append exactly one newline. The current runtime has no second sink-level scrub; see Known gaps.
 
 Overwrite policy: Allocate a new suffixed bundle directory on every rerun; never replace an earlier bundle.
 
