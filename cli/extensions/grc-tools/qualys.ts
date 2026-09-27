@@ -1206,7 +1206,7 @@ export class QualysApiClient {
     let dropped = false;
     let truncationReason: string | undefined;
     while (nextUrl && items.length < limit && pages < maxPages) {
-      const currentUrl = nextUrl;
+      const currentUrl: string = nextUrl;
       const document: XmlNode = await this.getXml(currentUrl);
       pages += 1;
       const pageItems = xmlRecords(document, elementName);

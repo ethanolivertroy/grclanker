@@ -995,7 +995,7 @@ export class WebexApiClient {
     let nextUrl: string | null = this.buildUrl(path, { ...pageQuery, ...query });
 
     while (nextUrl) {
-      const currentUrl = nextUrl;
+      const currentUrl: string = nextUrl;
       const response = await this.fetchJson(currentUrl);
       pageCount += 1;
       const pageItems = extractItems(response.payload);
