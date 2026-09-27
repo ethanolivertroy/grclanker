@@ -1895,7 +1895,7 @@ test("scrubErrorText is the one scrub for error strings: unanchored URL queries,
   assert.equal(scrubValue("see https://h/x?token=abc; then https://h/y?token=def, done"), "see https://h/x; then https://h/y, done");
   assert.equal(scrubValue("prefix https://h/x?q=1 sip:u@h;pwd=9;transport=tls"), "prefix https://h/x sip:u@h;transport=tls");
 
-  assert.equal(scrubErrorText("Authorization: Bearer abc123def456ghi"), "Authorization=[REDACTED]");
+  assert.equal(scrubErrorText("Authorization: Bearer abc123def456ghi"), "Authorization: Bearer [REDACTED]");
   assert.equal(scrubErrorText("upstream bearer=FAKE-1234 failed"), "upstream bearer=[REDACTED] failed");
   assert.equal(scrubErrorText("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig expired"), "Bearer [REDACTED] expired");
   assert.equal(scrubErrorText("Set-Cookie: session=s7e8s9; Path=/"), "Set-Cookie=[REDACTED]; Path=/", "a credential-named header takes its whole value");
@@ -1920,7 +1920,7 @@ test("scrubErrorText is the one scrub for error strings: unanchored URL queries,
   }
 
   const error = new WebexApiError("Webex request failed (401 Unauthorized) for /people: Authorization: Bearer abc123def456ghi at https://h/x?token=t", 401, "/people");
-  assert.equal(error.message, "Webex request failed (401 Unauthorized) for /people: Authorization=[REDACTED] at https://h/x", "the constructor scrubs, so no consumer can receive an unscrubbed API error");
+  assert.equal(error.message, "Webex request failed (401 Unauthorized) for /people: Authorization: Bearer [REDACTED] at https://h/x", "the constructor scrubs, so no consumer can receive an unscrubbed API error");
   assert.equal(error.status, 401);
   assert.equal(error.endpoint, "/people");
 });
@@ -1984,8 +1984,8 @@ test("fetchJson never places a response body in an error string: non-JSON bodies
   });
   const identity = await assessWebexIdentity(networkFailure);
   const rolesError = identity.errors.find((item) => item.startsWith("roles: "));
-  assert.equal(rolesError, "roles: connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization=[REDACTED]", "non-API errors are scrubbed where they become surface errors");
-  assert.deepEqual(identity.summary.inventory_status.roles, { readable: false, status: null, error: "connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization=[REDACTED]" });
+  assert.equal(rolesError, "roles: connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization: Bearer [REDACTED]", "non-API errors are scrubbed where they become surface errors");
+  assert.deepEqual(identity.summary.inventory_status.roles, { readable: false, status: null, error: "connect ECONNREFUSED https://webexapis.com/v1/roles with Authorization: Bearer [REDACTED]" });
   assert.equal(byId(identity.findings, "WEBEX-ID-02").evidence.admin_count, null);
   const rendered = JSON.stringify(identity);
   for (const canary of [ERROR_CANARIES.network_url_token, ERROR_CANARIES.network_bearer]) assert.ok(!rendered.includes(canary), `${canary} must not reach any assessment field`);
