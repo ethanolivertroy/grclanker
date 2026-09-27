@@ -637,7 +637,7 @@ function scrubEmbeddedUrl(match: string): string {
     return `${scheme}${tail.slice(at + 1)}`.replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl) + trailing;
   }
   const authority = pathStart === -1 ? hostAndPath : hostAndPath.slice(0, pathStart);
-  const scrubbedHostAndPath = !authority.includes(".") && looksLikeToken(authority)
+  const scrubbedHostAndPath = !authority.startsWith("[") && !/:\d*$/.test(authority) && !authority.includes(".") && looksLikeToken(authority)
     ? `${REDACTED}${pathStart === -1 ? "" : hostAndPath.slice(pathStart)}`
     : hostAndPath;
   return `${scheme}${scrubbedHostAndPath}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}${trailing}`;
