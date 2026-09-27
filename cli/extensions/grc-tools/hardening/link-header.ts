@@ -10,6 +10,7 @@
 export type ParsedNextLink =
   | { kind: "absent" }
   | { kind: "next"; target: string }
+  | { kind: "no_next" }
   | { kind: "unparseable" };
 
 const TOKEN_CHARACTER = /^[!#$%&'*+\-.^_`|~A-Za-z0-9]$/;
@@ -142,5 +143,5 @@ export function parseNextLinkHeader(header: string | null | undefined): ParsedNe
     if (!parsed) return { kind: "unparseable" };
     if (nextTarget === undefined && parsed.relations.includes("next")) nextTarget = parsed.target;
   }
-  return nextTarget === undefined ? { kind: "absent" } : { kind: "next", target: nextTarget };
+  return nextTarget === undefined ? { kind: "no_next" } : { kind: "next", target: nextTarget };
 }

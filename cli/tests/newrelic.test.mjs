@@ -912,14 +912,14 @@ test("NewrelicApiClient follows REST API v2 Link headers with the Api-Key header
 });
 
 test("NewrelicApiClient refuses cross-origin and userinfo REST next links", async () => {
-  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`) {
+  async function walk(nextLink, linkHeader = `<${nextLink}>; rel="next"`, firstUsers = [{ id: 1, email: "one@example.com" }]) {
     const requests = [];
     const fetchImpl = async (input, init = {}) => {
       const url = new URL(input.toString());
       requests.push({ url, apiKey: headerValue(init.headers, "api-key") });
       if (requests.length === 1) {
         return jsonResponse(
-          { users: [{ id: 1, email: "one@example.com" }] },
+          { users: firstUsers },
           { headers: { link: linkHeader } },
         );
       }
@@ -946,6 +946,28 @@ test("NewrelicApiClient refuses cross-origin and userinfo REST next links", asyn
   assert.equal(userinfo.result.complete, false);
   assert.match(userinfo.result.note, /carries userinfo/);
   assert.equal(userinfo.requests.length, 1);
+
+  const noNextRelation = await walk(
+    "unused",
+    '<https://api.newrelic.com/v2/users.json?page=previous>; rel="prev last"',
+  );
+  assert.equal(noNextRelation.result.complete, false);
+  assert.match(noNextRelation.result.note, /no rel=next relation/);
+  assert.equal(noNextRelation.requests.length, 1);
+
+  const repeated = await walk("https://api.newrelic.com/v2/users.json");
+  assert.equal(repeated.result.complete, false);
+  assert.match(repeated.result.note, /repeated a page already read/);
+  assert.equal(repeated.requests.length, 1);
+
+  const emptyWithNext = await walk(
+    "https://api.newrelic.com/v2/users.json?page=2",
+    '<https://api.newrelic.com/v2/users.json?page=2>; rel="next"',
+    [],
+  );
+  assert.equal(emptyWithNext.result.complete, false);
+  assert.match(emptyWithNext.result.note, /empty page still advertised/);
+  assert.equal(emptyWithNext.requests.length, 1);
 
   const relationList = await walk(
     "https://api.newrelic.com/v2/users.json?page=2",

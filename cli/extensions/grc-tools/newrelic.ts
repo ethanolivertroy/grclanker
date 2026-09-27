@@ -1756,10 +1756,12 @@ export class NewrelicApiClient {
 
   async restList(path: string, collectionKey: string, limit = DEFAULT_PAGE_LIMIT): Promise<PagedList> {
     const items: JsonRecord[] = [];
+    const visited = new Set<string>();
     let url: string | undefined = path;
     let limitReached = false;
     for (let page = 0; url && page < MAX_PAGES && items.length < limit; page += 1) {
       const currentUrl = this.buildRestUrl(url);
+      visited.add(currentUrl);
       const { payload, nextLink } = await this.restGet(currentUrl);
       const pageItems = asRecords(payload[collectionKey]);
       const kept = pageItems.slice(0, Math.max(0, limit - items.length));
@@ -1768,14 +1770,23 @@ export class NewrelicApiClient {
       if (nextLink.kind === "unparseable") {
         return { items, complete: false, note: `stopped after ${items.length} items because the Link header could not be parsed` };
       }
+      if (nextLink.kind === "no_next") {
+        return { items, complete: false, note: `stopped after ${items.length} items because the Link header had no rel=next relation` };
+      }
       if (nextLink.kind === "absent") {
         url = undefined;
       } else {
+        if (pageItems.length === 0) {
+          return { items, complete: false, note: `stopped after ${items.length} items because an empty page still advertised a Link rel=next page` };
+        }
         try {
           url = resolveSameOriginUrl(nextLink.target, currentUrl).toString();
         } catch (error) {
           if (!(error instanceof NextLinkError)) throw error;
           return { items, complete: false, note: `stopped after ${items.length} items because ${error.message}` };
+        }
+        if (visited.has(url)) {
+          return { items, complete: false, note: `stopped after ${items.length} items because the Link rel=next URL repeated a page already read` };
         }
       }
     }

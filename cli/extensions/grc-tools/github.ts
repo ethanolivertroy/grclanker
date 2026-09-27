@@ -2050,6 +2050,12 @@ export class GitHubAuditorClient {
         nextPath = null;
         break;
       }
+      if (parsedNext.kind === "no_next") {
+        truncated = true;
+        truncationReason = "Link header had no rel=next relation";
+        nextPath = null;
+        break;
+      }
       if (parsedNext.kind === "next") {
         try {
           nextPath = resolveSameOriginUrl(parsedNext.target, currentUrl).toString();
@@ -2057,6 +2063,12 @@ export class GitHubAuditorClient {
           if (!(error instanceof NextLinkError)) throw error;
           truncated = true;
           truncationReason = error.message;
+          nextPath = null;
+          break;
+        }
+        if (pageRecords.length === 0) {
+          truncated = true;
+          truncationReason = "an empty page still advertised a Link rel=next page";
           nextPath = null;
           break;
         }

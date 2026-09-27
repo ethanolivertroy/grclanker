@@ -828,13 +828,13 @@ test("GitHubAuditorClient handles installation token refresh, rate limits, and p
 });
 
 test("GitHubAuditorClient follows only same-origin REST next links without userinfo", async () => {
-  function clientFor(nextLink, requests, relation = 'rel="next"') {
+  function clientFor(nextLink, requests, relation = 'rel="next"', firstRecords = [{ full_name: "example-org/repo-one" }]) {
     return new GitHubAuditorClient(createSampleConfig(), async (input, init = {}) => {
       const url = new URL(input.toString());
       requests.push({ url, authorization: init.headers?.Authorization });
       if (requests.length === 1) {
         return new Response(
-          JSON.stringify([{ full_name: "example-org/repo-one" }]),
+          JSON.stringify(firstRecords),
           {
             status: 200,
             headers: {
@@ -873,6 +873,48 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
     /carries userinfo/,
   );
   assert.equal(userinfoRequests.length, 1, "a userinfo-bearing next link must never be requested");
+
+  const noNextRequests = [];
+  await assert.rejects(
+    clientFor(
+      "https://api.github.com/orgs/example-org/repos?page=previous",
+      noNextRequests,
+      'rel="prev last"',
+    ).listRepositories(),
+    /Link header had no rel=next relation/,
+  );
+  assert.equal(noNextRequests.length, 1);
+
+  const finiteNoNextRequests = [];
+  const finiteNoNext = await clientFor(
+    "https://api.github.com/orgs/example-org/audit-log?page=previous",
+    finiteNoNextRequests,
+    'rel="prev last"',
+  ).listAuditLog();
+  assert.equal(finiteNoNext.truncated, true);
+  assert.equal(finiteNoNextRequests.length, 1);
+
+  const emptyNextRequests = [];
+  await assert.rejects(
+    clientFor(
+      "https://api.github.com/orgs/example-org/repos?page=2",
+      emptyNextRequests,
+      'rel="next"',
+      [],
+    ).listRepositories(),
+    /empty page still advertised/,
+  );
+  assert.equal(emptyNextRequests.length, 1);
+
+  const finiteEmptyRequests = [];
+  const finiteEmpty = await clientFor(
+    "https://api.github.com/orgs/example-org/audit-log?page=2",
+    finiteEmptyRequests,
+    'rel="next"',
+    [],
+  ).listAuditLog();
+  assert.equal(finiteEmpty.truncated, true);
+  assert.equal(finiteEmptyRequests.length, 1);
 
   const variantRequests = [];
   const variant = await clientFor(

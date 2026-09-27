@@ -18,7 +18,7 @@ test("parseNextLinkHeader distinguishes exhaustion from malformed headers", () =
   assert.deepEqual(parseNextLinkHeader(null), { kind: "absent" });
   assert.deepEqual(
     parseNextLinkHeader('<https://api.example.test/page1>; rel="prev last"'),
-    { kind: "absent" },
+    { kind: "no_next" },
   );
   for (const header of [
     "",
@@ -37,7 +37,7 @@ test("parseNextLinkHeader distinguishes exhaustion from malformed headers", () =
 test("parseNextLinkHeader ignores duplicate rel parameters after the first", () => {
   assert.deepEqual(
     parseNextLinkHeader("<https://api.example.test/page2>; rel=prev; rel=next"),
-    { kind: "absent" },
+    { kind: "no_next" },
   );
   assert.deepEqual(
     parseNextLinkHeader('<https://api.example.test/page2>; rel="next prev"; rel=last'),
