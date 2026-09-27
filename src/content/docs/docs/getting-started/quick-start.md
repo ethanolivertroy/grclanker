@@ -53,10 +53,12 @@ grclanker "what is the CMVP certificate for BoringCrypto?"
 grclanker investigate "CVE-2024-3094"
 ```
 
-## 5. Use the repo’s own specs as inputs
+## 5. Review or extend a shipped integration
 
 ```bash
-grclanker "read specs/aws-sec-inspector.spec.md and build the tool"
+grclanker "read specs/aws-sec-inspector.spec.md, inspect the shipped AWS tools, and propose an extension"
 ```
 
-That is the real shape of the project now: the companion is the front door, and the specs are one of the surfaces it can work on.
+All 35 repository integration specs are implemented. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
+
+The Pi terminal CLI is the default path. A source checkout can run the same domain tools through the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) or [Flue](/docs/getting-started/flue-runtime/).

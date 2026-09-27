@@ -3,7 +3,7 @@ title: New Relic
 description: Read-only New Relic organization security inspection covering identity, API keys, access grants, alerting, and data governance, mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
 ---
 
-The New Relic integration implements the [New Relic Security Inspector spec](https://github.com/hackIDLE/grclanker/blob/main/specs/newrelic-sec-inspector.spec.md) as native grclanker tools. It reads organization, user, role, API key, alerting, and data governance configuration through NerdGraph (GraphQL) and the REST API v2, evaluates the 20 numbered controls from the spec, and emits normalized findings that carry the spec's compliance mappings. Every tool is read-only: no mutation is ever sent to New Relic.
+The New Relic integration implements the [New Relic Security Inspector spec](https://github.com/ethanolivertroy/grclanker/blob/main/specs/newrelic-sec-inspector.spec.md) as native grclanker tools. It reads organization, user, role, API key, alerting, and data governance configuration through NerdGraph (GraphQL) and the REST API v2, evaluates the 20 numbered controls from the spec, and emits normalized findings that carry the spec's compliance mappings. Every tool is read-only: no mutation is ever sent to New Relic.
 
 ## What it inspects
 

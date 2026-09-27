@@ -36,7 +36,7 @@ The examples below show the same spec handoff pattern across terminal agents, ID
 ## Browse the raw catalog
 
 - Site catalog: [`/specs`](/specs)
-- Raw base: `https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs`
+- Raw base: `https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs`
 
 ## Why this matters
 

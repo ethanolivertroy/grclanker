@@ -44,7 +44,7 @@ export const categoryLabels: Record<string, string> = {
   'community-specs': 'Community Specs',
 };
 
-export const RAW_BASE = 'https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs';
+export const RAW_BASE = 'https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs';
 
 export function loadSpecs(): SpecMeta[] {
   const specFiles = import.meta.glob('/specs/*.spec.md', { query: '?raw', import: 'default', eager: true });
