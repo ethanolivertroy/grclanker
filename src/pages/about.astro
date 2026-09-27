@@ -3,7 +3,7 @@ import Base from '../layouts/Base.astro';
 
 ---
 
-<Base title="About — grclanker">
+<Base title="About: grclanker">
   <!-- Hero illustration -->
   <section class="relative overflow-hidden">
     <div class="absolute inset-0 w-full h-full">
@@ -30,25 +30,29 @@ import Base from '../layouts/Base.astro';
             <div class="text-sm text-subtext0 space-y-1.5 font-mono">
               <p>Built by <a href="https://ethantroy.dev">Ethan Troy</a></p>
               <p><a href="https://ethantroy.dev">ethantroy.dev</a></p>
-              <p><a href="https://github.com/hackIDLE/grclanker">GitHub</a></p>
+              <p><a href="https://github.com/ethanolivertroy/grclanker">GitHub</a></p>
             </div>
 
             <div class="hud-divider !my-7"></div>
 
             <p>
-              <strong class="text-text">grclanker</strong> is a terminal-first compliance tool built on Pi, plus a raw spec library for building GRC automation. CMVP certificate lookups, KEV and EPSS triage, official FedRAMP GitHub-grounded 20x and Rev5 lookups, FedRAMP readiness, ADS package planning, starter-bundle generation, portable public trust-center site generation, read-only compliance assessments for AWS, Azure, GCP, OCI, Cloudflare, Webex, Zoom, Ansible AAP, Duo, Okta, GitHub, Google Workspace, Slack, Box, CrowdStrike, Datadog, Elastic, KnowBe4, LaunchDarkly, MuleSoft, New Relic, PagerDuty, Palo Alto Networks, Qualys, Salesforce, ServiceNow, Snowflake, Splunk, Sumo Logic, Tenable, Veracode, Zendesk, and Zscaler, an optional Google Workspace CLI operator bridge for raw evidence collection, framework-mapped posture work, Vanta audit export, SCF lookups, and trestle-backed OSCAL helpers ship in the current release.
+              <strong class="text-text">grclanker</strong> is an open source compliance agent with 241 domain tools. It ships 35 integrations, each with a repository spec and native checks, assessments, or evidence exports. CMVP, KEV, EPSS, FedRAMP, Vanta, SCF, and OSCAL tools round out the current surface.
             </p>
 
             <p>
-              The project exists because compliance evidence is scattered across vendor dashboards, government feeds, and spreadsheets that nobody wants to maintain. grclanker pulls that evidence into one terminal session, maps it to controls, and keeps everything on your machine.
+              The same prompts, personas, and domain tools run in the Pi terminal CLI, the Cursor Agent SDK project, and the Flue Framework adapter. The Pi path supports local-first models or an explicitly configured hosted provider.
             </p>
 
             <p>
-              The spec library is the second half. Each spec is a structured build plan for a vendor-specific GRC tool — APIs, auth model, controls, mappings, architecture, CLI, and build sequence. Feed a spec to any agent and it has enough context to start building.
+              The project exists because compliance evidence is scattered across vendor dashboards, government feeds, and spreadsheets. grclanker gathers that evidence, maps it to controls, and packages the result for review.
             </p>
 
             <p>
-              Specs cover FedRAMP Marketplace services across cloud infrastructure, identity, security tooling, vulnerability management, and monitoring. The raw files are agent-agnostic and URL-first — grab them from <a href="/specs" class="text-blue hover:underline">/specs</a>.
+              Shared hardening scrubs credential-shaped error text, marks incomplete collections, reports pagination stops, and avoids overwriting prior exports. Runtime adapters validate tool schemas, classify read effects, and put approval gates around writer tools where the host supports them.
+            </p>
+
+            <p>
+              Every raw spec remains an agent-agnostic build plan with APIs, authentication, control mappings, architecture, and test guidance. Browse them at <a href="/specs" class="text-blue hover:underline">/specs</a>.
             </p>
           </div>
         </div>

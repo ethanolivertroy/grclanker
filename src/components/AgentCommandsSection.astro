@@ -8,24 +8,24 @@ const groups = [
     title: 'Terminal Agents',
     open: true,
     items: [
-      { label: 'Claude Code', command: `claude "Read ${sampleSpec} and build the tool"`, preview: 'claude "Read ...spec.md and build the tool"' },
-      { label: 'Codex CLI', command: `codex "Read ${sampleSpec} and build the tool"`, preview: 'codex "Read ...spec.md and build the tool"' },
-      { label: 'Gemini CLI', command: `gemini "Read ${sampleSpec} and implement this spec"`, preview: 'gemini "Read ...spec.md and implement this spec"' },
-      { label: 'OpenCode', command: `opencode -p "Read ${sampleSpec} and build the tool"`, preview: 'opencode -p "Read ...spec.md and build the tool"' },
-      { label: 'Droid', command: `droid exec "Read ${sampleSpec} and build the tool"`, preview: 'droid exec "Read ...spec.md and build the tool"' },
-      { label: 'Pi', command: `pi "Read ${sampleSpec} and build the tool"`, preview: 'pi "Read ...spec.md and build the tool"' },
-      { label: 'Goose', command: `goose "Read ${sampleSpec} and build the tool"`, preview: 'goose "Read ...spec.md and build the tool"' },
-      { label: 'Amp', command: `amp "Read ${sampleSpec} and build the tool"`, preview: 'amp "Read ...spec.md and build the tool"' },
-      { label: 'Crush', command: `crush "Read ${sampleSpec} and build the tool"`, preview: 'crush "Read ...spec.md and build the tool"' },
+      { label: 'Claude Code', command: `claude "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'claude "Read ...spec.md and propose an extension"' },
+      { label: 'Codex CLI', command: `codex "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'codex "Read ...spec.md and propose an extension"' },
+      { label: 'Gemini CLI', command: `gemini "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'gemini "Read ...spec.md and propose an extension"' },
+      { label: 'OpenCode', command: `opencode -p "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'opencode -p "Read ...spec.md and propose an extension"' },
+      { label: 'Droid', command: `droid exec "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'droid exec "Read ...spec.md and propose an extension"' },
+      { label: 'Pi', command: `pi "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'pi "Read ...spec.md and propose an extension"' },
+      { label: 'Goose', command: `goose "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'goose "Read ...spec.md and propose an extension"' },
+      { label: 'Amp', command: `amp "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'amp "Read ...spec.md and propose an extension"' },
+      { label: 'Crush', command: `crush "Read ${sampleSpec}, inspect the shipped AWS tools, and propose an extension"`, preview: 'crush "Read ...spec.md and propose an extension"' },
     ],
   },
   {
     title: 'IDE Agents',
     open: false,
     items: [
-      { label: 'Cursor / Windsurf', command: '@file aws-sec-inspector.spec.md "Implement this spec as a Go CLI tool"', preview: '@file aws-sec-inspector.spec.md "Implement this spec"' },
-      { label: 'GitHub Copilot', command: '@workspace #file:aws-sec-inspector.spec.md implement this spec', preview: '@workspace #file:aws-sec-inspector.spec.md implement this spec' },
-      { label: 'Cline / Roo Code', command: `Paste this URL and build the tool: ${sampleSpec}`, preview: 'Paste the raw URL into the chat' },
+      { label: 'Cursor / Windsurf', command: '@file aws-sec-inspector.spec.md "Compare this spec with the shipped AWS tools and propose an extension"', preview: '@file aws-sec-inspector.spec.md "Propose an extension"' },
+      { label: 'GitHub Copilot', command: '@workspace #file:aws-sec-inspector.spec.md compare this spec with the shipped AWS tools', preview: '@workspace #file:aws-sec-inspector.spec.md compare coverage' },
+      { label: 'Cline / Roo Code', command: `Compare this spec with the shipped AWS tools: ${sampleSpec}`, preview: 'Paste the raw URL into the chat' },
     ],
   },
   {
@@ -34,8 +34,8 @@ const groups = [
     items: [
       {
         label: 'Claude.ai / ChatGPT / Gemini',
-        command: `Here's a compliance automation spec: ${sampleSpec} — Build me the Go CLI tool it describes.`,
-        preview: `Here's a spec: ...spec.md — Build me the Go CLI tool.`,
+        command: `Here is a shipped compliance integration spec: ${sampleSpec}. Review its coverage and propose the next extension.`,
+        preview: 'Review this shipped spec and propose an extension.',
       },
     ],
   },
@@ -43,16 +43,16 @@ const groups = [
     title: 'Programmatic',
     open: false,
     items: [
-      { label: 'Pipe to any LLM', command: `curl -s ${sampleSpec} | your-agent "Build this"`, preview: 'curl -s ...spec.md | your-agent "Build this"' },
-      { label: 'Clone all specs', command: 'git clone https://github.com/hackIDLE/grclanker.git', preview: 'git clone https://github.com/hackIDLE/grclanker.git' },
+      { label: 'Pipe to any LLM', command: `curl -s ${sampleSpec} | your-agent "Review this shipped spec and propose an extension"`, preview: 'curl -s ...spec.md | your-agent "Review this"' },
+      { label: 'Clone all specs', command: 'git clone https://github.com/ethanolivertroy/grclanker.git', preview: 'git clone https://github.com/ethanolivertroy/grclanker.git' },
     ],
   },
 ];
 ---
 
 <section class="mb-8" data-agent-commands>
-  <h2 class="font-semibold text-sm tracking-widest uppercase text-blue mb-2">Use With Any Agent</h2>
-  <p class="text-subtext0 text-sm mb-5 italic">Copy a command. Paste it into whatever you use.</p>
+  <h2 class="font-semibold text-sm tracking-widest uppercase text-blue mb-2">Review or Extend With Any Agent</h2>
+  <p class="text-subtext0 text-sm mb-5 italic">The native tool family already ships. Use the spec to inspect coverage or plan the next change.</p>
 
   {groups.map((group) => (
     <details class="agent-group mb-3" open={group.open}>
