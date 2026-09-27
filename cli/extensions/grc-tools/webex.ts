@@ -1480,7 +1480,10 @@ export async function assessWebexIdentity(
   const surfaces: SurfaceSet = { me, organizations: orgs, people, roles, organization, guest_count: guestCount };
 
   const roleMap = roleMapFromRoles(surfaceItems(roles));
-  const humans = surfaceItems(people).filter((person) => ![WEBEX_VERDICT_VALUES.botPersonType, WEBEX_VERDICT_VALUES.guestPersonType].includes(asString(person.type) ?? ""));
+  const humans = surfaceItems(people).filter((person) => {
+    const type = asString(person.type);
+    return type !== WEBEX_VERDICT_VALUES.botPersonType && type !== WEBEX_VERDICT_VALUES.guestPersonType;
+  });
   const bots = surfaceItems(people).filter((person) => asString(person.type) === WEBEX_VERDICT_VALUES.botPersonType);
   const guests = surfaceItems(people).filter((person) => asString(person.type) === WEBEX_VERDICT_VALUES.guestPersonType);
   const adminUsers = humans.filter((person) => personRoleNames(person, roleMap).some((role) => role.toLowerCase().includes(WEBEX_VERDICT_VALUES.administratorRolePattern)));
