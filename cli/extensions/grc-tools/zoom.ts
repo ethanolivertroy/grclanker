@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZOOM_SPEC } from "./zoom.spec.js";
@@ -163,6 +163,23 @@ export const ZOOM_SPEC_CONTROLS: ZoomSpecControl[] = [
   control(24, "Admin operation log retention verified", "AU-11", "AU.L2-3.3.1", "CC7.2", "8.3", "10.7", "SRG-APP-000515", "ISM-0859", "12.1.2"),
   control(25, "Personal Meeting ID (PMI) usage restricted", "AC-3", "AC.L2-3.1.5", "CC6.1", "5.3", "8.1.1", "SRG-APP-000038", "ISM-0974", "8.1.2"),
 ];
+
+hydrateBatchFrameworkMappings(ZOOM_SPEC, Object.fromEntries(
+  ZOOM_SPEC.checks.map((check) => {
+    const controlDefinition = ZOOM_SPEC_CONTROLS.find((entry) => entry.number === check.controlNumbers[0]);
+    if (!controlDefinition) throw new Error(`${check.id}: no Zoom runtime control mapping`);
+    return [check.id, {
+      fedramp: [controlDefinition.mappings.FedRAMP],
+      cmmc: [controlDefinition.mappings.CMMC],
+      soc2: [controlDefinition.mappings["SOC 2"]],
+      cis: [controlDefinition.mappings.CIS],
+      pci_dss: [controlDefinition.mappings["PCI-DSS"]],
+      disa_stig: [controlDefinition.mappings.STIG],
+      irap: [controlDefinition.mappings.IRAP],
+      ismap: [controlDefinition.mappings.ISMAP],
+    }];
+  }),
+));
 
 export interface ZoomResolvedConfig {
   accountId: string;

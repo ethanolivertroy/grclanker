@@ -18,7 +18,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -722,6 +722,19 @@ const DUO_CHECKS = {
     },
   },
 } satisfies Record<string, CheckDefinition>;
+
+hydrateBatchFrameworkMappings(DUO_SPEC, Object.fromEntries(
+  Object.entries(DUO_CHECKS).map(([id, check]) => [id, {
+    fedramp: check.frameworks.fedramp,
+    cmmc: check.frameworks.cmmc,
+    soc2: check.frameworks.soc2,
+    cis: check.frameworks.cis,
+    pci_dss: check.frameworks.pci_dss,
+    disa_stig: check.frameworks.disa_stig,
+    irap: check.frameworks.irap,
+    ismap: check.frameworks.ismap,
+  }]),
+));
 
 type DuoCheckId = keyof typeof DUO_CHECKS;
 

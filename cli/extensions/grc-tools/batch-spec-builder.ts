@@ -8,9 +8,14 @@ import {
   evaluateVerdictCriteria,
   type CheckContract,
   type EvaluatedFindingStatus,
+  type ExportContract,
   type FindingSeverity,
   type FrameworkKey,
   type IntegrationSpecContract,
+  type PermissionKind,
+  type PortableValue,
+  type VerdictCondition,
+  type VerdictRule,
   toolContract,
 } from "./spec-model.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -41,10 +46,34 @@ export interface BatchCheckDefinition {
   title: string;
   severity: FindingSeverity;
   owner: string;
-  surfaces?: readonly string[];
+  surfaces: readonly string[];
   frameworks?: Partial<Record<FrameworkKey, readonly string[]>>;
-  evidenceFields?: readonly string[];
+  evidenceFields: readonly string[];
+  derivedFacts?: Readonly<Record<string, string>>;
   decision: string;
+  outcomes?: {
+    fail?: boolean;
+    warn?: boolean;
+    pass?: boolean;
+  };
+}
+
+export interface BatchPermissionDefinition {
+  id: string;
+  kind: PermissionKind;
+  value: string;
+  unlocks: readonly string[];
+  notes?: string;
+}
+
+export interface BatchPaginationDefinition {
+  surfaceIds: readonly string[];
+  cursorFields: readonly string[];
+  pageSize: number | null;
+  itemCap: number | null;
+  pageCap: number | null;
+  totalSemantics: string;
+  stopConditions: readonly string[];
 }
 
 export interface BatchSpecDefinition {
@@ -64,18 +93,11 @@ export interface BatchSpecDefinition {
     configFields: readonly string[];
     refreshRequest?: string;
   };
-  permissions: readonly string[];
+  permissions: readonly BatchPermissionDefinition[];
   surfaces: readonly BatchSurfaceDefinition[];
   checks: readonly BatchCheckDefinition[];
   tools: Readonly<Record<string, readonly string[]>>;
-  pagination: {
-    cursorFields: readonly string[];
-    pageSize: number | null;
-    itemCap: number | null;
-    pageCap: number | null;
-    totalSemantics: string;
-    stopConditions: readonly string[];
-  };
+  pagination: readonly BatchPaginationDefinition[];
   rateLimit: {
     documentedLimit: string | null;
     retryHeaders: readonly string[];
@@ -86,24 +108,165 @@ export interface BatchSpecDefinition {
   knownGaps: readonly string[];
   sensitiveFields: readonly string[];
   credentialFormats: readonly string[];
-  outputPrefix: string;
+  output: ExportContract;
+}
+
+export interface BatchOutputDefinition {
+  files: readonly string[];
+  conditionalFiles?: readonly string[];
+  overwritePolicy: string;
+  archivePairing: string;
+  jsonFormatting?: string;
+}
+
+export function buildBatchOutputContract(definition: BatchOutputDefinition): ExportContract {
+  const conditional = new Set(definition.conditionalFiles ?? []);
+  const artifact = (path: string) => ({
+    path,
+    format: path.endsWith(".json")
+      ? "json" as const
+      : path.endsWith(".md")
+        ? "markdown" as const
+        : "text" as const,
+    requiredWhen: conditional.has(path) ? "Only under the runtime condition stated for this conditional file." : "Always.",
+    schema: path.startsWith("core_data/")
+      ? "The projected runtime dataset or its explicit unavailable marker."
+      : path.startsWith("analysis/")
+        ? "Runtime assessment or finding records."
+        : path.startsWith("compliance/")
+          ? "The runtime-generated human-readable compliance report."
+          : "The runtime-generated bundle metadata or operator guidance.",
+    serialization: path.endsWith(".json")
+      ? definition.jsonFormatting ?? "UTF-8 JSON with two-space indentation and a trailing newline."
+      : "UTF-8 text.",
+  });
+  return {
+    files: definition.files,
+    conditionalFiles: definition.conditionalFiles ?? [],
+    artifacts: [...definition.files, ...(definition.conditionalFiles ?? [])].map(artifact),
+    overwritePolicy: definition.overwritePolicy,
+    pathSafetyPolicy: "Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.",
+    archivePairing: definition.archivePairing,
+    recordSchemas: {
+      finding: ["id", "title", "severity", "status", "summary", "evidence", "framework mappings"],
+      collection_marker: ["collected", "status", "endpoint", "error"],
+      bundle_result: ["outputDir", "zipPath", "fileCount", "findingCount", "errorCount"],
+    },
+    jsonFormatting: definition.jsonFormatting ?? "UTF-8 JSON with two-space indentation and a trailing newline.",
+  };
+}
+
+/**
+ * The runtime remains the owner of framework mappings. Runtime modules call
+ * this immediately after declaring their existing control/check catalog so the
+ * generator and reports consume the same values without duplicating them in an
+ * adjacent manifest.
+ */
+export function hydrateBatchFrameworkMappings(
+  spec: IntegrationSpecContract,
+  mappingsByCheck: Readonly<Record<string, Partial<Record<FrameworkKey, readonly string[]>>>>,
+): void {
+  for (const check of spec.checks) {
+    const mappings = mappingsByCheck[check.id];
+    if (!mappings) throw new Error(`${spec.identity.slug}: no runtime framework mapping exists for ${check.id}`);
+    for (const controlNumber of check.controlNumbers) {
+      const control = spec.controls.find((entry) => entry.number === controlNumber);
+      if (!control) throw new Error(`${check.id}: no published control ${controlNumber}`);
+      for (const key of FRAMEWORK_KEYS) {
+        const target = control.frameworks[key] as string[];
+        for (const value of mappings[key] ?? []) {
+          if (!target.includes(value)) target.push(value);
+        }
+      }
+    }
+  }
 }
 
 function frameworkMap(values: BatchCheckDefinition["frameworks"] = {}): Record<FrameworkKey, readonly string[]> {
   return Object.fromEntries(FRAMEWORK_KEYS.map((key) => [key, values[key] ?? []])) as Record<FrameworkKey, readonly string[]>;
 }
 
-function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
+function factName(check: Pick<BatchCheckDefinition, "id">, suffix: string): string {
+  return `${check.id.toLowerCase().replaceAll("-", "_")}_${suffix}`;
+}
+
+function factPath(check: BatchCheckDefinition, suffix: string): { kind: "path"; path: string } {
+  return { kind: "path", path: factName(check, suffix) };
+}
+
+function factEquals(check: BatchCheckDefinition, suffix: string, value: PortableValue): VerdictCondition {
   return {
-    pass: `The portable derivation for ${check.title} returns pass from complete, readable evidence.`,
-    warn: `The portable derivation for ${check.title} returns warn, or a pass is demoted because a required source is partial or truncated.`,
-    fail: `The portable derivation for ${check.title} returns fail from complete evidence; this outcome has first-match precedence over incomplete-evidence warnings.`,
+    op: "eq",
+    left: factPath(check, suffix),
+    right: { kind: "value", value },
+  };
+}
+
+function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
+  const outcomes = {
+    fail: check.outcomes?.fail ?? !/^always return manual\b/i.test(check.decision),
+    warn: check.outcomes?.warn ?? !/^always return manual\b/i.test(check.decision),
+    pass: check.outcomes?.pass ?? !/^always return manual\b/i.test(check.decision),
+  };
+  const rules: VerdictRule[] = [];
+  if (outcomes.fail) {
+    rules.push({
+      status: "fail",
+      condition: factEquals(check, "failure_matches", true),
+      note: "A violation proved by readable evidence has first-match precedence over partial companion evidence.",
+    });
+  }
+  rules.push({
+    status: "manual",
+    condition: {
+      op: "or",
+      conditions: [
+        factEquals(check, "required_evidence_readable", false),
+        { op: "not", condition: { op: "defined", operand: factPath(check, "required_evidence_readable") } },
+      ],
+    },
+    note: "Missing, null, denied, unreadable, or never-requested required evidence cannot pass.",
+  });
+  if (outcomes.warn) {
+    rules.push({
+      status: "warn",
+      condition: {
+        op: "or",
+        conditions: [
+          factEquals(check, "warning_matches", true),
+          factEquals(check, "required_evidence_complete", false),
+        ],
+      },
+      note: "A review predicate or incomplete required inventory prevents pass.",
+    });
+  }
+  if (outcomes.pass) {
+    rules.push({
+      status: "pass",
+      condition: {
+        op: "and",
+        conditions: [
+          factEquals(check, "compliant_matches", true),
+          factEquals(check, "required_evidence_readable", true),
+          factEquals(check, "required_evidence_complete", true),
+        ],
+      },
+      note: "Pass requires the integration-specific compliant predicate and complete readable dependencies.",
+    });
+  }
+  rules.push({
+    status: "manual",
+    condition: { op: "always" },
+    note: "Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual.",
+  });
+  return {
+    pass: `Complete readable evidence satisfies the compliant branch of this derivation: ${check.decision}`,
+    warn: `Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: ${check.decision}`,
+    fail: `Complete readable evidence satisfies the violation branch, which has first-match precedence: ${check.decision}`,
     manual: `The required evidence for ${check.title} is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict.`,
     constants: {
-      passStatus: "pass",
-      warnStatus: "warn",
-      failStatus: "fail",
-      manualStatus: "manual",
+      requiredEvidenceReadable: true,
+      requiredEvidenceComplete: true,
     },
     examples: [
       {
@@ -131,58 +294,9 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
         reason: "Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes.",
       },
     ],
-    rules: [
-      {
-        status: "fail",
-        condition: {
-          op: "eq",
-          left: { kind: "path", path: "decision_status" },
-          right: { kind: "value", value: "fail" },
-        },
-        note: "A proven violation wins before incomplete-evidence outcomes.",
-      },
-      {
-        status: "warn",
-        condition: {
-          op: "eq",
-          left: { kind: "path", path: "decision_status" },
-          right: { kind: "value", value: "warn" },
-        },
-        note: "The runtime selected warning from readable but incomplete or review-required evidence.",
-      },
-      {
-        status: "pass",
-        condition: {
-          op: "eq",
-          left: { kind: "path", path: "decision_status" },
-          right: { kind: "value", value: "pass" },
-        },
-        note: "The runtime may select pass only after every required dependency is complete.",
-      },
-      {
-        status: "manual",
-        condition: { op: "always" },
-        note: "Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual.",
-      },
-    ],
+    rules,
   };
 }
-
-const OUTPUT_FILES = [
-  "core_data/access.json",
-  "analysis/findings.json",
-  "compliance/executive_summary.md",
-  "compliance/unified_compliance_matrix.md",
-  "compliance/fedramp/fedramp_compliance_report.md",
-  "compliance/cmmc/cmmc_compliance_report.md",
-  "compliance/soc2/soc2_compliance_report.md",
-  "compliance/cis/cis_compliance_report.md",
-  "compliance/pci_dss/pci_dss_compliance_report.md",
-  "compliance/disa_stig/stig_compliance_checklist.md",
-  "compliance/irap/irap_compliance_report.md",
-  "compliance/ismap/ismap_compliance_report.md",
-  "QUICK_REFERENCE.md",
-] as const;
 
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {
   for (const check of definition.checks) {
@@ -219,17 +333,37 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     },
     intent: "read" as const,
   }));
-  const surfaceIds = surfaces.map((surface) => surface.id);
+  const surfaceIds = new Set(surfaces.map((surface) => surface.id));
+  for (const check of definition.checks) {
+    for (const surfaceId of check.surfaces) {
+      if (!surfaceIds.has(surfaceId)) throw new Error(`${check.id} references unknown surface ${surfaceId}`);
+    }
+  }
+  for (const permission of definition.permissions) {
+    for (const surfaceId of permission.unlocks) {
+      if (!surfaceIds.has(surfaceId)) throw new Error(`${permission.id} references unknown surface ${surfaceId}`);
+    }
+  }
+  for (const pagination of definition.pagination) {
+    for (const surfaceId of pagination.surfaceIds) {
+      if (!surfaceIds.has(surfaceId)) throw new Error(`Pagination references unknown surface ${surfaceId}`);
+    }
+  }
   const checks = definition.checks.map((check) => ({
     id: check.id,
     controlNumbers: [check.control],
     title: check.title,
     severity: check.severity,
     owningTool: check.owner,
-    sourceSurfaceIds: check.surfaces ?? surfaceIds,
-    evidenceFields: check.evidenceFields ?? ["decision_status"],
+    sourceSurfaceIds: check.surfaces,
+    evidenceFields: check.evidenceFields,
     derivedFacts: {
-      decision_status: `Using complete source cardinalities, ${check.decision} Before evaluating that decision, any required null, missing, denied, unreadable, or not-requested source derives manual; any partial or truncated dependency demotes pass to warn unless the derivation already selects fail.`,
+      [factName(check, "required_evidence_readable")]: `From the declared source surfaces, set true only when every value required by ${check.id} was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false.`,
+      [factName(check, "required_evidence_complete")]: `From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false.`,
+      [factName(check, "failure_matches")]: `Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: ${check.decision}`,
+      [factName(check, "warning_matches")]: `Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: ${check.decision}`,
+      [factName(check, "compliant_matches")]: `Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: ${check.decision}`,
+      ...check.derivedFacts,
     },
     criteria: criterion(check),
   }));
@@ -242,15 +376,6 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     ...(name.endsWith("_export_audit_bundle") ? { output: undefined } : {}),
   }));
   const projections = Object.fromEntries(surfaces.map((surface) => [surface.id, surface.fieldsConsumed]));
-  const outputArtifacts = [
-    { path: "core_data/{dataset}.json", format: "json" as const, requiredWhen: "The dataset is part of the assessment, including explicit not-collected markers.", schema: "Projected source records or a structured unavailable marker; unavailable values remain null.", serialization: "UTF-8 JSON with two-space indentation and a trailing newline." },
-    { path: "analysis/findings.json", format: "json" as const, requiredWhen: "Always.", schema: "Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence.", serialization: "UTF-8 JSON with two-space indentation and a trailing newline." },
-    { path: "compliance/executive_summary.md", format: "markdown" as const, requiredWhen: "Always.", schema: "Human-readable counts and findings grouped by status.", serialization: "UTF-8 Markdown." },
-    { path: "compliance/unified_compliance_matrix.md", format: "markdown" as const, requiredWhen: "Always.", schema: "Finding-to-framework mapping matrix.", serialization: "UTF-8 Markdown." },
-    { path: "compliance/{framework}/{report}.md", format: "markdown" as const, requiredWhen: "Always for each supported framework.", schema: "Framework-specific finding rows and mappings.", serialization: "UTF-8 Markdown." },
-    { path: "QUICK_REFERENCE.md", format: "markdown" as const, requiredWhen: "Always.", schema: "Bundle navigation and operator next steps.", serialization: "UTF-8 Markdown." },
-    { path: "_errors.log", format: "text" as const, requiredWhen: "At least one collection read failed, was denied, or was incomplete.", schema: "Scrubbed collection error summaries without response bodies or credentials.", serialization: "UTF-8 text." },
-  ];
   return {
     identity: {
       slug: definition.slug,
@@ -275,22 +400,8 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       configFields: definition.authentication.configFields,
       malformedConfigBehavior: "Reject malformed or ambiguous configuration before any request; never echo credential values.",
     },
-    permissions: definition.permissions.map((permission, index) => ({
-      id: `permission-${index + 1}`,
-      kind: "role",
-      value: permission,
-      unlocks: surfaceIds,
-      notes: "Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence.",
-    })),
-    pagination: [{
-      surfaceIds,
-      cursorFields: definition.pagination.cursorFields,
-      pageSize: definition.pagination.pageSize,
-      itemCap: definition.pagination.itemCap,
-      pageCap: definition.pagination.pageCap,
-      totalSemantics: definition.pagination.totalSemantics,
-      stopConditions: definition.pagination.stopConditions,
-    }],
+    permissions: definition.permissions,
+    pagination: definition.pagination,
     rateLimits: [{
       scope: definition.displayName,
       documentedLimit: definition.rateLimit.documentedLimit,
@@ -322,22 +433,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
         "Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.",
       ],
     },
-    output: {
-      files: OUTPUT_FILES,
-      conditionalFiles: ["_errors.log"],
-      artifacts: outputArtifacts,
-      overwritePolicy: "Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.",
-      pathSafetyPolicy: "Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.",
-      archivePairing: `Create ${definition.outputPrefix}.zip beside the allocated ${definition.outputPrefix} directory, applying the same suffix to both.`,
-      recordSchemas: {
-        finding: ["id", "control", "title", "severity", "status", "summary", "evidence", "mappings", "manualEvidence"],
-        collection_marker: ["collected", "status", "endpoint", "error", "reason"],
-        access_surface: ["name", "endpoint", "status", "count", "error"],
-        assessment: ["area", "title", "summary", "findings", "errors"],
-        bundle_manifest: ["outputDir", "zipPath", "fileCount", "findingCount", "errorCount"],
-      },
-      jsonFormatting: "UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.",
-    },
+    output: definition.output,
     tools,
   };
 }
@@ -347,7 +443,15 @@ export function evaluateObservedFindingStatus(
   checkId: string,
   status: EvaluatedFindingStatus,
 ): EvaluatedFindingStatus {
-  return evaluateVerdictCriteria(checkContract(spec, checkId).criteria, { decision_status: status });
+  const check = checkContract(spec, checkId);
+  const facts = {
+    [factName(check, "required_evidence_readable")]: status !== "manual",
+    [factName(check, "required_evidence_complete")]: status !== "warn",
+    [factName(check, "failure_matches")]: status === "fail",
+    [factName(check, "warning_matches")]: status === "warn",
+    [factName(check, "compliant_matches")]: status === "pass",
+  };
+  return evaluateVerdictCriteria(check.criteria, facts);
 }
 
 export function preserveRuntimeFindingStatus<T extends string>(

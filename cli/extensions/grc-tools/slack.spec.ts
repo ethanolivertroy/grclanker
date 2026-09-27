@@ -1,4 +1,39 @@
-import { buildBatchIntegrationSpec, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+
+const SLACK_SURFACES = [
+  ["auth-test", "POST", "/api/auth.test"], ["users", "GET", "/api/users.list"],
+  ["workspaces", "POST", "/api/admin.teams.list"], ["workspace-settings", "POST", "/api/admin.teams.settings.info"],
+  ["workspace-admins", "GET", "/api/admin.teams.admins.list"], ["admin-users", "POST", "/api/admin.users.list"],
+  ["session-settings", "POST", "/api/admin.users.session.getSettings"], ["approved-apps", "GET", "/api/admin.apps.approved.list"],
+  ["restricted-apps", "GET", "/api/admin.apps.restricted.list"], ["barriers", "GET", "/api/admin.barriers.list"],
+  ["channels", "POST", "/api/admin.conversations.search"], ["channel-preferences", "POST", "/api/admin.conversations.getConversationPrefs"],
+  ["channel-retention", "POST", "/api/admin.conversations.getCustomRetention"], ["emoji", "GET", "/api/admin.emoji.list"],
+  ["analytics-export", "GET", "/api/admin.analytics.getFile"], ["team-preferences", "POST", "/api/team.preferences.list"],
+  ["scim-users", "GET", "/scim/v1/Users"], ["audit-logs", "GET", "/audit/v1/logs"], ["audit-schemas", "GET", "/audit/v1/schemas"],
+].map(([id, method, path]) => ({
+  id,
+  method: method as "GET" | "POST",
+  path,
+  service: path.startsWith("/scim") ? "Slack SCIM API" : path.startsWith("/audit") ? "Slack Audit Logs API" : "Slack Web/Admin API",
+  documentationUrl: path.startsWith("/scim") ? "https://docs.slack.dev/admins/scim-api/" : path.startsWith("/audit") ? "https://docs.slack.dev/admins/audit-logs-api/" : `https://api.slack.com/methods/${path.split("/").at(-1)}`,
+  fields: ["projected response fields consumed by the corresponding runtime assessment"],
+}));
+
+const SLACK_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
+  "SLACK-ID-01": ["users"], "SLACK-ID-02": ["users"], "SLACK-ID-03": ["scim-users"],
+  "SLACK-ID-04": ["users", "scim-users"], "SLACK-ID-05": ["users"],
+  "SLACK-ADMIN-01": ["workspaces", "workspace-admins"], "SLACK-ADMIN-02": ["admin-users"],
+  "SLACK-ADMIN-03": ["admin-users", "session-settings"], "SLACK-ADMIN-04": [],
+  "SLACK-ADMIN-05": ["workspaces", "workspace-settings"], "SLACK-ADMIN-06": [],
+  "SLACK-ADMIN-07": ["workspaces", "workspace-settings"], "SLACK-ADMIN-08": ["emoji", "workspace-admins"],
+  "SLACK-ADMIN-09": ["analytics-export"], "SLACK-APP-01": ["approved-apps"], "SLACK-APP-02": ["restricted-apps"],
+  "SLACK-APP-03": ["approved-apps"], "SLACK-APP-04": ["barriers"], "SLACK-APP-05": [],
+  "SLACK-APP-06": ["workspaces", "team-preferences"], "SLACK-APP-07": [],
+  "SLACK-CHAN-01": ["channels"], "SLACK-CHAN-02": ["channels", "channel-preferences"],
+  "SLACK-CHAN-03": ["channels", "channel-retention"], "SLACK-CHAN-04": [], "SLACK-CHAN-05": [],
+  "SLACK-MON-01": ["audit-logs"], "SLACK-MON-02": ["audit-logs"], "SLACK-MON-03": ["audit-logs"],
+  "SLACK-MON-04": ["audit-schemas"], "SLACK-MON-05": ["audit-logs"], "SLACK-MON-06": [],
+};
 
 const checkRows = [
   ["SLACK-ID-01", 2, "MFA enrollment", "critical", "slack_assess_identity"],
@@ -76,6 +111,8 @@ const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, sever
   title,
   severity,
   owner,
+  surfaces: SLACK_CHECK_SURFACES[id],
+  evidenceFields: [...SLACK_CHECK_SURFACES[id], "complete_source_counts"],
   decision: decisions[index],
 }));
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
@@ -102,14 +139,20 @@ export const SLACK_SPEC = buildBatchIntegrationSpec({
     variants: ["Enterprise Grid org token plus optional bot and SCIM credentials"],
     configFields: ["token", "botToken", "scimToken", "orgId", "webApiBaseUrl", "scimBaseUrl", "auditBaseUrl"],
   },
-  permissions: ["Slack Enterprise Grid org-admin OAuth scopes", "SCIM API entitlement and token", "Audit Logs API entitlement and scope", "Discovery and DLP plan features where applicable"],
-  surfaces: [
-    { id: "users", path: "/api/users.list", service: "Slack Web API", documentationUrl: "https://api.slack.com/methods/users.list", fields: ["id", "deleted", "is_admin", "is_owner", "is_restricted", "has_2fa", "has_sso"] },
-    { id: "admin-users", method: "POST", path: "/api/admin.users.list", service: "Slack Admin API", documentationUrl: "https://api.slack.com/methods/admin.users.list", fields: ["id", "team_id", "email", "is_admin", "is_owner"] },
-    { id: "admin-apps", path: "/api/admin.apps.approved.list", service: "Slack Admin API", documentationUrl: "https://api.slack.com/methods/admin.apps.approved.list", fields: ["app_id", "name", "scopes", "is_internal"] },
-    { id: "scim-users", path: "/scim/v1/Users", service: "Slack SCIM API", documentationUrl: "https://docs.slack.dev/admins/scim-api/", fields: ["id", "userName", "active", "groups"] },
-    { id: "audit-logs", path: "/audit/v1/logs", service: "Slack Audit Logs API", documentationUrl: "https://docs.slack.dev/admins/audit-logs-api/", fields: ["id", "date_create", "action", "actor", "entity", "context"] },
+  permissions: [
+    { id: "users-read", kind: "oauth-scope", value: "users:read", unlocks: ["users"] },
+    { id: "admin-teams-read", kind: "oauth-scope", value: "admin.teams:read", unlocks: ["workspaces", "workspace-settings", "workspace-admins", "team-preferences"] },
+    { id: "admin-users-read", kind: "oauth-scope", value: "admin.users:read", unlocks: ["admin-users", "session-settings"] },
+    { id: "admin-apps-read", kind: "oauth-scope", value: "admin.apps:read", unlocks: ["approved-apps", "restricted-apps"] },
+    { id: "admin-barriers-read", kind: "oauth-scope", value: "admin.barriers:read", unlocks: ["barriers"] },
+    { id: "admin-conversations-read", kind: "oauth-scope", value: "admin.conversations:read", unlocks: ["channels", "channel-preferences", "channel-retention"] },
+    { id: "admin-emoji-read", kind: "oauth-scope", value: "admin.emoji:read", unlocks: ["emoji"] },
+    { id: "admin-analytics-read", kind: "oauth-scope", value: "admin.analytics:read", unlocks: ["analytics-export"] },
+    { id: "auditlogs-read", kind: "oauth-scope", value: "auditlogs:read", unlocks: ["audit-logs", "audit-schemas"] },
+    { id: "scim-read", kind: "license", value: "SCIM API entitlement with a read-capable SCIM token", unlocks: ["scim-users"] },
+    { id: "enterprise-grid", kind: "plan", value: "Enterprise Grid for org-level Admin and Audit Logs APIs", unlocks: SLACK_SURFACES.filter((surface) => surface.path.includes("/admin.") || surface.path.startsWith("/audit")).map((surface) => surface.id) },
   ],
+  surfaces: SLACK_SURFACES,
   checks,
   tools: {
     slack_check_access: [],
@@ -120,14 +163,19 @@ export const SLACK_SPEC = buildBatchIntegrationSpec({
     slack_assess_monitoring: idsFor("slack_assess_monitoring"),
     slack_export_audit_bundle: checks.map((check) => check.id),
   },
-  pagination: {
-    cursorFields: ["response_metadata.next_cursor", "next_cursor", "startIndex", "totalResults"],
-    pageSize: null,
-    itemCap: null,
-    pageCap: 50,
-    totalSemantics: "SCIM totals are authoritative; Slack cursor APIs prove completion only with an empty next cursor.",
-    stopConditions: ["Empty next cursor or SCIM total reached", "Configured item cap", "Page cap", "Repeated cursor", "Empty page with cursor", "Unknown or inconsistent SCIM total"],
-  },
+  pagination: [
+    {
+      surfaceIds: SLACK_SURFACES.filter((surface) => !surface.path.startsWith("/scim") && !["auth-test", "workspace-settings", "session-settings", "channel-preferences", "channel-retention", "analytics-export", "team-preferences"].includes(surface.id)).map((surface) => surface.id),
+      cursorFields: ["response_metadata.next_cursor", "next_cursor"], pageSize: null, itemCap: null, pageCap: 50,
+      totalSemantics: "Completion requires an empty cursor; item and page caps, repeated cursors, and a page adding no records remain partial.",
+      stopConditions: ["Empty cursor", "Caller item cap", "50-page cap", "Repeated cursor", "Page adds no records while cursor remains"],
+    },
+    {
+      surfaceIds: ["scim-users"], cursorFields: ["startIndex", "itemsPerPage", "totalResults"], pageSize: 100, itemCap: null, pageCap: 50,
+      totalSemantics: "totalResults is authoritative and must be reached; missing or inconsistent totals are partial.",
+      stopConditions: ["Seen reaches totalResults", "Caller item cap", "50-page cap", "Non-advancing startIndex", "Empty page before total"],
+    },
+  ],
   rateLimit: {
     documentedLimit: "Method-specific Slack rate tiers",
     retryHeaders: ["Retry-After"],
@@ -138,5 +186,19 @@ export const SLACK_SPEC = buildBatchIntegrationSpec({
   knownGaps: ["Discovery DLP details, guest expiry, several workspace restrictions, and standalone reporters remain unavailable."],
   sensitiveFields: ["token", "scimToken", "authorization", "cookie", "webhook_url"],
   credentialFormats: ["xoxb, xoxp, xoxe, and xapp token families", "SCIM bearer tokens", "webhook path secrets"],
-  outputPrefix: "slack-audit",
+  output: buildBatchOutputContract({
+    files: [
+      "README.md", "QUICK_REFERENCE.md", "metadata.json", "core_data/access.json", "core_data/identity.json",
+      "core_data/admin_access.json", "core_data/integrations.json", "core_data/channel_governance.json", "core_data/monitoring.json",
+      "analysis/identity.json", "analysis/admin_access.json", "analysis/integrations.json", "analysis/channel_governance.json",
+      "analysis/monitoring.json", "reports/identity.md", "reports/admin_access.md", "reports/integrations.md",
+      "reports/channel_governance.md", "reports/monitoring.md", "analysis/findings.json",
+      "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md", "compliance/fedramp.md",
+      "compliance/cmmc.md", "compliance/soc-2.md", "compliance/cis.md", "compliance/pci-dss.md",
+      "compliance/stig.md", "compliance/irap.md", "compliance/ismap.md",
+    ],
+    conditionalFiles: ["_errors.log"],
+    overwritePolicy: "Allocate slack-audit-<UTC timestamp> and add a numeric suffix when either the directory or paired archive exists.",
+    archivePairing: "Create <allocated-directory>.zip beside the allocated Slack audit directory.",
+  }),
 });

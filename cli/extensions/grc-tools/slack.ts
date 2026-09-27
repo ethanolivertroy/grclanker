@@ -19,7 +19,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SLACK_SPEC } from "./slack.spec.js";
@@ -170,6 +170,23 @@ export const SLACK_SPEC_CONTROLS: SpecControl[] = [
   { number: 24, name: "Workspace analytics access", refs: ["AC-6(9)", "3.1.7", "CC6.3", null, "7.1.2", "SRG-APP-000343", "ISM-0988", "CPS.AC-6"] },
   { number: 25, name: "Token rotation and revocation", refs: ["IA-5(1)", "3.5.10", "CC6.1", null, "8.6.3", "SRG-APP-000175", "ISM-1557", "CPS.IA-5"] },
 ];
+
+hydrateBatchFrameworkMappings(SLACK_SPEC, Object.fromEntries(
+  SLACK_SPEC.checks.map((check) => {
+    const control = SLACK_SPEC_CONTROLS.find((entry) => entry.number === check.controlNumbers[0]);
+    if (!control) throw new Error(`${check.id}: no Slack runtime control mapping`);
+    return [check.id, {
+      fedramp: control.refs[0] ? [control.refs[0]] : [],
+      cmmc: control.refs[1] ? [control.refs[1]] : [],
+      soc2: control.refs[2] ? [control.refs[2]] : [],
+      cis: control.refs[3] ? [control.refs[3]] : [],
+      pci_dss: control.refs[4] ? [control.refs[4]] : [],
+      disa_stig: control.refs[5] ? [control.refs[5]] : [],
+      irap: control.refs[6] ? [control.refs[6]] : [],
+      ismap: control.refs[7] ? [control.refs[7]] : [],
+    }];
+  }),
+));
 
 export interface SlackConfiguration {
   token?: string;

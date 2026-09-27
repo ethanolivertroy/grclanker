@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SERVICENOW_SPEC } from "./servicenow.spec.js";
 
@@ -447,6 +447,20 @@ const SERVICENOW_CONTROLS: Record<number, ControlDefinition> = {
   19: control("MID Server security", "medium", "operations_governance", ["SC-7(7)", "3.13.6", "CC6.6", "n/a", "1.3.2", "SRG-APP-000001", "ISM-1528", "CPS.SC-7"]),
   20: control("Plugin inventory and licensing", "low", "operations_governance", ["CM-7(4)", "3.4.8", "CC6.8", "n/a", "2.2.1", "SRG-APP-000386", "ISM-1624", "CPS.CM-7"]),
 };
+
+hydrateBatchFrameworkMappings(SERVICENOW_SPEC, Object.fromEntries(Object.entries(SERVICENOW_CONTROLS).map(([number, definition]) => [
+  `SNOW-${number.padStart(2, "0")}`,
+  {
+    fedramp: [definition.mappings.FedRAMP],
+    cmmc: [definition.mappings.CMMC],
+    soc2: [definition.mappings["SOC 2"]],
+    cis: [definition.mappings.CIS],
+    pci_dss: [definition.mappings["PCI-DSS"]],
+    disa_stig: [definition.mappings.STIG],
+    irap: [definition.mappings.IRAP],
+    ismap: [definition.mappings.ISMAP],
+  },
+])));
 
 export function mappingsForControl(controlNumber: number): string[] {
   const definition = SERVICENOW_CONTROLS[controlNumber];

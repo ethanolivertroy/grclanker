@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -407,6 +407,19 @@ const BOX_CONTROLS: Record<number, ControlDefinition> = {
   24: control("Inactive user detection", "medium", "identity_access", ["AC-2(3)", "AC.L2-3.1.1", "CC6.2", "7.2", "8.1.4", "SRG-APP-000025", "ISM-1404", "CPS-07"]),
   25: control("Content access monitoring", "high", "shield_monitoring", ["AU-6", "AU.L2-3.3.5", "CC7.2", "8.4", "10.6.1", "SRG-APP-000108", "ISM-0580", "CPS-10"]),
 };
+
+hydrateBatchFrameworkMappings(BOX_SPEC, Object.fromEntries(
+  Object.entries(BOX_CONTROLS).map(([number, definition]) => [`BOX-${number.padStart(2, "0")}`, {
+    fedramp: [definition.mappings["FedRAMP"]],
+    cmmc: [definition.mappings.CMMC],
+    soc2: [definition.mappings["SOC 2"]],
+    cis: [definition.mappings.CIS],
+    pci_dss: [definition.mappings["PCI-DSS"]],
+    disa_stig: [definition.mappings.STIG],
+    irap: [definition.mappings.IRAP],
+    ismap: [definition.mappings.ISMAP],
+  }]),
+));
 
 const FRAMEWORK_ORDER: BoxFramework[] = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
 

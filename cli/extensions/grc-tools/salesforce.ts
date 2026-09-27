@@ -19,7 +19,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 
@@ -269,6 +269,20 @@ const CONTROLS: ControlDefinition[] = [
   { control: 19, title: "Clickjack protection", mappings: { FedRAMP: "SC-18", CMMC: "L2 SC.L2-3.13.1", "SOC 2": "CC6.1", CIS: "7.1", "PCI-DSS": "6.2.4", STIG: "SRG-APP-000516", IRAP: "ISM-1486", ISMAP: "6.2.4" } },
   { control: 20, title: "CSRF protection", mappings: { FedRAMP: "SC-18", CMMC: "L2 SC.L2-3.13.1", "SOC 2": "CC6.1", CIS: "7.2", "PCI-DSS": "6.2.4", STIG: "SRG-APP-000516", IRAP: "ISM-1486", ISMAP: "6.2.4" } },
 ];
+
+hydrateBatchFrameworkMappings(SALESFORCE_SPEC, Object.fromEntries(CONTROLS.map((control) => [
+  `SF-${String(control.control).padStart(2, "0")}`,
+  {
+    fedramp: control.mappings.FedRAMP.split(",").map((value) => value.trim()),
+    cmmc: [control.mappings.CMMC],
+    soc2: [control.mappings["SOC 2"]],
+    cis: [control.mappings.CIS],
+    pci_dss: [control.mappings["PCI-DSS"]],
+    disa_stig: [control.mappings.STIG],
+    irap: [control.mappings.IRAP],
+    ismap: [control.mappings.ISMAP],
+  },
+])));
 
 const FRAMEWORK_REPORTS: Array<{ framework: SalesforceFramework; path: string; title: string }> = [
   { framework: "FedRAMP", path: "compliance/fedramp/fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },

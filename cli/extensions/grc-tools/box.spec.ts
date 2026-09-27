@@ -1,4 +1,28 @@
-import { buildBatchIntegrationSpec, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+
+const BOX_SURFACES = [
+  ["current-user", "/2.0/users/me"], ["enterprise-configuration", "/2.0/enterprise_configurations/{enterpriseId}"],
+  ["users", "/2.0/users"], ["groups", "/2.0/groups"], ["events", "/2.0/events"],
+  ["device-pinners", "/2.0/enterprises/{enterpriseId}/device_pinners"], ["retention-policies", "/2.0/retention_policies"],
+  ["retention-assignments", "/2.0/retention_policies/{policyId}/assignments"], ["legal-hold-policies", "/2.0/legal_hold_policies"],
+  ["legal-hold-assignments", "/2.0/legal_hold_policy_assignments"], ["shield-barriers", "/2.0/shield_information_barriers"],
+  ["shield-barrier-segments", "/2.0/shield_information_barrier_segments"], ["shield-lists", "/2.0/shield_lists"],
+  ["allowlist-entries", "/2.0/collaboration_whitelist_entries"], ["allowlist-exempt-targets", "/2.0/collaboration_whitelist_exempt_targets"],
+  ["metadata-templates", "/2.0/metadata_templates/enterprise"], ["classification-template", "/2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema"],
+  ["terms-of-service", "/2.0/terms_of_services"],
+].map(([id, path]) => ({ id, path, service: "Box Content API", documentationUrl: "https://developer.box.com/reference/", fields: ["projected fields consumed by the corresponding runtime assessment"] }));
+
+const BOX_CHECK_SURFACES: Readonly<Record<number, readonly string[]>> = {
+  1: ["enterprise-configuration"], 2: ["enterprise-configuration", "users"], 3: ["enterprise-configuration", "users"],
+  4: ["enterprise-configuration", "allowlist-entries"], 5: ["enterprise-configuration", "allowlist-entries", "allowlist-exempt-targets"],
+  6: ["enterprise-configuration"], 7: ["enterprise-configuration"], 8: [], 9: ["enterprise-configuration"],
+  10: ["device-pinners"], 11: ["classification-template", "metadata-templates"],
+  12: ["retention-policies", "retention-assignments"], 13: ["legal-hold-policies", "legal-hold-assignments"],
+  14: ["enterprise-configuration", "shield-lists"], 15: ["shield-barriers", "shield-barrier-segments"],
+  16: ["events"], 17: ["users"], 18: ["users"], 19: ["events", "shield-lists"],
+  20: ["terms-of-service"], 21: ["enterprise-configuration"], 22: ["enterprise-configuration"],
+  23: ["shield-lists"], 24: ["users", "events"], 25: ["shield-lists", "events"],
+};
 
 const controls = [
   "SSO enforcement", "2FA for admins", "2FA for all users", "External collaboration restrictions",
@@ -57,6 +81,8 @@ const checks: BatchCheckDefinition[] = controls.map((title, index) => {
     title,
     severity: [1, 2].includes(control) ? "critical" : [3, 4, 6, 14, 16, 17, 21, 25].includes(control) ? "high" : "medium",
     owner: ownerFor(control),
+    surfaces: BOX_CHECK_SURFACES[control],
+    evidenceFields: [...BOX_CHECK_SURFACES[control], "complete_source_counts"],
     decision: decisions[index],
   };
 });
@@ -85,14 +111,12 @@ export const BOX_SPEC = buildBatchIntegrationSpec({
     configFields: ["clientId", "clientSecret", "enterpriseId", "subjectType", "subjectId", "accessToken", "refreshToken", "jwt"],
     refreshRequest: "POST https://api.box.com/oauth2/token using the selected JWT, client_credentials, or refresh_token grant.",
   },
-  permissions: ["Box application access to enterprise users, groups, events, policies, legal holds, terms, and enterprise configuration", "Box Shield or governance plan entitlements for gated surfaces"],
-  surfaces: [
-    { id: "enterprise-users", path: "/2.0/users", service: "Box Content API", documentationUrl: "https://developer.box.com/reference/get-users/", fields: ["id", "login", "role", "status", "is_exempt_from_login_verification", "is_external_collab_restricted"] },
-    { id: "enterprise-config", path: "/2.0/enterprise/configuration", service: "Box Content API", documentationUrl: "https://developer.box.com/reference/get-enterprise-configuration/", fields: ["user_settings", "security", "content_and_sharing"] },
-    { id: "enterprise-events", path: "/2.0/events", service: "Box Content API", documentationUrl: "https://developer.box.com/reference/get-events/", fields: ["event_id", "event_type", "created_at", "created_by", "source", "additional_details"] },
-    { id: "retention-policies", path: "/2.0/retention_policies", service: "Box Content API", documentationUrl: "https://developer.box.com/reference/get-retention-policies/", fields: ["id", "policy_name", "policy_type", "retention_length", "status"] },
-    { id: "legal-hold-policies", path: "/2.0/legal_hold_policies", service: "Box Content API", documentationUrl: "https://developer.box.com/reference/get-legal-hold-policies/", fields: ["id", "policy_name", "status", "created_at"] },
+  permissions: [
+    { id: "box-enterprise-read", kind: "role", value: "Box application scopes and enterprise authorization for users, groups, events, governance, and enterprise configuration", unlocks: BOX_SURFACES.map((surface) => surface.id) },
+    { id: "box-governance", kind: "license", value: "Box Governance entitlement", unlocks: ["retention-policies", "retention-assignments", "legal-hold-policies", "legal-hold-assignments"] },
+    { id: "box-shield", kind: "license", value: "Box Shield entitlement", unlocks: ["shield-barriers", "shield-barrier-segments", "shield-lists"] },
   ],
+  surfaces: BOX_SURFACES,
   checks,
   tools: {
     box_check_access: [],
@@ -102,14 +126,27 @@ export const BOX_SPEC = buildBatchIntegrationSpec({
     box_assess_shield_monitoring: idsFor("box_assess_shield_monitoring"),
     box_export_audit_bundle: checks.map((check) => check.id),
   },
-  pagination: {
-    cursorFields: ["next_marker", "offset", "total_count", "next_stream_position"],
-    pageSize: 100,
-    itemCap: null,
-    pageCap: null,
-    totalSemantics: "Offset totals and event stream positions are checked independently; a remaining marker or total above seen records is truncated.",
-    stopConditions: ["No next marker or total reached", "Configured item cap", "Fixed assignment cap", "Repeated marker or stream position", "Empty page with continuation", "Event page budget"],
-  },
+  pagination: [
+    {
+      surfaceIds: ["users", "device-pinners", "retention-policies", "retention-assignments", "legal-hold-policies", "legal-hold-assignments", "shield-barriers", "shield-barrier-segments", "allowlist-entries", "allowlist-exempt-targets", "metadata-templates"],
+      cursorFields: ["next_marker"], pageSize: 1000, itemCap: null, pageCap: null,
+      totalSemantics: "Completion requires next_marker exhaustion; a cap with a remaining marker is incomplete.",
+      stopConditions: ["No next_marker", "Configured record cap", "Repeated marker", "Empty page with marker"],
+    },
+    {
+      surfaceIds: ["groups"], cursorFields: ["offset", "limit", "total_count"], pageSize: 1000, itemCap: null, pageCap: null,
+      totalSemantics: "total_count is authoritative; seen below total is incomplete.", stopConditions: ["Seen reaches total", "Configured cap", "Offset fails to advance", "Empty page before total"],
+    },
+    {
+      surfaceIds: ["events"], cursorFields: ["next_stream_position", "stream_position"], pageSize: 500, itemCap: null, pageCap: null,
+      totalSemantics: "The event stream has no total; the walker requires an empty page and advancing stream positions.",
+      stopConditions: ["Empty page", "Configured event cap", "Repeated position", "Fresh position adds no unseen event", "Page budget"],
+    },
+    {
+      surfaceIds: ["shield-lists", "terms-of-service", "current-user", "enterprise-configuration", "classification-template"],
+      cursorFields: [], pageSize: null, itemCap: null, pageCap: null, totalSemantics: "Single request; a successful response is complete.", stopConditions: ["Single response"],
+    },
+  ],
   rateLimit: {
     documentedLimit: "Box rate limits vary by endpoint, user, and enterprise",
     retryHeaders: ["Retry-After", "X-Rate-Limit-Limit", "X-Rate-Limit-Remaining"],
@@ -120,5 +157,24 @@ export const BOX_SPEC = buildBatchIntegrationSpec({
   knownGaps: ["CSV, HTML, SARIF, TUI output, and several policy reads remain absent."],
   sensitiveFields: ["client_secret", "private_key", "passphrase", "access_token", "refresh_token", "authorization", "login"],
   credentialFormats: ["Box OAuth access and refresh tokens", "JWT private keys and passphrases", "signed JWT assertions"],
-  outputPrefix: "box-audit",
+  output: buildBatchOutputContract({
+    files: [
+      "core_data/access_check.json", "core_data/enterprise_configuration.json", "core_data/current_user.json", "core_data/users.json",
+      "core_data/groups.json", "core_data/enterprise_events_activity.json", "core_data/enterprise_events_sharing.json",
+      "core_data/enterprise_events_shield.json", "core_data/device_pinners.json", "core_data/classification_template.json",
+      "core_data/metadata_templates.json", "core_data/retention_policies.json", "core_data/retention_policy_assignments.json",
+      "core_data/legal_hold_policies.json", "core_data/legal_hold_policy_assignments.json", "core_data/shield_information_barriers.json",
+      "core_data/shield_information_barrier_segments.json", "core_data/shield_lists.json", "core_data/collaboration_allowlist_entries.json",
+      "core_data/collaboration_allowlist_exempt_targets.json", "core_data/terms_of_services.json", "core_data/collection_status.json",
+      "analysis/identity_access.json", "analysis/sharing_collaboration.json", "analysis/data_governance.json", "analysis/shield_monitoring.json",
+      "analysis/findings.json", "analysis/summary.json", "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md",
+      "compliance/fedramp/fedramp_compliance_report.md", "compliance/cmmc/cmmc_compliance_report.md",
+      "compliance/soc2/soc2_compliance_report.md", "compliance/cis/cis_compliance_report.md",
+      "compliance/pci_dss/pci_dss_compliance_report.md", "compliance/disa_stig/stig_compliance_checklist.md",
+      "compliance/irap/irap_compliance_report.md", "compliance/ismap/ismap_compliance_report.md", "QUICK_REFERENCE.md", "metadata.json",
+    ],
+    conditionalFiles: ["_errors.log"],
+    overwritePolicy: "Allocate a new <enterprise>-audit-bundle directory and numeric suffix without overwriting either directory or archive.",
+    archivePairing: "Create <allocated-directory>.zip beside the allocated enterprise audit directory.",
+  }),
 });

@@ -1,4 +1,17 @@
-import { buildBatchIntegrationSpec, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+
+const GWS_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
+  "GWS-ID-001": ["directory-users"], "GWS-ID-002": ["directory-users"], "GWS-ID-003": ["directory-users"],
+  "GWS-ID-004": ["directory-users", "login-activities"], "GWS-ID-005": ["two-step-policies"],
+  "GWS-ADMIN-001": ["directory-users", "roles", "role-assignments"],
+  "GWS-ADMIN-002": ["directory-users", "roles", "role-assignments"],
+  "GWS-ADMIN-003": ["roles", "role-assignments"], "GWS-ADMIN-004": ["admin-activities"],
+  "GWS-ADMIN-005": ["role-assignments"],
+  "GWS-INTEG-001": ["directory-users", "user-tokens"], "GWS-INTEG-002": ["directory-users", "roles", "role-assignments", "user-tokens"],
+  "GWS-INTEG-003": ["user-tokens"], "GWS-INTEG-004": ["token-activities"],
+  "GWS-MON-001": ["alerts"], "GWS-MON-002": ["alerts"], "GWS-MON-003": ["admin-activities"],
+  "GWS-MON-004": ["token-activities"], "GWS-MON-005": ["alerts"],
+};
 
 const groups = {
   ID: [
@@ -76,6 +89,8 @@ const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([key, tit
     title,
     severity: /Privileged|Super admin|2-step|Suspicious|Alert Center/i.test(title) ? "high" : "medium",
     owner: owners[group],
+    surfaces: GWS_CHECK_SURFACES[`GWS-${group}-${String(index + 1).padStart(3, "0")}`],
+    evidenceFields: [...GWS_CHECK_SURFACES[`GWS-${group}-${String(index + 1).padStart(3, "0")}`], "complete_source_counts"],
     decision: decisions[group][index],
   }));
 });
@@ -106,20 +121,23 @@ export const GWS_SPEC = buildBatchIntegrationSpec({
     refreshRequest: "POST https://oauth2.googleapis.com/token with a signed JWT bearer grant and delegated administrator subject.",
   },
   permissions: [
-    "admin.directory.user.readonly",
-    "admin.directory.rolemanagement.readonly",
-    "admin.directory.user.security",
-    "admin.reports.audit.readonly",
-    "apps.alerts",
-    "cloud-identity.policies.readonly",
+    { id: "directory-users-read", kind: "oauth-scope", value: "https://www.googleapis.com/auth/admin.directory.user.readonly", unlocks: ["directory-users"] },
+    { id: "directory-roles-read", kind: "oauth-scope", value: "https://www.googleapis.com/auth/admin.directory.rolemanagement.readonly", unlocks: ["roles", "role-assignments"] },
+    { id: "directory-user-security", kind: "oauth-scope", value: "https://www.googleapis.com/auth/admin.directory.user.security", unlocks: ["user-tokens"] },
+    { id: "reports-audit-read", kind: "oauth-scope", value: "https://www.googleapis.com/auth/admin.reports.audit.readonly", unlocks: ["login-activities", "admin-activities", "token-activities"] },
+    { id: "alerts-read", kind: "oauth-scope", value: "https://www.googleapis.com/auth/apps.alerts", unlocks: ["alerts"] },
+    { id: "policies-read", kind: "oauth-scope", value: "https://www.googleapis.com/auth/cloud-identity.policies.readonly", unlocks: ["two-step-policies"], notes: "Requested with the separate policy token; absence affects only policy-dependent findings." },
   ],
   surfaces: [
     { id: "directory-users", path: "/admin/directory/v1/users", service: "Admin SDK Directory API", documentationUrl: "https://developers.google.com/admin-sdk/directory/reference/rest/v1/users/list", fields: ["id", "primaryEmail", "suspended", "archived", "isAdmin", "isEnforcedIn2Sv", "lastLoginTime"] },
+    { id: "roles", path: "/admin/directory/v1/customer/{customer}/roles", service: "Admin SDK Directory API", documentationUrl: "https://developers.google.com/admin-sdk/directory/reference/rest/v1/roles/list", fields: ["roleId", "roleName", "isSystemRole", "isSuperAdminRole", "rolePrivileges"] },
     { id: "role-assignments", path: "/admin/directory/v1/customer/{customer}/roleassignments", service: "Admin SDK Directory API", documentationUrl: "https://developers.google.com/admin-sdk/directory/reference/rest/v1/roleAssignments/list", fields: ["roleAssignmentId", "roleId", "assignedTo", "scopeType"] },
     { id: "user-tokens", path: "/admin/directory/v1/users/{userKey}/tokens", service: "Admin SDK Directory API", documentationUrl: "https://developers.google.com/admin-sdk/directory/reference/rest/v1/tokens/list", fields: ["clientId", "displayText", "scopes", "anonymous"] },
-    { id: "activities", path: "/admin/reports/v1/activity/users/all/applications/{applicationName}", service: "Admin SDK Reports API", documentationUrl: "https://developers.google.com/admin-sdk/reports/reference/rest/v1/activities/list", fields: ["id", "actor", "events", "ipAddress"] },
-    { id: "alerts", path: "/v1beta1/alerts", service: "Alert Center API", documentationUrl: "https://developers.google.com/admin-sdk/alertcenter/reference/rest/v1beta1/alerts/list", fields: ["alertId", "type", "source", "createTime", "endTime"] },
-    { id: "policies", path: "/v1/policies", service: "Cloud Identity API", documentationUrl: "https://cloud.google.com/identity/docs/reference/rest/v1/policies/list", fields: ["name", "setting", "policyQuery", "customer"] },
+    { id: "login-activities", path: "/admin/reports/v1/activity/users/all/applications/login", service: "Admin SDK Reports API", documentationUrl: "https://developers.google.com/admin-sdk/reports/reference/rest/v1/activities/list", fields: ["id", "actor", "events", "ipAddress"] },
+    { id: "admin-activities", path: "/admin/reports/v1/activity/users/all/applications/admin", service: "Admin SDK Reports API", documentationUrl: "https://developers.google.com/admin-sdk/reports/reference/rest/v1/activities/list", fields: ["id", "actor", "events", "ipAddress"] },
+    { id: "token-activities", path: "/admin/reports/v1/activity/users/all/applications/token", service: "Admin SDK Reports API", documentationUrl: "https://developers.google.com/admin-sdk/reports/reference/rest/v1/activities/list", fields: ["id", "actor", "events", "ipAddress"] },
+    { id: "alerts", path: "/v1beta1/alerts", service: "Alert Center API", documentationUrl: "https://developers.google.com/admin-sdk/alertcenter/reference/rest/v1beta1/alerts/list", fields: ["alertId", "type", "source", "createTime", "endTime", "metadata.status", "metadata.severity"] },
+    { id: "two-step-policies", path: "/v1/policies", service: "Cloud Identity API", documentationUrl: "https://cloud.google.com/identity/docs/reference/rest/v1/policies/list", fields: ["name", "customer", "type", "policyQuery", "setting.value.enforcedFrom", "setting.value.allowEnrollment", "setting.value.allowedSignInFactorSet"] },
   ],
   checks,
   tools: {
@@ -130,14 +148,34 @@ export const GWS_SPEC = buildBatchIntegrationSpec({
     gws_assess_monitoring: idsFor("gws_assess_monitoring"),
     gws_export_audit_bundle: checks.map((check) => check.id),
   },
-  pagination: {
-    cursorFields: ["nextPageToken", "pageToken"],
-    pageSize: null,
-    itemCap: null,
-    pageCap: 1000,
-    totalSemantics: "Google list APIs generally omit authoritative totals; completion requires a missing nextPageToken.",
-    stopConditions: ["No nextPageToken", "Configured item cap", "Page cap", "Repeated page token", "Empty page with token", "Per-user child request denied or errored"],
-  },
+  pagination: [
+    {
+      surfaceIds: ["directory-users"], cursorFields: ["nextPageToken", "pageToken"], pageSize: 500, itemCap: 5000, pageCap: 1000,
+      totalSemantics: "No total is returned; a missing nextPageToken before the 5,000-user cap proves exhaustion.",
+      stopConditions: ["No nextPageToken", "5,000-user cap", "1,000-page cap", "Repeated token", "Empty page with token"],
+    },
+    {
+      surfaceIds: ["roles"], cursorFields: ["nextPageToken", "pageToken"], pageSize: 100, itemCap: 1000, pageCap: 1000,
+      totalSemantics: "No total is returned; completion requires a missing nextPageToken.", stopConditions: ["No nextPageToken", "1,000-role cap", "Page cap", "Repeated token", "Empty page with token"],
+    },
+    {
+      surfaceIds: ["role-assignments"], cursorFields: ["nextPageToken", "pageToken"], pageSize: 200, itemCap: 10000, pageCap: 1000,
+      totalSemantics: "No total is returned; completion requires a missing nextPageToken.", stopConditions: ["No nextPageToken", "10,000-assignment cap", "Page cap", "Repeated token", "Empty page with token"],
+    },
+    {
+      surfaceIds: ["login-activities", "admin-activities", "token-activities"], cursorFields: ["nextPageToken", "pageToken"], pageSize: 1000, itemCap: 5000, pageCap: 1000,
+      totalSemantics: "Reports omit a total; completion requires token exhaustion.", stopConditions: ["No nextPageToken", "5,000-record cap", "Page cap", "Repeated token", "Empty page with token"],
+    },
+    {
+      surfaceIds: ["alerts", "two-step-policies"], cursorFields: ["nextPageToken", "pageToken"], pageSize: 100, itemCap: 1000, pageCap: 1000,
+      totalSemantics: "No authoritative total is used; completion requires token exhaustion.", stopConditions: ["No nextPageToken", "1,000-item cap", "Page cap", "Repeated token", "Empty page with token"],
+    },
+    {
+      surfaceIds: ["user-tokens"], cursorFields: [], pageSize: null, itemCap: 50, pageCap: null,
+      totalSemantics: "tokens.list is a single request per user; only the first 50 users are queried and any skipped or failed user makes the aggregate inventory incomplete.",
+      stopConditions: ["Single response", "50-user sampling cap", "Per-user denial or error"],
+    },
+  ],
   rateLimit: {
     documentedLimit: "Per-project and per-customer Google API quotas",
     retryHeaders: ["Retry-After"],
@@ -148,5 +186,20 @@ export const GWS_SPEC = buildBatchIntegrationSpec({
   knownGaps: ["Installed-app OAuth, Chrome Policy, endpoint device controls, and group-membership expansion are not shipped."],
   sensitiveFields: ["private_key", "access_token", "refresh_token", "authorization", "cookie"],
   credentialFormats: ["Google service-account private keys", "OAuth bearer tokens", "signed JWT assertions"],
-  outputPrefix: "gws-audit",
+  output: buildBatchOutputContract({
+    files: [
+      "core_data/users.json", "core_data/roles.json", "core_data/role_assignments.json", "core_data/login_activities.json",
+      "core_data/admin_activities.json", "core_data/token_activities.json", "core_data/token_inventory.json", "core_data/alerts.json",
+      "core_data/two_step_verification_policies.json", "analysis/findings.json", "analysis/identity.json", "analysis/identity.md",
+      "analysis/admin_access.json", "analysis/admin_access.md", "analysis/integrations.json", "analysis/integrations.md",
+      "analysis/monitoring.json", "analysis/monitoring.md", "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md",
+      "compliance/fedramp/fedramp_compliance_report.md", "compliance/cmmc/cmmc_compliance_report.md",
+      "compliance/soc2/soc2_compliance_report.md", "compliance/cis/cis_compliance_report.md",
+      "compliance/pci_dss/pci_dss_compliance_report.md", "compliance/disa_stig/stig_compliance_checklist.md",
+      "compliance/irap/irap_compliance_report.md", "compliance/ismap/ismap_compliance_report.md", "QUICK_REFERENCE.md",
+    ],
+    conditionalFiles: ["_errors.log"],
+    overwritePolicy: "Allocate a new <organization>-gws-audit directory with a numeric suffix; never overwrite an existing directory or paired archive.",
+    archivePairing: "Create <allocated-directory>.zip beside the allocated audit directory.",
+  }),
 });

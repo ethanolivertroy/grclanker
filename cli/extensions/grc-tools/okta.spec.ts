@@ -1,4 +1,77 @@
-import { buildBatchIntegrationSpec, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  type BatchCheckDefinition,
+  type BatchSurfaceDefinition,
+} from "./batch-spec-builder.js";
+
+const OKTA_SURFACES: readonly BatchSurfaceDefinition[] = [
+  { id: "sign-on-policies", path: "/api/v1/policies?type=OKTA_SIGN_ON", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "name", "type", "status", "conditions", "settings"] },
+  { id: "sign-on-policy-rules", path: "/api/v1/policies/{policyId}/rules", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "name", "status", "conditions", "actions"] },
+  { id: "password-policies", path: "/api/v1/policies?type=PASSWORD", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "name", "status", "settings.password"] },
+  { id: "mfa-policies", path: "/api/v1/policies?type=MFA_ENROLL", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "name", "status", "settings", "conditions"] },
+  { id: "access-policies", path: "/api/v1/policies?type=ACCESS_POLICY", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "name", "status", "conditions", "settings"] },
+  { id: "access-policy-rules", path: "/api/v1/policies/{policyId}/rules", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "name", "status", "conditions", "actions"] },
+  { id: "authenticators", path: "/api/v1/authenticators", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Authenticator/", fields: ["id", "key", "name", "type", "status", "settings"] },
+  { id: "idps", path: "/api/v1/idps", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/IdentityProvider/", fields: ["id", "name", "type", "status", "protocol"] },
+  { id: "authorization-servers", path: "/api/v1/authorizationServers", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/AuthorizationServer/", fields: ["id", "name", "issuer", "status", "audiences"] },
+  { id: "default-authorization-server", path: "/api/v1/authorizationServers/default", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/AuthorizationServer/", fields: ["id", "issuer", "audiences"] },
+  { id: "org-factors", path: "/api/v1/org/factors", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/reference/api/factors/", fields: ["id", "factorType", "provider", "status"] },
+  { id: "users", path: "/api/v1/users", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/User/", fields: ["id", "status", "created", "lastLogin", "profile.login", "profile.email"] },
+  { id: "role-assignees", path: "/api/v1/iam/assignees/users", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/RoleAssignmentAUser/", fields: ["id", "status", "profile.login", "lastLogin"] },
+  { id: "user-roles", path: "/api/v1/users/{userId}/roles", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/RoleAssignmentAUser/", fields: ["id", "type", "label", "status"] },
+  { id: "user-factors", path: "/api/v1/users/{userId}/factors", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/reference/api/factors/", fields: ["id", "factorType", "provider", "status"] },
+  { id: "groups", path: "/api/v1/groups", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Group/", fields: ["id", "type", "profile.name"] },
+  { id: "group-roles", path: "/api/v1/groups/{groupId}/roles", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/RoleAssignmentAGroup/", fields: ["id", "type", "label"] },
+  { id: "group-members", path: "/api/v1/groups/{groupId}/users", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Group/", fields: ["id", "status", "profile.login"] },
+  { id: "okta-support", path: "/api/v1/org/privacy/oktaSupport", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/OrgSetting/", fields: ["support", "expiration"] },
+  { id: "third-party-admin", path: "/api/v1/org/orgSettings/thirdPartyAdminSetting", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/OrgSetting/", fields: ["thirdPartyAdmin"] },
+  { id: "apps", path: "/api/v1/apps", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Application/", fields: ["id", "name", "label", "status", "settings", "credentials", "features"] },
+  { id: "trusted-origins", path: "/api/v1/trustedOrigins", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/TrustedOrigin/", fields: ["id", "name", "origin", "status", "scopes"] },
+  { id: "network-zones", path: "/api/v1/zones", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/NetworkZone/", fields: ["id", "name", "type", "status", "system"] },
+  { id: "group-rules", path: "/api/v1/groups/rules", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/GroupRule/", fields: ["id", "name", "status", "conditions", "actions"] },
+  { id: "event-hooks", path: "/api/v1/eventHooks", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/EventHook/", fields: ["id", "name", "status", "events"] },
+  { id: "log-streams", path: "/api/v1/logStreams", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/LogStream/", fields: ["id", "name", "type", "status"] },
+  { id: "system-log", path: "/api/v1/logs", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/SystemLog/", fields: ["uuid", "published", "eventType", "severity", "outcome"] },
+  { id: "behaviors", path: "/api/v1/behaviors", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/BehaviorRule/", fields: ["id", "name", "type", "status", "settings"] },
+  { id: "threat-insight", path: "/api/v1/threats/configuration", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/ThreatInsight/", fields: ["action", "mode", "settings", "excludeZones"] },
+  { id: "api-tokens", path: "/api/v1/api-tokens", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/ApiToken/", fields: ["id", "name", "created", "lastUpdated", "expiresAt", "network", "userId"] },
+  { id: "device-assurance", path: "/api/v1/device-assurances", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/DeviceAssurance/", fields: ["id", "name", "platform", "status"] },
+  { id: "org-contacts", path: "/api/v1/org/contacts", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/OrgSetting/", fields: ["contactType", "userId"] },
+] as const;
+
+const OKTA_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
+  "OKTA-AUTH-001": ["authenticators", "org-factors"],
+  "OKTA-AUTH-002": ["sign-on-policies", "sign-on-policy-rules", "access-policies", "access-policy-rules", "authenticators", "mfa-policies"],
+  "OKTA-AUTH-003": ["password-policies"],
+  "OKTA-AUTH-004": ["password-policies"],
+  "OKTA-AUTH-005": ["password-policies"],
+  "OKTA-AUTH-006": ["sign-on-policies", "sign-on-policy-rules"],
+  "OKTA-AUTH-007": ["sign-on-policies", "sign-on-policy-rules"],
+  "OKTA-AUTH-008": ["idps", "authenticators"],
+  "OKTA-AUTH-009": ["authenticators", "org-factors"],
+  "OKTA-ADMIN-001": ["role-assignees", "user-roles"],
+  "OKTA-ADMIN-002": ["role-assignees", "user-roles"],
+  "OKTA-ADMIN-003": ["groups", "group-roles", "group-members"],
+  "OKTA-ADMIN-004": ["role-assignees", "user-factors"],
+  "OKTA-ADMIN-005": ["users"],
+  "OKTA-ADMIN-006": ["okta-support", "third-party-admin"],
+  "OKTA-INTEG-001": ["trusted-origins"],
+  "OKTA-INTEG-002": ["network-zones"],
+  "OKTA-INTEG-003": ["apps"],
+  "OKTA-INTEG-004": ["sign-on-policies", "sign-on-policy-rules", "access-policies", "access-policy-rules", "network-zones"],
+  "OKTA-INTEG-005": ["apps"],
+  "OKTA-INTEG-006": ["apps", "group-rules"],
+  "OKTA-MON-001": ["event-hooks", "log-streams"],
+  "OKTA-MON-002": ["system-log"],
+  "OKTA-MON-003": ["threat-insight"],
+  "OKTA-MON-004": ["behaviors"],
+  "OKTA-MON-005": ["api-tokens"],
+  "OKTA-MON-006": ["device-assurance"],
+  "OKTA-MON-007": ["api-tokens"],
+  "OKTA-MON-008": ["org-contacts", "users"],
+  "OKTA-MON-009": [],
+};
 
 const titles: Readonly<Record<string, string>> = {
   "OKTA-AUTH-001": "Phishing-resistant authenticators",
@@ -79,6 +152,8 @@ const checks: BatchCheckDefinition[] = Object.entries(titles).map(([id, title], 
   title,
   severity: id.endsWith("009") || id.includes("AUTH-001") || id.includes("AUTH-002") ? "high" : "medium",
   owner: owner(id),
+  surfaces: OKTA_CHECK_SURFACES[id],
+  evidenceFields: [...OKTA_CHECK_SURFACES[id], "complete_source_counts"],
   decision: decisions[id],
 }));
 
@@ -107,13 +182,42 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
     configFields: ["orgUrl", "token", "clientId", "privateKey", "privateKeyId", "clientAssertion", "scopes"],
     refreshRequest: "POST /oauth2/v1/token with the client_credentials grant and a private_key_jwt assertion.",
   },
-  permissions: ["Okta read-only Management API OAuth scopes for every requested surface", "An administrator role that can read policy, user, app, and System Log evidence"],
-  surfaces: [
-    { id: "users", path: "/api/v1/users", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/User/", fields: ["id", "status", "profile", "lastLogin"] },
-    { id: "policies", path: "/api/v1/policies", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "type", "status", "conditions", "settings"] },
-    { id: "apps", path: "/api/v1/apps", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Application/", fields: ["id", "name", "label", "status", "settings", "credentials"] },
-    { id: "system-log", path: "/api/v1/logs", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/SystemLog/", fields: ["uuid", "published", "eventType", "severity", "outcome"] },
+  permissions: [
+    ...[
+      "okta.users.read", "okta.groups.read", "okta.apps.read", "okta.authenticators.read",
+      "okta.authorizationServers.read", "okta.idps.read", "okta.trustedOrigins.read", "okta.policies.read",
+      "okta.logs.read", "okta.eventHooks.read", "okta.logStreams.read", "okta.orgs.read",
+      "okta.networkZones.read", "okta.behaviors.read", "okta.deviceAssurance.read", "okta.roles.read",
+      "okta.apiTokens.read", "okta.threatInsights.read",
+    ].map((value) => ({
+      id: value,
+      kind: "oauth-scope" as const,
+      value,
+      unlocks: OKTA_SURFACES.filter((surface) => {
+        if (value === "okta.users.read") return ["users", "role-assignees", "user-factors", "group-members"].includes(surface.id);
+        if (value === "okta.groups.read") return ["groups", "group-roles", "group-members", "group-rules"].includes(surface.id);
+        if (value === "okta.apps.read") return surface.id === "apps";
+        if (value === "okta.authenticators.read") return ["authenticators", "org-factors"].includes(surface.id);
+        if (value === "okta.authorizationServers.read") return ["authorization-servers", "default-authorization-server"].includes(surface.id);
+        if (value === "okta.idps.read") return surface.id === "idps";
+        if (value === "okta.trustedOrigins.read") return surface.id === "trusted-origins";
+        if (value === "okta.policies.read") return surface.id.includes("polic");
+        if (value === "okta.logs.read") return surface.id === "system-log";
+        if (value === "okta.eventHooks.read") return surface.id === "event-hooks";
+        if (value === "okta.logStreams.read") return surface.id === "log-streams";
+        if (value === "okta.orgs.read") return ["okta-support", "third-party-admin", "org-contacts"].includes(surface.id);
+        if (value === "okta.networkZones.read") return surface.id === "network-zones";
+        if (value === "okta.behaviors.read") return surface.id === "behaviors";
+        if (value === "okta.deviceAssurance.read") return surface.id === "device-assurance";
+        if (value === "okta.roles.read") return ["role-assignees", "user-roles", "group-roles"].includes(surface.id);
+        if (value === "okta.apiTokens.read") return surface.id === "api-tokens";
+        return surface.id === "threat-insight";
+      }).map((surface) => surface.id),
+      notes: "The OAuth service application needs this read scope; SSWS access instead follows the administrator role assigned to the token owner.",
+    })),
+    { id: "okta-admin-role", kind: "role", value: "Okta administrator role granting the same read surfaces for SSWS authentication", unlocks: OKTA_SURFACES.map((surface) => surface.id) },
   ],
+  surfaces: OKTA_SURFACES,
   checks,
   tools: {
     okta_check_access: [],
@@ -123,14 +227,17 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
     okta_assess_monitoring: byOwner("okta_assess_monitoring"),
     okta_export_audit_bundle: checks.map((check) => check.id),
   },
-  pagination: {
-    cursorFields: ["Link rel=next", "after"],
-    pageSize: null,
-    itemCap: null,
-    pageCap: null,
-    totalSemantics: "Okta collections are complete only after no same-origin next link remains; per-tool item caps make affected datasets partial.",
-    stopConditions: ["Proven exhaustion", "Configured item cap", "Repeated cursor", "Empty page with cursor", "Rejected off-origin or user-information next link"],
-  },
+  pagination: [
+    {
+      surfaceIds: OKTA_SURFACES.filter((surface) => !["default-authorization-server", "okta-support", "third-party-admin", "threat-insight"].includes(surface.id)).map((surface) => surface.id),
+      cursorFields: ["Link rel=next"],
+      pageSize: 200,
+      itemCap: null,
+      pageCap: 50,
+      totalSemantics: "No authoritative total is returned; completion requires the absence of a same-origin Link rel=next. Users use a 50-page cap and System Log uses a five-page cap.",
+      stopConditions: ["No rel=next", "50-page list cap", "five-page System Log cap", "Repeated next URL", "Empty page with next URL", "Rejected cross-origin or user-information URL"],
+    },
+  ],
   rateLimit: {
     documentedLimit: "Endpoint-specific Okta rate-limit buckets",
     retryHeaders: ["Retry-After", "X-Rate-Limit-Reset"],
@@ -141,5 +248,26 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
   knownGaps: ["Lifecycle workflow and broader trust-center evidence remain manual or deferred."],
   sensitiveFields: ["apiToken", "clientAssertion", "privateKey", "credentials", "authorization", "cookie"],
   credentialFormats: ["SSWS tokens", "OAuth bearer tokens", "private keys", "signed JWT assertions"],
-  outputPrefix: "okta-audit",
+  output: buildBatchOutputContract({
+    files: [
+      "core_data/sign_on_policies.json", "core_data/sign_on_policy_rules.json", "core_data/password_policies.json", "core_data/password_policy_rules.json",
+      "core_data/mfa_enrollment_policies.json", "core_data/access_policies.json", "core_data/access_policy_rules.json", "core_data/authenticators.json",
+      "core_data/idps.json", "core_data/authorization_servers.json", "core_data/default_authorization_server.json", "core_data/org_factors.json",
+      "core_data/users_with_role_assignments.json", "core_data/user_roles.json", "core_data/groups.json", "core_data/privileged_group_roles.json",
+      "core_data/privileged_group_members.json", "core_data/users.json", "core_data/privileged_user_factors.json", "core_data/okta_support_access.json",
+      "core_data/third_party_admin_setting.json", "core_data/apps.json", "core_data/trusted_origins.json", "core_data/network_zones.json",
+      "core_data/group_rules.json", "core_data/event_hooks.json", "core_data/log_streams.json", "core_data/system_logs_recent.json",
+      "core_data/behaviors.json", "core_data/threat_insight.json", "core_data/api_tokens.json", "core_data/device_assurance.json",
+      "core_data/org_contacts.json", "core_data/collection_status.json", "analysis/authentication.json", "analysis/admin_access.json",
+      "analysis/integrations.json", "analysis/monitoring.json", "analysis/findings.json", "compliance/executive_summary.md",
+      "compliance/unified_compliance_matrix.md", "compliance/fedramp/fedramp_compliance_report.md",
+      "compliance/fedramp/oscal_assessment_results.json", "compliance/disa_stig/stig_compliance_checklist.md",
+      "compliance/irap/irap_compliance_report.md", "compliance/irap/essential_eight_assessment.md",
+      "compliance/ismap/ismap_compliance_report.md", "compliance/soc2/soc2_compliance_report.md",
+      "compliance/pci_dss/pci_dss_compliance_report.md", "QUICK_REFERENCE.md",
+    ],
+    conditionalFiles: ["_errors.log"],
+    overwritePolicy: "Allocate a new <organization-host>-audit-bundle directory with a numeric suffix when either the directory or paired archive exists.",
+    archivePairing: "Create <allocated-directory>.zip beside the allocated organization-host audit directory.",
+  }),
 });

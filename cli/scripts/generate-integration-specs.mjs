@@ -469,11 +469,18 @@ export async function renderAllIntegrationSpecs() {
     llmsCatalogEnd,
   ].join("\n");
   const blockPattern = new RegExp(`${llmsCatalogStart}[\\s\\S]*?${llmsCatalogEnd}`);
+  const publishedPaths = new Set(PUBLISHED_INTEGRATION_SPECS.map((entry) => entry.outputPath));
+  const catalogLine = /^- \[[^\]]+\]\(https?:\/\/[^)]+\/(specs\/[^)]+\.spec\.md)\):/;
+  const llmsWithoutGeneratedCatalog = llms.replace(blockPattern, "").split("\n")
+    .filter((line) => {
+      const match = line.match(catalogLine);
+      return !match || !publishedPaths.has(match[1]);
+    })
+    .join("\n")
+    .trimEnd();
   outputs.set(
     llmsPath,
-    blockPattern.test(llms)
-      ? llms.replace(blockPattern, generatedCatalog)
-      : `${llms.trimEnd()}\n\n${generatedCatalog}\n`,
+    `${llmsWithoutGeneratedCatalog}\n\n${generatedCatalog}\n`,
   );
   return outputs;
 }

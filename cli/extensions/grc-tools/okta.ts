@@ -20,7 +20,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -1652,6 +1652,17 @@ const OKTA_CHECKS: Record<string, CheckDefinition> = {
     },
   },
 };
+
+hydrateBatchFrameworkMappings(OKTA_SPEC, Object.fromEntries(
+  Object.entries(OKTA_CHECKS).map(([id, check]) => [id, {
+    fedramp: check.frameworks.fedramp,
+    soc2: check.frameworks.soc2,
+    pci_dss: check.frameworks.pci_dss,
+    disa_stig: check.frameworks.disa_stig,
+    irap: check.frameworks.irap,
+    ismap: check.frameworks.ismap,
+  }]),
+));
 
 export const OKTA_CHECK_IDS = Object.keys(OKTA_CHECKS);
 

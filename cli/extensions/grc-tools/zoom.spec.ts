@@ -1,4 +1,36 @@
-import { buildBatchIntegrationSpec, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+
+const ZOOM_SURFACES = [
+  ["current-user", "/v2/users/me"], ["account-settings", "/v2/accounts/{accountId}/settings"],
+  ["account-lock-settings", "/v2/accounts/{accountId}/lock_settings"], ["users", "/v2/users"],
+  ["user-settings", "/v2/users/{userId}/settings"], ["roles", "/v2/roles"],
+  ["role-members", "/v2/roles/{roleId}/members"], ["groups", "/v2/groups"],
+  ["group-settings", "/v2/groups/{groupId}/settings"], ["group-lock-settings", "/v2/groups/{groupId}/lock_settings"],
+  ["operation-logs", "/v2/report/operationlogs"], ["im-groups", "/v2/im/groups"],
+  ["managed-domains", "/v2/accounts/{accountId}/managed_domains"], ["trusted-domains", "/v2/accounts/{accountId}/trusted_domains"],
+  ["phone-settings", "/v2/phone/account_settings"],
+].map(([id, path]) => ({ id, path, service: "Zoom REST API", documentationUrl: "https://developers.zoom.us/docs/api/", fields: ["projected fields consumed by the corresponding runtime assessment"] }));
+
+const ZOOM_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
+  "ZOOM-ID-01": ["users"], "ZOOM-ID-02": ["account-settings", "roles", "role-members"],
+  "ZOOM-ID-03": ["managed-domains"], "ZOOM-ID-04": ["roles", "role-members"], "ZOOM-ID-05": ["users"],
+  "ZOOM-ID-06": ["account-settings"], "ZOOM-ID-07": [],
+  "ZOOM-COLLAB-01": ["trusted-domains"], "ZOOM-COLLAB-02": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-COLLAB-03": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-COLLAB-04": ["phone-settings"], "ZOOM-COLLAB-05": ["operation-logs"], "ZOOM-COLLAB-06": ["im-groups"],
+  "ZOOM-COLLAB-07": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-COLLAB-08": [],
+  "ZOOM-MTG-01": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-02": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-03": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-04": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-05": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-06": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-07": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-08": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-09": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+  "ZOOM-MTG-10": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+};
 
 const rows = [
   ["ZOOM-ID-01", 5, "SSO enforcement for all users", "critical", "zoom_assess_identity"],
@@ -56,7 +88,16 @@ const decisions = [
   "return pass when every participant sees the recording disclaimer, warn for guest-only, unknown, or group-relaxed settings, fail when the legacy disclaimer is explicitly false, and manual when no documented setting is exposed.",
 ] as const;
 
-const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, owner], index) => ({ id, control, title, severity, owner, decision: decisions[index] }));
+const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, owner], index) => ({
+  id,
+  control,
+  title,
+  severity,
+  owner,
+  surfaces: ZOOM_CHECK_SURFACES[id],
+  evidenceFields: [...ZOOM_CHECK_SURFACES[id], "complete_source_counts"],
+  decision: decisions[index],
+}));
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 export const ZOOM_RUNTIME_BEHAVIOR = [
@@ -82,14 +123,16 @@ export const ZOOM_SPEC = buildBatchIntegrationSpec({
     configFields: ["accountId", "clientId", "clientSecret", "accessToken", "baseUrl", "oauthBaseUrl", "timeoutMs"],
     refreshRequest: "POST /oauth/token?grant_type=account_credentials&account_id={accountId} with client Basic authentication.",
   },
-  permissions: ["account:read:admin settings and lock-settings scopes", "user and role read scopes", "report:read:operation_logs:admin", "contact_group and Zoom Phone account-setting read scopes where licensed"],
-  surfaces: [
-    { id: "account-settings", path: "/v2/accounts/{accountId}/settings", service: "Zoom REST API", documentationUrl: "https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/settings", fields: ["security", "meeting_security", "schedule_meeting", "in_meeting", "recording", "chat"] },
-    { id: "lock-settings", path: "/v2/accounts/{accountId}/lock_settings", service: "Zoom REST API", documentationUrl: "https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/lock_settings", fields: ["meeting_security", "schedule_meeting", "in_meeting", "recording", "chat"] },
-    { id: "users", path: "/v2/users", service: "Zoom REST API", documentationUrl: "https://developers.zoom.us/docs/api/users/#tag/users/GET/users", fields: ["id", "email", "status", "type", "login_types"] },
-    { id: "groups", path: "/v2/groups", service: "Zoom REST API", documentationUrl: "https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups", fields: ["id", "name", "total_members"] },
-    { id: "operation-logs", path: "/v2/report/operationlogs", service: "Zoom REST API", documentationUrl: "https://developers.zoom.us/docs/api/meetings/#tag/reports/GET/report/operationlogs", fields: ["time", "operator", "category_type", "operation_detail"] },
+  permissions: [
+    { id: "account-settings-read", kind: "oauth-scope", value: "account:read:admin", unlocks: ["account-settings", "account-lock-settings", "managed-domains", "trusted-domains"] },
+    { id: "users-read", kind: "oauth-scope", value: "user:read:list_users:admin", unlocks: ["current-user", "users", "user-settings"] },
+    { id: "roles-read", kind: "oauth-scope", value: "role:read:list_roles:admin", unlocks: ["roles", "role-members"] },
+    { id: "groups-read", kind: "oauth-scope", value: "group:read:list_groups:admin", unlocks: ["groups", "group-settings", "group-lock-settings"] },
+    { id: "operation-logs-read", kind: "oauth-scope", value: "report:read:operation_logs:admin", unlocks: ["operation-logs"] },
+    { id: "im-groups-read", kind: "oauth-scope", value: "imgroup:read:admin", unlocks: ["im-groups"] },
+    { id: "phone-settings-read", kind: "oauth-scope", value: "phone:read:admin", unlocks: ["phone-settings"], notes: "Requires Zoom Phone licensing in addition to scope." },
   ],
+  surfaces: ZOOM_SURFACES,
   checks,
   tools: {
     zoom_check_access: [],
@@ -98,14 +141,17 @@ export const ZOOM_SPEC = buildBatchIntegrationSpec({
     zoom_assess_meeting_security: idsFor("zoom_assess_meeting_security"),
     zoom_export_audit_bundle: checks.map((check) => check.id),
   },
-  pagination: {
-    cursorFields: ["next_page_token", "page_number", "page_count", "total_records"],
-    pageSize: 300,
-    itemCap: null,
-    pageCap: 500,
-    totalSemantics: "total_records is checked when returned; missing totals require explicit token exhaustion and never imply empty completeness.",
-    stopConditions: ["No next_page_token", "Declared total reached", "Configured item cap", "Page cap", "Repeated token", "Empty page with token", "Missing or inconsistent total"],
-  },
+  pagination: [
+    {
+      surfaceIds: ["users", "role-members", "groups", "operation-logs"], cursorFields: ["next_page_token", "total_records"], pageSize: 300, itemCap: null, pageCap: 500,
+      totalSemantics: "total_records is authoritative when returned; otherwise completion requires next_page_token exhaustion.",
+      stopConditions: ["No next_page_token", "Declared total reached", "Caller cap", "500-page cap", "Repeated token", "Empty page with token", "Missing or inconsistent total"],
+    },
+    {
+      surfaceIds: ["roles", "im-groups", "managed-domains", "trusted-domains"], cursorFields: [], pageSize: null, itemCap: null, pageCap: null,
+      totalSemantics: "The runtime treats these documented single-response lists as complete on success.", stopConditions: ["Single response"],
+    },
+  ],
   rateLimit: {
     documentedLimit: "Zoom applies endpoint labels and app-level daily request limits",
     retryHeaders: ["Retry-After", "X-RateLimit-Category", "X-RateLimit-Remaining"],
@@ -116,5 +162,19 @@ export const ZOOM_SPEC = buildBatchIntegrationSpec({
   knownGaps: ["User OAuth, per-user settings drift, deeper Zoom Phone policy, and usage analytics are deferred."],
   sensitiveFields: ["client_secret", "access_token", "authorization", "cookie", "join_url", "start_url"],
   credentialFormats: ["Zoom OAuth bearer tokens", "OAuth client secrets", "meeting start and join URLs"],
-  outputPrefix: "zoom-audit",
+  output: buildBatchOutputContract({
+    files: [
+      "README.md", "QUICK_REFERENCE.md", "metadata.json", "core_data/access.json", "core_data/current_user.json",
+      "core_data/account_settings.json", "core_data/account_lock_settings.json", "core_data/users.json", "core_data/roles.json",
+      "core_data/groups.json", "core_data/im_groups.json", "core_data/managed_domains.json", "core_data/trusted_domains.json",
+      "core_data/operation_logs.json", "core_data/phone_account_settings.json", "analysis/findings.json", "analysis/identity.json",
+      "analysis/collaboration-governance.json", "analysis/meeting-security.json", "analysis/summary.json",
+      "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md", "compliance/fedramp.md",
+      "compliance/cmmc.md", "compliance/soc-2.md", "compliance/cis.md", "compliance/pci-dss.md",
+      "compliance/stig.md", "compliance/irap.md", "compliance/ismap.md",
+    ],
+    conditionalFiles: ["_errors.log"],
+    overwritePolicy: "Allocate zoom-audit-<UTC timestamp> and add a numeric suffix when either the directory or paired archive exists.",
+    archivePairing: "Create <allocated-directory>.zip beside the allocated Zoom audit directory with the same suffix.",
+  }),
 });

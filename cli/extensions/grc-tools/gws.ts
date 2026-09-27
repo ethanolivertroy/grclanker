@@ -32,7 +32,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -859,6 +859,19 @@ const GWS_CHECKS: Record<string, CheckDefinition> = {
     },
   },
 };
+
+hydrateBatchFrameworkMappings(GWS_SPEC, Object.fromEntries(
+  Object.entries(GWS_CHECKS).map(([id, check]) => [id, {
+    fedramp: check.frameworks.fedramp,
+    cmmc: check.frameworks.cmmc,
+    soc2: check.frameworks.soc2,
+    cis: check.frameworks.cis,
+    pci_dss: check.frameworks.pci_dss,
+    disa_stig: check.frameworks.disa_stig,
+    irap: check.frameworks.irap,
+    ismap: check.frameworks.ismap,
+  }]),
+));
 
 export const GWS_CHECK_IDS = Object.keys(GWS_CHECKS);
 

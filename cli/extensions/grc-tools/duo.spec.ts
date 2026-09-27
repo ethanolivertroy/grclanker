@@ -1,4 +1,49 @@
-import { buildBatchIntegrationSpec, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  type BatchCheckDefinition,
+  type BatchSurfaceDefinition,
+} from "./batch-spec-builder.js";
+
+const DUO_SURFACES: readonly BatchSurfaceDefinition[] = [
+  ["settings", "/admin/v1/settings", ["helpdesk_bypass", "user_lockout", "notifications"]],
+  ["info-summary", "/admin/v1/info/summary", ["telephony_credits_remaining", "user_count", "integration_count"]],
+  ["authentication-attempts", "/admin/v1/info/authentication_attempts", ["count", "result", "reason"]],
+  ["admin-auth-methods", "/admin/v1/admins/allowed_auth_methods", ["webauthn", "duo_push", "sms", "phone"]],
+  ["global-policy", "/admin/v2/policies/global", ["authentication_methods", "new_user_policy", "remembered_devices", "trusted_endpoints", "device_health"]],
+  ["policies", "/admin/v2/policies", ["policy_id", "name", "authentication_methods", "remembered_devices", "device_health"]],
+  ["users", "/admin/v1/users", ["user_id", "username", "status", "last_login", "is_enrolled"]],
+  ["bypass-codes", "/admin/v1/bypass_codes", ["user_id", "created", "expires", "remaining_uses"]],
+  ["webauthn-credentials", "/admin/v1/webauthncredentials", ["user_id", "credential_name", "date_added"]],
+  ["admins", "/admin/v1/admins", ["admin_id", "name", "role", "status", "last_login"]],
+  ["integrations", "/admin/v3/integrations", ["integration_key", "name", "type", "policy", "prompt_type", "permissions"]],
+  ["authentication-logs", "/admin/v2/logs/authentication", ["timestamp", "result", "reason", "factor", "access_device", "location"]],
+  ["activity-logs", "/admin/v2/logs/activity", ["timestamp", "action", "username", "description"]],
+  ["telephony-logs", "/admin/v2/logs/telephony", ["timestamp", "type", "context", "credits"]],
+  ["offline-enrollment-logs", "/admin/v1/logs/offline_enrollment", ["timestamp", "username", "action", "application"]],
+  ["trust-monitor-events", "/admin/v1/trust_monitor/events", ["id", "type", "timestamp", "risk", "location"]],
+].map(([id, path, fields]) => ({
+  id: id as string,
+  path: path as string,
+  service: "Duo Admin API",
+  documentationUrl: "https://duo.com/docs/adminapi",
+  fields: fields as string[],
+}));
+
+const DUO_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
+  "DUO-AUTH-001": ["global-policy"], "DUO-AUTH-002": ["global-policy"], "DUO-AUTH-003": ["global-policy"],
+  "DUO-AUTH-004": ["global-policy"], "DUO-AUTH-005": ["global-policy"], "DUO-AUTH-006": ["bypass-codes", "settings"],
+  "DUO-AUTH-007": ["global-policy"], "DUO-AUTH-008": ["users"], "DUO-AUTH-009": ["users"],
+  "DUO-AUTH-010": ["users", "webauthn-credentials"], "DUO-AUTH-011": ["global-policy", "offline-enrollment-logs"],
+  "DUO-ADMIN-001": ["admins"], "DUO-ADMIN-002": ["admin-auth-methods", "global-policy"],
+  "DUO-ADMIN-003": ["settings"], "DUO-ADMIN-004": ["admins"], "DUO-ADMIN-005": ["settings"],
+  "DUO-INTEGRATIONS-001": ["integrations"], "DUO-INTEGRATIONS-002": ["integrations"],
+  "DUO-INTEGRATIONS-003": ["integrations"], "DUO-INTEGRATIONS-004": ["integrations"],
+  "DUO-INTEGRATIONS-005": ["integrations"], "DUO-INTEGRATIONS-006": ["global-policy"],
+  "DUO-MON-001": ["authentication-logs"], "DUO-MON-002": ["trust-monitor-events"],
+  "DUO-MON-003": ["info-summary", "telephony-logs"], "DUO-MON-004": ["settings"],
+  "DUO-MON-005": ["authentication-attempts", "authentication-logs"],
+};
 
 const groups = {
   AUTH: [
@@ -91,6 +136,8 @@ const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([groupNam
     title,
     severity: /MFA|privileged|bypass|Critical|API integration/i.test(title) ? "high" : "medium",
     owner: ownerFor(group),
+    surfaces: DUO_CHECK_SURFACES[`DUO-${group}-${String(index + 1).padStart(3, "0")}`],
+    evidenceFields: [...DUO_CHECK_SURFACES[`DUO-${group}-${String(index + 1).padStart(3, "0")}`], "complete_source_counts"],
     decision: decisions[group][index],
   }));
 });
@@ -119,14 +166,14 @@ export const DUO_SPEC = buildBatchIntegrationSpec({
     variants: ["Commercial and FedRAMP Duo API hostnames selected by api_hostname"],
     configFields: ["integrationKey", "secretKey", "apiHostname", "timeoutMs"],
   },
-  permissions: ["Grant resource - Read", "Grant administrators - Read", "Grant settings - Read", "Grant logs - Read", "Grant information - Read"],
-  surfaces: [
-    { id: "settings", path: "/admin/v1/settings", service: "Duo Admin API", documentationUrl: "https://duo.com/docs/adminapi", fields: ["global_policy", "user_lockout", "notifications", "helpdesk_bypass"] },
-    { id: "policies", path: "/admin/v2/policies", service: "Duo Admin API", documentationUrl: "https://duo.com/docs/adminapi#policies", fields: ["policy_id", "name", "authentication_methods", "remembered_devices", "device_health"] },
-    { id: "users", path: "/admin/v1/users", service: "Duo Admin API", documentationUrl: "https://duo.com/docs/adminapi#users", fields: ["user_id", "username", "status", "last_login", "is_enrolled"] },
-    { id: "integrations", path: "/admin/v3/integrations", service: "Duo Admin API", documentationUrl: "https://duo.com/docs/adminapi#integrations", fields: ["integration_key", "name", "type", "policy", "prompt_type"] },
-    { id: "authentication-logs", path: "/admin/v2/logs/authentication", service: "Duo Admin API", documentationUrl: "https://duo.com/docs/adminapi#authentication-logs", fields: ["timestamp", "result", "reason", "factor", "access_device", "location"] },
+  permissions: [
+    { id: "resource-read", kind: "role", value: "Grant resource - Read", unlocks: ["global-policy", "policies", "users", "bypass-codes", "webauthn-credentials", "integrations", "offline-enrollment-logs"] },
+    { id: "admins-read", kind: "role", value: "Grant administrators - Read", unlocks: ["admins", "admin-auth-methods"] },
+    { id: "settings-read", kind: "role", value: "Grant settings", unlocks: ["settings"] },
+    { id: "logs-read", kind: "role", value: "Grant read log", unlocks: ["authentication-logs", "activity-logs", "telephony-logs", "offline-enrollment-logs", "trust-monitor-events"] },
+    { id: "information-read", kind: "role", value: "Grant read information", unlocks: ["info-summary", "authentication-attempts"] },
   ],
+  surfaces: DUO_SURFACES,
   checks,
   tools: {
     duo_check_access: [],
@@ -136,14 +183,35 @@ export const DUO_SPEC = buildBatchIntegrationSpec({
     duo_assess_monitoring: idsFor("duo_assess_monitoring"),
     duo_export_audit_bundle: checks.map((check) => check.id),
   },
-  pagination: {
-    cursorFields: ["offset", "next_offset", "metadata.total_objects"],
-    pageSize: 500,
-    itemCap: null,
-    pageCap: 1000,
-    totalSemantics: "metadata.total_objects is authoritative when present; seen records below that total are truncated.",
-    stopConditions: ["Proven total reached", "No next offset", "Configured item cap", "Page cap", "Repeated offset", "Empty page with offset", "Missing or inconsistent total"],
-  },
+  pagination: [
+    {
+      surfaceIds: ["policies", "users", "bypass-codes", "webauthn-credentials", "admins", "integrations"],
+      cursorFields: ["offset", "metadata.next_offset", "metadata.total_objects"],
+      pageSize: 100,
+      itemCap: null,
+      pageCap: 1000,
+      totalSemantics: "metadata.total_objects is authoritative when present; seen records below that total are incomplete.",
+      stopConditions: ["Total reached", "No next_offset", "Page cap", "Repeated offset", "Empty page with offset", "Missing or inconsistent total"],
+    },
+    {
+      surfaceIds: ["authentication-logs", "activity-logs", "telephony-logs", "trust-monitor-events"],
+      cursorFields: ["metadata.next_offset"],
+      pageSize: 200,
+      itemCap: 400,
+      pageCap: 1000,
+      totalSemantics: "Log walks are complete only when next_offset is absent before the caller record cap.",
+      stopConditions: ["No next_offset", "400-record cap", "Repeated offset", "Empty page with offset", "Page cap"],
+    },
+    {
+      surfaceIds: ["offline-enrollment-logs"],
+      cursorFields: ["mintime", "timestamp"],
+      pageSize: 1000,
+      itemCap: 5000,
+      pageCap: 5,
+      totalSemantics: "Advance mintime from the latest event; the 5,000-record cap leaves the dataset incomplete.",
+      stopConditions: ["Short page", "5,000-record cap", "Timestamp fails to advance"],
+    },
+  ],
   rateLimit: {
     documentedLimit: "Duo applies integration- and endpoint-specific limits",
     retryHeaders: ["Retry-After", "X-RateLimit-Remaining"],
@@ -154,5 +222,23 @@ export const DUO_SPEC = buildBatchIntegrationSpec({
   knownGaps: ["Auth API and Accounts API authentication modes, richer Trust Monitor analysis, and trend reporting are not shipped."],
   sensitiveFields: ["skey", "integration_key", "authorization", "cookie", "bypass_code"],
   credentialFormats: ["Duo integration keys", "Duo secret keys", "HMAC Authorization signatures"],
-  outputPrefix: "duo-audit",
+  output: buildBatchOutputContract({
+    files: [
+      "QUICK_REFERENCE.md", "config.json", "core_data/settings.json", "core_data/policies.json", "core_data/global_policy.json",
+      "core_data/users.json", "core_data/bypass_codes.json", "core_data/webauthn_credentials.json",
+      "core_data/admin_allowed_auth_methods.json", "core_data/authentication_logs.json", "core_data/offline_enrollment_logs.json",
+      "core_data/admins.json", "core_data/activity_logs.json", "core_data/integrations.json", "core_data/info_summary.json",
+      "core_data/telephony_logs.json", "core_data/trust_monitor_events.json", "core_data/authentication_attempts.json",
+      "core_data/collection_status.json", "analysis/authentication.json", "analysis/admin_access.json",
+      "analysis/integrations.json", "analysis/monitoring.json", "analysis/findings.json",
+      "compliance/executive_summary.md", "compliance/unified_compliance_matrix.md",
+      "compliance/fedramp/fedramp_compliance_report.md", "compliance/cmmc/cmmc_compliance_report.md",
+      "compliance/soc2/soc2_compliance_report.md", "compliance/cis/cis_compliance_report.md",
+      "compliance/pci_dss/pci_dss_compliance_report.md", "compliance/disa_stig/stig_compliance_checklist.md",
+      "compliance/irap/irap_compliance_report.md", "compliance/ismap/ismap_compliance_report.md",
+    ],
+    conditionalFiles: ["_errors.log"],
+    overwritePolicy: "Allocate a timestamped <api-host> directory and add a numeric suffix if that directory already exists; allocate the archive independently without overwriting.",
+    archivePairing: "Create a zip named from the allocated directory beside it; if that zip exists, add an independent numeric suffix.",
+  }),
 });

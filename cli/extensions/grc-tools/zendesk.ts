@@ -21,7 +21,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
-import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZENDESK_SPEC } from "./zendesk.spec.js";
 
@@ -214,6 +214,20 @@ const CONTROL_MAPPINGS: Record<number, string[]> = {
   24: ["FedRAMP SC-8(1)", "CMMC SC.L2-3.13.8", "SOC 2 CC6.7", "CIS 14.4", "PCI-DSS 4.1", "DISA STIG SRG-APP-000441", "IRAP ISM-0487", "ISMAP 10.1.1"],
   25: ["FedRAMP AC-4", "CMMC AC.L2-3.1.3", "SOC 2 CC6.6", "CIS 13.4", "PCI-DSS 1.3.4", "DISA STIG SRG-APP-000039", "IRAP ISM-1284", "ISMAP 8.1.3"],
 };
+
+hydrateBatchFrameworkMappings(ZENDESK_SPEC, Object.fromEntries(Object.entries(CONTROL_MAPPINGS).map(([number, mappings]) => [
+  `ZD-${number.padStart(2, "0")}`,
+  {
+    fedramp: [mappings[0].replace(/^FedRAMP /, "")],
+    cmmc: [mappings[1].replace(/^CMMC /, "")],
+    soc2: [mappings[2].replace(/^SOC 2 /, "")],
+    cis: [mappings[3].replace(/^CIS /, "")],
+    pci_dss: [mappings[4].replace(/^PCI-DSS /, "")],
+    disa_stig: [mappings[5].replace(/^DISA STIG /, "")],
+    irap: [mappings[6].replace(/^IRAP /, "")],
+    ismap: [mappings[7].replace(/^ISMAP /, "")],
+  },
+])));
 
 const FRAMEWORK_REPORTS: Array<{ slug: string; title: string; prefix: string }> = [
   { slug: "fedramp", title: "FedRAMP / NIST 800-53 Compliance Report", prefix: "FedRAMP " },
