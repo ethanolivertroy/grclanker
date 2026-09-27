@@ -2,440 +2,749 @@
 slug: "salesforce-sec-inspector"
 name: "Salesforce Security Inspector"
 vendor: "Salesforce"
-category: "saas-collaboration"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+category: "crm-and-business-applications"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# salesforce-sec-inspector
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-Multi-framework security compliance audit tool for Salesforce.
+# Salesforce Security Inspector
 
-## Overview
+Portable contract for the shipped Salesforce platform, identity, data-protection, and monitoring assessments.
 
-salesforce-sec-inspector is a command-line tool that audits Salesforce org configurations against multiple security compliance frameworks. It queries the REST API, Tooling API, Metadata API, and Shield Platform to evaluate security settings, user permissions, authentication policies, and data protection controls, then maps findings to FedRAMP, CMMC 2.0, SOC 2, CIS Benchmarks, PCI-DSS, DISA STIG, IRAP, and ISMAP controls.
+## Purpose
 
-Salesforce orgs accumulate permission sprawl, stale integrations, and misconfigured session policies over time. The built-in Security Health Check provides a 0-100 score but does not map to external compliance frameworks. salesforce-sec-inspector bridges that gap by correlating Health Check findings with granular permission set analysis, connected app inventory, Shield event monitoring, and setup audit trail data to produce actionable, framework-mapped compliance reports.
+Inspect Salesforce organization security, identity permissions, data protection, and monitoring configuration through read-only REST, Tooling, and Metadata API evidence.
 
-### grclanker implementation
+## Design guidance
 
-The inspector ships as native TypeScript tools in `cli/extensions/grc-tools/salesforce.ts` (tests in `cli/tests/salesforce.test.mjs`, live smoke in `cli/scripts/salesforce-live-smoke.mjs`, guide in `src/content/docs/docs/integrations/salesforce.md`):
+Keep the three API surfaces and their permissions distinct. Population sanity checks are mandatory for user, profile, permission-set, and MFA conclusions. A zero-row response from a permission-limited view is unknown, not compliant.
 
-- `salesforce_check_access`: probes every read surface and reports likely missing permissions
-- `salesforce_assess_platform_security`: controls 1, 2, 3, 5, 18, 19, 20
-- `salesforce_assess_identity_access`: controls 4, 6, 7, 9, 10, 13
-- `salesforce_assess_data_protection`: controls 8, 12, 16, 17
-- `salesforce_assess_monitoring_integrations`: controls 11, 14, 15
-- `salesforce_export_audit_bundle`: `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log`, zip archive
+## Shared integration contract
 
-## APIs & SDKs
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-### REST API
+## Known runtime gaps
 
-Standard Salesforce REST API for sObject queries and CRUD operations.
+- REST, Tooling SOQL, and synchronous Metadata API reads retain separate permission and pagination states; one readable surface does not substitute for another denied dependency.
+- Profile and user verdicts require population sanity gates: zero standard users, unresolved sensitive profiles, row caps, or partial profile metadata cannot pass.
+- SOQL nextRecordsUrl values are followed only on the configured Salesforce instance origin without user information; rejected links stop truncated.
+- Interactive authorization code flow, geolocation baselines, and several policy surfaces are not read.
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /services/data/vXX.0/sobjects/SetupAuditTrail` | 180-day admin change history |
-| `GET /services/data/vXX.0/sobjects/User` | User records (active, frozen, profile assignments) |
-| `GET /services/data/vXX.0/sobjects/Profile` | Profile definitions and settings |
-| `GET /services/data/vXX.0/sobjects/LoginHistory` | Login events with source IP, status, client |
-| `GET /services/data/vXX.0/sobjects/AuthSession` | Active sessions |
-| `GET /services/data/vXX.0/sobjects/TwoFactorInfo` | MFA enrollment status per user |
-| `GET /services/data/vXX.0/sobjects/ConnectedApplication` | Connected app inventory |
-| `GET /services/data/vXX.0/sobjects/Certificate` | Certificate management |
-| `GET /services/data/vXX.0/sobjects/CustomDomain` | My Domain configuration |
+## Tools
 
-### Tooling API
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `salesforce_check_access` | Validate read-only Salesforce access across OAuth session, Organization, limits, Security Health Check, SecuritySettings metadata, users, profiles, permission sets, login history, setup audit trail, connected apps, and event log files, and report likely missing permissions. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `salesforce_assess_platform_security` | Assess Salesforce Health Check score, session timeout, password policy, trusted IP ranges, My Domain login policy, clickjack protection, and CSRF protection (controls 1, 2, 3, 5, 18, 19, 20) via the Tooling API and Metadata API readMetadata. | `SF-01`, `SF-02`, `SF-03`, `SF-05`, `SF-18`, `SF-19`, `SF-20` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `salesforce_assess_identity_access` | Assess Salesforce MFA enforcement and enrollment, login hour restrictions, API access controls, elevated permission sets and assignments, administrator profiles, and guest user access (controls 4, 6, 7, 9, 10, 13). | `SF-04`, `SF-06`, `SF-07`, `SF-09`, `SF-10`, `SF-13` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `salesforce_assess_data_protection` | Assess Salesforce field-level security on sensitive fields, organization-wide sharing defaults, Shield Platform Encryption tenant secrets, and certificate expiry (controls 8, 12, 16, 17). | `SF-08`, `SF-12`, `SF-16`, `SF-17` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `salesforce_assess_monitoring_integrations` | Assess Salesforce connected app OAuth policies and token usage, login history forensics, setup audit trail high-risk changes, and Event Monitoring availability (controls 11, 14, 15). | `SF-11`, `SF-14`, `SF-15` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `salesforce_export_audit_bundle` | Export a Salesforce audit package with projected and redacted API snapshots (core_data/, with not-collected markers for denied datasets), normalized findings (analysis/), executive summary, unified compliance matrix, per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive. | `SF-01`, `SF-02`, `SF-03`, `SF-04`, `SF-05`, `SF-06`, `SF-07`, `SF-08`, `SF-09`, `SF-10`, `SF-11`, `SF-12`, `SF-13`, `SF-14`, `SF-15`, `SF-16`, `SF-17`, `SF-18`, `SF-19`, `SF-20` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
 
-Programmatic access to Salesforce setup and configuration metadata.
+### Parameters
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /services/data/vXX.0/tooling/sobjects/SecurityHealthCheck` | Overall 0-100 security score |
-| `GET /services/data/vXX.0/tooling/sobjects/SecurityHealthCheckRisks` | Per-setting risk categories (HIGH/MEDIUM/LOW) |
-| `GET /services/data/vXX.0/tooling/sobjects/PermissionSet` | Permission set definitions |
-| `GET /services/data/vXX.0/tooling/sobjects/PermissionSetAssignment` | Permission set-to-user assignments |
-| `GET /services/data/vXX.0/tooling/sobjects/FieldPermissions` | Field-level security per permission set |
-| `GET /services/data/vXX.0/tooling/sobjects/ObjectPermissions` | Object-level CRUD per permission set |
-| `GET /services/data/vXX.0/tooling/sobjects/SessionPermSetActivation` | Session-based permission set activations |
-| `GET /services/data/vXX.0/tooling/sobjects/ProfilePasswordPolicy` | Password policy per profile |
+#### `salesforce_check_access`
 
-### Metadata API
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
+| `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
+| `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
+| `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
+| `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
+| `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
+| `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
+| `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
+| `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
+| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
-Declarative configuration retrieval for security-relevant settings.
+#### `salesforce_assess_platform_security`
 
-| Endpoint | Purpose |
-|----------|---------|
-| `retrieve SecuritySettings` | Session timeout, IP restrictions, password policy, clickjack protection, 2FA, login hours |
-| `retrieve SharingRules` | Organization-wide sharing defaults and rules |
-| `retrieve RemoteSiteSetting` | Approved remote site URLs |
-| `retrieve CspTrustedSite` | Content Security Policy trusted sites |
-| `retrieve ExternalDataSource` | External data source configurations |
-| `retrieve NamedCredential` | Named credential configurations |
-| `retrieve HistoryRetentionPolicy` | Field history retention settings |
-| `retrieve NetworkAccess` | Trusted IP ranges |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
+| `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
+| `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
+| `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
+| `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
+| `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
+| `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
+| `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
+| `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
+| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
 
-### Shield Platform (add-on license)
+#### `salesforce_assess_identity_access`
 
-Enhanced security monitoring, encryption, and audit capabilities.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
+| `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
+| `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
+| `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
+| `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
+| `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
+| `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
+| `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
+| `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
+| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
+| `max_admins` | number | no | Maximum acceptable administrator-class users or elevated assignees before failing. Defaults to 5. |
+| `stale_login_days` | number | no | Days without login after which an administrator is stale. Defaults to 90. |
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /services/data/vXX.0/sobjects/EventLogFile` | 50+ event types (Login, API, Report, etc.) -- 24-hour log files |
-| `GET /services/data/vXX.0/sobjects/FieldHistoryArchive` | Field Audit Trail -- 60 fields/object, 10-year retention |
-| `GET /services/data/vXX.0/sobjects/TenantSecret` | Platform Encryption tenant secrets (AES-256) |
-| `GET /services/data/vXX.0/sobjects/EncryptedFieldsInfo` | Fields currently encrypted |
-| `GET /services/data/vXX.0/sobjects/EventBusSubscriber` | Platform event subscribers |
-| `GET /services/data/vXX.0/sobjects/TransactionSecurityPolicy` | Transaction security policies |
+#### `salesforce_assess_data_protection`
 
-**Note:** Shield Platform Encryption, Event Monitoring, and Field Audit Trail are add-on licenses. The tool detects their availability and adjusts audit scope accordingly.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
+| `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
+| `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
+| `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
+| `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
+| `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
+| `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
+| `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
+| `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
+| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
+| `certificate_expiry_warning_days` | number | no | Warn when a certificate expires within this many days. Defaults to 30. |
 
-### Connected Apps & OAuth
+#### `salesforce_assess_monitoring_integrations`
 
-OAuth application inventory and scope management.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
+| `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
+| `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
+| `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
+| `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
+| `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
+| `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
+| `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
+| `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
+| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
+| `login_history_days` | number | no | Login history lookback window in days. Defaults to 30. |
+| `audit_trail_days` | number | no | Setup audit trail lookback window in days (max 180). Defaults to 90. |
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /services/data/vXX.0/sobjects/ConnectedApplication` | Connected app definitions |
-| `GET /services/data/vXX.0/sobjects/OauthToken` | Active OAuth tokens |
-| SOQL: `SELECT ... FROM SetupEntityAccess WHERE SetupEntityType = 'ConnectedApplication'` | App-to-profile/permset assignments |
-| Setup API: Connected App policies | Admin pre-authorization, IP relaxation, refresh token policy |
+#### `salesforce_export_audit_bundle`
 
-### SOQL Queries
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `instance_url` | string | no | Salesforce instance or My Domain URL, for example https://acme.my.salesforce.com. Defaults to SF_INSTANCE_URL. |
+| `login_url` | string | no | OAuth login host. Defaults to SF_LOGIN_URL, else https://test.salesforce.com for sandboxes or https://login.salesforce.com. |
+| `username` | string | no | Salesforce username for JWT bearer or username-password flows. Defaults to SF_USERNAME. |
+| `password` | string | no | Password for the username-password flow. Defaults to SF_PASSWORD. |
+| `security_token` | string | no | Security token appended to the password. Defaults to SF_SECURITY_TOKEN. |
+| `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
+| `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
+| `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
+| `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
+| `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
+| `api_version` | string | no | Salesforce API version. Defaults to 64.0. |
+| `sandbox` | boolean | no | Force the sandbox login host https://test.salesforce.com. Defaults to SF_SANDBOX or detection from the instance URL. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `record_limit` | number | no | Maximum records to read per SOQL query before recording truncation. Defaults to 2000. |
+| `output_dir` | string | no | Output root. Defaults to ./export/salesforce. |
+| `max_admins` | number | no | Maximum acceptable administrator-class users before failing. Defaults to 5. |
+| `login_history_days` | number | no | Login history lookback window in days. Defaults to 30. |
+| `audit_trail_days` | number | no | Setup audit trail lookback window in days. Defaults to 90. |
+| `certificate_expiry_warning_days` | number | no | Warn when a certificate expires within this many days. Defaults to 30. |
+| `stale_login_days` | number | no | Days without login after which an administrator is stale. Defaults to 90. |
 
-Key queries for security analysis.
-
-```sql
--- Active users with profile and permission sets
-SELECT Id, Username, Profile.Name, IsActive, LastLoginDate, UserType
-FROM User WHERE IsActive = true
-
--- Permission set assignments (who has what)
-SELECT Assignee.Username, PermissionSet.Name, PermissionSet.IsOwnedByProfile
-FROM PermissionSetAssignment
-
--- Setup audit trail (admin changes)
-SELECT CreatedDate, CreatedBy.Username, Action, Section, Display
-FROM SetupAuditTrail ORDER BY CreatedDate DESC
-
--- Login history with failure analysis
-SELECT LoginTime, UserId, SourceIp, Status, LoginType, Application, Browser
-FROM LoginHistory WHERE LoginTime = LAST_N_DAYS:30
-
--- Connected apps with scope
-SELECT Name, ContactEmail, StartUrl, OptionsAllowAdminApprovedUsersOnly
-FROM ConnectedApplication
-```
-
-### SDKs and CLI Tools
-
-| Tool | Usage |
-|------|-------|
-| [simple-salesforce](https://github.com/simple-salesforce/simple-salesforce) | Python SDK for REST, Tooling, Metadata, and Bulk APIs |
-| [Salesforce CLI (sf)](https://developer.salesforce.com/tools/salesforcecli) | Official CLI for org management and metadata retrieval |
-| `requests` | Direct HTTP for endpoints not covered by simple-salesforce |
 
 ## Authentication
 
-### JWT Bearer Flow (recommended for automation)
+Supported modes:
 
-Server-to-server authentication using a connected app with a digital certificate. No interactive login required.
+- JWT bearer
+- username/password plus security token
+- OAuth refresh token
+- explicit access token
 
-```bash
-export SF_CONSUMER_KEY=3MVG9...
-export SF_USERNAME=admin@myorg.example.com
-export SF_PRIVATE_KEY_FILE=/path/to/server.key
-export SF_INSTANCE_URL=https://myorg.my.salesforce.com
-```
+Credential precedence, highest first:
 
-### OAuth 2.0 Authorization Code Flow
+1. Explicit access token and instance URL
+2. Explicit refresh token
+3. Explicit JWT credentials
+4. Password grant
+5. Credentials file and SF_* environment variables
 
-Interactive browser-based login. Suitable for development and ad-hoc audits.
+Environment variables: `SF_INSTANCE_URL`, `SF_LOGIN_URL`, `SF_USERNAME`, `SF_PASSWORD`, `SF_SECURITY_TOKEN`, `SF_CONSUMER_KEY`, `SF_CONSUMER_SECRET`, `SF_PRIVATE_KEY`, `SF_REFRESH_TOKEN`, `SF_ACCESS_TOKEN`
 
-```bash
-export SF_CONSUMER_KEY=3MVG9...
-export SF_CONSUMER_SECRET=...
-export SF_INSTANCE_URL=https://myorg.my.salesforce.com
-```
+Configuration locations: Explicit credentials JSON file
 
-### Username/Password + Security Token
+Credential and deployment variants: Production login, Sandbox login, Custom My Domain login
 
-Legacy authentication. Not recommended for production use.
+Configuration fields: `instanceUrl`, `loginUrl`, `username`, `password`, `securityToken`, `consumerKey`, `consumerSecret`, `privateKey`, `refreshToken`, `accessToken`, `apiVersion`
 
-```bash
-export SF_USERNAME=admin@myorg.example.com
-export SF_PASSWORD=...
-export SF_SECURITY_TOKEN=...
-export SF_INSTANCE_URL=https://myorg.my.salesforce.com
-```
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 
-### Credential File (alternative)
+Credential refresh: POST /services/oauth2/token with the selected JWT bearer, refresh_token, or password grant.
 
-```bash
-export SF_CREDENTIALS_FILE=/path/to/salesforce-credentials.json
-```
+## Permissions
 
-The credentials file supports all three auth methods with a `"grant_type"` field (`jwt-bearer`, `authorization_code`, or `password`).
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| role | `API Enabled` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `View Setup and Configuration` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `View Health Check` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `View All Users` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `Manage MFA in API` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `Metadata API read privileges` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `View Event Log Files where licensed` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
 
-### Required Permissions
+## API surfaces
 
-| Permission | Purpose |
-|------------|---------|
-| `View Setup and Configuration` | Access security settings |
-| `View All Users` | User and permission analysis |
-| `View Event Log Files` | Shield event monitoring (if licensed) |
-| `Manage Encryption Keys` | Shield encryption audit (if licensed) |
-| `API Enabled` | API access for all queries |
-| `Query All Files` | Full SetupAuditTrail access |
-| `Customize Application` | Metadata API access; also required to see every user's `OauthToken` rows rather than only the caller's own |
-| `Manage MFA in API` | Query `TwoFactorMethodsInfo` for per-user MFA enrollment |
-| `Modify Metadata Through Metadata API Functions` | `listMetadata` and `readMetadata` for `SecuritySettings`, `MyDomainSettings`, and `Profile` (or `Modify All Data`) |
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `standard-query` | HTTP | `GET /services/data/v64.0/query` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `records`, `totalSize`, `done`, `nextRecordsUrl` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_query.htm) |
+| `tooling-query` | HTTP | `GET /services/data/v64.0/tooling/query` | Salesforce Tooling API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `records`, `totalSize`, `done`, `nextRecordsUrl` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_tooling.meta/api_tooling/intro_rest_resources.htm) |
+| `metadata-read` | HTTP | `POST /services/Soap/m/64.0` | Salesforce Metadata API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `SecuritySettings`, `MyDomainSettings`, `Profile`, `ConnectedApp` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_meta.meta/api_meta/meta_readMetadata.htm) |
+| `limits` | HTTP | `GET /services/data/v64.0/limits` | Salesforce REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `DailyApiRequests`, `HourlyODataCallout`, `DailyAsyncApexExecutions` | [Official documentation](https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_limits.htm) |
 
-## Security Controls
+### Request construction
 
-| # | Control | API Source | Description |
-|---|---------|-----------|-------------|
-| 1 | Health Check Score | Tooling API | Overall security score (0-100) with per-setting risk breakdown |
-| 2 | Session Timeout | Metadata API | Session timeout <= 2 hours; force logout on session timeout |
-| 3 | Password Policy | Metadata API, Tooling API | Minimum length >= 12, complexity requirements, expiration <= 90 days, history >= 12 |
-| 4 | MFA/2FA Enforcement | REST API, Tooling API | MFA required for all UI logins; per-user enrollment verification |
-| 5 | IP Range Restrictions | Metadata API | Login IP ranges configured per profile; org-wide trusted IP ranges |
-| 6 | Login Hour Restrictions | Metadata API | Login hours restricted for sensitive profiles |
-| 7 | API Access Controls | Tooling API | API-only profiles identified; API access limited to required profiles |
-| 8 | Field-Level Security | Tooling API | Sensitive fields (SSN, credit card) restricted to minimum profiles |
-| 9 | Permission Set Review | Tooling API | Overprivileged permission sets; Modify All Data / View All Data usage |
-| 10 | Profile Permissions | Tooling API, REST API | System admin count; profiles with excessive object permissions |
-| 11 | Connected App OAuth Scopes | REST API | Connected apps with broad scopes (full, api); unapproved apps |
-| 12 | Sharing Settings | Metadata API | Organization-wide defaults not set to Public; sharing rules reviewed |
-| 13 | Guest User Access | REST API, Tooling API | Guest user profiles with excessive permissions; public sites exposure |
-| 14 | Login Forensics | REST API | Failed login patterns; login from unexpected geolocations/IPs |
-| 15 | Setup Change Tracking | REST API | High-risk setup changes (permission changes, new admins, IP changes) |
-| 16 | Data Encryption Status | Shield API | Platform Encryption enabled for sensitive fields; tenant secret rotation |
-| 17 | Certificate Management | REST API | Certificate expiration; self-signed vs CA-signed |
-| 18 | My Domain Enforcement | REST API, Metadata API | Custom domain configured; login policy set to prevent login via login.salesforce.com |
-| 19 | Clickjack Protection | Metadata API | Clickjack protection enabled for setup pages, Visualforce, and non-setup pages |
-| 20 | CSRF Protection | Metadata API | Cross-Site Request Forgery protection enabled |
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `standard-query` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `standard-query` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `standard-query` | response | A JSON object or list containing only the documented records, totalSize, done, nextRecordsUrl members consumed by verdicts. | yes |
+| `tooling-query` | client | Use the configured Salesforce Tooling API origin; never follow a server link to a different origin. | yes |
+| `tooling-query` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `tooling-query` | response | A JSON object or list containing only the documented records, totalSize, done, nextRecordsUrl members consumed by verdicts. | yes |
+| `metadata-read` | client | Use the configured Salesforce Metadata API origin; never follow a server link to a different origin. | yes |
+| `metadata-read` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `metadata-read` | response | A JSON object or list containing only the documented SecuritySettings, MyDomainSettings, Profile, ConnectedApp members consumed by verdicts. | yes |
+| `limits` | client | Use the configured Salesforce REST API origin; never follow a server link to a different origin. | yes |
+| `limits` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `limits` | response | A JSON object or list containing only the documented DailyApiRequests, HourlyODataCallout, DailyAsyncApexExecutions members consumed by verdicts. | yes |
 
-## Compliance Framework Mappings
+## Pagination
 
-| # | Control | FedRAMP | CMMC 2.0 | SOC 2 | CIS SF | PCI-DSS 4.0 | DISA STIG | IRAP | ISMAP |
-|---|---------|---------|----------|-------|--------|-------------|-----------|------|-------|
-| 1 | Health Check Score | CA-2 | L2: CA.L2-3.12.1 | CC4.1 | 1.1 | 11.3.1 | SRG-APP-000516 | ISM-1526 | 11.3.1 |
-| 2 | Session Timeout | AC-12 | L2: AC.L2-3.1.10 | CC6.1 | 2.1 | 8.2.8 | SRG-APP-000295 | ISM-1164 | 8.2.8 |
-| 3 | Password Policy | IA-5(1) | L2: IA.L2-3.5.7 | CC6.1 | 2.2 | 8.3.6 | SRG-APP-000164 | ISM-0421 | 8.3.6 |
-| 4 | MFA/2FA Enforcement | IA-2(1) | L2: IA.L2-3.5.3 | CC6.1 | 2.3 | 8.4.1 | SRG-APP-000149 | ISM-1401 | 8.4.1 |
-| 5 | IP Range Restrictions | AC-3, SC-7 | L2: SC.L2-3.13.1 | CC6.6 | 2.4 | 1.3.1 | SRG-APP-000142 | ISM-1416 | 1.3.1 |
-| 6 | Login Hour Restrictions | AC-2(5) | L2: AC.L2-3.1.8 | CC6.1 | 2.5 | 7.2.1 | SRG-APP-000025 | ISM-0988 | 7.2.1 |
-| 7 | API Access Controls | AC-3 | L2: AC.L2-3.1.2 | CC6.3 | 3.1 | 7.2.2 | SRG-APP-000033 | ISM-1508 | 7.2.2 |
-| 8 | Field-Level Security | AC-3 | L2: AC.L2-3.1.3 | CC6.1 | 3.2 | 7.2.1 | SRG-APP-000033 | ISM-0405 | 7.2.1 |
-| 9 | Permission Set Review | AC-6(1) | L2: AC.L2-3.1.5 | CC6.3 | 3.3 | 7.2.2 | SRG-APP-000340 | ISM-1508 | 7.2.2 |
-| 10 | Profile Permissions | AC-6(5) | L2: AC.L2-3.1.6 | CC6.3 | 3.4 | 7.2.1 | SRG-APP-000340 | ISM-1508 | 7.2.1 |
-| 11 | Connected App OAuth | AC-3 | L2: AC.L2-3.1.2 | CC6.1 | 4.1 | 6.4.1 | SRG-APP-000033 | ISM-1508 | 6.4.1 |
-| 12 | Sharing Settings | AC-4 | L2: AC.L2-3.1.3 | CC6.1 | 3.5 | 7.2.1 | SRG-APP-000038 | ISM-0405 | 7.2.1 |
-| 13 | Guest User Access | AC-14 | L2: AC.L2-3.1.1 | CC6.1 | 3.6 | 7.2.5 | SRG-APP-000033 | ISM-1508 | 7.2.5 |
-| 14 | Login Forensics | AU-6 | L2: AU.L2-3.3.5 | CC7.2 | 5.1 | 10.6.1 | SRG-APP-000343 | ISM-0580 | 10.6.1 |
-| 15 | Setup Change Tracking | AU-2, AU-3 | L2: AU.L2-3.3.1 | CC7.2 | 5.2 | 10.2.1 | SRG-APP-000089 | ISM-0580 | 10.2.1 |
-| 16 | Data Encryption | SC-28(1) | L2: SC.L2-3.13.16 | CC6.1 | 6.1 | 3.4.1 | SRG-APP-000231 | ISM-0457 | 3.4.1 |
-| 17 | Certificate Mgmt | SC-17 | L2: SC.L2-3.13.10 | CC6.1 | 6.2 | 4.1.1 | SRG-APP-000514 | ISM-1139 | 4.1.1 |
-| 18 | My Domain | IA-8 | L2: IA.L2-3.5.2 | CC6.1 | 2.6 | 2.2.1 | SRG-APP-000516 | ISM-1590 | 2.2.1 |
-| 19 | Clickjack Protection | SC-18 | L2: SC.L2-3.13.1 | CC6.1 | 7.1 | 6.2.4 | SRG-APP-000516 | ISM-1486 | 6.2.4 |
-| 20 | CSRF Protection | SC-18 | L2: SC.L2-3.13.1 | CC6.1 | 7.2 | 6.2.4 | SRG-APP-000516 | ISM-1486 | 6.2.4 |
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `standard-query`, `tooling-query`, `metadata-read`, `limits` | `nextRecordsUrl`, `done`, `totalSize` | 2000 | 2000 | none | totalSize is authoritative when present; done=true and seen equal total prove completion. | done true with matching total; Configured row cap; Repeated nextRecordsUrl; Empty page with continuation; Missing or larger total; Rejected cross-origin or user-information cursor |
 
-## Existing Tools
+## Rate limits
 
-| Tool | Notes |
-|------|-------|
-| [Salesforce Security Health Check](https://help.salesforce.com/s/articleView?id=sf.security_health_check.htm) | Built-in. 0-100 score with per-setting risk. No external framework mapping. No API automation story until Spring '20. |
-| [Varonis for Salesforce](https://www.varonis.com/integrations/salesforce) | Commercial. Permission analysis, data classification, threat detection. No compliance framework mapping. |
-| [OwnBackup (now Own)](https://www.owndata.com/) | Commercial. Primarily backup/restore. Some security analytics for permissions. |
-| [Sonar](https://www.sonarsource.com/) | Code quality for Apex/LWC. Not configuration security. |
-| [Clayton](https://www.yourorg.io/) | Commercial. Org health and technical debt analysis. Some security overlap. |
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Salesforce Security Inspector | Organization edition and license determine daily and concurrent API limits | `Sforce-Limit-Info`, `Retry-After` | 429, 500, 502, 503, 504 | Use bounded Retry-After and exponential retry; preserve REQUEST_LIMIT_EXCEEDED as unreadable evidence. |
 
-**Gap:** No open-source tool maps Salesforce security settings to FedRAMP, CMMC 2.0, DISA STIG, IRAP, and ISMAP. The built-in Health Check is a good starting point but provides no compliance framework context. salesforce-sec-inspector extends the Health Check with external framework mapping, permission analysis, and automated evidence collection.
+## Checks
 
-## Architecture
+### Control coverage
 
-Package structure mirroring the okta-inspector pattern:
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | Health Check score | SF-01 | Evaluate the ordered first-match rules for SF-01 below. |
+| 2 | Session timeout | SF-02 | Evaluate the ordered first-match rules for SF-02 below. |
+| 3 | Password policy | SF-03 | Evaluate the ordered first-match rules for SF-03 below. |
+| 4 | MFA enforcement | SF-04 | Evaluate the ordered first-match rules for SF-04 below. |
+| 5 | IP range restrictions | SF-05 | Evaluate the ordered first-match rules for SF-05 below. |
+| 6 | Login hour restrictions | SF-06 | Evaluate the ordered first-match rules for SF-06 below. |
+| 7 | API access controls | SF-07 | Evaluate the ordered first-match rules for SF-07 below. |
+| 8 | Field-level security | SF-08 | Evaluate the ordered first-match rules for SF-08 below. |
+| 9 | Permission set review | SF-09 | Evaluate the ordered first-match rules for SF-09 below. |
+| 10 | Profile permissions | SF-10 | Evaluate the ordered first-match rules for SF-10 below. |
+| 11 | Connected app OAuth policies | SF-11 | Evaluate the ordered first-match rules for SF-11 below. |
+| 12 | Sharing settings | SF-12 | Evaluate the ordered first-match rules for SF-12 below. |
+| 13 | Guest user access | SF-13 | Evaluate the ordered first-match rules for SF-13 below. |
+| 14 | Login forensics | SF-14 | Evaluate the ordered first-match rules for SF-14 below. |
+| 15 | Setup change tracking | SF-15 | Evaluate the ordered first-match rules for SF-15 below. |
+| 16 | Data encryption status | SF-16 | Evaluate the ordered first-match rules for SF-16 below. |
+| 17 | Certificate management | SF-17 | Evaluate the ordered first-match rules for SF-17 below. |
+| 18 | My Domain enforcement | SF-18 | Evaluate the ordered first-match rules for SF-18 below. |
+| 19 | Clickjack protection | SF-19 | Evaluate the ordered first-match rules for SF-19 below. |
+| 20 | CSRF protection | SF-20 | Evaluate the ordered first-match rules for SF-20 below. |
 
-```
-salesforce-sec-inspector/
-├── spec.md
-├── pyproject.toml
-├── src/
-│   └── salesforce_sec_inspector/
-│       ├── __init__.py
-│       ├── __main__.py          # Entry point
-│       ├── cli.py               # Click CLI definition
-│       ├── client.py            # Salesforce API client (REST, Tooling, Metadata, Shield)
-│       ├── collector.py         # Data collection across all API surfaces
-│       ├── engine.py            # Audit engine orchestrating controls
-│       ├── models.py            # Pydantic models for findings and controls
-│       ├── output.py            # Console output formatting
-│       ├── analyzers/
-│       │   ├── __init__.py
-│       │   ├── base.py          # Base analyzer interface
-│       │   ├── common.py        # Shared analysis utilities
-│       │   ├── fedramp.py       # FedRAMP AC/AU/IA/SC family mapping
-│       │   ├── cmmc.py          # CMMC 2.0 Level 2 practice mapping
-│       │   ├── soc2.py          # SOC 2 Trust Services Criteria mapping
-│       │   ├── cis.py           # CIS Salesforce Benchmark checks
-│       │   ├── pci_dss.py       # PCI-DSS 4.0 requirement mapping
-│       │   ├── stig.py          # DISA STIG SRG mapping
-│       │   ├── irap.py          # IRAP ISM control mapping
-│       │   └── ismap.py         # ISMAP control mapping
-│       └── reporters/
-│           ├── __init__.py
-│           ├── base.py          # Base reporter interface
-│           ├── executive.py     # Executive summary with Health Check score + framework status
-│           ├── fedramp.py       # FedRAMP POA&M format
-│           ├── cmmc.py          # CMMC assessment report format
-│           ├── soc2.py          # SOC 2 evidence format
-│           ├── cis.py           # CIS Benchmark scoring
-│           ├── pci_dss.py       # PCI-DSS ROC evidence format
-│           ├── stig.py          # STIG Checklist (.ckl) format
-│           ├── irap.py          # IRAP assessment format
-│           ├── ismap.py         # ISMAP assessment format
-│           ├── matrix.py        # Cross-framework control matrix
-│           └── validation.py    # Finding validation and deduplication
-└── tests/
-    ├── conftest.py
-    ├── test_client.py
-    ├── test_collector.py
-    ├── test_engine.py
-    └── test_analyzers/
-        ├── test_fedramp.py
-        ├── test_cmmc.py
-        └── ...
-```
+### Finding notes
 
-### Key Design Decisions
+These notes explain intent only. The ordered rule table is normative.
 
-- **Health Check as baseline:** The Security Health Check score and per-risk breakdown serve as the foundation. Additional controls extend coverage beyond what Health Check measures.
-- **Shield detection:** The tool probes for Shield Platform availability at startup. If Event Monitoring, Field Audit Trail, or Platform Encryption are not licensed, those controls report "Not Available (Shield license required)" rather than failing.
-- **Multi-API collection:** Data is gathered from REST, Tooling, Metadata, and Shield APIs in a coordinated sweep. The collector deduplicates overlapping data (e.g., password policy appears in both Metadata and Tooling APIs).
-- **SOQL-first for bulk data:** User, permission, and login data is collected via SOQL queries for efficiency. API-per-record calls are avoided except where SOQL is not supported.
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `SF-01` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Health Check score; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Health Check score, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Health Check score; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Health Check score is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-02` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Session timeout; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Session timeout, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Session timeout; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Session timeout is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-03` | high | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Password policy; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Password policy, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Password policy; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Password policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-04` | critical | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for MFA enforcement; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for MFA enforcement, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of MFA enforcement; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for MFA enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-05` | high | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for IP range restrictions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for IP range restrictions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of IP range restrictions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for IP range restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-06` | high | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Login hour restrictions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Login hour restrictions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Login hour restrictions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Login hour restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-07` | medium | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for API access controls; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for API access controls, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of API access controls; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for API access controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-08` | medium | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Field-level security; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Field-level security, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Field-level security; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Field-level security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-09` | high | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Permission set review; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Permission set review, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Permission set review; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Permission set review is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-10` | high | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Profile permissions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Profile permissions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Profile permissions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Profile permissions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-11` | high | `salesforce_assess_monitoring_integrations` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Connected app OAuth policies; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Connected app OAuth policies, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Connected app OAuth policies; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Connected app OAuth policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-12` | high | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Sharing settings; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Sharing settings, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Sharing settings; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Sharing settings is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-13` | medium | `salesforce_assess_identity_access` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Guest user access; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Guest user access, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Guest user access; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Guest user access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-14` | medium | `salesforce_assess_monitoring_integrations` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Login forensics; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Login forensics, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Login forensics; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Login forensics is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-15` | medium | `salesforce_assess_monitoring_integrations` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Setup change tracking; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Setup change tracking, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Setup change tracking; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Setup change tracking is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-16` | high | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Data encryption status; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Data encryption status, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Data encryption status; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Data encryption status is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-17` | high | `salesforce_assess_data_protection` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Certificate management; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Certificate management, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Certificate management; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Certificate management is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-18` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for My Domain enforcement; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for My Domain enforcement, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of My Domain enforcement; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for My Domain enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-19` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Clickjack protection; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Clickjack protection, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Clickjack protection; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Clickjack protection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SF-20` | medium | `salesforce_assess_platform_security` | `standard-query`, `tooling-query`, `metadata-read`, `limits` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for CSRF protection; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for CSRF protection, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of CSRF protection; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for CSRF protection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
-## CLI Interface
+### Ordered decision rules
 
-```bash
-# Full org audit with all frameworks
-salesforce-sec-inspector audit --all-frameworks
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
 
-# Audit with specific framework
-salesforce-sec-inspector audit --framework fedramp
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `SF-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-09` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-09` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-09` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-09` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-10` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-10` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-10` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-10` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-11` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-11` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-11` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-11` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-12` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-12` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-12` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-12` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-13` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-13` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-13` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-13` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-14` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-14` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-14` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-14` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-15` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-15` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-15` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-15` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-16` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-16` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-16` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-16` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-17` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-17` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-17` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-17` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-18` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-18` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-18` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-18` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-19` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-19` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-19` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-19` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SF-20` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SF-20` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SF-20` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SF-20` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
 
-# Audit specific controls only
-salesforce-sec-inspector audit --controls 1,3,4,9,11
+### Derived decision facts
 
-# Health Check deep-dive with framework mapping
-salesforce-sec-inspector health-check --framework cmmc --output health-check.json
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `SF-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-07` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-08` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-09` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-10` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-11` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-12` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-13` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-14` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-15` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-16` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-17` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-18` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-19` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SF-20` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
 
-# Permission set analysis
-salesforce-sec-inspector permissions --report overprivileged --output permissions.csv
+### Criterion constants
 
-# Connected app inventory
-salesforce-sec-inspector apps --show-scopes --show-assignments
+| Finding | Name | Value |
+|---|---|---|
+| `SF-01` | `passStatus` | pass |
+| `SF-01` | `warnStatus` | warn |
+| `SF-01` | `failStatus` | fail |
+| `SF-01` | `manualStatus` | manual |
+| `SF-02` | `passStatus` | pass |
+| `SF-02` | `warnStatus` | warn |
+| `SF-02` | `failStatus` | fail |
+| `SF-02` | `manualStatus` | manual |
+| `SF-03` | `passStatus` | pass |
+| `SF-03` | `warnStatus` | warn |
+| `SF-03` | `failStatus` | fail |
+| `SF-03` | `manualStatus` | manual |
+| `SF-04` | `passStatus` | pass |
+| `SF-04` | `warnStatus` | warn |
+| `SF-04` | `failStatus` | fail |
+| `SF-04` | `manualStatus` | manual |
+| `SF-05` | `passStatus` | pass |
+| `SF-05` | `warnStatus` | warn |
+| `SF-05` | `failStatus` | fail |
+| `SF-05` | `manualStatus` | manual |
+| `SF-06` | `passStatus` | pass |
+| `SF-06` | `warnStatus` | warn |
+| `SF-06` | `failStatus` | fail |
+| `SF-06` | `manualStatus` | manual |
+| `SF-07` | `passStatus` | pass |
+| `SF-07` | `warnStatus` | warn |
+| `SF-07` | `failStatus` | fail |
+| `SF-07` | `manualStatus` | manual |
+| `SF-08` | `passStatus` | pass |
+| `SF-08` | `warnStatus` | warn |
+| `SF-08` | `failStatus` | fail |
+| `SF-08` | `manualStatus` | manual |
+| `SF-09` | `passStatus` | pass |
+| `SF-09` | `warnStatus` | warn |
+| `SF-09` | `failStatus` | fail |
+| `SF-09` | `manualStatus` | manual |
+| `SF-10` | `passStatus` | pass |
+| `SF-10` | `warnStatus` | warn |
+| `SF-10` | `failStatus` | fail |
+| `SF-10` | `manualStatus` | manual |
+| `SF-11` | `passStatus` | pass |
+| `SF-11` | `warnStatus` | warn |
+| `SF-11` | `failStatus` | fail |
+| `SF-11` | `manualStatus` | manual |
+| `SF-12` | `passStatus` | pass |
+| `SF-12` | `warnStatus` | warn |
+| `SF-12` | `failStatus` | fail |
+| `SF-12` | `manualStatus` | manual |
+| `SF-13` | `passStatus` | pass |
+| `SF-13` | `warnStatus` | warn |
+| `SF-13` | `failStatus` | fail |
+| `SF-13` | `manualStatus` | manual |
+| `SF-14` | `passStatus` | pass |
+| `SF-14` | `warnStatus` | warn |
+| `SF-14` | `failStatus` | fail |
+| `SF-14` | `manualStatus` | manual |
+| `SF-15` | `passStatus` | pass |
+| `SF-15` | `warnStatus` | warn |
+| `SF-15` | `failStatus` | fail |
+| `SF-15` | `manualStatus` | manual |
+| `SF-16` | `passStatus` | pass |
+| `SF-16` | `warnStatus` | warn |
+| `SF-16` | `failStatus` | fail |
+| `SF-16` | `manualStatus` | manual |
+| `SF-17` | `passStatus` | pass |
+| `SF-17` | `warnStatus` | warn |
+| `SF-17` | `failStatus` | fail |
+| `SF-17` | `manualStatus` | manual |
+| `SF-18` | `passStatus` | pass |
+| `SF-18` | `warnStatus` | warn |
+| `SF-18` | `failStatus` | fail |
+| `SF-18` | `manualStatus` | manual |
+| `SF-19` | `passStatus` | pass |
+| `SF-19` | `warnStatus` | warn |
+| `SF-19` | `failStatus` | fail |
+| `SF-19` | `manualStatus` | manual |
+| `SF-20` | `passStatus` | pass |
+| `SF-20` | `warnStatus` | warn |
+| `SF-20` | `failStatus` | fail |
+| `SF-20` | `manualStatus` | manual |
 
-# Login forensics
-salesforce-sec-inspector logins --days 30 --show-failures --geo-analysis
+### Illustrative criterion notes
 
-# Setup audit trail analysis
-salesforce-sec-inspector audit-trail --days 90 --high-risk-only
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
 
-# Generate cross-framework compliance matrix
-salesforce-sec-inspector matrix --output matrix.html
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `SF-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-07` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-07` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-08` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-08` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-09` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-09` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-10` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-10` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-10` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-10` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-11` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-11` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-11` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-11` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-12` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-12` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-12` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-12` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-13` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-13` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-13` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-13` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-14` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-14` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-14` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-14` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-15` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-15` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-15` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-15` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-16` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-16` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-16` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-16` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-17` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-17` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-17` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-17` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-18` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-18` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-18` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-18` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-19` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-19` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-19` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-19` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SF-20` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SF-20` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SF-20` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SF-20` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
 
-# Generate CMMC Level 2 assessment report
-salesforce-sec-inspector report --framework cmmc --level 2 --output cmmc-report.json
+### Compliance framework mappings
 
-# Check required permissions before running
-salesforce-sec-inspector check-permissions
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | Health Check score | - | - | - | - | - | - | - | - |
+| 2 | Session timeout | - | - | - | - | - | - | - | - |
+| 3 | Password policy | - | - | - | - | - | - | - | - |
+| 4 | MFA enforcement | - | - | - | - | - | - | - | - |
+| 5 | IP range restrictions | - | - | - | - | - | - | - | - |
+| 6 | Login hour restrictions | - | - | - | - | - | - | - | - |
+| 7 | API access controls | - | - | - | - | - | - | - | - |
+| 8 | Field-level security | - | - | - | - | - | - | - | - |
+| 9 | Permission set review | - | - | - | - | - | - | - | - |
+| 10 | Profile permissions | - | - | - | - | - | - | - | - |
+| 11 | Connected app OAuth policies | - | - | - | - | - | - | - | - |
+| 12 | Sharing settings | - | - | - | - | - | - | - | - |
+| 13 | Guest user access | - | - | - | - | - | - | - | - |
+| 14 | Login forensics | - | - | - | - | - | - | - | - |
+| 15 | Setup change tracking | - | - | - | - | - | - | - | - |
+| 16 | Data encryption status | - | - | - | - | - | - | - | - |
+| 17 | Certificate management | - | - | - | - | - | - | - | - |
+| 18 | My Domain enforcement | - | - | - | - | - | - | - | - |
+| 19 | Clickjack protection | - | - | - | - | - | - | - | - |
+| 20 | CSRF protection | - | - | - | - | - | - | - | - |
 
-# List available controls
-salesforce-sec-inspector controls --framework pci-dss
-```
+## Collection states
 
-### Output Formats
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
 
-- `json` -- machine-readable findings with control mappings
-- `html` -- interactive dashboard with Health Check gauge and framework drill-down
-- `csv` -- spreadsheet-compatible for GRC tools
-- `ckl` -- DISA STIG Checklist format
-- `oscal` -- NIST OSCAL assessment results
+## Integration-specific scrubbing
 
-## Build Sequence
+Shared contract version: 1.1.
 
-### Phase 1: Foundation
-- Project scaffolding (pyproject.toml, src layout, CI)
-- Salesforce authentication (JWT Bearer, OAuth 2.0, username/password)
-- API client supporting REST, Tooling, Metadata, and SOQL
-- Pydantic models for findings and controls
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
 
-### Phase 2: Core Collection
-- Security Health Check score and risk retrieval
-- User, profile, and permission set enumeration
-- Security settings via Metadata API
-- Setup audit trail and login history collection
+Sensitive fields and values: password, securityToken, consumerSecret, privateKey, refreshToken, accessToken, authorization, sessionId
 
-### Phase 3: Security Controls
-- Implement controls 1-10 (Health Check, session, passwords, MFA, permissions)
-- Implement controls 11-20 (OAuth, sharing, guest users, encryption, web security)
-- Shield Platform detection and conditional collection
-- Connected app and certificate analysis
+Credential formats: Salesforce OAuth access and refresh tokens, security tokens, private keys, signed JWT assertions, SOAP session IDs
 
-### Phase 4: Compliance Mapping
-- FedRAMP control family mapping
-- CMMC 2.0 practice mapping
-- SOC 2, CIS Salesforce, PCI-DSS mapping
-- DISA STIG, IRAP, ISMAP mapping
-- Cross-framework compliance matrix
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
 
-### Phase 5: Reporting & Polish
-- Executive summary with Health Check score integration
-- Framework-specific report formats (POA&M, CKL, OSCAL)
-- HTML dashboard with security score gauge
-- Permission sprawl visualization
-- Test suite with mocked API responses
+Integration-specific rules:
 
-## Status
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
 
-Implemented in grclanker as native TypeScript tools (2026-09-21). The Go rewrite described in the Architecture section was not pursued; the implementation lives in `cli/extensions/grc-tools/salesforce.ts` and follows the shared `zoom.ts` and `webex.ts` patterns.
+Projected fields by surface:
 
-### Shipped
+| Surface | Allowed fields |
+|---|---|
+| `standard-query` | `records`, `totalSize`, `done`, `nextRecordsUrl` |
+| `tooling-query` | `records`, `totalSize`, `done`, `nextRecordsUrl` |
+| `metadata-read` | `SecuritySettings`, `MyDomainSettings`, `Profile`, `ConnectedApp` |
+| `limits` | `DailyApiRequests`, `HourlyODataCallout`, `DailyAsyncApexExecutions` |
 
-- `salesforce_check_access`, four `salesforce_assess_*` tools, and `salesforce_export_audit_bundle`, all read-only
-- All 20 security controls render a finding with the framework mappings from the table above and are evaluated from API evidence; control 6 (Login Hour Restrictions) and the per-profile half of control 5 read `loginHours` and `loginIpRanges` from `Profile` metadata for sensitive profiles (System Administrator plus profiles with elevated permissions), mapping SOQL profile IDs to metadata `fullName`s through `listMetadata(Profile)` and reading them with `readMetadata(Profile)` in batches of 10; control 6 passes only when every sensitive profile bounds all seven `ProfileLoginHours` weekday pairs, since each pair is independent and a day without a start or end is unrestricted
-- Authentication: JWT bearer (RS256 assertion signed with `node:crypto`), username-password with security token, refresh token exchange, and direct access token reuse; login hosts for production, sandbox (`test.salesforce.com`), and My Domain; precedence explicit args > env vars > `SF_CREDENTIALS_FILE`
-- Verdict safety: unreadable or forbidden data renders `manual` with the Setup evidence to collect, empty inventories never pass except zero guest users inside a visible user population (control 13), truncated or partial inventories downgrade `pass` to `warn`, undated rows are reported in a separate bucket, SOQL pagination follows `nextRecordsUrl` until `done` or records truncation
-- Population sanity gate: controls 4, 7, 9, 10, and 13 render `manual` when the visible profile list has no administrator-class profile (System Administrator or Modify All Data) or when a non-empty user list shows zero active administrators, since every real org has at least one and that view can only come from a credential without `View All Users` or setup visibility
-- Documented fields only: every SOQL statement selects fields listed in the Object Reference (`OauthToken` without `CreatedDate`, `ConnectedApplication` without `CreatedDate` and `LastModifiedDate`, `TwoFactorMethodsInfo` without `Id`); `Permissions*` fields on `Profile` and `PermissionSet` are probed through `describeSObject` first so edition-specific fields such as `PermissionsApiUserOnly` are omitted rather than failing the query
-- Permission-aware partial views: `TwoFactorMethodsInfo` requires `Manage MFA in API` and caps at 2500 rows with no `done=false` signal, so an exactly 2500-row result is treated as possibly truncated; `OauthToken` carries the same documented 2500-row cap and is handled the same way (`oauth_tokens_possibly_capped` in the control 11 evidence and summary); `OauthToken` also returns only the caller's own tokens without `Customize Application`, so the caller's flag is read from `UserPermissionAccess` and control 11 is marked as a partial view when it is false or unknown; `salesforce_check_access` names both permissions and lists any caller flag that is false
-- Audit bundle: `core_data/`, `analysis/`, `compliance/` with eight framework reports, `QUICK_REFERENCE.md`, `_errors.log` on partial collection, and a zip paired with the allocated output directory
-- Regression tests in `cli/tests/salesforce.test.mjs`, live smoke in `cli/scripts/salesforce-live-smoke.mjs` (`npm --prefix cli run test:salesforce:live`), and the integration guide in `src/content/docs/docs/integrations/salesforce.md`
+## Export layout
 
-### Deviations from this spec (official docs followed)
+Required paths:
 
-- Session settings are the `sessionSettings` element of the `SecuritySettings` metadata type, not a separate `SessionSettings` type; trusted IP ranges come from `SecuritySettings.networkAccess`, not a `NetworkAccess` type
-- Settings are read with the synchronous Metadata API `readMetadata()` SOAP call instead of the asynchronous `retrieve()` zip flow; `readMetadata` requires `Modify Metadata Through Metadata API Functions` (or `Modify All Data`), not `Customize Application`
-- Health Check data comes from Tooling API SOQL (`SELECT Score FROM SecurityHealthCheck`, `SecurityHealthCheckRisks`) rather than `tooling/sobjects/...` GETs
-- `PermissionSet`, `PermissionSetAssignment`, and `FieldPermissions` are queried through the standard REST `query` endpoint because they are standard sObjects
-- MFA enrollment uses the documented `TwoFactorMethodsInfo` object instead of `TwoFactorInfo`; My Domain policy uses the `MyDomainSettings` metadata type (`canOnlyLoginWithMyDomainUrl`, `doesApiLoginRequireOrgDomain`) instead of a `CustomDomain` object
-- Platform Encryption status uses the `TenantSecret` sObject; `EncryptedFieldsInfo` is not queried
-- `Certificate` is a Tooling API object (version 37.0 and later), not a REST sObject, so it is queried through `tooling/query`; its documented `OptionsIsCaSigned`, `OptionsIsPrivateKeyExportable`, and `OptionsIsUnusable` flags feed control 17, and a certificate without a `KeySize` value is reported as unknown rather than assumed to be 2048 bits
-- Profile login hours and login IP ranges are read with `readMetadata(Profile)` (the `Profile` metadata type always returns user permissions, IP ranges, and login hours) rather than from a SOQL object; `listMetadata(Profile)` supplies the metadata `fullName` for each SOQL profile ID because standard profile names differ from their metadata names (for example System Administrator is `Admin`)
-- The caller's own permission flags are read from the documented `UserPermissionAccess` object (API 41.0 and later) so that missing `View All Users` or `Customize Application` can be reported directly instead of inferred
-- The interactive authorization code flow is not implemented; a refresh token obtained from that flow (or a `grant_type: authorization_code` credentials file that carries `refresh_token`) is exchanged instead
-- API version defaults to 64.0 and can be overridden with `SF_API_VERSION`
+- `core_data/access.json`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis/cis_compliance_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/stig_compliance_checklist.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
+- `QUICK_REFERENCE.md`
 
-### Not yet implemented
+Conditional paths:
 
-- `SessionPermSetActivation`, `ObjectPermissions`, `ProfilePasswordPolicy`, `AuthSession`, and `SetupEntityAccess`; Profile metadata is read only for sensitive profiles (capped at 50) and only for `loginHours` and `loginIpRanges`
-- `SharingRules`, `RemoteSiteSetting`, `CspTrustedSite`, `ExternalDataSource`, `NamedCredential`, `HistoryRetentionPolicy`, `FieldHistoryArchive`, `EventBusSubscriber`, `TransactionSecurityPolicy`
-- Connected app OAuth scopes, IP relaxation, and per-app session policies beyond `OptionsAllowAdminApprovedUsersOnly` and refresh token validity (not exposed by SOQL)
-- Custom object organization-wide defaults; only the standard object `Default*Access` fields on `Organization` are evaluated
-- Geolocation baselines for login forensics; the current check evaluates failure ratios, repeated failing sources, and legacy TLS
-- A standalone CLI binary with the `--frameworks` and `--output` flags described in the CLI Interface section; grclanker exposes the same behavior through tool arguments
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `core_data/{dataset}.json` | json | The dataset is part of the assessment, including explicit not-collected markers. | Projected source records or a structured unavailable marker; unavailable values remain null. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | Human-readable counts and findings grouped by status. | UTF-8 Markdown. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | Finding-to-framework mapping matrix. | UTF-8 Markdown. |
+| `compliance/{framework}/{report}.md` | markdown | Always for each supported framework. | Framework-specific finding rows and mappings. | UTF-8 Markdown. |
+| `QUICK_REFERENCE.md` | markdown | Always. | Bundle navigation and operator next steps. | UTF-8 Markdown. |
+| `_errors.log` | text | At least one collection read failed, was denied, or was incomplete. | Scrubbed collection error summaries without response bodies or credentials. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `control`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `mappings`
+- `manualEvidence`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+- `reason`
+
+#### access_surface
+
+- `name`
+- `endpoint`
+- `status`
+- `count`
+- `error`
+
+#### assessment
+
+- `area`
+- `title`
+- `summary`
+- `findings`
+- `errors`
+
+#### bundle_manifest
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+JSON formatting: UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.
+
+Overwrite policy: Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create salesforce-audit.zip beside the allocated salesforce-audit directory, applying the same suffix to both.

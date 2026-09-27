@@ -2,330 +2,772 @@
 slug: "zoom-sec-inspector"
 name: "Zoom Security Inspector"
 vendor: "Zoom"
-category: "saas-collaboration"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+category: "collaboration"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
+
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
 # Zoom Security Inspector
 
-## 1. Overview
+Portable contract for the shipped Zoom identity, collaboration-governance, and meeting-security assessments.
 
-A security compliance inspection tool for **Zoom for Government** and Zoom Workplace environments. Audits account-level and user-level security settings, meeting policies, recording controls, authentication enforcement, and communication restrictions against enterprise security baselines and government compliance frameworks.
+## Purpose
 
-Targets Zoom accounts using the Zoom REST API v2 to evaluate configuration posture, identify misconfigurations, and generate compliance-mapped findings.
+Assess Zoom account identity, collaboration, recording, chat, routing, and meeting-security posture from read-only account and reporting APIs.
 
-## 2. APIs & SDKs
+## Design guidance
 
-### Zoom REST API v2
+Evaluate account settings together with locks and group overrides. Sampling may support review but cannot prove tenant-wide compliance. Plan-gated Zoom Phone and Team Chat evidence must remain unavailable or manual when the licensed surface cannot be read.
 
-Base URL: `https://api.zoom.us/v2` (commercial) / `https://api.zoomgov.com/v2` (GovCloud)
+## Shared integration contract
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /accounts/{accountId}/settings` | Account-level security and meeting settings |
-| `GET /accounts/{accountId}/lock_settings` | Locked (enforced) settings at account level |
-| `GET /users` | List all users, pagination |
-| `GET /users/{userId}/settings` | Per-user meeting, recording, telephony settings |
-| `GET /users/{userId}/token` | User ZAK token info |
-| `GET /roles` | List all custom roles |
-| `GET /roles/{roleId}` | Role detail and privileges |
-| `GET /roles/{roleId}/members` | Members assigned to a role |
-| `GET /groups` | List all groups |
-| `GET /groups/{groupId}/settings` | Group-level setting overrides |
-| `GET /groups/{groupId}/lock_settings` | Locked settings at group level |
-| `GET /report/meetings` | Meeting usage reports |
-| `GET /report/operationlogs` | Admin operation/audit logs |
-| `GET /im/groups` | IM (chat) group configuration |
-| `GET /im/groups/{imGroupId}` | IM group detail and members |
-| `GET /accounts/{accountId}/managed_domains` | Managed/associated domains |
-| `GET /accounts/{accountId}/trusted_domains` | Trusted external domains |
-| `GET /phone/call_handling/settings` | Zoom Phone call handling settings |
-| `GET /phone/recording` | Zoom Phone recording policies |
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-### Rate Limits
+## Known runtime gaps
 
-- Per-second rate limits vary by endpoint category (heavy: 1 req/s, medium: 10 req/s, light: 30 req/s)
-- Daily rate limits apply to report endpoints (60 requests/day for some)
-- Response header `X-RateLimit-Remaining` for tracking
+- Account settings are read through documented option views and sampled group overrides; a pass requires complete account and group evidence plus every required account-level lock.
+- User, role-member, group, operation-log, and IM-group verdict facts use complete seen and declared-total counts, while exported evidence may retain bounded record samples.
+- The account API exposes neither a decisive Team Chat encryption setting nor account vanity URL field; those findings remain manual rather than inferred from unrelated fields.
+- User OAuth, per-user settings drift, deeper Zoom Phone policy, and usage analytics are deferred.
 
-### SDKs & Tools
+## Tools
 
-| Tool | Type | Notes |
-|------|------|-------|
-| `zoom-python` | Community Python SDK | Wraps REST API v2, not officially maintained |
-| `zoomus` | Community Python SDK | Alternative community wrapper |
-| Zoom CLI | Official CLI | Limited to meeting/webinar management |
-| `httpx` / `requests` | HTTP client | Direct API calls recommended for reliability |
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `zoom_check_access` | Validate Zoom read-only access across account settings and lock settings (the default view plus the meeting_authentication, security, and meeting_security option views this tool reads; recording_authentication is not requested because no verdict reads it), users, roles, groups, operation logs, IM groups, managed and trusted domains, and Zoom Phone account settings. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `zoom_assess_identity` | Assess Zoom identity posture: SSO enforcement, blocked personal sign-in methods, admin two-factor authentication, managed domain verification, admin privilege concentration, session inactivity timeout, and the manual vanity URL control. | `ZOOM-ID-01`, `ZOOM-ID-02`, `ZOOM-ID-03`, `ZOOM-ID-04`, `ZOOM-ID-05`, `ZOOM-ID-06`, `ZOOM-ID-07` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `zoom_assess_collaboration_governance` | Assess Zoom collaboration governance: trusted domains, in-meeting file transfer, cloud recording auto-delete retention, Zoom Phone recording policies, admin operation logs, IM group restrictions, external contact restrictions, and the manual chat encryption control. | `ZOOM-COLLAB-01`, `ZOOM-COLLAB-02`, `ZOOM-COLLAB-03`, `ZOOM-COLLAB-04`, `ZOOM-COLLAB-05`, `ZOOM-COLLAB-06`, `ZOOM-COLLAB-07`, `ZOOM-COLLAB-08` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `zoom_assess_meeting_security` | Assess Zoom meeting security: passcode enforcement and lock, waiting room, host-only screen sharing, local recording, end-to-end encryption, join-link passcode embedding, PMI restrictions, authenticated join, data center regions, and recording consent disclaimers, with group override detection. | `ZOOM-MTG-01`, `ZOOM-MTG-02`, `ZOOM-MTG-03`, `ZOOM-MTG-04`, `ZOOM-MTG-05`, `ZOOM-MTG-06`, `ZOOM-MTG-07`, `ZOOM-MTG-08`, `ZOOM-MTG-09`, `ZOOM-MTG-10` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `zoom_export_audit_bundle` | Export a Zoom audit bundle: core_data raw snapshots, analysis findings, compliance reports per framework, QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive named after the allocated directory. | `ZOOM-ID-01`, `ZOOM-ID-02`, `ZOOM-ID-03`, `ZOOM-ID-04`, `ZOOM-ID-05`, `ZOOM-ID-06`, `ZOOM-ID-07`, `ZOOM-COLLAB-01`, `ZOOM-COLLAB-02`, `ZOOM-COLLAB-03`, `ZOOM-COLLAB-04`, `ZOOM-COLLAB-05`, `ZOOM-COLLAB-06`, `ZOOM-COLLAB-07`, `ZOOM-COLLAB-08`, `ZOOM-MTG-01`, `ZOOM-MTG-02`, `ZOOM-MTG-03`, `ZOOM-MTG-04`, `ZOOM-MTG-05`, `ZOOM-MTG-06`, `ZOOM-MTG-07`, `ZOOM-MTG-08`, `ZOOM-MTG-09`, `ZOOM-MTG-10` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
 
-## 3. Authentication
+### Parameters
 
-### Server-to-Server OAuth (Recommended)
+#### `zoom_check_access`
 
-- Created in Zoom App Marketplace as "Server-to-Server OAuth" app type
-- Provides `account_id`, `client_id`, `client_secret`
-- Token endpoint: `POST https://zoom.us/oauth/token` with basic auth (`client_id:client_secret`) and an `application/x-www-form-urlencoded` body `grant_type=account_credentials&account_id={account_id}` (no query parameters)
-- Tokens expire in 1 hour, must be refreshed
-- Scopes required: `account:read:admin`, `user:read:admin`, `group:read:admin`, `role:read:admin`, `report:read:admin`, `im:read:admin`, `phone:read:admin`
-- Best for automated/headless inspection
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `account_id` | string | no | Zoom account ID. Defaults to ZOOM_ACCOUNT_ID or the config file. |
+| `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
+| `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
+| `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
-### OAuth 2.0 (User-Level)
+#### `zoom_assess_identity`
 
-- Authorization Code flow for interactive use
-- Redirect URI required
-- Scopes granted per-user
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `account_id` | string | no | Zoom account ID. Defaults to ZOOM_ACCOUNT_ID or the config file. |
+| `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
+| `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
+| `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `user_limit` | number | no | Maximum users to enumerate before flagging a partial inventory. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable distinct admin users before warning. Defaults to 10. |
+| `max_session_inactivity_minutes` | number | no | Maximum acceptable inactivity sign-out period in minutes. Defaults to 120. |
 
-### JWT (Deprecated)
+#### `zoom_assess_collaboration_governance`
 
-- Deprecated June 2023, removed September 2023
-- Should not be used; detect and warn if configured
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `account_id` | string | no | Zoom account ID. Defaults to ZOOM_ACCOUNT_ID or the config file. |
+| `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
+| `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
+| `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `group_limit` | number | no | Maximum groups to inspect. Defaults to 50. |
+| `operation_log_limit` | number | no | Maximum admin operation log entries to enumerate (30-day window). Defaults to 300. |
+| `max_recording_retention_days` | number | no | Maximum acceptable cloud recording retention in days before warning. Defaults to 120. |
 
-### Configuration
+#### `zoom_assess_meeting_security`
 
-```
-ZOOM_ACCOUNT_ID=<account_id>
-ZOOM_CLIENT_ID=<client_id>
-ZOOM_CLIENT_SECRET=<client_secret>
-ZOOM_BASE_URL=https://api.zoom.us/v2       # or https://api.zoomgov.com/v2
-```
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `account_id` | string | no | Zoom account ID. Defaults to ZOOM_ACCOUNT_ID or the config file. |
+| `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
+| `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
+| `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `group_limit` | number | no | Maximum groups to inspect for override drift. Defaults to 50. |
 
-### grclanker implementation
+#### `zoom_export_audit_bundle`
 
-The grclanker CLI ships this spec as the native tool family in `cli/extensions/grc-tools/zoom.ts`: `zoom_check_access`, `zoom_assess_identity`, `zoom_assess_collaboration_governance`, `zoom_assess_meeting_security`, and `zoom_export_audit_bundle`. Credentials resolve from tool arguments, then the environment variables above (plus `ZOOM_TOKEN` for a pre-issued bearer token, `ZOOM_OAUTH_BASE_URL`, `ZOOM_TIMEOUT`, and `ZOOM_CONFIG_FILE`), then a JSON config file at `ZOOM_CONFIG_FILE`, `./.zoom.json`, `./.grclanker-zoom.json`, `~/.zoom.json`, `~/.grclanker-zoom.json`, or `~/.config/grclanker/zoom.json`. Only Server-to-Server OAuth is implemented; the user-level OAuth flow is out of scope for the CLI and JWT is not supported. The integration guide with the endpoint table lives at `src/content/docs/docs/integrations/zoom.md`, tests in `cli/tests/zoom.test.mjs`, and the live smoke script at `cli/scripts/zoom-live-smoke.mjs` (`npm --prefix cli run test:zoom:live`).
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `account_id` | string | no | Zoom account ID. Defaults to ZOOM_ACCOUNT_ID or the config file. |
+| `token` | string | no | Pre-issued Zoom OAuth access token. Defaults to ZOOM_TOKEN. |
+| `client_id` | string | no | Zoom Server-to-Server OAuth client ID. Defaults to ZOOM_CLIENT_ID or the config file. |
+| `client_secret` | string | no | Zoom Server-to-Server OAuth client secret. Defaults to ZOOM_CLIENT_SECRET or the config file. |
+| `base_url` | string | no | Zoom REST API base URL. Defaults to https://api.zoom.us/v2. |
+| `oauth_base_url` | string | no | Zoom OAuth base URL. Defaults to https://zoom.us or https://zoomgov.com based on base_url. |
+| `config_file` | string | no | JSON config file with account_id, client_id, client_secret, base_url. Defaults to ZOOM_CONFIG_FILE, ./.zoom.json, or ~/.zoom.json. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `output_dir` | string | no | Output root. Defaults to ./export/zoom. |
+| `user_limit` | number | no | Maximum users to enumerate before flagging a partial inventory. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable distinct admin users before warning. Defaults to 10. |
+| `max_session_inactivity_minutes` | number | no | Maximum acceptable inactivity sign-out period in minutes. Defaults to 120. |
+| `group_limit` | number | no | Maximum groups to inspect. Defaults to 50. |
+| `operation_log_limit` | number | no | Maximum admin operation log entries to enumerate (30-day window). Defaults to 300. |
+| `max_recording_retention_days` | number | no | Maximum acceptable cloud recording retention in days before warning. Defaults to 120. |
 
-## 4. Security Controls
 
-| # | Control | API Source | Severity |
-|---|---------|-----------|----------|
-| 1 | Meeting password enforcement enabled | `/accounts/{id}/settings` → `schedule_meeting.require_password_for_scheduling_new_meetings` | Critical |
-| 2 | Waiting room enabled by default | `/accounts/{id}/settings` → `in_meeting.waiting_room` | Critical |
-| 3 | Screen sharing restricted to host only | `/accounts/{id}/settings` → `in_meeting.screen_sharing` | High |
-| 4 | Recording consent notification enabled | `/accounts/{id}/settings` → `recording.recording_disclaimer` | High |
-| 5 | SSO enforcement for all users | `/users` → `login_type` field analysis | Critical |
-| 6 | Two-factor authentication for admins | `/users/{id}/settings` → `feature.two_factor_auth` | Critical |
-| 7 | End-to-end encryption available and default | `/accounts/{id}/settings` → `in_meeting.e2e_encryption` | High |
-| 8 | Chat encryption enabled | `/accounts/{id}/settings` → `in_meeting.chat` encryption settings | Medium |
-| 9 | File transfer in meetings restricted | `/accounts/{id}/settings` → `in_meeting.file_transfer` | Medium |
-| 10 | Cloud recording auto-delete policy configured | `/accounts/{id}/settings` → `recording.auto_delete_cmr` | High |
-| 11 | Cloud recording auto-delete days ≤ retention policy | `/accounts/{id}/settings` → `recording.auto_delete_cmr_days` | Medium |
-| 12 | External contacts restricted | `/accounts/{id}/settings` → `in_meeting.allow_participants_to_rename` | Medium |
-| 13 | Vanity URL configured and secured | `/accounts/{id}/settings` → account vanity URL | Low |
-| 14 | Managed domains verified | `/accounts/{id}/managed_domains` | High |
-| 15 | IM group restrictions enforced | `/im/groups` → group settings analysis | Medium |
-| 16 | Sign-in methods restricted (no personal email) | `/users` → `login_type` analysis | High |
-| 17 | Session timeout configured ≤ organizational policy | `/accounts/{id}/settings` → `security.session_duration` | Medium |
-| 18 | Data routing control enabled (GovCloud/data residency) | `/accounts/{id}/settings` → `in_meeting.data_center_regions` | Critical |
-| 19 | Zoom Phone recording policies enforced | `/phone/recording` | High |
-| 20 | Local recording disabled or restricted | `/accounts/{id}/settings` → `recording.local_recording` | High |
-| 21 | Meeting password locked at account level | `/accounts/{id}/lock_settings` → password settings | Critical |
-| 22 | Embed password in join link disabled | `/accounts/{id}/settings` → `schedule_meeting.embed_password_in_join_link` | Medium |
-| 23 | Only authenticated users can join meetings | `/accounts/{id}/settings` → `schedule_meeting.meeting_authentication` | High |
-| 24 | Admin operation log retention verified | `/report/operationlogs` | Medium |
-| 25 | Personal Meeting ID (PMI) usage restricted | `/accounts/{id}/settings` → `schedule_meeting.use_pmi_for_scheduled_meetings` | Medium |
+## Authentication
 
-## 5. Compliance Framework Mappings
+Supported modes:
 
-| Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---------|---------|------|-------|-----|---------|------|------|-------|
-| 1. Meeting password enforcement | AC-3 | AC.L2-3.1.1 | CC6.1 | 5.2 | 8.3.1 | SRG-APP-000033 | ISM-0974 | 8.1.1 |
-| 2. Waiting room enabled | AC-3 | AC.L2-3.1.2 | CC6.1 | 5.2 | 7.1.1 | SRG-APP-000033 | ISM-0974 | 8.1.1 |
-| 3. Screen sharing restricted | AC-3 | AC.L2-3.1.5 | CC6.1 | 5.3 | 7.1.2 | SRG-APP-000038 | ISM-1146 | 8.1.2 |
-| 4. Recording consent | AU-14 | AU.L2-3.3.1 | CC7.2 | 8.1 | 10.1 | SRG-APP-000092 | ISM-0580 | 12.1.1 |
-| 5. SSO enforcement | IA-2 | IA.L2-3.5.1 | CC6.1 | 4.1 | 8.3.1 | SRG-APP-000148 | ISM-1557 | 8.2.1 |
-| 6. 2FA for admins | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.5 | 8.3.2 | SRG-APP-000149 | ISM-1401 | 8.2.2 |
-| 7. E2E encryption | SC-8(1) | SC.L2-3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000441 | ISM-0487 | 10.1.1 |
-| 8. Chat encryption | SC-8 | SC.L2-3.13.1 | CC6.7 | 14.4 | 4.1 | SRG-APP-000439 | ISM-0487 | 10.1.1 |
-| 9. File transfer restricted | SC-7 | SC.L2-3.13.6 | CC6.6 | 13.1 | 1.3.1 | SRG-APP-000383 | ISM-1284 | 10.2.1 |
-| 10. Cloud recording auto-delete | SI-12 | MP.L2-3.8.3 | CC6.5 | 3.1 | 3.1 | SRG-APP-000504 | ISM-0261 | 7.1.1 |
-| 11. Recording retention days | SI-12 | MP.L2-3.8.3 | CC6.5 | 3.1 | 3.1 | SRG-APP-000504 | ISM-0261 | 7.1.1 |
-| 12. External contacts restricted | AC-4 | AC.L2-3.1.3 | CC6.6 | 13.4 | 1.3.4 | SRG-APP-000039 | ISM-1284 | 8.1.3 |
-| 13. Vanity URL secured | IA-8 | IA.L2-3.5.2 | CC6.1 | 4.1 | 8.1.1 | SRG-APP-000153 | ISM-1557 | 8.2.1 |
-| 14. Managed domains verified | IA-8 | IA.L2-3.5.2 | CC6.1 | 4.1 | 8.1.1 | SRG-APP-000153 | ISM-1557 | 8.2.1 |
-| 15. IM group restrictions | AC-4 | AC.L2-3.1.3 | CC6.6 | 13.4 | 7.1.2 | SRG-APP-000039 | ISM-1284 | 8.1.3 |
-| 16. Sign-in methods restricted | IA-5 | IA.L2-3.5.7 | CC6.1 | 4.1 | 8.2.1 | SRG-APP-000170 | ISM-1557 | 8.2.3 |
-| 17. Session timeout | AC-12 | AC.L2-3.1.10 | CC6.1 | 5.6 | 8.1.8 | SRG-APP-000295 | ISM-1164 | 8.3.1 |
-| 18. Data routing control | SC-7 | SC.L2-3.13.1 | CC6.6 | 13.1 | 1.3.1 | SRG-APP-000383 | ISM-1037 | 10.2.1 |
-| 19. Phone recording policies | AU-14 | AU.L2-3.3.1 | CC7.2 | 8.1 | 10.1 | SRG-APP-000092 | ISM-0580 | 12.1.1 |
-| 20. Local recording restricted | AC-3 | MP.L2-3.8.1 | CC6.1 | 3.1 | 3.4.1 | SRG-APP-000033 | ISM-0261 | 7.1.2 |
-| 21. Password locked at account | AC-3 | AC.L2-3.1.1 | CC6.1 | 5.2 | 8.3.1 | SRG-APP-000033 | ISM-0974 | 8.1.1 |
-| 22. Embed password in link disabled | IA-5 | IA.L2-3.5.10 | CC6.1 | 5.2 | 8.2.1 | SRG-APP-000170 | ISM-0974 | 8.2.3 |
-| 23. Authenticated users only | IA-2 | IA.L2-3.5.1 | CC6.1 | 4.1 | 8.3.1 | SRG-APP-000148 | ISM-1557 | 8.2.1 |
-| 24. Audit log retention | AU-11 | AU.L2-3.3.1 | CC7.2 | 8.3 | 10.7 | SRG-APP-000515 | ISM-0859 | 12.1.2 |
-| 25. PMI usage restricted | AC-3 | AC.L2-3.1.5 | CC6.1 | 5.3 | 8.1.1 | SRG-APP-000038 | ISM-0974 | 8.1.2 |
+- Server-to-Server OAuth client credentials
+- Explicit access token
 
-## 6. Existing Tools
+Credential precedence, highest first:
 
-| Tool | Type | Notes |
-|------|------|-------|
-| Zoom Admin Dashboard | Built-in | Manual review of settings, no automation |
-| ScoutSuite | Open source | Multi-cloud; no Zoom provider |
-| Prowler | Open source | AWS/Azure/GCP focus; no Zoom |
-| Drata / Vanta | Commercial SaaS | Zoom integration for compliance, closed source |
-| Resmo | Commercial SaaS | Zoom asset inventory, limited security checks |
-| **No open-source Zoom security inspector exists** | Gap | This tool fills the gap |
+1. Explicit access token
+2. Explicit account/client credentials
+3. Config file
+4. ZOOM_* environment variables
 
-## 7. Architecture
+Environment variables: `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET`, `ZOOM_ACCESS_TOKEN`, `ZOOM_BASE_URL`
 
-```
-zoom-sec-inspector/
-├── cmd/
-│   └── zoom-sec-inspector/
-│       └── main.go                 # Entry point, CLI parsing
-├── internal/
-│   ├── auth/
-│   │   ├── oauth.go                # Server-to-Server OAuth token management
-│   │   └── config.go               # Credential loading, validation
-│   ├── client/
-│   │   ├── zoom.go                 # HTTP client with rate limiting, retries
-│   │   ├── accounts.go             # Account settings API calls
-│   │   ├── users.go                # User listing and settings
-│   │   ├── groups.go               # Group and IM group calls
-│   │   ├── roles.go                # Role enumeration
-│   │   ├── reports.go              # Report and audit log calls
-│   │   └── phone.go                # Zoom Phone API calls
-│   ├── analyzers/
-│   │   ├── analyzer.go             # Analyzer interface definition
-│   │   ├── meeting_security.go     # Controls 1-3, 21-23, 25
-│   │   ├── authentication.go       # Controls 5, 6, 16
-│   │   ├── encryption.go           # Controls 7, 8
-│   │   ├── recording.go            # Controls 4, 10, 11, 19, 20
-│   │   ├── communication.go        # Controls 9, 12, 15
-│   │   ├── account_hygiene.go      # Controls 13, 14, 17, 24
-│   │   └── data_residency.go       # Control 18
-│   ├── models/
-│   │   ├── settings.go             # Account/user/group settings structs
-│   │   ├── finding.go              # Security finding with severity, mapping
-│   │   └── compliance.go           # Framework mapping definitions
-│   └── reporters/
-│       ├── reporter.go             # Reporter interface
-│       ├── json.go                 # JSON output
-│       ├── csv.go                  # CSV output
-│       ├── html.go                 # HTML dashboard report
-│       └── sarif.go                # SARIF for CI/CD integration
-├── pkg/
-│   └── version/
-│       └── version.go              # Build version info
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── spec.md
-└── README.md
-```
+Configuration locations: .zoom.json, .grclanker-zoom.json
 
-## 8. CLI Interface
+Credential and deployment variants: Master or sub-account ID supplied explicitly
 
-```
-zoom-sec-inspector [flags]
+Configuration fields: `accountId`, `clientId`, `clientSecret`, `accessToken`, `baseUrl`, `oauthBaseUrl`, `timeoutMs`
 
-Flags:
-  --account-id string       Zoom account ID (or ZOOM_ACCOUNT_ID env)
-  --client-id string        OAuth client ID (or ZOOM_CLIENT_ID env)
-  --client-secret string    OAuth client secret (or ZOOM_CLIENT_SECRET env)
-  --base-url string         API base URL (default: https://api.zoom.us/v2)
-  --govcloud                Use ZoomGov base URL (https://api.zoomgov.com/v2)
-  --controls string         Comma-separated control IDs to run (default: all)
-  --skip-controls string    Comma-separated control IDs to skip
-  --severity string         Minimum severity to report: critical,high,medium,low (default: low)
-  --format string           Output format: json,csv,html,sarif (default: json)
-  --output string           Output file path (default: stdout)
-  --include-users           Include per-user setting analysis (slower)
-  --include-groups          Include per-group setting analysis
-  --concurrency int         Max concurrent API requests (default: 5)
-  --timeout duration        HTTP request timeout (default: 30s)
-  --verbose                 Enable verbose/debug logging
-  --version                 Print version and exit
-  --help                    Show help
-```
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 
-### Example Usage
+Credential refresh: POST /oauth/token?grant_type=account_credentials&account_id={accountId} with client Basic authentication.
 
-```bash
-# Full inspection with JSON output
-zoom-sec-inspector --govcloud --format json --output report.json
+## Permissions
 
-# Critical controls only, HTML report
-zoom-sec-inspector --severity critical --format html --output dashboard.html
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| role | `account:read:admin settings and lock-settings scopes` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `user and role read scopes` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `report:read:operation_logs:admin` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `contact_group and Zoom Phone account-setting read scopes where licensed` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
 
-# Specific controls with user analysis
-zoom-sec-inspector --controls 1,2,5,6,18 --include-users --format json
-```
+## API surfaces
 
-## 9. Build Sequence
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `account-settings` | HTTP | `GET /v2/accounts/{accountId}/settings` | Zoom REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `security`, `meeting_security`, `schedule_meeting`, `in_meeting`, `recording`, `chat` | [Official documentation](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/settings) |
+| `lock-settings` | HTTP | `GET /v2/accounts/{accountId}/lock_settings` | Zoom REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `meeting_security`, `schedule_meeting`, `in_meeting`, `recording`, `chat` | [Official documentation](https://developers.zoom.us/docs/api/accounts/#tag/accounts/GET/accounts/{accountId}/lock_settings) |
+| `users` | HTTP | `GET /v2/users` | Zoom REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `email`, `status`, `type`, `login_types` | [Official documentation](https://developers.zoom.us/docs/api/users/#tag/users/GET/users) |
+| `groups` | HTTP | `GET /v2/groups` | Zoom REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `name`, `total_members` | [Official documentation](https://developers.zoom.us/docs/api/users/#tag/groups/GET/groups) |
+| `operation-logs` | HTTP | `GET /v2/report/operationlogs` | Zoom REST API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `time`, `operator`, `category_type`, `operation_detail` | [Official documentation](https://developers.zoom.us/docs/api/meetings/#tag/reports/GET/report/operationlogs) |
 
-```bash
-# 1. Initialize module
-go mod init github.com/hackIDLE/zoom-sec-inspector
+### Request construction
 
-# 2. Define models and interfaces
-#    - internal/models/finding.go (Finding struct, Severity enum)
-#    - internal/models/compliance.go (framework mapping tables)
-#    - internal/analyzers/analyzer.go (Analyzer interface)
-#    - internal/reporters/reporter.go (Reporter interface)
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `account-settings` | client | Use the configured Zoom REST API origin; never follow a server link to a different origin. | yes |
+| `account-settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `account-settings` | response | A JSON object or list containing only the documented security, meeting_security, schedule_meeting, in_meeting, recording, chat members consumed by verdicts. | yes |
+| `lock-settings` | client | Use the configured Zoom REST API origin; never follow a server link to a different origin. | yes |
+| `lock-settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `lock-settings` | response | A JSON object or list containing only the documented meeting_security, schedule_meeting, in_meeting, recording, chat members consumed by verdicts. | yes |
+| `users` | client | Use the configured Zoom REST API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented id, email, status, type, login_types members consumed by verdicts. | yes |
+| `groups` | client | Use the configured Zoom REST API origin; never follow a server link to a different origin. | yes |
+| `groups` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `groups` | response | A JSON object or list containing only the documented id, name, total_members members consumed by verdicts. | yes |
+| `operation-logs` | client | Use the configured Zoom REST API origin; never follow a server link to a different origin. | yes |
+| `operation-logs` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `operation-logs` | response | A JSON object or list containing only the documented time, operator, category_type, operation_detail members consumed by verdicts. | yes |
 
-# 3. Implement authentication
-#    - internal/auth/config.go (env/flag loading)
-#    - internal/auth/oauth.go (S2S OAuth token refresh)
+## Pagination
 
-# 4. Build API client
-#    - internal/client/zoom.go (base client, rate limiter)
-#    - internal/client/accounts.go, users.go, groups.go, etc.
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `next_page_token`, `page_number`, `page_count`, `total_records` | 300 | caller limit | 500 | total_records is checked when returned; missing totals require explicit token exhaustion and never imply empty completeness. | No next_page_token; Declared total reached; Configured item cap; Page cap; Repeated token; Empty page with token; Missing or inconsistent total |
 
-# 5. Implement analyzers (one per control group)
-#    - internal/analyzers/meeting_security.go
-#    - internal/analyzers/authentication.go
-#    - ... (all 7 analyzer files)
+## Rate limits
 
-# 6. Implement reporters
-#    - internal/reporters/json.go, csv.go, html.go, sarif.go
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Zoom Security Inspector | Zoom applies endpoint labels and app-level daily request limits | `Retry-After`, `X-RateLimit-Category`, `X-RateLimit-Remaining` | 429, 500, 502, 503, 504 | Honor Retry-After up to 30 seconds and retry three times with bounded backoff. |
 
-# 7. Wire CLI entry point
-#    - cmd/zoom-sec-inspector/main.go
+## Checks
 
-# 8. Test and build
-go test ./...
-go build -ldflags "-X pkg/version.Version=$(git describe --tags)" \
-  -o bin/zoom-sec-inspector ./cmd/zoom-sec-inspector/
-```
+### Control coverage
 
-## 10. Status
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | Meeting password enforcement and account lock | ZOOM-MTG-01 | Evaluate the ordered first-match rules for ZOOM-MTG-01 below. |
+| 2 | Waiting room enabled by default | ZOOM-MTG-02 | Evaluate the ordered first-match rules for ZOOM-MTG-02 below. |
+| 3 | Screen sharing restricted to host only | ZOOM-MTG-03 | Evaluate the ordered first-match rules for ZOOM-MTG-03 below. |
+| 4 | Recording consent disclaimer shown to participants | ZOOM-MTG-10 | Evaluate the ordered first-match rules for ZOOM-MTG-10 below. |
+| 5 | SSO enforcement for all users | ZOOM-ID-01 | Evaluate the ordered first-match rules for ZOOM-ID-01 below. |
+| 6 | Administrative privilege concentration | ZOOM-ID-02, ZOOM-ID-04 | Evaluate the ordered first-match rules for ZOOM-ID-02, ZOOM-ID-04 below. |
+| 7 | End-to-end encryption available and default | ZOOM-MTG-05 | Evaluate the ordered first-match rules for ZOOM-MTG-05 below. |
+| 8 | Chat encryption enabled | ZOOM-COLLAB-08 | Evaluate the ordered first-match rules for ZOOM-COLLAB-08 below. |
+| 9 | In-meeting file transfer restricted | ZOOM-COLLAB-02 | Evaluate the ordered first-match rules for ZOOM-COLLAB-02 below. |
+| 10 | Cloud recording auto-delete retention | ZOOM-COLLAB-03 | Evaluate the ordered first-match rules for ZOOM-COLLAB-03 below. |
+| 12 | External contacts restricted | ZOOM-COLLAB-01, ZOOM-COLLAB-07 | Evaluate the ordered first-match rules for ZOOM-COLLAB-01, ZOOM-COLLAB-07 below. |
+| 13 | Vanity URL configured and secured | ZOOM-ID-07 | Evaluate the ordered first-match rules for ZOOM-ID-07 below. |
+| 14 | Managed domains verified | ZOOM-ID-03 | Evaluate the ordered first-match rules for ZOOM-ID-03 below. |
+| 15 | IM group restrictions enforced | ZOOM-COLLAB-06 | Evaluate the ordered first-match rules for ZOOM-COLLAB-06 below. |
+| 16 | Personal and social sign-in methods blocked | ZOOM-ID-05 | Evaluate the ordered first-match rules for ZOOM-ID-05 below. |
+| 17 | Session inactivity timeout enforced | ZOOM-ID-06 | Evaluate the ordered first-match rules for ZOOM-ID-06 below. |
+| 18 | Data routing control enabled | ZOOM-MTG-09 | Evaluate the ordered first-match rules for ZOOM-MTG-09 below. |
+| 19 | Zoom Phone recording policies enforced | ZOOM-COLLAB-04 | Evaluate the ordered first-match rules for ZOOM-COLLAB-04 below. |
+| 20 | Local recording disabled | ZOOM-MTG-04 | Evaluate the ordered first-match rules for ZOOM-MTG-04 below. |
+| 22 | Embed password in join link disabled | ZOOM-MTG-06 | Evaluate the ordered first-match rules for ZOOM-MTG-06 below. |
+| 23 | Only authenticated users can join meetings | ZOOM-MTG-08 | Evaluate the ordered first-match rules for ZOOM-MTG-08 below. |
+| 24 | Admin operation logs readable and recent | ZOOM-COLLAB-05 | Evaluate the ordered first-match rules for ZOOM-COLLAB-05 below. |
+| 25 | Personal Meeting ID usage restricted | ZOOM-MTG-07 | Evaluate the ordered first-match rules for ZOOM-MTG-07 below. |
 
-Implemented in grclanker as of 2026-09-21 (`cli/extensions/grc-tools/zoom.ts`, TypeScript). The Go architecture in sections 7 to 9 describes the original standalone design; the CLI exposes the same controls as native agent tools instead of a `zoom-sec-inspector` binary.
+### Finding notes
 
-### What shipped
+These notes explain intent only. The ordered rule table is normative.
 
-- 25 of 25 controls have a finding: ZOOM-ID-01 to 07 (`zoom_assess_identity`), ZOOM-COLLAB-01 to 08 (`zoom_assess_collaboration_governance`), ZOOM-MTG-01 to 10 (`zoom_assess_meeting_security`). 23 are automatable; controls 8 and 13 are manual by design (see deviations).
-- Server-to-Server OAuth (form-encoded `grant_type=account_credentials` and `account_id` body under basic auth, as the S2S page documents) with automatic token refresh, `next_page_token` pagination to completion with truncation tracking, 429 retries (the rate-limits page names no header, so `Retry-After` is honored as a defensive fallback with a one-second default wait), and JSON config-file discovery.
-- Verdict safety: denied or errored surfaces render manual and name the endpoint and scope; empty inventories render manual or warn per control intent and never pass; partial inventories (user cap, truncated pages, `total_records` above the returned list) render warn with seen and total counts; compliant but unlocked settings render warn where the control requires enforcement; sampled group overrides downgrade account-level passes; undated operation log entries are bucketed and cap at warn.
-- Multi-inventory corollary: a finding that depends on more than one inventory demotes when any of them is unreadable, even when the failure is disclosed elsewhere, and its summary names the unreadable dataset and endpoint. Every settings and lock view read per sampled group (base and `option=meeting_security`) is retained; a denied `GET /groups/{groupId}/settings?option=meeting_security` demotes all 13 group-dependent findings to warn naming the group and endpoint, and a denied `GET /roles` demotes ZOOM-ID-02 to warn (admin role inventory evidence) instead of rendering an empty `admin_roles`. Group lock views are disclosed in the errors arrays but do not demote because no verdict reads group lock state yet. A table-driven test makes each of 20 surfaces unreadable in turn and asserts exactly the findings that read it demote and name it.
-- Truncation on every cap exit: the pagination loop reports `truncated` on the item limit, the 500-page cap, a repeated `next_page_token`, or a token that stops yielding items; `/roles`, `/im/groups`, and managed domains are complete only when `total_records` is present and matches (a missing total renders as an unknown total); `/trusted_domains` is a single documented array with no total and is complete by contract. Every finding that depends on a truncated list (users, roles, role members, groups, operation logs, IM groups, managed domains) demotes and states seen versus total.
-- Bundle secret hygiene: every collected surface is sanitized once at collection time (credential-bearing keys such as `host_key`, `pmi_password`, tokens, secrets, certificates, and API keys keep their name with a `[REDACTED]` marker; passcode and token URL query parameters are blanked; the Server-to-Server OAuth client id, client secret, and token values are scrubbed from strings and error text). The bundle projects settings and lock settings to the exact paths the verdicts read (listed in `metadata.json`), projects list snapshots to the record fields the verdicts read, drops operation log `operation_detail` free text, and scrubs every written file, so no verbatim configuration dump or credential reaches `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, or the zip.
-- Error-body hygiene (rule 9, error-path class): a non-JSON response body is never placed in an error string; the client substitutes HTTP status, method and endpoint, content type, and byte length, echoes only the documented JSON error fields, and routes every error string through the exported `scrubErrorText` (the `ZoomApiError` constructor, the collector error-to-text helper, and again at the bundle write sink). The scrub covers embedded-URL query and `name=value` fragment removal, `Bearer` and `Basic` values, `Cookie` and `Set-Cookie` values, credential name-value pairs (API key, session id, access, refresh, and id tokens, client secret, password, quoted or not), and a long-token rule for free-text JSON message fields; the sink and data values skip only the long-token heuristic because opaque Zoom identifiers are evidence. Denied surfaces now disclose the scrubbed Zoom detail alongside the status and endpoint. The JSON config file loader (`readConfigFile`) is a guarded read and a guarded parse: read failures throw `Unable to read Zoom config file <path> (<code>)` with the Node error code only when it matches `^E[A-Z0-9_]{1,30}$`, parse failures throw `Unable to parse Zoom config file: invalid JSON in <path>` without the `SyntaxError` message (whose 10-character source window would carry the start of an unquoted credential value), and the assignment scrub lists `client_id` and `clientId` because `credentialValues()` treats the client id as a secret.
-- `zoom_export_audit_bundle` writes `core_data/` (projected and redacted), `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log` only on partial collection failure, and a zip named after the allocated directory; reruns allocate `-2`, `-3` and never overwrite.
-- Self-check results with fixture (d) built strictly from documented shapes: (a) all denied: 25 manual, 0 pass; (b) all empty: 24 manual, 1 warn (ZOOM-COLLAB-05, an empty operation log is a retention warning by intent), 0 pass; (c) partial inventory: 19 warn, 6 manual, 0 pass; (d) documented compliant: 23 pass, 2 manual (ZOOM-ID-07 vanity URL and ZOOM-COLLAB-08 chat encryption, manual by design).
-- Sign-in method classification: every `login_types` code documented on `GET /users` and `GET /users/{userId}` is classified (third-party OAuth 0, 1, 21, 23, 24, 27, 98 and Zoom-held passwords 11, 100 fail ZOOM-ID-05; 97 mobile device and 99 API user are documented but neither SSO nor a personal provider and cap at warn; undocumented codes cap at warn; only 101 passes).
-- Tests: `cli/tests/zoom.test.mjs` covers the four-fixture false-pass self-check (all denied, all empty, partial, documented compliant), exact key paths for every setting a verdict reads, pagination, rate limiting, config discovery, the bundle layout, a cap-exit test per collection loop driven through the real client over a fake HTTP transport, a secret-hygiene test that plants fake secrets in every collected object and inspects every bundle file and every zip entry, a unit test on `scrubErrorText`, and a table-driven error-body walk that derives every request from the client and fails each one in three body shapes (including `POST /oauth/token`), scanning findings, summaries, errors arrays, bundle files, zip entries, and thrown errors for canaries. `npm --prefix cli run test:zoom:live` runs a live smoke against a real account when credentials are present.
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `ZOOM-ID-01` | critical | `zoom_assess_identity` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for SSO enforcement for all users; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for SSO enforcement for all users, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of SSO enforcement for all users; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for SSO enforcement for all users is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-ID-02` | critical | `zoom_assess_identity` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Two-factor authentication for admins; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Two-factor authentication for admins, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Two-factor authentication for admins; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Two-factor authentication for admins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-ID-03` | high | `zoom_assess_identity` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Managed domains verified; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Managed domains verified, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Managed domains verified; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Managed domains verified is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-ID-04` | medium | `zoom_assess_identity` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Administrative privilege concentration; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Administrative privilege concentration, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Administrative privilege concentration; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Administrative privilege concentration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-ID-05` | high | `zoom_assess_identity` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Personal and social sign-in methods blocked; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Personal and social sign-in methods blocked, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Personal and social sign-in methods blocked; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Personal and social sign-in methods blocked is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-ID-06` | medium | `zoom_assess_identity` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Session inactivity timeout enforced; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Session inactivity timeout enforced, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Session inactivity timeout enforced; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Session inactivity timeout enforced is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-ID-07` | low | `zoom_assess_identity` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Vanity URL configured and secured; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Vanity URL configured and secured, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Vanity URL configured and secured; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Vanity URL configured and secured is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-01` | high | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Trusted domain restrictions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Trusted domain restrictions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Trusted domain restrictions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Trusted domain restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-02` | high | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for In-meeting file transfer restricted; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for In-meeting file transfer restricted, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of In-meeting file transfer restricted; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for In-meeting file transfer restricted is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-03` | high | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Cloud recording auto-delete retention; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Cloud recording auto-delete retention, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Cloud recording auto-delete retention; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Cloud recording auto-delete retention is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-04` | medium | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Zoom Phone recording policies enforced; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Zoom Phone recording policies enforced, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Zoom Phone recording policies enforced; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Zoom Phone recording policies enforced is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-05` | medium | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Admin operation logs readable and recent; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Admin operation logs readable and recent, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Admin operation logs readable and recent; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Admin operation logs readable and recent is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-06` | medium | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for IM group restrictions enforced; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for IM group restrictions enforced, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of IM group restrictions enforced; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for IM group restrictions enforced is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-07` | medium | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for External contacts restricted; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for External contacts restricted, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of External contacts restricted; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for External contacts restricted is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-COLLAB-08` | medium | `zoom_assess_collaboration_governance` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Chat encryption enabled; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Chat encryption enabled, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Chat encryption enabled; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Chat encryption enabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-01` | critical | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Meeting password enforcement and account lock; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Meeting password enforcement and account lock, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Meeting password enforcement and account lock; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Meeting password enforcement and account lock is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-02` | critical | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Waiting room enabled by default; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Waiting room enabled by default, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Waiting room enabled by default; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Waiting room enabled by default is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-03` | high | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Screen sharing restricted to host only; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Screen sharing restricted to host only, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Screen sharing restricted to host only; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Screen sharing restricted to host only is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-04` | high | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Local recording disabled; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Local recording disabled, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Local recording disabled; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Local recording disabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-05` | high | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for End-to-end encryption available and default; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for End-to-end encryption available and default, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of End-to-end encryption available and default; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for End-to-end encryption available and default is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-06` | medium | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Embed password in join link disabled; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Embed password in join link disabled, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Embed password in join link disabled; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Embed password in join link disabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-07` | medium | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Personal Meeting ID usage restricted; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Personal Meeting ID usage restricted, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Personal Meeting ID usage restricted; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Personal Meeting ID usage restricted is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-08` | high | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Only authenticated users can join meetings; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Only authenticated users can join meetings, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Only authenticated users can join meetings; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Only authenticated users can join meetings is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-09` | critical | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Data routing control enabled; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Data routing control enabled, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Data routing control enabled; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Data routing control enabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `ZOOM-MTG-10` | high | `zoom_assess_meeting_security` | `account-settings`, `lock-settings`, `users`, `groups`, `operation-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Recording consent disclaimer shown to participants; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Recording consent disclaimer shown to participants, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Recording consent disclaimer shown to participants; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Recording consent disclaimer shown to participants is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
-### Deviations from this spec (docs win)
+### Ordered decision rules
 
-- Control 2: the account-level waiting room flag is `meeting_security.waiting_room` (settings `option=meeting_security`), not `in_meeting.waiting_room`.
-- Control 4: `recording.recording_disclaimer` is marked deprecated in the account settings reference; the verdict reads `recording.recording_notification_for_zoom_client.disclaimer_to_participants` and only falls back to the deprecated boolean when the replacement is absent.
-- Control 6: admin 2FA is read from the account `security.sign_in_with_two_factor_auth` (`all`, `role`, `group`, `none`) and `sign_in_with_two_factor_auth_roles` under `option=security`, not from `GET /users/{userId}/settings`, which documents no 2FA field.
-- Control 8: the account settings reference documents no Team Chat encryption setting under `chat`; encryption indicators exist only as per-message metadata in the Team Chat API, so ZOOM-COLLAB-08 is manual with the citation in its summary.
-- Control 12: the documented settings are `chat.allow_users_to_add_contacts` and `chat.allow_users_to_chat_with_others` (`enable` plus `selected_option` 1 to 4); trusted domains remain a supporting finding (ZOOM-COLLAB-01).
-- Control 13: no account vanity URL field is documented on `GET /accounts/{accountId}/settings`; only per-user `vanity_url` exists on `GET /users/{userId}`, so ZOOM-ID-07 is manual with the citation in its summary.
-- Control 17: the documented fields are `security.sign_again_period_for_inactivity_on_client` and `security.sign_again_period_for_inactivity_on_web` (minutes, 0 disables), under `option=security`.
-- Control 22: the `GET /accounts/{accountId}/settings` response documents `embed_password_in_join_link` only under `meeting_security` (settings `option=meeting_security`); `schedule_meeting.embed_password_in_join_link` exists only in the `lock_settings` response. ZOOM-MTG-06 reads `meeting_security.embed_password_in_join_link` and the `meeting_security.embed_password_in_join_link` lock (both documented), not the `schedule_meeting` path asserted in section 4.
-- Control 16: the `GET /users` `login_types` enum is `[0, 1, 23, 24, 27, 97, 98, 100, 101]` while its description omits 23 and 98 and describes 99, which is absent from the enum; `GET /users/{userId}` describes 98 (RingCentral OAuth), 99 (API user), and the China-only 11, 21, and 23 (Alipay). The classification above cites both pages.
-- Control 19: `GET /phone/recording` and `GET /phone/call_handling/settings` are not in the Zoom Phone reference as account policy reads; the verdict uses `GET /phone/account_settings?setting_types=auto_call_recording,ad_hoc_call_recording`.
-- `GET /report/operationlogs` requires `from` and `to` (yyyy-mm-dd); the CLI queries a 30-day window.
-- Not used: `GET /users/{userId}/settings`, `GET /users/{userId}/token`, `GET /roles/{roleId}`, `GET /report/meetings`, `GET /im/groups/{imGroupId}`. No shipped control depends on them.
-- Scope naming: the IM groups endpoint documents `imgroup:read:admin` (classic) and `contact_group:read:list_groups:admin` (granular), not `im:read:admin`. The Team Chat reference (`https://developers.zoom.us/docs/api/chat/`) has no stable per-operation anchor; its OpenAPI document carries `GET /im/groups`. Managed and trusted domains require master-account granular scopes (`account:read:managed_domains:master`, `account:read:trusted_domains:master`).
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
 
-### What remains
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `ZOOM-ID-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-ID-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-ID-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-ID-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-ID-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-ID-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-ID-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-ID-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-ID-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-ID-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-ID-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-ID-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-ID-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-ID-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-ID-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-ID-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-ID-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-ID-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-ID-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-ID-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-ID-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-ID-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-ID-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-ID-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-ID-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-ID-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-ID-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-ID-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-COLLAB-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-COLLAB-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-COLLAB-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-COLLAB-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-09` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-09` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-09` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-09` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `ZOOM-MTG-10` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `ZOOM-MTG-10` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `ZOOM-MTG-10` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `ZOOM-MTG-10` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
 
-- Out of scope for this pass: user-level OAuth (section 3), SARIF, CSV, and HTML reporters (section 7), the standalone Go binary and CLI flags (sections 8 and 9).
-- Deferred: per-user setting drift via `GET /users/{userId}/settings` (only account and group levels are inspected), Zoom Phone call handling policies, and `GET /report/meetings` usage analytics.
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `ZOOM-ID-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-ID-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-ID-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-ID-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-ID-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-ID-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-ID-07` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-07` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-COLLAB-08` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-07` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-08` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-09` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `ZOOM-MTG-10` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `ZOOM-ID-01` | `passStatus` | pass |
+| `ZOOM-ID-01` | `warnStatus` | warn |
+| `ZOOM-ID-01` | `failStatus` | fail |
+| `ZOOM-ID-01` | `manualStatus` | manual |
+| `ZOOM-ID-02` | `passStatus` | pass |
+| `ZOOM-ID-02` | `warnStatus` | warn |
+| `ZOOM-ID-02` | `failStatus` | fail |
+| `ZOOM-ID-02` | `manualStatus` | manual |
+| `ZOOM-ID-03` | `passStatus` | pass |
+| `ZOOM-ID-03` | `warnStatus` | warn |
+| `ZOOM-ID-03` | `failStatus` | fail |
+| `ZOOM-ID-03` | `manualStatus` | manual |
+| `ZOOM-ID-04` | `passStatus` | pass |
+| `ZOOM-ID-04` | `warnStatus` | warn |
+| `ZOOM-ID-04` | `failStatus` | fail |
+| `ZOOM-ID-04` | `manualStatus` | manual |
+| `ZOOM-ID-05` | `passStatus` | pass |
+| `ZOOM-ID-05` | `warnStatus` | warn |
+| `ZOOM-ID-05` | `failStatus` | fail |
+| `ZOOM-ID-05` | `manualStatus` | manual |
+| `ZOOM-ID-06` | `passStatus` | pass |
+| `ZOOM-ID-06` | `warnStatus` | warn |
+| `ZOOM-ID-06` | `failStatus` | fail |
+| `ZOOM-ID-06` | `manualStatus` | manual |
+| `ZOOM-ID-07` | `passStatus` | pass |
+| `ZOOM-ID-07` | `warnStatus` | warn |
+| `ZOOM-ID-07` | `failStatus` | fail |
+| `ZOOM-ID-07` | `manualStatus` | manual |
+| `ZOOM-COLLAB-01` | `passStatus` | pass |
+| `ZOOM-COLLAB-01` | `warnStatus` | warn |
+| `ZOOM-COLLAB-01` | `failStatus` | fail |
+| `ZOOM-COLLAB-01` | `manualStatus` | manual |
+| `ZOOM-COLLAB-02` | `passStatus` | pass |
+| `ZOOM-COLLAB-02` | `warnStatus` | warn |
+| `ZOOM-COLLAB-02` | `failStatus` | fail |
+| `ZOOM-COLLAB-02` | `manualStatus` | manual |
+| `ZOOM-COLLAB-03` | `passStatus` | pass |
+| `ZOOM-COLLAB-03` | `warnStatus` | warn |
+| `ZOOM-COLLAB-03` | `failStatus` | fail |
+| `ZOOM-COLLAB-03` | `manualStatus` | manual |
+| `ZOOM-COLLAB-04` | `passStatus` | pass |
+| `ZOOM-COLLAB-04` | `warnStatus` | warn |
+| `ZOOM-COLLAB-04` | `failStatus` | fail |
+| `ZOOM-COLLAB-04` | `manualStatus` | manual |
+| `ZOOM-COLLAB-05` | `passStatus` | pass |
+| `ZOOM-COLLAB-05` | `warnStatus` | warn |
+| `ZOOM-COLLAB-05` | `failStatus` | fail |
+| `ZOOM-COLLAB-05` | `manualStatus` | manual |
+| `ZOOM-COLLAB-06` | `passStatus` | pass |
+| `ZOOM-COLLAB-06` | `warnStatus` | warn |
+| `ZOOM-COLLAB-06` | `failStatus` | fail |
+| `ZOOM-COLLAB-06` | `manualStatus` | manual |
+| `ZOOM-COLLAB-07` | `passStatus` | pass |
+| `ZOOM-COLLAB-07` | `warnStatus` | warn |
+| `ZOOM-COLLAB-07` | `failStatus` | fail |
+| `ZOOM-COLLAB-07` | `manualStatus` | manual |
+| `ZOOM-COLLAB-08` | `passStatus` | pass |
+| `ZOOM-COLLAB-08` | `warnStatus` | warn |
+| `ZOOM-COLLAB-08` | `failStatus` | fail |
+| `ZOOM-COLLAB-08` | `manualStatus` | manual |
+| `ZOOM-MTG-01` | `passStatus` | pass |
+| `ZOOM-MTG-01` | `warnStatus` | warn |
+| `ZOOM-MTG-01` | `failStatus` | fail |
+| `ZOOM-MTG-01` | `manualStatus` | manual |
+| `ZOOM-MTG-02` | `passStatus` | pass |
+| `ZOOM-MTG-02` | `warnStatus` | warn |
+| `ZOOM-MTG-02` | `failStatus` | fail |
+| `ZOOM-MTG-02` | `manualStatus` | manual |
+| `ZOOM-MTG-03` | `passStatus` | pass |
+| `ZOOM-MTG-03` | `warnStatus` | warn |
+| `ZOOM-MTG-03` | `failStatus` | fail |
+| `ZOOM-MTG-03` | `manualStatus` | manual |
+| `ZOOM-MTG-04` | `passStatus` | pass |
+| `ZOOM-MTG-04` | `warnStatus` | warn |
+| `ZOOM-MTG-04` | `failStatus` | fail |
+| `ZOOM-MTG-04` | `manualStatus` | manual |
+| `ZOOM-MTG-05` | `passStatus` | pass |
+| `ZOOM-MTG-05` | `warnStatus` | warn |
+| `ZOOM-MTG-05` | `failStatus` | fail |
+| `ZOOM-MTG-05` | `manualStatus` | manual |
+| `ZOOM-MTG-06` | `passStatus` | pass |
+| `ZOOM-MTG-06` | `warnStatus` | warn |
+| `ZOOM-MTG-06` | `failStatus` | fail |
+| `ZOOM-MTG-06` | `manualStatus` | manual |
+| `ZOOM-MTG-07` | `passStatus` | pass |
+| `ZOOM-MTG-07` | `warnStatus` | warn |
+| `ZOOM-MTG-07` | `failStatus` | fail |
+| `ZOOM-MTG-07` | `manualStatus` | manual |
+| `ZOOM-MTG-08` | `passStatus` | pass |
+| `ZOOM-MTG-08` | `warnStatus` | warn |
+| `ZOOM-MTG-08` | `failStatus` | fail |
+| `ZOOM-MTG-08` | `manualStatus` | manual |
+| `ZOOM-MTG-09` | `passStatus` | pass |
+| `ZOOM-MTG-09` | `warnStatus` | warn |
+| `ZOOM-MTG-09` | `failStatus` | fail |
+| `ZOOM-MTG-09` | `manualStatus` | manual |
+| `ZOOM-MTG-10` | `passStatus` | pass |
+| `ZOOM-MTG-10` | `warnStatus` | warn |
+| `ZOOM-MTG-10` | `failStatus` | fail |
+| `ZOOM-MTG-10` | `manualStatus` | manual |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `ZOOM-ID-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-ID-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-ID-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-ID-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-ID-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-ID-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-ID-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-ID-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-ID-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-ID-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-ID-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-ID-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-ID-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-ID-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-ID-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-ID-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-ID-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-ID-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-ID-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-ID-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-ID-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-ID-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-ID-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-ID-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-ID-07` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-ID-07` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-ID-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-ID-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-07` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-07` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-COLLAB-08` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-COLLAB-08` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-COLLAB-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-COLLAB-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-07` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-07` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-08` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-08` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-09` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-09` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `ZOOM-MTG-10` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `ZOOM-MTG-10` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `ZOOM-MTG-10` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `ZOOM-MTG-10` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | Meeting password enforcement and account lock | - | - | - | - | - | - | - | - |
+| 2 | Waiting room enabled by default | - | - | - | - | - | - | - | - |
+| 3 | Screen sharing restricted to host only | - | - | - | - | - | - | - | - |
+| 4 | Recording consent disclaimer shown to participants | - | - | - | - | - | - | - | - |
+| 5 | SSO enforcement for all users | - | - | - | - | - | - | - | - |
+| 6 | Administrative privilege concentration | - | - | - | - | - | - | - | - |
+| 7 | End-to-end encryption available and default | - | - | - | - | - | - | - | - |
+| 8 | Chat encryption enabled | - | - | - | - | - | - | - | - |
+| 9 | In-meeting file transfer restricted | - | - | - | - | - | - | - | - |
+| 10 | Cloud recording auto-delete retention | - | - | - | - | - | - | - | - |
+| 12 | External contacts restricted | - | - | - | - | - | - | - | - |
+| 13 | Vanity URL configured and secured | - | - | - | - | - | - | - | - |
+| 14 | Managed domains verified | - | - | - | - | - | - | - | - |
+| 15 | IM group restrictions enforced | - | - | - | - | - | - | - | - |
+| 16 | Personal and social sign-in methods blocked | - | - | - | - | - | - | - | - |
+| 17 | Session inactivity timeout enforced | - | - | - | - | - | - | - | - |
+| 18 | Data routing control enabled | - | - | - | - | - | - | - | - |
+| 19 | Zoom Phone recording policies enforced | - | - | - | - | - | - | - | - |
+| 20 | Local recording disabled | - | - | - | - | - | - | - | - |
+| 22 | Embed password in join link disabled | - | - | - | - | - | - | - | - |
+| 23 | Only authenticated users can join meetings | - | - | - | - | - | - | - | - |
+| 24 | Admin operation logs readable and recent | - | - | - | - | - | - | - | - |
+| 25 | Personal Meeting ID usage restricted | - | - | - | - | - | - | - | - |
+
+## Collection states
+
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
+
+## Integration-specific scrubbing
+
+Shared contract version: 1.1.
+
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
+
+Sensitive fields and values: client_secret, access_token, authorization, cookie, join_url, start_url
+
+Credential formats: Zoom OAuth bearer tokens, OAuth client secrets, meeting start and join URLs
+
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
+
+Integration-specific rules:
+
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `account-settings` | `security`, `meeting_security`, `schedule_meeting`, `in_meeting`, `recording`, `chat` |
+| `lock-settings` | `meeting_security`, `schedule_meeting`, `in_meeting`, `recording`, `chat` |
+| `users` | `id`, `email`, `status`, `type`, `login_types` |
+| `groups` | `id`, `name`, `total_members` |
+| `operation-logs` | `time`, `operator`, `category_type`, `operation_detail` |
+
+## Export layout
+
+Required paths:
+
+- `core_data/access.json`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis/cis_compliance_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/stig_compliance_checklist.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
+- `QUICK_REFERENCE.md`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `core_data/{dataset}.json` | json | The dataset is part of the assessment, including explicit not-collected markers. | Projected source records or a structured unavailable marker; unavailable values remain null. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | Human-readable counts and findings grouped by status. | UTF-8 Markdown. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | Finding-to-framework mapping matrix. | UTF-8 Markdown. |
+| `compliance/{framework}/{report}.md` | markdown | Always for each supported framework. | Framework-specific finding rows and mappings. | UTF-8 Markdown. |
+| `QUICK_REFERENCE.md` | markdown | Always. | Bundle navigation and operator next steps. | UTF-8 Markdown. |
+| `_errors.log` | text | At least one collection read failed, was denied, or was incomplete. | Scrubbed collection error summaries without response bodies or credentials. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `control`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `mappings`
+- `manualEvidence`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+- `reason`
+
+#### access_surface
+
+- `name`
+- `endpoint`
+- `status`
+- `count`
+- `error`
+
+#### assessment
+
+- `area`
+- `title`
+- `summary`
+- `findings`
+- `errors`
+
+#### bundle_manifest
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+JSON formatting: UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.
+
+Overwrite policy: Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create zoom-audit.zip beside the allocated zoom-audit directory, applying the same suffix to both.

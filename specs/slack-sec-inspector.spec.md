@@ -2,366 +2,889 @@
 slug: "slack-sec-inspector"
 name: "Slack Security Inspector"
 vendor: "Slack"
-category: "saas-collaboration"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+category: "collaboration"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# slack-sec-inspector
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-## 1. Overview
+# Slack Security Inspector
 
-A security compliance inspection tool for **Slack Enterprise Grid** that audits workspace and organization-level security configurations against industry compliance frameworks. The tool connects to Slack's management and audit APIs to evaluate SSO enforcement, MFA policies, data loss prevention settings, external sharing controls, app management, session policies, and audit log configurations. Results are output as structured compliance reports mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP controls.
+Portable contract for the shipped Slack Enterprise Grid identity, administration, app, channel, and monitoring assessments.
 
-### grclanker implementation
+## Purpose
 
-The shipped implementation lives in `cli/extensions/grc-tools/slack.ts` as six native tools plus an exporter: `slack_check_access`, `slack_assess_identity`, `slack_assess_admin_access`, `slack_assess_integrations`, `slack_assess_channel_governance`, `slack_assess_monitoring`, and `slack_export_audit_bundle`. Every method, argument, and response field is listed in the `SLACK_METHODS` table with its reference page, and the integration guide (`src/content/docs/docs/integrations/slack.md`) maps each of the 25 controls to a finding id.
+Provide a read-only Enterprise Grid assessment across identity, administration, applications, channel governance, SCIM lifecycle, and audit monitoring.
 
-## 2. APIs & SDKs
+## Design guidance
 
-### Slack APIs
+Model Slack's Web, Admin, SCIM, and Audit Logs APIs as separate evidence domains with separate scopes and plan gates. Do not infer private organization settings from unrelated public fields; preserve manual review where Slack offers no read method.
 
-| API | Base URL | Purpose |
-|-----|----------|---------|
-| **Web API** | `https://slack.com/api/` | Core workspace and user management methods |
-| **SCIM API** | `https://api.slack.com/scim/v2/` | User and group provisioning (Enterprise Grid) |
-| **Audit Logs API** | `https://api.slack.com/audit/v1/logs` | Organization-level audit event retrieval (Enterprise Grid) |
-| **Admin API** | `https://slack.com/api/admin.*` | Enterprise administration methods |
-| **Discovery API** | `https://slack.com/api/discovery.*` | DLP and eDiscovery content access (Enterprise Grid) |
+## Shared integration contract
 
-### Key API Methods
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-**Admin API (admin.* methods):**
-- `admin.teams.settings.info` - Workspace-level security settings
-- `admin.teams.settings.setDiscoverability` - Control workspace discoverability
-- `admin.users.session.list` / `admin.users.session.invalidate` - Session management
-- `admin.users.session.setSettings` - Session duration and idle timeout policies
-- `admin.conversations.setConversationPrefs` - Channel posting restrictions
-- `admin.conversations.restrictAccess.addGroup` - IDP group channel restrictions
-- `admin.apps.approve` / `admin.apps.restrict` - App management
-- `admin.apps.approved.list` / `admin.apps.restricted.list` - App audit
-- `admin.emoji.add` / `admin.emoji.list` - Custom emoji management
-- `admin.teams.admins.list` - Admin role enumeration
-- `admin.users.list` - User management with deactivation status
-- `admin.usergroups.addTeams` - IDP group workspace assignment
-- `admin.barriers.create` / `admin.barriers.list` - Information barriers
+## Known runtime gaps
 
-**SCIM API:**
-- `GET /Users` - List provisioned users with attributes
-- `GET /Groups` - List provisioned groups
-- `PATCH /Users/{id}` - Update user provisioning attributes
-- `GET /ServiceProviderConfig` - SCIM endpoint capabilities
+- Eight controls remain manual because the public read APIs do not expose a decisive setting; the runtime names the exact Admin Console or SIEM evidence instead of calling write endpoints.
+- Cross-inventory findings require every dependent workspace, admin, channel, SCIM, or audit inventory to be complete before pass; partial secondary reads demote the dependent result.
+- SCIM, Web API, Admin API, and Audit Logs pagination use different cursor locations and preserve stalled cursors, page caps, item caps, and unknown totals as incomplete evidence.
+- Discovery DLP details, guest expiry, several workspace restrictions, and standalone reporters remain unavailable.
 
-**Audit Logs API:**
-- `GET /audit/v1/logs` - Retrieve audit events with action-based filtering
-- `GET /audit/v1/schemas` - Available audit event schemas
-- Supported actions: `user_login`, `user_logout`, `file_downloaded`, `app_installed`, `role_change_to_admin`, `pref_sso_setting_changed`, `pref_two_factor_auth_changed`, etc.
+## Tools
 
-**Discovery API:**
-- `discovery.enterprise.info` - Organization-level DLP settings
-- `discovery.conversations.list` - Enumerate conversations for DLP scanning
-- `discovery.conversations.history` - Retrieve message content for DLP
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `slack_check_access` | Validate read-only Slack Enterprise Grid API access and show which Web API, Admin API, SCIM, and Audit Logs surfaces are readable with the configured user, bot, and SCIM tokens. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_identity` | Assess Slack MFA enrollment (has_2fa), guest inventory, SCIM provisioning coverage, user lifecycle alignment, and deactivated user visibility. | `SLACK-ID-01`, `SLACK-ID-02`, `SLACK-ID-03`, `SLACK-ID-04`, `SLACK-ID-05` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_admin_access` | Assess Slack workspace admin inventory, SSO coverage (has_sso), session duration, idle timeout, discoverability, mobile session controls, email domain restrictions, custom emoji governance, and analytics access. | `SLACK-ADMIN-01`, `SLACK-ADMIN-02`, `SLACK-ADMIN-03`, `SLACK-ADMIN-04`, `SLACK-ADMIN-05`, `SLACK-ADMIN-06`, `SLACK-ADMIN-07`, `SLACK-ADMIN-08`, `SLACK-ADMIN-09` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_integrations` | Assess Slack approved and restricted app inventories, internal and sensitive-scope apps, information barriers, DLP and Discovery evidence, file upload restrictions (team.preferences.list), and token rotation. | `SLACK-APP-01`, `SLACK-APP-02`, `SLACK-APP-03`, `SLACK-APP-04`, `SLACK-APP-05`, `SLACK-APP-06`, `SLACK-APP-07` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_channel_governance` | Assess Slack Connect exposure, posting restrictions on general and org default channels, channel retention overrides, external email ingestion, and link preview settings. | `SLACK-CHAN-01`, `SLACK-CHAN-02`, `SLACK-CHAN-03`, `SLACK-CHAN-04`, `SLACK-CHAN-05` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_monitoring` | Assess Slack Audit Logs API access, event recency, security administration events, schema visibility, external sharing monitoring, and SIEM streaming evidence. | `SLACK-MON-01`, `SLACK-MON-02`, `SLACK-MON-03`, `SLACK-MON-04`, `SLACK-MON-05`, `SLACK-MON-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_export_audit_bundle` | Export a Slack audit bundle with core_data snapshots, analysis JSON, per-framework compliance reports, QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive named after the allocated directory. | `SLACK-ID-01`, `SLACK-ID-02`, `SLACK-ID-03`, `SLACK-ID-04`, `SLACK-ID-05`, `SLACK-ADMIN-01`, `SLACK-ADMIN-02`, `SLACK-ADMIN-03`, `SLACK-ADMIN-04`, `SLACK-ADMIN-05`, `SLACK-ADMIN-06`, `SLACK-ADMIN-07`, `SLACK-ADMIN-08`, `SLACK-ADMIN-09`, `SLACK-APP-01`, `SLACK-APP-02`, `SLACK-APP-03`, `SLACK-APP-04`, `SLACK-APP-05`, `SLACK-APP-06`, `SLACK-APP-07`, `SLACK-CHAN-01`, `SLACK-CHAN-02`, `SLACK-CHAN-03`, `SLACK-CHAN-04`, `SLACK-CHAN-05`, `SLACK-MON-01`, `SLACK-MON-02`, `SLACK-MON-03`, `SLACK-MON-04`, `SLACK-MON-05`, `SLACK-MON-06` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
 
-### SDKs
+### Parameters
 
-| SDK | Language | Package |
-|-----|----------|---------|
-| **slack_sdk** | Python | `pip install slack_sdk` (official, Slack Technologies) |
-| **slack-bolt** | Python | `pip install slack-bolt` (app framework) |
-| **Slack CLI** | CLI | `slack` CLI tool for Slack platform apps |
-| **node-slack-sdk** | Node.js | `@slack/web-api` (official) |
+#### `slack_check_access`
 
-## 3. Authentication
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
 
-### Token Types
+#### `slack_assess_identity`
 
-| Token | Prefix | Scope |
-|-------|--------|-------|
-| **Bot Token** | `xoxb-` | Workspace-level bot permissions |
-| **User Token** | `xoxp-` | User-level API access; required for admin.* methods |
-| **Org-Level Token** | `xoxp-` | Enterprise Grid org-level admin token |
-| **SCIM Token** | Bearer | SCIM provisioning API access |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `user_limit` | number | no | Maximum users to read. Defaults to 1000. |
+| `skip_scim` | boolean | no | Skip SCIM provisioning checks. Defaults to false. |
 
-### Required OAuth Scopes
+#### `slack_assess_admin_access`
 
-For a comprehensive security audit, the following scopes are required on an **org-level user token**:
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `workspace_limit` | number | no | Maximum workspaces to read. Defaults to 50. |
+| `user_limit` | number | no | Maximum org users to read from admin.users.list. Defaults to 1000. |
+| `max_workspace_admins` | number | no | Maximum expected admins per workspace. Defaults to 5. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+| `session_sample` | number | no | Maximum users whose session settings are sampled. Defaults to 100. |
 
-- `admin.teams:read` - Read workspace settings
-- `admin.users:read` - List users and session info
-- `admin.users.session:read` - Read session settings
-- `admin.conversations:read` - Read conversation preferences
-- `admin.apps:read` - Read approved/restricted apps
-- `admin.barriers:read` - Read information barriers
-- `admin.roles:read` - Read admin role assignments
-- `auditlogs:read` - Read audit log events (Enterprise Grid)
-- `discovery:read` - Read DLP/eDiscovery data (Enterprise Grid)
-- `users:read` - Basic user enumeration
-- `team:read` - Workspace info
+#### `slack_assess_integrations`
 
-### SCIM Authentication
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `app_limit` | number | no | Maximum approved/restricted apps to read. Defaults to 500. |
+| `workspace_limit` | number | no | Maximum workspaces to read when scoping team.preferences.list. Defaults to 50. |
 
-SCIM API uses a separate bearer token issued from the Enterprise Grid admin dashboard under **Settings > Authentication > SCIM Provisioning**.
+#### `slack_assess_channel_governance`
 
-### Configuration
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `channel_limit` | number | no | Maximum active channels to sample for prefs and retention. Defaults to 40. |
+| `min_retention_days` | number | no | Minimum acceptable custom retention in days. Defaults to 365. |
 
-```
-SLACK_USER_TOKEN=xoxp-...
-SLACK_SCIM_TOKEN=...
-SLACK_ORG_ID=E0123456789
-```
+#### `slack_assess_monitoring`
 
-## 4. Security Controls
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `days` | number | no | Audit log lookback window in days. Defaults to 30. |
+| `audit_limit` | number | no | Maximum audit events to read (1-9999). Defaults to 200. |
 
-1. **SSO enforcement** - Verify SAML SSO is required for all users (not optional) via org-level authentication policy
-2. **Two-factor authentication** - Confirm 2FA is mandated org-wide; enumerate users without 2FA enrolled
-3. **Session duration limits** - Validate maximum session duration is set (recommended: 24h or less)
-4. **Session idle timeout** - Ensure idle session timeout is configured (recommended: 30 minutes or less)
-5. **Mobile session controls** - Verify mobile app session duration and jailbreak/root detection policies
-6. **File upload restrictions** - Check whether file uploads are restricted by type or disabled for external channels
-7. **External sharing controls** - Audit whether Slack Connect (external organizations) channels are permitted and which workspaces allow them
-8. **Information barriers** - Verify information barriers are configured between restricted groups (e.g., compliance walls)
-9. **App management policy** - Confirm app installation requires admin approval; enumerate approved and restricted apps
-10. **Custom app restrictions** - Verify that only approved custom integrations and bots are permitted
-11. **DLP policy configuration** - Check that Discovery API is enabled and DLP scanning is active for sensitive content patterns
-12. **Channel retention policies** - Audit message and file retention settings per workspace; verify compliance-required retention periods
-13. **Audit log streaming** - Confirm audit logs are being streamed to an external SIEM (Amazon S3, Splunk, etc.)
-14. **Admin role inventory** - Enumerate all org admins, workspace admins, and owners; flag excessive admin privileges
-15. **Guest account controls** - Audit single-channel and multi-channel guest accounts; verify guest expiration policies
-16. **Email domain restrictions** - Verify workspace signup is restricted to approved email domains
-17. **Workspace discoverability** - Ensure workspace discoverability is set appropriately (not open to all org members if sensitive)
-18. **Channel posting restrictions** - Audit channels where posting is restricted to admins or specific groups
-19. **Custom emoji restrictions** - Verify whether custom emoji uploads are restricted to admins
-20. **External email ingestion** - Check whether email-to-channel forwarding is enabled and restricted
-21. **Link previews and URL unfurling** - Audit whether link previews expose sensitive content in channels
-22. **SCIM provisioning status** - Verify SCIM provisioning is active and user lifecycle management is automated
-23. **Deactivated user audit** - Enumerate deactivated users and verify timely deprovisioning matches HR/IdP records
-24. **Workspace analytics access** - Verify analytics export access is restricted to authorized admins
-25. **Token rotation and revocation** - Audit API token age and ensure legacy tokens are revoked
+#### `slack_export_audit_bundle`
 
-## 5. Compliance Framework Mappings
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `output_dir` | string | no | Output root. Defaults to ./export/slack. |
+| `user_limit` | number | no | Maximum users to read. Defaults to 1000. |
+| `workspace_limit` | number | no | Maximum workspaces to read. Defaults to 50. |
+| `app_limit` | number | no | Maximum approved/restricted apps to read. Defaults to 500. |
+| `audit_limit` | number | no | Maximum audit events to read. Defaults to 200. |
+| `channel_limit` | number | no | Maximum channels to sample. Defaults to 40. |
+| `days` | number | no | Audit log lookback window in days. Defaults to 30. |
+| `max_workspace_admins` | number | no | Maximum expected admins per workspace. Defaults to 5. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+| `min_retention_days` | number | no | Minimum acceptable custom retention in days. Defaults to 365. |
+| `skip_scim` | boolean | no | Skip SCIM provisioning checks. Defaults to false. |
 
-| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---|---------|---------|------|-------|-----|---------|------|------|-------|
-| 1 | SSO enforcement | IA-2(1) | 3.5.3 | CC6.1 | 16.2 | 8.4.1 | SRG-APP-000149 | ISM-1546 | CPS.AT-1 |
-| 2 | Two-factor authentication | IA-2(6) | 3.5.3 | CC6.1 | 16.3 | 8.4.2 | SRG-APP-000150 | ISM-1504 | CPS.AT-2 |
-| 3 | Session duration limits | AC-12 | 3.1.10 | CC6.1 | 16.4 | 8.2.8 | SRG-APP-000295 | ISM-1164 | CPS.AC-7 |
-| 4 | Session idle timeout | AC-11 | 3.1.11 | CC6.1 | 16.5 | 8.2.8 | SRG-APP-000190 | ISM-1164 | CPS.AC-7 |
-| 5 | Mobile session controls | AC-19 | 3.1.18 | CC6.7 | - | 8.2.8 | SRG-APP-000394 | ISM-1082 | CPS.MP-1 |
-| 6 | File upload restrictions | SC-7 | 3.13.6 | CC6.6 | - | 1.3.2 | SRG-APP-000001 | ISM-0331 | CPS.SC-7 |
-| 7 | External sharing controls | AC-21 | 3.1.20 | CC6.6 | - | 7.1.2 | SRG-APP-000378 | ISM-0661 | CPS.AC-4 |
-| 8 | Information barriers | AC-4 | 3.1.3 | CC6.6 | - | 7.1.1 | SRG-APP-000039 | ISM-1528 | CPS.AC-4 |
-| 9 | App management policy | CM-7 | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000141 | ISM-1624 | CPS.CM-7 |
-| 10 | Custom app restrictions | CM-7(4) | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000386 | ISM-1624 | CPS.CM-7 |
-| 11 | DLP policy configuration | SC-7(8) | 3.13.6 | CC6.7 | - | - | SRG-APP-000400 | ISM-0261 | CPS.SC-7 |
-| 12 | Channel retention policies | AU-11 | 3.3.1 | CC7.2 | - | 10.7.1 | SRG-APP-000515 | ISM-0859 | CPS.AU-11 |
-| 13 | Audit log streaming | AU-6(3) | 3.3.5 | CC7.2 | 8.2 | 10.5.1 | SRG-APP-000516 | ISM-0580 | CPS.AU-6 |
-| 14 | Admin role inventory | AC-6(5) | 3.1.5 | CC6.3 | 16.8 | 7.1.1 | SRG-APP-000340 | ISM-1507 | CPS.AC-6 |
-| 15 | Guest account controls | AC-2(2) | 3.1.1 | CC6.2 | 16.7 | 7.1.2 | SRG-APP-000024 | ISM-0415 | CPS.AC-2 |
-| 16 | Email domain restrictions | IA-5 | 3.5.7 | CC6.1 | - | 8.3.1 | SRG-APP-000173 | ISM-1557 | CPS.IA-5 |
-| 17 | Workspace discoverability | AC-3 | 3.1.1 | CC6.1 | - | 7.1.1 | SRG-APP-000033 | ISM-0432 | CPS.AC-3 |
-| 18 | Channel posting restrictions | AC-3(7) | 3.1.2 | CC6.1 | - | 7.1.1 | SRG-APP-000033 | ISM-0405 | CPS.AC-3 |
-| 19 | Custom emoji restrictions | CM-5 | 3.4.5 | CC8.1 | - | - | SRG-APP-000380 | ISM-1624 | CPS.CM-5 |
-| 20 | External email ingestion | SC-7(4) | 3.13.6 | CC6.6 | - | 1.3.2 | SRG-APP-000001 | ISM-0264 | CPS.SC-7 |
-| 21 | Link previews and URL unfurling | SC-7 | 3.13.1 | CC6.6 | - | - | SRG-APP-000001 | ISM-0260 | CPS.SC-7 |
-| 22 | SCIM provisioning status | AC-2(1) | 3.1.1 | CC6.2 | - | 7.1.1 | SRG-APP-000023 | ISM-1594 | CPS.AC-2 |
-| 23 | Deactivated user audit | AC-2(3) | 3.1.12 | CC6.2 | 16.9 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
-| 24 | Workspace analytics access | AC-6(9) | 3.1.7 | CC6.3 | - | 7.1.2 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
-| 25 | Token rotation and revocation | IA-5(1) | 3.5.10 | CC6.1 | - | 8.6.3 | SRG-APP-000175 | ISM-1557 | CPS.IA-5 |
 
-## 6. Existing Tools
+## Authentication
 
-| Tool | Description | Limitations |
-|------|-------------|-------------|
-| **Slack Enterprise Audit Dashboard** | Built-in admin analytics and audit log viewer | No automated compliance mapping; manual review only |
-| **Slack SIEM Integrations** (Splunk, Datadog) | Audit log forwarding and alerting | Focused on detection, not configuration compliance |
-| **Resmo** | SaaS security posture management with Slack integration | Commercial; limited to their predefined checks |
-| **Nudge Security** | SaaS discovery and governance | Focused on shadow IT, not deep config audit |
-| **AppOmni** | SaaS security posture management | Commercial; expensive enterprise pricing |
-| **Valence Security** | SaaS security remediation | Commercial; focused on remediation workflows |
-| **ScoutSuite** | Multi-cloud security auditing | Cloud-focused, no Slack support |
+Supported modes:
 
-**Gap:** No open-source tool performs comprehensive Slack Enterprise security configuration auditing with multi-framework compliance mapping. Existing tools are either commercial SaaS platforms, focused on log analysis rather than configuration posture, or lack the depth of controls covered here.
+- User OAuth token
+- Bot OAuth token
+- SCIM bearer token
 
-## 7. Architecture
+Credential precedence, highest first:
 
-```
-slack-sec-inspector/
-├── cmd/
-│   └── slack-sec-inspector/
-│       └── main.go                  # CLI entrypoint
-├── internal/
-│   ├── client/
-│   │   ├── slack.go                 # Slack Web API client wrapper
-│   │   ├── scim.go                  # SCIM API client
-│   │   ├── audit.go                 # Audit Logs API client
-│   │   └── ratelimit.go            # Tier-aware rate limiter (Tier 1-4)
-│   ├── analyzers/
-│   │   ├── sso.go                   # Control 1: SSO enforcement
-│   │   ├── mfa.go                   # Control 2: Two-factor authentication
-│   │   ├── sessions.go              # Controls 3-5: Session policies
-│   │   ├── fileuploads.go           # Control 6: File upload restrictions
-│   │   ├── externalsharing.go       # Controls 7, 20: External sharing and email ingestion
-│   │   ├── barriers.go              # Control 8: Information barriers
-│   │   ├── apps.go                  # Controls 9-10: App management
-│   │   ├── dlp.go                   # Control 11: DLP policy configuration
-│   │   ├── retention.go             # Control 12: Channel retention policies
-│   │   ├── auditlogs.go            # Control 13: Audit log streaming
-│   │   ├── adminroles.go           # Control 14: Admin role inventory
-│   │   ├── guests.go               # Control 15: Guest account controls
-│   │   ├── domains.go              # Control 16: Email domain restrictions
-│   │   ├── discoverability.go      # Control 17: Workspace discoverability
-│   │   ├── channels.go             # Control 18: Channel posting restrictions
-│   │   ├── emoji.go                # Control 19: Custom emoji restrictions
-│   │   ├── urlpreviews.go          # Control 21: Link previews
-│   │   ├── scim.go                 # Control 22: SCIM provisioning status
-│   │   ├── users.go                # Control 23: Deactivated user audit
-│   │   ├── analytics.go            # Control 24: Workspace analytics access
-│   │   └── tokens.go               # Control 25: Token rotation and revocation
-│   ├── reporters/
-│   │   ├── json.go                  # JSON output reporter
-│   │   ├── csv.go                   # CSV output reporter
-│   │   ├── markdown.go              # Markdown report with compliance matrix
-│   │   ├── html.go                  # HTML dashboard report
-│   │   └── sarif.go                 # SARIF format for CI/CD integration
-│   ├── compliance/
-│   │   ├── mapper.go                # Maps findings to framework controls
-│   │   ├── fedramp.go               # FedRAMP control definitions
-│   │   ├── cmmc.go                  # CMMC control definitions
-│   │   ├── soc2.go                  # SOC 2 trust criteria
-│   │   ├── cis.go                   # CIS Benchmark references
-│   │   ├── pcidss.go                # PCI-DSS requirements
-│   │   ├── stig.go                  # DISA STIG rules
-│   │   ├── irap.go                  # IRAP ISM controls
-│   │   └── ismap.go                 # ISMAP control references
-│   ├── models/
-│   │   ├── finding.go               # Finding severity, evidence, remediation
-│   │   ├── control.go               # Security control definition
-│   │   └── report.go                # Aggregate report model
-│   └── tui/
-│       ├── app.go                   # Bubble Tea TUI application
-│       ├── views/
-│       │   ├── dashboard.go         # Summary dashboard view
-│       │   ├── controls.go          # Control detail drill-down
-│       │   └── compliance.go        # Framework compliance matrix view
-│       └── components/
-│           ├── table.go             # Sortable findings table
-│           ├── progress.go          # Scan progress indicator
-│           └── severity.go          # Severity badge rendering
-├── pkg/
-│   └── version/
-│       └── version.go               # Build version info
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── .goreleaser.yaml
-└── spec.md
-```
+1. Explicit tool arguments
+2. Explicit config file
+3. SLACK_* environment variables
 
-### Key Dependencies
+Environment variables: `SLACK_USER_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_SCIM_TOKEN`, `SLACK_ORG_ID`, `SLACK_CONFIG_FILE`
 
-| Package | Purpose |
-|---------|---------|
-| `github.com/slack-go/slack` | Go Slack API client |
-| `github.com/spf13/cobra` | CLI framework |
-| `github.com/charmbracelet/bubbletea` | Terminal UI framework |
-| `github.com/charmbracelet/lipgloss` | TUI styling |
+Configuration locations: ~/.config/grclanker/slack.json
 
-## 8. CLI Interface
+Credential and deployment variants: Enterprise Grid org token plus optional bot and SCIM credentials
 
-```
-slack-sec-inspector [command] [flags]
+Configuration fields: `token`, `botToken`, `scimToken`, `orgId`, `webApiBaseUrl`, `scimBaseUrl`, `auditBaseUrl`
 
-Commands:
-  scan          Run security compliance scan against Slack org
-  report        Generate compliance report from scan results
-  version       Print version information
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 
-Global Flags:
-  --token string        Slack user token (xoxp-...) [$SLACK_USER_TOKEN]
-  --scim-token string   SCIM bearer token [$SLACK_SCIM_TOKEN]
-  --org-id string       Enterprise Grid organization ID [$SLACK_ORG_ID]
-  --output string       Output format: json, csv, markdown, html, sarif (default "json")
-  --output-dir string   Directory for report output (default "./results")
-  --severity string     Minimum severity to report: critical, high, medium, low, info (default "low")
-  --controls string     Comma-separated list of control numbers to run (default: all)
-  --quiet               Suppress progress output
-  --no-color            Disable colored output
-  --tui                 Launch interactive terminal UI
+## Permissions
 
-Scan Flags:
-  --workspace string    Limit scan to specific workspace ID
-  --skip-scim           Skip SCIM provisioning checks
-  --skip-discovery      Skip Discovery API (DLP) checks
-  --skip-audit-logs     Skip Audit Logs API checks
-  --parallel int        Number of parallel API calls (default 4)
-  --timeout duration    API call timeout (default 30s)
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| role | `Slack Enterprise Grid org-admin OAuth scopes` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `SCIM API entitlement and token` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `Audit Logs API entitlement and scope` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `Discovery and DLP plan features where applicable` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
 
-Examples:
-  # Full org-level scan with JSON output
-  slack-sec-inspector scan --token xoxp-... --scim-token ... --org-id E01234
+## API surfaces
 
-  # Scan specific controls with markdown report
-  slack-sec-inspector scan --controls 1,2,3,14 --output markdown
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `users` | HTTP | `GET /api/users.list` | Slack Web API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `deleted`, `is_admin`, `is_owner`, `is_restricted`, `has_2fa`, `has_sso` | [Official documentation](https://api.slack.com/methods/users.list) |
+| `admin-users` | HTTP | `POST /api/admin.users.list` | Slack Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `team_id`, `email`, `is_admin`, `is_owner` | [Official documentation](https://api.slack.com/methods/admin.users.list) |
+| `admin-apps` | HTTP | `GET /api/admin.apps.approved.list` | Slack Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `app_id`, `name`, `scopes`, `is_internal` | [Official documentation](https://api.slack.com/methods/admin.apps.approved.list) |
+| `scim-users` | HTTP | `GET /scim/v1/Users` | Slack SCIM API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `userName`, `active`, `groups` | [Official documentation](https://docs.slack.dev/admins/scim-api/) |
+| `audit-logs` | HTTP | `GET /audit/v1/logs` | Slack Audit Logs API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `date_create`, `action`, `actor`, `entity`, `context` | [Official documentation](https://docs.slack.dev/admins/audit-logs-api/) |
 
-  # Interactive TUI mode
-  slack-sec-inspector scan --tui
+### Request construction
 
-  # Generate SARIF for CI/CD pipeline
-  slack-sec-inspector scan --output sarif --severity high
-```
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `users` | client | Use the configured Slack Web API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented id, deleted, is_admin, is_owner, is_restricted, has_2fa, has_sso members consumed by verdicts. | yes |
+| `admin-users` | client | Use the configured Slack Admin API origin; never follow a server link to a different origin. | yes |
+| `admin-users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `admin-users` | response | A JSON object or list containing only the documented id, team_id, email, is_admin, is_owner members consumed by verdicts. | yes |
+| `admin-apps` | client | Use the configured Slack Admin API origin; never follow a server link to a different origin. | yes |
+| `admin-apps` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `admin-apps` | response | A JSON object or list containing only the documented app_id, name, scopes, is_internal members consumed by verdicts. | yes |
+| `scim-users` | client | Use the configured Slack SCIM API origin; never follow a server link to a different origin. | yes |
+| `scim-users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `scim-users` | response | A JSON object or list containing only the documented id, userName, active, groups members consumed by verdicts. | yes |
+| `audit-logs` | client | Use the configured Slack Audit Logs API origin; never follow a server link to a different origin. | yes |
+| `audit-logs` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `audit-logs` | response | A JSON object or list containing only the documented id, date_create, action, actor, entity, context members consumed by verdicts. | yes |
 
-## 9. Build Sequence
+## Pagination
 
-```bash
-# 1. Initialize module
-go mod init github.com/hackIDLE/slack-sec-inspector
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `response_metadata.next_cursor`, `next_cursor`, `startIndex`, `totalResults` | service default | caller limit | 50 | SCIM totals are authoritative; Slack cursor APIs prove completion only with an empty next cursor. | Empty next cursor or SCIM total reached; Configured item cap; Page cap; Repeated cursor; Empty page with cursor; Unknown or inconsistent SCIM total |
 
-# 2. Add dependencies
-go get github.com/slack-go/slack
-go get github.com/spf13/cobra
-go get github.com/charmbracelet/bubbletea
-go get github.com/charmbracelet/lipgloss
+## Rate limits
 
-# 3. Build
-go build -ldflags "-X pkg/version.Version=$(git describe --tags)" \
-  -o bin/slack-sec-inspector ./cmd/slack-sec-inspector/
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Slack Security Inspector | Method-specific Slack rate tiers | `Retry-After` | 429, 500, 502, 503, 504 | Honor Retry-After up to the runtime bound and retry 429 responses twice; exhausted reads stay explicit. |
 
-# 4. Test
-go test ./...
+## Checks
 
-# 5. Lint
-golangci-lint run
+### Control coverage
 
-# 6. Docker
-docker build -t slack-sec-inspector .
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | SSO enforcement | SLACK-ADMIN-02 | Evaluate the ordered first-match rules for SLACK-ADMIN-02 below. |
+| 2 | MFA enrollment | SLACK-ID-01 | Evaluate the ordered first-match rules for SLACK-ID-01 below. |
+| 3 | Session duration limits | SLACK-ADMIN-03 | Evaluate the ordered first-match rules for SLACK-ADMIN-03 below. |
+| 4 | Session idle timeout | SLACK-ADMIN-04 | Evaluate the ordered first-match rules for SLACK-ADMIN-04 below. |
+| 5 | Mobile session controls | SLACK-ADMIN-06 | Evaluate the ordered first-match rules for SLACK-ADMIN-06 below. |
+| 6 | File upload restrictions | SLACK-APP-06 | Evaluate the ordered first-match rules for SLACK-APP-06 below. |
+| 7 | External sharing monitoring | SLACK-CHAN-01, SLACK-MON-05 | Evaluate the ordered first-match rules for SLACK-CHAN-01, SLACK-MON-05 below. |
+| 8 | Information barriers | SLACK-APP-04 | Evaluate the ordered first-match rules for SLACK-APP-04 below. |
+| 9 | Restricted app policy | SLACK-APP-01, SLACK-APP-02 | Evaluate the ordered first-match rules for SLACK-APP-01, SLACK-APP-02 below. |
+| 10 | Custom and sensitive-scope apps | SLACK-APP-03 | Evaluate the ordered first-match rules for SLACK-APP-03 below. |
+| 11 | DLP and Discovery evidence | SLACK-APP-05 | Evaluate the ordered first-match rules for SLACK-APP-05 below. |
+| 12 | Channel retention overrides | SLACK-CHAN-03 | Evaluate the ordered first-match rules for SLACK-CHAN-03 below. |
+| 13 | SIEM streaming evidence | SLACK-MON-01, SLACK-MON-02, SLACK-MON-03, SLACK-MON-04, SLACK-MON-06 | Evaluate the ordered first-match rules for SLACK-MON-01, SLACK-MON-02, SLACK-MON-03, SLACK-MON-04, SLACK-MON-06 below. |
+| 14 | Workspace admin inventory | SLACK-ADMIN-01 | Evaluate the ordered first-match rules for SLACK-ADMIN-01 below. |
+| 15 | Guest account inventory | SLACK-ID-02 | Evaluate the ordered first-match rules for SLACK-ID-02 below. |
+| 16 | Email domain restrictions | SLACK-ADMIN-07 | Evaluate the ordered first-match rules for SLACK-ADMIN-07 below. |
+| 17 | Workspace discoverability | SLACK-ADMIN-05 | Evaluate the ordered first-match rules for SLACK-ADMIN-05 below. |
+| 18 | Channel posting restrictions | SLACK-CHAN-02 | Evaluate the ordered first-match rules for SLACK-CHAN-02 below. |
+| 19 | Custom emoji governance | SLACK-ADMIN-08 | Evaluate the ordered first-match rules for SLACK-ADMIN-08 below. |
+| 20 | External email ingestion | SLACK-CHAN-04 | Evaluate the ordered first-match rules for SLACK-CHAN-04 below. |
+| 21 | Link previews and URL unfurling | SLACK-CHAN-05 | Evaluate the ordered first-match rules for SLACK-CHAN-05 below. |
+| 22 | SCIM provisioning coverage | SLACK-ID-03 | Evaluate the ordered first-match rules for SLACK-ID-03 below. |
+| 23 | Deactivated user visibility | SLACK-ID-04, SLACK-ID-05 | Evaluate the ordered first-match rules for SLACK-ID-04, SLACK-ID-05 below. |
+| 24 | Workspace analytics access | SLACK-ADMIN-09 | Evaluate the ordered first-match rules for SLACK-ADMIN-09 below. |
+| 25 | Token rotation and revocation | SLACK-APP-07 | Evaluate the ordered first-match rules for SLACK-APP-07 below. |
 
-# 7. Release
-goreleaser release --snapshot
-```
+### Finding notes
 
-## 10. Status
+These notes explain intent only. The ordered rule table is normative.
 
-Implemented in grclanker (TypeScript) on 2026-09-21. 25 of 25 controls are represented by findings: 17 are automated from documented read methods and 8 are manual by design because no public reference page exposes the setting (controls 4, 5, 11, 13, 20, 21, 24, 25). Control 6 is automated from `team.preferences.list` `disable_file_uploads` (`disallow_all` and `type:owner,type:admin` pass, `type:regular` warns, `allow_all` fails). Verdicts follow eight safety rules: unreadable or forbidden methods render manual with the cause, empty inventories never pass by default, plan or scope gaps render manual naming the plan, undated items are bucketed, partial inventories are flagged with seen and total counts, enabling flags must be read, pagination runs to completion or downgrades the verdict, and export reruns allocate `-2`, `-3` directories. Two hygiene rules apply on top: every API response is redacted at collection time (credential-named fields keep their name with a `[REDACTED]` value; Slack token shapes, `hooks.slack.com` URLs, bearer headers, and credential query parameters are scrubbed from strings, including JSON error bodies; every error string passes through one scrub, `redactErrorText`, when it is created, which also replaces header- and assignment-style credentials such as cookie, authorization, API key, and session id values; a non-JSON error body such as an HTML gateway page is never quoted and is described by content type and length instead) and every bundle file is scrubbed again on write; and every pagination exit other than an exhausted cursor (item cap, page cap of 50 requests, a cursor that returns an empty page, a missing SCIM `totalResults`, an audit page ending with `next_cursor`) is reported as truncated with the reason so dependent findings warn instead of pass. A corollary to the first rule applies to findings that compare inventories: when any inventory a verdict depends on is unreadable (`SLACK-ADMIN-08` and the admin roster from `admin.teams.admins.list`, `SLACK-APP-06` and `auth.test`, `SLACK-CHAN-02` and per-channel `admin.conversations.getConversationPrefs`), the finding demotes below pass, names the endpoint and the workspace or channel id, and renders derived counts and lists as `null` beside a status field rather than `0`, `[]`, or a placeholder.
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `SLACK-ID-01` | critical | `slack_assess_identity` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for MFA enrollment; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for MFA enrollment, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of MFA enrollment; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for MFA enrollment is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-02` | medium | `slack_assess_identity` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Guest account inventory; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Guest account inventory, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Guest account inventory; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Guest account inventory is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-03` | high | `slack_assess_identity` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for SCIM provisioning coverage; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for SCIM provisioning coverage, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of SCIM provisioning coverage; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for SCIM provisioning coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-04` | high | `slack_assess_identity` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for User lifecycle alignment; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for User lifecycle alignment, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of User lifecycle alignment; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for User lifecycle alignment is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-05` | info | `slack_assess_identity` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Deactivated user visibility; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Deactivated user visibility, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Deactivated user visibility; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Deactivated user visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-01` | high | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Workspace admin inventory; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Workspace admin inventory, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Workspace admin inventory; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Workspace admin inventory is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-02` | critical | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for SSO enforcement; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for SSO enforcement, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of SSO enforcement; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for SSO enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-03` | high | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Session duration limits; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Session duration limits, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Session duration limits; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Session duration limits is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-04` | medium | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Session idle timeout; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Session idle timeout, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Session idle timeout; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Session idle timeout is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-05` | medium | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Workspace discoverability; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Workspace discoverability, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Workspace discoverability; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Workspace discoverability is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-06` | medium | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Mobile session controls; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Mobile session controls, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Mobile session controls; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Mobile session controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-07` | high | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Email domain restrictions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Email domain restrictions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Email domain restrictions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Email domain restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-08` | low | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Custom emoji governance; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Custom emoji governance, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Custom emoji governance; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Custom emoji governance is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-09` | medium | `slack_assess_admin_access` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Workspace analytics access; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Workspace analytics access, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Workspace analytics access; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Workspace analytics access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-01` | high | `slack_assess_integrations` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Approved app inventory; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Approved app inventory, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Approved app inventory; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Approved app inventory is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-02` | medium | `slack_assess_integrations` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Restricted app policy; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Restricted app policy, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Restricted app policy; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Restricted app policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-03` | medium | `slack_assess_integrations` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Custom and sensitive-scope apps; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Custom and sensitive-scope apps, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Custom and sensitive-scope apps; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Custom and sensitive-scope apps is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-04` | high | `slack_assess_integrations` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Information barriers; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Information barriers, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Information barriers; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Information barriers is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-05` | medium | `slack_assess_integrations` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for DLP and Discovery evidence; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for DLP and Discovery evidence, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of DLP and Discovery evidence; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for DLP and Discovery evidence is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-06` | medium | `slack_assess_integrations` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for File upload restrictions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for File upload restrictions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of File upload restrictions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for File upload restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-07` | medium | `slack_assess_integrations` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Token rotation and revocation; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Token rotation and revocation, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Token rotation and revocation; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Token rotation and revocation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-01` | high | `slack_assess_channel_governance` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Slack Connect exposure; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Slack Connect exposure, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Slack Connect exposure; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Slack Connect exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-02` | medium | `slack_assess_channel_governance` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Channel posting restrictions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Channel posting restrictions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Channel posting restrictions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Channel posting restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-03` | medium | `slack_assess_channel_governance` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Channel retention overrides; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Channel retention overrides, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Channel retention overrides; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Channel retention overrides is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-04` | medium | `slack_assess_channel_governance` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for External email ingestion; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for External email ingestion, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of External email ingestion; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for External email ingestion is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-05` | medium | `slack_assess_channel_governance` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Link previews and URL unfurling; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Link previews and URL unfurling, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Link previews and URL unfurling; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Link previews and URL unfurling is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-01` | critical | `slack_assess_monitoring` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Audit Logs API access; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Audit Logs API access, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Audit Logs API access; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Audit Logs API access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-02` | high | `slack_assess_monitoring` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Audit log recency; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Audit log recency, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Audit log recency; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Audit log recency is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-03` | medium | `slack_assess_monitoring` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Security event visibility; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Security event visibility, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Security event visibility; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Security event visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-04` | low | `slack_assess_monitoring` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Audit schema visibility; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Audit schema visibility, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Audit schema visibility; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Audit schema visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-05` | medium | `slack_assess_monitoring` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for External sharing monitoring; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for External sharing monitoring, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of External sharing monitoring; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for External sharing monitoring is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-06` | medium | `slack_assess_monitoring` | `users`, `admin-users`, `admin-apps`, `scim-users`, `audit-logs` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for SIEM streaming evidence; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for SIEM streaming evidence, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of SIEM streaming evidence; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for SIEM streaming evidence is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
-### Deviations from this spec
+### Ordered decision rules
 
-- `admin.teams.settings.info` documents only `id`, `name`, `domain`, `email_domain`, `icon`, `enterprise_id`, `enterprise_name`, and `default_channels`; SSO, session, idle, discoverability, and file settings listed in section 2 are not readable there. Discoverability is read from `admin.teams.list`, SSO coverage from `admin.users.list` `has_sso`, and session duration from `admin.users.session.getSettings`.
-- `admin.teams.admins.list` returns `admin_ids`, and the app inventories return `approved_apps` and `restricted_apps` with nested `app` objects; the implementation follows the documented shapes.
-- `admin.enterprise.info` and `discovery.enterprise.info` are not documented methods and are not called. The Discovery API in sections 2 and 3 has no public reference page (no `discovery.*` method appears in https://docs.slack.dev/reference/methods), so control 11 is manual and the `discovery:read` scope is not requested.
-- Audit Logs action names follow https://docs.slack.dev/reference/audit-logs-api/methods-actions-reference: `pref.sso_setting_changed`, `pref.two_factor_auth_changed`, and the `external_shared_channel_*` family; no other action strings are matched.
-- `admin.analytics.getFile` succeeds with a gzipped newline-delimited JSON file (`Content-type: application/gzip`) rather than an `ok:true` JSON body; the probe treats that header as success without downloading the file and treats `ok:false` JSON as the failure path.
-- `admin.conversations.getConversationPrefs` documents `who_can_post.type` values such as `admins`; the implementation accepts `admin`, `admins`, `owner`, and `owners`.
-- `team.preferences.list` reads the token's workspace only; when the org has more than one workspace or the workspace inventory is partial, a passing control 6 verdict is downgraded to warn.
-- The configuration file is not defined by this spec; the implementation reads `SLACK_CONFIG_FILE` or `~/.config/grclanker/slack.json` with `user_token`, `bot_token`, `scim_token`, and `org_id`.
-- `SLACK_BOT_TOKEN` is accepted for the three methods whose reference pages list bot tokens (`auth.test`, `users.list`, `team.preferences.list`).
-- The Go architecture, TUI, `--controls`, CSV, HTML, and SARIF outputs in sections 7 and 8 are not part of the CLI surface; results are Markdown and JSON in the export bundle.
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
 
-### Remaining work
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `SLACK-ID-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ID-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ID-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ID-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ID-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ID-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ID-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ID-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ID-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ID-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ID-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ID-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ID-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ID-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ID-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ID-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ID-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ID-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ID-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ID-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-ADMIN-09` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-ADMIN-09` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-ADMIN-09` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-ADMIN-09` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-APP-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-APP-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-APP-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-APP-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-APP-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-APP-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-APP-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-APP-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-APP-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-APP-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-APP-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-APP-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-APP-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-APP-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-APP-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-APP-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-APP-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-APP-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-APP-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-APP-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-APP-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-APP-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-APP-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-APP-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-APP-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-APP-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-APP-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-APP-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-CHAN-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-CHAN-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-CHAN-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-CHAN-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-CHAN-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-CHAN-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-CHAN-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-CHAN-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-CHAN-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-CHAN-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-CHAN-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-CHAN-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-CHAN-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-CHAN-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-CHAN-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-CHAN-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-CHAN-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-CHAN-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-CHAN-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-CHAN-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-MON-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-MON-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-MON-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-MON-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-MON-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-MON-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-MON-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-MON-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-MON-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-MON-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-MON-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-MON-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-MON-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-MON-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-MON-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-MON-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-MON-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-MON-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-MON-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-MON-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `SLACK-MON-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `SLACK-MON-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `SLACK-MON-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `SLACK-MON-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
 
-- IDP group channel restrictions via `admin.conversations.restrictAccess.listGroups`.
-- Guest expiration dates via `admin.users.list only_guests=true`.
-- Discovery API DLP content checks (`discovery.conversations.*`) cannot be implemented until Slack publishes a reference page for the Discovery API.
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `SLACK-ID-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ID-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ID-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ID-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ID-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-07` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-08` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-ADMIN-09` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-APP-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-APP-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-APP-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-APP-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-APP-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-APP-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-APP-07` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-CHAN-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-CHAN-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-CHAN-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-CHAN-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-CHAN-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-MON-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-MON-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-MON-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-MON-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-MON-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `SLACK-MON-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `SLACK-ID-01` | `passStatus` | pass |
+| `SLACK-ID-01` | `warnStatus` | warn |
+| `SLACK-ID-01` | `failStatus` | fail |
+| `SLACK-ID-01` | `manualStatus` | manual |
+| `SLACK-ID-02` | `passStatus` | pass |
+| `SLACK-ID-02` | `warnStatus` | warn |
+| `SLACK-ID-02` | `failStatus` | fail |
+| `SLACK-ID-02` | `manualStatus` | manual |
+| `SLACK-ID-03` | `passStatus` | pass |
+| `SLACK-ID-03` | `warnStatus` | warn |
+| `SLACK-ID-03` | `failStatus` | fail |
+| `SLACK-ID-03` | `manualStatus` | manual |
+| `SLACK-ID-04` | `passStatus` | pass |
+| `SLACK-ID-04` | `warnStatus` | warn |
+| `SLACK-ID-04` | `failStatus` | fail |
+| `SLACK-ID-04` | `manualStatus` | manual |
+| `SLACK-ID-05` | `passStatus` | pass |
+| `SLACK-ID-05` | `warnStatus` | warn |
+| `SLACK-ID-05` | `failStatus` | fail |
+| `SLACK-ID-05` | `manualStatus` | manual |
+| `SLACK-ADMIN-01` | `passStatus` | pass |
+| `SLACK-ADMIN-01` | `warnStatus` | warn |
+| `SLACK-ADMIN-01` | `failStatus` | fail |
+| `SLACK-ADMIN-01` | `manualStatus` | manual |
+| `SLACK-ADMIN-02` | `passStatus` | pass |
+| `SLACK-ADMIN-02` | `warnStatus` | warn |
+| `SLACK-ADMIN-02` | `failStatus` | fail |
+| `SLACK-ADMIN-02` | `manualStatus` | manual |
+| `SLACK-ADMIN-03` | `passStatus` | pass |
+| `SLACK-ADMIN-03` | `warnStatus` | warn |
+| `SLACK-ADMIN-03` | `failStatus` | fail |
+| `SLACK-ADMIN-03` | `manualStatus` | manual |
+| `SLACK-ADMIN-04` | `passStatus` | pass |
+| `SLACK-ADMIN-04` | `warnStatus` | warn |
+| `SLACK-ADMIN-04` | `failStatus` | fail |
+| `SLACK-ADMIN-04` | `manualStatus` | manual |
+| `SLACK-ADMIN-05` | `passStatus` | pass |
+| `SLACK-ADMIN-05` | `warnStatus` | warn |
+| `SLACK-ADMIN-05` | `failStatus` | fail |
+| `SLACK-ADMIN-05` | `manualStatus` | manual |
+| `SLACK-ADMIN-06` | `passStatus` | pass |
+| `SLACK-ADMIN-06` | `warnStatus` | warn |
+| `SLACK-ADMIN-06` | `failStatus` | fail |
+| `SLACK-ADMIN-06` | `manualStatus` | manual |
+| `SLACK-ADMIN-07` | `passStatus` | pass |
+| `SLACK-ADMIN-07` | `warnStatus` | warn |
+| `SLACK-ADMIN-07` | `failStatus` | fail |
+| `SLACK-ADMIN-07` | `manualStatus` | manual |
+| `SLACK-ADMIN-08` | `passStatus` | pass |
+| `SLACK-ADMIN-08` | `warnStatus` | warn |
+| `SLACK-ADMIN-08` | `failStatus` | fail |
+| `SLACK-ADMIN-08` | `manualStatus` | manual |
+| `SLACK-ADMIN-09` | `passStatus` | pass |
+| `SLACK-ADMIN-09` | `warnStatus` | warn |
+| `SLACK-ADMIN-09` | `failStatus` | fail |
+| `SLACK-ADMIN-09` | `manualStatus` | manual |
+| `SLACK-APP-01` | `passStatus` | pass |
+| `SLACK-APP-01` | `warnStatus` | warn |
+| `SLACK-APP-01` | `failStatus` | fail |
+| `SLACK-APP-01` | `manualStatus` | manual |
+| `SLACK-APP-02` | `passStatus` | pass |
+| `SLACK-APP-02` | `warnStatus` | warn |
+| `SLACK-APP-02` | `failStatus` | fail |
+| `SLACK-APP-02` | `manualStatus` | manual |
+| `SLACK-APP-03` | `passStatus` | pass |
+| `SLACK-APP-03` | `warnStatus` | warn |
+| `SLACK-APP-03` | `failStatus` | fail |
+| `SLACK-APP-03` | `manualStatus` | manual |
+| `SLACK-APP-04` | `passStatus` | pass |
+| `SLACK-APP-04` | `warnStatus` | warn |
+| `SLACK-APP-04` | `failStatus` | fail |
+| `SLACK-APP-04` | `manualStatus` | manual |
+| `SLACK-APP-05` | `passStatus` | pass |
+| `SLACK-APP-05` | `warnStatus` | warn |
+| `SLACK-APP-05` | `failStatus` | fail |
+| `SLACK-APP-05` | `manualStatus` | manual |
+| `SLACK-APP-06` | `passStatus` | pass |
+| `SLACK-APP-06` | `warnStatus` | warn |
+| `SLACK-APP-06` | `failStatus` | fail |
+| `SLACK-APP-06` | `manualStatus` | manual |
+| `SLACK-APP-07` | `passStatus` | pass |
+| `SLACK-APP-07` | `warnStatus` | warn |
+| `SLACK-APP-07` | `failStatus` | fail |
+| `SLACK-APP-07` | `manualStatus` | manual |
+| `SLACK-CHAN-01` | `passStatus` | pass |
+| `SLACK-CHAN-01` | `warnStatus` | warn |
+| `SLACK-CHAN-01` | `failStatus` | fail |
+| `SLACK-CHAN-01` | `manualStatus` | manual |
+| `SLACK-CHAN-02` | `passStatus` | pass |
+| `SLACK-CHAN-02` | `warnStatus` | warn |
+| `SLACK-CHAN-02` | `failStatus` | fail |
+| `SLACK-CHAN-02` | `manualStatus` | manual |
+| `SLACK-CHAN-03` | `passStatus` | pass |
+| `SLACK-CHAN-03` | `warnStatus` | warn |
+| `SLACK-CHAN-03` | `failStatus` | fail |
+| `SLACK-CHAN-03` | `manualStatus` | manual |
+| `SLACK-CHAN-04` | `passStatus` | pass |
+| `SLACK-CHAN-04` | `warnStatus` | warn |
+| `SLACK-CHAN-04` | `failStatus` | fail |
+| `SLACK-CHAN-04` | `manualStatus` | manual |
+| `SLACK-CHAN-05` | `passStatus` | pass |
+| `SLACK-CHAN-05` | `warnStatus` | warn |
+| `SLACK-CHAN-05` | `failStatus` | fail |
+| `SLACK-CHAN-05` | `manualStatus` | manual |
+| `SLACK-MON-01` | `passStatus` | pass |
+| `SLACK-MON-01` | `warnStatus` | warn |
+| `SLACK-MON-01` | `failStatus` | fail |
+| `SLACK-MON-01` | `manualStatus` | manual |
+| `SLACK-MON-02` | `passStatus` | pass |
+| `SLACK-MON-02` | `warnStatus` | warn |
+| `SLACK-MON-02` | `failStatus` | fail |
+| `SLACK-MON-02` | `manualStatus` | manual |
+| `SLACK-MON-03` | `passStatus` | pass |
+| `SLACK-MON-03` | `warnStatus` | warn |
+| `SLACK-MON-03` | `failStatus` | fail |
+| `SLACK-MON-03` | `manualStatus` | manual |
+| `SLACK-MON-04` | `passStatus` | pass |
+| `SLACK-MON-04` | `warnStatus` | warn |
+| `SLACK-MON-04` | `failStatus` | fail |
+| `SLACK-MON-04` | `manualStatus` | manual |
+| `SLACK-MON-05` | `passStatus` | pass |
+| `SLACK-MON-05` | `warnStatus` | warn |
+| `SLACK-MON-05` | `failStatus` | fail |
+| `SLACK-MON-05` | `manualStatus` | manual |
+| `SLACK-MON-06` | `passStatus` | pass |
+| `SLACK-MON-06` | `warnStatus` | warn |
+| `SLACK-MON-06` | `failStatus` | fail |
+| `SLACK-MON-06` | `manualStatus` | manual |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `SLACK-ID-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-07` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-07` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-08` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-08` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-09` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-09` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-07` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-07` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | SSO enforcement | - | - | - | - | - | - | - | - |
+| 2 | MFA enrollment | - | - | - | - | - | - | - | - |
+| 3 | Session duration limits | - | - | - | - | - | - | - | - |
+| 4 | Session idle timeout | - | - | - | - | - | - | - | - |
+| 5 | Mobile session controls | - | - | - | - | - | - | - | - |
+| 6 | File upload restrictions | - | - | - | - | - | - | - | - |
+| 7 | External sharing monitoring | - | - | - | - | - | - | - | - |
+| 8 | Information barriers | - | - | - | - | - | - | - | - |
+| 9 | Restricted app policy | - | - | - | - | - | - | - | - |
+| 10 | Custom and sensitive-scope apps | - | - | - | - | - | - | - | - |
+| 11 | DLP and Discovery evidence | - | - | - | - | - | - | - | - |
+| 12 | Channel retention overrides | - | - | - | - | - | - | - | - |
+| 13 | SIEM streaming evidence | - | - | - | - | - | - | - | - |
+| 14 | Workspace admin inventory | - | - | - | - | - | - | - | - |
+| 15 | Guest account inventory | - | - | - | - | - | - | - | - |
+| 16 | Email domain restrictions | - | - | - | - | - | - | - | - |
+| 17 | Workspace discoverability | - | - | - | - | - | - | - | - |
+| 18 | Channel posting restrictions | - | - | - | - | - | - | - | - |
+| 19 | Custom emoji governance | - | - | - | - | - | - | - | - |
+| 20 | External email ingestion | - | - | - | - | - | - | - | - |
+| 21 | Link previews and URL unfurling | - | - | - | - | - | - | - | - |
+| 22 | SCIM provisioning coverage | - | - | - | - | - | - | - | - |
+| 23 | Deactivated user visibility | - | - | - | - | - | - | - | - |
+| 24 | Workspace analytics access | - | - | - | - | - | - | - | - |
+| 25 | Token rotation and revocation | - | - | - | - | - | - | - | - |
+
+## Collection states
+
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
+
+## Integration-specific scrubbing
+
+Shared contract version: 1.1.
+
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
+
+Sensitive fields and values: token, scimToken, authorization, cookie, webhook_url
+
+Credential formats: xoxb, xoxp, xoxe, and xapp token families, SCIM bearer tokens, webhook path secrets
+
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
+
+Integration-specific rules:
+
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `users` | `id`, `deleted`, `is_admin`, `is_owner`, `is_restricted`, `has_2fa`, `has_sso` |
+| `admin-users` | `id`, `team_id`, `email`, `is_admin`, `is_owner` |
+| `admin-apps` | `app_id`, `name`, `scopes`, `is_internal` |
+| `scim-users` | `id`, `userName`, `active`, `groups` |
+| `audit-logs` | `id`, `date_create`, `action`, `actor`, `entity`, `context` |
+
+## Export layout
+
+Required paths:
+
+- `core_data/access.json`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis/cis_compliance_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/stig_compliance_checklist.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
+- `QUICK_REFERENCE.md`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `core_data/{dataset}.json` | json | The dataset is part of the assessment, including explicit not-collected markers. | Projected source records or a structured unavailable marker; unavailable values remain null. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | Human-readable counts and findings grouped by status. | UTF-8 Markdown. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | Finding-to-framework mapping matrix. | UTF-8 Markdown. |
+| `compliance/{framework}/{report}.md` | markdown | Always for each supported framework. | Framework-specific finding rows and mappings. | UTF-8 Markdown. |
+| `QUICK_REFERENCE.md` | markdown | Always. | Bundle navigation and operator next steps. | UTF-8 Markdown. |
+| `_errors.log` | text | At least one collection read failed, was denied, or was incomplete. | Scrubbed collection error summaries without response bodies or credentials. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `control`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `mappings`
+- `manualEvidence`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+- `reason`
+
+#### access_surface
+
+- `name`
+- `endpoint`
+- `status`
+- `count`
+- `error`
+
+#### assessment
+
+- `area`
+- `title`
+- `summary`
+- `findings`
+- `errors`
+
+#### bundle_manifest
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+JSON formatting: UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.
+
+Overwrite policy: Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create slack-audit.zip beside the allocated slack-audit directory, applying the same suffix to both.

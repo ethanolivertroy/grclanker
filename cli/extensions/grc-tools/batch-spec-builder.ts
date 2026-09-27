@@ -231,7 +231,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       : "A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte.",
     ...(name.endsWith("_export_audit_bundle") ? { output: undefined } : {}),
   }));
-  const projections = Object.fromEntries(surfaces.map((surface) => [surface.id, surface.fields]));
+  const projections = Object.fromEntries(surfaces.map((surface) => [surface.id, surface.fieldsConsumed]));
   const outputArtifacts = [
     { path: "core_data/{dataset}.json", format: "json" as const, requiredWhen: "The dataset is part of the assessment, including explicit not-collected markers.", schema: "Projected source records or a structured unavailable marker; unavailable values remain null.", serialization: "UTF-8 JSON with two-space indentation and a trailing newline." },
     { path: "analysis/findings.json", format: "json" as const, requiredWhen: "Always.", schema: "Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence.", serialization: "UTF-8 JSON with two-space indentation and a trailing newline." },

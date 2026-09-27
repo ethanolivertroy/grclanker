@@ -2,424 +2,840 @@
 slug: "box-sec-inspector"
 name: "Box Security Inspector"
 vendor: "Box"
-category: "saas-collaboration"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
-legacy_repo: "https://github.com/hackIDLE/box-sec-inspector"
-reference_docs: "https://developer.box.com/reference/"
+category: "collaboration-and-content"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# Box Enterprise Security Inspector: Architecture Specification
-
-## 1. Overview
-
-**box-sec-inspector** is a security compliance inspection tool for Box Enterprise environments. It audits authentication policies, external collaboration settings, sharing controls, data governance (retention, legal hold, classification), device trust, Shield smart access policies, and admin role assignments via the Box REST API. The tool produces structured findings mapped to major compliance frameworks, enabling security teams to identify misconfigurations, enforce data protection policies, and maintain continuous compliance posture.
-
-Written in Go with a hybrid CLI/TUI architecture, it supports both automated pipeline execution (JSON/SARIF output) and interactive exploration of findings.
-
-### grclanker implementation
-
-The shipped implementation lives in grclanker as native TypeScript tools (`cli/extensions/grc-tools/box.ts`) rather than the standalone Go binary described in sections 7 through 9. It is read-only, uses `fetch` and `node:crypto` (no Box SDK), and registers:
-
-- `box_check_access`: token exchange plus a probe of 15 read surfaces.
-- `box_assess_identity_access`: controls 1, 2, 3, 17, 18, 21, 22, 23, 24.
-- `box_assess_sharing_collaboration`: controls 4, 5, 6, 7, 8, 9, 19, 20.
-- `box_assess_data_governance`: controls 10, 11, 12, 13.
-- `box_assess_shield_monitoring`: controls 14, 15, 16, 25.
-- `box_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified matrix, one report per framework in section 5, and a zip archive.
-
-The integration guide is `src/content/docs/docs/integrations/box.md`; regression coverage is `cli/tests/box.test.mjs`; the live smoke is `npm --prefix cli run test:box:live`.
-
-## 2. APIs & SDKs
-
-### Box REST API (Content API v2.0)
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /2.0/users` | List enterprise users, roles, status |
-| `GET /2.0/users/{id}` | User details, login, 2FA status |
-| `GET /2.0/groups` | Enterprise groups and membership |
-| `GET /2.0/groups/{id}/memberships` | Group membership details |
-| `GET /2.0/events?stream_type=admin_logs` | Enterprise event stream (audit) |
-| `GET /2.0/events?stream_type=admin_logs_streaming` | Real-time admin event stream |
-| `GET /2.0/device_pins` | Device trust/pinned devices |
-| `GET /2.0/device_pins/{id}` | Device pin details |
-| `GET /2.0/retention_policies` | Data retention policies |
-| `GET /2.0/retention_policies/{id}` | Retention policy details |
-| `GET /2.0/retention_policies/{id}/assignments` | Retention policy assignments |
-| `GET /2.0/legal_hold_policies` | Legal hold policies |
-| `GET /2.0/legal_hold_policies/{id}` | Legal hold policy details |
-| `GET /2.0/legal_hold_policies/{id}/assignments` | Legal hold assignments |
-| `GET /2.0/shield_information_barriers` | Shield information barriers |
-| `GET /2.0/shield_information_barrier_segments` | Shield barrier segments |
-| `GET /2.0/collaboration_whitelist_entries` | External collaboration allowlist |
-| `GET /2.0/collaboration_whitelist_exempt_targets` | Collaboration exemptions |
-| `GET /2.0/enterprises/{id}` | Enterprise settings |
-| `GET /2.0/folders/{id}` | Folder details and shared link settings |
-| `GET /2.0/folders/{id}/collaborations` | Folder collaboration audit |
-| `GET /2.0/metadata_templates/enterprise` | Classification labels/templates |
-| `GET /2.0/terms_of_services` | Custom terms of service |
-| `GET /2.0/invites` | Pending enterprise invitations |
-
-**Base URL:** `https://api.box.com`
-**Upload URL:** `https://upload.box.com`
-
-### Box Events API (for Audit)
-
-Key event types for security auditing:
-- `LOGIN` / `FAILED_LOGIN`: Authentication events
-- `ADD_LOGIN_ACTIVITY_DEVICE` / `REMOVE_LOGIN_ACTIVITY_DEVICE`: Device trust events
-- `CHANGE_ADMIN_ROLE`: Admin role changes
-- `SHARE` / `UNSHARE` / `COLLABORATION_INVITE`: Sharing events
-- `DOWNLOAD` / `PREVIEW`: Content access events
-- `POLICY_VIOLATION`: Shield policy violations
-- `CONTENT_ACCESS`: Access to sensitive content
-
-### SDKs and Libraries
-
-| Name | Language | Notes |
-|------|----------|-------|
-| `box-go-sdk` | Go | Community Go SDK |
-| `boxsdk` | Python | Official Python SDK (box-python-sdk) |
-| `box-java-sdk` | Java | Official Java SDK |
-| `box-node-sdk` | Node.js | Official Node.js SDK |
-| Box CLI | Node.js | Official CLI tool |
-| Terraform Provider (community) | HCL | Limited Box resource coverage |
-
-## 3. Authentication
-
-### JWT (Server Authentication), recommended
-
-```json
-{
-  "boxAppSettings": {
-    "clientID": "...",
-    "clientSecret": "...",
-    "appAuth": {
-      "publicKeyID": "...",
-      "privateKey": "-----BEGIN ENCRYPTED PRIVATE KEY-----\n...",
-      "passphrase": "..."
-    }
-  },
-  "enterpriseID": "12345"
-}
-```
-
-- Service account with enterprise-level access
-- No user interaction required; ideal for automated scanning
-- Requires Admin Console app authorization
-
-### OAuth 2.0 (User Authentication)
-
-```
-Authorization: Bearer <access-token>
-```
-
-- User-level access with OAuth 2.0 flow
-- Requires user with Co-Admin or Admin role
-- Token refresh handled automatically
-
-### Client Credentials Grant (CCG)
-
-```
-POST https://api.box.com/oauth2/token
-grant_type=client_credentials
-client_id=<client_id>
-client_secret=<client_secret>
-box_subject_type=enterprise
-box_subject_id=<enterprise_id>
-```
-
-- Server-to-server without JWT key management
-- Simpler setup than JWT
-
-### Required Scopes/Permissions
-
-| Permission | Purpose |
-|------------|---------|
-| `Manage Enterprise Properties` | Read enterprise settings |
-| `Manage Users` | Enumerate users, roles, status |
-| `Manage Groups` | Group and membership audit |
-| `Manage Retention Policies` | Retention and legal hold review |
-| `Manage Enterprise Events` | Enterprise event stream access |
-| `Manage Device Pins` | Device trust audit |
-| `Manage Shield` | Shield information barriers |
-| `Manage Collaboration Allowlist` | External collaboration settings |
-
-### Configuration
-
-```bash
-export BOX_JWT_CONFIG_PATH="/path/to/box_config.json"
-# Or for CCG:
-export BOX_CLIENT_ID="your-client-id"
-export BOX_CLIENT_SECRET="your-client-secret"
-export BOX_ENTERPRISE_ID="12345"
-```
-
-Alternatively, configure via `~/.box-sec-inspector/config.yaml` or CLI flags.
-
-## 4. Security Controls
-
-1. **SSO Enforcement**: Verify external SSO is configured and enforced for all users (not optional or disabled).
-2. **2FA for Admins**: Confirm two-factor authentication is required for all admin and co-admin accounts.
-3. **2FA for All Users**: Check if 2FA is enforced enterprise-wide, not just for admins.
-4. **External Collaboration Restrictions**: Verify external collaboration is restricted to allowlisted domains only.
-5. **Collaboration Allowlist Audit**: Review the external collaboration allowlist for stale or overly broad domain entries.
-6. **Sharing Link Policies**: Ensure shared links default to "People in this company" or more restrictive; detect "Open" default links.
-7. **Shared Link Expiration**: Verify shared links have mandatory expiration dates configured.
-8. **Shared Link Password Policy**: Check if password protection is required for externally shared links.
-9. **Watermarking Enabled**: Verify watermarking is enabled for sensitive content to deter unauthorized distribution.
-10. **Device Trust/Pins**: Audit device pin configuration; ensure only approved devices can access enterprise content.
-11. **Classification Labels**: Verify classification labels are defined and applied to sensitive content.
-12. **Retention Policies**: Confirm retention policies exist and are assigned to appropriate folders/metadata for compliance.
-13. **Legal Hold Policies**: Verify legal hold policies are properly configured and assigned for litigation readiness.
-14. **Shield Smart Access Policies**: Audit Box Shield policies for anomaly detection, smart access rules, and threat detection.
-15. **Shield Information Barriers**: Verify information barrier segments prevent unauthorized data flow between groups.
-16. **Enterprise Event Streaming**: Confirm enterprise event streaming is active for audit trail and SIEM integration.
-17. **Admin Role Minimization**: Detect excessive Admin/Co-Admin role assignments; ensure least-privilege.
-18. **Co-Admin Permission Scoping**: Verify co-admin roles have appropriately scoped permissions (not full admin equivalent).
-19. **App Approval Process**: Check that custom/third-party app access requires admin approval (not open by default).
-20. **Custom Terms of Service**: Verify custom ToS is configured and required for users before accessing content.
-21. **Password Policy Strength**: Validate enterprise password policy meets minimum complexity and length requirements.
-22. **Session Duration Limits**: Confirm session timeout and maximum session duration are appropriately configured.
-23. **IP Allowlisting**: Verify IP-based access restrictions are configured for the enterprise.
-24. **Inactive User Detection**: Identify user accounts that have not logged in within 90 days.
-25. **Content Access Monitoring**: Verify Shield or event monitoring is configured for sensitive content access patterns.
-
-## 5. Compliance Framework Mappings
-
-| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---|---------|---------|------|-------|-----|---------|------|------|-------|
-| 1 | SSO Enforcement | IA-2 | AC.L2-3.1.1 | CC6.1 | 1.1 | 8.3.1 | SRG-APP-000148 | ISM-1557 | CPS-04 |
-| 2 | 2FA for Admins | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.1 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
-| 3 | 2FA for All Users | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.2 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
-| 4 | External Collab Restrictions | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.1 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
-| 5 | Collab Allowlist Audit | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.2 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
-| 6 | Sharing Link Policies | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.3 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 7 | Shared Link Expiration | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.4 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 8 | Shared Link Password | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.5 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 9 | Watermarking | SC-28 | SC.L2-3.13.16 | CC6.7 | 3.1 | 3.4 | SRG-APP-000231 | ISM-0457 | CPS-09 |
-| 10 | Device Trust/Pins | IA-3 | IA.L2-3.5.1 | CC6.1 | 1.2 | 2.4 | SRG-APP-000158 | ISM-1482 | CPS-04 |
-| 11 | Classification Labels | MP-4 | MP.L2-3.8.5 | CC6.7 | 3.2 | 9.6.1 | SRG-APP-000231 | ISM-0272 | CPS-09 |
-| 12 | Retention Policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.1 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
-| 13 | Legal Hold Policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.2 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
-| 14 | Shield Smart Access | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.6 | 7.2.1 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 15 | Information Barriers | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.7 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
-| 16 | Event Streaming | AU-2 | AU.L2-3.3.1 | CC7.2 | 8.3 | 10.2.1 | SRG-APP-000089 | ISM-0580 | CPS-10 |
-| 17 | Admin Role Minimization | AC-6(5) | AC.L2-3.1.5 | CC6.3 | 6.8 | 7.2.2 | SRG-APP-000340 | ISM-1507 | CPS-07 |
-| 18 | Co-Admin Scoping | AC-6 | AC.L2-3.1.5 | CC6.3 | 6.9 | 7.2.2 | SRG-APP-000340 | ISM-0432 | CPS-07 |
-| 19 | App Approval Process | CM-7(5) | CM.L2-3.4.8 | CC8.1 | 10.1 | 6.3.2 | SRG-APP-000386 | ISM-1490 | CPS-12 |
-| 20 | Custom Terms of Service | PS-6 | AT.L2-3.2.1 | CC1.4 | 11.1 | 12.6.1 | SRG-APP-000516 | ISM-0252 | CPS-13 |
-| 21 | Password Policy Strength | IA-5(1) | IA.L2-3.5.7 | CC6.1 | 5.1 | 8.3.6 | SRG-APP-000166 | ISM-0421 | CPS-05 |
-| 22 | Session Duration | AC-11 | AC.L2-3.1.10 | CC6.1 | 7.1 | 8.2.8 | SRG-APP-000190 | ISM-0853 | CPS-08 |
-| 23 | IP Allowlisting | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.1 | 1.3.2 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 24 | Inactive User Detection | AC-2(3) | AC.L2-3.1.1 | CC6.2 | 7.2 | 8.1.4 | SRG-APP-000025 | ISM-1404 | CPS-07 |
-| 25 | Content Access Monitoring | AU-6 | AU.L2-3.3.5 | CC7.2 | 8.4 | 10.6.1 | SRG-APP-000108 | ISM-0580 | CPS-10 |
-
-## 6. Existing Tools
-
-| Tool | Type | Limitations |
-|------|------|-------------|
-| Box Admin Console | Built-in | Manual configuration review, no automated compliance reporting |
-| Box Shield | Built-in | Threat detection and smart access, but no comprehensive config posture assessment |
-| Box Governance | Add-on | Retention and legal hold management, not security configuration auditing |
-| Box CLI | CLI | Management operations, no security assessment capability |
-| Box Reports (Admin) | Reporting | Usage analytics, not security posture analysis |
-| Custom Event Stream Scripts | Custom | No structured compliance mapping or standardized output |
-
-**Gap:** No existing tool provides automated security posture assessment of Box Enterprise configurations, including Shield policies, collaboration restrictions, device trust, and data governance settings, mapped to compliance frameworks. box-sec-inspector fills this gap.
-
-## 7. Architecture
-
-```
-box-sec-inspector/
-├── cmd/
-│   └── box-sec-inspector/
-│       └── main.go                 # Entrypoint, CLI bootstrap
-├── internal/
-│   ├── analyzers/
-│   │   ├── analyzer.go             # Analyzer interface and registry
-│   │   ├── sso.go                  # SSO enforcement checks
-│   │   ├── mfa.go                  # 2FA for admins and all users
-│   │   ├── collaboration.go        # External collab restrictions, allowlist
-│   │   ├── sharing.go              # Shared link policies, expiration, passwords
-│   │   ├── watermark.go            # Watermarking configuration
-│   │   ├── devices.go              # Device trust/pin audit
-│   │   ├── classification.go       # Classification label audit
-│   │   ├── retention.go            # Retention and legal hold policies
-│   │   ├── shield.go               # Shield smart access and info barriers
-│   │   ├── events.go               # Enterprise event streaming checks
-│   │   ├── admins.go               # Admin role minimization and scoping
-│   │   ├── apps.go                 # App approval process audit
-│   │   ├── tos.go                  # Terms of service configuration
-│   │   ├── password.go             # Password policy strength
-│   │   ├── sessions.go             # Session duration and timeout
-│   │   ├── network.go              # IP allowlisting
-│   │   └── users.go                # Inactive user detection
-│   ├── client/
-│   │   ├── client.go               # Box API client
-│   │   ├── jwt.go                  # JWT authentication
-│   │   ├── oauth.go                # OAuth 2.0 authentication
-│   │   ├── ccg.go                  # Client Credentials Grant auth
-│   │   ├── ratelimit.go            # Rate limiter (10 req/sec per user)
-│   │   └── pagination.go           # Marker-based pagination handler
-│   ├── config/
-│   │   ├── config.go               # Configuration loading and validation
-│   │   └── redact.go               # Credential redaction for logging
-│   ├── models/
-│   │   ├── user.go                 # User, group, role models
-│   │   ├── policy.go               # Retention, legal hold, Shield models
-│   │   ├── collaboration.go        # Collaboration and sharing models
-│   │   ├── device.go               # Device pin model
-│   │   ├── event.go                # Enterprise event model
-│   │   └── finding.go              # Finding severity/status model
-│   ├── reporters/
-│   │   ├── reporter.go             # Reporter interface
-│   │   ├── json.go                 # JSON output
-│   │   ├── sarif.go                # SARIF 2.1.0 output
-│   │   ├── csv.go                  # CSV output
-│   │   ├── table.go                # Terminal table output
-│   │   └── html.go                 # HTML report with charts
-│   └── tui/
-│       ├── app.go                  # Bubble Tea TUI application
-│       ├── views.go                # Finding detail views
-│       └── styles.go               # Lip Gloss styling
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── spec.md
-└── README.md
-```
-
-### Key Design Decisions
-
-- **Multi-auth support**: JWT (recommended for automation), OAuth 2.0 (interactive), and CCG (simplified server-to-server)
-- **Enterprise event analysis**: Leverages the enterprise event stream for historical security event correlation
-- **Rate limiting**: Box enforces 10 API calls per second per user; built-in token bucket rate limiter
-- **Marker-based pagination**: All list endpoints use marker pagination; client handles transparently
-- **Shield-aware**: Dedicated analyzers for Box Shield features (smart access, information barriers, threat detection)
-
-## 8. CLI Interface
-
-```
-box-sec-inspector [command] [flags]
-
-Commands:
-  scan        Run all or selected security analyzers
-  list        List available analyzers and their descriptions
-  version     Print version information
-
-Scan Flags:
-  --jwt-config string      Path to Box JWT config file (env: BOX_JWT_CONFIG_PATH)
-  --client-id string       Box app client ID (env: BOX_CLIENT_ID)
-  --client-secret string   Box app client secret (env: BOX_CLIENT_SECRET)
-  --enterprise-id string   Box enterprise ID (env: BOX_ENTERPRISE_ID)
-  --auth-method string     Auth method: jwt, ccg, oauth (default "jwt")
-  --analyzers strings      Run specific analyzers (comma-separated)
-  --exclude strings        Exclude specific analyzers
-  --severity string        Minimum severity to report: critical,high,medium,low,info
-  --format string          Output format: table,json,sarif,csv,html (default "table")
-  --output string          Output file path (default: stdout)
-  --tui                    Launch interactive TUI
-  --no-color               Disable colored output
-  --config string          Path to config file (default "~/.box-sec-inspector/config.yaml")
-  --event-window duration  Event stream lookback window (default 30d)
-  --timeout duration       API request timeout (default 30s)
-  --verbose                Enable verbose logging
-```
-
-### Usage Examples
-
-```bash
-# Full scan with JWT auth
-box-sec-inspector scan --jwt-config /path/to/box_config.json
-
-# Scan with Client Credentials Grant
-box-sec-inspector scan --auth-method ccg
-
-# Collaboration and sharing checks only
-box-sec-inspector scan --analyzers collaboration,sharing
-
-# Generate SARIF for CI/CD pipeline
-box-sec-inspector scan --format sarif --output results.sarif
-
-# JSON output for SIEM integration
-box-sec-inspector scan --format json --output results.json
-
-# Interactive TUI
-box-sec-inspector scan --tui
-
-# List available analyzers
-box-sec-inspector list
-```
-
-## 9. Build Sequence
-
-```bash
-# Prerequisites
-go 1.22+
-
-# Clone and build
-git clone https://github.com/hackIDLE/box-sec-inspector.git
-cd box-sec-inspector
-go mod download
-go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \
-  -o bin/box-sec-inspector ./cmd/box-sec-inspector/
-
-# Run tests
-go test ./...
-
-# Build Docker image
-docker build -t box-sec-inspector .
-
-# Run via Docker
-docker run --rm \
-  -v /path/to/box_config.json:/config/box_config.json:ro \
-  -e BOX_JWT_CONFIG_PATH=/config/box_config.json \
-  box-sec-inspector scan --format json
-```
-
-### Makefile Targets
-
-```
-make build       # Build binary
-make test        # Run tests
-make lint        # Run golangci-lint
-make docker      # Build Docker image
-make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
-```
-
-## 10. Status
-
-Implemented in grclanker (TypeScript) as of 2026-09-21. All 25 controls in section 4 produce a finding with the eight framework mappings from section 5.
-
-### What shipped
-
-- Authentication: JWT (RS256, RS384, or RS512 assertion signed with `node:crypto`, `kid` from `publicKeyID`), Client Credentials Grant (`box_subject_type` `enterprise` or `user`), and OAuth 2.0 access tokens with refresh-token renewal on 401. Configuration precedence is tool arguments, then `BOX_*` environment variables, then `~/.box-sec-inspector/config.yaml` (or `BOX_CONFIG_PATH`). Secrets are redacted from error messages.
-- Client: marker pagination (`usemarker`/`marker`), offset pagination for `GET /groups`, `stream_position` paging for `admin_logs` events, `retry-after` aware retry on 429 and exponential backoff on 5xx, per-request timeouts, and memoized reads within a run.
-- Tools: `box_check_access`, `box_assess_identity_access`, `box_assess_sharing_collaboration`, `box_assess_data_governance`, `box_assess_shield_monitoring`, `box_export_audit_bundle` (see the grclanker implementation subsection in section 1).
-- Automated verdicts (`pass`, `warn`, or `fail`) for controls 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 24, and 25. Controls 8, 19, and 23 are always `manual`; controls 10 and 18 are `manual` whenever device pins or co-admins exist. Every `manual` finding names the Admin Console evidence to collect.
-- Verdict safety: absent data never produces `fail`. Configuration categories that Box returns as `null`, an unreadable user list (controls 2, 3, 17, 18, 24), and settings missing from a readable category produce `manual` or `warn` with the reason. Configuration items with `is_used: false` are treated as not enforced and never support `pass`; the finding reports the item's `is_used` state and reported value in its evidence. An empty user inventory (zero users, or no `admin` account) and a truncated list (the API still offered a `next_marker`, an offset below `total_count`, or a `next_stream_position` when the cap was reached) are reported as `warn` for every finding whose `pass` would rest on the absence of a record (controls 2, 3, 5, 17, 18, 24, 25); truncation is recorded per assessment (`truncated`), in the bundle summary (`truncated_datasets`), and per snapshot in `core_data/collection_status.json`.
-- Tests: mocked coverage for configuration precedence, JWT and CCG token exchange, marker and offset pagination, retry and redaction, OAuth refresh, access check (healthy and limited), every assessment with passing and failing fixtures, and the export bundle (layout, zip, `_errors.log`, output path safety). Live smoke: `npm --prefix cli run test:box:live`.
-
-### Deviations from this spec, following the official Box documentation
-
-- Rate limit: Box documents 1000 API requests per minute per user (not 10 per second). The client honors `retry-after` on 429 and backs off exponentially on 5xx instead of using a fixed token bucket.
-- Device pins: the documented endpoint is `GET /2.0/enterprises/{enterprise_id}/device_pinners`, not `GET /2.0/device_pins`.
-- Legal hold assignments: the documented endpoint is `GET /2.0/legal_hold_policy_assignments?policy_id=...`, not a nested `/legal_hold_policies/{id}/assignments` path.
-- Enterprise settings: `GET /2.0/enterprises/{id}` does not return security settings. Posture values (SSO, MFA, password, session, sharing, watermarking, Shield rules) come from `GET /2.0/enterprise_configurations/{enterprise_id}?categories=security,content_and_sharing,user_settings,shield` with the `box-version: 2025.0` header, and IP and integration lists from `GET /2.0/shield_lists` (also `2025.0`).
-- Classification labels: read from the enterprise security classification template `GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema` in addition to `GET /2.0/metadata_templates/enterprise`.
-- Inactive users: the user object has no last login field, so control 24 correlates `admin_logs` activity events (`LOGIN`, `ADMIN_LOGIN`, `DOWNLOAD`, `UPLOAD`, and similar) with active managed users inside the lookback window. `FAILED_LOGIN` events are collected as evidence but do not count as activity.
-- Event types: `POLICY_VIOLATION` and `CONTENT_ACCESS` are not valid `event_type` filters; the implementation uses the documented `SHIELD_*`, `CONTENT_WORKFLOW_*`, `FILE_MARKED_MALICIOUS`, `DEVICE_TRUST_CHECK_FAILED`, `DOWNLOAD`, and `PREVIEW` types.
-- Users: `is_exempt_from_login_verification` (true means the user is exempt from 2-step verification) is the per-user MFA signal; there is no per-user "2FA status" field.
-- Enterprise ID: for OAuth tokens without `BOX_ENTERPRISE_ID`, the ID is discovered from `GET /2.0/users/me?fields=enterprise`.
-
-### What remains
-
-- The API does not expose the open shared link password requirement (control 8), the app approval policy (control 19), enterprise IP allowlisting (control 23), the device trust enforcement policy (control 10), or co-admin permission sets (control 18); these stay manual until Box exposes them.
-- Folder-level sampling (`GET /folders/{id}` and `/collaborations`) for watermark and classification application is not automated; the findings list the sampling step as manual evidence.
-- SARIF, CSV, and HTML reporters and the interactive TUI from sections 7 and 8 are not part of the grclanker implementation; the audit bundle provides JSON and Markdown outputs instead.
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
+
+# Box Security Inspector
+
+Portable contract for the shipped Box identity, sharing, governance, Shield, and monitoring assessments.
+
+## Purpose
+
+Audit Box enterprise identity, sharing, governance, retention, legal-hold, Shield, and event-monitoring posture with read-only Content API evidence.
+
+## Design guidance
+
+Treat settings marked unused by Box as unenforced, not compliant. Keep marker, offset, and event-stream completion semantics separate. Preserve Admin Console review where individual delegated permissions or policy details are not exposed by the API.
+
+## Shared integration contract
+
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
+
+## Known runtime gaps
+
+- Enterprise configuration categories can be returned but marked unused by Box; unused security settings never pass and render warning or manual evidence.
+- Marker, offset, and event-stream walkers keep distinct completion rules, including repeated markers, empty pages, server totals, item caps, and stream-position exits.
+- Five policy areas remain partly or wholly manual because the Box Content API does not expose a decisive read field; the runtime names Admin Console evidence.
+- CSV, HTML, SARIF, TUI output, and several policy reads remain absent.
+
+## Tools
+
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `box_check_access` | Validate read-only Box Content API access across the current principal, enterprise configuration, users, groups, enterprise events, device pins, retention and legal hold policies, Shield barriers and lists, collaboration allowlist, metadata and classification templates, and terms of service. Supports JWT, Client Credentials Grant, and OAuth 2.0 tokens. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_identity_access` | Assess Box identity and access controls: SSO enforcement, 2FA for admins and all users, admin role minimization, co-admin scoping, password policy strength, session duration, IP allowlisting, and inactive user detection (spec controls 1, 2, 3, 17, 18, 21, 22, 23, 24). | `BOX-01`, `BOX-02`, `BOX-03`, `BOX-17`, `BOX-18`, `BOX-21`, `BOX-22`, `BOX-23`, `BOX-24` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_sharing_collaboration` | Assess Box sharing and collaboration controls: external collaboration restrictions, allowlist audit, shared link defaults, expiration, password requirements, watermarking, app approval, and custom terms of service (spec controls 4, 5, 6, 7, 8, 9, 19, 20). | `BOX-04`, `BOX-05`, `BOX-06`, `BOX-07`, `BOX-08`, `BOX-09`, `BOX-19`, `BOX-20` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_data_governance` | Assess Box data governance controls: device trust and pins, classification labels, retention policies, and legal hold policies (spec controls 10, 11, 12, 13). | `BOX-10`, `BOX-11`, `BOX-12`, `BOX-13` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_shield_monitoring` | Assess Box Shield and monitoring controls: Shield smart access and threat detection rules, information barriers, enterprise event streaming, and content access monitoring (spec controls 14, 15, 16, 25). | `BOX-14`, `BOX-15`, `BOX-16`, `BOX-25` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_export_audit_bundle` | Export a Box audit package covering all 25 spec controls with raw API snapshots (core_data/), normalized findings (analysis/), executive summary, unified compliance matrix, per-framework reports for FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP (compliance/), a quick reference, an error log for partial collection, and a zip archive. | `BOX-01`, `BOX-02`, `BOX-03`, `BOX-04`, `BOX-05`, `BOX-06`, `BOX-07`, `BOX-08`, `BOX-09`, `BOX-10`, `BOX-11`, `BOX-12`, `BOX-13`, `BOX-14`, `BOX-15`, `BOX-16`, `BOX-17`, `BOX-18`, `BOX-19`, `BOX-20`, `BOX-21`, `BOX-22`, `BOX-23`, `BOX-24`, `BOX-25` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
+
+### Parameters
+
+#### `box_check_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+
+#### `box_assess_identity_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+| `user_limit` | number | no | Maximum enterprise users to inspect. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable admin plus co-admin accounts before warning. Defaults to 10. |
+| `min_password_length` | number | no | Minimum password length expected for a passing result. Defaults to 12. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+
+#### `box_assess_sharing_collaboration`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+| `stale_allowlist_days` | number | no | Age in days after which a collaboration allowlist entry is flagged for review. Defaults to 365. |
+| `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
+
+#### `box_assess_data_governance`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
+
+#### `box_assess_shield_monitoring`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+
+#### `box_export_audit_bundle`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+| `user_limit` | number | no | Maximum enterprise users to inspect. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable admin plus co-admin accounts before warning. Defaults to 10. |
+| `min_password_length` | number | no | Minimum password length expected for a passing result. Defaults to 12. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+| `stale_allowlist_days` | number | no | Age in days after which a collaboration allowlist entry is flagged for review. Defaults to 365. |
+| `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
+| `output_dir` | string | no | Output root. Defaults to ./export/box. |
+
+
+## Authentication
+
+Supported modes:
+
+- JWT server authentication
+- Client Credentials Grant
+- OAuth refresh token
+- Explicit access token
+
+Credential precedence, highest first:
+
+1. Explicit arguments
+2. Explicit config path
+3. Box inspector config
+4. BOX_* environment variables
+
+Environment variables: `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, `BOX_ENTERPRISE_ID`, `BOX_ACCESS_TOKEN`, `BOX_REFRESH_TOKEN`, `BOX_JWT_CONFIG`
+
+Configuration locations: ~/.box-sec-inspector/config.yaml
+
+Credential and deployment variants: Enterprise or user subject, JWT RS256, RS384, or RS512 assertion
+
+Configuration fields: `clientId`, `clientSecret`, `enterpriseId`, `subjectType`, `subjectId`, `accessToken`, `refreshToken`, `jwt`
+
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
+
+Credential refresh: POST https://api.box.com/oauth2/token using the selected JWT, client_credentials, or refresh_token grant.
+
+## Permissions
+
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| role | `Box application access to enterprise users, groups, events, policies, legal holds, terms, and enterprise configuration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+| role | `Box Shield or governance plan entitlements for gated surfaces` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | Read-only access; denied or plan-gated surfaces remain explicit unavailable evidence. |
+
+## API surfaces
+
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `enterprise-users` | HTTP | `GET /2.0/users` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `login`, `role`, `status`, `is_exempt_from_login_verification`, `is_external_collab_restricted` | [Official documentation](https://developer.box.com/reference/get-users/) |
+| `enterprise-config` | HTTP | `GET /2.0/enterprise/configuration` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `user_settings`, `security`, `content_and_sharing` | [Official documentation](https://developer.box.com/reference/get-enterprise-configuration/) |
+| `enterprise-events` | HTTP | `GET /2.0/events` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `event_id`, `event_type`, `created_at`, `created_by`, `source`, `additional_details` | [Official documentation](https://developer.box.com/reference/get-events/) |
+| `retention-policies` | HTTP | `GET /2.0/retention_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `policy_name`, `policy_type`, `retention_length`, `status` | [Official documentation](https://developer.box.com/reference/get-retention-policies/) |
+| `legal-hold-policies` | HTTP | `GET /2.0/legal_hold_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `policy_name`, `status`, `created_at` | [Official documentation](https://developer.box.com/reference/get-legal-hold-policies/) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `enterprise-users` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `enterprise-users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `enterprise-users` | response | A JSON object or list containing only the documented id, login, role, status, is_exempt_from_login_verification, is_external_collab_restricted members consumed by verdicts. | yes |
+| `enterprise-config` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `enterprise-config` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `enterprise-config` | response | A JSON object or list containing only the documented user_settings, security, content_and_sharing members consumed by verdicts. | yes |
+| `enterprise-events` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `enterprise-events` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `enterprise-events` | response | A JSON object or list containing only the documented event_id, event_type, created_at, created_by, source, additional_details members consumed by verdicts. | yes |
+| `retention-policies` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `retention-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `retention-policies` | response | A JSON object or list containing only the documented id, policy_name, policy_type, retention_length, status members consumed by verdicts. | yes |
+| `legal-hold-policies` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `legal-hold-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `legal-hold-policies` | response | A JSON object or list containing only the documented id, policy_name, status, created_at members consumed by verdicts. | yes |
+
+## Pagination
+
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `next_marker`, `offset`, `total_count`, `next_stream_position` | 100 | caller limit | none | Offset totals and event stream positions are checked independently; a remaining marker or total above seen records is truncated. | No next marker or total reached; Configured item cap; Fixed assignment cap; Repeated marker or stream position; Empty page with continuation; Event page budget |
+
+## Rate limits
+
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Box Security Inspector | Box rate limits vary by endpoint, user, and enterprise | `Retry-After`, `X-Rate-Limit-Limit`, `X-Rate-Limit-Remaining` | 429, 500, 502, 503, 504 | Honor Retry-After up to 60 seconds and retry three times with bounded exponential delay. |
+
+## Checks
+
+### Control coverage
+
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | SSO enforcement | BOX-01 | Evaluate the ordered first-match rules for BOX-01 below. |
+| 2 | 2FA for admins | BOX-02 | Evaluate the ordered first-match rules for BOX-02 below. |
+| 3 | 2FA for all users | BOX-03 | Evaluate the ordered first-match rules for BOX-03 below. |
+| 4 | External collaboration restrictions | BOX-04 | Evaluate the ordered first-match rules for BOX-04 below. |
+| 5 | Collaboration allowlist audit | BOX-05 | Evaluate the ordered first-match rules for BOX-05 below. |
+| 6 | Sharing link policies | BOX-06 | Evaluate the ordered first-match rules for BOX-06 below. |
+| 7 | Shared link expiration | BOX-07 | Evaluate the ordered first-match rules for BOX-07 below. |
+| 8 | Shared link password policy | BOX-08 | Evaluate the ordered first-match rules for BOX-08 below. |
+| 9 | Watermarking enabled | BOX-09 | Evaluate the ordered first-match rules for BOX-09 below. |
+| 10 | Device trust and pins | BOX-10 | Evaluate the ordered first-match rules for BOX-10 below. |
+| 11 | Classification labels | BOX-11 | Evaluate the ordered first-match rules for BOX-11 below. |
+| 12 | Retention policies | BOX-12 | Evaluate the ordered first-match rules for BOX-12 below. |
+| 13 | Legal hold policies | BOX-13 | Evaluate the ordered first-match rules for BOX-13 below. |
+| 14 | Shield smart access policies | BOX-14 | Evaluate the ordered first-match rules for BOX-14 below. |
+| 15 | Shield information barriers | BOX-15 | Evaluate the ordered first-match rules for BOX-15 below. |
+| 16 | Enterprise event streaming | BOX-16 | Evaluate the ordered first-match rules for BOX-16 below. |
+| 17 | Admin role minimization | BOX-17 | Evaluate the ordered first-match rules for BOX-17 below. |
+| 18 | Co-admin permission scoping | BOX-18 | Evaluate the ordered first-match rules for BOX-18 below. |
+| 19 | App approval process | BOX-19 | Evaluate the ordered first-match rules for BOX-19 below. |
+| 20 | Custom terms of service | BOX-20 | Evaluate the ordered first-match rules for BOX-20 below. |
+| 21 | Password policy strength | BOX-21 | Evaluate the ordered first-match rules for BOX-21 below. |
+| 22 | Session duration limits | BOX-22 | Evaluate the ordered first-match rules for BOX-22 below. |
+| 23 | IP allowlisting | BOX-23 | Evaluate the ordered first-match rules for BOX-23 below. |
+| 24 | Inactive user detection | BOX-24 | Evaluate the ordered first-match rules for BOX-24 below. |
+| 25 | Content access monitoring | BOX-25 | Evaluate the ordered first-match rules for BOX-25 below. |
+
+### Finding notes
+
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `BOX-01` | critical | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for SSO enforcement; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for SSO enforcement, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of SSO enforcement; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for SSO enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-02` | critical | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for 2FA for admins; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for 2FA for admins, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of 2FA for admins; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for 2FA for admins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-03` | high | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for 2FA for all users; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for 2FA for all users, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of 2FA for all users; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for 2FA for all users is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-04` | high | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for External collaboration restrictions; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for External collaboration restrictions, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of External collaboration restrictions; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for External collaboration restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-05` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Collaboration allowlist audit; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Collaboration allowlist audit, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Collaboration allowlist audit; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Collaboration allowlist audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-06` | high | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Sharing link policies; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Sharing link policies, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Sharing link policies; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Sharing link policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-07` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Shared link expiration; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Shared link expiration, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Shared link expiration; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Shared link expiration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-08` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Shared link password policy; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Shared link password policy, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Shared link password policy; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Shared link password policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-09` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Watermarking enabled; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Watermarking enabled, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Watermarking enabled; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Watermarking enabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-10` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Device trust and pins; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Device trust and pins, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Device trust and pins; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Device trust and pins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-11` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Classification labels; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Classification labels, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Classification labels; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Classification labels is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-12` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Retention policies; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Retention policies, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Retention policies; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Retention policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-13` | medium | `box_assess_data_governance` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Legal hold policies; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Legal hold policies, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Legal hold policies; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Legal hold policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-14` | high | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Shield smart access policies; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Shield smart access policies, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Shield smart access policies; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Shield smart access policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-15` | medium | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Shield information barriers; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Shield information barriers, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Shield information barriers; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Shield information barriers is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-16` | high | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Enterprise event streaming; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Enterprise event streaming, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Enterprise event streaming; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Enterprise event streaming is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-17` | high | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Admin role minimization; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Admin role minimization, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Admin role minimization; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Admin role minimization is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-18` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Co-admin permission scoping; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Co-admin permission scoping, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Co-admin permission scoping; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Co-admin permission scoping is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-19` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for App approval process; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for App approval process, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of App approval process; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for App approval process is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-20` | medium | `box_assess_sharing_collaboration` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Custom terms of service; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Custom terms of service, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Custom terms of service; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Custom terms of service is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-21` | high | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Password policy strength; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Password policy strength, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Password policy strength; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Password policy strength is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-22` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Session duration limits; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Session duration limits, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Session duration limits; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Session duration limits is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-23` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for IP allowlisting; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for IP allowlisting, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of IP allowlisting; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for IP allowlisting is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-24` | medium | `box_assess_identity_access` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Inactive user detection; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Inactive user detection, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Inactive user detection; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Inactive user detection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-25` | high | `box_assess_shield_monitoring` | `enterprise-users`, `enterprise-config`, `enterprise-events`, `retention-policies`, `legal-hold-policies` | `decision_status` | Complete, readable evidence satisfies the runtime predicates for Content access monitoring; partial, denied, missing, or null evidence cannot select this outcome. | Readable evidence establishes an incomplete or review-required posture for Content access monitoring, including any runtime sampling or truncation limitation. | Readable evidence establishes a configured violation of Content access monitoring; this outcome has first-match precedence over partial-evidence warnings. | The required evidence for Content access monitoring is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `BOX-01` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-01` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-01` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-01` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-02` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-02` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-02` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-02` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-03` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-03` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-03` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-03` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-04` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-04` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-04` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-04` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-05` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-05` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-05` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-05` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-06` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-06` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-06` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-06` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-07` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-07` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-07` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-07` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-08` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-08` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-08` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-08` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-09` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-09` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-09` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-09` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-10` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-10` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-10` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-10` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-11` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-11` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-11` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-11` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-12` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-12` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-12` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-12` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-13` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-13` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-13` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-13` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-14` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-14` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-14` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-14` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-15` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-15` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-15` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-15` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-16` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-16` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-16` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-16` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-17` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-17` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-17` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-17` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-18` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-18` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-18` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-18` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-19` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-19` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-19` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-19` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-20` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-20` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-20` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-20` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-21` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-21` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-21` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-21` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-22` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-22` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-22` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-22` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-23` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-23` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-23` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-23` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-24` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-24` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-24` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-24` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+| `BOX-25` | 1 | fail | `decision_status` equals "fail" | A proven violation wins before incomplete-evidence outcomes. |
+| `BOX-25` | 2 | warn | `decision_status` equals "warn" | The runtime selected warning from readable but incomplete or review-required evidence. |
+| `BOX-25` | 3 | pass | `decision_status` equals "pass" | The runtime may select pass only after every required dependency is complete. |
+| `BOX-25` | 4 | manual | always | Null, missing, denied, partial-without-a-runtime-warning, malformed, and unknown states fall back to manual. |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `BOX-01` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-02` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-03` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-04` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-05` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-06` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-07` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-08` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-09` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-10` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-11` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-12` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-13` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-14` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-15` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-16` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-17` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-18` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-19` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-20` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-21` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-22` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-23` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-24` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+| `BOX-25` | `decision_status` | Run the integration's evidence-specific, dependency-aware evaluator over complete cardinalities and projected source values. Preserve fail, warn, pass, or manual exactly; null, missing, denied, and unreadable required evidence derives manual, never pass. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `BOX-01` | `passStatus` | pass |
+| `BOX-01` | `warnStatus` | warn |
+| `BOX-01` | `failStatus` | fail |
+| `BOX-01` | `manualStatus` | manual |
+| `BOX-02` | `passStatus` | pass |
+| `BOX-02` | `warnStatus` | warn |
+| `BOX-02` | `failStatus` | fail |
+| `BOX-02` | `manualStatus` | manual |
+| `BOX-03` | `passStatus` | pass |
+| `BOX-03` | `warnStatus` | warn |
+| `BOX-03` | `failStatus` | fail |
+| `BOX-03` | `manualStatus` | manual |
+| `BOX-04` | `passStatus` | pass |
+| `BOX-04` | `warnStatus` | warn |
+| `BOX-04` | `failStatus` | fail |
+| `BOX-04` | `manualStatus` | manual |
+| `BOX-05` | `passStatus` | pass |
+| `BOX-05` | `warnStatus` | warn |
+| `BOX-05` | `failStatus` | fail |
+| `BOX-05` | `manualStatus` | manual |
+| `BOX-06` | `passStatus` | pass |
+| `BOX-06` | `warnStatus` | warn |
+| `BOX-06` | `failStatus` | fail |
+| `BOX-06` | `manualStatus` | manual |
+| `BOX-07` | `passStatus` | pass |
+| `BOX-07` | `warnStatus` | warn |
+| `BOX-07` | `failStatus` | fail |
+| `BOX-07` | `manualStatus` | manual |
+| `BOX-08` | `passStatus` | pass |
+| `BOX-08` | `warnStatus` | warn |
+| `BOX-08` | `failStatus` | fail |
+| `BOX-08` | `manualStatus` | manual |
+| `BOX-09` | `passStatus` | pass |
+| `BOX-09` | `warnStatus` | warn |
+| `BOX-09` | `failStatus` | fail |
+| `BOX-09` | `manualStatus` | manual |
+| `BOX-10` | `passStatus` | pass |
+| `BOX-10` | `warnStatus` | warn |
+| `BOX-10` | `failStatus` | fail |
+| `BOX-10` | `manualStatus` | manual |
+| `BOX-11` | `passStatus` | pass |
+| `BOX-11` | `warnStatus` | warn |
+| `BOX-11` | `failStatus` | fail |
+| `BOX-11` | `manualStatus` | manual |
+| `BOX-12` | `passStatus` | pass |
+| `BOX-12` | `warnStatus` | warn |
+| `BOX-12` | `failStatus` | fail |
+| `BOX-12` | `manualStatus` | manual |
+| `BOX-13` | `passStatus` | pass |
+| `BOX-13` | `warnStatus` | warn |
+| `BOX-13` | `failStatus` | fail |
+| `BOX-13` | `manualStatus` | manual |
+| `BOX-14` | `passStatus` | pass |
+| `BOX-14` | `warnStatus` | warn |
+| `BOX-14` | `failStatus` | fail |
+| `BOX-14` | `manualStatus` | manual |
+| `BOX-15` | `passStatus` | pass |
+| `BOX-15` | `warnStatus` | warn |
+| `BOX-15` | `failStatus` | fail |
+| `BOX-15` | `manualStatus` | manual |
+| `BOX-16` | `passStatus` | pass |
+| `BOX-16` | `warnStatus` | warn |
+| `BOX-16` | `failStatus` | fail |
+| `BOX-16` | `manualStatus` | manual |
+| `BOX-17` | `passStatus` | pass |
+| `BOX-17` | `warnStatus` | warn |
+| `BOX-17` | `failStatus` | fail |
+| `BOX-17` | `manualStatus` | manual |
+| `BOX-18` | `passStatus` | pass |
+| `BOX-18` | `warnStatus` | warn |
+| `BOX-18` | `failStatus` | fail |
+| `BOX-18` | `manualStatus` | manual |
+| `BOX-19` | `passStatus` | pass |
+| `BOX-19` | `warnStatus` | warn |
+| `BOX-19` | `failStatus` | fail |
+| `BOX-19` | `manualStatus` | manual |
+| `BOX-20` | `passStatus` | pass |
+| `BOX-20` | `warnStatus` | warn |
+| `BOX-20` | `failStatus` | fail |
+| `BOX-20` | `manualStatus` | manual |
+| `BOX-21` | `passStatus` | pass |
+| `BOX-21` | `warnStatus` | warn |
+| `BOX-21` | `failStatus` | fail |
+| `BOX-21` | `manualStatus` | manual |
+| `BOX-22` | `passStatus` | pass |
+| `BOX-22` | `warnStatus` | warn |
+| `BOX-22` | `failStatus` | fail |
+| `BOX-22` | `manualStatus` | manual |
+| `BOX-23` | `passStatus` | pass |
+| `BOX-23` | `warnStatus` | warn |
+| `BOX-23` | `failStatus` | fail |
+| `BOX-23` | `manualStatus` | manual |
+| `BOX-24` | `passStatus` | pass |
+| `BOX-24` | `warnStatus` | warn |
+| `BOX-24` | `failStatus` | fail |
+| `BOX-24` | `manualStatus` | manual |
+| `BOX-25` | `passStatus` | pass |
+| `BOX-25` | `warnStatus` | warn |
+| `BOX-25` | `failStatus` | fail |
+| `BOX-25` | `manualStatus` | manual |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `BOX-01` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-01` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-02` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-02` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-03` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-03` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-04` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-04` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-05` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-05` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-06` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-06` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-07` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-07` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-08` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-08` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-09` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-09` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-10` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-10` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-10` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-10` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-11` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-11` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-11` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-11` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-12` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-12` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-12` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-12` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-13` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-13` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-13` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-13` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-14` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-14` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-14` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-14` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-15` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-15` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-15` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-15` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-16` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-16` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-16` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-16` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-17` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-17` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-17` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-17` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-18` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-18` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-18` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-18` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-19` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-19` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-19` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-19` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-20` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-20` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-20` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-20` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-21` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-21` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-21` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-21` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-22` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-22` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-22` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-22` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-23` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-23` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-23` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-23` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-24` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-24` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-24` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-24` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-25` | compliant | All required source reads are complete and the evidence-specific runtime evaluation returns pass. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-25` | noncompliant | A complete source read proves a configured violation and the evidence-specific runtime evaluation returns fail. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-25` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-25` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | SSO enforcement | - | - | - | - | - | - | - | - |
+| 2 | 2FA for admins | - | - | - | - | - | - | - | - |
+| 3 | 2FA for all users | - | - | - | - | - | - | - | - |
+| 4 | External collaboration restrictions | - | - | - | - | - | - | - | - |
+| 5 | Collaboration allowlist audit | - | - | - | - | - | - | - | - |
+| 6 | Sharing link policies | - | - | - | - | - | - | - | - |
+| 7 | Shared link expiration | - | - | - | - | - | - | - | - |
+| 8 | Shared link password policy | - | - | - | - | - | - | - | - |
+| 9 | Watermarking enabled | - | - | - | - | - | - | - | - |
+| 10 | Device trust and pins | - | - | - | - | - | - | - | - |
+| 11 | Classification labels | - | - | - | - | - | - | - | - |
+| 12 | Retention policies | - | - | - | - | - | - | - | - |
+| 13 | Legal hold policies | - | - | - | - | - | - | - | - |
+| 14 | Shield smart access policies | - | - | - | - | - | - | - | - |
+| 15 | Shield information barriers | - | - | - | - | - | - | - | - |
+| 16 | Enterprise event streaming | - | - | - | - | - | - | - | - |
+| 17 | Admin role minimization | - | - | - | - | - | - | - | - |
+| 18 | Co-admin permission scoping | - | - | - | - | - | - | - | - |
+| 19 | App approval process | - | - | - | - | - | - | - | - |
+| 20 | Custom terms of service | - | - | - | - | - | - | - | - |
+| 21 | Password policy strength | - | - | - | - | - | - | - | - |
+| 22 | Session duration limits | - | - | - | - | - | - | - | - |
+| 23 | IP allowlisting | - | - | - | - | - | - | - | - |
+| 24 | Inactive user detection | - | - | - | - | - | - | - | - |
+| 25 | Content access monitoring | - | - | - | - | - | - | - | - |
+
+## Collection states
+
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
+
+## Integration-specific scrubbing
+
+Shared contract version: 1.1.
+
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
+
+Sensitive fields and values: client_secret, private_key, passphrase, access_token, refresh_token, authorization, login
+
+Credential formats: Box OAuth access and refresh tokens, JWT private keys and passphrases, signed JWT assertions
+
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
+
+Integration-specific rules:
+
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `enterprise-users` | `id`, `login`, `role`, `status`, `is_exempt_from_login_verification`, `is_external_collab_restricted` |
+| `enterprise-config` | `user_settings`, `security`, `content_and_sharing` |
+| `enterprise-events` | `event_id`, `event_type`, `created_at`, `created_by`, `source`, `additional_details` |
+| `retention-policies` | `id`, `policy_name`, `policy_type`, `retention_length`, `status` |
+| `legal-hold-policies` | `id`, `policy_name`, `status`, `created_at` |
+
+## Export layout
+
+Required paths:
+
+- `core_data/access.json`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis/cis_compliance_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/stig_compliance_checklist.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
+- `QUICK_REFERENCE.md`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `core_data/{dataset}.json` | json | The dataset is part of the assessment, including explicit not-collected markers. | Projected source records or a structured unavailable marker; unavailable values remain null. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Array of finding id, control, title, severity, status, summary, evidence, mappings, and optional manual evidence. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | Human-readable counts and findings grouped by status. | UTF-8 Markdown. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | Finding-to-framework mapping matrix. | UTF-8 Markdown. |
+| `compliance/{framework}/{report}.md` | markdown | Always for each supported framework. | Framework-specific finding rows and mappings. | UTF-8 Markdown. |
+| `QUICK_REFERENCE.md` | markdown | Always. | Bundle navigation and operator next steps. | UTF-8 Markdown. |
+| `_errors.log` | text | At least one collection read failed, was denied, or was incomplete. | Scrubbed collection error summaries without response bodies or credentials. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `control`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `mappings`
+- `manualEvidence`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+- `reason`
+
+#### access_surface
+
+- `name`
+- `endpoint`
+- `status`
+- `count`
+- `error`
+
+#### assessment
+
+- `area`
+- `title`
+- `summary`
+- `findings`
+- `errors`
+
+#### bundle_manifest
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+JSON formatting: UTF-8 JSON with deterministic field order, two-space indentation, and a trailing newline.
+
+Overwrite policy: Allocate a new suffixed output directory on every rerun; never overwrite an earlier bundle.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create box-audit.zip beside the allocated box-audit directory, applying the same suffix to both.
