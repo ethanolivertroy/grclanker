@@ -17,7 +17,7 @@ import {
 } from "../scripts/generate-integration-specs.mjs";
 
 const expectedDatasetStates = ["complete", "truncated", "unreadable", "not_requested"];
-const expectedCollectionStates = [...expectedDatasetStates, "denied", "not_configured"];
+const expectedCollectionStates = ["complete", "truncated", "unreadable", "denied", "not_requested", "not_configured"];
 const expectedPaginationStops = [
   "exhausted",
   "limit",
@@ -85,7 +85,8 @@ test("rendered requirements remain language-neutral and preserve mapping table s
     const outputPath = resolve(repoRoot, entry.outputPath);
     const markdown = outputs.get(outputPath);
     assert.ok(markdown, entry.outputPath);
-    assert.doesNotMatch(markdown, /\b(?:interface|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments)\b/);
+    assert.doesNotMatch(markdown, /\b(?:TypeScript|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments)\b/);
+    assert.doesNotMatch(markdown, /\binterface\s+[A-Z][A-Za-z0-9_]*\s*(?:\{|<)/);
 
     const mappingRows = markdown.split("\n").filter((line) => {
       const cells = line.split("|").map((cell) => cell.trim());

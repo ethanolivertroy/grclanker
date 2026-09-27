@@ -50,25 +50,25 @@ type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
 
 const DEFAULT_OUTPUT_DIR = WEBEX_DEFAULTS.outputDir;
-const DEFAULT_TIMEOUT_MS = WEBEX_DEFAULTS.timeoutMs;
+const DEFAULT_TIMEOUT_MS: number = WEBEX_DEFAULTS.timeoutMs;
 const DEFAULT_CONFIG_DIR = WEBEX_DEFAULTS.configDir;
 const CONFIG_FILE_NAMES = WEBEX_DEFAULTS.configFileNames;
-const MAX_RETRY_AFTER_MS = WEBEX_DEFAULTS.maxRetryAfterMs;
-const MAX_429_RETRIES = WEBEX_DEFAULTS.max429Retries;
-const MAX_LIST_PAGES = WEBEX_DEFAULTS.maxListPages;
+const MAX_RETRY_AFTER_MS: number = WEBEX_DEFAULTS.maxRetryAfterMs;
+const MAX_429_RETRIES: number = WEBEX_DEFAULTS.max429Retries;
+const MAX_LIST_PAGES: number = WEBEX_DEFAULTS.maxListPages;
 const PAGE_MAX = WEBEX_PAGE_MAX;
-const MIN_MEETING_PASSWORD_LENGTH = WEBEX_DEFAULTS.minimumMeetingPasswordLength;
-const DEFAULT_PEOPLE_LIMIT = WEBEX_DEFAULTS.peopleLimit;
-const DEFAULT_EVENT_LIMIT = WEBEX_DEFAULTS.eventLimit;
-const DEFAULT_LICENSE_LIMIT = WEBEX_DEFAULTS.licenseLimit;
-const DEFAULT_RECORDING_LIMIT = WEBEX_DEFAULTS.recordingLimit;
-const DEFAULT_MEETING_LIMIT = WEBEX_DEFAULTS.meetingLimit;
-const DEFAULT_WEBHOOK_LIMIT = WEBEX_DEFAULTS.webhookLimit;
-const DEFAULT_DEVICE_LIMIT = WEBEX_DEFAULTS.deviceLimit;
-const DEFAULT_ROOM_LIMIT = WEBEX_DEFAULTS.roomLimit;
-const DEFAULT_GENERIC_LIMIT = WEBEX_DEFAULTS.genericLimit;
-const DEFAULT_MAX_ADMINS = WEBEX_DEFAULTS.maxAdmins;
-const ADMIN_AUDIT_WINDOW_DAYS = WEBEX_DEFAULTS.adminAuditWindowDays;
+const MIN_MEETING_PASSWORD_LENGTH: number = WEBEX_DEFAULTS.minimumMeetingPasswordLength;
+const DEFAULT_PEOPLE_LIMIT: number = WEBEX_DEFAULTS.peopleLimit;
+const DEFAULT_EVENT_LIMIT: number = WEBEX_DEFAULTS.eventLimit;
+const DEFAULT_LICENSE_LIMIT: number = WEBEX_DEFAULTS.licenseLimit;
+const DEFAULT_RECORDING_LIMIT: number = WEBEX_DEFAULTS.recordingLimit;
+const DEFAULT_MEETING_LIMIT: number = WEBEX_DEFAULTS.meetingLimit;
+const DEFAULT_WEBHOOK_LIMIT: number = WEBEX_DEFAULTS.webhookLimit;
+const DEFAULT_DEVICE_LIMIT: number = WEBEX_DEFAULTS.deviceLimit;
+const DEFAULT_ROOM_LIMIT: number = WEBEX_DEFAULTS.roomLimit;
+const DEFAULT_GENERIC_LIMIT: number = WEBEX_DEFAULTS.genericLimit;
+const DEFAULT_MAX_ADMINS: number = WEBEX_DEFAULTS.maxAdmins;
+const ADMIN_AUDIT_WINDOW_DAYS: number = WEBEX_DEFAULTS.adminAuditWindowDays;
 
 export type WebexFindingStatus = "pass" | "warn" | "fail" | "manual";
 export type WebexTokenType = "person" | "bot" | "appuser" | "unknown";
@@ -1011,7 +1011,16 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): WebexFinding {
-  const merged: WebexFrameworkMap = frameworks("", "", "", "", "", "", "", "");
+  const merged: WebexFrameworkMap = {
+    fedramp: [],
+    cmmc: [],
+    soc2: [],
+    cis: [],
+    pci_dss: [],
+    disa_stig: [],
+    irap: [],
+    ismap: [],
+  };
   for (const number of control) {
     const map = WEBEX_CONTROL_FRAMEWORKS[number];
     if (!map) continue;

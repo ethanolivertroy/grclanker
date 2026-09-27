@@ -193,8 +193,12 @@ interface AwsOperationContract {
 }
 
 function operation(service: string, operationName: string, fields: readonly string[], actionPrefix = service): AwsOperationContract {
+  const stableOperationId = operationName
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1-$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .toLowerCase();
   return {
-    id: `${service}-${operationName.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`).replace(/^-/, "")}`,
+    id: `${service}-${stableOperationId}`,
     service,
     operation: operationName,
     action: `${actionPrefix}:${operationName}`,
