@@ -95,154 +95,67 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  AWS_CONTROL_CATALOG,
+  AWS_DEFAULTS,
+  AWS_FINDING_CONTROLS,
+  AWS_FRAMEWORKS,
+  AWS_REQUIRED_OUTPUT_MEMBERS,
+  AWS_REQUIRED_PUBLIC_ACCESS_FLAGS,
+  AWS_SPEC,
+} from "./aws.spec.js";
+import type {
+  AwsControlDescriptor,
+  AwsFrameworkDescriptor,
+  AwsFrameworkKey,
+  AwsOutputMemberKind,
+} from "./aws.spec.js";
+import { defineGrcTool, toolContract } from "./spec-model.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+
+export {
+  AWS_CONTROL_CATALOG,
+  AWS_FINDING_CONTROLS,
+  AWS_FRAMEWORKS,
+  AWS_REQUIRED_OUTPUT_MEMBERS,
+} from "./aws.spec.js";
+export type {
+  AwsControlDescriptor,
+  AwsFrameworkDescriptor,
+  AwsFrameworkKey,
+  AwsOutputMemberKind,
+} from "./aws.spec.js";
 
 type JsonRecord = Record<string, unknown>;
 
-const DEFAULT_REGION = "us-east-1";
-const DEFAULT_OUTPUT_DIR = "./export/aws";
-const DEFAULT_USER_LIMIT = 500;
-const DEFAULT_ROLE_LIMIT = 500;
-const DEFAULT_STALE_DAYS = 90;
-const DEFAULT_MAX_PRIVILEGED_ROLES = 5;
-const DEFAULT_MAX_FINDINGS = 200;
-const DEFAULT_REGION_LIMIT = 30;
-const DEFAULT_BUCKET_LIMIT = 1000;
-const DEFAULT_KEY_LIMIT = 1000;
-const DEFAULT_INSTANCE_LIMIT = 500;
-const DEFAULT_RESOURCE_LIMIT = 2000;
-const DEFAULT_POLICY_LIMIT = 1000;
-const DEFAULT_EVENT_LIMIT = 500;
-const DEFAULT_ACCOUNT_LIMIT = 1000;
-const DEFAULT_TARGET_LIMIT = 1000;
-const DEFAULT_ANALYZER_LIMIT = 100;
-const DEFAULT_STANDARD_LIMIT = 100;
-const DEFAULT_DETECTOR_LIMIT = 50;
-/** Upper bound on pages walked per list call; a token that never stops advancing is reported as truncation. */
-const MAX_PAGES_PER_LIST = 1000;
-const DEFAULT_ROOT_LOOKBACK_DAYS = 90;
+const DEFAULT_REGION = AWS_DEFAULTS.region;
+const DEFAULT_OUTPUT_DIR = AWS_DEFAULTS.outputDir;
+const DEFAULT_USER_LIMIT = AWS_DEFAULTS.userLimit;
+const DEFAULT_ROLE_LIMIT = AWS_DEFAULTS.roleLimit;
+const DEFAULT_STALE_DAYS = AWS_DEFAULTS.staleDays;
+const DEFAULT_MAX_PRIVILEGED_ROLES = AWS_DEFAULTS.maxPrivilegedRoles;
+const DEFAULT_MAX_FINDINGS = AWS_DEFAULTS.maxFindings;
+const DEFAULT_REGION_LIMIT = AWS_DEFAULTS.regionLimit;
+const DEFAULT_BUCKET_LIMIT = AWS_DEFAULTS.bucketLimit;
+const DEFAULT_KEY_LIMIT = AWS_DEFAULTS.keyLimit;
+const DEFAULT_INSTANCE_LIMIT = AWS_DEFAULTS.instanceLimit;
+const DEFAULT_RESOURCE_LIMIT = AWS_DEFAULTS.resourceLimit;
+const DEFAULT_POLICY_LIMIT = AWS_DEFAULTS.policyLimit;
+const DEFAULT_EVENT_LIMIT = AWS_DEFAULTS.eventLimit;
+const DEFAULT_ACCOUNT_LIMIT = AWS_DEFAULTS.accountLimit;
+const DEFAULT_TARGET_LIMIT = AWS_DEFAULTS.targetLimit;
+const DEFAULT_ANALYZER_LIMIT = AWS_DEFAULTS.analyzerLimit;
+const DEFAULT_STANDARD_LIMIT = AWS_DEFAULTS.standardLimit;
+const DEFAULT_DETECTOR_LIMIT = AWS_DEFAULTS.detectorLimit;
+const MAX_PAGES_PER_LIST = AWS_DEFAULTS.maxPagesPerList;
+const DEFAULT_ROOT_LOOKBACK_DAYS = AWS_DEFAULTS.rootLookbackDays;
 /** Global service events such as root ConsoleLogin are delivered to CloudTrail in us-east-1 only. */
-export const ROOT_EVENT_REGION = "us-east-1";
-const DEFAULT_CONCURRENCY = 8;
-const DEFAULT_SENSITIVE_PORTS = [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017];
+export const ROOT_EVENT_REGION = AWS_DEFAULTS.rootEventRegion;
+const DEFAULT_CONCURRENCY = AWS_DEFAULTS.concurrency;
+const DEFAULT_SENSITIVE_PORTS = [...AWS_DEFAULTS.sensitivePorts];
 const ANY_IPV4 = "0.0.0.0/0";
 const ANY_IPV6 = "::/0";
-const REQUIRED_PUBLIC_ACCESS_FLAGS = [
-  "BlockPublicAcls",
-  "IgnorePublicAcls",
-  "BlockPublicPolicy",
-  "RestrictPublicBuckets",
-] as const;
-
-export type AwsFrameworkKey =
-  | "fedramp"
-  | "cmmc"
-  | "soc2"
-  | "cis"
-  | "pci_dss"
-  | "disa_stig"
-  | "irap"
-  | "ismap";
-
-export interface AwsFrameworkDescriptor {
-  key: AwsFrameworkKey;
-  label: string;
-  file: string;
-}
-
-/** Framework labels double as mapping prefixes, matching the existing "CIS AWS 1.4" style. */
-export const AWS_FRAMEWORKS: ReadonlyArray<AwsFrameworkDescriptor> = [
-  { key: "fedramp", label: "FedRAMP", file: "fedramp" },
-  { key: "cmmc", label: "CMMC", file: "cmmc" },
-  { key: "soc2", label: "SOC 2", file: "soc2" },
-  { key: "cis", label: "CIS AWS", file: "cis" },
-  { key: "pci_dss", label: "PCI-DSS", file: "pci-dss" },
-  { key: "disa_stig", label: "DISA STIG", file: "disa-stig" },
-  { key: "irap", label: "IRAP", file: "irap" },
-  { key: "ismap", label: "ISMAP", file: "ismap" },
-];
-
-export interface AwsControlDescriptor {
-  title: string;
-  frameworks: Record<AwsFrameworkKey, string[]>;
-}
-
-function control(
-  title: string,
-  fedramp: string[],
-  cmmc: string[],
-  soc2: string[],
-  cis: string[],
-  pciDss: string[],
-  disaStig: string[],
-  irap: string[],
-  ismap: string[],
-): AwsControlDescriptor {
-  return {
-    title,
-    frameworks: { fedramp, cmmc, soc2, cis, pci_dss: pciDss, disa_stig: disaStig, irap, ismap },
-  };
-}
-
-/** Section 5 of specs/aws-sec-inspector.spec.md, one row per numbered control. */
-export const AWS_CONTROL_CATALOG: Record<number, AwsControlDescriptor> = {
-  1: control("MFA Enforcement", ["IA-2(1)", "IA-2(2)"], ["AC.L2-3.1.1"], ["CC6.1", "CC6.6"], ["1.5", "1.6", "1.10"], ["8.4.2"], ["SRG-APP-000149"], ["ISM-1401"], ["7.2.1"]),
-  2: control("Password Policy", ["IA-5(1)"], ["IA.L2-3.5.7"], ["CC6.1"], ["1.8", "1.9"], ["8.3.6"], ["SRG-APP-000166"], ["ISM-0421"], ["7.2.2"]),
-  3: control("Access Key Rotation", ["IA-5(1)"], ["IA.L2-3.5.8"], ["CC6.1", "CC6.2"], ["1.12", "1.14"], ["8.6.3"], ["SRG-APP-000175"], ["ISM-1590"], ["7.2.3"]),
-  4: control("Root Account Usage", ["AC-6(1)", "AC-6(5)"], ["AC.L2-3.1.5"], ["CC6.1", "CC6.3"], ["1.4", "1.7"], ["8.6.1"], ["SRG-APP-000340"], ["ISM-1507"], ["7.1.1"]),
-  5: control("Unused Credentials", ["AC-2(3)"], ["AC.L2-3.1.12"], ["CC6.2"], ["1.12"], ["8.1.4"], ["SRG-APP-000163"], ["ISM-1404"], ["7.2.4"]),
-  6: control("CloudTrail Enabled", ["AU-2", "AU-3", "AU-12"], ["AU.L2-3.3.1"], ["CC7.2", "CC7.3"], ["3.1", "3.2"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.1"]),
-  7: control("CloudTrail Log Integrity", ["AU-9", "AU-10"], ["AU.L2-3.3.8"], ["CC7.2"], ["3.4", "3.7"], ["10.3.2"], ["SRG-APP-000125"], ["ISM-0859"], ["8.1.2"]),
-  8: control("Security Hub Enabled", ["CA-7", "SI-4"], ["CA.L2-3.12.3"], ["CC7.1", "CC7.2"], [], ["11.5.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.1"]),
-  9: control("GuardDuty Enabled", ["SI-4", "IR-4"], ["SI.L2-3.14.6"], ["CC7.2", "CC7.3"], [], ["11.5.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.2"]),
-  10: control("Config Enabled", ["CM-2", "CM-6", "CM-8"], ["CM.L2-3.4.1"], ["CC7.1"], ["3.5"], ["10.2.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.3"]),
-  11: control("S3 Public Access", ["AC-3", "AC-4"], ["AC.L2-3.1.3"], ["CC6.1", "CC6.6"], ["2.1.4"], ["1.3.1"], ["SRG-APP-000516"], ["ISM-0263"], ["6.1.1"]),
-  12: control("Encryption at Rest", ["SC-28"], ["SC.L2-3.13.16"], ["CC6.1", "CC6.7"], ["2.2.1"], ["3.4.1"], ["SRG-APP-000231"], ["ISM-0457"], ["6.2.1"]),
-  13: control("Encryption in Transit", ["SC-8", "SC-23"], ["SC.L2-3.13.8"], ["CC6.1", "CC6.7"], [], ["4.1.1"], ["SRG-APP-000014"], ["ISM-0469"], ["6.2.2"]),
-  14: control("VPC Flow Logs", ["AU-12", "SI-4"], ["AU.L2-3.3.1"], ["CC7.2"], ["3.9"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.3"]),
-  15: control("Cross-Account Access", ["AC-3", "AC-6"], ["AC.L2-3.1.2"], ["CC6.1", "CC6.3"], ["1.16"], ["7.2.1"], ["SRG-APP-000033"], ["ISM-1380"], ["7.1.2"]),
-  16: control("SCP Enforcement", ["AC-3", "CM-7"], ["AC.L2-3.1.7"], ["CC6.1", "CC6.8"], [], ["7.2.1"], ["SRG-APP-000246"], ["ISM-1380"], ["7.1.3"]),
-  17: control("Permission Boundaries", ["AC-6(1)", "AC-6(2)"], ["AC.L2-3.1.5"], ["CC6.3"], [], ["7.2.2"], ["SRG-APP-000340"], ["ISM-1380"], ["7.1.4"]),
-  18: control("Least Privilege", ["AC-6"], ["AC.L2-3.1.5"], ["CC6.1", "CC6.3"], ["1.16"], ["7.2.2"], ["SRG-APP-000342"], ["ISM-1380"], ["7.1.5"]),
-  19: control("Logging Configuration", ["AU-2", "AU-3", "AU-6"], ["AU.L2-3.3.1"], ["CC7.2", "CC7.3"], ["3.1", "3.3", "3.5"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.4"]),
-  20: control("Network ACLs", ["AC-4", "SC-7"], ["SC.L2-3.13.1"], ["CC6.1", "CC6.6"], ["5.1"], ["1.3.1"], ["SRG-APP-000142"], ["ISM-1416"], ["6.1.2"]),
-  21: control("Security Group Rules", ["AC-4", "SC-7"], ["SC.L2-3.13.1"], ["CC6.1", "CC6.6"], ["5.2", "5.3"], ["1.3.2"], ["SRG-APP-000142"], ["ISM-1416"], ["6.1.3"]),
-  22: control("KMS Key Rotation", ["SC-12", "SC-28"], ["SC.L2-3.13.10"], ["CC6.1", "CC6.7"], ["3.8"], ["3.6.4"], ["SRG-APP-000231"], ["ISM-0457"], ["6.2.3"]),
-  23: control("Identity Center Configuration", ["AC-2", "IA-2"], ["AC.L2-3.1.1"], ["CC6.1", "CC6.2"], [], ["8.4.2"], ["SRG-APP-000149"], ["ISM-1401"], ["7.2.5"]),
-  24: control("Audit Manager Evidence", ["CA-2", "CA-7"], ["CA.L2-3.12.1"], ["CC4.1"], [], ["12.4.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.3.1"]),
-  25: control("Account Contacts", ["IR-6", "PM-2"], ["IR.L2-3.6.2"], ["CC7.4"], ["1.1", "1.2"], ["12.10.5"], ["SRG-APP-000516"], ["ISM-0072"], ["9.1.1"]),
-};
-
-/** Spec control numbers covered by each finding id, used for coverage and framework reports. */
-export const AWS_FINDING_CONTROLS: Record<string, number[]> = {
-  "AWS-IAM-01": [1, 4],
-  "AWS-IAM-02": [1],
-  "AWS-IAM-03": [2],
-  "AWS-IAM-04": [3],
-  "AWS-IAM-05": [17],
-  "AWS-IAM-06": [5],
-  "AWS-IAM-07": [4],
-  "AWS-IAM-08": [18],
-  "AWS-LOG-01": [6, 7],
-  "AWS-LOG-02": [19],
-  "AWS-LOG-03": [8],
-  "AWS-LOG-04": [9],
-  "AWS-LOG-05": [10],
-  "AWS-ORG-01": [16],
-  "AWS-ORG-02": [16],
-  "AWS-ORG-03": [15],
-  "AWS-ORG-04": [15],
-  "AWS-ORG-05": [23],
-  "AWS-ORG-06": [24],
-  "AWS-ORG-07": [25],
-  "AWS-DATA-11": [11],
-  "AWS-DATA-12": [12],
-  "AWS-DATA-13": [13],
-  "AWS-DATA-22": [22],
-  "AWS-NET-14": [14],
-  "AWS-NET-20": [20],
-  "AWS-NET-21": [21],
-};
+const REQUIRED_PUBLIC_ACCESS_FLAGS = AWS_REQUIRED_PUBLIC_ACCESS_FLAGS;
 
 export function buildAwsMappings(controlNumber: number): string[] {
   const descriptor = AWS_CONTROL_CATALOG[controlNumber];
@@ -1284,68 +1197,6 @@ function toAwsApiError(error: unknown): Error {
 type SdkClientPrototype = {
   send: (command: unknown, ...rest: unknown[]) => Promise<unknown>;
 };
-
-/**
- * The documented shape of a top-level output member: a list, a map or structure (which the service never answers
- * empty), a non-empty string, a boolean, or a string that is a JSON policy document carrying a Statement.
- */
-export type AwsOutputMemberKind = "list" | "map" | "structure" | "string" | "boolean" | "policyDocument";
-
-/**
- * The top-level output member each command the client sends is answered with, and its documented shape; a list
- * member is present (empty) even when the account holds nothing. When a command can answer with one of several
- * members, any one counts, and every one that is present must have its documented shape. A 2xx whose deserialized
- * output carries none of them, or carries one in another shape (a string where a list is documented, an empty
- * structure, bare text inside an XML list element the deserializer read as empty, a Policy that is not a policy
- * document), was not a service response (a proxy's HTML page, an empty body the SDK turns into an output without
- * members, a foreign document bound to a payload member) and is thrown as IncompleteResponse rather than read as
- * an empty inventory or a default.
- */
-export const AWS_REQUIRED_OUTPUT_MEMBERS: Readonly<Record<string, Readonly<Record<string, AwsOutputMemberKind>>>> = Object.freeze({
-  GetCallerIdentity: { Account: "string" },
-  GetAccountSummary: { SummaryMap: "map" },
-  GetAccountPasswordPolicy: { PasswordPolicy: "structure" },
-  ListUsers: { Users: "list" },
-  ListMFADevices: { MFADevices: "list" },
-  ListAccessKeys: { AccessKeyMetadata: "list" },
-  GetAccessKeyLastUsed: { AccessKeyLastUsed: "structure" },
-  GetAccountAuthorizationDetails: { RoleDetailList: "list", UserDetailList: "list", GroupDetailList: "list", Policies: "list" },
-  ListPolicies: { Policies: "list" },
-  GetPolicyVersion: { PolicyVersion: "structure" },
-  LookupEvents: { Events: "list" },
-  DescribeTrails: { trailList: "list" },
-  GetTrailStatus: { IsLogging: "boolean" },
-  GetEventSelectors: { TrailARN: "string", EventSelectors: "list", AdvancedEventSelectors: "list" },
-  DescribeHub: { HubArn: "string" },
-  GetEnabledStandards: { StandardsSubscriptions: "list" },
-  DescribeConfigurationRecorders: { ConfigurationRecorders: "list" },
-  DescribeConfigurationRecorderStatus: { ConfigurationRecordersStatus: "list" },
-  ListDetectors: { DetectorIds: "list" },
-  GetDetector: { Status: "string", ServiceRole: "string" },
-  DescribeOrganization: { Organization: "structure" },
-  ListAccounts: { Accounts: "list" },
-  ListTargetsForPolicy: { Targets: "list" },
-  ListAnalyzers: { analyzers: "list" },
-  ListFindings: { findings: "list" },
-  ListInstances: { Instances: "list" },
-  ListAssessments: { assessmentMetadata: "list" },
-  GetAlternateContact: { AlternateContact: "structure" },
-  DescribeRegions: { Regions: "list" },
-  GetPublicAccessBlock: { PublicAccessBlockConfiguration: "structure" },
-  ListBuckets: { Buckets: "list" },
-  GetBucketPolicyStatus: { PolicyStatus: "structure" },
-  GetBucketEncryption: { ServerSideEncryptionConfiguration: "structure" },
-  GetBucketPolicy: { Policy: "policyDocument" },
-  GetEbsEncryptionByDefault: { EbsEncryptionByDefault: "boolean" },
-  DescribeVpcs: { Vpcs: "list" },
-  DescribeFlowLogs: { FlowLogs: "list" },
-  DescribeNetworkAcls: { NetworkAcls: "list" },
-  DescribeSecurityGroups: { SecurityGroups: "list" },
-  DescribeDBInstances: { DBInstances: "list" },
-  ListKeys: { Keys: "list" },
-  DescribeKey: { KeyMetadata: "structure" },
-  GetKeyRotationStatus: { KeyRotationEnabled: "boolean" },
-});
 
 /**
  * The XML element that carries a member when it is not the member's own name. Only the EC2 query protocol renames
@@ -5305,7 +5156,7 @@ const authParams = {
 };
 
 export function registerAwsTools(pi: any): void {
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_check_access",
     label: "Check AWS audit access",
     description:
@@ -5323,9 +5174,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_check_access")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_identity",
     label: "Assess AWS identity posture",
     description:
@@ -5358,9 +5209,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_identity")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_logging_detection",
     label: "Assess AWS logging and detection",
     description:
@@ -5378,9 +5229,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_logging_detection")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_org_guardrails",
     label: "Assess AWS organization guardrails",
     description:
@@ -5403,9 +5254,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_org_guardrails")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_data_protection",
     label: "Assess AWS data protection",
     description:
@@ -5432,9 +5283,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_data_protection")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_network_security",
     label: "Assess AWS network security",
     description:
@@ -5462,9 +5313,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_network_security")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_export_audit_bundle",
     label: "Export AWS audit bundle",
     description:
@@ -5514,7 +5365,7 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_export_audit_bundle")));
 }
 
 /** The IncompleteResponse error the shape guard throws for a command, produced by the guard itself. */

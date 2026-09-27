@@ -69,3 +69,11 @@ export type { PaginationOutcome, PaginationStop, PaginationStopKind } from "./pa
 
 export { INVALID_CONFIGURED_ORIGIN_CODE, NEXT_LINK_REJECTED_CODE, NextLinkError, nextLinkStop, originOf, resolveSameOriginUrl } from "./next-link.js";
 export type { NextLinkRejection } from "./next-link.js";
+
+export {
+  SHARED_COLLECTION_STATES,
+  SHARED_DATASET_STATES,
+  SHARED_INTEGRATION_CONTRACT_VERSION,
+  SHARED_INTEGRATION_REQUIREMENTS,
+  SHARED_PAGINATION_STOP_KINDS,
+} from "./contract.js";
