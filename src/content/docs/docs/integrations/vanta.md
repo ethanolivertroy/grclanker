@@ -11,10 +11,13 @@ Create Auditor API credentials in Vanta with the audit and auditor read scopes, 
 
 ```bash
 export VANTA_CLIENT_ID="..."
-export VANTA_CLIENT_SECRET="..."
+printf 'Vanta client secret: '
+IFS= read -rs VANTA_CLIENT_SECRET
+printf '\n'
+export VANTA_CLIENT_SECRET
 ```
 
-The tools also accept `client_id` and `client_secret` arguments, but environment variables keep credentials out of prompts and shell history.
+The silent `read` keeps the secret value out of interactive Bash and Zsh history. A protected environment file or secret manager that injects the variable into the process is also appropriate. The tools accept `client_id` and `client_secret` arguments, but passing the secret as a tool argument can expose it to prompts, traces, or session storage.
 
 ## Tools
 
