@@ -19,7 +19,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { ConfigFileError, parseJsonConfigText, parseYamlConfigText, readConfigText } from "./hardening/index.js";
-import { checkContract, defineGrcTool, toolContract } from "./spec-model.js";
+import { checkContract, defineGrcTool, evaluateVerdictCriteria, toolContract } from "./spec-model.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import {
   WEBEX_CONTROL_FRAMEWORKS,
@@ -1015,7 +1015,10 @@ function finding(
   evidence?: JsonRecord,
 ): WebexFinding {
   const publishedCheck = checkContract(WEBEX_SPEC, id);
-  if (!publishedCheck.criteria[status]) throw new Error(`Check ${id} has no ${status} criterion`);
+  const evaluatedStatus = evaluateVerdictCriteria(publishedCheck.criteria, evidence ?? {});
+  if (evaluatedStatus !== status) {
+    throw new Error(`Check ${id} runtime status ${status} disagrees with metadata status ${evaluatedStatus}`);
+  }
   const merged: WebexFrameworkMap = {
     fedramp: [],
     cmmc: [],
@@ -1035,7 +1038,7 @@ function finding(
   }
   const mappings = (Object.keys(merged) as WebexFrameworkKey[])
     .flatMap((key) => merged[key].map((value) => `${WEBEX_FRAMEWORK_LABELS[key]} ${value}`));
-  return { id, control, title, severity, status, summary, evidence, mappings, frameworks: merged };
+  return { id, control, title, severity, status: evaluatedStatus, summary, evidence, mappings, frameworks: merged };
 }
 
 function deniedSummary(surface: string, endpoint: string, result: { error: string; status?: number }, requirement: string): string {

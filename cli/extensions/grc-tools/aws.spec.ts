@@ -1,10 +1,12 @@
 import type {
   CheckContract,
   ControlContract,
+  EvaluatedFindingStatus,
   FrameworkKey,
   IntegrationSpecContract,
   RequestContract,
   VerdictCriteria,
+  VerdictFacts,
 } from "./spec-model.js";
 
 export type AwsFrameworkKey = FrameworkKey;
@@ -462,6 +464,7 @@ function criteria(
       { kind: "partial", input: warn, expected: partial, reason: `The partial predicate emits ${partial}.` },
       { kind: "unreadable", input: manual, expected: "manual", reason: "The required evidence cannot be evaluated automatically." },
     ],
+    rules: [],
   };
 }
 
@@ -475,7 +478,31 @@ function awsCheck(
 ): CheckContract {
   const evidenceFields = AWS_EVIDENCE_FIELDS[id];
   if (!evidenceFields) throw new Error(`No evidence schema exists for ${id}`);
-  return { id, controlNumbers: AWS_FINDING_CONTROLS[id], title, severity, owningTool, sourceSurfaceIds, evidenceFields, criteria: verdictCriteria };
+  const evaluate = AWS_VERDICT_EVALUATORS[id];
+  if (!evaluate) throw new Error(`No runtime verdict evaluator exists for ${id}`);
+  const statusDescriptions = {
+    manual: verdictCriteria.manual,
+    fail: verdictCriteria.fail,
+    warn: verdictCriteria.warn,
+    pass: verdictCriteria.pass,
+  } as const;
+  return {
+    id,
+    controlNumbers: AWS_FINDING_CONTROLS[id],
+    title,
+    severity,
+    owningTool,
+    sourceSurfaceIds,
+    evidenceFields,
+    criteria: {
+      ...verdictCriteria,
+      rules: (["manual", "fail", "warn", "pass"] as const).map((status) => ({
+        status,
+        description: statusDescriptions[status],
+        matches: (facts) => evaluate(facts) === status,
+      })),
+    },
+  };
 }
 
 const IDENTITY_TOOL = "aws_assess_identity";
@@ -512,6 +539,192 @@ export const AWS_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> = 
   "AWS-NET-14": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "vpcs", "vpcs_without_active_flow_logs", "vpcs_unverified", "inventory_truncated", "regions_with_vpc_errors", "regions_with_flow_log_errors"],
   "AWS-NET-20": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "sensitive_ports", "network_acls", "permissive_network_acls", "inventory_truncated", "regions_with_errors"],
   "AWS-NET-21": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "sensitive_ports", "security_groups", "unrestricted_security_groups", "inventory_truncated", "regions_with_errors"],
+};
+
+type AwsVerdictEvaluator = (facts: VerdictFacts) => EvaluatedFindingStatus;
+const awsRecord = (value: unknown): Readonly<Record<string, unknown>> | undefined =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Readonly<Record<string, unknown>> : undefined;
+const awsNumber = (facts: VerdictFacts, key: string): number | undefined => typeof facts[key] === "number" ? facts[key] : undefined;
+const awsBoolean = (facts: VerdictFacts, key: string): boolean | undefined => typeof facts[key] === "boolean" ? facts[key] : undefined;
+const awsArray = (facts: VerdictFacts, key: string): readonly unknown[] | undefined => Array.isArray(facts[key]) ? facts[key] as readonly unknown[] : undefined;
+const nonempty = (facts: VerdictFacts, key: string): boolean => (awsArray(facts, key)?.length ?? 0) > 0;
+const regionPartial = (facts: VerdictFacts): boolean => facts.partial === true;
+
+export const AWS_VERDICT_EVALUATORS: Readonly<Record<string, AwsVerdictEvaluator>> = {
+  "AWS-IAM-01": (facts) => {
+    if (facts.summary_readable !== true) return "manual";
+    return facts.account_mfa_enabled === AWS_VERDICT_VALUES.accountMfaEnabled
+      && (facts.account_access_keys_present === null || facts.account_access_keys_present === AWS_VERDICT_VALUES.accountAccessKeysPresent) ? "pass" : "fail";
+  },
+  "AWS-IAM-02": (facts) => {
+    if (facts.users_readable !== true || facts.users_mfa_judged === null) return "manual";
+    if (nonempty(facts, "users_without_mfa")) return "fail";
+    return facts.user_inventory_truncated === true || nonempty(facts, "users_mfa_unreadable") ? "warn" : "pass";
+  },
+  "AWS-IAM-03": (facts) => {
+    if (facts.password_policy_readable !== true) return "manual";
+    if (facts.password_policy_configured !== true) return "fail";
+    const policy = awsRecord(facts.password_policy);
+    const strong = (awsNumber(policy ?? {}, "MinimumPasswordLength") ?? 0) >= AWS_VERDICT_VALUES.minimumPasswordLength
+      && AWS_VERDICT_VALUES.passwordComplexityFields.every((field) => policy?.[field] === true);
+    return strong ? "pass" : "fail";
+  },
+  "AWS-IAM-04": (facts) => {
+    if (facts.users_readable !== true || facts.keys_judged === null) return "manual";
+    if (nonempty(facts, "stale_access_keys")) return "fail";
+    return facts.user_inventory_truncated === true || nonempty(facts, "users_keys_unreadable") || nonempty(facts, "keys_last_used_unreadable") ? "warn" : "pass";
+  },
+  "AWS-IAM-05": (facts) => {
+    if (facts.roles_readable !== true) return "manual";
+    const missing = awsArray(facts, "roles_without_boundaries")?.length ?? 0;
+    const maximum = awsNumber(facts, "max_privileged_roles") ?? AWS_DEFAULTS.maxPrivilegedRoles;
+    if (missing > maximum) return "fail";
+    return missing > 0 || facts.role_inventory_truncated === true ? "warn" : "pass";
+  },
+  "AWS-IAM-06": (facts) => {
+    if (facts.users_readable !== true) return "manual";
+    return nonempty(facts, "dormant_users") || facts.user_inventory_truncated === true || nonempty(facts, "users_keys_unreadable") ? "warn" : "pass";
+  },
+  "AWS-IAM-07": (facts) => {
+    if (facts.events_readable !== true) return "manual";
+    if (nonempty(facts, "root_console_logins")) return "fail";
+    if (nonempty(facts, "root_other_events")) return "warn";
+    return facts.global_lookup_error || facts.lookup_truncated === true || (awsNumber(facts, "undated_root_events") ?? 0) > 0 ? "warn" : "pass";
+  },
+  "AWS-IAM-08": (facts) => {
+    if (facts.policies_readable !== true || awsNumber(facts, "customer_managed_policies") === 0) return "manual";
+    if (nonempty(facts, "full_admin_attached")) return "fail";
+    return nonempty(facts, "full_admin_unattached") || nonempty(facts, "service_wildcard_policies")
+      || nonempty(facts, "policies_unreadable") || facts.policy_inventory_truncated === true ? "warn" : "pass";
+  },
+  "AWS-LOG-01": (facts) => {
+    if (facts.trails_readable !== true) return "manual";
+    const trails = awsArray(facts, "trails")?.map(awsRecord).filter(Boolean) ?? [];
+    const good = trails.some((trail) => trail?.is_multi_region === true && trail.validation === true && trail.is_logging === true);
+    const unverified = trails.some((trail) => trail?.is_multi_region === true && trail.validation === true && trail.is_logging === null);
+    if (!good) return unverified ? "manual" : "fail";
+    return trails.some((trail) => trail?.status_error) ? "warn" : "pass";
+  },
+  "AWS-LOG-02": (facts) => {
+    if (facts.trails_readable !== true || facts.data_event_trails === null) return "manual";
+    const dataEvents = awsArray(facts, "data_event_trails")?.length ?? 0;
+    const unreadable = awsArray(facts, "selectors_unreadable")?.length ?? 0;
+    if (dataEvents === 0) return unreadable > 0 ? "manual" : "warn";
+    return unreadable > 0 ? "warn" : "pass";
+  },
+  "AWS-LOG-03": (facts) => {
+    if (facts.hub_readable !== true) return "manual";
+    if (facts.hub_enabled !== true) return "fail";
+    if (facts.standards_readable !== true || (awsNumber(facts, "standard_count") ?? 0) === 0 || facts.standards_truncated === true) return "warn";
+    return "pass";
+  },
+  "AWS-LOG-04": (facts) => {
+    if (facts.detectors_readable !== true || facts.enabled_detectors === null) return "manual";
+    const enabled = awsNumber(facts, "enabled_detectors") ?? 0;
+    if (enabled === 0) return nonempty(facts, "detectors_unreadable") ? "manual" : "fail";
+    return nonempty(facts, "detectors_unreadable") || facts.detector_list_truncated === true ? "warn" : "pass";
+  },
+  "AWS-LOG-05": (facts) => {
+    if (facts.recorders_readable !== true) return "manual";
+    const recorders = awsArray(facts, "recorders") ?? [];
+    if (recorders.length === 0) return "fail";
+    if (facts.recorder_status_readable !== true) return "manual";
+    const statuses = awsArray(facts, "recorder_statuses")?.map(awsRecord).filter(Boolean) ?? [];
+    return statuses.some((status) => status?.recording === true) ? "pass" : "fail";
+  },
+  "AWS-ORG-01": (facts) => {
+    if (facts.organization_readable !== true) return "manual";
+    if (facts.standalone === true) return "warn";
+    return facts.accounts_readable === false || facts.account_list_truncated === true ? "warn" : "pass";
+  },
+  "AWS-ORG-02": (facts) => {
+    if (facts.scps_readable === null) return "warn";
+    if (facts.scps_readable !== true) return "manual";
+    if ((awsNumber(facts, "scp_count") ?? 0) === 0) return "warn";
+    if (facts.attached_scp_count === null) return "manual";
+    const attached = awsNumber(facts, "attached_scp_count") ?? 0;
+    if (attached === 0 && !nonempty(facts, "scps_targets_unreadable")) return "fail";
+    return nonempty(facts, "scps_targets_unreadable") || facts.scp_list_truncated === true ? "warn" : "pass";
+  },
+  "AWS-ORG-03": (facts) => {
+    if (facts.analyzers_readable !== true) return "manual";
+    const analyzers = awsArray(facts, "analyzers")?.map(awsRecord).filter(Boolean) ?? [];
+    if (!analyzers.some((analyzer) => analyzer?.status === AWS_VERDICT_VALUES.activeAnalyzerStatus)) return "fail";
+    return facts.analyzer_list_truncated === true ? "warn" : "pass";
+  },
+  "AWS-ORG-04": (facts) => {
+    if (facts.analyzers_readable !== true || facts.analyzers_sampled === null || facts.active_finding_count === null) return "manual";
+    if ((awsNumber(facts, "active_finding_count") ?? 0) > 0) return "warn";
+    return nonempty(facts, "analyzers_findings_unreadable") || nonempty(facts, "analyzers_findings_truncated") ? "warn" : "pass";
+  },
+  "AWS-ORG-05": (facts) => {
+    if (facts.instances_readable !== true) return "manual";
+    if ((awsNumber(facts, "identity_center_instances") ?? 0) === 0) return "warn";
+    return facts.instance_list_truncated === true ? "warn" : "pass";
+  },
+  "AWS-ORG-06": (facts) => {
+    if (facts.assessments_readable !== true) return "manual";
+    if ((awsNumber(facts, "active_assessments") ?? 0) === 0) return "fail";
+    const undated = awsArray(facts, "assessments")?.map(awsRecord).filter((assessment) => assessment?.last_updated === null).length ?? 0;
+    return undated > 0 || facts.list_truncated === true ? "warn" : "pass";
+  },
+  "AWS-ORG-07": (facts) => {
+    if (facts.contact_readable !== true) return "manual";
+    if (facts.security_contact_configured !== true) return "fail";
+    return facts.email_domain === null || facts.has_phone !== true ? "warn" : "pass";
+  },
+  "AWS-DATA-11": (facts) => {
+    if (facts.account_block_readable !== true || facts.buckets_readable !== true) return "manual";
+    const flags = awsRecord(facts.account_flags);
+    const full = AWS_REQUIRED_PUBLIC_ACCESS_FLAGS.every((name) => flags?.[name] === true);
+    const uncovered = awsArray(facts, "buckets_without_full_block")?.length ?? 0;
+    const publicPolicies = awsArray(facts, "buckets_with_public_policy")?.length ?? 0;
+    if (facts.account_block_configured !== true || (!full && (uncovered > 0 || publicPolicies > 0))) return "fail";
+    if (!full || publicPolicies > 0) return "warn";
+    return nonempty(facts, "buckets_unreadable") || facts.bucket_inventory_truncated === true ? "warn" : "pass";
+  },
+  "AWS-DATA-12": (facts) => {
+    const ebs = awsArray(facts, "ebs_by_region")?.map(awsRecord).filter(Boolean) ?? [];
+    if (ebs.length > 0 && ebs.every((row) => row?.EbsEncryptionByDefault === null)) return "manual";
+    if (facts.buckets_readable !== true) return "manual";
+    if (ebs.some((row) => row?.EbsEncryptionByDefault === false)
+      || nonempty(facts, "rds_unencrypted") || nonempty(facts, "buckets_without_default_encryption")) return "fail";
+    return regionPartial(facts) || ebs.some((row) => row?.EbsEncryptionByDefault === null)
+      || nonempty(facts, "regions_with_rds_errors") || nonempty(facts, "rds_without_flag")
+      || nonempty(facts, "buckets_encryption_unreadable") || facts.bucket_inventory_truncated === true ? "warn" : "pass";
+  },
+  "AWS-DATA-13": (facts) => {
+    if (facts.buckets_readable !== true || (awsNumber(facts, "buckets") ?? 0) === 0) return "manual";
+    if (nonempty(facts, "buckets_without_tls_deny")) return "fail";
+    return nonempty(facts, "buckets_policy_unreadable") || facts.bucket_inventory_truncated === true ? "warn" : "pass";
+  },
+  "AWS-DATA-22": (facts) => {
+    if (facts.keys === null || facts.customer_managed_keys === null || (awsNumber(facts, "customer_managed_keys") ?? 0) === 0) return "manual";
+    if (nonempty(facts, "keys_not_rotating")) return "fail";
+    if ((awsNumber(facts, "eligible_keys") ?? 0) === 0) return "warn";
+    return regionPartial(facts) || nonempty(facts, "keys_rotation_unreadable") || nonempty(facts, "keys_manager_unreadable")
+      || facts.key_inventory_truncated === true || nonempty(facts, "regions_with_list_errors") ? "warn" : "pass";
+  },
+  "AWS-NET-14": (facts) => {
+    const vpcs = awsNumber(facts, "vpcs");
+    if (vpcs === undefined || vpcs === 0 || facts.vpcs_without_active_flow_logs === null) return "manual";
+    if (nonempty(facts, "vpcs_without_active_flow_logs")) return "fail";
+    if ((awsArray(facts, "vpcs_unverified")?.length ?? 0) === vpcs) return "manual";
+    return regionPartial(facts) || nonempty(facts, "vpcs_unverified") || facts.inventory_truncated === true
+      || nonempty(facts, "regions_with_vpc_errors") || nonempty(facts, "regions_with_flow_log_errors") ? "warn" : "pass";
+  },
+  "AWS-NET-20": (facts) => {
+    const count = awsNumber(facts, "network_acls");
+    if (count === undefined || count === 0) return "manual";
+    if (nonempty(facts, "permissive_network_acls")) return "fail";
+    return regionPartial(facts) || facts.inventory_truncated === true || nonempty(facts, "regions_with_errors") ? "warn" : "pass";
+  },
+  "AWS-NET-21": (facts) => {
+    const count = awsNumber(facts, "security_groups");
+    if (count === undefined || count === 0) return "manual";
+    if (nonempty(facts, "unrestricted_security_groups")) return "fail";
+    return regionPartial(facts) || facts.inventory_truncated === true || nonempty(facts, "regions_with_errors") ? "warn" : "pass";
+  },
 };
 
 export const AWS_CHECKS: readonly CheckContract[] = [

@@ -112,7 +112,7 @@ import type {
   AwsFrameworkKey,
   AwsOutputMemberKind,
 } from "./aws.spec.js";
-import { checkContract, defineGrcTool, toolContract } from "./spec-model.js";
+import { checkContract, defineGrcTool, evaluateVerdictCriteria, toolContract } from "./spec-model.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 export {
@@ -359,8 +359,11 @@ function finding(
   evidence?: JsonRecord,
 ): AwsFinding {
   const publishedCheck = checkContract(AWS_SPEC, id);
-  if (!publishedCheck.criteria[status]) throw new Error(`Check ${id} has no ${status} criterion`);
-  return { id, title, severity, status, summary, mappings, evidence };
+  const evaluatedStatus = evaluateVerdictCriteria(publishedCheck.criteria, evidence ?? {});
+  if (evaluatedStatus !== status) {
+    throw new Error(`Check ${id} runtime status ${status} disagrees with metadata status ${evaluatedStatus}`);
+  }
+  return { id, title, severity, status: evaluatedStatus, summary, mappings, evidence };
 }
 
 /** Every JSON file the bundle writes goes through the snapshot walk first (rule 9 at every depth, with the cap). */

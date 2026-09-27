@@ -97,6 +97,16 @@ export interface VerdictCriteria {
   manual: string;
   constants: Readonly<Record<string, PortableValue>>;
   examples: readonly CriterionExample[];
+  rules: readonly VerdictRule[];
+}
+
+export type EvaluatedFindingStatus = "pass" | "warn" | "fail" | "manual";
+export type VerdictFacts = Readonly<Record<string, unknown>>;
+
+export interface VerdictRule {
+  status: EvaluatedFindingStatus;
+  description: string;
+  matches: (facts: VerdictFacts) => boolean;
 }
 
 export interface CriterionExample {
@@ -247,4 +257,11 @@ export function criterionConstant<T extends PortableValue>(
   const value = checkContract(spec, checkId).criteria.constants[name];
   if (value === undefined) throw new Error(`Check ${checkId} has no criterion constant ${name}`);
   return value as T;
+}
+
+export function evaluateVerdictCriteria(criteria: VerdictCriteria, facts: VerdictFacts): EvaluatedFindingStatus {
+  for (const rule of criteria.rules) {
+    if (rule.matches(facts)) return rule.status;
+  }
+  throw new Error("No verdict criterion matched the supplied facts");
 }
