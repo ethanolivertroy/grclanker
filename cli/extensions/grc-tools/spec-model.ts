@@ -137,6 +137,7 @@ export interface CheckContract {
   owningTool: string;
   sourceSurfaceIds: readonly string[];
   evidenceFields: readonly string[];
+  derivedFacts: Readonly<Record<string, string>>;
   criteria: VerdictCriteria;
 }
 
@@ -311,7 +312,8 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
     case "not":
       return !evaluateCondition(condition.condition, facts, item);
     case "defined":
-      return operandValue(condition.operand, facts, item) !== undefined;
+      return operandValue(condition.operand, facts, item) !== undefined
+        && operandValue(condition.operand, facts, item) !== null;
     case "null":
       return operandValue(condition.operand, facts, item) === null;
     case "eq":
@@ -319,13 +321,17 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
     case "ne":
       return operandValue(condition.left, facts, item) !== operandValue(condition.right, facts, item);
     case "gt":
-      return Number(operandValue(condition.left, facts, item)) > Number(operandValue(condition.right, facts, item));
     case "gte":
-      return Number(operandValue(condition.left, facts, item)) >= Number(operandValue(condition.right, facts, item));
     case "lt":
-      return Number(operandValue(condition.left, facts, item)) < Number(operandValue(condition.right, facts, item));
-    case "lte":
-      return Number(operandValue(condition.left, facts, item)) <= Number(operandValue(condition.right, facts, item));
+    case "lte": {
+      const left = operandValue(condition.left, facts, item);
+      const right = operandValue(condition.right, facts, item);
+      if (left === null || left === undefined || right === null || right === undefined) return false;
+      if (condition.op === "gt") return Number(left) > Number(right);
+      if (condition.op === "gte") return Number(left) >= Number(right);
+      if (condition.op === "lt") return Number(left) < Number(right);
+      return Number(left) <= Number(right);
+    }
     case "some":
     case "every": {
       const value = pathValue(facts, condition.path, item);
@@ -371,7 +377,7 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
     case "not":
       return `not (${renderVerdictCondition(condition.condition)})`;
     case "defined":
-      return `${renderOperand(condition.operand)} is defined`;
+      return `${renderOperand(condition.operand)} is present and non-null`;
     case "null":
       return `${renderOperand(condition.operand)} is null`;
     case "eq":
@@ -393,6 +399,39 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
     default: {
       const unhandled: never = condition;
       return String(unhandled);
+    }
+  }
+}
+
+function operandPaths(operand: VerdictOperand): string[] {
+  return operand.kind === "path" || operand.kind === "length" ? [operand.path] : [];
+}
+
+export function verdictConditionPaths(condition: VerdictCondition): string[] {
+  switch (condition.op) {
+    case "always":
+      return [];
+    case "and":
+    case "or":
+      return condition.conditions.flatMap(verdictConditionPaths);
+    case "not":
+      return verdictConditionPaths(condition.condition);
+    case "defined":
+    case "null":
+      return operandPaths(condition.operand);
+    case "eq":
+    case "ne":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte":
+      return [...operandPaths(condition.left), ...operandPaths(condition.right)];
+    case "some":
+    case "every":
+      return [condition.path, ...verdictConditionPaths(condition.condition)];
+    default: {
+      const unhandled: never = condition;
+      return [String(unhandled)];
     }
   }
 }

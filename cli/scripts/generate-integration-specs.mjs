@@ -7,7 +7,7 @@ import {
   SHARED_INTEGRATION_REQUIREMENTS,
   SHARED_REDACTION_RULES,
 } from "../dist/extensions/grc-tools/hardening/contract.js";
-import { collectDefinedGrcTools, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
+import { collectDefinedGrcTools, renderVerdictCondition, verdictConditionPaths } from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -189,6 +189,8 @@ function renderChecks(spec) {
     .map(([name, value]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(Array.isArray(value) ? value.join(", ") : value)} |`));
   const exampleRows = spec.checks.flatMap((check) => check.criteria.examples
     .map((example) => `| \`${check.id}\` | ${example.kind} | ${escapeCell(example.input)} | ${example.expected} | ${escapeCell(example.reason)} |`));
+  const derivedRows = spec.checks.flatMap((check) => Object.entries(check.derivedFacts)
+    .map(([name, derivation]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(derivation)} |`));
   return [
     "## Checks",
     "",
@@ -220,6 +222,12 @@ function renderChecks(spec) {
     "|---|---|---|---|---|",
     ...spec.checks.flatMap((check) => check.criteria.rules.map((rule, index) =>
       `| \`${check.id}\` | ${index + 1} | ${rule.status} | ${escapeCell(renderVerdictCondition(rule.condition))} | ${escapeCell(rule.note ?? "")} |`)),
+    "",
+    "### Derived decision facts",
+    "",
+    "| Finding | Input | Portable derivation |",
+    "|---|---|---|",
+    ...(derivedRows.length > 0 ? derivedRows : ["| None |  |  |"]),
     "",
     "### Criterion constants",
     "",
@@ -419,6 +427,21 @@ export function renderSharedContract() {
   ].join("\n");
 }
 
+export function validateDecisionInputs(contract) {
+  for (const check of contract.checks) {
+    const declared = new Set([...check.evidenceFields, ...Object.keys(check.derivedFacts)]);
+    for (const [index, rule] of check.criteria.rules.entries()) {
+      for (const path of verdictConditionPaths(rule.condition)) {
+        if (path === "$" || path.startsWith("$.")) continue;
+        const root = path.split(".")[0];
+        if (!declared.has(root)) {
+          throw new Error(`${check.id} rule ${index + 1} references undeclared decision input ${root}`);
+        }
+      }
+    }
+  }
+}
+
 export async function renderAllIntegrationSpecs() {
   const outputs = new Map([[sharedContractPath, renderSharedContract()]]);
   for (const entry of PUBLISHED_INTEGRATION_SPECS) {
@@ -430,6 +453,7 @@ export async function renderAllIntegrationSpecs() {
     if (JSON.stringify(expectedNames) !== JSON.stringify(actualNames)) {
       throw new Error(`${entry.contract.identity.slug} registered tools do not match its published tool contracts`);
     }
+    validateDecisionInputs(entry.contract);
     outputs.set(resolve(repoRoot, entry.outputPath), renderIntegrationSpec(entry, narrative, tools));
   }
   return outputs;

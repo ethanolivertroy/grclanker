@@ -345,6 +345,7 @@ function check(
 ): CheckContract {
   const evidenceFields = WEBEX_EVIDENCE_FIELDS[id];
   if (!evidenceFields) throw new Error(`No evidence schema exists for ${id}`);
+  const derivedFacts = WEBEX_DERIVED_FACTS[id] ?? {};
   const rules = WEBEX_VERDICT_RULES[id];
   if (!rules) throw new Error(`No runtime verdict rules exist for ${id}`);
   return {
@@ -355,6 +356,7 @@ function check(
     owningTool,
     sourceSurfaceIds,
     evidenceFields,
+    derivedFacts,
     criteria: {
       ...verdictCriteria,
       rules,
@@ -391,6 +393,15 @@ export const WEBEX_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> 
   "WEBEX-MTG-07": ["citation"],
 };
 
+export const WEBEX_DERIVED_FACTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "WEBEX-COLLAB-06": {
+    license_warn_threshold_units: `Multiply total_units by maximumUnassignedRatio (${WEBEX_VERDICT_VALUES.maximumUnassignedLicenseRatio}).`,
+  },
+  "WEBEX-MTG-04": {
+    hybrid_lists_truncated: "Boolean OR of the hybrid-clusters truncated flag and the hybrid-connectors truncated flag.",
+  },
+};
+
 const path = (name: string, fallback?: PortableValue): VerdictOperand =>
   fallback === undefined ? { kind: "path", path: name } : { kind: "path", path: name, fallback };
 const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
@@ -406,13 +417,10 @@ const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?:
 const alwaysManualRules = (note: string): readonly VerdictRule[] => [rule("manual", { op: "always" }, note)];
 const statusUnreadable = (name: string): VerdictCondition => eq(`${name}.readable`, false);
 const siteRules = (secondaryStatuses: readonly string[]): readonly VerdictRule[] => [
-  rule("manual", or(not(defined("sites")), compare("eq", length("sites"), value(0)), some("sites", eq("$.status", "manual")))),
   rule("fail", some("sites", eq("$.status", "fail"))),
-  rule("warn", or(
-    some("sites", eq("$.status", "warn")),
-    eq("site_coverage_complete", false),
-    ...secondaryStatuses.map(statusUnreadable),
-  )),
+  rule("warn", some("sites", eq("$.status", "warn"))),
+  rule("manual", or(not(defined("sites")), compare("eq", length("sites"), value(0)), some("sites", eq("$.status", "manual")))),
+  rule("warn", or(eq("site_coverage_complete", false), ...secondaryStatuses.map(statusUnreadable))),
   rule("pass", { op: "always" }),
 ];
 

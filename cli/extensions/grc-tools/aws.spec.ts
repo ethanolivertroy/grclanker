@@ -480,6 +480,7 @@ function awsCheck(
 ): CheckContract {
   const evidenceFields = AWS_EVIDENCE_FIELDS[id];
   if (!evidenceFields) throw new Error(`No evidence schema exists for ${id}`);
+  const derivedFacts = AWS_DERIVED_FACTS[id] ?? {};
   const rules = AWS_VERDICT_RULES[id];
   if (!rules) throw new Error(`No runtime verdict rules exist for ${id}`);
   return {
@@ -490,6 +491,7 @@ function awsCheck(
     owningTool,
     sourceSurfaceIds,
     evidenceFields,
+    derivedFacts,
     criteria: {
       ...verdictCriteria,
       rules,
@@ -531,6 +533,15 @@ export const AWS_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> = 
   "AWS-NET-14": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "vpcs", "vpcs_without_active_flow_logs", "vpcs_unverified", "inventory_truncated", "regions_with_vpc_errors", "regions_with_flow_log_errors"],
   "AWS-NET-20": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "sensitive_ports", "network_acls", "permissive_network_acls", "inventory_truncated", "regions_with_errors"],
   "AWS-NET-21": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "sensitive_ports", "security_groups", "unrestricted_security_groups", "inventory_truncated", "regions_with_errors"],
+};
+
+export const AWS_DERIVED_FACTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "AWS-IAM-07": {
+    undated_root_events: "Count entries returned by LookupEvents whose EventTime is absent or cannot be parsed as a date.",
+  },
+  "AWS-ORG-06": {
+    undated_assessments: "Count ACTIVE assessment records for which both lastUpdated and creationTime are absent or cannot be parsed as dates.",
+  },
 };
 
 const awsPath = (name: string, fallback?: PortableValue): VerdictOperand =>

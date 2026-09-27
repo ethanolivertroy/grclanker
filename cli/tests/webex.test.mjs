@@ -1026,6 +1026,22 @@ test("WEBEX-MTG-02 and WEBEX-MTG-06 judge lobby and password defaults per site f
   assert.equal(byId(missing.findings, "WEBEX-MTG-06").status, "manual");
 });
 
+test("mixed manual and failing Webex sites preserve fail precedence", async () => {
+  const result = await assessWebexMeetingHybridSecurity(compliantClient({
+    async listMeetingSites() {
+      return page([{ siteUrl: "manual.webex.com" }, { siteUrl: "failing.webex.com" }]);
+    },
+    async getMeetingCommonSettings(siteUrl) {
+      return siteUrl === "manual.webex.com"
+        ? { siteOptions: { allowCustomPersonalRoomURL: true } }
+        : compliantCommonSettings({ joinBeforeHost: true, requireStrongPassword: false, requireLoginBeforeAccess: false });
+    },
+  }));
+  for (const id of ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"]) {
+    assert.equal(byId(result.findings, id).status, "fail", id);
+  }
+});
+
 test("site coverage: a denied or unlisted site downgrades a passing commonSettings verdict to warn", async () => {
   const requested = [];
   const twoSites = compliantClient({

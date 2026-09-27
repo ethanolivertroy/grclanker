@@ -29,6 +29,7 @@ import {
   checkIntegrationSpecs,
   repoRoot,
   renderAllIntegrationSpecs,
+  validateDecisionInputs,
 } from "../scripts/generate-integration-specs.mjs";
 
 const expectedDatasetStates = ["complete", "truncated", "unreadable", "not_requested"];
@@ -142,7 +143,7 @@ test("ordered decision rules cover reachable boundaries and precedence", () => {
     [WEBEX_SPEC, "WEBEX-COLLAB-04", { rooms_seen: 1, rooms_without_classification_count: 1, rooms_truncated: true }, "fail"],
     [WEBEX_SPEC, "WEBEX-COLLAB-05", { webhooks_seen: 1, insecure_webhooks_count: 1, webhooks_truncated: true }, "fail"],
     [WEBEX_SPEC, "WEBEX-MTG-04", { clusters_seen: 1, connectors_seen: 0, hybrid_lists_truncated: true }, "fail"],
-    [WEBEX_SPEC, "WEBEX-MTG-02", { sites: [{ status: "manual" }, { status: "fail" }], site_coverage_complete: false, token_probe_status: { readable: false } }, "manual"],
+    [WEBEX_SPEC, "WEBEX-MTG-02", { sites: [{ status: "manual" }, { status: "fail" }], site_coverage_complete: false, token_probe_status: { readable: false } }, "fail"],
     [AWS_SPEC, "AWS-LOG-02", { trails_readable: true, data_event_trails: ["org-trail"], selectors_unreadable: ["regional-trail"] }, "warn"],
     [AWS_SPEC, "AWS-NET-14", { vpcs: 1, vpcs_without_active_flow_logs: [{ vpc_id: "vpc-1" }], vpcs_unverified: [], partial: true }, "fail"],
     [AWS_SPEC, "AWS-LOG-04", { detectors_readable: false, enabled_detectors: 0, detectors_unreadable: [] }, "manual"],
@@ -151,6 +152,43 @@ test("ordered decision rules cover reachable boundaries and precedence", () => {
     const check = checkContract(spec, id);
     assert.equal(evaluateVerdictCriteria(check.criteria, facts), expected, `${id}: ${expected}`);
   }
+});
+
+test("null and missing unavailable evidence demotes to manual instead of pass", () => {
+  const cases = [
+    ["WEBEX-COLLAB-04", { rooms_seen: null }],
+    ["WEBEX-COLLAB-04", {}],
+    ["WEBEX-COLLAB-05", { webhooks_seen: null }],
+    ["WEBEX-COLLAB-05", {}],
+    ["WEBEX-COLLAB-06", { total_units: null, unassigned_units: 0 }],
+    ["WEBEX-COLLAB-06", {}],
+    ["WEBEX-COLLAB-07", { events_seen: null }],
+    ["WEBEX-COLLAB-07", {}],
+  ];
+  for (const [id, facts] of cases) {
+    const check = checkContract(WEBEX_SPEC, id);
+    assert.equal(evaluateVerdictCriteria(check.criteria, facts), "manual", `${id}: ${JSON.stringify(facts)}`);
+  }
+});
+
+test("generator rejects rule inputs absent from evidence and derived-fact schemas", () => {
+  validateDecisionInputs(AWS_SPEC);
+  validateDecisionInputs(WEBEX_SPEC);
+  const check = AWS_SPEC.checks[0];
+  const invalid = {
+    ...AWS_SPEC,
+    checks: [{
+      ...check,
+      criteria: {
+        ...check.criteria,
+        rules: [{ status: "manual", condition: { op: "defined", operand: { kind: "path", path: "undeclared_fact" } } }],
+      },
+    }],
+  };
+  assert.throws(
+    () => validateDecisionInputs(invalid),
+    /AWS-IAM-01 rule 1 references undeclared decision input undeclared_fact/,
+  );
 });
 
 test("request and pagination metadata matches the concrete pilot clients", () => {
