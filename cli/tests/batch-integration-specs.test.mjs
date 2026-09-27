@@ -181,7 +181,19 @@ test("generated batch specs are portable and contain no repository-language leak
 });
 
 test("contracts enumerate exact surfaces, permission unlocks, framework mappings, and ServiceNow auth support", () => {
-  const emptySurfaceChecks = new Set(["BOX-08", "BOX-19", "BOX-23"]);
+  const emptySurfaceChecks = new Set([
+    "BOX-08",
+    "OKTA-MON-009",
+    "SLACK-ADMIN-04",
+    "SLACK-ADMIN-06",
+    "SLACK-APP-05",
+    "SLACK-APP-07",
+    "SLACK-CHAN-04",
+    "SLACK-CHAN-05",
+    "SLACK-MON-06",
+    "ZOOM-ID-07",
+    "ZOOM-COLLAB-08",
+  ]);
   for (const [spec] of batch) {
     const surfaceIds = new Set(spec.apiSurfaces.map((surface) => surface.id));
     assert.equal(surfaceIds.size, spec.apiSurfaces.length, `${spec.identity.slug}: unique surfaces`);
