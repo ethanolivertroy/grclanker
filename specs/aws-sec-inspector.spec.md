@@ -589,7 +589,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `AWS-IAM-06` | 3 | pass | always |  |
 | `AWS-IAM-07` | 1 | manual | `events_readable` equals false |  |
 | `AWS-IAM-07` | 2 | fail | length of `root_console_logins` is greater than 0 |  |
-| `AWS-IAM-07` | 3 | warn | any of (length of `root_other_events` is greater than 0; all of (`global_lookup_error` is defined; `global_lookup_error` does not equal null); `lookup_truncated` equals true; `undated_root_events` (default 0) is greater than 0) |  |
+| `AWS-IAM-07` | 3 | warn | any of (length of `root_other_events` is greater than 0; all of (`global_lookup_error` is present and non-null; `global_lookup_error` does not equal null); `lookup_truncated` equals true; `undated_root_events` (default 0) is greater than 0) |  |
 | `AWS-IAM-07` | 4 | pass | always |  |
 | `AWS-IAM-08` | 1 | manual | any of (`policies_readable` equals false; `customer_managed_policies` equals 0) |  |
 | `AWS-IAM-08` | 2 | fail | length of `full_admin_attached` is greater than 0 |  |
@@ -597,7 +597,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `AWS-IAM-08` | 4 | pass | always |  |
 | `AWS-LOG-01` | 1 | manual | any of (`trails_readable` equals false; all of (not (some item in `trails` satisfies (all of (`$.is_multi_region` equals true; `$.validation` equals true; `$.is_logging` equals true))); some item in `trails` satisfies (all of (`$.is_multi_region` equals true; `$.validation` equals true; `$.is_logging` is null)))) |  |
 | `AWS-LOG-01` | 2 | fail | not (some item in `trails` satisfies (all of (`$.is_multi_region` equals true; `$.validation` equals true; `$.is_logging` equals true))) |  |
-| `AWS-LOG-01` | 3 | warn | some item in `trails` satisfies (all of (`$.status_error` is defined; `$.status_error` does not equal null)) |  |
+| `AWS-LOG-01` | 3 | warn | some item in `trails` satisfies (all of (`$.status_error` is present and non-null; `$.status_error` does not equal null)) |  |
 | `AWS-LOG-01` | 4 | pass | always |  |
 | `AWS-LOG-02` | 1 | manual | any of (`trails_readable` equals false; `data_event_trails` is null; all of (length of `data_event_trails` equals 0; length of `selectors_unreadable` is greater than 0)) |  |
 | `AWS-LOG-02` | 2 | warn | any of (length of `data_event_trails` equals 0; length of `selectors_unreadable` is greater than 0) |  |
@@ -656,18 +656,25 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `AWS-DATA-22` | 2 | fail | length of `keys_not_rotating` is greater than 0 |  |
 | `AWS-DATA-22` | 3 | warn | any of (`eligible_keys` equals 0; `partial` equals true; length of `keys_rotation_unreadable` is greater than 0; length of `keys_manager_unreadable` is greater than 0; `key_inventory_truncated` equals true; length of `regions_with_list_errors` is greater than 0) |  |
 | `AWS-DATA-22` | 4 | pass | always |  |
-| `AWS-NET-14` | 1 | manual | any of (not (`vpcs` is defined); `vpcs` equals 0; `vpcs_without_active_flow_logs` is null; length of `vpcs_unverified` equals `vpcs` (default 0)) |  |
+| `AWS-NET-14` | 1 | manual | any of (not (`vpcs` is present and non-null); `vpcs` equals 0; `vpcs_without_active_flow_logs` is null; length of `vpcs_unverified` equals `vpcs` (default 0)) |  |
 | `AWS-NET-14` | 2 | fail | length of `vpcs_without_active_flow_logs` is greater than 0 |  |
 | `AWS-NET-14` | 3 | warn | any of (`partial` equals true; length of `vpcs_unverified` is greater than 0; `inventory_truncated` equals true; length of `regions_with_vpc_errors` is greater than 0; length of `regions_with_flow_log_errors` is greater than 0) |  |
 | `AWS-NET-14` | 4 | pass | always |  |
-| `AWS-NET-20` | 1 | manual | any of (not (`network_acls` is defined); `network_acls` is null; `network_acls` equals 0) |  |
+| `AWS-NET-20` | 1 | manual | any of (not (`network_acls` is present and non-null); `network_acls` is null; `network_acls` equals 0) |  |
 | `AWS-NET-20` | 2 | fail | length of `permissive_network_acls` is greater than 0 |  |
 | `AWS-NET-20` | 3 | warn | any of (`partial` equals true; `inventory_truncated` equals true; length of `regions_with_errors` is greater than 0) |  |
 | `AWS-NET-20` | 4 | pass | always |  |
-| `AWS-NET-21` | 1 | manual | any of (not (`security_groups` is defined); `security_groups` is null; `security_groups` equals 0) |  |
+| `AWS-NET-21` | 1 | manual | any of (not (`security_groups` is present and non-null); `security_groups` is null; `security_groups` equals 0) |  |
 | `AWS-NET-21` | 2 | fail | length of `unrestricted_security_groups` is greater than 0 |  |
 | `AWS-NET-21` | 3 | warn | any of (`partial` equals true; `inventory_truncated` equals true; length of `regions_with_errors` is greater than 0) |  |
 | `AWS-NET-21` | 4 | pass | always |  |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `AWS-IAM-07` | `undated_root_events` | Count entries returned by LookupEvents whose EventTime is absent or cannot be parsed as a date. |
+| `AWS-ORG-06` | `undated_assessments` | Count ACTIVE assessment records for which both lastUpdated and creationTime are absent or cannot be parsed as dates. |
 
 ### Criterion constants
 

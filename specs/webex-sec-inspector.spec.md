@@ -394,57 +394,67 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 |---|---|---|---|---|
 | `WEBEX-ID-01` | 1 | manual | always | SSO state has no documented read field. |
 | `WEBEX-ID-02` | 1 | manual | always | Administrator MFA state has no documented read field. |
-| `WEBEX-ID-03` | 1 | manual | any of (not (`people_seen` is defined); `people_seen` equals 0) |  |
-| `WEBEX-ID-03` | 2 | fail | any of (not (`compliance_officer_count` is defined); `compliance_officer_count` equals 0) |  |
+| `WEBEX-ID-03` | 1 | manual | any of (not (`people_seen` is present and non-null); `people_seen` equals 0) |  |
+| `WEBEX-ID-03` | 2 | fail | any of (not (`compliance_officer_count` is present and non-null); `compliance_officer_count` equals 0) |  |
 | `WEBEX-ID-03` | 3 | warn | `people_truncated` equals true |  |
 | `WEBEX-ID-03` | 4 | pass | always |  |
-| `WEBEX-ID-04` | 1 | manual | any of (`people_seen` equals 0; all of (not (`admin_users` is defined); not (`admin_count` is defined))) |  |
-| `WEBEX-ID-04` | 2 | warn | any of (`admin_count` (default -1) equals 0; all of (not (`admin_count` is defined); `admin_users` equals 0); `admin_count` (default 0) is greater than `max_admins` (default 10); `people_truncated` equals true) |  |
+| `WEBEX-ID-04` | 1 | manual | any of (`people_seen` equals 0; all of (not (`admin_users` is present and non-null); not (`admin_count` is present and non-null))) |  |
+| `WEBEX-ID-04` | 2 | warn | any of (`admin_count` (default -1) equals 0; all of (not (`admin_count` is present and non-null); `admin_users` equals 0); `admin_count` (default 0) is greater than `max_admins` (default 10); `people_truncated` equals true) |  |
 | `WEBEX-ID-04` | 3 | pass | always |  |
-| `WEBEX-ID-05` | 1 | manual | not (`bot_count` is defined) |  |
+| `WEBEX-ID-05` | 1 | manual | not (`bot_count` is present and non-null) |  |
 | `WEBEX-ID-05` | 2 | warn | `people_truncated` equals true |  |
 | `WEBEX-ID-05` | 3 | pass | always |  |
 | `WEBEX-ID-06` | 1 | manual | always | Bot approval has no documented read field. |
-| `WEBEX-ID-07` | 1 | manual | any of (not (`guest_count_people` is defined); `guest_count_people` is null; `people_seen` equals 0) |  |
+| `WEBEX-ID-07` | 1 | manual | any of (not (`guest_count_people` is present and non-null); `guest_count_people` is null; `people_seen` equals 0) |  |
 | `WEBEX-ID-07` | 2 | warn | any of (`people_truncated` equals true; `guest_count_api_status.readable` equals false) |  |
 | `WEBEX-ID-07` | 3 | pass | always |  |
 | `WEBEX-COLLAB-01` | 1 | manual | always | External communication policy has no documented read field. |
 | `WEBEX-COLLAB-02` | 1 | manual | always | File-sharing and DLP policy state has no documented read field. |
 | `WEBEX-COLLAB-03` | 1 | manual | always | Recording retention/storage policy has no documented read field. |
-| `WEBEX-COLLAB-04` | 1 | manual | any of (not (`rooms_seen` is defined); `rooms_seen` equals 0) |  |
+| `WEBEX-COLLAB-04` | 1 | manual | any of (not (`rooms_seen` is present and non-null); `rooms_seen` equals 0) |  |
 | `WEBEX-COLLAB-04` | 2 | fail | `rooms_without_classification_count` (default 0) is greater than 0 |  |
 | `WEBEX-COLLAB-04` | 3 | warn | any of (`rooms_truncated` equals true; `token_type` equals "bot"; `token_probe_status.readable` equals false) |  |
 | `WEBEX-COLLAB-04` | 4 | pass | always |  |
-| `WEBEX-COLLAB-05` | 1 | manual | any of (not (`webhooks_seen` is defined); `webhooks_seen` equals 0) |  |
+| `WEBEX-COLLAB-05` | 1 | manual | any of (not (`webhooks_seen` is present and non-null); `webhooks_seen` equals 0) |  |
 | `WEBEX-COLLAB-05` | 2 | fail | `insecure_webhooks_count` (default 0) is greater than 0 |  |
 | `WEBEX-COLLAB-05` | 3 | warn | any of (`webhooks_truncated` equals true; `token_type` equals "bot"; `token_probe_status.readable` equals false) |  |
 | `WEBEX-COLLAB-05` | 4 | pass | always |  |
-| `WEBEX-COLLAB-06` | 1 | manual | any of (not (`total_units` is defined); `total_units` equals 0) |  |
+| `WEBEX-COLLAB-06` | 1 | manual | any of (not (`total_units` is present and non-null); `total_units` equals 0) |  |
 | `WEBEX-COLLAB-06` | 2 | warn | any of (`unassigned_units` (default 0) is greater than `license_warn_threshold_units`; `licenses_truncated` equals true) | license_warn_threshold_units is total_units multiplied by maximumUnassignedRatio. |
 | `WEBEX-COLLAB-06` | 3 | pass | always |  |
-| `WEBEX-COLLAB-07` | 1 | manual | not (`events_seen` is defined) |  |
+| `WEBEX-COLLAB-07` | 1 | manual | not (`events_seen` is present and non-null) |  |
 | `WEBEX-COLLAB-07` | 2 | warn | any of (`events_seen` equals 0; `events_truncated` equals true) |  |
 | `WEBEX-COLLAB-07` | 3 | pass | always |  |
 | `WEBEX-COLLAB-08` | 1 | manual | always | eDiscovery/legal hold configuration has no documented read field. |
 | `WEBEX-MTG-01` | 1 | manual | always | Meeting E2EE and calling SRTP have no documented read field. |
-| `WEBEX-MTG-02` | 1 | manual | any of (not (`sites` is defined); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
-| `WEBEX-MTG-02` | 2 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
-| `WEBEX-MTG-02` | 3 | warn | any of (some item in `sites` satisfies (`$.status` equals "warn"); `site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
-| `WEBEX-MTG-02` | 4 | pass | always |  |
-| `WEBEX-MTG-03` | 1 | manual | any of (not (`sites` is defined); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
-| `WEBEX-MTG-03` | 2 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
-| `WEBEX-MTG-03` | 3 | warn | any of (some item in `sites` satisfies (`$.status` equals "warn"); `site_coverage_complete` equals false; `token_probe_status.readable` equals false) |  |
-| `WEBEX-MTG-03` | 4 | pass | always |  |
-| `WEBEX-MTG-04` | 1 | manual | any of (not (`clusters_seen` is defined); not (`connectors_seen` is defined); all of (`clusters_seen` equals 0; `connectors_seen` equals 0)) |  |
+| `WEBEX-MTG-02` | 1 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-02` | 2 | warn | some item in `sites` satisfies (`$.status` equals "warn") |  |
+| `WEBEX-MTG-02` | 3 | manual | any of (not (`sites` is present and non-null); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-02` | 4 | warn | any of (`site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-02` | 5 | pass | always |  |
+| `WEBEX-MTG-03` | 1 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-03` | 2 | warn | some item in `sites` satisfies (`$.status` equals "warn") |  |
+| `WEBEX-MTG-03` | 3 | manual | any of (not (`sites` is present and non-null); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-03` | 4 | warn | any of (`site_coverage_complete` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-03` | 5 | pass | always |  |
+| `WEBEX-MTG-04` | 1 | manual | any of (not (`clusters_seen` is present and non-null); not (`connectors_seen` is present and non-null); all of (`clusters_seen` equals 0; `connectors_seen` equals 0)) |  |
 | `WEBEX-MTG-04` | 2 | fail | any of (`connectors_seen` equals 0; `non_operational_count` (default 0) is greater than 0) |  |
 | `WEBEX-MTG-04` | 3 | warn | `hybrid_lists_truncated` equals true |  |
 | `WEBEX-MTG-04` | 4 | pass | always |  |
 | `WEBEX-MTG-05` | 1 | manual | always | Firmware lifecycle and blocking policy require manual evidence. |
-| `WEBEX-MTG-06` | 1 | manual | any of (not (`sites` is defined); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
-| `WEBEX-MTG-06` | 2 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
-| `WEBEX-MTG-06` | 3 | warn | any of (some item in `sites` satisfies (`$.status` equals "warn"); `site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
-| `WEBEX-MTG-06` | 4 | pass | always |  |
+| `WEBEX-MTG-06` | 1 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-06` | 2 | warn | some item in `sites` satisfies (`$.status` equals "warn") |  |
+| `WEBEX-MTG-06` | 3 | manual | any of (not (`sites` is present and non-null); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-06` | 4 | warn | any of (`site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-06` | 5 | pass | always |  |
 | `WEBEX-MTG-07` | 1 | manual | always | Virtual-background policy has no documented read field. |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `WEBEX-COLLAB-06` | `license_warn_threshold_units` | Multiply total_units by maximumUnassignedRatio (0.2). |
+| `WEBEX-MTG-04` | `hybrid_lists_truncated` | Boolean OR of the hybrid-clusters truncated flag and the hybrid-connectors truncated flag. |
 
 ### Criterion constants
 
