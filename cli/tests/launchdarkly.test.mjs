@@ -3464,16 +3464,22 @@ test("verdict rule 1 (silent success): LaunchdarklyApiClient treats a 200 with a
   assert.deepEqual({ items: none.items, truncated: none.truncated, seen: none.seen, total: none.total }, { items: [], truncated: false, seen: 0, total: 0 }, "a documented empty listing stays a readable empty inventory");
   assert.equal((await documented.getCallerIdentity()).accountId, "acct-1");
 
-  const nullOnly = new LaunchdarklyApiClient(sampleConfig(), {
-    fetchImpl: async () => jsonResponse({ items: [null], totalCount: 1 }),
-    maxRetries: 0,
-  });
-  await assert.rejects(nullOnly.listMembers(5), (error) => {
-    assert.ok(error instanceof LaunchdarklyApiError);
-    assert.equal(error.status, 200);
-    assert.match(error.message, /JSON body that is not the documented list object with an items array/);
-    return true;
-  });
+  for (const items of [
+    [null],
+    [null, { _id: "a" }],
+    [7, { _id: "a" }],
+  ]) {
+    const malformed = new LaunchdarklyApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ items, totalCount: items.length }),
+      maxRetries: 0,
+    });
+    await assert.rejects(malformed.listMembers(5), (error) => {
+      assert.ok(error instanceof LaunchdarklyApiError);
+      assert.equal(error.status, 200);
+      assert.match(error.message, /JSON body that is not the documented list object with an items array/);
+      return true;
+    });
+  }
 });
 
 test("verdict rule 1 (silent success): a silent 200 on any LaunchDarkly inventory is recorded not_readable with the observed 200, nothing passes or fails on it, no value falls back, and nothing from the body is echoed", async () => {

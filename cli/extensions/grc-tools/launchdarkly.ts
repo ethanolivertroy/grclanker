@@ -1368,7 +1368,7 @@ function matchesResponseShape(payload: unknown, shape: LaunchdarklyResponseShape
   const record = asObject(payload);
   if (!record) return false;
   if (shape.kind === "list") {
-    return Array.isArray(record.items) && (record.items.length === 0 || record.items.some((item) => asObject(item) !== undefined));
+    return Array.isArray(record.items) && record.items.every((item) => asObject(item) !== undefined);
   }
   return shape.documentedKeys.some((key) => key in record);
 }
