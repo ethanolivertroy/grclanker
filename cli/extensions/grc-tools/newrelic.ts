@@ -16,7 +16,16 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ConfigFileError, describePagination, readYamlConfig, type ConfigFileFailureKind, type ConfigFileResult, type PaginationStop } from "./hardening/index.js";
+import {
+  ConfigFileError,
+  NextLinkError,
+  describePagination,
+  readYamlConfig,
+  resolveSameOriginUrl,
+  type ConfigFileFailureKind,
+  type ConfigFileResult,
+  type PaginationStop,
+} from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1733,7 +1742,7 @@ export class NewrelicApiClient {
   }
 
   async restGet(pathOrUrl: string, query: JsonRecord = {}): Promise<{ payload: JsonRecord; nextUrl?: string }> {
-    const url = this.buildRestUrl(pathOrUrl, query);
+    const url = resolveSameOriginUrl(this.buildRestUrl(pathOrUrl, query), this.config.restBaseUrl).toString();
     const response = await this.requestWithRetry(url, {
       method: "GET",
       headers: {
@@ -1762,7 +1771,16 @@ export class NewrelicApiClient {
       const kept = pageItems.slice(0, Math.max(0, limit - items.length));
       items.push(...kept);
       if (kept.length < pageItems.length) limitReached = true;
-      url = nextUrl;
+      if (!nextUrl) {
+        url = undefined;
+      } else {
+        try {
+          url = resolveSameOriginUrl(nextUrl, this.config.restBaseUrl).toString();
+        } catch (error) {
+          if (!(error instanceof NextLinkError)) throw error;
+          return { items, complete: false, note: `stopped after ${items.length} items because ${error.message}` };
+        }
+      }
     }
     if (limitReached) {
       return { items, complete: false, note: `stopped after ${items.length} items at the ${limit} item limit with more items available` };

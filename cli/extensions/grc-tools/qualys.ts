@@ -19,7 +19,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { readConfigText } from "./hardening/index.js";
+import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -1139,7 +1139,7 @@ export class QualysApiClient {
   }
 
   async getXml(path: string, query: JsonRecord = {}): Promise<XmlNode> {
-    const url = this.buildUrl(path, query);
+    const url = resolveSameOriginUrl(this.buildUrl(path, query), this.config.baseUrl).toString();
     const response = await this.rawRequest("GET", url);
     const endpoint = this.endpointLabel(path);
     const document = parseXmlBody(response.text);
@@ -1204,6 +1204,7 @@ export class QualysApiClient {
     let nextUrl: string | undefined = this.buildUrl(path, query);
     let pages = 0;
     let dropped = false;
+    let truncationReason: string | undefined;
     while (nextUrl && items.length < limit && pages < maxPages) {
       const document: XmlNode = await this.getXml(nextUrl);
       pages += 1;
@@ -1212,13 +1213,24 @@ export class QualysApiClient {
       if (pageItems.length > room) dropped = true;
       items.push(...pageItems.slice(0, room));
       const warning = findXmlElement(document, "WARNING");
-      nextUrl = warning ? xmlText(findXmlElement(warning, "URL")) : undefined;
+      const continuation = warning ? xmlText(findXmlElement(warning, "URL")) : undefined;
+      if (!continuation) {
+        nextUrl = undefined;
+      } else {
+        try {
+          nextUrl = resolveSameOriginUrl(continuation, this.config.baseUrl).toString();
+        } catch (error) {
+          if (!(error instanceof NextLinkError)) throw error;
+          truncationReason = error.message;
+          nextUrl = undefined;
+          break;
+        }
+      }
       if (pageItems.length === 0) break;
     }
-    let truncationReason: string | undefined;
-    if (dropped || (nextUrl && items.length >= limit)) {
+    if (!truncationReason && (dropped || (nextUrl && items.length >= limit))) {
       truncationReason = `item cap ${limit} reached with more records available`;
-    } else if (nextUrl && pages >= maxPages) {
+    } else if (!truncationReason && nextUrl && pages >= maxPages) {
       truncationReason = `page cap ${maxPages} reached with a WARNING/URL continuation not followed`;
     }
     return listResult(items, pages, truncationReason);

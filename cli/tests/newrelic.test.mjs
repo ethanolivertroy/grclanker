@@ -911,6 +911,43 @@ test("NewrelicApiClient follows REST API v2 Link headers with the Api-Key header
   assert.equal(seen[1].page, "2");
 });
 
+test("NewrelicApiClient refuses cross-origin and userinfo REST next links", async () => {
+  async function walk(nextLink) {
+    const requests = [];
+    const fetchImpl = async (input, init = {}) => {
+      const url = new URL(input.toString());
+      requests.push({ url, apiKey: headerValue(init.headers, "api-key") });
+      if (requests.length === 1) {
+        return jsonResponse(
+          { users: [{ id: 1, email: "one@example.com" }] },
+          { headers: { link: `<${nextLink}>; rel="next"` } },
+        );
+      }
+      return jsonResponse({ users: [{ id: 2, email: "two@example.com" }] });
+    };
+    const result = await new NewrelicApiClient(sampleConfig(), { fetchImpl }).listRestUsers();
+    return { requests, result };
+  }
+
+  const sameOrigin = await walk("https://api.newrelic.com/v2/users.json?page=2");
+  assert.deepEqual(sameOrigin.result.items.map((item) => item.id), [1, 2]);
+  assert.equal(sameOrigin.result.complete, true);
+  assert.equal(sameOrigin.requests.length, 2);
+  assert.equal(sameOrigin.requests[1].apiKey, TEST_KEY);
+
+  const crossOrigin = await walk("https://attacker.example/collect");
+  assert.deepEqual(crossOrigin.result.items.map((item) => item.id), [1]);
+  assert.equal(crossOrigin.result.complete, false);
+  assert.match(crossOrigin.result.note, /attacker\.example/);
+  assert.equal(crossOrigin.requests.length, 1);
+
+  const userinfo = await walk("https://svc:password@api.newrelic.com/v2/users.json?page=2");
+  assert.deepEqual(userinfo.result.items.map((item) => item.id), [1]);
+  assert.equal(userinfo.result.complete, false);
+  assert.match(userinfo.result.note, /carries userinfo/);
+  assert.equal(userinfo.requests.length, 1);
+});
+
 test("NewrelicApiClient paginates keySearch with a cursor and scopes it to account IDs", async () => {
   const seen = [];
   const fetchImpl = async (_input, init = {}) => {

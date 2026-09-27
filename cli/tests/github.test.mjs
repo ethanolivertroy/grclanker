@@ -827,6 +827,54 @@ test("GitHubAuditorClient handles installation token refresh, rate limits, and p
   assert.equal(state.rulesetRateLimitCount, 1);
 });
 
+test("GitHubAuditorClient follows only same-origin REST next links without userinfo", async () => {
+  function clientFor(nextLink, requests) {
+    return new GitHubAuditorClient(createSampleConfig(), async (input, init = {}) => {
+      const url = new URL(input.toString());
+      requests.push({ url, authorization: init.headers?.Authorization });
+      if (requests.length === 1) {
+        return new Response(
+          JSON.stringify([{ full_name: "example-org/repo-one" }]),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              link: `<${nextLink}>; rel="next"`,
+            },
+          },
+        );
+      }
+      return new Response(
+        JSON.stringify([{ full_name: "example-org/repo-two" }]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+  }
+
+  const sameOriginRequests = [];
+  const sameOrigin = await clientFor(
+    "https://api.github.com/orgs/example-org/repos?per_page=100&page=2",
+    sameOriginRequests,
+  ).listRepositories();
+  assert.deepEqual(sameOrigin.map((repo) => repo.full_name), ["example-org/repo-one", "example-org/repo-two"]);
+  assert.equal(sameOriginRequests.length, 2);
+  assert.equal(sameOriginRequests[1].authorization, "Bearer ghp_test");
+
+  const crossOriginRequests = [];
+  await assert.rejects(
+    clientFor("https://attacker.example/collect", crossOriginRequests).listRepositories(),
+    /does not share the configured origin https:\/\/api\.github\.com/,
+  );
+  assert.equal(crossOriginRequests.length, 1, "the GitHub token must never be sent off-origin");
+
+  const userinfoRequests = [];
+  await assert.rejects(
+    clientFor("https://svc:password@api.github.com/orgs/example-org/repos?page=2", userinfoRequests).listRepositories(),
+    /carries userinfo/,
+  );
+  assert.equal(userinfoRequests.length, 1, "a userinfo-bearing next link must never be requested");
+});
+
 test("GitHub assessment helpers classify sample posture correctly", () => {
   const config = createSampleConfig();
   const orgAccess = assessGitHubOrgAccess(createOrgAccessData(), config);

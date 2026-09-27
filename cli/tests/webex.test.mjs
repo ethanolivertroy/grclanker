@@ -715,6 +715,41 @@ test("WebexApiClient follows Link pagination to completion, reports truncation, 
   assert.equal(parseLinkHeaderNext('<https://a/prev>; rel="prev"'), null);
 });
 
+test("WebexApiClient follows only same-origin next links without userinfo", async () => {
+  async function walk(nextLink) {
+    const requests = [];
+    const fetchImpl = async (input, init = {}) => {
+      const url = new URL(input.toString());
+      requests.push({ url, authorization: init.headers?.authorization });
+      if (requests.length === 1) {
+        return jsonResponse(
+          { items: [{ id: "person-1" }] },
+          { headers: { link: `<${nextLink}>; rel="next"` } },
+        );
+      }
+      return jsonResponse({ items: [{ id: "person-2" }] });
+    };
+    const result = await new WebexApiClient(sampleConfig({ token: "webex-pagination-token" }), { fetchImpl }).listPeople(10);
+    return { requests, result };
+  }
+
+  const sameOrigin = await walk("https://webexapis.com/v1/people?after=safe");
+  assert.deepEqual(sameOrigin.result.items.map((item) => item.id), ["person-1", "person-2"]);
+  assert.equal(sameOrigin.result.truncated, false);
+  assert.equal(sameOrigin.requests.length, 2);
+  assert.equal(sameOrigin.requests[1].authorization, "Bearer webex-pagination-token");
+
+  const crossOrigin = await walk("https://attacker.example/collect");
+  assert.deepEqual(crossOrigin.result.items.map((item) => item.id), ["person-1"]);
+  assert.equal(crossOrigin.result.truncated, true);
+  assert.equal(crossOrigin.requests.length, 1, "the bearer token must never be sent off-origin");
+
+  const userinfo = await walk("https://svc:password@webexapis.com/v1/people?after=unsafe");
+  assert.deepEqual(userinfo.result.items.map((item) => item.id), ["person-1"]);
+  assert.equal(userinfo.result.truncated, true);
+  assert.equal(userinfo.requests.length, 1, "a userinfo-bearing next link must never be requested");
+});
+
 test("WebexApiClient sends max only where the reference documents it and orgId only where documented", async () => {
   const seen = [];
   const fetchImpl = async (input) => {
@@ -1705,6 +1740,47 @@ test("rule 9: no fake secret from any carrier reaches any bundle file or any zip
   const findings = JSON.parse(read("analysis/findings.json"));
   assert.equal(findings.find((item) => item.id === "WEBEX-COLLAB-05").status, "pass", "scrubbing the webhook URL query must not change the https verdict");
   assert.equal(findings.find((item) => item.id === "WEBEX-MTG-02").status, "pass");
+});
+
+test("exportWebexAuditBundle applies configured-secret and credential-carrier redaction at the write sink", async () => {
+  const configuredSecret = "SINKCONFIGUREDq7w2e9r4t6y8";
+  const bearerSecret = "SINKBEARERm4n8b2v6c0x5";
+  const assignmentSecret = "SINKASSIGNMENTp3o7i1u5y9t2";
+  const baseClient = compliantClient();
+  const client = compliantClient({
+    async getMe() {
+      return {
+        ...(await baseClient.getMe()),
+        displayName: configuredSecret,
+      };
+    },
+    async listPeople() {
+      const people = await baseClient.listPeople();
+      return page(people.items.map((person, index) => ({
+        ...person,
+        displayName: index === 0
+          ? `Bearer ${bearerSecret}`
+          : index === 1
+            ? `token=${assignmentSecret}`
+            : person.displayName,
+      })));
+    },
+  });
+  const base = createTempBase("grclanker-webex-sink-redaction-");
+  const result = await exportWebexAuditBundle(
+    client,
+    sampleConfig({ token: configuredSecret }),
+    base,
+  );
+
+  const forbidden = [configuredSecret, bearerSecret, assignmentSecret];
+  for (const file of walkFiles(result.outputDir)) {
+    const content = readFileSync(file, "utf8");
+    for (const secret of forbidden) assert.equal(content.includes(secret), false, `${secret} leaked into ${relative(result.outputDir, file)}`);
+  }
+  for (const entry of readZipEntries(readFileSync(result.zipPath))) {
+    for (const secret of forbidden) assert.equal(entry.content.includes(secret), false, `${secret} leaked into zip:${entry.name}`);
+  }
 });
 
 /** Rule 9 error path: one canary per carrier that only an error response can bring into the bundle. */

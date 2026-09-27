@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ConfigFileError, parseJsonConfigText, parseYamlConfigText, readConfigText } from "./hardening/index.js";
+import { ConfigFileError, NextLinkError, parseJsonConfigText, parseYamlConfigText, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -412,6 +412,22 @@ export function scrubErrorText(message: string): string {
   return scrubValue(message)
     .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (_match, key: string) => `${key}=[REDACTED]`)
     .replace(CREDENTIAL_SCHEME_PATTERN, (_match, scheme: string) => `${scheme} [REDACTED]`);
+}
+
+function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string): string[] {
+  return [
+    config.token,
+    config.refresh?.clientSecret,
+    config.refresh?.refreshToken,
+    accessToken,
+  ].filter((value): value is string => typeof value === "string" && value.length >= 4);
+}
+
+/** Final bundle sink scrub: exact configured/runtime credentials plus free-text credential carriers. */
+function scrubBundleText(content: string, secrets: readonly string[]): string {
+  let scrubbed = content;
+  for (const secret of secrets) scrubbed = scrubbed.split(secret).join("[REDACTED]");
+  return scrubErrorText(scrubbed);
 }
 
 /**
@@ -840,6 +856,10 @@ export class WebexApiClient {
     return this.config;
   }
 
+  knownSecrets(): string[] {
+    return webexCredentialValues(this.config, this.accessToken);
+  }
+
   getNow(): Date {
     return this.now();
   }
@@ -982,6 +1002,14 @@ export class WebexApiClient {
       if (nextUrl && pageCount >= this.maxPages) {
         return { items, truncated: true, pageCount };
       }
+      if (nextUrl) {
+        try {
+          nextUrl = resolveSameOriginUrl(nextUrl, this.config.baseUrl).toString();
+        } catch (error) {
+          if (!(error instanceof NextLinkError)) throw error;
+          return { items, truncated: true, pageCount };
+        }
+      }
     }
 
     return { items, truncated: false, pageCount };
@@ -1110,7 +1138,7 @@ type WebexClientLike = Pick<
   | "listWorkspaces"
   | "listRooms"
   | "listWebhooks"
->;
+> & { knownSecrets?: () => string[] };
 
 function errorStatus(error: unknown): number | undefined {
   if (error instanceof WebexApiError) return error.status;
@@ -2315,27 +2343,30 @@ export async function exportWebexAuditBundle(
   const assessments = [identity, collaboration, meetingHybrid];
   const findings = assessments.flatMap((assessment) => assessment.findings);
   const errors = [...new Set(assessments.flatMap((assessment) => assessment.errors.map((item) => `${assessment.category}: ${item}`)))];
+  const secrets = client.knownSecrets?.() ?? webexCredentialValues(config);
 
   ensurePrivateDir(outputRoot);
   const outputDir = await nextAvailableAuditDir(
     outputRoot,
     `${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`,
   );
+  const write = (relativePathname: string, content: string): Promise<void> =>
+    writeSecureTextFile(outputDir, relativePathname, scrubBundleText(content, secrets));
 
-  await writeSecureTextFile(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
-  await writeSecureTextFile(outputDir, "metadata.json", serializeJson({
+  await write("QUICK_REFERENCE.md", buildQuickReference());
+  await write("metadata.json", serializeJson({
     generated_at: new Date().toISOString(),
     org_id: config.orgId ?? access.orgId ?? null,
     token_type: access.tokenType,
     source_chain: config.sourceChain,
     config_file: config.configFile ? basename(config.configFile) : null,
   }));
-  await writeSecureTextFile(outputDir, "core_data/access.json", serializeJson(access));
+  await write("core_data/access.json", serializeJson(access));
   for (const assessment of assessments) {
     for (const [name, value] of Object.entries(assessment.rawData)) {
-      await writeSecureTextFile(outputDir, `core_data/${assessment.category}/${name}.json`, serializeJson(value));
+      await write(`core_data/${assessment.category}/${name}.json`, serializeJson(value));
     }
-    await writeSecureTextFile(outputDir, `analysis/${assessment.category}.json`, serializeJson({
+    await write(`analysis/${assessment.category}.json`, serializeJson({
       title: assessment.title,
       category: assessment.category,
       summary: assessment.summary,
@@ -2343,14 +2374,14 @@ export async function exportWebexAuditBundle(
       errors: assessment.errors,
     }));
   }
-  await writeSecureTextFile(outputDir, "analysis/findings.json", serializeJson(findings));
-  await writeSecureTextFile(outputDir, "compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await writeSecureTextFile(outputDir, "compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  await write("analysis/findings.json", serializeJson(findings));
+  await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const key of Object.keys(FRAMEWORK_REPORT_PATHS) as WebexFrameworkKey[]) {
-    await writeSecureTextFile(outputDir, FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
+    await write(FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
   }
   if (errors.length > 0) {
-    await writeSecureTextFile(outputDir, "_errors.log", `${errors.join("\n")}\n`);
+    await write("_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = `${outputDir}.zip`;
