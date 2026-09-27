@@ -3,358 +3,799 @@ slug: "webex-sec-inspector"
 name: "Webex Security Inspector"
 vendor: "Cisco"
 category: "saas-collaboration"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+language: "language-neutral"
+status: "generated"
+version: "2.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# Cisco Webex Security Inspector - Architecture Specification
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-## 1. Overview
+# Webex Security Inspector
 
-Cisco Webex Security Inspector is a hybrid CLI/TUI tool that audits the security posture of a Cisco Webex organization. It connects to the Webex REST API (webexapis.com/v1) to evaluate identity and access management, messaging policies, meeting security, recording governance, device management, hybrid infrastructure, and compliance controls. The tool produces structured findings mapped to enterprise compliance frameworks and outputs reports in JSON, CSV, and HTML formats.
+Read-only Webex organization posture inspection across identity, collaboration governance, meetings, hybrid services, and devices.
 
-The inspector targets Webex organizations on Business and Enterprise plans (including Webex Control Hub-managed orgs) where advanced security, compliance, and hybrid deployment capabilities are available. It operates in read-only mode and requires no agent installation.
+## Purpose
 
-### grclanker implementation
+Webex Security Inspector gives auditors a read-only, evidence-based view of a Webex organization's identity, collaboration, meeting, hybrid-service, and device posture. It combines the settings that Webex exposes through documented read interfaces with explicit manual evidence requests for settings that remain available only in Control Hub.
 
-The shipped implementation is the native TypeScript tool family in `cli/extensions/grc-tools/webex.ts`: `webex_check_access`, `webex_assess_identity`, `webex_assess_collaboration_governance`, `webex_assess_meeting_hybrid_security`, and `webex_export_audit_bundle`. It replaces the Go CLI/TUI layout in sections 7 to 9 with grclanker tools, keeps the 25 controls and the section 5 mapping table, and is documented in `src/content/docs/docs/integrations/webex.md`.
+## Rationale
 
-## 2. APIs & SDKs
+Webex security evidence is split across organization, meeting, messaging, calling, and compliance surfaces. Token type, tenant plan, delegated scopes, and per-site configuration all affect what a collector can see. A portable implementation must preserve that uncertainty instead of treating an inaccessible or credential-scoped view as a compliant empty tenant.
 
-### Webex REST API (v1)
+The contract favors documented reads over guessed fields or write interfaces. This is especially important for SSO, organization-wide MFA, data loss prevention, calling encryption, device blocking, and other controls whose administrative state is not exposed by a public read operation.
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/people` | GET | List organization members, roles, login status |
-| `/people/{personId}` | GET | Get member details including last activity |
-| `/people/me` | GET | Get authenticated user profile and org context |
-| `/organizations` | GET | List organizations visible to the account |
-| `/organizations/{orgId}` | GET | Get organization details, settings, security config |
-| `/roles` | GET | List available roles (admin, compliance, readonly) |
-| `/licenses` | GET | List license assignments and usage |
-| `/licenses/{licenseId}` | GET | Get license details and assigned users |
-| `/events` | GET | List compliance events (messages, memberships, rooms) |
-| `/recordings` | GET | List meeting recordings and storage locations |
-| `/recordings/{recordingId}` | GET | Get recording details and access permissions |
-| `/meetings` | GET | List meetings with security settings |
-| `/meetings/{meetingId}` | GET | Get meeting details (encryption, lobby, password) |
-| `/meetingPreferences` | GET | Get user/org meeting preference defaults |
-| `/meetingPreferences/sites` | GET | List Webex meeting sites and their settings |
-| `/admin/organizations/{orgId}/settings` | GET | Get organization-wide admin security settings |
-| `/hybrid/clusters` | GET | List hybrid infrastructure clusters |
-| `/hybrid/clusters/{clusterId}` | GET | Get cluster status, nodes, connectivity |
-| `/hybrid/connectors` | GET | List hybrid connectors (Calendar, Call, etc.) |
-| `/devices` | GET | List registered devices and their config |
-| `/devices/{deviceId}` | GET | Get device details, firmware, security posture |
-| `/workspaces` | GET | List workspaces (rooms/devices) and settings |
-| `/rooms` | GET | List spaces/rooms with classification labels |
-| `/rooms/{roomId}` | GET | Get room details, classification, retention policy |
-| `/webhooks` | GET | List registered webhooks |
-| `/webhooks/{webhookId}` | GET | Get webhook details (URL, events, secret) |
-| `/resourceGroups` | GET | List resource groups for hybrid services |
-| `/admin/organizations/{orgId}/security` | GET | Get security policies (DLP, file sharing, external comms) |
+## Non-goals
 
-**Base URL:** `https://webexapis.com/v1`
+- Changing Webex settings or issuing any administrative write request
+- Claiming complete organization coverage from bot-scoped rooms or webhooks
+- Replacing reviewer judgment for settings that have no documented read interface
+- Providing a general Webex administration client
+- Reproducing a particular programming language, package layout, or command-line framework
 
-**Rate Limits:** API calls are rate-limited per application. Response headers include `Retry-After` on 429 status. Typical limits: 100 requests/minute for most endpoints, lower for admin endpoints.
+## Portable implementation guidance
 
-### Python SDKs
+Keep the API client, evidence projection, verdict evaluation, and bundle writer as separable concerns. Preserve the relationship between a finding and every source it depends on, including the token-type probe and the site list. Assess each meeting site independently before combining results. When Webex returns a credential-scoped inventory, state that scope in the evidence even if every visible record is compliant.
 
-| Package | Version | Notes |
-|---------|---------|-------|
-| `webexpythonsdk` | 2.0.5+ | Community SDK; successor to `webexteamssdk`; Python 3.10+ |
-| `webexteamssdk` | 1.7 (final) | Deprecated; last release; Python 2/3 compatible |
+## Shared integration contract
 
-The `webexpythonsdk` package provides native Python objects for all Webex API resources with automatic pagination, rate-limit handling, and file upload support. For a Go implementation, direct HTTP calls via `net/http` are used since no official Go SDK exists.
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-## 3. Authentication
+## Known runtime gaps
 
-| Method | Header Format | Use Case |
-|--------|--------------|----------|
-| Bot token | `Authorization: Bearer {token}` | Automated scans; org-scoped, does not impersonate users |
-| OAuth 2.0 integration | `Authorization: Bearer {token}` | User-delegated access with specific scopes |
-| Service app | `Authorization: Bearer {token}` | Machine-to-machine; org-wide admin access without user context |
+- TODO after the follow-up Webex pagination fix lands: A Link value without any rel parameter is classified as unparseable, and the walk stops truncated. A repeated next URL is not detected immediately; the walk continues until the item cap or 1,000-page cap. An empty page carrying rel=next is not detected immediately; the walk continues until the item cap or 1,000-page cap. These are temporary exceptions to the shared pagination contract.
+- TODO after the follow-up Webex URL-projection fix lands: webhook and callback URL fields currently retain scheme, host, port, and path while removing user information, query, and fragment. This is a temporary exception to the shared origin-only webhook/callback rule.
 
-**Bot token setup:**
-- Created via [developer.webex.com/my-apps](https://developer.webex.com/my-apps)
-- Bot must be added to the organization by an admin
-- Scope is limited to what the bot's org membership permits
+## Tools
 
-**Service app setup:**
-- Created in Webex Control Hub under "Apps > Service Apps"
-- Uses OAuth 2.0 client_credentials grant
-- Can be granted admin-level scopes without a user login
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `webex_check_access` | Validate read-only Webex access across people, organizations, roles, licenses, recordings, events, admin audit, hybrid, devices, workspaces, rooms, webhooks, meetings, site common settings, and guest count, and report the token type. | None | Text table plus structured fields {tool, status, orgId?, tokenType, adminCapable, surfaces, notes, recommendedNextStep}. |
+| `webex_assess_identity` | Assess Webex identity posture across SSO enforcement, admin MFA, Compliance Officer assignment, administrative privilege concentration, bot inventory, bot approval state, and guest account inventory. | `WEBEX-ID-01`, `WEBEX-ID-02`, `WEBEX-ID-03`, `WEBEX-ID-04`, `WEBEX-ID-05`, `WEBEX-ID-06`, `WEBEX-ID-07` | Text summary/table plus structured fields {tool, title, category, summary, findings, errors, rawData}. |
+| `webex_assess_collaboration_governance` | Assess Webex collaboration governance across external communications, file sharing and DLP, recording governance, space classification, webhook security, license utilization, admin audit visibility, and eDiscovery capability. | `WEBEX-COLLAB-01`, `WEBEX-COLLAB-02`, `WEBEX-COLLAB-03`, `WEBEX-COLLAB-04`, `WEBEX-COLLAB-05`, `WEBEX-COLLAB-06`, `WEBEX-COLLAB-07`, `WEBEX-COLLAB-08` | Text summary/table plus structured fields {tool, title, category, summary, findings, errors, rawData}. |
+| `webex_assess_meeting_hybrid_security` | Assess Webex meeting and hybrid security across encryption defaults, per-site lobby, password, and guest access settings from the site common settings API, virtual background policy, hybrid connector health, and device inventory posture. | `WEBEX-MTG-01`, `WEBEX-MTG-02`, `WEBEX-MTG-03`, `WEBEX-MTG-04`, `WEBEX-MTG-05`, `WEBEX-MTG-06`, `WEBEX-MTG-07` | Text summary/table plus structured fields {tool, title, category, summary, findings, errors, rawData}. |
+| `webex_export_audit_bundle` | Export a Webex audit bundle with field-allowlisted, redacted core_data snapshots (URL query strings such as recording RCID and meeting MTID stripped), analysis JSON, compliance reports per framework, a quick reference, and a zip archive named after the allocated output directory. | `WEBEX-ID-01`, `WEBEX-ID-02`, `WEBEX-ID-03`, `WEBEX-ID-04`, `WEBEX-ID-05`, `WEBEX-ID-06`, `WEBEX-ID-07`, `WEBEX-COLLAB-01`, `WEBEX-COLLAB-02`, `WEBEX-COLLAB-03`, `WEBEX-COLLAB-04`, `WEBEX-COLLAB-05`, `WEBEX-COLLAB-06`, `WEBEX-COLLAB-07`, `WEBEX-COLLAB-08`, `WEBEX-MTG-01`, `WEBEX-MTG-02`, `WEBEX-MTG-03`, `WEBEX-MTG-04`, `WEBEX-MTG-05`, `WEBEX-MTG-06`, `WEBEX-MTG-07` | Text export receipt plus structured fields {tool, output_dir, zip_path, finding_count, file_count, error_count}. |
 
-**Required scopes (minimum for full inspection):**
-- `spark-admin:people_read` - member enumeration
-- `spark-admin:organizations_read` - organization settings
-- `spark-admin:roles_read` - role assignments
-- `spark-admin:licenses_read` - license usage
-- `spark-admin:devices_read` - device inventory
-- `spark-admin:hybrid_clusters_read` - hybrid infrastructure
-- `spark-admin:resource_groups_read` - resource group config
-- `spark-compliance:events_read` - compliance events
-- `spark-compliance:meetings_read` - meeting compliance data
-- `spark-compliance:rooms_read` - room compliance data
-- `meeting:admin_schedule_read` - meeting settings
-- `meeting:admin_recordings_read` - recording inventory
-- `meeting:admin_preferences_read` - meeting preferences
+### Parameters
 
-**Configuration precedence:**
-1. `--token` CLI flag
-2. `WEBEX_TOKEN` environment variable
-3. `--client-id` / `--client-secret` for service app OAuth
-4. `~/.config/webex-sec-inspector/config.toml`
+#### `webex_check_access`
 
-The tool never stores tokens beyond the current session. Tokens and secrets are redacted from all log output and reports.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Webex access token. Defaults to WEBEX_TOKEN, then the config file. |
+| `client_id` | string | no | Integration or Service App client ID for the refresh_token grant. Defaults to WEBEX_CLIENT_ID. |
+| `client_secret` | string | no | Integration or Service App client secret. Defaults to WEBEX_CLIENT_SECRET. |
+| `refresh_token` | string | no | Integration or Service App refresh token. Defaults to WEBEX_REFRESH_TOKEN. |
+| `config_file` | string | no | Config file path. Defaults to WEBEX_CONFIG_FILE, then ~/.config/webex-sec-inspector/config.{json,yaml,yml}. |
+| `org_id` | string | no | Webex organization ID. Defaults to WEBEX_ORG_ID or auto-detect when only one org is visible. |
+| `base_url` | string | no | Webex API base URL. Defaults to https://webexapis.com/v1. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
-## 4. Security Controls
+#### `webex_assess_identity`
 
-| # | Control | API Source | Severity |
-|---|---------|-----------|----------|
-| 1 | SSO enforcement enabled for the organization | `/admin/organizations/{orgId}/settings` | Critical |
-| 2 | MFA required for all admin-role users | `/people` (filter: admin roles), org settings | Critical |
-| 3 | Compliance Officer role assigned to designated personnel | `/people`, `/roles` | High |
-| 4 | External communications policy restricts messaging to approved domains | `/admin/organizations/{orgId}/security` | High |
-| 5 | File sharing restricted or limited by policy (block external, type filters) | `/admin/organizations/{orgId}/security` | High |
-| 6 | Recording storage uses organization-controlled location (not personal) | `/recordings`, org settings | Medium |
-| 7 | Recording auto-delete policy configured (retention limit set) | `/recordings`, org settings | Medium |
-| 8 | Meeting default encryption set to end-to-end (E2EE) where supported | `/meetingPreferences`, org settings | High |
-| 9 | Meeting lobby enabled by default for external participants | `/meetingPreferences` | High |
-| 10 | Meeting password required by default | `/meetingPreferences` | Medium |
-| 11 | eDiscovery/legal hold capability configured and compliance officer assigned | `/events`, org settings | High |
-| 12 | Data retention policy configured with defined retention period | `/admin/organizations/{orgId}/settings`, `/rooms` | High |
-| 13 | Guest access restricted or disabled for the organization | org settings | Medium |
-| 14 | Space classification labels enabled and enforced | `/rooms` (classification field) | Medium |
-| 15 | Hybrid cluster nodes healthy and running supported versions | `/hybrid/clusters/{id}` | High |
-| 16 | Hybrid connectors registered and reporting active status | `/hybrid/connectors` | Medium |
-| 17 | Device firmware up to date (no devices on EOL firmware) | `/devices/{id}` | High |
-| 18 | Unmanaged/personal devices blocked or restricted from org access | `/devices`, org settings | Medium |
-| 19 | Bot management: only approved bots active in the organization | org settings, `/people` (type: bot) | Medium |
-| 20 | Webhook endpoints use HTTPS and have secret configured | `/webhooks` | High |
-| 21 | Messaging DLP (Data Loss Prevention) policies configured | `/admin/organizations/{orgId}/security` | High |
-| 22 | Calling security: SRTP encryption enforced for all calling profiles | org settings, calling config | High |
-| 23 | Virtual background enforcement for meetings (prevent inappropriate content) | `/meetingPreferences` | Low |
-| 24 | License utilization reviewed (no excessive unassigned licenses) | `/licenses` | Low |
-| 25 | Admin activity audit: admin role changes logged and reviewed | `/events` (admin actions) | High |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Webex access token. Defaults to WEBEX_TOKEN, then the config file. |
+| `client_id` | string | no | Integration or Service App client ID for the refresh_token grant. Defaults to WEBEX_CLIENT_ID. |
+| `client_secret` | string | no | Integration or Service App client secret. Defaults to WEBEX_CLIENT_SECRET. |
+| `refresh_token` | string | no | Integration or Service App refresh token. Defaults to WEBEX_REFRESH_TOKEN. |
+| `config_file` | string | no | Config file path. Defaults to WEBEX_CONFIG_FILE, then ~/.config/webex-sec-inspector/config.{json,yaml,yml}. |
+| `org_id` | string | no | Webex organization ID. Defaults to WEBEX_ORG_ID or auto-detect when only one org is visible. |
+| `base_url` | string | no | Webex API base URL. Defaults to https://webexapis.com/v1. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `people_limit` | number | no | Maximum people to inspect. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable admin users before warning. Defaults to 10. |
 
-## 5. Compliance Framework Mappings
+#### `webex_assess_collaboration_governance`
 
-| Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---------|---------|------|-------|-----|---------|------|------|-------|
-| 1 SSO enforcement | IA-2(1) | L2 3.5.3 | CC6.1 | 16.2 | 8.4.1 | SRG-APP-000148 | ISM-1546 | CPS-7.1 |
-| 2 Admin MFA | IA-2(2) | L2 3.5.3 | CC6.1 | 16.3 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-7.2 |
-| 3 Compliance officer role | AU-1 | L2 3.3.2 | CC7.2 | 8.1 | 12.5.2 | SRG-APP-000516 | ISM-0042 | CPS-12.1 |
-| 4 External communications | AC-4 | L2 3.1.3 | CC6.6 | 13.4 | 1.3.7 | SRG-APP-000100 | ISM-1528 | CPS-11.1 |
-| 5 File sharing restrictions | AC-4(1) | L2 3.1.3 | CC6.7 | 13.4 | 1.3.7 | SRG-APP-000100 | ISM-0947 | CPS-11.2 |
-| 6 Recording storage control | SC-28 | L2 3.13.16 | CC6.7 | 14.8 | 3.4.1 | SRG-APP-000428 | ISM-0457 | CPS-11.3 |
-| 7 Recording retention | SI-12 | L2 3.8.9 | CC6.5 | 14.8 | 3.1 | SRG-APP-000504 | ISM-0859 | CPS-12.2 |
-| 8 E2E meeting encryption | SC-8(1) | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000441 | ISM-0484 | CPS-11.4 |
-| 9 Meeting lobby controls | AC-3 | L2 3.1.1 | CC6.1 | 16.7 | 7.1.3 | SRG-APP-000033 | ISM-1506 | CPS-8.1 |
-| 10 Meeting password required | IA-5 | L2 3.5.7 | CC6.1 | 16.5 | 8.2.3 | SRG-APP-000170 | ISM-1557 | CPS-7.3 |
-| 11 eDiscovery/legal hold | AU-11 | L2 3.3.1 | CC7.3 | 8.3 | 10.7 | SRG-APP-000515 | ISM-0859 | CPS-12.3 |
-| 12 Data retention policy | SI-12 | L2 3.8.9 | CC6.5 | 14.8 | 3.1 | SRG-APP-000504 | ISM-0859 | CPS-12.4 |
-| 13 Guest access restrictions | AC-14 | L2 3.1.1 | CC6.1 | 16.7 | 7.1.3 | SRG-APP-000033 | ISM-1506 | CPS-8.2 |
-| 14 Space classification | AC-16 | L2 3.13.12 | CC6.7 | 14.1 | 9.6.1 | SRG-APP-000311 | ISM-0271 | CPS-11.5 |
-| 15 Hybrid cluster health | CM-8 | L2 3.4.1 | CC6.8 | 1.1 | 2.4 | SRG-APP-000383 | ISM-1409 | CPS-10.1 |
-| 16 Hybrid connector status | SI-4 | L2 3.14.6 | CC7.1 | 1.1 | 10.6 | SRG-APP-000516 | ISM-0576 | CPS-12.5 |
-| 17 Device firmware currency | SI-2 | L2 3.14.1 | CC7.1 | 7.4 | 6.2 | SRG-APP-000456 | ISM-1143 | CPS-13.1 |
-| 18 Unmanaged device blocking | CM-8(3) | L2 3.4.1 | CC6.8 | 1.4 | 9.7.1 | SRG-APP-000383 | ISM-1482 | CPS-10.2 |
-| 19 Bot management | CM-7 | L2 3.4.6 | CC6.8 | 4.8 | 2.2.2 | SRG-APP-000141 | ISM-1407 | CPS-10.3 |
-| 20 Webhook HTTPS and signing | SC-8(1) | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000441 | ISM-0484 | CPS-11.6 |
-| 21 Messaging DLP | SC-7(8) | L2 3.13.1 | CC6.7 | 13.4 | 1.3.7 | SRG-APP-000516 | ISM-0947 | CPS-11.7 |
-| 22 SRTP calling encryption | SC-8 | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000439 | ISM-0484 | CPS-11.8 |
-| 23 Virtual background policy | AC-3 | L2 3.1.1 | CC6.1 | - | - | SRG-APP-000033 | - | - |
-| 24 License utilization | CM-8 | L2 3.4.1 | CC6.8 | 1.1 | 2.4 | SRG-APP-000383 | ISM-1409 | CPS-10.4 |
-| 25 Admin audit logging | AU-12 | L2 3.3.1 | CC7.2 | 8.5 | 10.2.2 | SRG-APP-000507 | ISM-0580 | CPS-12.6 |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Webex access token. Defaults to WEBEX_TOKEN, then the config file. |
+| `client_id` | string | no | Integration or Service App client ID for the refresh_token grant. Defaults to WEBEX_CLIENT_ID. |
+| `client_secret` | string | no | Integration or Service App client secret. Defaults to WEBEX_CLIENT_SECRET. |
+| `refresh_token` | string | no | Integration or Service App refresh token. Defaults to WEBEX_REFRESH_TOKEN. |
+| `config_file` | string | no | Config file path. Defaults to WEBEX_CONFIG_FILE, then ~/.config/webex-sec-inspector/config.{json,yaml,yml}. |
+| `org_id` | string | no | Webex organization ID. Defaults to WEBEX_ORG_ID or auto-detect when only one org is visible. |
+| `base_url` | string | no | Webex API base URL. Defaults to https://webexapis.com/v1. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `event_limit` | number | no | Maximum events to inspect. Defaults to 500. |
+| `recording_limit` | number | no | Maximum recordings to inspect. Defaults to 200. |
+| `webhook_limit` | number | no | Maximum webhooks to inspect. Defaults to 200. |
+| `license_limit` | number | no | Maximum licenses to inspect. Defaults to 200. |
+| `room_limit` | number | no | Maximum rooms to inspect. Defaults to 500. |
 
-## 6. Existing Tools
+#### `webex_assess_meeting_hybrid_security`
 
-| Tool | Type | Overlap | Gap Addressed |
-|------|------|---------|---------------|
-| Webex Control Hub | Native admin console | Full admin visibility - but manual, no automated compliance checks | No automated posture scoring or compliance framework mapping |
-| Webex Control Hub Alerts | Native | Alerts on specific events - not comprehensive posture analysis | No holistic security control evaluation |
-| Webex Pro Pack for Control Hub | Add-on | Enhanced compliance features - still requires manual review | No automated security benchmark or drift detection |
-| Cisco ThousandEyes (Webex integration) | Monitoring | Network/performance monitoring - no security posture | No IAM, policy, or compliance assessment |
-| webexpythonsdk / webexteamssdk | SDK | API wrapper - no security analysis logic | Building block only, no compliance controls |
-| Prowler | Cloud security | AWS/Azure/GCP focused - no SaaS collaboration platform coverage | No Webex-specific controls |
-| ScoutSuite | Cloud security | Multi-cloud auditor - no SaaS platform support | No Webex platform coverage |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Webex access token. Defaults to WEBEX_TOKEN, then the config file. |
+| `client_id` | string | no | Integration or Service App client ID for the refresh_token grant. Defaults to WEBEX_CLIENT_ID. |
+| `client_secret` | string | no | Integration or Service App client secret. Defaults to WEBEX_CLIENT_SECRET. |
+| `refresh_token` | string | no | Integration or Service App refresh token. Defaults to WEBEX_REFRESH_TOKEN. |
+| `config_file` | string | no | Config file path. Defaults to WEBEX_CONFIG_FILE, then ~/.config/webex-sec-inspector/config.{json,yaml,yml}. |
+| `org_id` | string | no | Webex organization ID. Defaults to WEBEX_ORG_ID or auto-detect when only one org is visible. |
+| `base_url` | string | no | Webex API base URL. Defaults to https://webexapis.com/v1. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `meeting_limit` | number | no | Maximum meetings to inspect. Defaults to 200. |
+| `device_limit` | number | no | Maximum devices to inspect. Defaults to 500. |
 
-## 7. Architecture
+#### `webex_export_audit_bundle`
 
-```
-webex-sec-inspector/
-├── cmd/
-│   └── webex-sec-inspector/
-│       └── main.go                  # Entrypoint, CLI argument parsing
-├── internal/
-│   ├── client/
-│   │   ├── client.go                # HTTP client with auth, rate limiting, retry
-│   │   ├── auth.go                  # Token management (bot, OAuth, service app)
-│   │   ├── pagination.go            # Cursor/link-based pagination handler
-│   │   └── endpoints.go             # API endpoint path constants
-│   ├── config/
-│   │   ├── config.go                # TOML config loader, env var merging
-│   │   └── validation.go            # Config validation and org ID resolution
-│   ├── analyzers/
-│   │   ├── analyzer.go              # Analyzer interface definition
-│   │   ├── registry.go              # Analyzer registration and discovery
-│   │   ├── identity.go              # SSO, MFA, admin roles, compliance officer
-│   │   ├── messaging.go             # External comms, file sharing, DLP, classification
-│   │   ├── meetings.go              # Encryption, lobby, passwords, virtual backgrounds
-│   │   ├── recordings.go            # Recording storage, retention, access controls
-│   │   ├── compliance.go            # eDiscovery, legal hold, data retention, audit events
-│   │   ├── hybrid.go                # Cluster health, connector status, resource groups
-│   │   ├── devices.go               # Device firmware, managed/unmanaged, workspaces
-│   │   ├── bots.go                  # Bot inventory, approval status
-│   │   ├── webhooks.go              # Webhook HTTPS enforcement, signing secrets
-│   │   ├── calling.go               # SRTP enforcement, calling security profiles
-│   │   ├── licenses.go              # License utilization and assignment review
-│   │   └── guests.go                # Guest access policy evaluation
-│   ├── reporters/
-│   │   ├── reporter.go              # Reporter interface definition
-│   │   ├── json.go                  # JSON findings output
-│   │   ├── csv.go                   # CSV tabular output
-│   │   ├── html.go                  # HTML report with severity charts
-│   │   └── summary.go              # Terminal summary table (TUI/CLI)
-│   ├── models/
-│   │   ├── finding.go               # Finding struct: control, severity, evidence, mappings
-│   │   ├── compliance.go            # Framework mapping definitions
-│   │   └── report.go                # Report metadata and aggregation
-│   └── tui/
-│       ├── app.go                   # Bubble Tea TUI application
-│       ├── views.go                 # Dashboard, findings list, detail views
-│       └── styles.go                # Lip Gloss styling definitions
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── spec.md
-└── .goreleaser.yaml
-```
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Webex access token. Defaults to WEBEX_TOKEN, then the config file. |
+| `client_id` | string | no | Integration or Service App client ID for the refresh_token grant. Defaults to WEBEX_CLIENT_ID. |
+| `client_secret` | string | no | Integration or Service App client secret. Defaults to WEBEX_CLIENT_SECRET. |
+| `refresh_token` | string | no | Integration or Service App refresh token. Defaults to WEBEX_REFRESH_TOKEN. |
+| `config_file` | string | no | Config file path. Defaults to WEBEX_CONFIG_FILE, then ~/.config/webex-sec-inspector/config.{json,yaml,yml}. |
+| `org_id` | string | no | Webex organization ID. Defaults to WEBEX_ORG_ID or auto-detect when only one org is visible. |
+| `base_url` | string | no | Webex API base URL. Defaults to https://webexapis.com/v1. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `output_dir` | string | no | Output root. Defaults to ./export/webex. |
+| `people_limit` | number | no | Maximum people to inspect. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable admin users before warning. Defaults to 10. |
+| `event_limit` | number | no | Maximum events to inspect. Defaults to 500. |
+| `recording_limit` | number | no | Maximum recordings to inspect. Defaults to 200. |
+| `webhook_limit` | number | no | Maximum webhooks to inspect. Defaults to 200. |
+| `license_limit` | number | no | Maximum licenses to inspect. Defaults to 200. |
+| `room_limit` | number | no | Maximum rooms to inspect. Defaults to 500. |
+| `meeting_limit` | number | no | Maximum meetings to inspect. Defaults to 200. |
+| `device_limit` | number | no | Maximum devices to inspect. Defaults to 500. |
 
-### Key Dependencies
 
-| Dependency | Purpose |
-|-----------|---------|
-| `github.com/spf13/cobra` | CLI command structure |
-| `github.com/charmbracelet/bubbletea` | Terminal TUI framework |
-| `github.com/charmbracelet/lipgloss` | TUI styling |
-| `github.com/pelletier/go-toml/v2` | Configuration parsing |
-| `net/http` (stdlib) | HTTP client for API calls |
-| `encoding/json` (stdlib) | JSON serialization/deserialization |
+## Authentication
 
-## 8. CLI Interface
+Supported modes:
 
-```
-webex-sec-inspector [command] [flags]
+- Existing OAuth access token
+- OAuth refresh-token exchange for an integration or service application
 
-Commands:
-  scan        Run all security analyzers against the Webex organization
-  analyze     Run a specific analyzer (e.g., identity, meetings, hybrid, devices)
-  report      Generate report from previous scan results
-  list        List available analyzers and controls
-  version     Print version information
+Credential precedence, highest first:
 
-Global Flags:
-  --token string           Webex bot or integration access token
-  --client-id string       Service app client ID (OAuth client_credentials)
-  --client-secret string   Service app client secret
-  --org-id string          Organization ID to inspect (auto-detected if not set)
-  --config string          Config file path (default "~/.config/webex-sec-inspector/config.toml")
-  --output string          Output format: json, csv, html, summary (default "summary")
-  --output-file string     Write report to file instead of stdout
-  --severity string        Minimum severity to report: critical, high, medium, low (default "low")
-  --tui                    Launch interactive TUI dashboard
-  --no-color               Disable colored output
-  --verbose                Enable verbose logging
-  --timeout duration       API request timeout (default 30s)
+1. Explicit tool arguments
+2. Environment variables
+3. Configured file
+4. Default user configuration file
 
-Examples:
-  # Full scan with bot token
-  webex-sec-inspector scan --token $WEBEX_TOKEN
+Environment variables: `WEBEX_TOKEN`, `WEBEX_CLIENT_ID`, `WEBEX_CLIENT_SECRET`, `WEBEX_REFRESH_TOKEN`, `WEBEX_ORG_ID`, `WEBEX_API_BASE_URL`, `WEBEX_TIMEOUT`, `WEBEX_CONFIG_FILE`
 
-  # Scan specific analyzers with JSON output
-  webex-sec-inspector analyze identity,meetings,hybrid --output json --output-file report.json
+Configuration locations: Path named by WEBEX_CONFIG_FILE, ~/.config/webex-sec-inspector/config.json, ~/.config/webex-sec-inspector/config.yaml, ~/.config/webex-sec-inspector/config.yml
 
-  # Scan high severity and above only
-  webex-sec-inspector scan --severity high
+Credential and deployment variants: Person token, Guest token, Bot token, Integration token, Service application token
 
-  # Launch interactive TUI
-  webex-sec-inspector scan --tui
+Configuration fields: `token`, `client_id`, `client_secret`, `refresh_token`, `org_id`, `base_url`, `timeout_seconds`
 
-  # Service app authentication
-  webex-sec-inspector scan --client-id $WEBEX_CLIENT_ID --client-secret $WEBEX_CLIENT_SECRET
+Malformed configuration: Reject unreadable, invalid, or non-object JSON/YAML with a fixed Webex configuration error. Never include parser text, source text, or credential values.
 
-  # Target specific organization
-  webex-sec-inspector scan --token $WEBEX_TOKEN --org-id Y2lzY29zcGFyazovL3VzL09SR...
-```
+Credential refresh: POST /access_token with application/x-www-form-urlencoded grant_type=refresh_token, client_id, client_secret and refresh_token; require a JSON access_token.
 
-## 9. Build Sequence
+## Permissions
 
-```bash
-# 1. Initialize module
-go mod init github.com/hackIDLE/webex-sec-inspector
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| oauth-scope | `spark:people_read` | `me` |  |
+| oauth-scope | `spark-admin:people_read` | `people` |  |
+| oauth-scope | `spark-admin:organizations_read` | `organizations`, `organization` |  |
+| oauth-scope | `spark-admin:roles_read` | `roles` |  |
+| oauth-scope | `spark-admin:licenses_read` | `licenses` |  |
+| oauth-scope | `spark-admin:devices_read` | `devices` |  |
+| oauth-scope | `spark-admin:workspaces_read` | `workspaces` |  |
+| oauth-scope | `spark-admin:hybrid_clusters_read` | `hybrid-clusters`, `hybrid-connectors` |  |
+| oauth-scope | `spark-compliance:events_read` | `events` |  |
+| oauth-scope | `audit:events_read` | `admin-audit-events` |  |
+| oauth-scope | `meeting:schedules_read or meeting:admin_schedule_read` | `meetings` |  |
+| oauth-scope | `spark-compliance:recordings_read` | `admin-recordings` |  |
+| oauth-scope | `guest-issuer:read` | `guest-count` |  |
+| oauth-scope | `meeting:preferences_read or meeting:admin_preferences_read` | `meeting-preferences`, `meeting-sites` |  |
+| oauth-scope | `meeting:admin_config_read` | `meeting-common-settings` |  |
+| oauth-scope | `spark:rooms_read` | `rooms` |  |
+| oauth-scope | `spark:webhooks_read` | `webhooks` |  |
+| plan | `Webex Pro Pack` | `events`, `admin-audit-events` | Some compliance and longer-retention evidence depends on the tenant plan. |
 
-# 2. Install dependencies
-go get github.com/spf13/cobra@latest
-go get github.com/charmbracelet/bubbletea@latest
-go get github.com/charmbracelet/lipgloss@latest
-go get github.com/pelletier/go-toml/v2@latest
-go mod tidy
+## API surfaces
 
-# 3. Build binary
-go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \
-  -o bin/webex-sec-inspector ./cmd/webex-sec-inspector/
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `token-refresh` | HTTP | `POST /access_token` | https://webexapis.com/v1 | N/A | auth-only | Authentication only. The access token is never exported. | `access_token` | [Official documentation](https://developer.webex.com/docs/integrations) |
+| `me` | HTTP | `GET /people/me` | https://webexapis.com/v1 | N/A | auth-only | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `displayName`, `emails`, `type`, `roles`, `orgId`, `created` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/people/get-my-own-details) |
+| `organizations` | HTTP | `GET /organizations` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `displayName`, `created` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/organizations/list-organizations) |
+| `organization` | HTTP | `GET /organizations/{orgId}` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `displayName`, `created` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/organizations/get-organization-details) |
+| `people` | HTTP | `GET /people` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `displayName`, `emails`, `type`, `roles`, `orgId`, `created` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/people/list-people) |
+| `roles` | HTTP | `GET /roles` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `name` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/roles/list-roles) |
+| `licenses` | HTTP | `GET /licenses` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `name`, `totalUnits`, `consumedUnits`, `subscriptionId`, `siteUrl`, `siteType` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/licenses/list-licenses) |
+| `events` | HTTP | `GET /events` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `resource`, `type`, `actorId`, `actorOrgId`, `orgId`, `created` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/events/list-events) |
+| `admin-audit-events` | HTTP | `GET /adminAudit/events` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `actorId`, `actorOrgId`, `targetOrgId`, `created`, `data.eventCategory`, `data.eventDescription`, `data.actionText`, `data.actorEmail`, `data.actorName`, `data.adminRoles`, `data.targetType`, `data.targetName` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/admin-audit-events/list-admin-audit-events) |
+| `admin-recordings` | HTTP | `GET /admin/recordings` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `meetingId`, `topic`, `createTime`, `timeRecorded`, `hostEmail`, `siteUrl`, `downloadUrl`, `playbackUrl`, `format`, `serviceType`, `durationSeconds`, `sizeBytes`, `status` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/recordings/list-recordings-for-an-admin-or-compliance-officer) |
+| `guest-count` | HTTP | `GET /guests/count` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `count` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/guest-management/get-guest-count) |
+| `hybrid-clusters` | HTTP | `GET /hybrid/clusters` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `name`, `orgId`, `resourceGroupId` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/hybrid-clusters/list-hybrid-clusters) |
+| `hybrid-connectors` | HTTP | `GET /hybrid/connectors` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `orgId`, `hybridClusterId`, `hostname`, `type`, `version`, `status`, `created` | [Official documentation](https://developer.webex.com/admin/docs/api/v1/hybrid-connectors/list-hybrid-connectors) |
+| `meetings` | HTTP | `GET /meetings` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `title`, `meetingType`, `state`, `start`, `end`, `hostEmail`, `siteUrl`, `webLink`, `password`, `unlockedMeetingJoinSecurity`, `enabledJoinBeforeHost`, `joinBeforeHostMinutes`, `enableAutomaticLock`, `automaticLockMinutes`, `publicMeeting` | [Official documentation](https://developer.webex.com/meeting/docs/api/v1/meetings/list-meetings) |
+| `meeting-preferences` | HTTP | `GET /meetingPreferences` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `personalMeetingRoom.enabledAutoLock`, `personalMeetingRoom.autoLockMinutes`, `personalMeetingRoom.notifyHost`, `personalMeetingRoom.supportCoHost`, `personalMeetingRoom.supportAnyoneAsCoHost`, `personalMeetingRoom.allowFirstUserToBeCoHost`, `personalMeetingRoom.allowAuthenticatedDevices`, `audio.defaultAudioType`, `audio.enabledGlobalCallIn`, `audio.enabledTollFree`, `audio.enabledAutoConnection`, `schedulingOptions.enabledJoinBeforeHost`, `schedulingOptions.joinBeforeHostMinutes`, `schedulingOptions.enabledAutoShareRecording`, `schedulingOptions.enabledWebexAssistantByDefault`, `sites.siteUrl`, `sites.default` | [Official documentation](https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-meeting-preference-details) |
+| `meeting-sites` | HTTP | `GET /meetingPreferences/sites` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `siteUrl`, `default` | [Official documentation](https://developer.webex.com/meeting/docs/api/v1/meeting-preferences/get-site-list) |
+| `meeting-common-settings` | HTTP | `GET /admin/meeting/config/commonSettings` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `siteUrl`, `securityOptions.joinBeforeHost`, `securityOptions.audioBeforeHost`, `securityOptions.firstAttendeeAsPresenter`, `securityOptions.unlistAllMeetings`, `securityOptions.requireLoginBeforeAccess`, `securityOptions.allowMobileScreenCapture`, `securityOptions.requireStrongPassword`, `securityOptions.passwordCriteria.mixedCase`, `securityOptions.passwordCriteria.minLength`, `securityOptions.passwordCriteria.minNumeric`, `securityOptions.passwordCriteria.minAlpha`, `securityOptions.passwordCriteria.minSpecial`, `securityOptions.passwordCriteria.disallowDynamicWebText`, `securityOptions.passwordCriteria.disallowList`, `securityOptions.passwordCriteria.disallowValues` | [Official documentation](https://developer.webex.com/meeting/docs/api/v1/site/get-meeting-common-settings-configuration) |
+| `devices` | HTTP | `GET /devices` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `displayName`, `workspaceId`, `personId`, `orgId`, `product`, `type`, `software`, `upgradeChannel`, `connectionStatus`, `managedBy`, `created` | [Official documentation](https://developer.webex.com/calling/docs/api/v1/devices/list-devices) |
+| `workspaces` | HTTP | `GET /workspaces` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `displayName`, `type`, `orgId`, `created` | [Official documentation](https://developer.webex.com/calling/docs/api/v1/workspaces/list-workspaces) |
+| `rooms` | HTTP | `GET /rooms` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `title`, `type`, `isLocked`, `isPublic`, `classificationId`, `teamId`, `ownerId`, `created`, `lastActivity` | [Official documentation](https://developer.webex.com/messaging/docs/api/v1/rooms/list-rooms) |
+| `webhooks` | HTTP | `GET /webhooks` | https://webexapis.com/v1 | N/A | read | Fields name the normalized record written under core_data after allowlist projection and secret scrubbing. | `id`, `name`, `targetUrl`, `resource`, `event`, `secret`, `status`, `ownedBy`, `created` | [Official documentation](https://developer.webex.com/meeting/docs/api/v1/webhooks/list-webhooks) |
 
-# 4. Run tests
-go test ./... -v -race -coverprofile=coverage.out
+### Request construction
 
-# 5. Lint
-golangci-lint run ./...
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `token-refresh` | client | The configured Webex API origin. | yes |
+| `token-refresh` | headers | Content-Type: application/x-www-form-urlencoded; Accept: application/json | yes |
+| `token-refresh` | response | JSON object containing a nonempty access_token string. | yes |
+| `token-refresh` | form-body:grant_type | refresh_token | yes |
+| `token-refresh` | form-body:client_id | Configured client identifier | yes |
+| `token-refresh` | form-body:client_secret | Configured client secret | yes |
+| `token-refresh` | form-body:refresh_token | Configured refresh token | yes |
+| `me` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `me` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `me` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `organizations` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `organizations` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `organizations` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `organization` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `organization` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `organization` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `organization` | path:orgId | URL-encoded organization identifier | yes |
+| `people` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `people` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `people` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `people` | query:orgId | Configured organization identifier; Only when org_id is configured. | no |
+| `people` | query:max | 100; Sent on every page for this surface. | no |
+| `roles` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `roles` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `roles` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `licenses` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `licenses` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `licenses` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `licenses` | query:orgId | Configured organization identifier; Only when org_id is configured. | no |
+| `events` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `events` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `events` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `events` | query:max | 100; Sent on every page for this surface. | no |
+| `admin-audit-events` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `admin-audit-events` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `admin-audit-events` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `admin-audit-events` | query:orgId | Resolved organization identifier | yes |
+| `admin-audit-events` | query:from | Current time minus 30 days, ISO 8601 | yes |
+| `admin-audit-events` | query:to | Current time, ISO 8601 | yes |
+| `admin-audit-events` | query:max | 200; Sent on every page for this surface. | no |
+| `admin-recordings` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `admin-recordings` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `admin-recordings` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `admin-recordings` | query:max | 100; Sent on every page for this surface. | no |
+| `guest-count` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `guest-count` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `guest-count` | response | A bare decimal count in text/plain or a JSON object containing one numeric value. | yes |
+| `hybrid-clusters` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `hybrid-clusters` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `hybrid-clusters` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `hybrid-clusters` | query:orgId | Configured organization identifier; Only when org_id is configured. | no |
+| `hybrid-connectors` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `hybrid-connectors` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `hybrid-connectors` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `hybrid-connectors` | query:orgId | Configured organization identifier; Only when org_id is configured. | no |
+| `meetings` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `meetings` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `meetings` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `meetings` | query:max | 100; Sent on every page for this surface. | no |
+| `meeting-preferences` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `meeting-preferences` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `meeting-preferences` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `meeting-sites` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `meeting-sites` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `meeting-sites` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `meeting-common-settings` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `meeting-common-settings` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `meeting-common-settings` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `meeting-common-settings` | query:siteUrl | One site URL from meeting-sites; Once per listed site; omit only for the preferred-site fallback. | no |
+| `devices` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `devices` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `devices` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `devices` | query:orgId | Configured organization identifier; Only when org_id is configured. | no |
+| `devices` | query:max | 100; Sent on every page for this surface. | no |
+| `workspaces` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `workspaces` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `workspaces` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `workspaces` | query:orgId | Configured organization identifier; Only when org_id is configured. | no |
+| `workspaces` | query:max | 100; Sent on every page for this surface. | no |
+| `rooms` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `rooms` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `rooms` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `rooms` | query:max | 100; Sent on every page for this surface. | no |
+| `webhooks` | client | The configured Webex API origin; there is no regional client selection. | yes |
+| `webhooks` | headers | Accept: application/json; Authorization: Bearer <access token> | yes |
+| `webhooks` | response | JSON object; list operations read the items array and also accept a top-level array. | yes |
+| `webhooks` | query:max | 100; Sent on every page for this surface. | no |
 
-# 6. Docker build
-docker build -t webex-sec-inspector:latest .
+## Pagination
 
-# 7. Release (via GoReleaser)
-goreleaser release --clean
-```
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `organizations`, `people`, `roles`, `licenses`, `events`, `admin-audit-events`, `admin-recordings`, `hybrid-clusters`, `hybrid-connectors`, `meetings`, `meeting-sites`, `devices`, `workspaces`, `rooms`, `webhooks` | `Link header rel=next` | service default | caller limit | 1000 | The service does not provide a dependable total for these walks; report items seen and whether exhaustion was proven. | No Link header or a parsed Link header with no rel=next; Any Link header value rejected by the current parser stops the walk truncated; Configured item cap; Page cap; A cross-origin next URL is rejected before a second request and the walk stops truncated; A next URL carrying user information is rejected before a second request and the walk stops truncated |
 
-## 10. Status
+## Rate limits
 
-Implemented in grclanker (2026-09-21) as five read-only tools with 22 findings covering all 25 controls.
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Webex REST API | Not published | `Retry-After` | 429 | Retry at most 2 times, cap each Retry-After delay at 30000 milliseconds, then report the surface unreadable. |
 
-### What shipped
+## Checks
 
-- Auth: bearer token, integration or Service App `refresh_token` grant against `POST /access_token`, config file discovery, bot token detection with admin-only controls rendered manual, and token redaction in every output.
-- Automatable controls (pass, warn, or fail from documented fields): 3 (Compliance Officer role), 9 (`securityOptions.joinBeforeHost`, `audioBeforeHost`, `unlistAllMeetings` from `GET /admin/meeting/config/commonSettings` per site), 10 (`securityOptions.requireStrongPassword` and `passwordCriteria.minLength`, same endpoint), 13 (`securityOptions.requireLoginBeforeAccess`, same endpoint, plus a guest inventory from People `type = appuser` and `GET /guests/count`), 14 (space classification via `classificationId`), 15 and 16 (hybrid connector `status`), 19 inventory (People `type = bot`), 20 (webhook `targetUrl` and `secret`), 24 (license `totalUnits` and `consumedUnits`), 25 (`/adminAudit/events`).
-- Manual controls with the citation proving the setting is absent from the public API and the Control Hub evidence to collect: 1, 2, 4, 5, 6, 7, 8, 11, 12, 17, 18, 19 approval, 21, 22, 23.
-- Verdict safety: denied or errored endpoints, empty inventories, partial views (truncated pages, bot tokens, sites that could not be read or listed), and undated items never pass; pagination follows `Link rel="next"` to completion and reports truncation; 429 honors `Retry-After`.
-- Rule 1 corollary: a finding that reads more than one inventory caps at `warn` when any of them is unreadable, even if its verdict comes from a complete primary inventory (WEBEX-ID-07 on `GET /guests/count`; WEBEX-MTG-02 and WEBEX-MTG-06 on `GET /meetings` and `GET /meetingPreferences`; WEBEX-COLLAB-04, WEBEX-COLLAB-05, WEBEX-MTG-02, WEBEX-MTG-03, and WEBEX-MTG-06 on the `GET /people/me` token-type probe). The summary names the endpoint and scope, counts and lists derived from the unreadable inventory render as `null` beside a `*_status` object, a denied `GET /meetingPreferences/sites` is named even when `GET /meetingPreferences` still lists the sites, and per-site `commonSettings` failures land in the assessment errors array and `_errors.log`. The null rule is uniform across every summary and evidence field, including manual findings: WEBEX-ID-02 takes the denied path (fields `null`, endpoint named, no count in prose) when either `GET /people` or `GET /roles` is unreadable, because the administrator list is derived from both.
-- Error-string hygiene: no response body is ever copied into an error string (JSON errors contribute only their documented message fields; a non-JSON body is described as `non-JSON error body (<content type>; <bytes> bytes)`), and every error string is scrubbed once where it is created (`scrubErrorText`, applied in the `WebexApiError` constructor and in the surface collectors) so that URL query strings anywhere in the text and credential-shaped fragments (`Bearer <value>`, `session=<value>`, `api_key: <value>`) never reach the errors array, `_errors.log`, `access.json`, status objects, summaries, or reports. The config loader follows the same rule: a read failure is `Unable to read Webex config file <path> (<code>)` with `code` taken from the system error's `code` only when it matches `^E[A-Z0-9_]{1,30}$`, a parse failure is `Unable to parse Webex config file: invalid YAML|JSON in <path>[ at line <n>]` with the line only from a structured `YAMLError.linePos`, neither library message is ever interpolated (the YAML parser quotes the offending line, an unresolved alias throws a `ReferenceError` naming its value, and `JSON.parse` quotes a ten-character source window), and an explicit `config_file` or `WEBEX_CONFIG_FILE` path that does not exist is `Webex config file not found: <path>`.
-- Bundle layout: `core_data/` (each surface projected to a per-surface field allowlist of what the findings read, with secret-named keys redacted and URL query strings such as recording `RCID`, meeting `MTID`, and webhook tokens stripped; nothing outside the allowlist is written), `analysis/`, `compliance/` with executive summary, unified matrix, and one report per framework in section 5, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, zip named after the allocated directory with `-2`, `-3` reruns.
-- Pagination follows `Link rel="next"` up to 1000 pages per listing; the item limit and the page ceiling both report `truncated: true`.
-- Live smoke: `npm --prefix cli run test:webex:live`.
+### Control coverage
 
-### Deviations from this spec
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | SSO enforcement | WEBEX-ID-01 | Evaluate the ordered first-match rules for WEBEX-ID-01 below. |
+| 2 | Admin MFA | WEBEX-ID-02 | Evaluate the ordered first-match rules for WEBEX-ID-02 below. |
+| 3 | Compliance officer role | WEBEX-ID-03 | Evaluate the ordered first-match rules for WEBEX-ID-03 below. |
+| 4 | External communications | WEBEX-COLLAB-01 | Evaluate the ordered first-match rules for WEBEX-COLLAB-01 below. |
+| 5 | File sharing restrictions | WEBEX-COLLAB-02 | Evaluate the ordered first-match rules for WEBEX-COLLAB-02 below. |
+| 6 | Recording storage control | WEBEX-COLLAB-03 | Evaluate the ordered first-match rules for WEBEX-COLLAB-03 below. |
+| 7 | Recording retention | WEBEX-COLLAB-03 | Evaluate the ordered first-match rules for WEBEX-COLLAB-03 below. |
+| 8 | End-to-end meeting encryption | WEBEX-MTG-01 | Evaluate the ordered first-match rules for WEBEX-MTG-01 below. |
+| 9 | Meeting lobby controls | WEBEX-MTG-02 | Evaluate the ordered first-match rules for WEBEX-MTG-02 below. |
+| 10 | Meeting password required | WEBEX-MTG-06 | Evaluate the ordered first-match rules for WEBEX-MTG-06 below. |
+| 11 | eDiscovery and legal hold | WEBEX-COLLAB-08 | Evaluate the ordered first-match rules for WEBEX-COLLAB-08 below. |
+| 12 | Data retention policy | WEBEX-COLLAB-03 | Evaluate the ordered first-match rules for WEBEX-COLLAB-03 below. |
+| 13 | Guest access restrictions | WEBEX-ID-07, WEBEX-MTG-03 | Evaluate the ordered first-match rules for WEBEX-ID-07, WEBEX-MTG-03 below. |
+| 14 | Space classification | WEBEX-COLLAB-04 | Evaluate the ordered first-match rules for WEBEX-COLLAB-04 below. |
+| 15 | Hybrid cluster health | WEBEX-MTG-04 | Evaluate the ordered first-match rules for WEBEX-MTG-04 below. |
+| 16 | Hybrid connector status | WEBEX-MTG-04 | Evaluate the ordered first-match rules for WEBEX-MTG-04 below. |
+| 17 | Device firmware currency | WEBEX-MTG-05 | Evaluate the ordered first-match rules for WEBEX-MTG-05 below. |
+| 18 | Unmanaged device blocking | WEBEX-MTG-05 | Evaluate the ordered first-match rules for WEBEX-MTG-05 below. |
+| 19 | Bot management | WEBEX-ID-05, WEBEX-ID-06 | Evaluate the ordered first-match rules for WEBEX-ID-05, WEBEX-ID-06 below. |
+| 20 | Webhook transport and signing | WEBEX-COLLAB-05 | Evaluate the ordered first-match rules for WEBEX-COLLAB-05 below. |
+| 21 | Messaging data loss prevention | WEBEX-COLLAB-02 | Evaluate the ordered first-match rules for WEBEX-COLLAB-02 below. |
+| 22 | Calling encryption | WEBEX-MTG-01 | Evaluate the ordered first-match rules for WEBEX-MTG-01 below. |
+| 23 | Virtual background policy | WEBEX-MTG-07 | Evaluate the ordered first-match rules for WEBEX-MTG-07 below. |
+| 24 | License utilization | WEBEX-COLLAB-06 | Evaluate the ordered first-match rules for WEBEX-COLLAB-06 below. |
+| 25 | Admin activity audit | WEBEX-ID-04, WEBEX-COLLAB-07 | Evaluate the ordered first-match rules for WEBEX-ID-04, WEBEX-COLLAB-07 below. |
 
-- `/admin/organizations/{orgId}/settings` and `/admin/organizations/{orgId}/security` do not exist in the public API; the Organizations reference documents only `id`, `displayName`, and `created`, so controls that depended on them render manual.
-- Org-wide meeting lobby, password, and guest access defaults (controls 9, 10, 13) are read from `GET /admin/meeting/config/commonSettings` (site reference, scope `meeting:admin_config_read`), once per site returned by `GET /meetingPreferences/sites`, instead of the per-meeting or organization endpoints this spec named.
-- Control 2 (admin MFA) stays manual by coordinator ruling: `mfaEnabled` exists only in the PATCH request schema of `/identity/organizations/{orgId}/authenticationConfig` (update-organization-authentication-configuration-settings); no GET is documented, and a read-only inspector does not PATCH. `/people` has no MFA attribute either, so the admin list is attached as evidence only. WEBEX-ID-02 is the only finding tagged with control 2; the administrator concentration finding (WEBEX-ID-04) is tagged with control 25 so a bounded admin count never rolls up as a pass on MFA.
-- Recordings are read through `/admin/recordings` (the admin and compliance officer endpoint named in the compliance guide) and expose no storage or retention fields.
-- Admin audit evidence comes from `/adminAudit/events` (`audit:events_read`), not `/events`.
-- `orgId` is sent only where documented: `/people`, `/licenses`, `/devices`, `/workspaces`, `/hybrid/clusters`, `/hybrid/connectors`, `/adminAudit/events`. `max` is sent only where documented: `/people`, `/events`, `/adminAudit/events`, `/admin/recordings`, `/meetings`, `/devices`, `/workspaces`, `/rooms`, `/webhooks`.
-- Config file is `~/.config/webex-sec-inspector/config.json`, `.yaml`, or `.yml` instead of `config.toml`.
-- Control 22 (SRTP) stays folded into WEBEX-MTG-01 because no public API exposes a calling SRTP setting.
-- Per-resource GET endpoints are unused except `/organizations/{orgId}`; no control needs a field the list endpoints lack.
-- Guest inventory (control 13) uses the People `type` enum, whose `appuser` value is documented as a guest user, and `GET /guests/count` (scope `guest-issuer:read`), which answers with a bare number.
-- Reference verification: the canonical `https://developer.webex.com/docs/api/v1/<category>/<page>` URL answers 302 to a category-prefixed page (`/admin/docs`, `/meeting/docs`, `/calling/docs`, `/messaging/docs`) whose server-rendered HTML embeds the OpenAPI 3.0.3 schema for every endpoint in that category. `curl -L` fetches it without a browser, and every field read by the implementation was checked against that embedded schema.
+### Finding notes
 
-### Deferred
+These notes explain intent only. The ordered rule table is normative.
 
-- SARIF, CSV, and HTML reporters (section 1 output formats).
-- TUI and Go CLI surface (sections 7 to 9).
-- `GET /webhooks?ownedBy=org` for org-wide webhook inventory.
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `WEBEX-ID-01` | critical | `webex_assess_identity` | `organization` | `org_id`, `organization`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created. |
+| `WEBEX-ID-02` | critical | `webex_assess_identity` | `people`, `roles` | `admin_users`, `admin_count`, `people_seen`, `people_truncated`, `denied_endpoint`, `inventory_status`, `citation`, `people_citation`, `roles_citation`, `token_type` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field. |
+| `WEBEX-ID-03` | high | `webex_assess_identity` | `people`, `roles` | `citation`, `token_type`, `people_seen`, `roles_seen`, `compliance_officers`, `compliance_officer_count`, `people_truncated` | People and roles are readable, the people population is nonempty, the people listing is complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively. Role-list truncation does not demote this runtime finding. | At least one Compliance Officer is visible, but the people listing is truncated. | People and roles are readable and the nonempty people population contains no Compliance Officer. | People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer. |
+| `WEBEX-ID-04` | medium | `webex_assess_identity` | `people`, `roles` | `token_type`, `people_seen`, `people_truncated`, `admin_users`, `admin_count`, `max_admins` | People and roles are readable, the people listing is complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins. Role-list truncation does not demote this runtime finding. | No administrator is visible, the people list is truncated, or administrator count exceeds max_admins; max_admins defaults to 10. | No fail verdict is emitted; concentration above the threshold requires review rather than proving noncompliance. | People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list. |
+| `WEBEX-ID-05` | medium | `webex_assess_identity` | `people` | `citation`, `token_type`, `people_seen`, `people_truncated`, `bots`, `bot_count` | GET /people is readable, nonempty and complete; inventory records every Person.type equal to 'bot'. | GET /people is readable and nonempty but truncated. | No fail verdict is emitted because bot presence is an inventory for comparison with the approved register. | GET /people is unreadable or returns zero people; export Control Hub Apps > Bots. |
+| `WEBEX-ID-06` | medium | `webex_assess_identity` | `people` | `bot_count`, `people_status`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Management > Apps bot management and reconcile it with WEBEX-ID-05; no documented read field exposes bot approval state. |
+| `WEBEX-ID-07` | medium | `webex_assess_identity` | `people`, `guest-count` | `guests`, `guest_count_people`, `guest_count_api`, `guest_count_api_error`, `guest_count_api_status`, `people_seen`, `people_truncated`, `citation`, `guest_count_citation`, `token_type` | GET /people is readable, nonempty and complete, GET /guests/count is readable, and Person.type='appuser' records are inventoried for reconciliation with WEBEX-MTG-03. | The people listing is truncated or GET /guests/count is unreadable, so the otherwise complete inventory cannot pass. | No fail verdict is emitted because the inventory does not itself settle guest-access policy. | GET /people is unreadable or returns zero people; export the Control Hub guest user list. |
+| `WEBEX-COLLAB-01` | high | `webex_assess_collaboration_governance` | `organization` | `org_id`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub Messaging external communication allow-list settings; no documented read endpoint exposes the policy. |
+| `WEBEX-COLLAB-02` | high | `webex_assess_collaboration_governance` | `events` | `events_readable`, `events_seen`, `events_status`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub file-sharing controls and DLP or CASB integration evidence; Events is supporting inventory only and exposes no policy-state field. |
+| `WEBEX-COLLAB-03` | medium | `webex_assess_collaboration_governance` | `admin-recordings` | `citation`, `token_type`, `recordings_seen`, `deleted_recordings`, `recordings_truncated` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub recording and messaging retention and storage settings; the admin recordings read exposes recordings but no retention or storage-location policy. |
+| `WEBEX-COLLAB-04` | medium | `webex_assess_collaboration_governance` | `rooms`, `me` | `citation`, `rooms_seen`, `rooms_truncated`, `rooms_without_classification`, `rooms_without_classification_count`, `token_type`, `token_probe_status` | Rooms is readable and nonempty, every visible room has classificationId, the listing is complete, and token type is verified as non-bot. | Every visible room has classificationId but the listing is truncated, the token is a bot, or GET /people/me cannot prove token type. | At least one visible room lacks classificationId. | Rooms is unreadable or empty; export Control Hub space classification settings. |
+| `WEBEX-COLLAB-05` | high | `webex_assess_collaboration_governance` | `webhooks`, `me` | `citation`, `webhooks_seen`, `webhooks_truncated`, `inactive_webhooks`, `insecure_webhooks`, `insecure_webhooks_count`, `token_type`, `token_probe_status` | Webhooks is readable and nonempty, every visible webhook targetUrl starts with 'https://' and has a nonempty secret, the list is complete, and token type is verified as non-bot. | Every visible webhook is secure but the list is truncated, the token is a bot, or token type cannot be verified. | At least one visible webhook lacks an HTTPS targetUrl or a nonempty signing secret. | Webhooks is unreadable or empty; collect webhook inventories from every integration owner. |
+| `WEBEX-COLLAB-06` | low | `webex_assess_collaboration_governance` | `licenses` | `citation`, `token_type`, `licenses_seen`, `licenses_truncated`, `total_units`, `consumed_units`, `unassigned_units` | Licenses is readable and complete, totalUnits is positive, and unassigned units divided by total units is at most 0.20. | The unassigned ratio exceeds 0.20 or the license listing is truncated. | No fail verdict is emitted; excess unassigned capacity is a review condition. | Licenses is unreadable, empty, or has totalUnits equal to zero; export the Control Hub subscriptions and usage report. |
+| `WEBEX-COLLAB-07` | high | `webex_assess_collaboration_governance` | `admin-audit-events` | `citation`, `token_type`, `events_seen`, `events_with_dates`, `undated_events`, `window_days`, `events_truncated` | Admin audit events is readable, nonempty and complete for the last 30 days. | The read returns zero events or is truncated; confirm the log is populated and reviewed. | No fail verdict is emitted because an empty window needs reviewer confirmation. | Organization context is unavailable or admin audit events is unreadable; export the Control Hub admin audit log. |
+| `WEBEX-COLLAB-08` | high | `webex_assess_collaboration_governance` | `events` | `events_readable`, `events_seen`, `events_truncated`, `events_status`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export Control Hub eDiscovery and legal-hold configuration; the public compliance guide exposes no read endpoint for configuration and events older than 90 days require Pro Pack. |
+| `WEBEX-MTG-01` | high | `webex_assess_meeting_hybrid_security` | `meeting-preferences`, `meeting-common-settings` | `meeting_preferences_readable`, `sites_seen`, `meeting_sites_status`, `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export the Control Hub meeting session type showing end-to-end encryption and the calling security configuration showing SRTP; the documented reads expose neither setting. |
+| `WEBEX-MTG-02` | high | `webex_assess_meeting_hybrid_security` | `meeting-sites`, `meeting-common-settings`, `meetings`, `meeting-preferences`, `me` | `sites`, `denied_sites`, `site_coverage_complete`, `site_list_status`, `citation`, `token_type`, `meetings_seen`, `meetings_truncated`, `meetings_status`, `sampled_allow_join_without_lobby`, `sampled_without_password`, `personal_meeting_room_auto_lock`, `meeting_preferences_status`, `token_probe_status`, `meetings_citation` | Every readable site reports joinBeforeHost=false, audioBeforeHost=false and unlistAllMeetings=true; the site list and all sites are complete; meetings, meeting preferences and token type are readable. | joinBeforeHost=false but audioBeforeHost is absent or unlistAllMeetings is not true, or otherwise-passing evidence has partial site or secondary coverage. | Any site reports joinBeforeHost=true or audioBeforeHost=true. | No site common settings are readable or any site omits joinBeforeHost; collect each site's Control Hub Common Settings > Security page. |
+| `WEBEX-MTG-03` | medium | `webex_assess_meeting_hybrid_security` | `meeting-sites`, `meeting-common-settings`, `me` | `sites`, `denied_sites`, `site_coverage_complete`, `site_list_status`, `citation`, `token_type`, `token_probe_status` | Every readable site reports requireLoginBeforeAccess=true, site coverage is complete, and token type is readable. | All readable sites require login but site coverage or token-type evidence is partial. | Any readable site reports requireLoginBeforeAccess=false. | No site common settings are readable or any site omits requireLoginBeforeAccess; collect each site's Control Hub Common Settings > Security page. |
+| `WEBEX-MTG-04` | high | `webex_assess_meeting_hybrid_security` | `hybrid-clusters`, `hybrid-connectors` | `citation`, `token_type`, `clusters_seen`, `connectors_seen`, `connector_versions`, `undated_connectors`, `non_operational`, `non_operational_count` | Both inventories are readable, at least one connector exists, every connector status equals 'operational', and neither listing is truncated. | Every connector is operational but either listing is truncated. | Clusters exist with no connectors, or any connector status is not 'operational'. | Either inventory is unreadable, or both are empty and deployment applicability must be confirmed in Control Hub. |
+| `WEBEX-MTG-05` | high | `webex_assess_meeting_hybrid_security` | `devices`, `workspaces` | `citation`, `token_type`, `devices_seen`, `devices_truncated`, `personal_mode_devices`, `software_versions`, `software_version_count`, `upgrade_channels`, `upgrade_channel_count`, `devices_without_upgrade_channel`, `managed_by`, `workspaces_seen`, `workspaces_status` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Compare inventoried software and upgrade channels with Cisco RoomOS lifecycle guidance and export the Control Hub device activation policy; documented device reads expose no end-of-life or blocking-policy field. |
+| `WEBEX-MTG-06` | high | `webex_assess_meeting_hybrid_security` | `meeting-sites`, `meeting-common-settings`, `meetings`, `meeting-preferences`, `me` | `sites`, `denied_sites`, `site_coverage_complete`, `site_list_status`, `citation`, `token_type`, `meetings_seen`, `meetings_truncated`, `meetings_status`, `sampled_allow_join_without_lobby`, `sampled_without_password`, `personal_meeting_room_auto_lock`, `meeting_preferences_status`, `token_probe_status`, `meetings_citation` | Every readable site reports requireStrongPassword=true and passwordCriteria.minLength at least 8; site coverage and all secondary evidence are complete. | Strong passwords are required but minLength is absent or below 8, or otherwise-passing evidence has partial site or secondary coverage. | Any readable site reports requireStrongPassword=false. | No site common settings are readable or any site omits requireStrongPassword; collect each site's Control Hub Common Settings > Security page. |
+| `WEBEX-MTG-07` | low | `webex_assess_meeting_hybrid_security` | `meeting-common-settings` | `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export the Control Hub meeting settings page for virtual backgrounds; no field is exposed by meeting preferences, common settings, or session types. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `WEBEX-ID-01` | 1 | manual | always | SSO state has no documented read field. |
+| `WEBEX-ID-02` | 1 | manual | always | Administrator MFA state has no documented read field. |
+| `WEBEX-ID-03` | 1 | manual | any of (not (`people_seen` is present and non-null); `people_seen` equals 0) |  |
+| `WEBEX-ID-03` | 2 | fail | any of (not (`compliance_officer_count` is present and non-null); `compliance_officer_count` equals 0) |  |
+| `WEBEX-ID-03` | 3 | warn | `people_truncated` equals true |  |
+| `WEBEX-ID-03` | 4 | pass | always |  |
+| `WEBEX-ID-04` | 1 | manual | any of (`people_seen` equals 0; all of (not (`admin_users` is present and non-null); not (`admin_count` is present and non-null))) |  |
+| `WEBEX-ID-04` | 2 | warn | any of (`admin_count` (default -1) equals 0; all of (not (`admin_count` is present and non-null); `admin_users` equals 0); `admin_count` (default 0) is greater than `max_admins` (default 10); `people_truncated` equals true) |  |
+| `WEBEX-ID-04` | 3 | pass | always |  |
+| `WEBEX-ID-05` | 1 | manual | not (`bot_count` is present and non-null) |  |
+| `WEBEX-ID-05` | 2 | warn | `people_truncated` equals true |  |
+| `WEBEX-ID-05` | 3 | pass | always |  |
+| `WEBEX-ID-06` | 1 | manual | always | Bot approval has no documented read field. |
+| `WEBEX-ID-07` | 1 | manual | any of (not (`guest_count_people` is present and non-null); `guest_count_people` is null; `people_seen` equals 0) |  |
+| `WEBEX-ID-07` | 2 | warn | any of (`people_truncated` equals true; `guest_count_api_status.readable` equals false) |  |
+| `WEBEX-ID-07` | 3 | pass | always |  |
+| `WEBEX-COLLAB-01` | 1 | manual | always | External communication policy has no documented read field. |
+| `WEBEX-COLLAB-02` | 1 | manual | always | File-sharing and DLP policy state has no documented read field. |
+| `WEBEX-COLLAB-03` | 1 | manual | always | Recording retention/storage policy has no documented read field. |
+| `WEBEX-COLLAB-04` | 1 | manual | any of (not (`rooms_seen` is present and non-null); `rooms_seen` equals 0) |  |
+| `WEBEX-COLLAB-04` | 2 | fail | `rooms_without_classification_count` (default 0) is greater than 0 |  |
+| `WEBEX-COLLAB-04` | 3 | warn | any of (`rooms_truncated` equals true; `token_type` equals "bot"; `token_probe_status.readable` equals false) |  |
+| `WEBEX-COLLAB-04` | 4 | pass | always |  |
+| `WEBEX-COLLAB-05` | 1 | manual | any of (not (`webhooks_seen` is present and non-null); `webhooks_seen` equals 0) |  |
+| `WEBEX-COLLAB-05` | 2 | fail | `insecure_webhooks_count` (default 0) is greater than 0 |  |
+| `WEBEX-COLLAB-05` | 3 | warn | any of (`webhooks_truncated` equals true; `token_type` equals "bot"; `token_probe_status.readable` equals false) |  |
+| `WEBEX-COLLAB-05` | 4 | pass | always |  |
+| `WEBEX-COLLAB-06` | 1 | manual | any of (not (`total_units` is present and non-null); `total_units` equals 0) |  |
+| `WEBEX-COLLAB-06` | 2 | warn | any of (`unassigned_units` (default 0) is greater than `license_warn_threshold_units`; `licenses_truncated` equals true) | license_warn_threshold_units is total_units multiplied by maximumUnassignedRatio. |
+| `WEBEX-COLLAB-06` | 3 | pass | always |  |
+| `WEBEX-COLLAB-07` | 1 | manual | not (`events_seen` is present and non-null) |  |
+| `WEBEX-COLLAB-07` | 2 | warn | any of (`events_seen` equals 0; `events_truncated` equals true) |  |
+| `WEBEX-COLLAB-07` | 3 | pass | always |  |
+| `WEBEX-COLLAB-08` | 1 | manual | always | eDiscovery/legal hold configuration has no documented read field. |
+| `WEBEX-MTG-01` | 1 | manual | always | Meeting E2EE and calling SRTP have no documented read field. |
+| `WEBEX-MTG-02` | 1 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-02` | 2 | warn | some item in `sites` satisfies (`$.status` equals "warn") |  |
+| `WEBEX-MTG-02` | 3 | manual | any of (not (`sites` is present and non-null); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-02` | 4 | warn | any of (`site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-02` | 5 | pass | always |  |
+| `WEBEX-MTG-03` | 1 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-03` | 2 | warn | some item in `sites` satisfies (`$.status` equals "warn") |  |
+| `WEBEX-MTG-03` | 3 | manual | any of (not (`sites` is present and non-null); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-03` | 4 | warn | any of (`site_coverage_complete` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-03` | 5 | pass | always |  |
+| `WEBEX-MTG-04` | 1 | manual | any of (not (`clusters_seen` is present and non-null); not (`connectors_seen` is present and non-null); all of (`clusters_seen` equals 0; `connectors_seen` equals 0)) |  |
+| `WEBEX-MTG-04` | 2 | fail | any of (`connectors_seen` equals 0; `non_operational_count` (default 0) is greater than 0) |  |
+| `WEBEX-MTG-04` | 3 | warn | `hybrid_lists_truncated` equals true |  |
+| `WEBEX-MTG-04` | 4 | pass | always |  |
+| `WEBEX-MTG-05` | 1 | manual | always | Firmware lifecycle and blocking policy require manual evidence. |
+| `WEBEX-MTG-06` | 1 | fail | some item in `sites` satisfies (`$.status` equals "fail") |  |
+| `WEBEX-MTG-06` | 2 | warn | some item in `sites` satisfies (`$.status` equals "warn") |  |
+| `WEBEX-MTG-06` | 3 | manual | any of (not (`sites` is present and non-null); length of `sites` equals 0; some item in `sites` satisfies (`$.status` equals "manual")) |  |
+| `WEBEX-MTG-06` | 4 | warn | any of (`site_coverage_complete` equals false; `meetings_status.readable` equals false; `meeting_preferences_status.readable` equals false; `token_probe_status.readable` equals false) |  |
+| `WEBEX-MTG-06` | 5 | pass | always |  |
+| `WEBEX-MTG-07` | 1 | manual | always | Virtual-background policy has no documented read field. |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `WEBEX-COLLAB-06` | `license_warn_threshold_units` | Multiply total_units by maximumUnassignedRatio (0.2). |
+| `WEBEX-MTG-04` | `hybrid_lists_truncated` | Boolean OR of the hybrid-clusters truncated flag and the hybrid-connectors truncated flag. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `WEBEX-ID-03` | `roleNameContains` | compliance officer |
+| `WEBEX-ID-04` | `administratorRoleContains` | administrator |
+| `WEBEX-ID-04` | `defaultMaxAdmins` | 10 |
+| `WEBEX-ID-05` | `botPersonType` | bot |
+| `WEBEX-ID-07` | `guestPersonType` | appuser |
+| `WEBEX-COLLAB-05` | `secureTargetPrefix` | https:// |
+| `WEBEX-COLLAB-06` | `maximumUnassignedRatio` | 0.2 |
+| `WEBEX-COLLAB-07` | `windowDays` | 30 |
+| `WEBEX-MTG-02` | `joinBeforeHost` | false |
+| `WEBEX-MTG-02` | `audioBeforeHost` | false |
+| `WEBEX-MTG-02` | `unlistAllMeetings` | true |
+| `WEBEX-MTG-03` | `requireLoginBeforeAccess` | true |
+| `WEBEX-MTG-04` | `operationalStatus` | operational |
+| `WEBEX-MTG-06` | `minimumLength` | 8 |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `WEBEX-ID-01` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-ID-01` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-ID-01` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-ID-01` | unreadable | Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-ID-02` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-ID-02` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-ID-02` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-ID-02` | unreadable | Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-ID-03` | compliant | People and roles are readable, the people population is nonempty, the people listing is complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively. Role-list truncation does not demote this runtime finding. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-ID-03` | noncompliant | People and roles are readable and the nonempty people population contains no Compliance Officer. | fail | The noncompliant predicate emits fail. |
+| `WEBEX-ID-03` | partial | At least one Compliance Officer is visible, but the people listing is truncated. | warn | The partial case emits warn. |
+| `WEBEX-ID-03` | unreadable | People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-ID-04` | compliant | People and roles are readable, the people listing is complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins. Role-list truncation does not demote this runtime finding. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-ID-04` | noncompliant | No fail verdict is emitted; concentration above the threshold requires review rather than proving noncompliance. | warn | The noncompliant predicate emits warn. |
+| `WEBEX-ID-04` | partial | No administrator is visible, the people list is truncated, or administrator count exceeds max_admins; max_admins defaults to 10. | warn | The partial case emits warn. |
+| `WEBEX-ID-04` | unreadable | People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-ID-05` | compliant | GET /people is readable, nonempty and complete; inventory records every Person.type equal to 'bot'. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-ID-05` | noncompliant | No fail verdict is emitted because bot presence is an inventory for comparison with the approved register. | warn | The noncompliant predicate emits warn. |
+| `WEBEX-ID-05` | partial | GET /people is readable and nonempty but truncated. | warn | The partial case emits warn. |
+| `WEBEX-ID-05` | unreadable | GET /people is unreadable or returns zero people; export Control Hub Apps > Bots. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-ID-06` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-ID-06` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-ID-06` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-ID-06` | unreadable | Export Control Hub Management > Apps bot management and reconcile it with WEBEX-ID-05; no documented read field exposes bot approval state. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-ID-07` | compliant | GET /people is readable, nonempty and complete, GET /guests/count is readable, and Person.type='appuser' records are inventoried for reconciliation with WEBEX-MTG-03. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-ID-07` | noncompliant | No fail verdict is emitted because the inventory does not itself settle guest-access policy. | warn | The noncompliant predicate emits warn. |
+| `WEBEX-ID-07` | partial | The people listing is truncated or GET /guests/count is unreadable, so the otherwise complete inventory cannot pass. | warn | The partial case emits warn. |
+| `WEBEX-ID-07` | unreadable | GET /people is unreadable or returns zero people; export the Control Hub guest user list. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-01` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-COLLAB-01` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-COLLAB-01` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-COLLAB-01` | unreadable | Export Control Hub Messaging external communication allow-list settings; no documented read endpoint exposes the policy. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-02` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-COLLAB-02` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-COLLAB-02` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-COLLAB-02` | unreadable | Export Control Hub file-sharing controls and DLP or CASB integration evidence; Events is supporting inventory only and exposes no policy-state field. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-03` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-COLLAB-03` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-COLLAB-03` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-COLLAB-03` | unreadable | Export Control Hub recording and messaging retention and storage settings; the admin recordings read exposes recordings but no retention or storage-location policy. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-04` | compliant | Rooms is readable and nonempty, every visible room has classificationId, the listing is complete, and token type is verified as non-bot. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-COLLAB-04` | noncompliant | At least one visible room lacks classificationId. | fail | The noncompliant predicate emits fail. |
+| `WEBEX-COLLAB-04` | partial | Every visible room has classificationId but the listing is truncated, the token is a bot, or GET /people/me cannot prove token type. | warn | The partial case emits warn. |
+| `WEBEX-COLLAB-04` | unreadable | Rooms is unreadable or empty; export Control Hub space classification settings. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-05` | compliant | Webhooks is readable and nonempty, every visible webhook targetUrl starts with 'https://' and has a nonempty secret, the list is complete, and token type is verified as non-bot. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-COLLAB-05` | noncompliant | At least one visible webhook lacks an HTTPS targetUrl or a nonempty signing secret. | fail | The noncompliant predicate emits fail. |
+| `WEBEX-COLLAB-05` | partial | Every visible webhook is secure but the list is truncated, the token is a bot, or token type cannot be verified. | warn | The partial case emits warn. |
+| `WEBEX-COLLAB-05` | unreadable | Webhooks is unreadable or empty; collect webhook inventories from every integration owner. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-06` | compliant | Licenses is readable and complete, totalUnits is positive, and unassigned units divided by total units is at most 0.20. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-COLLAB-06` | noncompliant | No fail verdict is emitted; excess unassigned capacity is a review condition. | warn | The noncompliant predicate emits warn. |
+| `WEBEX-COLLAB-06` | partial | The unassigned ratio exceeds 0.20 or the license listing is truncated. | warn | The partial case emits warn. |
+| `WEBEX-COLLAB-06` | unreadable | Licenses is unreadable, empty, or has totalUnits equal to zero; export the Control Hub subscriptions and usage report. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-07` | compliant | Admin audit events is readable, nonempty and complete for the last 30 days. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-COLLAB-07` | noncompliant | No fail verdict is emitted because an empty window needs reviewer confirmation. | warn | The noncompliant predicate emits warn. |
+| `WEBEX-COLLAB-07` | partial | The read returns zero events or is truncated; confirm the log is populated and reviewed. | warn | The partial case emits warn. |
+| `WEBEX-COLLAB-07` | unreadable | Organization context is unavailable or admin audit events is unreadable; export the Control Hub admin audit log. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-COLLAB-08` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-COLLAB-08` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-COLLAB-08` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-COLLAB-08` | unreadable | Export Control Hub eDiscovery and legal-hold configuration; the public compliance guide exposes no read endpoint for configuration and events older than 90 days require Pro Pack. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-MTG-01` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-MTG-01` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-MTG-01` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-MTG-01` | unreadable | Export the Control Hub meeting session type showing end-to-end encryption and the calling security configuration showing SRTP; the documented reads expose neither setting. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-MTG-02` | compliant | Every readable site reports joinBeforeHost=false, audioBeforeHost=false and unlistAllMeetings=true; the site list and all sites are complete; meetings, meeting preferences and token type are readable. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-MTG-02` | noncompliant | Any site reports joinBeforeHost=true or audioBeforeHost=true. | fail | The noncompliant predicate emits fail. |
+| `WEBEX-MTG-02` | partial | joinBeforeHost=false but audioBeforeHost is absent or unlistAllMeetings is not true, or otherwise-passing evidence has partial site or secondary coverage. | warn | The partial case emits warn. |
+| `WEBEX-MTG-02` | unreadable | No site common settings are readable or any site omits joinBeforeHost; collect each site's Control Hub Common Settings > Security page. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-MTG-03` | compliant | Every readable site reports requireLoginBeforeAccess=true, site coverage is complete, and token type is readable. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-MTG-03` | noncompliant | Any readable site reports requireLoginBeforeAccess=false. | fail | The noncompliant predicate emits fail. |
+| `WEBEX-MTG-03` | partial | All readable sites require login but site coverage or token-type evidence is partial. | warn | The partial case emits warn. |
+| `WEBEX-MTG-03` | unreadable | No site common settings are readable or any site omits requireLoginBeforeAccess; collect each site's Control Hub Common Settings > Security page. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-MTG-04` | compliant | Both inventories are readable, at least one connector exists, every connector status equals 'operational', and neither listing is truncated. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-MTG-04` | noncompliant | Clusters exist with no connectors, or any connector status is not 'operational'. | fail | The noncompliant predicate emits fail. |
+| `WEBEX-MTG-04` | partial | Every connector is operational but either listing is truncated. | warn | The partial case emits warn. |
+| `WEBEX-MTG-04` | unreadable | Either inventory is unreadable, or both are empty and deployment applicability must be confirmed in Control Hub. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-MTG-05` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-MTG-05` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-MTG-05` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-MTG-05` | unreadable | Compare inventoried software and upgrade channels with Cisco RoomOS lifecycle guidance and export the Control Hub device activation policy; documented device reads expose no end-of-life or blocking-policy field. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-MTG-06` | compliant | Every readable site reports requireStrongPassword=true and passwordCriteria.minLength at least 8; site coverage and all secondary evidence are complete. | pass | Complete evidence satisfies the pass predicate. |
+| `WEBEX-MTG-06` | noncompliant | Any readable site reports requireStrongPassword=false. | fail | The noncompliant predicate emits fail. |
+| `WEBEX-MTG-06` | partial | Strong passwords are required but minLength is absent or below 8, or otherwise-passing evidence has partial site or secondary coverage. | warn | The partial case emits warn. |
+| `WEBEX-MTG-06` | unreadable | No site common settings are readable or any site omits requireStrongPassword; collect each site's Control Hub Common Settings > Security page. | manual | The required source cannot be evaluated automatically. |
+| `WEBEX-MTG-07` | compliant | No automatic pass is emitted. | manual | The setting has no documented read interface, so compliant evidence remains manual. |
+| `WEBEX-MTG-07` | noncompliant | No automatic fail is emitted. | manual | The noncompliant predicate emits manual. |
+| `WEBEX-MTG-07` | partial | No automatic warn is emitted unless supporting inventory is partial. | manual | The partial case emits manual. |
+| `WEBEX-MTG-07` | unreadable | Export the Control Hub meeting settings page for virtual backgrounds; no field is exposed by meeting preferences, common settings, or session types. | manual | The required source cannot be evaluated automatically. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | SSO enforcement | IA-2(1) | L2 3.5.3 | CC6.1 | 16.2 | 8.4.1 | SRG-APP-000148 | ISM-1546 | CPS-7.1 |
+| 2 | Admin MFA | IA-2(2) | L2 3.5.3 | CC6.1 | 16.3 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-7.2 |
+| 3 | Compliance officer role | AU-1 | L2 3.3.2 | CC7.2 | 8.1 | 12.5.2 | SRG-APP-000516 | ISM-0042 | CPS-12.1 |
+| 4 | External communications | AC-4 | L2 3.1.3 | CC6.6 | 13.4 | 1.3.7 | SRG-APP-000100 | ISM-1528 | CPS-11.1 |
+| 5 | File sharing restrictions | AC-4(1) | L2 3.1.3 | CC6.7 | 13.4 | 1.3.7 | SRG-APP-000100 | ISM-0947 | CPS-11.2 |
+| 6 | Recording storage control | SC-28 | L2 3.13.16 | CC6.7 | 14.8 | 3.4.1 | SRG-APP-000428 | ISM-0457 | CPS-11.3 |
+| 7 | Recording retention | SI-12 | L2 3.8.9 | CC6.5 | 14.8 | 3.1 | SRG-APP-000504 | ISM-0859 | CPS-12.2 |
+| 8 | End-to-end meeting encryption | SC-8(1) | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000441 | ISM-0484 | CPS-11.4 |
+| 9 | Meeting lobby controls | AC-3 | L2 3.1.1 | CC6.1 | 16.7 | 7.1.3 | SRG-APP-000033 | ISM-1506 | CPS-8.1 |
+| 10 | Meeting password required | IA-5 | L2 3.5.7 | CC6.1 | 16.5 | 8.2.3 | SRG-APP-000170 | ISM-1557 | CPS-7.3 |
+| 11 | eDiscovery and legal hold | AU-11 | L2 3.3.1 | CC7.3 | 8.3 | 10.7 | SRG-APP-000515 | ISM-0859 | CPS-12.3 |
+| 12 | Data retention policy | SI-12 | L2 3.8.9 | CC6.5 | 14.8 | 3.1 | SRG-APP-000504 | ISM-0859 | CPS-12.4 |
+| 13 | Guest access restrictions | AC-14 | L2 3.1.1 | CC6.1 | 16.7 | 7.1.3 | SRG-APP-000033 | ISM-1506 | CPS-8.2 |
+| 14 | Space classification | AC-16 | L2 3.13.12 | CC6.7 | 14.1 | 9.6.1 | SRG-APP-000311 | ISM-0271 | CPS-11.5 |
+| 15 | Hybrid cluster health | CM-8 | L2 3.4.1 | CC6.8 | 1.1 | 2.4 | SRG-APP-000383 | ISM-1409 | CPS-10.1 |
+| 16 | Hybrid connector status | SI-4 | L2 3.14.6 | CC7.1 | 1.1 | 10.6 | SRG-APP-000516 | ISM-0576 | CPS-12.5 |
+| 17 | Device firmware currency | SI-2 | L2 3.14.1 | CC7.1 | 7.4 | 6.2 | SRG-APP-000456 | ISM-1143 | CPS-13.1 |
+| 18 | Unmanaged device blocking | CM-8(3) | L2 3.4.1 | CC6.8 | 1.4 | 9.7.1 | SRG-APP-000383 | ISM-1482 | CPS-10.2 |
+| 19 | Bot management | CM-7 | L2 3.4.6 | CC6.8 | 4.8 | 2.2.2 | SRG-APP-000141 | ISM-1407 | CPS-10.3 |
+| 20 | Webhook transport and signing | SC-8(1) | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000441 | ISM-0484 | CPS-11.6 |
+| 21 | Messaging data loss prevention | SC-7(8) | L2 3.13.1 | CC6.7 | 13.4 | 1.3.7 | SRG-APP-000516 | ISM-0947 | CPS-11.7 |
+| 22 | Calling encryption | SC-8 | L2 3.13.8 | CC6.7 | 14.4 | 4.1 | SRG-APP-000439 | ISM-0484 | CPS-11.8 |
+| 23 | Virtual background policy | AC-3 | L2 3.1.1 | CC6.1 | - | - | SRG-APP-000033 | - | - |
+| 24 | License utilization | CM-8 | L2 3.4.1 | CC6.8 | 1.1 | 2.4 | SRG-APP-000383 | ISM-1409 | CPS-10.4 |
+| 25 | Admin activity audit | AU-12 | L2 3.3.1 | CC7.2 | 8.5 | 10.2.2 | SRG-APP-000507 | ISM-0580 | CPS-12.6 |
+
+## Collection states
+
+| State | Required rendering |
+|---|---|
+| complete | The requested surface was read to proven exhaustion. |
+| truncated | The surface returned data, but a cap or pagination anomaly prevented proven exhaustion. |
+| unreadable | The request failed or the response did not match the documented shape. |
+| denied | The service refused the request; record the endpoint and observed status without treating the inventory as empty. |
+| not requested | A dependent request was never issued because its parent inventory was unreadable; name the parent and invent no status. |
+| not configured | The surface requires tenant or organization context that was not configured or discoverable. |
+
+## Integration-specific scrubbing
+
+Shared contract version: 1.1.
+
+Projection stage: Each raw Webex object is allowlist-projected before it enters rawData or core_data. Sensitive keys and values are scrubbed recursively during projection, then the complete value is scrubbed again with configured and runtime credentials at every bundle write sink.
+
+Sensitive fields and values: token, client_secret, refresh_token, password, secret, targetUrl query, downloadUrl query, playbackUrl query, webLink query
+
+Credential formats: Bearer credentials, OAuth client secrets, Refresh tokens, Webhook signing secrets, Meeting passwords, Credential-bearing URL parameters
+
+Reviewed benign exceptions: Documented resource identifiers, Organization identifiers, Site host names
+
+Integration-specific rules:
+
+- A key containing token, secret, password, passcode, hostpin, hostkey, authorization, accesscode, activationcode, or credential is replaced with [REDACTED], except passwordCriteria, requireStrongPassword, and excludePassword policy objects.
+- Authorization Bearer and Basic values, credential assignments, cookies, URL user information, URL query and fragment values, SIP URI pwd/password/pin/passcode/token/secret parameters, and configured credentials in encoded forms are replaced.
+- Webhook and callback URL fields currently retain scheme, host, port, and path while removing user information, query, and fragment. Other URL-valued strings such as recording downloadUrl/playbackUrl and meeting webLink follow the same retention rule.
+- Configured token, client secret, refresh token, and refreshed access token values are registered with the shared scrubber before error rendering and bundle writes; non-JSON bodies are represented only by media type and byte length.
+- Projection retains password and secret fields only so their presence is represented as [REDACTED], never their value.
+- Every text artifact passes through carrier/configured-secret scrubbing at the write sink. Every JSON artifact passes through recursive data scrubbing before serialization.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `me` | `id`, `displayName`, `emails`, `type`, `roles`, `orgId`, `created` |
+| `organizations` | `id`, `displayName`, `created` |
+| `organization` | `id`, `displayName`, `created` |
+| `people` | `id`, `displayName`, `emails`, `type`, `roles`, `orgId`, `created` |
+| `roles` | `id`, `name` |
+| `guest_count` | `count` |
+| `licenses` | `id`, `name`, `totalUnits`, `consumedUnits`, `subscriptionId`, `siteUrl`, `siteType` |
+| `events` | `id`, `resource`, `type`, `actorId`, `actorOrgId`, `orgId`, `created` |
+| `admin_audit_events` | `id`, `actorId`, `actorOrgId`, `targetOrgId`, `created`, `data.eventCategory`, `data.eventDescription`, `data.actionText`, `data.actorEmail`, `data.actorName`, `data.adminRoles`, `data.targetType`, `data.targetName` |
+| `admin_recordings` | `id`, `meetingId`, `topic`, `createTime`, `timeRecorded`, `hostEmail`, `siteUrl`, `downloadUrl`, `playbackUrl`, `format`, `serviceType`, `durationSeconds`, `sizeBytes`, `status` |
+| `rooms` | `id`, `title`, `type`, `isLocked`, `isPublic`, `classificationId`, `teamId`, `ownerId`, `created`, `lastActivity` |
+| `webhooks` | `id`, `name`, `targetUrl`, `resource`, `event`, `secret`, `status`, `ownedBy`, `created` |
+| `meeting_preferences` | `personalMeetingRoom.enabledAutoLock`, `personalMeetingRoom.autoLockMinutes`, `personalMeetingRoom.notifyHost`, `personalMeetingRoom.supportCoHost`, `personalMeetingRoom.supportAnyoneAsCoHost`, `personalMeetingRoom.allowFirstUserToBeCoHost`, `personalMeetingRoom.allowAuthenticatedDevices`, `audio.defaultAudioType`, `audio.enabledGlobalCallIn`, `audio.enabledTollFree`, `audio.enabledAutoConnection`, `schedulingOptions.enabledJoinBeforeHost`, `schedulingOptions.joinBeforeHostMinutes`, `schedulingOptions.enabledAutoShareRecording`, `schedulingOptions.enabledWebexAssistantByDefault`, `sites.siteUrl`, `sites.default` |
+| `meeting_sites` | `siteUrl`, `default` |
+| `meeting_common_settings` | `siteUrl`, `securityOptions.joinBeforeHost`, `securityOptions.audioBeforeHost`, `securityOptions.firstAttendeeAsPresenter`, `securityOptions.unlistAllMeetings`, `securityOptions.requireLoginBeforeAccess`, `securityOptions.allowMobileScreenCapture`, `securityOptions.requireStrongPassword`, `securityOptions.passwordCriteria.mixedCase`, `securityOptions.passwordCriteria.minLength`, `securityOptions.passwordCriteria.minNumeric`, `securityOptions.passwordCriteria.minAlpha`, `securityOptions.passwordCriteria.minSpecial`, `securityOptions.passwordCriteria.disallowDynamicWebText`, `securityOptions.passwordCriteria.disallowList`, `securityOptions.passwordCriteria.disallowValues` |
+| `meetings` | `id`, `title`, `meetingType`, `state`, `start`, `end`, `hostEmail`, `siteUrl`, `webLink`, `password`, `unlockedMeetingJoinSecurity`, `enabledJoinBeforeHost`, `joinBeforeHostMinutes`, `enableAutomaticLock`, `automaticLockMinutes`, `publicMeeting` |
+| `hybrid_clusters` | `id`, `name`, `orgId`, `resourceGroupId` |
+| `hybrid_connectors` | `id`, `orgId`, `hybridClusterId`, `hostname`, `type`, `version`, `status`, `created` |
+| `devices` | `id`, `displayName`, `workspaceId`, `personId`, `orgId`, `product`, `type`, `software`, `upgradeChannel`, `connectionStatus`, `managedBy`, `created` |
+| `workspaces` | `id`, `displayName`, `type`, `orgId`, `created` |
+
+## Export layout
+
+Required paths:
+
+- `QUICK_REFERENCE.md`
+- `metadata.json`
+- `core_data/access.json`
+- `core_data/{category}/{surface}.json`
+- `analysis/{category}.json`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/{framework}/{report}.md`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `QUICK_REFERENCE.md` | markdown | Always | Heading, five bundle-orientation bullets, then a four-step recommended reading order. | UTF-8 with a trailing newline. |
+| `metadata.json` | json | Always | Object: generated_at string, org_id string\|null, token_type person\|bot\|appuser\|unknown, source_chain string[], config_file basename\|string\|null. | Recursively scrub with configured/runtime secrets, then serialize as two-space JSON with insertion-order keys and one trailing newline. |
+| `core_data/access.json` | json | Always | WebexAccessCheckResult record described below. | Scrub errors during collection, recursively scrub the complete value at the sink, then serialize as two-space JSON with one trailing newline. |
+| `core_data/{category}/{surface}.json` | json | For every collected assessment surface | Readable surface: projected object or array using that surface allowlist. Unreadable surface: {error: scrubbed string, status: number\|null}. | Project the collected surface, recursively scrub with configured/runtime secrets, then serialize as two-space JSON with one trailing newline. |
+| `analysis/{category}.json` | json | For identity, collaboration-governance and meeting-hybrid-security | Object: title string, category string, summary object, findings WebexFinding[], errors string[]. | Recursively scrub the normalized assessment at the sink, then serialize as two-space JSON with insertion-order keys and one trailing newline. |
+| `analysis/findings.json` | json | Always | Array of WebexFinding records in assessment order: identity, collaboration governance, meeting/hybrid. | Recursively scrub normalized findings at the sink, then serialize as two-space JSON with one trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always | Org and generated timestamp; Result Counts; Highest Priority Findings sorted by status rank and capped at 12; optional Partial Collection Warnings. | UTF-8 Markdown with one trailing newline. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always | Finding, spec control, uppercase status, then one column for each of eight frameworks. | UTF-8 Markdown table with one trailing newline. |
+| `compliance/{framework}/{report}.md` | markdown | One file for every configured framework | Framework heading, mapped-finding count, then Requirement, Finding, Status, Title, Summary table. | UTF-8 Markdown with one trailing newline. |
+| `_errors.log` | text | At least one assessment collection error exists | Deduplicated lines prefixed by assessment category, one error per line. | UTF-8 text with one final newline. |
+| `{allocated-bundle-name}.zip` | zip | Always after directory files are complete | Archive contains every bundle file under relative paths with no enclosing bundle directory. | Zip archive paired to the exact allocated directory basename; credentials are scrubbed before files enter the archive. |
+
+### Record schemas
+
+#### WebexFinding
+
+- `id:string`
+- `control:number[]`
+- `title:string`
+- `severity:critical|high|medium|low|info`
+- `status:pass|warn|fail|manual`
+- `summary:string`
+- `evidence?:object`
+- `mappings:string[]`
+- `frameworks:{fedramp,cmmc,soc2,cis,pci_dss,disa_stig,irap,ismap}:string[]`
+
+#### WebexAssessment
+
+- `title:string`
+- `category:string`
+- `summary:object`
+- `findings:WebexFinding[]`
+- `errors:string[]`
+- `rawData:surface-name -> projected value or unreadable marker`
+
+#### WebexAccessCheckResult
+
+- `status:healthy|limited`
+- `orgId?:string`
+- `tokenType:person|bot|appuser|unknown`
+- `adminCapable:boolean`
+- `surfaces:WebexAccessSurface[]`
+- `notes:string[]`
+- `recommendedNextStep:string`
+
+#### WebexAccessSurface
+
+- `name:string`
+- `endpoint:string`
+- `doc:string`
+- `status:readable|not_readable|not_configured|manual`
+- `count?:number`
+- `truncated?:boolean`
+- `error?:string`
+
+#### UnreadableSurface
+
+- `error:scrubbed string`
+- `status:number|null`
+
+#### IdentitySummary
+
+- `org_id`
+- `token_type`
+- `people_seen`
+- `people_truncated`
+- `admin_users`
+- `compliance_officers`
+- `bots`
+- `guests`
+- `inventory_status`
+- `pass`
+- `warn`
+- `fail`
+- `manual`
+
+#### CollaborationGovernanceSummary
+
+- `org_id`
+- `token_type`
+- `rooms_seen`
+- `rooms_without_classification`
+- `webhooks_seen`
+- `insecure_webhooks`
+- `recordings_seen`
+- `admin_audit_events`
+- `compliance_events`
+- `unassigned_license_units`
+- `total_license_units`
+- `inventory_status`
+- `pass`
+- `warn`
+- `fail`
+- `manual`
+
+#### MeetingHybridSecuritySummary
+
+- `org_id`
+- `token_type`
+- `sites_evaluated`
+- `sites_denied`
+- `meetings_seen`
+- `hybrid_clusters`
+- `hybrid_connectors`
+- `non_operational_connectors`
+- `devices_seen`
+- `workspaces_seen`
+- `inventory_status`
+- `pass`
+- `warn`
+- `fail`
+- `manual`
+
+JSON formatting: Recursively scrub the complete normalized/projected value with configured and runtime credentials immediately before writing. Serialize with two-space indentation, preserve object insertion order, encode dates as ISO strings through the platform JSON conversion, and append exactly one newline.
+
+Overwrite policy: Allocate a new suffixed bundle directory on every rerun; never replace an earlier bundle.
+
+Path safety: Reject traversal, output roots outside the configured parent, symlink roots, and symlinked parent directories.
+
+Archive pairing: Write a zip archive beside the bundle directory using the exact allocated directory name plus .zip.

@@ -35,6 +35,8 @@ import {
   scrubErrorText,
   scrubValue,
 } from "../dist/extensions/grc-tools/webex.js";
+import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
+import { WEBEX_SPEC } from "../dist/extensions/grc-tools/webex.spec.js";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(TEST_DIR, "..", "..");
@@ -440,6 +442,30 @@ async function allAssessments(client) {
     await assessWebexMeetingHybridSecurity(client),
   ];
 }
+
+test("metadata decision rules independently reproduce every compliant Webex runtime verdict", async () => {
+  for (const assessment of await allAssessments(compliantClient())) {
+    for (const finding of assessment.findings) {
+      const contract = checkContract(WEBEX_SPEC, finding.id);
+      assert.equal(
+        evaluateVerdictCriteria(contract.criteria, finding.evidence ?? {}),
+        finding.status,
+        finding.id,
+      );
+    }
+  }
+});
+
+test("metadata rules preserve runtime treatment of a truncated role catalog", async () => {
+  const base = compliantClient();
+  const identity = await assessWebexIdentity(compliantClient({
+    async listRoles() {
+      return page((await base.listRoles()).items, true);
+    },
+  }));
+  assert.equal(byId(identity.findings, "WEBEX-ID-03").status, "pass");
+  assert.equal(byId(identity.findings, "WEBEX-ID-04").status, "pass");
+});
 
 function findingsOf(assessments) {
   return assessments.flatMap((item) => item.findings);
@@ -1087,6 +1113,22 @@ test("WEBEX-MTG-02 and WEBEX-MTG-06 judge lobby and password defaults per site f
   assert.equal(byId(missing.findings, "WEBEX-MTG-02").status, "manual");
   assert.match(byId(missing.findings, "WEBEX-MTG-02").summary, /^Manual: .*securityOptions\.joinBeforeHost was absent.* Collect the Control Hub site Common Settings > Security page/);
   assert.equal(byId(missing.findings, "WEBEX-MTG-06").status, "manual");
+});
+
+test("mixed manual and failing Webex sites preserve fail precedence", async () => {
+  const result = await assessWebexMeetingHybridSecurity(compliantClient({
+    async listMeetingSites() {
+      return page([{ siteUrl: "manual.webex.com" }, { siteUrl: "failing.webex.com" }]);
+    },
+    async getMeetingCommonSettings(siteUrl) {
+      return siteUrl === "manual.webex.com"
+        ? { siteOptions: { allowCustomPersonalRoomURL: true } }
+        : compliantCommonSettings({ joinBeforeHost: true, requireStrongPassword: false, requireLoginBeforeAccess: false });
+    },
+  }));
+  for (const id of ["WEBEX-MTG-02", "WEBEX-MTG-03", "WEBEX-MTG-06"]) {
+    assert.equal(byId(result.findings, id).status, "fail", id);
+  }
 });
 
 test("site coverage: a denied or unlisted site downgrades a passing commonSettings verdict to warn", async () => {
@@ -2133,6 +2175,17 @@ test("WebexApiClient stops an endless rel=next chain at the page ceiling and rep
   assert.equal(defaulted.truncated, true);
   assert.equal(defaulted.pageCount, 1000);
   assert.equal(calls, 1000);
+
+  calls = 0;
+  const repeated = await new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse({ items: [] }, { headers: { link: '<https://webexapis.com/v1/roles?cursor=same>; rel="next"' } });
+    },
+    maxPages: 3,
+  }).listRoles();
+  assert.deepEqual(repeated, { items: [], truncated: true, pageCount: 3 }, "the current runtime reaches the page cap rather than stopping immediately on a repeated empty cursor");
+  assert.equal(calls, 3);
 
   calls = 0;
   const finished = await new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ items: [{ id: "a" }] }), maxPages: 1 }).listRoles();

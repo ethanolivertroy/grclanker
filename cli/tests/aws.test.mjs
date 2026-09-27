@@ -46,6 +46,8 @@ import {
   statementDeniesInsecureTransport,
   unrestrictedSecurityGroupRules,
 } from "../dist/extensions/grc-tools/aws.js";
+import { AWS_SPEC } from "../dist/extensions/grc-tools/aws.spec.js";
+import { checkContract, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
 import {
   AWS_CANARIES,
   CANARY_URL,
@@ -497,6 +499,61 @@ test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", as
   const staleKeys = findingById(result, "AWS-IAM-04").evidence.stale_access_keys;
   assert.deepEqual(staleKeys.map((key) => key.accessKeyId), [MASKED_ACCESS_KEY_ID], "access key ids are masked in evidence");
   assertNoCanaryWindows(assert, result, [RAW_ACCESS_KEY_ID], "the raw access key id never reaches the assessment output");
+});
+
+test("decision facts preserve cardinality beyond 25-item evidence samples", async () => {
+  const base = compliantBundleClient();
+  const accessKeys = Array.from({ length: 30 }, (_, index) => ({
+    AccessKeyId: `AKIA${String(index).padStart(16, "0")}`,
+    CreateDate: "2026-01-01T00:00:00Z",
+  }));
+  const unreadableKeys = await assessAwsIdentity({
+    ...base,
+    async listIamUsers() {
+      return paged([{ UserName: "bulk-user", PasswordLastUsed: "2026-04-15T00:00:00Z" }]);
+    },
+    async listMfaDevices() {
+      return [{ SerialNumber: "mfa-bulk" }];
+    },
+    async listAccessKeys() {
+      return accessKeys;
+    },
+    async getAccessKeyLastUsed() {
+      throw accessDenied();
+    },
+  });
+  const rotation = findingById(unreadableKeys, "AWS-IAM-04");
+  assert.equal(rotation.status, "manual");
+  assert.equal(rotation.evidence.keys_last_used_unreadable.length, 25, "presentation evidence remains capped");
+
+  const roles = Array.from({ length: 31 }, (_, index) => ({
+    RoleName: `AdminRole${index}`,
+    AttachedManagedPolicies: [{ PolicyName: "AdministratorAccess" }],
+  }));
+  const excessiveRoles = await assessAwsIdentity({
+    ...base,
+    async getAccountAuthorizationDetails() {
+      return paged(roles);
+    },
+  }, { maxPrivilegedRoles: 30 });
+  const boundaries = findingById(excessiveRoles, "AWS-IAM-05");
+  assert.equal(boundaries.status, "fail");
+  assert.equal(boundaries.evidence.roles_without_boundaries.length, 25, "presentation evidence remains capped");
+
+  const vpcs = Array.from({ length: 30 }, (_, index) => ({ VpcId: `vpc-${index}`, IsDefault: false }));
+  const flowLogs = vpcs.map((vpc, index) => ({ FlowLogId: `fl-${index}`, ResourceId: vpc.VpcId }));
+  const unverifiedVpcs = await assessAwsNetworkSecurity(compliantNetworkClient({
+    async describeVpcs() {
+      return paged(vpcs);
+    },
+    async describeFlowLogs() {
+      void flowLogs;
+      throw accessDenied();
+    },
+  }), { regions: ["us-east-1"] });
+  const flowCoverage = findingById(unverifiedVpcs, "AWS-NET-14");
+  assert.equal(flowCoverage.status, "manual");
+  assert.equal(flowCoverage.evidence.vpcs_unverified.length, 25, "presentation evidence remains capped");
 });
 
 test("paginateAwsList stops at the limit, on a repeated token, and on the page budget, reporting each as truncated", async () => {
@@ -2434,6 +2491,20 @@ async function runAllAssessments(client) {
     "network-security": await assessAwsNetworkSecurity(client),
   };
 }
+
+test("metadata decision rules independently reproduce every compliant AWS runtime verdict", async () => {
+  const outputs = await runAllAssessments(compliantBundleClient());
+  for (const assessment of Object.values(outputs).filter((output) => Array.isArray(output.findings))) {
+    for (const finding of assessment.findings) {
+      const contract = checkContract(AWS_SPEC, finding.id);
+      assert.equal(
+        evaluateVerdictCriteria(contract.criteria, finding.evidence ?? {}),
+        finding.status,
+        finding.id,
+      );
+    }
+  }
+});
 
 /** Flattens an output tree into dotted leaf paths; empty arrays and objects are leaves so a collapse to [] or {} is visible. */
 function leafValues(value, path = "", out = new Map()) {

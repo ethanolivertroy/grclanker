@@ -34,11 +34,11 @@ const { meta, content } = parseFrontmatter(entry[1] as string);
 const rawMarkdown = content.trim();
 
 const rawUrl = `${RAW_BASE}/${meta.slug}.spec.md`;
-const githubUrl = `https://github.com/hackIDLE/grclanker/blob/main/specs/${meta.slug}.spec.md`;
-const editUrl = `https://github.com/hackIDLE/grclanker/edit/main/specs/${meta.slug}.spec.md`;
+const githubUrl = `https://github.com/ethanolivertroy/grclanker/blob/main/specs/${meta.slug}.spec.md`;
+const editUrl = `https://github.com/ethanolivertroy/grclanker/edit/main/specs/${meta.slug}.spec.md`;
 ---
 
-<Base title={`${meta.name} — grclanker`} description={`Compliance automation spec for ${meta.vendor}. ${meta.name}.`}>
+<Base title={`${meta.name}: grclanker`} description={`Compliance automation spec for ${meta.vendor}. ${meta.name}.`}>
   <div class="max-w-content mx-auto px-4 py-6 sm:px-6 sm:py-8">
 
     <!-- Spec page data for keyboard shortcuts + markdown copy -->

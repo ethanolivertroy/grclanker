@@ -5,7 +5,7 @@ description: Read-only Splunk Enterprise and Splunk Cloud Platform security insp
 
 The Splunk integration inspects a Splunk Enterprise or Splunk Cloud Platform deployment through the splunkd management REST API and, when configured, the Splunk Cloud Admin Config Service (ACS). It is read-only: the only POST requests it issues are the session-key login (`/services/auth/login`, when you supply a username and password) and a single read-only oneshot search against `index=_audit` that confirms audit events are flowing.
 
-Every finding carries the framework mappings from the [Splunk security inspector spec](https://github.com/hackIDLE/grclanker/blob/main/specs/splunk-sec-inspector.spec.md) (FedRAMP / NIST 800-53 r5, CMMC 2.0, SOC 2, CIS Splunk Benchmark, PCI-DSS 4.0, DISA STIG, IRAP, ISMAP).
+Every finding carries the framework mappings from the [Splunk security inspector spec](https://github.com/ethanolivertroy/grclanker/blob/main/specs/splunk-sec-inspector.spec.md) (FedRAMP / NIST 800-53 r5, CMMC 2.0, SOC 2, CIS Splunk Benchmark, PCI-DSS 4.0, DISA STIG, IRAP, ISMAP).
 
 ## What it inspects
 
