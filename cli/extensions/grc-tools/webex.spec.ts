@@ -2,12 +2,14 @@ import { join } from "node:path";
 import type {
   CheckContract,
   ControlContract,
-  EvaluatedFindingStatus,
   FrameworkKey,
   IntegrationSpecContract,
+  PortableValue,
   RequestContract,
   VerdictCriteria,
-  VerdictFacts,
+  VerdictCondition,
+  VerdictOperand,
+  VerdictRule,
 } from "./spec-model.js";
 
 export type WebexFieldSpec = true | { readonly [field: string]: WebexFieldSpec };
@@ -343,14 +345,8 @@ function check(
 ): CheckContract {
   const evidenceFields = WEBEX_EVIDENCE_FIELDS[id];
   if (!evidenceFields) throw new Error(`No evidence schema exists for ${id}`);
-  const evaluate = WEBEX_VERDICT_EVALUATORS[id];
-  if (!evaluate) throw new Error(`No runtime verdict evaluator exists for ${id}`);
-  const statusDescriptions = {
-    manual: verdictCriteria.manual,
-    fail: verdictCriteria.fail,
-    warn: verdictCriteria.warn,
-    pass: verdictCriteria.pass,
-  } as const;
+  const rules = WEBEX_VERDICT_RULES[id];
+  if (!rules) throw new Error(`No runtime verdict rules exist for ${id}`);
   return {
     id,
     controlNumbers,
@@ -361,11 +357,7 @@ function check(
     evidenceFields,
     criteria: {
       ...verdictCriteria,
-      rules: (["manual", "fail", "warn", "pass"] as const).map((status) => ({
-        status,
-        description: statusDescriptions[status],
-        matches: (facts) => evaluate(facts) === status,
-      })),
+      rules,
     },
   };
 }
@@ -399,111 +391,102 @@ export const WEBEX_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> 
   "WEBEX-MTG-07": ["citation"],
 };
 
-type WebexVerdictEvaluator = (facts: VerdictFacts) => EvaluatedFindingStatus;
-const alwaysManual: WebexVerdictEvaluator = () => "manual";
-const record = (value: unknown): Readonly<Record<string, unknown>> | undefined =>
-  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Readonly<Record<string, unknown>> : undefined;
-const numberFact = (facts: VerdictFacts, key: string): number | undefined =>
-  typeof facts[key] === "number" ? facts[key] : undefined;
-const booleanFact = (facts: VerdictFacts, key: string): boolean | undefined =>
-  typeof facts[key] === "boolean" ? facts[key] : undefined;
-const statusReadable = (facts: VerdictFacts, key: string): boolean | undefined => {
-  const value = record(facts[key]);
-  return typeof value?.readable === "boolean" ? value.readable : undefined;
-};
-const siteAggregate = (facts: VerdictFacts): EvaluatedFindingStatus => {
-  const sites = Array.isArray(facts.sites) ? facts.sites.map(record).filter(Boolean) : [];
-  if (sites.length === 0) return "manual";
-  const statuses = sites.map((site) => site?.status);
-  if (statuses.includes("manual")) return "manual";
-  if (statuses.includes("fail")) return "fail";
-  if (statuses.includes("warn")) return "warn";
-  return facts.site_coverage_complete === true ? "pass" : "warn";
-};
+const path = (name: string, fallback?: PortableValue): VerdictOperand =>
+  fallback === undefined ? { kind: "path", path: name } : { kind: "path", path: name, fallback };
+const value = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
+const length = (name: string): VerdictOperand => ({ kind: "length", path: name });
+const compare = (op: Extract<VerdictCondition["op"], "eq" | "ne" | "gt" | "gte" | "lt" | "lte">, left: VerdictOperand, right: VerdictOperand): VerdictCondition => ({ op, left, right });
+const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", path(name), value(entry));
+const defined = (name: string): VerdictCondition => ({ op: "defined", operand: path(name) });
+const and = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const or = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", condition });
+const some = (name: string, condition: VerdictCondition): VerdictCondition => ({ op: "some", path: name, condition });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({ status, condition, ...(note ? { note } : {}) });
+const alwaysManualRules = (note: string): readonly VerdictRule[] => [rule("manual", { op: "always" }, note)];
+const statusUnreadable = (name: string): VerdictCondition => eq(`${name}.readable`, false);
+const siteRules = (secondaryStatuses: readonly string[]): readonly VerdictRule[] => [
+  rule("manual", or(compare("eq", length("sites"), value(0)), some("sites", eq("$.status", "manual")))),
+  rule("fail", some("sites", eq("$.status", "fail"))),
+  rule("warn", or(
+    some("sites", eq("$.status", "warn")),
+    eq("site_coverage_complete", false),
+    ...secondaryStatuses.map(statusUnreadable),
+  )),
+  rule("pass", { op: "always" }),
+];
 
-export const WEBEX_VERDICT_EVALUATORS: Readonly<Record<string, WebexVerdictEvaluator>> = {
-  "WEBEX-ID-01": alwaysManual,
-  "WEBEX-ID-02": alwaysManual,
-  "WEBEX-ID-03": (facts) => {
-    const count = numberFact(facts, "compliance_officer_count");
-    if (count === undefined) {
-      return (numberFact(facts, "people_seen") ?? 0) > 0 && Array.isArray(facts.roles_seen) ? "fail" : "manual";
-    }
-    if (count === 0) return "fail";
-    return facts.people_truncated === true ? "warn" : "pass";
-  },
-  "WEBEX-ID-04": (facts) => {
-    if (numberFact(facts, "people_seen") === 0 || (facts.admin_users === undefined && facts.admin_count === undefined)) return "manual";
-    const count = numberFact(facts, "admin_count") ?? numberFact(facts, "admin_users") ?? 0;
-    if (count === 0 || count > (numberFact(facts, "max_admins") ?? WEBEX_DEFAULTS.maxAdmins)) return "warn";
-    return facts.people_truncated === true ? "warn" : "pass";
-  },
-  "WEBEX-ID-05": (facts) => {
-    if (numberFact(facts, "bot_count") === undefined) return "manual";
-    return facts.people_truncated === true ? "warn" : "pass";
-  },
-  "WEBEX-ID-06": alwaysManual,
-  "WEBEX-ID-07": (facts) => {
-    if (numberFact(facts, "guest_count_people") === undefined || numberFact(facts, "people_seen") === 0) return "manual";
-    return facts.people_truncated === true || statusReadable(facts, "guest_count_api_status") === false ? "warn" : "pass";
-  },
-  "WEBEX-COLLAB-01": alwaysManual,
-  "WEBEX-COLLAB-02": alwaysManual,
-  "WEBEX-COLLAB-03": alwaysManual,
-  "WEBEX-COLLAB-04": (facts) => {
-    const seen = numberFact(facts, "rooms_seen");
-    if (seen === undefined || seen === 0) return "manual";
-    if ((numberFact(facts, "rooms_without_classification_count") ?? 0) > 0) return "fail";
-    if (facts.rooms_truncated === true || facts.token_type === WEBEX_VERDICT_VALUES.botPersonType || statusReadable(facts, "token_probe_status") === false) return "warn";
-    return "pass";
-  },
-  "WEBEX-COLLAB-05": (facts) => {
-    const seen = numberFact(facts, "webhooks_seen");
-    if (seen === undefined || seen === 0) return "manual";
-    if ((numberFact(facts, "insecure_webhooks_count") ?? 0) > 0) return "fail";
-    if (facts.webhooks_truncated === true || facts.token_type === WEBEX_VERDICT_VALUES.botPersonType || statusReadable(facts, "token_probe_status") === false) return "warn";
-    return "pass";
-  },
-  "WEBEX-COLLAB-06": (facts) => {
-    const total = numberFact(facts, "total_units");
-    if (total === undefined || total === 0) return "manual";
-    const unassigned = numberFact(facts, "unassigned_units") ?? 0;
-    return unassigned / total > WEBEX_VERDICT_VALUES.maximumUnassignedLicenseRatio || facts.licenses_truncated === true ? "warn" : "pass";
-  },
-  "WEBEX-COLLAB-07": (facts) => {
-    const seen = numberFact(facts, "events_seen");
-    if (seen === undefined) return "manual";
-    return seen === 0 || facts.events_truncated === true ? "warn" : "pass";
-  },
-  "WEBEX-COLLAB-08": alwaysManual,
-  "WEBEX-MTG-01": alwaysManual,
-  "WEBEX-MTG-02": (facts) => {
-    const base = siteAggregate(facts);
-    if (base !== "pass") return base;
-    return statusReadable(facts, "meetings_status") === false
-      || statusReadable(facts, "meeting_preferences_status") === false
-      || statusReadable(facts, "token_probe_status") === false ? "warn" : "pass";
-  },
-  "WEBEX-MTG-03": (facts) => {
-    const base = siteAggregate(facts);
-    return base === "pass" && statusReadable(facts, "token_probe_status") === false ? "warn" : base;
-  },
-  "WEBEX-MTG-04": (facts) => {
-    const clusters = numberFact(facts, "clusters_seen");
-    const connectors = numberFact(facts, "connectors_seen");
-    if (clusters === undefined || connectors === undefined || (clusters === 0 && connectors === 0)) return "manual";
-    if (connectors === 0 || (numberFact(facts, "non_operational_count") ?? 0) > 0) return "fail";
-    return facts.hybrid_lists_truncated === true ? "warn" : "pass";
-  },
-  "WEBEX-MTG-05": alwaysManual,
-  "WEBEX-MTG-06": (facts) => {
-    const base = siteAggregate(facts);
-    if (base !== "pass") return base;
-    return statusReadable(facts, "meetings_status") === false
-      || statusReadable(facts, "meeting_preferences_status") === false
-      || statusReadable(facts, "token_probe_status") === false ? "warn" : "pass";
-  },
-  "WEBEX-MTG-07": alwaysManual,
+export const WEBEX_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]>> = {
+  "WEBEX-ID-01": alwaysManualRules("SSO state has no documented read field."),
+  "WEBEX-ID-02": alwaysManualRules("Administrator MFA state has no documented read field."),
+  "WEBEX-ID-03": [
+    rule("manual", or(not(defined("people_seen")), eq("people_seen", 0))),
+    rule("fail", or(not(defined("compliance_officer_count")), eq("compliance_officer_count", 0))),
+    rule("warn", eq("people_truncated", true)),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-ID-04": [
+    rule("manual", or(eq("people_seen", 0), and(not(defined("admin_users")), not(defined("admin_count"))))),
+    rule("warn", or(
+      compare("eq", path("admin_count", -1), value(0)),
+      and(not(defined("admin_count")), eq("admin_users", 0)),
+      compare("gt", path("admin_count", 0), path("max_admins", WEBEX_DEFAULTS.maxAdmins)),
+      eq("people_truncated", true),
+    )),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-ID-05": [
+    rule("manual", not(defined("bot_count"))),
+    rule("warn", eq("people_truncated", true)),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-ID-06": alwaysManualRules("Bot approval has no documented read field."),
+  "WEBEX-ID-07": [
+    rule("manual", or(not(defined("guest_count_people")), eq("people_seen", 0))),
+    rule("warn", or(eq("people_truncated", true), statusUnreadable("guest_count_api_status"))),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-COLLAB-01": alwaysManualRules("External communication policy has no documented read field."),
+  "WEBEX-COLLAB-02": alwaysManualRules("File-sharing and DLP policy state has no documented read field."),
+  "WEBEX-COLLAB-03": alwaysManualRules("Recording retention/storage policy has no documented read field."),
+  "WEBEX-COLLAB-04": [
+    rule("manual", or(not(defined("rooms_seen")), eq("rooms_seen", 0))),
+    rule("fail", compare("gt", path("rooms_without_classification_count", 0), value(0))),
+    rule("warn", or(eq("rooms_truncated", true), eq("token_type", WEBEX_VERDICT_VALUES.botPersonType), statusUnreadable("token_probe_status"))),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-COLLAB-05": [
+    rule("manual", or(not(defined("webhooks_seen")), eq("webhooks_seen", 0))),
+    rule("fail", compare("gt", path("insecure_webhooks_count", 0), value(0))),
+    rule("warn", or(eq("webhooks_truncated", true), eq("token_type", WEBEX_VERDICT_VALUES.botPersonType), statusUnreadable("token_probe_status"))),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-COLLAB-06": [
+    rule("manual", or(not(defined("total_units")), eq("total_units", 0))),
+    rule("warn", or(
+      compare("gt", path("unassigned_units", 0), { kind: "path", path: "license_warn_threshold_units" }),
+      eq("licenses_truncated", true),
+    ), "license_warn_threshold_units is total_units multiplied by maximumUnassignedRatio."),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-COLLAB-07": [
+    rule("manual", not(defined("events_seen"))),
+    rule("warn", or(eq("events_seen", 0), eq("events_truncated", true))),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-COLLAB-08": alwaysManualRules("eDiscovery/legal hold configuration has no documented read field."),
+  "WEBEX-MTG-01": alwaysManualRules("Meeting E2EE and calling SRTP have no documented read field."),
+  "WEBEX-MTG-02": siteRules(["meetings_status", "meeting_preferences_status", "token_probe_status"]),
+  "WEBEX-MTG-03": siteRules(["token_probe_status"]),
+  "WEBEX-MTG-04": [
+    rule("manual", or(not(defined("clusters_seen")), not(defined("connectors_seen")), and(eq("clusters_seen", 0), eq("connectors_seen", 0)))),
+    rule("fail", or(eq("connectors_seen", 0), compare("gt", path("non_operational_count", 0), value(0)))),
+    rule("warn", eq("hybrid_lists_truncated", true)),
+    rule("pass", { op: "always" }),
+  ],
+  "WEBEX-MTG-05": alwaysManualRules("Firmware lifecycle and blocking policy require manual evidence."),
+  "WEBEX-MTG-06": siteRules(["meetings_status", "meeting_preferences_status", "token_probe_status"]),
+  "WEBEX-MTG-07": alwaysManualRules("Virtual-background policy has no documented read field."),
 };
 
 export const WEBEX_CHECKS: readonly CheckContract[] = [

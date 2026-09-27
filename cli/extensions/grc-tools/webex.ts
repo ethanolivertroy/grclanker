@@ -1781,7 +1781,8 @@ export async function assessWebexCollaborationGovernance(
     licenseFinding = finding("WEBEX-COLLAB-06", [24], "License utilization review", "low",
       unassignedRatio <= WEBEX_VERDICT_VALUES.maximumUnassignedLicenseRatio ? (licenses.truncated ? "warn" : "pass") : "warn",
       `${unassigned} of ${totalUnits} license units are unassigned (${Math.round(unassignedRatio * 100)}%, threshold 20%) across ${licenseItems.length} licenses.${partialNote(licenses, "licenses")}`,
-      { total_units: totalUnits, consumed_units: consumedUnits, unassigned_units: unassigned, licenses_seen: licenseItems.length, licenses_truncated: licenses.truncated });
+      { total_units: totalUnits, consumed_units: consumedUnits, unassigned_units: unassigned, licenses_seen: licenseItems.length, licenses_truncated: licenses.truncated },
+      { license_warn_threshold_units: totalUnits * WEBEX_VERDICT_VALUES.maximumUnassignedLicenseRatio });
   }
 
   const auditItems = surfaceItems(adminAudit);

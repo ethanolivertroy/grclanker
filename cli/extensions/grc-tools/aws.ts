@@ -357,9 +357,10 @@ function finding(
   summary: string,
   mappings: string[],
   evidence?: JsonRecord,
+  decisionFacts?: JsonRecord,
 ): AwsFinding {
   const publishedCheck = checkContract(AWS_SPEC, id);
-  const evaluatedStatus = evaluateVerdictCriteria(publishedCheck.criteria, evidence ?? {});
+  const evaluatedStatus = evaluateVerdictCriteria(publishedCheck.criteria, { ...(evidence ?? {}), ...(decisionFacts ?? {}) });
   if (evaluatedStatus !== status) {
     throw new Error(`Check ${id} runtime status ${status} disagrees with metadata status ${evaluatedStatus}`);
   }
@@ -3266,6 +3267,7 @@ export async function assessAwsIdentity(
       root_other_events: ifRead(rootEvents, sample(rootOtherEvents.map((event) => ({ time: event.EventTime, name: event.EventName, source: event.EventSource })))),
       lookup_truncated: truncatedFlag(rootEvents),
     },
+    { undated_root_events: undatedRootEvents.length },
   ));
 
   // Control 18 (least privilege): customer-managed policies with wildcard Action and Resource.
@@ -3899,6 +3901,7 @@ export async function assessAwsOrgGuardrails(
       assessments: ifRead(auditAssessments, sample(activeAssessments.map((assessment) => ({ name: assessment.name, compliance_type: assessment.complianceType, last_updated: assessment.lastUpdated ?? null })))),
       list_truncated: truncatedFlag(auditAssessments),
     },
+    { undated_assessments: undatedAssessments.length },
   ));
 
   // Control 25: account security alternate contact.

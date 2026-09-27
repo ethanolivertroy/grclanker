@@ -1,12 +1,14 @@
 import type {
   CheckContract,
   ControlContract,
-  EvaluatedFindingStatus,
   FrameworkKey,
   IntegrationSpecContract,
+  PortableValue,
   RequestContract,
   VerdictCriteria,
-  VerdictFacts,
+  VerdictCondition,
+  VerdictOperand,
+  VerdictRule,
 } from "./spec-model.js";
 
 export type AwsFrameworkKey = FrameworkKey;
@@ -478,14 +480,8 @@ function awsCheck(
 ): CheckContract {
   const evidenceFields = AWS_EVIDENCE_FIELDS[id];
   if (!evidenceFields) throw new Error(`No evidence schema exists for ${id}`);
-  const evaluate = AWS_VERDICT_EVALUATORS[id];
-  if (!evaluate) throw new Error(`No runtime verdict evaluator exists for ${id}`);
-  const statusDescriptions = {
-    manual: verdictCriteria.manual,
-    fail: verdictCriteria.fail,
-    warn: verdictCriteria.warn,
-    pass: verdictCriteria.pass,
-  } as const;
+  const rules = AWS_VERDICT_RULES[id];
+  if (!rules) throw new Error(`No runtime verdict rules exist for ${id}`);
   return {
     id,
     controlNumbers: AWS_FINDING_CONTROLS[id],
@@ -496,11 +492,7 @@ function awsCheck(
     evidenceFields,
     criteria: {
       ...verdictCriteria,
-      rules: (["manual", "fail", "warn", "pass"] as const).map((status) => ({
-        status,
-        description: statusDescriptions[status],
-        matches: (facts) => evaluate(facts) === status,
-      })),
+      rules,
     },
   };
 }
@@ -541,193 +533,216 @@ export const AWS_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> = 
   "AWS-NET-21": ["regions_seen", "regions_total", "regions", "partial", "source", "scope_error", "sensitive_ports", "security_groups", "unrestricted_security_groups", "inventory_truncated", "regions_with_errors"],
 };
 
-type AwsVerdictEvaluator = (facts: VerdictFacts) => EvaluatedFindingStatus;
-const awsRecord = (value: unknown): Readonly<Record<string, unknown>> | undefined =>
-  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Readonly<Record<string, unknown>> : undefined;
-const awsNumber = (facts: VerdictFacts, key: string): number | undefined => typeof facts[key] === "number" ? facts[key] : undefined;
-const awsBoolean = (facts: VerdictFacts, key: string): boolean | undefined => typeof facts[key] === "boolean" ? facts[key] : undefined;
-const awsArray = (facts: VerdictFacts, key: string): readonly unknown[] | undefined => Array.isArray(facts[key]) ? facts[key] as readonly unknown[] : undefined;
-const nonempty = (facts: VerdictFacts, key: string): boolean => (awsArray(facts, key)?.length ?? 0) > 0;
-const regionPartial = (facts: VerdictFacts): boolean => facts.partial === true;
+const awsPath = (name: string, fallback?: PortableValue): VerdictOperand =>
+  fallback === undefined ? { kind: "path", path: name } : { kind: "path", path: name, fallback };
+const awsValue = (entry: PortableValue): VerdictOperand => ({ kind: "value", value: entry });
+const awsLength = (name: string): VerdictOperand => ({ kind: "length", path: name });
+const awsCompare = (op: Extract<VerdictCondition["op"], "eq" | "ne" | "gt" | "gte" | "lt" | "lte">, left: VerdictOperand, right: VerdictOperand): VerdictCondition => ({ op, left, right });
+const awsEq = (name: string, entry: PortableValue): VerdictCondition => awsCompare("eq", awsPath(name), awsValue(entry));
+const awsDefined = (name: string): VerdictCondition => ({ op: "defined", operand: awsPath(name) });
+const awsNull = (name: string): VerdictCondition => ({ op: "null", operand: awsPath(name) });
+const awsAnd = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const awsOr = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const awsNot = (condition: VerdictCondition): VerdictCondition => ({ op: "not", condition });
+const awsSome = (name: string, condition: VerdictCondition): VerdictCondition => ({ op: "some", path: name, condition });
+const awsEvery = (name: string, condition: VerdictCondition): VerdictCondition => ({ op: "every", path: name, condition });
+const awsRule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({ status, condition, ...(note ? { note } : {}) });
+const awsNonempty = (name: string): VerdictCondition => awsCompare("gt", awsLength(name), awsValue(0));
+const awsEmpty = (name: string): VerdictCondition => awsCompare("eq", awsLength(name), awsValue(0));
+const awsMissingOrZero = (name: string): VerdictCondition => awsOr(awsNot(awsDefined(name)), awsEq(name, 0));
 
-export const AWS_VERDICT_EVALUATORS: Readonly<Record<string, AwsVerdictEvaluator>> = {
-  "AWS-IAM-01": (facts) => {
-    if (facts.summary_readable !== true) return "manual";
-    return facts.account_mfa_enabled === AWS_VERDICT_VALUES.accountMfaEnabled
-      && (facts.account_access_keys_present === null || facts.account_access_keys_present === AWS_VERDICT_VALUES.accountAccessKeysPresent) ? "pass" : "fail";
-  },
-  "AWS-IAM-02": (facts) => {
-    if (facts.users_readable !== true || facts.users_mfa_judged === null) return "manual";
-    if (nonempty(facts, "users_without_mfa")) return "fail";
-    return facts.user_inventory_truncated === true || nonempty(facts, "users_mfa_unreadable") ? "warn" : "pass";
-  },
-  "AWS-IAM-03": (facts) => {
-    if (facts.password_policy_readable !== true) return "manual";
-    if (facts.password_policy_configured !== true) return "fail";
-    const policy = awsRecord(facts.password_policy);
-    const strong = (awsNumber(policy ?? {}, "MinimumPasswordLength") ?? 0) >= AWS_VERDICT_VALUES.minimumPasswordLength
-      && AWS_VERDICT_VALUES.passwordComplexityFields.every((field) => policy?.[field] === true);
-    return strong ? "pass" : "fail";
-  },
-  "AWS-IAM-04": (facts) => {
-    if (facts.users_readable !== true) return "manual";
-    const sampled = awsNumber(facts, "keys_sampled");
-    const lastUsedUnreadable = awsArray(facts, "keys_last_used_unreadable")?.length ?? 0;
-    if (facts.keys_sampled === null || (sampled !== undefined && sampled > 0 && lastUsedUnreadable === sampled)) return "manual";
-    if (nonempty(facts, "stale_access_keys")) return "fail";
-    return facts.user_inventory_truncated === true || nonempty(facts, "users_keys_unreadable") || nonempty(facts, "keys_last_used_unreadable") ? "warn" : "pass";
-  },
-  "AWS-IAM-05": (facts) => {
-    if (facts.roles_readable !== true) return "manual";
-    const missing = awsArray(facts, "roles_without_boundaries")?.length ?? 0;
-    const maximum = awsNumber(facts, "max_privileged_roles") ?? AWS_DEFAULTS.maxPrivilegedRoles;
-    if (missing > maximum) return "fail";
-    return missing > 0 || facts.role_inventory_truncated === true ? "warn" : "pass";
-  },
-  "AWS-IAM-06": (facts) => {
-    if (facts.users_readable !== true) return "manual";
-    return nonempty(facts, "dormant_users") || facts.user_inventory_truncated === true || nonempty(facts, "users_keys_unreadable") ? "warn" : "pass";
-  },
-  "AWS-IAM-07": (facts) => {
-    if (facts.events_readable !== true) return "manual";
-    if (nonempty(facts, "root_console_logins")) return "fail";
-    if (nonempty(facts, "root_other_events")) return "warn";
-    return facts.global_lookup_error || facts.lookup_truncated === true || (awsNumber(facts, "undated_root_events") ?? 0) > 0 ? "warn" : "pass";
-  },
-  "AWS-IAM-08": (facts) => {
-    if (facts.policies_readable !== true || awsNumber(facts, "customer_managed_policies") === 0) return "manual";
-    if (nonempty(facts, "full_admin_attached")) return "fail";
-    return nonempty(facts, "full_admin_unattached") || nonempty(facts, "service_wildcard_policies")
-      || nonempty(facts, "policies_unreadable") || facts.policy_inventory_truncated === true ? "warn" : "pass";
-  },
-  "AWS-LOG-01": (facts) => {
-    if (facts.trails_readable !== true) return "manual";
-    const trails = awsArray(facts, "trails")?.map(awsRecord).filter(Boolean) ?? [];
-    const good = trails.some((trail) => trail?.is_multi_region === true && trail.validation === true && trail.is_logging === true);
-    const unverified = trails.some((trail) => trail?.is_multi_region === true && trail.validation === true && trail.is_logging === null);
-    if (!good) return unverified ? "manual" : "fail";
-    return trails.some((trail) => trail?.status_error) ? "warn" : "pass";
-  },
-  "AWS-LOG-02": (facts) => {
-    if (facts.trails_readable !== true || facts.data_event_trails === null) return "manual";
-    const dataEvents = awsArray(facts, "data_event_trails")?.length ?? 0;
-    const unreadable = awsArray(facts, "selectors_unreadable")?.length ?? 0;
-    if (dataEvents === 0) return unreadable > 0 ? "manual" : "warn";
-    return unreadable > 0 ? "warn" : "pass";
-  },
-  "AWS-LOG-03": (facts) => {
-    if (facts.hub_readable !== true) return "manual";
-    if (facts.hub_enabled !== true) return "fail";
-    if (facts.standards_readable !== true || (awsNumber(facts, "standard_count") ?? 0) === 0 || facts.standards_truncated === true) return "warn";
-    return "pass";
-  },
-  "AWS-LOG-04": (facts) => {
-    if (facts.detectors_readable !== true || facts.enabled_detectors === null) return "manual";
-    const enabled = awsNumber(facts, "enabled_detectors") ?? 0;
-    if (enabled === 0) return nonempty(facts, "detectors_unreadable") ? "manual" : "fail";
-    return nonempty(facts, "detectors_unreadable") || facts.detector_list_truncated === true ? "warn" : "pass";
-  },
-  "AWS-LOG-05": (facts) => {
-    if (facts.recorders_readable !== true) return "manual";
-    const recorders = awsArray(facts, "recorders") ?? [];
-    if (recorders.length === 0) return "fail";
-    if (facts.recorder_status_readable !== true) return "manual";
-    const statuses = awsArray(facts, "recorder_statuses")?.map(awsRecord).filter(Boolean) ?? [];
-    return statuses.some((status) => status?.recording === true) ? "pass" : "fail";
-  },
-  "AWS-ORG-01": (facts) => {
-    if (facts.organization_readable !== true) return "manual";
-    if (facts.standalone === true) return "warn";
-    return facts.accounts_readable === false || facts.account_list_truncated === true ? "warn" : "pass";
-  },
-  "AWS-ORG-02": (facts) => {
-    if (facts.scps_readable === null) return "warn";
-    if (facts.scps_readable !== true) return "manual";
-    if ((awsNumber(facts, "scp_count") ?? 0) === 0) return "warn";
-    if (facts.attached_scp_count === null) return "manual";
-    const attached = awsNumber(facts, "attached_scp_count") ?? 0;
-    if (attached === 0 && !nonempty(facts, "scps_targets_unreadable")) return "fail";
-    return nonempty(facts, "scps_targets_unreadable") || facts.scp_list_truncated === true ? "warn" : "pass";
-  },
-  "AWS-ORG-03": (facts) => {
-    if (facts.analyzers_readable !== true) return "manual";
-    const analyzers = awsArray(facts, "analyzers")?.map(awsRecord).filter(Boolean) ?? [];
-    if (!analyzers.some((analyzer) => analyzer?.status === AWS_VERDICT_VALUES.activeAnalyzerStatus)) return "fail";
-    return facts.analyzer_list_truncated === true ? "warn" : "pass";
-  },
-  "AWS-ORG-04": (facts) => {
-    if (facts.analyzers_readable !== true || facts.analyzers_sampled === null || facts.active_finding_count === null) return "manual";
-    if ((awsNumber(facts, "active_finding_count") ?? 0) > 0) return "warn";
-    return nonempty(facts, "analyzers_findings_unreadable") || nonempty(facts, "analyzers_findings_truncated") ? "warn" : "pass";
-  },
-  "AWS-ORG-05": (facts) => {
-    if (facts.instances_readable !== true) return "manual";
-    if ((awsNumber(facts, "identity_center_instances") ?? 0) === 0) return "warn";
-    return facts.instance_list_truncated === true ? "warn" : "pass";
-  },
-  "AWS-ORG-06": (facts) => {
-    if (facts.assessments_readable !== true) return "manual";
-    if ((awsNumber(facts, "active_assessments") ?? 0) === 0) return "fail";
-    const undated = awsArray(facts, "assessments")?.map(awsRecord).filter((assessment) => assessment?.last_updated === null).length ?? 0;
-    return undated > 0 || facts.list_truncated === true ? "warn" : "pass";
-  },
-  "AWS-ORG-07": (facts) => {
-    if (facts.contact_readable !== true) return "manual";
-    if (facts.security_contact_configured !== true) return "fail";
-    return facts.email_domain === null || facts.has_phone !== true ? "warn" : "pass";
-  },
-  "AWS-DATA-11": (facts) => {
-    if (facts.account_block_readable !== true || facts.buckets_readable !== true) return "manual";
-    const flags = awsRecord(facts.account_flags);
-    const full = AWS_REQUIRED_PUBLIC_ACCESS_FLAGS.every((name) => flags?.[name] === true);
-    const uncovered = awsArray(facts, "buckets_without_full_block")?.length ?? 0;
-    const publicPolicies = awsArray(facts, "buckets_with_public_policy")?.length ?? 0;
-    if (facts.account_block_configured !== true || (!full && (uncovered > 0 || publicPolicies > 0))) return "fail";
-    if (!full || publicPolicies > 0) return "warn";
-    return nonempty(facts, "buckets_unreadable") || facts.bucket_inventory_truncated === true ? "warn" : "pass";
-  },
-  "AWS-DATA-12": (facts) => {
-    const ebs = awsArray(facts, "ebs_by_region")?.map(awsRecord).filter(Boolean) ?? [];
-    if (ebs.length > 0 && ebs.every((row) => row?.EbsEncryptionByDefault === null)) return "manual";
-    if (facts.buckets_readable !== true) return "manual";
-    if (ebs.some((row) => row?.EbsEncryptionByDefault === false)
-      || nonempty(facts, "rds_unencrypted") || nonempty(facts, "buckets_without_default_encryption")) return "fail";
-    return regionPartial(facts) || ebs.some((row) => row?.EbsEncryptionByDefault === null)
-      || nonempty(facts, "regions_with_rds_errors") || nonempty(facts, "rds_without_flag")
-      || nonempty(facts, "buckets_encryption_unreadable") || facts.bucket_inventory_truncated === true ? "warn" : "pass";
-  },
-  "AWS-DATA-13": (facts) => {
-    if (facts.buckets_readable !== true || (awsNumber(facts, "buckets") ?? 0) === 0) return "manual";
-    if (nonempty(facts, "buckets_without_tls_deny")) return "fail";
-    return nonempty(facts, "buckets_policy_unreadable") || facts.bucket_inventory_truncated === true ? "warn" : "pass";
-  },
-  "AWS-DATA-22": (facts) => {
-    if (facts.keys === null || facts.customer_managed_keys === null || (awsNumber(facts, "customer_managed_keys") ?? 0) === 0) return "manual";
-    if (nonempty(facts, "keys_not_rotating")) return "fail";
-    if ((awsNumber(facts, "eligible_keys") ?? 0) === 0) return "warn";
-    return regionPartial(facts) || nonempty(facts, "keys_rotation_unreadable") || nonempty(facts, "keys_manager_unreadable")
-      || facts.key_inventory_truncated === true || nonempty(facts, "regions_with_list_errors") ? "warn" : "pass";
-  },
-  "AWS-NET-14": (facts) => {
-    const vpcs = awsNumber(facts, "vpcs");
-    if (vpcs === undefined || vpcs === 0 || facts.vpcs_without_active_flow_logs === null) return "manual";
-    if (nonempty(facts, "vpcs_without_active_flow_logs")) return "fail";
-    if ((awsArray(facts, "vpcs_unverified")?.length ?? 0) === vpcs) return "manual";
-    return regionPartial(facts) || nonempty(facts, "vpcs_unverified") || facts.inventory_truncated === true
-      || nonempty(facts, "regions_with_vpc_errors") || nonempty(facts, "regions_with_flow_log_errors") ? "warn" : "pass";
-  },
-  "AWS-NET-20": (facts) => {
-    const count = awsNumber(facts, "network_acls");
-    if (count === undefined || count === 0) return "manual";
-    if (nonempty(facts, "permissive_network_acls")) return "fail";
-    return regionPartial(facts) || facts.inventory_truncated === true || nonempty(facts, "regions_with_errors") ? "warn" : "pass";
-  },
-  "AWS-NET-21": (facts) => {
-    const count = awsNumber(facts, "security_groups");
-    if (count === undefined || count === 0) return "manual";
-    if (nonempty(facts, "unrestricted_security_groups")) return "fail";
-    return regionPartial(facts) || facts.inventory_truncated === true || nonempty(facts, "regions_with_errors") ? "warn" : "pass";
-  },
+export const AWS_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]>> = {
+  "AWS-IAM-01": [
+    awsRule("manual", awsEq("summary_readable", false)),
+    awsRule("fail", awsOr(awsCompare("ne", awsPath("account_mfa_enabled"), awsValue(AWS_VERDICT_VALUES.accountMfaEnabled)), awsCompare("gt", awsPath("account_access_keys_present", 0), awsValue(0)))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-IAM-02": [
+    awsRule("manual", awsOr(awsEq("users_readable", false), awsNull("users_mfa_judged"))),
+    awsRule("fail", awsNonempty("users_without_mfa")),
+    awsRule("warn", awsOr(awsEq("user_inventory_truncated", true), awsNonempty("users_mfa_unreadable"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-IAM-03": [
+    awsRule("manual", awsEq("password_policy_readable", false)),
+    awsRule("fail", awsOr(
+      awsEq("password_policy_configured", false),
+      awsCompare("lt", awsPath("password_policy.MinimumPasswordLength", 0), awsValue(AWS_VERDICT_VALUES.minimumPasswordLength)),
+      ...AWS_VERDICT_VALUES.passwordComplexityFields.map((field) => awsCompare("ne", awsPath(`password_policy.${field}`), awsValue(true))),
+    )),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-IAM-04": [
+    awsRule("manual", awsOr(
+      awsEq("users_readable", false),
+      awsNull("keys_sampled"),
+      awsAnd(awsCompare("gt", awsPath("keys_sampled", 0), awsValue(0)), awsCompare("eq", awsLength("keys_last_used_unreadable"), awsPath("keys_sampled", 0))),
+    )),
+    awsRule("fail", awsNonempty("stale_access_keys")),
+    awsRule("warn", awsOr(awsEq("user_inventory_truncated", true), awsNonempty("users_keys_unreadable"), awsNonempty("keys_last_used_unreadable"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-IAM-05": [
+    awsRule("manual", awsEq("roles_readable", false)),
+    awsRule("fail", awsCompare("gt", awsLength("roles_without_boundaries"), awsPath("max_privileged_roles", AWS_DEFAULTS.maxPrivilegedRoles))),
+    awsRule("warn", awsOr(awsNonempty("roles_without_boundaries"), awsEq("role_inventory_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-IAM-06": [
+    awsRule("manual", awsEq("users_readable", false)),
+    awsRule("warn", awsOr(awsNonempty("dormant_users"), awsEq("user_inventory_truncated", true), awsNonempty("users_keys_unreadable"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-IAM-07": [
+    awsRule("manual", awsEq("events_readable", false)),
+    awsRule("fail", awsNonempty("root_console_logins")),
+    awsRule("warn", awsOr(
+      awsNonempty("root_other_events"),
+      awsAnd(awsDefined("global_lookup_error"), awsCompare("ne", awsPath("global_lookup_error"), awsValue(null))),
+      awsEq("lookup_truncated", true),
+      awsCompare("gt", awsPath("undated_root_events", 0), awsValue(0)),
+    )),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-IAM-08": [
+    awsRule("manual", awsOr(awsEq("policies_readable", false), awsEq("customer_managed_policies", 0))),
+    awsRule("fail", awsNonempty("full_admin_attached")),
+    awsRule("warn", awsOr(awsNonempty("full_admin_unattached"), awsNonempty("service_wildcard_policies"), awsNonempty("policies_unreadable"), awsEq("policy_inventory_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-LOG-01": [
+    awsRule("manual", awsOr(
+      awsEq("trails_readable", false),
+      awsAnd(
+        awsNot(awsSome("trails", awsAnd(awsEq("$.is_multi_region", true), awsEq("$.validation", true), awsEq("$.is_logging", true)))),
+        awsSome("trails", awsAnd(awsEq("$.is_multi_region", true), awsEq("$.validation", true), awsNull("$.is_logging"))),
+      ),
+    )),
+    awsRule("fail", awsNot(awsSome("trails", awsAnd(awsEq("$.is_multi_region", true), awsEq("$.validation", true), awsEq("$.is_logging", true))))),
+    awsRule("warn", awsSome("trails", awsDefined("$.status_error"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-LOG-02": [
+    awsRule("manual", awsOr(awsEq("trails_readable", false), awsNull("data_event_trails"), awsAnd(awsEmpty("data_event_trails"), awsNonempty("selectors_unreadable")))),
+    awsRule("warn", awsOr(awsEmpty("data_event_trails"), awsNonempty("selectors_unreadable"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-LOG-03": [
+    awsRule("manual", awsEq("hub_readable", false)),
+    awsRule("fail", awsEq("hub_enabled", false)),
+    awsRule("warn", awsOr(awsEq("standards_readable", false), awsEq("standard_count", 0), awsEq("standards_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-LOG-04": [
+    awsRule("manual", awsOr(awsEq("detectors_readable", false), awsNull("enabled_detectors"), awsAnd(awsEq("enabled_detectors", 0), awsNonempty("detectors_unreadable")))),
+    awsRule("fail", awsEq("enabled_detectors", 0)),
+    awsRule("warn", awsOr(awsNonempty("detectors_unreadable"), awsEq("detector_list_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-LOG-05": [
+    awsRule("manual", awsOr(awsEq("recorders_readable", false), awsAnd(awsNonempty("recorders"), awsEq("recorder_status_readable", false)))),
+    awsRule("fail", awsOr(awsEmpty("recorders"), awsNot(awsSome("recorder_statuses", awsEq("$.recording", true))))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-ORG-01": [
+    awsRule("manual", awsEq("organization_readable", false)),
+    awsRule("warn", awsOr(awsEq("standalone", true), awsEq("accounts_readable", false), awsEq("account_list_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-ORG-02": [
+    awsRule("warn", awsNull("scps_readable")),
+    awsRule("manual", awsOr(awsEq("scps_readable", false), awsNull("attached_scp_count"))),
+    awsRule("warn", awsEq("scp_count", 0)),
+    awsRule("fail", awsAnd(awsEq("attached_scp_count", 0), awsEmpty("scps_targets_unreadable"))),
+    awsRule("warn", awsOr(awsNonempty("scps_targets_unreadable"), awsEq("scp_list_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-ORG-03": [
+    awsRule("manual", awsEq("analyzers_readable", false)),
+    awsRule("fail", awsNot(awsSome("analyzers", awsEq("$.status", AWS_VERDICT_VALUES.activeAnalyzerStatus)))),
+    awsRule("warn", awsEq("analyzer_list_truncated", true)),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-ORG-04": [
+    awsRule("manual", awsOr(awsEq("analyzers_readable", false), awsNull("analyzers_sampled"), awsNull("active_finding_count"))),
+    awsRule("warn", awsOr(awsCompare("gt", awsPath("active_finding_count", 0), awsValue(0)), awsNonempty("analyzers_findings_unreadable"), awsNonempty("analyzers_findings_truncated"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-ORG-05": [
+    awsRule("manual", awsEq("instances_readable", false)),
+    awsRule("warn", awsOr(awsEq("identity_center_instances", 0), awsEq("instance_list_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-ORG-06": [
+    awsRule("manual", awsEq("assessments_readable", false)),
+    awsRule("fail", awsEq("active_assessments", 0)),
+    awsRule("warn", awsOr(awsCompare("gt", awsPath("undated_assessments", 0), awsValue(0)), awsEq("list_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-ORG-07": [
+    awsRule("manual", awsEq("contact_readable", false)),
+    awsRule("fail", awsEq("security_contact_configured", false)),
+    awsRule("warn", awsOr(awsNull("email_domain"), awsCompare("ne", awsPath("has_phone"), awsValue(true)))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-DATA-11": [
+    awsRule("manual", awsOr(awsEq("account_block_readable", false), awsEq("buckets_readable", false))),
+    awsRule("fail", awsOr(
+      awsEq("account_block_configured", false),
+      awsAnd(
+        awsNot(awsAnd(...AWS_REQUIRED_PUBLIC_ACCESS_FLAGS.map((name) => awsEq(`account_flags.${name}`, true)))),
+        awsOr(awsNonempty("buckets_without_full_block"), awsNonempty("buckets_with_public_policy")),
+      ),
+    )),
+    awsRule("warn", awsOr(
+      awsNot(awsAnd(...AWS_REQUIRED_PUBLIC_ACCESS_FLAGS.map((name) => awsEq(`account_flags.${name}`, true)))),
+      awsNonempty("buckets_with_public_policy"),
+      awsNonempty("buckets_unreadable"),
+      awsEq("bucket_inventory_truncated", true),
+    )),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-DATA-12": [
+    awsRule("manual", awsOr(awsEq("buckets_readable", false), awsAnd(awsNonempty("ebs_by_region"), awsEvery("ebs_by_region", awsNull("$.EbsEncryptionByDefault"))))),
+    awsRule("fail", awsOr(awsSome("ebs_by_region", awsEq("$.EbsEncryptionByDefault", false)), awsNonempty("rds_unencrypted"), awsNonempty("buckets_without_default_encryption"))),
+    awsRule("warn", awsOr(awsEq("partial", true), awsSome("ebs_by_region", awsNull("$.EbsEncryptionByDefault")), awsNonempty("regions_with_rds_errors"), awsNonempty("rds_without_flag"), awsNonempty("buckets_encryption_unreadable"), awsEq("bucket_inventory_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-DATA-13": [
+    awsRule("manual", awsOr(awsEq("buckets_readable", false), awsEq("buckets", 0))),
+    awsRule("fail", awsNonempty("buckets_without_tls_deny")),
+    awsRule("warn", awsOr(awsNonempty("buckets_policy_unreadable"), awsEq("bucket_inventory_truncated", true))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-DATA-22": [
+    awsRule("manual", awsOr(awsNull("keys"), awsNull("customer_managed_keys"), awsEq("customer_managed_keys", 0))),
+    awsRule("fail", awsNonempty("keys_not_rotating")),
+    awsRule("warn", awsOr(awsEq("eligible_keys", 0), awsEq("partial", true), awsNonempty("keys_rotation_unreadable"), awsNonempty("keys_manager_unreadable"), awsEq("key_inventory_truncated", true), awsNonempty("regions_with_list_errors"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-NET-14": [
+    awsRule("manual", awsOr(
+      awsNot(awsDefined("vpcs")),
+      awsEq("vpcs", 0),
+      awsNull("vpcs_without_active_flow_logs"),
+      awsCompare("eq", awsLength("vpcs_unverified"), awsPath("vpcs", 0)),
+    )),
+    awsRule("fail", awsNonempty("vpcs_without_active_flow_logs")),
+    awsRule("warn", awsOr(awsEq("partial", true), awsNonempty("vpcs_unverified"), awsEq("inventory_truncated", true), awsNonempty("regions_with_vpc_errors"), awsNonempty("regions_with_flow_log_errors"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-NET-20": [
+    awsRule("manual", awsOr(awsNot(awsDefined("network_acls")), awsEq("network_acls", 0))),
+    awsRule("fail", awsNonempty("permissive_network_acls")),
+    awsRule("warn", awsOr(awsEq("partial", true), awsEq("inventory_truncated", true), awsNonempty("regions_with_errors"))),
+    awsRule("pass", { op: "always" }),
+  ],
+  "AWS-NET-21": [
+    awsRule("manual", awsOr(awsNot(awsDefined("security_groups")), awsEq("security_groups", 0))),
+    awsRule("fail", awsNonempty("unrestricted_security_groups")),
+    awsRule("warn", awsOr(awsEq("partial", true), awsEq("inventory_truncated", true), awsNonempty("regions_with_errors"))),
+    awsRule("pass", { op: "always" }),
+  ],
 };
 
 export const AWS_CHECKS: readonly CheckContract[] = [

@@ -105,9 +105,22 @@ export type VerdictFacts = Readonly<Record<string, unknown>>;
 
 export interface VerdictRule {
   status: EvaluatedFindingStatus;
-  description: string;
-  matches: (facts: VerdictFacts) => boolean;
+  condition: VerdictCondition;
+  note?: string;
 }
+
+export type VerdictOperand =
+  | { kind: "value"; value: PortableValue }
+  | { kind: "path"; path: string; fallback?: PortableValue }
+  | { kind: "length"; path: string };
+
+export type VerdictCondition =
+  | { op: "always" }
+  | { op: "and" | "or"; conditions: readonly VerdictCondition[] }
+  | { op: "not"; condition: VerdictCondition }
+  | { op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte"; left: VerdictOperand; right: VerdictOperand }
+  | { op: "defined" | "null"; operand: VerdictOperand }
+  | { op: "some" | "every"; path: string; condition: VerdictCondition };
 
 export interface CriterionExample {
   kind: CriterionExampleKind;
@@ -252,7 +265,134 @@ export function checkContract(spec: IntegrationSpecContract, checkId: string): C
 
 export function evaluateVerdictCriteria(criteria: VerdictCriteria, facts: VerdictFacts): EvaluatedFindingStatus {
   for (const rule of criteria.rules) {
-    if (rule.matches(facts)) return rule.status;
+    if (evaluateVerdictCondition(rule.condition, facts)) return rule.status;
   }
   throw new Error("No verdict criterion matched the supplied facts");
+}
+
+function pathValue(root: unknown, path: string, item: unknown): unknown {
+  const fromItem = path === "$" || path.startsWith("$.");
+  const segments = (fromItem ? path.slice(1).replace(/^\./, "") : path).split(".").filter(Boolean);
+  let value: unknown = fromItem ? item : root;
+  for (const segment of segments) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+    value = (value as Record<string, unknown>)[segment];
+  }
+  return value;
+}
+
+function operandValue(operand: VerdictOperand, facts: VerdictFacts, item: unknown): unknown {
+  switch (operand.kind) {
+    case "value":
+      return operand.value;
+    case "path": {
+      const value = pathValue(facts, operand.path, item);
+      return value === undefined && "fallback" in operand ? operand.fallback : value;
+    }
+    case "length": {
+      const value = pathValue(facts, operand.path, item);
+      return Array.isArray(value) || typeof value === "string" ? value.length : undefined;
+    }
+    default: {
+      const unhandled: never = operand;
+      return unhandled;
+    }
+  }
+}
+
+function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, item: unknown): boolean {
+  switch (condition.op) {
+    case "always":
+      return true;
+    case "and":
+      return condition.conditions.every((entry) => evaluateCondition(entry, facts, item));
+    case "or":
+      return condition.conditions.some((entry) => evaluateCondition(entry, facts, item));
+    case "not":
+      return !evaluateCondition(condition.condition, facts, item);
+    case "defined":
+      return operandValue(condition.operand, facts, item) !== undefined;
+    case "null":
+      return operandValue(condition.operand, facts, item) === null;
+    case "eq":
+      return operandValue(condition.left, facts, item) === operandValue(condition.right, facts, item);
+    case "ne":
+      return operandValue(condition.left, facts, item) !== operandValue(condition.right, facts, item);
+    case "gt":
+      return Number(operandValue(condition.left, facts, item)) > Number(operandValue(condition.right, facts, item));
+    case "gte":
+      return Number(operandValue(condition.left, facts, item)) >= Number(operandValue(condition.right, facts, item));
+    case "lt":
+      return Number(operandValue(condition.left, facts, item)) < Number(operandValue(condition.right, facts, item));
+    case "lte":
+      return Number(operandValue(condition.left, facts, item)) <= Number(operandValue(condition.right, facts, item));
+    case "some":
+    case "every": {
+      const value = pathValue(facts, condition.path, item);
+      if (!Array.isArray(value)) return false;
+      return condition.op === "some"
+        ? value.some((entry) => evaluateCondition(condition.condition, facts, entry))
+        : value.every((entry) => evaluateCondition(condition.condition, facts, entry));
+    }
+    default: {
+      const unhandled: never = condition;
+      return unhandled;
+    }
+  }
+}
+
+export function evaluateVerdictCondition(condition: VerdictCondition, facts: VerdictFacts): boolean {
+  return evaluateCondition(condition, facts, undefined);
+}
+
+function renderOperand(operand: VerdictOperand): string {
+  switch (operand.kind) {
+    case "value":
+      return Array.isArray(operand.value) ? `[${operand.value.join(", ")}]` : JSON.stringify(operand.value);
+    case "path":
+      return `\`${operand.path}\`${"fallback" in operand ? ` (default ${JSON.stringify(operand.fallback)})` : ""}`;
+    case "length":
+      return `length of \`${operand.path}\``;
+    default: {
+      const unhandled: never = operand;
+      return String(unhandled);
+    }
+  }
+}
+
+export function renderVerdictCondition(condition: VerdictCondition): string {
+  switch (condition.op) {
+    case "always":
+      return "always";
+    case "and":
+      return `all of (${condition.conditions.map(renderVerdictCondition).join("; ")})`;
+    case "or":
+      return `any of (${condition.conditions.map(renderVerdictCondition).join("; ")})`;
+    case "not":
+      return `not (${renderVerdictCondition(condition.condition)})`;
+    case "defined":
+      return `${renderOperand(condition.operand)} is defined`;
+    case "null":
+      return `${renderOperand(condition.operand)} is null`;
+    case "eq":
+      return `${renderOperand(condition.left)} equals ${renderOperand(condition.right)}`;
+    case "ne":
+      return `${renderOperand(condition.left)} does not equal ${renderOperand(condition.right)}`;
+    case "gt":
+      return `${renderOperand(condition.left)} is greater than ${renderOperand(condition.right)}`;
+    case "gte":
+      return `${renderOperand(condition.left)} is at least ${renderOperand(condition.right)}`;
+    case "lt":
+      return `${renderOperand(condition.left)} is less than ${renderOperand(condition.right)}`;
+    case "lte":
+      return `${renderOperand(condition.left)} is at most ${renderOperand(condition.right)}`;
+    case "some":
+      return `some item in \`${condition.path}\` satisfies (${renderVerdictCondition(condition.condition)})`;
+    case "every":
+      return `every item in \`${condition.path}\` satisfies (${renderVerdictCondition(condition.condition)})`;
+    default: {
+      const unhandled: never = condition;
+      return String(unhandled);
+    }
+  }
 }

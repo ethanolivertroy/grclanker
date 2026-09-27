@@ -7,7 +7,7 @@ import {
   SHARED_INTEGRATION_REQUIREMENTS,
   SHARED_REDACTION_RULES,
 } from "../dist/extensions/grc-tools/hardening/contract.js";
-import { collectDefinedGrcTools } from "../dist/extensions/grc-tools/spec-model.js";
+import { collectDefinedGrcTools, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -199,16 +199,27 @@ function renderChecks(spec) {
     ...spec.controls.map((control) => {
       const checks = checksByControl.get(control.number) ?? [];
       const semantics = checks.length > 0
-        ? checks.map((check) => check.criteria.manual).filter((value, index, values) => values.indexOf(value) === index).join(" ")
+        ? `Evaluate the ordered first-match rules for ${checks.map((check) => check.id).join(", ")} below.`
         : "No automated finding is published for this control.";
       return `| ${control.number} | ${escapeCell(control.title)} | ${checks.map((check) => check.id).join(", ")} | ${escapeCell(semantics)} |`;
     }),
     "",
-    "### Finding criteria",
+    "### Finding notes",
     "",
-    "| Finding | Severity | Owning tool | Sources | Evidence fields | Pass | Warn | Fail | Manual |",
+    "These notes explain intent only. The ordered rule table is normative.",
+    "",
+    "| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |",
     "|---|---|---|---|---|---|---|---|---|",
     ...spec.checks.map((check) => `| \`${check.id}\` | ${check.severity} | \`${check.owningTool}\` | ${listCell(check.sourceSurfaceIds)} | ${listCell(check.evidenceFields)} | ${escapeCell(check.criteria.pass)} | ${escapeCell(check.criteria.warn)} | ${escapeCell(check.criteria.fail)} | ${escapeCell(check.criteria.manual)} |`),
+    "",
+    "### Ordered decision rules",
+    "",
+    "Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.",
+    "",
+    "| Finding | Order | Outcome | First-match condition | Explanatory note |",
+    "|---|---|---|---|---|",
+    ...spec.checks.flatMap((check) => check.criteria.rules.map((rule, index) =>
+      `| \`${check.id}\` | ${index + 1} | ${rule.status} | ${escapeCell(renderVerdictCondition(rule.condition))} | ${escapeCell(rule.note ?? "")} |`)),
     "",
     "### Criterion constants",
     "",
@@ -216,7 +227,9 @@ function renderChecks(spec) {
     "|---|---|---|",
     ...(constantRows.length > 0 ? constantRows : ["| None |  |  |"]),
     "",
-    "### Criterion examples",
+    "### Illustrative criterion notes",
+    "",
+    "Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.",
     "",
     "| Finding | Case | Input condition | Expected | Reason |",
     "|---|---|---|---|---|",

@@ -16,7 +16,7 @@ import {
   SHARED_PAGINATION_STOP_KINDS,
   SHARED_REDACTION_RULES,
 } from "../dist/extensions/grc-tools/hardening/contract.js";
-import { collectDefinedGrcTools } from "../dist/extensions/grc-tools/spec-model.js";
+import { collectDefinedGrcTools, evaluateVerdictCriteria, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 import { resolveWebexConfiguration } from "../dist/extensions/grc-tools/webex.js";
 import {
@@ -115,16 +115,9 @@ test("every finding publishes exact criteria, constants, and four portability ex
       }
       assert.ok(check.evidenceFields.length > 0, `${check.id}: evidence schema`);
       assert.equal(new Set(check.evidenceFields).size, check.evidenceFields.length, `${check.id}: unique evidence fields`);
-      assert.deepEqual(
-        Object.fromEntries(check.criteria.rules.map((rule) => [rule.status, rule.description])),
-        {
-          manual: check.criteria.manual,
-          fail: check.criteria.fail,
-          warn: check.criteria.warn,
-          pass: check.criteria.pass,
-        },
-        `${check.id}: rendered criteria come from runtime rules`,
-      );
+      assert.ok(check.criteria.rules.length > 0, `${check.id}: ordered runtime rules`);
+      assert.equal(check.criteria.rules.at(-1).condition.op, "always", `${check.id}: total fallback`);
+      assert.ok(check.criteria.rules.every((rule) => renderVerdictCondition(rule.condition).length > 0), `${check.id}: portable conditions`);
       assert.deepEqual(
         check.criteria.examples.map((example) => example.kind).sort(),
         ["compliant", "noncompliant", "partial", "unreadable"],
@@ -135,6 +128,29 @@ test("every finding publishes exact criteria, constants, and four portability ex
   }
   assert.equal(AWS_SPEC.checks.find((check) => check.id === "AWS-IAM-03").criteria.constants.minimumLength, AWS_VERDICT_VALUES.minimumPasswordLength);
   assert.equal(WEBEX_SPEC.checks.find((check) => check.id === "WEBEX-MTG-06").criteria.constants.minimumLength, WEBEX_VERDICT_VALUES.minimumMeetingPasswordLength);
+});
+
+test("ordered decision rules cover reachable boundaries and precedence", () => {
+  const cases = [
+    [AWS_SPEC, "AWS-IAM-05", { roles_readable: true, roles_without_boundaries: Array(6).fill("role"), max_privileged_roles: 5 }, "fail"],
+    [AWS_SPEC, "AWS-LOG-01", { trails_readable: true, trails: [] }, "fail"],
+    [AWS_SPEC, "AWS-LOG-04", { detectors_readable: true, enabled_detectors: 0, detectors_unreadable: [] }, "fail"],
+    [AWS_SPEC, "AWS-ORG-02", { scps_readable: true, scp_count: 1, attached_scp_count: 0, scps_targets_unreadable: [] }, "fail"],
+    [AWS_SPEC, "AWS-NET-14", { vpcs: 1, vpcs_without_active_flow_logs: [], vpcs_unverified: [{}] }, "manual"],
+    [AWS_SPEC, "AWS-IAM-05", { roles_readable: false, roles_without_boundaries: Array(6).fill("role"), max_privileged_roles: 5 }, "manual"],
+    [AWS_SPEC, "AWS-IAM-05", { roles_readable: true, roles_without_boundaries: Array(6).fill("role"), max_privileged_roles: 5, role_inventory_truncated: true }, "fail"],
+    [WEBEX_SPEC, "WEBEX-COLLAB-04", { rooms_seen: 1, rooms_without_classification_count: 1, rooms_truncated: true }, "fail"],
+    [WEBEX_SPEC, "WEBEX-COLLAB-05", { webhooks_seen: 1, insecure_webhooks_count: 1, webhooks_truncated: true }, "fail"],
+    [WEBEX_SPEC, "WEBEX-MTG-04", { clusters_seen: 1, connectors_seen: 0, hybrid_lists_truncated: true }, "fail"],
+    [WEBEX_SPEC, "WEBEX-MTG-02", { sites: [{ status: "manual" }, { status: "fail" }], site_coverage_complete: false, token_probe_status: { readable: false } }, "manual"],
+    [AWS_SPEC, "AWS-LOG-02", { trails_readable: true, data_event_trails: ["org-trail"], selectors_unreadable: ["regional-trail"] }, "warn"],
+    [AWS_SPEC, "AWS-NET-14", { vpcs: 1, vpcs_without_active_flow_logs: [{ vpc_id: "vpc-1" }], vpcs_unverified: [], partial: true }, "fail"],
+    [AWS_SPEC, "AWS-LOG-04", { detectors_readable: false, enabled_detectors: 0, detectors_unreadable: [] }, "manual"],
+  ];
+  for (const [spec, id, facts, expected] of cases) {
+    const check = checkContract(spec, id);
+    assert.equal(evaluateVerdictCriteria(check.criteria, facts), expected, `${id}: ${expected}`);
+  }
 });
 
 test("request and pagination metadata matches the concrete pilot clients", () => {
@@ -228,6 +244,14 @@ test("rendered requirements remain language-neutral and preserve mapping table s
     assert.ok(markdown, entry.outputPath);
     assert.doesNotMatch(markdown, /\b(?:TypeScript|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments)\b/);
     assert.doesNotMatch(markdown, /\binterface\s+[A-Z][A-Za-z0-9_]*\s*(?:\{|<)/);
+    assert.match(markdown, /Rules are evaluated from lowest order number to highest\. The first matching condition determines/);
+    for (const check of entry.contract.checks) {
+      check.criteria.rules.forEach((rule, index) => {
+        const prefix = `| \`${check.id}\` | ${index + 1} | ${rule.status} |`;
+        assert.ok(markdown.includes(prefix), `${check.id}: rendered rule ${index + 1}`);
+        assert.ok(markdown.includes(renderVerdictCondition(rule.condition)), `${check.id}: rendered canonical condition ${index + 1}`);
+      });
+    }
 
     const mappingRows = markdown.split("\n").filter((line) => {
       const cells = line.split("|").map((cell) => cell.trim());
