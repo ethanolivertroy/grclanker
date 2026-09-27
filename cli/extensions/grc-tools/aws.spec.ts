@@ -536,11 +536,20 @@ export const AWS_EVIDENCE_FIELDS: Readonly<Record<string, readonly string[]>> = 
 };
 
 export const AWS_DERIVED_FACTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "AWS-IAM-04": {
+    keys_last_used_unreadable_count: "Count every sampled access key whose GetAccessKeyLastUsed read is unavailable, before the evidence list is capped at 25.",
+  },
+  "AWS-IAM-05": {
+    roles_without_boundaries_count: "Count every privileged role without PermissionsBoundary, before the evidence list is capped at 25.",
+  },
   "AWS-IAM-07": {
     undated_root_events: "Count entries returned by LookupEvents whose EventTime is absent or cannot be parsed as a date.",
   },
   "AWS-ORG-06": {
     undated_assessments: "Count ACTIVE assessment records for which both lastUpdated and creationTime are absent or cannot be parsed as dates.",
+  },
+  "AWS-NET-14": {
+    vpcs_unverified_count: "Count every VPC whose flow-log inventory is unreadable or whose matching flow logs have no ACTIVE status and at least one missing FlowLogStatus, before the evidence list is capped at 25.",
   },
 };
 
@@ -587,7 +596,7 @@ export const AWS_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]>>
     awsRule("manual", awsOr(
       awsEq("users_readable", false),
       awsNull("keys_sampled"),
-      awsAnd(awsCompare("gt", awsPath("keys_sampled", 0), awsValue(0)), awsCompare("eq", awsLength("keys_last_used_unreadable"), awsPath("keys_sampled", 0))),
+      awsAnd(awsCompare("gt", awsPath("keys_sampled", 0), awsValue(0)), awsCompare("eq", awsPath("keys_last_used_unreadable_count", 0), awsPath("keys_sampled", 0))),
     )),
     awsRule("fail", awsNonempty("stale_access_keys")),
     awsRule("warn", awsOr(awsEq("user_inventory_truncated", true), awsNonempty("users_keys_unreadable"), awsNonempty("keys_last_used_unreadable"))),
@@ -595,8 +604,8 @@ export const AWS_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]>>
   ],
   "AWS-IAM-05": [
     awsRule("manual", awsEq("roles_readable", false)),
-    awsRule("fail", awsCompare("gt", awsLength("roles_without_boundaries"), awsPath("max_privileged_roles", AWS_DEFAULTS.maxPrivilegedRoles))),
-    awsRule("warn", awsOr(awsNonempty("roles_without_boundaries"), awsEq("role_inventory_truncated", true))),
+    awsRule("fail", awsCompare("gt", awsPath("roles_without_boundaries_count", 0), awsPath("max_privileged_roles", AWS_DEFAULTS.maxPrivilegedRoles))),
+    awsRule("warn", awsOr(awsCompare("gt", awsPath("roles_without_boundaries_count", 0), awsValue(0)), awsEq("role_inventory_truncated", true))),
     awsRule("pass", { op: "always" }),
   ],
   "AWS-IAM-06": [
@@ -736,7 +745,7 @@ export const AWS_VERDICT_RULES: Readonly<Record<string, readonly VerdictRule[]>>
       awsNot(awsDefined("vpcs")),
       awsEq("vpcs", 0),
       awsNull("vpcs_without_active_flow_logs"),
-      awsCompare("eq", awsLength("vpcs_unverified"), awsPath("vpcs", 0)),
+      awsCompare("eq", awsPath("vpcs_unverified_count", 0), awsPath("vpcs", 0)),
     )),
     awsRule("fail", awsNonempty("vpcs_without_active_flow_logs")),
     awsRule("warn", awsOr(awsEq("partial", true), awsNonempty("vpcs_unverified"), awsEq("inventory_truncated", true), awsNonempty("regions_with_vpc_errors"), awsNonempty("regions_with_flow_log_errors"))),

@@ -3184,6 +3184,7 @@ export async function assessAwsIdentity(
         keys_last_used_unreadable: ifRead(userListRead, sample(lastUsedUnreadableKeys)),
         user_inventory_truncated: truncatedFlag(userListRead),
       },
+      { keys_last_used_unreadable_count: lastUsedUnreadableKeys.length },
     ),
     finding(
       "AWS-IAM-05",
@@ -3200,6 +3201,7 @@ export async function assessAwsIdentity(
         max_privileged_roles: maxPrivilegedRoles,
         role_inventory_truncated: truncatedFlag(roleListRead),
       },
+      { roles_without_boundaries_count: rolesWithoutBoundaries.length },
     ),
     finding(
       "AWS-IAM-06",
@@ -4663,6 +4665,7 @@ export async function assessAwsNetworkSecurity(
         regions_with_vpc_errors: vpcRegionErrors.map((result) => result.region),
         regions_with_flow_log_errors: flowLogRegionErrors.map((result) => result.region),
       },
+      { vpcs_unverified_count: vpcsUnverified.length },
     ),
     finding(
       "AWS-NET-20",

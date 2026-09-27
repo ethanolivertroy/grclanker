@@ -501,6 +501,60 @@ test("assessAwsIdentity flags root, MFA, password, key, and boundary issues", as
   assertNoCanaryWindows(assert, result, [RAW_ACCESS_KEY_ID], "the raw access key id never reaches the assessment output");
 });
 
+test("decision facts preserve cardinality beyond 25-item evidence samples", async () => {
+  const base = compliantBundleClient();
+  const accessKeys = Array.from({ length: 30 }, (_, index) => ({
+    AccessKeyId: `AKIA${String(index).padStart(16, "0")}`,
+    CreateDate: "2026-01-01T00:00:00Z",
+  }));
+  const unreadableKeys = await assessAwsIdentity({
+    ...base,
+    async listIamUsers() {
+      return paged([{ UserName: "bulk-user", PasswordLastUsed: "2026-04-15T00:00:00Z" }]);
+    },
+    async listMfaDevices() {
+      return [{ SerialNumber: "mfa-bulk" }];
+    },
+    async listAccessKeys() {
+      return accessKeys;
+    },
+    async getAccessKeyLastUsed() {
+      throw accessDenied();
+    },
+  });
+  const rotation = findingById(unreadableKeys, "AWS-IAM-04");
+  assert.equal(rotation.status, "manual");
+  assert.equal(rotation.evidence.keys_last_used_unreadable.length, 25, "presentation evidence remains capped");
+
+  const roles = Array.from({ length: 31 }, (_, index) => ({
+    RoleName: `AdminRole${index}`,
+    AttachedManagedPolicies: [{ PolicyName: "AdministratorAccess" }],
+  }));
+  const excessiveRoles = await assessAwsIdentity({
+    ...base,
+    async getAccountAuthorizationDetails() {
+      return paged(roles);
+    },
+  }, { maxPrivilegedRoles: 30 });
+  const boundaries = findingById(excessiveRoles, "AWS-IAM-05");
+  assert.equal(boundaries.status, "fail");
+  assert.equal(boundaries.evidence.roles_without_boundaries.length, 25, "presentation evidence remains capped");
+
+  const vpcs = Array.from({ length: 30 }, (_, index) => ({ VpcId: `vpc-${index}`, IsDefault: false }));
+  const flowLogs = vpcs.map((vpc, index) => ({ FlowLogId: `fl-${index}`, ResourceId: vpc.VpcId }));
+  const unverifiedVpcs = await assessAwsNetworkSecurity(compliantNetworkClient({
+    async describeVpcs() {
+      return paged(vpcs);
+    },
+    async describeFlowLogs() {
+      return paged(flowLogs);
+    },
+  }), { regions: ["us-east-1"] });
+  const flowCoverage = findingById(unverifiedVpcs, "AWS-NET-14");
+  assert.equal(flowCoverage.status, "manual");
+  assert.equal(flowCoverage.evidence.vpcs_unverified.length, 25, "presentation evidence remains capped");
+});
+
 test("paginateAwsList stops at the limit, on a repeated token, and on the page budget, reporting each as truncated", async () => {
   const pages = { undefined: { items: [1, 2], nextToken: "t1" }, t1: { items: [3, 4], nextToken: "t2" }, t2: { items: [5] } };
   const complete = await paginateAwsList(10, async (token) => pages[String(token)]);
