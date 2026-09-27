@@ -1900,11 +1900,11 @@ test("scrubErrorText is the one scrub for error strings: unanchored URL queries,
   assert.equal(scrubErrorText("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig expired"), "Bearer [REDACTED] expired");
   assert.equal(scrubErrorText("Set-Cookie: session=s7e8s9; Path=/"), "Set-Cookie: [REDACTED]", "a credential-named header takes its whole value");
   assert.equal(scrubErrorText("cookie session=s7e8s9; Path=/"), "cookie session=[REDACTED]; Path=/");
-  assert.equal(scrubErrorText("JSESSIONID=abc123; sid: 42"), "JSESSIONID=[REDACTED]; sid=[REDACTED]");
-  assert.equal(scrubErrorText("X-Api-Key: k1e2y3 rejected"), "X-Api-Key=[REDACTED] rejected");
-  assert.equal(scrubErrorText('body {"access_token":"tok123","expires_in":3600}'), 'body {"access_token=[REDACTED]","expires_in":3600}');
+  assert.equal(scrubErrorText("JSESSIONID=abc123; sid: 42"), "JSESSIONID=[REDACTED]; sid: [REDACTED]");
+  assert.equal(scrubErrorText("X-Api-Key: k1e2y3 rejected"), "X-Api-Key: [REDACTED] rejected");
+  assert.equal(scrubErrorText('body {"access_token":"tok123","expires_in":3600}'), 'body {"access_token":"[REDACTED]","expires_in":3600}');
   assert.equal(scrubErrorText("client_secret=s3cr3t&grant_type=refresh_token&refresh_token=r7"), "client_secret=[REDACTED]&grant_type=refresh_token&refresh_token=[REDACTED]");
-  assert.equal(scrubErrorText("password: hunter2, pwd=x1, passcode=9, api_key=k, apikey=k2, credential=c, signature=s"), "password=[REDACTED], pwd=[REDACTED], passcode=[REDACTED], api_key=[REDACTED], apikey=[REDACTED], credential=[REDACTED], signature=[REDACTED]");
+  assert.equal(scrubErrorText("password: hunter2, pwd=x1, passcode=9, api_key=k, apikey=k2, credential=c, signature=s"), "password: [REDACTED], pwd=[REDACTED], passcode=[REDACTED], api_key=[REDACTED], apikey=[REDACTED], credential=[REDACTED], signature=[REDACTED]");
   assert.equal(scrubErrorText("Webex request failed (403 Forbidden) for /people: see https://idbroker.webex.com/authorize?token=abc to continue"), "Webex request failed (403 Forbidden) for /people: see https://idbroker.webex.com/authorize to continue");
 
   const plain = [
