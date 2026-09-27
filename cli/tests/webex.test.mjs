@@ -1898,7 +1898,7 @@ test("scrubErrorText is the one scrub for error strings: unanchored URL queries,
   assert.equal(scrubErrorText("Authorization: Bearer abc123def456ghi"), "Authorization: Bearer [REDACTED]");
   assert.equal(scrubErrorText("upstream bearer=FAKE-1234 failed"), "upstream bearer=[REDACTED] failed");
   assert.equal(scrubErrorText("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig expired"), "Bearer [REDACTED] expired");
-  assert.equal(scrubErrorText("Set-Cookie: session=s7e8s9; Path=/"), "Set-Cookie=[REDACTED]; Path=/", "a credential-named header takes its whole value");
+  assert.equal(scrubErrorText("Set-Cookie: session=s7e8s9; Path=/"), "Set-Cookie: [REDACTED]", "a credential-named header takes its whole value");
   assert.equal(scrubErrorText("cookie session=s7e8s9; Path=/"), "cookie session=[REDACTED]; Path=/");
   assert.equal(scrubErrorText("JSESSIONID=abc123; sid: 42"), "JSESSIONID=[REDACTED]; sid=[REDACTED]");
   assert.equal(scrubErrorText("X-Api-Key: k1e2y3 rejected"), "X-Api-Key=[REDACTED] rejected");
