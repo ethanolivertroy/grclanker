@@ -100,6 +100,7 @@ import {
   AWS_DEFAULTS,
   AWS_FINDING_CONTROLS,
   AWS_FRAMEWORKS,
+  AWS_IAM_ACTIONS,
   AWS_REQUIRED_OUTPUT_MEMBERS,
   AWS_REQUIRED_PUBLIC_ACCESS_FLAGS,
   AWS_SPEC,
@@ -110,7 +111,7 @@ import type {
   AwsFrameworkKey,
   AwsOutputMemberKind,
 } from "./aws.spec.js";
-import { defineGrcTool, toolContract } from "./spec-model.js";
+import { checkContract, defineGrcTool, toolContract } from "./spec-model.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 export {
@@ -356,6 +357,8 @@ function finding(
   mappings: string[],
   evidence?: JsonRecord,
 ): AwsFinding {
+  const publishedCheck = checkContract(AWS_SPEC, id);
+  if (!publishedCheck.criteria[status]) throw new Error(`Check ${id} has no ${status} criterion`);
   return { id, title, severity, status, summary, mappings, evidence };
 }
 
@@ -2758,33 +2761,33 @@ export async function checkAwsAccess(client: AwsAccessCheckClient): Promise<AwsA
   const region = config.region;
   const optionalProbes: Array<Promise<AwsAccessSurface>> = [];
   if (client.describeRegions) {
-    optionalProbes.push(surface("ec2_regions", "ec2", "ec2:DescribeRegions", region, () => client.describeRegions!(), arrayObservation));
+    optionalProbes.push(surface("ec2_regions", "ec2", AWS_IAM_ACTIONS["ec2-describe-regions"], region, () => client.describeRegions!(), arrayObservation));
   }
   if (client.listBuckets) {
-    optionalProbes.push(surface("s3_buckets", "s3", "s3:ListBuckets", region, () => client.listBuckets!(1), pagedObservation));
+    optionalProbes.push(surface("s3_buckets", "s3", AWS_IAM_ACTIONS["s3-list-buckets"], region, () => client.listBuckets!(1), pagedObservation));
   }
   if (client.listKmsKeys) {
-    optionalProbes.push(surface("kms_keys", "kms", "kms:ListKeys", region, () => client.listKmsKeys!(region, 1), pagedObservation));
+    optionalProbes.push(surface("kms_keys", "kms", AWS_IAM_ACTIONS["kms-list-keys"], region, () => client.listKmsKeys!(region, 1), pagedObservation));
   }
   if (client.describeDbInstances) {
-    optionalProbes.push(surface("rds_instances", "rds", "rds:DescribeDBInstances", region, () => client.describeDbInstances!(region, 1), pagedObservation));
+    optionalProbes.push(surface("rds_instances", "rds", AWS_IAM_ACTIONS["rds-describe-db-instances"], region, () => client.describeDbInstances!(region, 1), pagedObservation));
   }
   if (client.listActiveAuditManagerAssessments) {
-    optionalProbes.push(surface("audit_manager", "auditmanager", "auditmanager:ListAssessments", region, () => client.listActiveAuditManagerAssessments!(1), pagedObservation));
+    optionalProbes.push(surface("audit_manager", "auditmanager", AWS_IAM_ACTIONS["auditmanager-list-assessments"], region, () => client.listActiveAuditManagerAssessments!(1), pagedObservation));
   }
   if (client.getSecurityAlternateContact) {
-    optionalProbes.push(surface("account_contacts", "account", "account:GetAlternateContact", region, () => client.getSecurityAlternateContact!(), presenceObservation));
+    optionalProbes.push(surface("account_contacts", "account", AWS_IAM_ACTIONS["account-get-alternate-contact"], region, () => client.getSecurityAlternateContact!(), presenceObservation));
   }
   const surfaces = await Promise.all([
-    surface("iam_summary", "iam", "iam:GetAccountSummary", region, () => client.getAccountSummary(), () => ({ count: 1, truncated: null })),
-    surface("iam_users", "iam", "iam:ListUsers", region, () => client.listIamUsers(1), pagedObservation),
-    surface("cloudtrail", "cloudtrail", "cloudtrail:DescribeTrails", region, () => client.describeTrails(), arrayObservation),
-    surface("security_hub", "securityhub", "securityhub:GetEnabledStandards", region, () => client.getEnabledSecurityHubStandards(), pagedObservation),
-    surface("config", "config", "config:DescribeConfigurationRecorders", region, () => client.describeConfigurationRecorders(), arrayObservation),
-    surface("guardduty", "guardduty", "guardduty:ListDetectors", region, () => client.listDetectors(), pagedObservation),
-    surface("access_analyzer", "access-analyzer", "access-analyzer:ListAnalyzers", region, () => client.listAnalyzers(), pagedObservation),
-    surface("organizations", "organizations", "organizations:DescribeOrganization", region, () => client.describeOrganization(), presenceObservation),
-    surface("identity_center", "sso-admin", "sso:ListInstances", region, () => client.listIdentityCenterInstances(), pagedObservation),
+    surface("iam_summary", "iam", AWS_IAM_ACTIONS["iam-get-account-summary"], region, () => client.getAccountSummary(), () => ({ count: 1, truncated: null })),
+    surface("iam_users", "iam", AWS_IAM_ACTIONS["iam-list-users"], region, () => client.listIamUsers(1), pagedObservation),
+    surface("cloudtrail", "cloudtrail", AWS_IAM_ACTIONS["cloudtrail-describe-trails"], region, () => client.describeTrails(), arrayObservation),
+    surface("security_hub", "securityhub", AWS_IAM_ACTIONS["securityhub-get-enabled-standards"], region, () => client.getEnabledSecurityHubStandards(), pagedObservation),
+    surface("config", "config", AWS_IAM_ACTIONS["config-describe-configuration-recorders"], region, () => client.describeConfigurationRecorders(), arrayObservation),
+    surface("guardduty", "guardduty", AWS_IAM_ACTIONS["guardduty-list-detectors"], region, () => client.listDetectors(), pagedObservation),
+    surface("access_analyzer", "access-analyzer", AWS_IAM_ACTIONS["access-analyzer-list-analyzers"], region, () => client.listAnalyzers(), pagedObservation),
+    surface("organizations", "organizations", AWS_IAM_ACTIONS["organizations-describe-organization"], region, () => client.describeOrganization(), presenceObservation),
+    surface("identity_center", "sso-admin", AWS_IAM_ACTIONS["sso-admin-list-instances"], region, () => client.listIdentityCenterInstances(), pagedObservation),
     ...optionalProbes,
   ]);
 

@@ -254,6 +254,10 @@ export const AWS_OPERATIONS: readonly AwsOperationContract[] = [
   operation("kms", "GetKeyRotationStatus", ["KeyRotationEnabled", "RotationPeriodInDays", "NextRotationDate"]),
 ];
 
+export const AWS_IAM_ACTIONS: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(AWS_OPERATIONS.map((entry) => [entry.id, entry.action])),
+);
+
 function docsUrl(entry: AwsOperationContract): string {
   const serviceDocs: Record<string, string> = {
     "access-analyzer": "access-analyzer",

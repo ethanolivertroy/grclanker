@@ -19,7 +19,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { ConfigFileError, parseJsonConfigText, parseYamlConfigText, readConfigText } from "./hardening/index.js";
-import { defineGrcTool, toolContract } from "./spec-model.js";
+import { checkContract, defineGrcTool, toolContract } from "./spec-model.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import {
   WEBEX_CONTROL_FRAMEWORKS,
@@ -28,6 +28,7 @@ import {
   WEBEX_ENDPOINTS,
   WEBEX_FRAMEWORK_LABELS,
   WEBEX_PAGE_MAX,
+  WEBEX_SCOPES,
   WEBEX_SPEC,
   WEBEX_SURFACE_FIELDS,
 } from "./webex.spec.js";
@@ -1011,6 +1012,8 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): WebexFinding {
+  const publishedCheck = checkContract(WEBEX_SPEC, id);
+  if (!publishedCheck.criteria[status]) throw new Error(`Check ${id} has no ${status} criterion`);
   const merged: WebexFrameworkMap = {
     fedramp: [],
     cmmc: [],
@@ -1890,8 +1893,8 @@ export async function assessWebexMeetingHybridSecurity(
     meetings_citation: WEBEX_DOCS.meetingsList,
   };
   const meetingSecondaries: SecondaryInventory[] = [
-    { endpoint: "GET /meetings", scope: "meeting:schedules_read or meeting:admin_schedule_read", result: meetings, consequence: "the sampled per-meeting lobby and password evidence is unavailable" },
-    { endpoint: "GET /meetingPreferences", scope: "meeting:preferences_read or meeting:admin_preferences_read", result: meetingPreferences, consequence: "the Personal Room auto-lock preference is unavailable" },
+    { endpoint: "GET /meetings", scope: WEBEX_SCOPES.meetingScheduleRead, result: meetings, consequence: "the sampled per-meeting lobby and password evidence is unavailable" },
+    { endpoint: "GET /meetingPreferences", scope: WEBEX_SCOPES.meetingPreferencesRead, result: meetingPreferences, consequence: "the Personal Room auto-lock preference is unavailable" },
     tokenProbe,
   ];
   const lobbyFinding = siteFinding("WEBEX-MTG-02", [9], "Meeting lobby and join-before-host defaults", "high", siteSettings, judgeLobbyDefaults, tokenType,

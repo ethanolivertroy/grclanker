@@ -99,6 +99,21 @@ export const WEBEX_PAGE_MAX = {
   webhooks: 100,
 } as const;
 
+export const WEBEX_SCOPES = {
+  peopleRead: "spark-admin:people_read",
+  organizationsRead: "spark-admin:organizations_read",
+  rolesRead: "spark-admin:roles_read",
+  licensesRead: "spark-admin:licenses_read",
+  devicesRead: "spark-admin:devices_read",
+  hybridRead: "spark-admin:hybrid_clusters_read",
+  eventsRead: "spark-compliance:events_read",
+  meetingScheduleRead: "meeting:schedules_read or meeting:admin_schedule_read",
+  meetingAdminScheduleRead: "meeting:admin_schedule_read",
+  meetingRecordingsRead: "meeting:admin_recordings_read",
+  meetingPreferencesRead: "meeting:preferences_read or meeting:admin_preferences_read",
+  meetingAdminPreferencesRead: "meeting:admin_preferences_read",
+} as const;
+
 export const WEBEX_FRAMEWORK_LABELS: Record<WebexFrameworkKey, string> = {
   fedramp: "FedRAMP / NIST 800-53",
   cmmc: "CMMC",
@@ -373,16 +388,16 @@ export const WEBEX_SPEC: IntegrationSpecContract = {
     variants: ["Person token", "Guest token", "Bot token", "Integration token", "Service application token"],
   },
   permissions: [
-    { id: "people-read", kind: "oauth-scope", value: "spark-admin:people_read", unlocks: ["people", "me"] },
-    { id: "organizations-read", kind: "oauth-scope", value: "spark-admin:organizations_read", unlocks: ["organizations", "organization"] },
-    { id: "roles-read", kind: "oauth-scope", value: "spark-admin:roles_read", unlocks: ["roles"] },
-    { id: "licenses-read", kind: "oauth-scope", value: "spark-admin:licenses_read", unlocks: ["licenses"] },
-    { id: "devices-read", kind: "oauth-scope", value: "spark-admin:devices_read", unlocks: ["devices", "workspaces"] },
-    { id: "hybrid-read", kind: "oauth-scope", value: "spark-admin:hybrid_clusters_read", unlocks: ["hybrid-clusters", "hybrid-connectors"] },
-    { id: "events-read", kind: "oauth-scope", value: "spark-compliance:events_read", unlocks: ["events", "admin-audit-events"] },
-    { id: "meetings-read", kind: "oauth-scope", value: "meeting:admin_schedule_read", unlocks: ["meetings"] },
-    { id: "recordings-read", kind: "oauth-scope", value: "meeting:admin_recordings_read", unlocks: ["admin-recordings"] },
-    { id: "preferences-read", kind: "oauth-scope", value: "meeting:admin_preferences_read", unlocks: ["meeting-preferences", "meeting-sites", "meeting-common-settings"] },
+    { id: "people-read", kind: "oauth-scope", value: WEBEX_SCOPES.peopleRead, unlocks: ["people", "me"] },
+    { id: "organizations-read", kind: "oauth-scope", value: WEBEX_SCOPES.organizationsRead, unlocks: ["organizations", "organization"] },
+    { id: "roles-read", kind: "oauth-scope", value: WEBEX_SCOPES.rolesRead, unlocks: ["roles"] },
+    { id: "licenses-read", kind: "oauth-scope", value: WEBEX_SCOPES.licensesRead, unlocks: ["licenses"] },
+    { id: "devices-read", kind: "oauth-scope", value: WEBEX_SCOPES.devicesRead, unlocks: ["devices", "workspaces"] },
+    { id: "hybrid-read", kind: "oauth-scope", value: WEBEX_SCOPES.hybridRead, unlocks: ["hybrid-clusters", "hybrid-connectors"] },
+    { id: "events-read", kind: "oauth-scope", value: WEBEX_SCOPES.eventsRead, unlocks: ["events", "admin-audit-events"] },
+    { id: "meetings-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingAdminScheduleRead, unlocks: ["meetings"] },
+    { id: "recordings-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingRecordingsRead, unlocks: ["admin-recordings"] },
+    { id: "preferences-read", kind: "oauth-scope", value: WEBEX_SCOPES.meetingAdminPreferencesRead, unlocks: ["meeting-preferences", "meeting-sites", "meeting-common-settings"] },
     { id: "pro-pack", kind: "plan", value: "Webex Pro Pack", unlocks: ["events", "admin-audit-events"], notes: "Some compliance and longer-retention evidence depends on the tenant plan." },
   ],
   pagination: [

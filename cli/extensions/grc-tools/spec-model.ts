@@ -182,3 +182,9 @@ export function toolContract(spec: IntegrationSpecContract, toolName: string): T
   if (!contract) throw new Error(`No integration contract exists for tool ${toolName}`);
   return contract;
 }
+
+export function checkContract(spec: IntegrationSpecContract, checkId: string): CheckContract {
+  const contract = spec.checks.find((check) => check.id === checkId);
+  if (!contract) throw new Error(`No integration contract exists for check ${checkId}`);
+  return contract;
+}
