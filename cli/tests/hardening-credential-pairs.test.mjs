@@ -785,10 +785,17 @@ test("shared URL scrub handles raw delimiters in userinfo passwords and token-sh
 
   const tokenHost = "Kq7Zx2Vw9Lm4Tp8RwQ12";
   for (const scrub of [scrubErrorText, scrubDataText, redactSecretValues]) {
-    const output = scrub(`request to https://${tokenHost}?x@h/p failed`);
-    assert.equal(output, `request to https://${REDACTED}?${REDACTED} failed`);
-    assert.equal(scrub(output), output);
-    assert.equal(leakedCanaryWindow(typeof output === "string" ? output : JSON.stringify(output), tokenHost), undefined);
+    for (const [input, expected] of [
+      [`request to https://${tokenHost}?x@h/p failed`, `request to https://${REDACTED}?${REDACTED} failed`],
+      [`request to https://${tokenHost}:8443/path failed`, `request to https://${REDACTED}:8443/path failed`],
+      [`request to https://${tokenHost}:8443?x@api.example.com/path failed`, `request to https://${REDACTED}:8443?${REDACTED} failed`],
+      [`request to https:\\/\\/${tokenHost}:8443\\/path failed`, `request to https:\\/\\/${REDACTED}:8443\\/path failed`],
+    ]) {
+      const output = scrub(input);
+      assert.equal(output, expected);
+      assert.equal(scrub(output), output);
+      assert.equal(leakedCanaryWindow(typeof output === "string" ? output : JSON.stringify(output), tokenHost), undefined);
+    }
   }
 });
 
@@ -799,6 +806,9 @@ test("a semicolon inside a bare credential pair value is removed with the value"
     [`api_key=${token};tail`, `api_key=${REDACTED}`],
     [`request failed with token=${token};retry-value upstream`, `request failed with token=${REDACTED} upstream`],
     [`password=hunter2; Content-Type: application/json`, `password=${REDACTED}; Content-Type: application/json`],
+    [`command password=hunter2; echo ok`, `command password=${REDACTED}; echo ok`],
+    [`password=hunter2;`, `password=${REDACTED};`],
+    [`password=hunter2;)`, `password=${REDACTED};)`],
   ];
   for (const [input, expected] of rows) {
     for (const scrub of [scrubErrorText, scrubDataText, redactSecretValues]) {

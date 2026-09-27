@@ -591,6 +591,10 @@ function credentialPairCells(options, canaries) {
     planted: [semicolonHead, semicolonTail],
     mustKeep: ["password", "before closing"],
   }));
+  cells.push(cell("semicolon delimiting a bare prose pair value", `command password=${semicolonHead}; echo ok`, {
+    planted: [semicolonHead],
+    mustKeep: ["password", "; echo ok"],
+  }));
   cells.push(cell("semicolon inside a URL query value", `GET /v1/users?token=${semicolonHead};${semicolonTail} failed`, {
     planted: [semicolonHead, semicolonTail],
     mustKeep: ["GET /v1/users?token=", " failed"],
@@ -663,6 +667,18 @@ function schemeWordOrderCells(options, canaries) {
         cells.push(cell(`scheme-word order ${key} / ${scheme} / ${formName}`, form(key, scheme), { mustRemove: remove(scheme), mustKeep: [key] }));
       }
       cells.push(cell(`scheme-word order ${key} / ${scheme} / NAME=<scheme> <word>`, `${key}=${scheme} ${continuation}`, { mustRemove: [`=${scheme}`], mustKeep: [key] }));
+    }
+  }
+  const authorityToken = tokenAt(canaries, 8);
+  for (const [label, url] of [
+    ["token-shaped URL authority with a port", `https://${authorityToken}:8443/v1/items`],
+    ["slash-escaped token-shaped URL authority with a port", `https:\\/\\/${authorityToken}:8443\\/v1\\/items`],
+  ]) {
+    for (const [contextName, context, contextKeep] of urlContexts) {
+      cells.push(cell(`${label} / ${contextName}`, context(url), {
+        planted: [authorityToken],
+        mustKeep: [":8443", ...contextKeep],
+      }));
     }
   }
   return cells;

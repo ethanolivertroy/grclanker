@@ -624,6 +624,17 @@ function scrubConfiguredSecrets(text: string, secrets: ScrubErrorTextOptions["se
   return scrubSensitiveValues(text, values).split(REDACTED_VALUE).join(REDACTED);
 }
 
+function splitAuthorityPort(authority: string): { host: string; port: string } {
+  if (authority.startsWith("[")) {
+    const close = authority.indexOf("]");
+    if (close < 0) return { host: authority, port: "" };
+    const port = authority.slice(close + 1);
+    return /^:\d+$/.test(port) ? { host: authority.slice(0, close + 1), port } : { host: authority, port: "" };
+  }
+  const port = /:\d+$/.exec(authority)?.[0] ?? "";
+  return { host: port ? authority.slice(0, -port.length) : authority, port };
+}
+
 function scrubEmbeddedUrl(match: string): string {
   const trailing = TRAILING_PUNCTUATION_PATTERN.exec(match)?.[0] ?? "";
   const url = match.slice(0, match.length - trailing.length);
@@ -637,8 +648,9 @@ function scrubEmbeddedUrl(match: string): string {
     return `${scheme}${tail.slice(at + 1)}`.replace(EMBEDDED_URL_PATTERN, scrubEmbeddedUrl) + trailing;
   }
   const authority = pathStart === -1 ? hostAndPath : hostAndPath.slice(0, pathStart);
-  const scrubbedHostAndPath = !authority.startsWith("[") && !/:\d*$/.test(authority) && !authority.includes(".") && looksLikeToken(authority)
-    ? `${REDACTED}${pathStart === -1 ? "" : hostAndPath.slice(pathStart)}`
+  const { host, port } = splitAuthorityPort(authority);
+  const scrubbedHostAndPath = !host.startsWith("[") && !host.includes(".") && looksLikeToken(host)
+    ? `${REDACTED}${port}${pathStart === -1 ? "" : hostAndPath.slice(pathStart)}`
     : hostAndPath;
   return `${scheme}${scrubbedHostAndPath}${query ? `?${REDACTED}` : ""}${fragment ? `#${REDACTED}` : ""}${trailing}`;
 }
@@ -819,6 +831,7 @@ function readBareValue(text: string, index: number, barePattern: RegExp): string
   if (bare === null) return null;
   let value = bare;
   if (barePattern === PAIR_BARE_VALUE_PATTERN) {
+    if (value.endsWith(";")) value = value.slice(0, -1);
     for (let semicolon = value.indexOf(";"); semicolon >= 0; semicolon = value.indexOf(";", semicolon + 1)) {
       if (stickyExec(FOLLOWING_HEADER_PATTERN, text, index + semicolon) !== null) {
         value = value.slice(0, semicolon);
