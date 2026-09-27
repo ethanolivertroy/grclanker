@@ -121,7 +121,7 @@ const PEM_OPEN_PATTERN = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*$/;
 // solidus `\/`: a JSON encoder may write every "/" of a URL as `\/`, so
 // `https:\/\/svc:<value>@api.example.com\/v1\/items` is the same URL and loses its userinfo, query, and
 // fragment the same way, its escaped separators kept as written.
-const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
+const EMBEDDED_URL_PATTERN = /\b[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)(?:\[REDACTED\]|\[[0-9A-Fa-f:.]+\]|\\\/|[^\s"'<>()[\]{}\\])+/gi;
 const URL_PARTS_PATTERN = /^([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:[^\s\/?#@"'<>\\]+@)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
 const HOST_AND_PORT_PATTERN = /^(?:\[[^\]\s]*\]|[^:\[\]@\\]+)(?::\d*)?$/;
