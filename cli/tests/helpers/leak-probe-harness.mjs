@@ -669,18 +669,6 @@ function schemeWordOrderCells(options, canaries) {
       cells.push(cell(`scheme-word order ${key} / ${scheme} / NAME=<scheme> <word>`, `${key}=${scheme} ${continuation}`, { mustRemove: [`=${scheme}`], mustKeep: [key] }));
     }
   }
-  const authorityToken = tokenAt(canaries, 8);
-  for (const [label, url] of [
-    ["token-shaped URL authority with a port", `https://${authorityToken}:8443/v1/items`],
-    ["slash-escaped token-shaped URL authority with a port", `https:\\/\\/${authorityToken}:8443\\/v1\\/items`],
-  ]) {
-    for (const [contextName, context, contextKeep] of urlContexts) {
-      cells.push(cell(`${label} / ${contextName}`, context(url), {
-        planted: [authorityToken],
-        mustKeep: [":8443", ...contextKeep],
-      }));
-    }
-  }
   return cells;
 }
 
@@ -774,6 +762,18 @@ function escapeBoundaryCells(options, canaries) {
       for (const [contextName, context, contextKeep] of urlContexts) {
         cells.push(cell(`${urlName} / ${valueName} / ${contextName}`, context(url), { planted: [value], mustKeep: [...keep, ...contextKeep] }));
       }
+    }
+  }
+  const authorityToken = tokenAt(canaries, 8);
+  for (const [label, url] of [
+    ["token-shaped URL authority with a port", `https://${authorityToken}:8443/v1/items`],
+    ["slash-escaped token-shaped URL authority with a port", `https:\\/\\/${authorityToken}:8443\\/v1\\/items`],
+  ]) {
+    for (const [contextName, context, contextKeep] of urlContexts) {
+      cells.push(cell(`${label} / ${contextName}`, context(url), {
+        planted: [authorityToken],
+        mustKeep: [":8443", ...contextKeep],
+      }));
     }
   }
   return cells;
