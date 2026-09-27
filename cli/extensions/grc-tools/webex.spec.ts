@@ -426,7 +426,9 @@ export const WEBEX_VERDICT_EVALUATORS: Readonly<Record<string, WebexVerdictEvalu
   "WEBEX-ID-02": alwaysManual,
   "WEBEX-ID-03": (facts) => {
     const count = numberFact(facts, "compliance_officer_count");
-    if (count === undefined) return "manual";
+    if (count === undefined) {
+      return (numberFact(facts, "people_seen") ?? 0) > 0 && Array.isArray(facts.roles_seen) ? "fail" : "manual";
+    }
     if (count === 0) return "fail";
     return facts.people_truncated === true ? "warn" : "pass";
   },
@@ -442,7 +444,7 @@ export const WEBEX_VERDICT_EVALUATORS: Readonly<Record<string, WebexVerdictEvalu
   },
   "WEBEX-ID-06": alwaysManual,
   "WEBEX-ID-07": (facts) => {
-    if (numberFact(facts, "guest_count_people") === undefined) return "manual";
+    if (numberFact(facts, "guest_count_people") === undefined || numberFact(facts, "people_seen") === 0) return "manual";
     return facts.people_truncated === true || statusReadable(facts, "guest_count_api_status") === false ? "warn" : "pass";
   },
   "WEBEX-COLLAB-01": alwaysManual,
@@ -508,14 +510,14 @@ export const WEBEX_CHECKS: readonly CheckContract[] = [
   check("WEBEX-ID-01", [1], "SSO enforcement", "critical", IDENTITY_TOOL, ["organization"], ALWAYS_MANUAL("Export Control Hub Organization Settings > Authentication showing SSO enabled; the Organizations read exposes only id, displayName, and created.")),
   check("WEBEX-ID-02", [2], "Admin MFA enforcement", "critical", IDENTITY_TOOL, ["people", "roles"], ALWAYS_MANUAL("Export Control Hub Organization Settings > Authentication and the administrator list with MFA status for every administrator; the only documented mfaEnabled shape is on a write request and People has no MFA field.")),
   check("WEBEX-ID-03", [3], "Compliance Officer assignment", "high", IDENTITY_TOOL, ["people", "roles"], criteria(
-    "People and roles are readable, the people population is nonempty and complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively.",
+    "People and roles are readable, the people population is nonempty, the people listing is complete, and at least one human has a role whose name contains 'Compliance Officer' case-insensitively. Role-list truncation does not demote this runtime finding.",
     "At least one Compliance Officer is visible, but the people listing is truncated.",
     "People and roles are readable and the nonempty people population contains no Compliance Officer.",
     "People or roles is unreadable, or GET /people returns zero people; export the Control Hub Users list filtered to Compliance Officer.",
     { roleNameContains: WEBEX_VERDICT_VALUES.complianceOfficerRolePattern },
   )),
   check("WEBEX-ID-04", [25], "Administrative privilege concentration", "medium", IDENTITY_TOOL, ["people", "roles"], criteria(
-    "People and roles are readable and complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins.",
+    "People and roles are readable, the people listing is complete, at least one human has a role containing 'Administrator', and the administrator count is at most max_admins. Role-list truncation does not demote this runtime finding.",
     "No administrator is visible, the people list is truncated, or administrator count exceeds max_admins; max_admins defaults to 10.",
     "No fail verdict is emitted; concentration above the threshold requires review rather than proving noncompliance.",
     "People or roles is unreadable, or GET /people returns zero people; export the Control Hub administrator list.",

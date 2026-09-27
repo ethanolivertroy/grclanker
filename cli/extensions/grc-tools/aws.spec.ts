@@ -570,7 +570,10 @@ export const AWS_VERDICT_EVALUATORS: Readonly<Record<string, AwsVerdictEvaluator
     return strong ? "pass" : "fail";
   },
   "AWS-IAM-04": (facts) => {
-    if (facts.users_readable !== true || facts.keys_judged === null) return "manual";
+    if (facts.users_readable !== true) return "manual";
+    const sampled = awsNumber(facts, "keys_sampled");
+    const lastUsedUnreadable = awsArray(facts, "keys_last_used_unreadable")?.length ?? 0;
+    if (facts.keys_sampled === null || (sampled !== undefined && sampled > 0 && lastUsedUnreadable === sampled)) return "manual";
     if (nonempty(facts, "stale_access_keys")) return "fail";
     return facts.user_inventory_truncated === true || nonempty(facts, "users_keys_unreadable") || nonempty(facts, "keys_last_used_unreadable") ? "warn" : "pass";
   },

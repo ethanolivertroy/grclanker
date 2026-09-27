@@ -1013,9 +1013,10 @@ function finding(
   status: WebexFindingStatus,
   summary: string,
   evidence?: JsonRecord,
+  decisionFacts?: JsonRecord,
 ): WebexFinding {
   const publishedCheck = checkContract(WEBEX_SPEC, id);
-  const evaluatedStatus = evaluateVerdictCriteria(publishedCheck.criteria, evidence ?? {});
+  const evaluatedStatus = evaluateVerdictCriteria(publishedCheck.criteria, { ...(evidence ?? {}), ...(decisionFacts ?? {}) });
   if (evaluatedStatus !== status) {
     throw new Error(`Check ${id} runtime status ${status} disagrees with metadata status ${evaluatedStatus}`);
   }
@@ -1934,7 +1935,8 @@ export async function assessWebexMeetingHybridSecurity(
     hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high",
       hybridClusters.truncated || hybridConnectors.truncated ? "warn" : "pass",
       `All ${connectorItems.length} hybrid connectors across ${clusterItems.length} clusters report status = operational.${partialNote(hybridConnectors, "connectors")}`,
-      { clusters_seen: clusterItems.length, connectors_seen: connectorItems.length, connector_versions: [...new Set(connectorItems.map((item) => asString(item.version)).filter(Boolean))], undated_connectors: undatedConnectors.length });
+      { clusters_seen: clusterItems.length, connectors_seen: connectorItems.length, connector_versions: [...new Set(connectorItems.map((item) => asString(item.version)).filter(Boolean))], undated_connectors: undatedConnectors.length },
+      { hybrid_lists_truncated: hybridClusters.truncated || hybridConnectors.truncated });
   } else if (connectorItems.length === 0) {
     hybridFinding = finding("WEBEX-MTG-04", [15, 16], "Hybrid cluster and connector health", "high", "fail",
       `${clusterItems.length} hybrid clusters are registered but no connectors report status, so nothing demonstrates the clusters are healthy.`,
