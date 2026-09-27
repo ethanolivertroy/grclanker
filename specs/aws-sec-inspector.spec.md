@@ -12,7 +12,7 @@ implementation_kind: "security-inspector"
 ---
 
 <!-- generated integration spec -->
-> Generated from `cli/extensions/grc-tools/aws.spec.ts` and registered tool definitions by `npm --prefix cli run sync:integration-specs`. Edit the metadata or narrative source, not this file.
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
 # AWS Security Inspector
 
@@ -42,19 +42,19 @@ Keep service calls behind a read-only client boundary and attach the service act
 
 ## Shared integration contract
 
-This specification requires [shared integration contract version 1.0](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
 ## Tools
 
-| Tool | Purpose | Finding IDs |
-|---|---|---|
-| `aws_check_access` | Validate read-only AWS audit access across IAM, CloudTrail, Security Hub, Config, GuardDuty, Access Analyzer, Organizations, Identity Center, EC2, S3, KMS, RDS, Audit Manager, and Account surfaces. | None |
-| `aws_assess_identity` | Assess AWS IAM hygiene, including root-account protection, IAM user MFA, password policy, access key rotation, dormant users, and privileged roles without permission boundaries. | `AWS-IAM-01`, `AWS-IAM-02`, `AWS-IAM-03`, `AWS-IAM-04`, `AWS-IAM-05`, `AWS-IAM-06`, `AWS-IAM-07`, `AWS-IAM-08` |
-| `aws_assess_logging_detection` | Assess AWS CloudTrail, Security Hub, GuardDuty, and Config posture, including multi-region trail coverage, log validation, data events, standards enablement, and active recording. | `AWS-LOG-01`, `AWS-LOG-02`, `AWS-LOG-03`, `AWS-LOG-04`, `AWS-LOG-05` |
-| `aws_assess_org_guardrails` | Assess AWS Organizations visibility, service control policies, Access Analyzer coverage, active external-access findings, and IAM Identity Center visibility. | `AWS-ORG-01`, `AWS-ORG-02`, `AWS-ORG-03`, `AWS-ORG-04`, `AWS-ORG-05`, `AWS-ORG-06`, `AWS-ORG-07` |
-| `aws_assess_data_protection` | Assess AWS data protection posture: account and bucket S3 Block Public Access, EBS default encryption per region, S3 default encryption, RDS storage encryption, TLS-only bucket policies (aws:SecureTransport), and customer-managed KMS key rotation. | `AWS-DATA-11`, `AWS-DATA-12`, `AWS-DATA-13`, `AWS-DATA-22` |
-| `aws_assess_network_security` | Assess AWS network security posture per region: VPC Flow Logs coverage (DescribeFlowLogs versus DescribeVpcs), network ACL inbound rules open to 0.0.0.0/0 or ::/0 on sensitive ports, and security group inbound rules open to the world on sensitive ports. | `AWS-NET-14`, `AWS-NET-20`, `AWS-NET-21` |
-| `aws_export_audit_bundle` | Export an AWS audit package with the access check, identity, logging and detection, organization guardrail, data protection, and network security findings, an executive summary, a unified compliance matrix, per-framework reports, JSON analysis, an error log when collection was partial, and a zip archive named after the bundle directory. | `AWS-IAM-01`, `AWS-IAM-02`, `AWS-IAM-03`, `AWS-IAM-04`, `AWS-IAM-05`, `AWS-IAM-06`, `AWS-IAM-07`, `AWS-IAM-08`, `AWS-LOG-01`, `AWS-LOG-02`, `AWS-LOG-03`, `AWS-LOG-04`, `AWS-LOG-05`, `AWS-ORG-01`, `AWS-ORG-02`, `AWS-ORG-03`, `AWS-ORG-04`, `AWS-ORG-05`, `AWS-ORG-06`, `AWS-ORG-07`, `AWS-DATA-11`, `AWS-DATA-12`, `AWS-DATA-13`, `AWS-DATA-22`, `AWS-NET-14`, `AWS-NET-20`, `AWS-NET-21` |
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `aws_check_access` | Validate read-only AWS audit access across IAM, CloudTrail, Security Hub, Config, GuardDuty, Access Analyzer, Organizations, Identity Center, EC2, S3, KMS, RDS, Audit Manager, and Account surfaces. | None | Text table plus structured fields {tool, status, accountId?, arn?, surfaces, notes, recommendedNextStep}. |
+| `aws_assess_identity` | Assess AWS IAM hygiene, including root-account protection, IAM user MFA, password policy, access key rotation, dormant users, and privileged roles without permission boundaries. | `AWS-IAM-01`, `AWS-IAM-02`, `AWS-IAM-03`, `AWS-IAM-04`, `AWS-IAM-05`, `AWS-IAM-06`, `AWS-IAM-07`, `AWS-IAM-08` | Text summary/table plus structured fields {tool, title, summary, findings, errors?}. |
+| `aws_assess_logging_detection` | Assess AWS CloudTrail, Security Hub, GuardDuty, and Config posture, including multi-region trail coverage, log validation, data events, standards enablement, and active recording. | `AWS-LOG-01`, `AWS-LOG-02`, `AWS-LOG-03`, `AWS-LOG-04`, `AWS-LOG-05` | Text summary/table plus structured fields {tool, title, summary, findings, errors?}. |
+| `aws_assess_org_guardrails` | Assess AWS Organizations visibility, service control policies, Access Analyzer coverage, active external-access findings, and IAM Identity Center visibility. | `AWS-ORG-01`, `AWS-ORG-02`, `AWS-ORG-03`, `AWS-ORG-04`, `AWS-ORG-05`, `AWS-ORG-06`, `AWS-ORG-07` | Text summary/table plus structured fields {tool, title, summary, findings, errors?}. |
+| `aws_assess_data_protection` | Assess AWS data protection posture: account and bucket S3 Block Public Access, EBS default encryption per region, S3 default encryption, RDS storage encryption, TLS-only bucket policies (aws:SecureTransport), and customer-managed KMS key rotation. | `AWS-DATA-11`, `AWS-DATA-12`, `AWS-DATA-13`, `AWS-DATA-22` | Text summary/table plus structured fields {tool, title, summary, findings, errors?}. |
+| `aws_assess_network_security` | Assess AWS network security posture per region: VPC Flow Logs coverage (DescribeFlowLogs versus DescribeVpcs), network ACL inbound rules open to 0.0.0.0/0 or ::/0 on sensitive ports, and security group inbound rules open to the world on sensitive ports. | `AWS-NET-14`, `AWS-NET-20`, `AWS-NET-21` | Text summary/table plus structured fields {tool, title, summary, findings, errors?}. |
+| `aws_export_audit_bundle` | Export an AWS audit package with the access check, identity, logging and detection, organization guardrail, data protection, and network security findings, an executive summary, a unified compliance matrix, per-framework reports, JSON analysis, an error log when collection was partial, and a zip archive named after the bundle directory. | `AWS-IAM-01`, `AWS-IAM-02`, `AWS-IAM-03`, `AWS-IAM-04`, `AWS-IAM-05`, `AWS-IAM-06`, `AWS-IAM-07`, `AWS-IAM-08`, `AWS-LOG-01`, `AWS-LOG-02`, `AWS-LOG-03`, `AWS-LOG-04`, `AWS-LOG-05`, `AWS-ORG-01`, `AWS-ORG-02`, `AWS-ORG-03`, `AWS-ORG-04`, `AWS-ORG-05`, `AWS-ORG-06`, `AWS-ORG-07`, `AWS-DATA-11`, `AWS-DATA-12`, `AWS-DATA-13`, `AWS-DATA-22`, `AWS-NET-14`, `AWS-NET-20`, `AWS-NET-21` | Text export receipt plus structured fields {tool, output_dir, zip_path, finding_count, file_count, error_count}. |
 
 ### Parameters
 
@@ -161,11 +161,15 @@ Credential precedence, highest first:
 4. Container credentials
 5. Instance role credentials
 
-Environment variables: `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`
+Environment variables: `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ACCOUNT_ID`
 
 Configuration locations: ~/.aws/credentials, ~/.aws/config
 
 Credential and deployment variants: Long-lived access keys, Temporary session credentials, Identity Center cached session, Container role, Instance role
+
+Configuration fields: `region`, `profile`, `account_id`
+
+Malformed configuration: Credential-provider errors are replaced with a fixed provider name and sanitized code/status; raw provider and shared-file parser messages are never emitted.
 
 ## Permissions
 
@@ -219,62 +223,270 @@ Credential and deployment variants: Long-lived access keys, Temporary session cr
 
 ## API surfaces
 
-| ID | Interface | Read operation | Service | Intent | Fields consumed | Reference |
-|---|---|---|---|---|---|---|
-| `sts-get-caller-identity` | service operation | `GetCallerIdentity` | sts | auth-only | `Account`, `Arn`, `UserId` | [Official documentation](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html) |
-| `iam-get-account-summary` | service operation | `GetAccountSummary` | iam | read | `SummaryMap` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountSummary.html) |
-| `iam-get-account-password-policy` | service operation | `GetAccountPasswordPolicy` | iam | read | `PasswordPolicy` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountPasswordPolicy.html) |
-| `iam-list-users` | service operation | `ListUsers` | iam | read | `Users.UserName`, `Users.Arn`, `Users.CreateDate`, `Users.PasswordLastUsed` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListUsers.html) |
-| `iam-list-mfa-devices` | service operation | `ListMFADevices` | iam | read | `MFADevices.SerialNumber`, `MFADevices.EnableDate` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListMFADevices.html) |
-| `iam-list-access-keys` | service operation | `ListAccessKeys` | iam | read | `AccessKeyMetadata.UserName`, `AccessKeyMetadata.AccessKeyId`, `AccessKeyMetadata.Status`, `AccessKeyMetadata.CreateDate` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListAccessKeys.html) |
-| `iam-get-access-key-last-used` | service operation | `GetAccessKeyLastUsed` | iam | read | `AccessKeyLastUsed.LastUsedDate`, `AccessKeyLastUsed.ServiceName`, `AccessKeyLastUsed.Region` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccessKeyLastUsed.html) |
-| `iam-get-account-authorization-details` | service operation | `GetAccountAuthorizationDetails` | iam | read | `RoleDetailList`, `UserDetailList`, `GroupDetailList`, `Policies` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountAuthorizationDetails.html) |
-| `iam-list-policies` | service operation | `ListPolicies` | iam | read | `Policies.PolicyName`, `Policies.Arn`, `Policies.DefaultVersionId`, `Policies.AttachmentCount`, `Policies.PermissionsBoundaryUsageCount` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListPolicies.html) |
-| `iam-get-policy-version` | service operation | `GetPolicyVersion` | iam | read | `PolicyVersion.Document` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetPolicyVersion.html) |
-| `cloudtrail-lookup-events` | service operation | `LookupEvents` | cloudtrail | read | `Events.EventId`, `Events.EventName`, `Events.EventSource`, `Events.EventTime`, `Events.Username`, `Events.ReadOnly` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_LookupEvents.html) |
-| `cloudtrail-describe-trails` | service operation | `DescribeTrails` | cloudtrail | read | `trailList.Name`, `trailList.TrailARN`, `trailList.IsMultiRegionTrail`, `trailList.LogFileValidationEnabled` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_DescribeTrails.html) |
-| `cloudtrail-get-trail-status` | service operation | `GetTrailStatus` | cloudtrail | read | `IsLogging` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetTrailStatus.html) |
-| `cloudtrail-get-event-selectors` | service operation | `GetEventSelectors` | cloudtrail | read | `EventSelectors`, `AdvancedEventSelectors` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetEventSelectors.html) |
-| `securityhub-describe-hub` | service operation | `DescribeHub` | securityhub | read | `HubArn` | [Official documentation](https://docs.aws.amazon.com/securityhub/latest/APIReference/API_DescribeHub.html) |
-| `securityhub-get-enabled-standards` | service operation | `GetEnabledStandards` | securityhub | read | `StandardsSubscriptions` | [Official documentation](https://docs.aws.amazon.com/securityhub/latest/APIReference/API_GetEnabledStandards.html) |
-| `config-describe-configuration-recorders` | service operation | `DescribeConfigurationRecorders` | config | read | `ConfigurationRecorders` | [Official documentation](https://docs.aws.amazon.com/config/latest/APIReference/API_DescribeConfigurationRecorders.html) |
-| `config-describe-configuration-recorder-status` | service operation | `DescribeConfigurationRecorderStatus` | config | read | `ConfigurationRecordersStatus` | [Official documentation](https://docs.aws.amazon.com/config/latest/APIReference/API_DescribeConfigurationRecorderStatus.html) |
-| `guardduty-list-detectors` | service operation | `ListDetectors` | guardduty | read | `DetectorIds` | [Official documentation](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_ListDetectors.html) |
-| `guardduty-get-detector` | service operation | `GetDetector` | guardduty | read | `Status`, `ServiceRole` | [Official documentation](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_GetDetector.html) |
-| `organizations-describe-organization` | service operation | `DescribeOrganization` | organizations | read | `Organization.Id`, `Organization.Arn`, `Organization.FeatureSet` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_DescribeOrganization.html) |
-| `organizations-list-accounts` | service operation | `ListAccounts` | organizations | read | `Accounts.Id`, `Accounts.Name`, `Accounts.Email`, `Accounts.Status` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListAccounts.html) |
-| `organizations-list-policies` | service operation | `ListPolicies` | organizations | read | `Policies.Id`, `Policies.Name`, `Policies.Arn`, `Policies.Type`, `Policies.AwsManaged` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListPolicies.html) |
-| `organizations-list-targets-for-policy` | service operation | `ListTargetsForPolicy` | organizations | read | `Targets.TargetId`, `Targets.Name`, `Targets.Type` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListTargetsForPolicy.html) |
-| `access-analyzer-list-analyzers` | service operation | `ListAnalyzers` | access-analyzer | read | `analyzers.arn`, `analyzers.name`, `analyzers.status`, `analyzers.type` | [Official documentation](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/API_ListAnalyzers.html) |
-| `access-analyzer-list-findings` | service operation | `ListFindings` | access-analyzer | read | `findings.id`, `findings.resource`, `findings.resourceType`, `findings.status`, `findings.createdAt`, `findings.updatedAt` | [Official documentation](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/API_ListFindings.html) |
-| `sso-admin-list-instances` | service operation | `ListInstances` | sso-admin | read | `Instances.InstanceArn`, `Instances.IdentityStoreId`, `Instances.Name`, `Instances.Status` | [Official documentation](https://docs.aws.amazon.com/singlesignon/latest/APIReference/API_ListInstances.html) |
-| `auditmanager-list-assessments` | service operation | `ListAssessments` | auditmanager | read | `assessmentMetadata.id`, `assessmentMetadata.name`, `assessmentMetadata.status` | [Official documentation](https://docs.aws.amazon.com/auditmanager/latest/APIReference/API_ListAssessments.html) |
-| `account-get-alternate-contact` | service operation | `GetAlternateContact` | account | read | `AlternateContact.Name`, `AlternateContact.Title`, `AlternateContact.EmailAddress`, `AlternateContact.PhoneNumber` | [Official documentation](https://docs.aws.amazon.com/accounts/latest/APIReference/API_GetAlternateContact.html) |
-| `ec2-describe-regions` | service operation | `DescribeRegions` | ec2 | read | `Regions.RegionName`, `Regions.OptInStatus` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html) |
-| `s3-get-account-public-access-block` | service operation | `GetAccountPublicAccessBlock` | s3 | read | `PublicAccessBlockConfiguration` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetAccountPublicAccessBlock.html) |
-| `s3-list-buckets` | service operation | `ListBuckets` | s3 | read | `Buckets.Name`, `Buckets.CreationDate`, `ContinuationToken` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_ListBuckets.html) |
-| `s3-get-public-access-block` | service operation | `GetPublicAccessBlock` | s3 | read | `PublicAccessBlockConfiguration` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetPublicAccessBlock.html) |
-| `s3-get-bucket-policy-status` | service operation | `GetBucketPolicyStatus` | s3 | read | `PolicyStatus.IsPublic` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetBucketPolicyStatus.html) |
-| `s3-get-bucket-encryption` | service operation | `GetBucketEncryption` | s3 | read | `ServerSideEncryptionConfiguration.Rules` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetBucketEncryption.html) |
-| `s3-get-bucket-policy` | service operation | `GetBucketPolicy` | s3 | read | `Policy` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetBucketPolicy.html) |
-| `ec2-get-ebs-encryption-by-default` | service operation | `GetEbsEncryptionByDefault` | ec2 | read | `EbsEncryptionByDefault`, `SseType` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_GetEbsEncryptionByDefault.html) |
-| `ec2-describe-vpcs` | service operation | `DescribeVpcs` | ec2 | read | `Vpcs.VpcId`, `Vpcs.IsDefault`, `Vpcs.CidrBlock`, `Vpcs.State` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeVpcs.html) |
-| `ec2-describe-flow-logs` | service operation | `DescribeFlowLogs` | ec2 | read | `FlowLogs.FlowLogId`, `FlowLogs.ResourceId`, `FlowLogs.FlowLogStatus` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeFlowLogs.html) |
-| `ec2-describe-network-acls` | service operation | `DescribeNetworkAcls` | ec2 | read | `NetworkAcls.NetworkAclId`, `NetworkAcls.VpcId`, `NetworkAcls.Entries` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeNetworkAcls.html) |
-| `ec2-describe-security-groups` | service operation | `DescribeSecurityGroups` | ec2 | read | `SecurityGroups.GroupId`, `SecurityGroups.GroupName`, `SecurityGroups.VpcId`, `SecurityGroups.IpPermissions` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeSecurityGroups.html) |
-| `rds-describe-db-instances` | service operation | `DescribeDBInstances` | rds | read | `DBInstances.DBInstanceIdentifier`, `DBInstances.StorageEncrypted`, `DBInstances.Engine`, `DBInstances.KmsKeyId` | [Official documentation](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DescribeDBInstances.html) |
-| `kms-list-keys` | service operation | `ListKeys` | kms | read | `Keys.KeyId`, `Keys.KeyArn` | [Official documentation](https://docs.aws.amazon.com/kms/latest/APIReference/API_ListKeys.html) |
-| `kms-describe-key` | service operation | `DescribeKey` | kms | read | `KeyMetadata.KeyId`, `KeyMetadata.Arn`, `KeyMetadata.KeyManager`, `KeyMetadata.KeyState`, `KeyMetadata.KeySpec`, `KeyMetadata.Origin` | [Official documentation](https://docs.aws.amazon.com/kms/latest/APIReference/API_DescribeKey.html) |
-| `kms-get-key-rotation-status` | service operation | `GetKeyRotationStatus` | kms | read | `KeyRotationEnabled`, `RotationPeriodInDays`, `NextRotationDate` | [Official documentation](https://docs.aws.amazon.com/kms/latest/APIReference/API_GetKeyRotationStatus.html) |
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `sts-get-caller-identity` | service operation | `GetCallerIdentity` | sts | `sts:GetCallerIdentity` | auth-only | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Account`, `Arn`, `UserId` | [Official documentation](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html) |
+| `iam-get-account-summary` | service operation | `GetAccountSummary` | iam | `iam:GetAccountSummary` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `SummaryMap` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountSummary.html) |
+| `iam-get-account-password-policy` | service operation | `GetAccountPasswordPolicy` | iam | `iam:GetAccountPasswordPolicy` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `PasswordPolicy` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountPasswordPolicy.html) |
+| `iam-list-users` | service operation | `ListUsers` | iam | `iam:ListUsers` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Users.UserName`, `Users.Arn`, `Users.CreateDate`, `Users.PasswordLastUsed` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListUsers.html) |
+| `iam-list-mfa-devices` | service operation | `ListMFADevices` | iam | `iam:ListMFADevices` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `MFADevices.SerialNumber`, `MFADevices.EnableDate` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListMFADevices.html) |
+| `iam-list-access-keys` | service operation | `ListAccessKeys` | iam | `iam:ListAccessKeys` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `AccessKeyMetadata.UserName`, `AccessKeyMetadata.AccessKeyId`, `AccessKeyMetadata.Status`, `AccessKeyMetadata.CreateDate` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListAccessKeys.html) |
+| `iam-get-access-key-last-used` | service operation | `GetAccessKeyLastUsed` | iam | `iam:GetAccessKeyLastUsed` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `AccessKeyLastUsed.LastUsedDate`, `AccessKeyLastUsed.ServiceName`, `AccessKeyLastUsed.Region` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccessKeyLastUsed.html) |
+| `iam-get-account-authorization-details` | service operation | `GetAccountAuthorizationDetails` | iam | `iam:GetAccountAuthorizationDetails` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `RoleDetailList`, `UserDetailList`, `GroupDetailList`, `Policies` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetAccountAuthorizationDetails.html) |
+| `iam-list-policies` | service operation | `ListPolicies` | iam | `iam:ListPolicies` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Policies.PolicyName`, `Policies.Arn`, `Policies.DefaultVersionId`, `Policies.AttachmentCount`, `Policies.PermissionsBoundaryUsageCount` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListPolicies.html) |
+| `iam-get-policy-version` | service operation | `GetPolicyVersion` | iam | `iam:GetPolicyVersion` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `PolicyVersion.Document` | [Official documentation](https://docs.aws.amazon.com/IAM/latest/APIReference/API_GetPolicyVersion.html) |
+| `cloudtrail-lookup-events` | service operation | `LookupEvents` | cloudtrail | `cloudtrail:LookupEvents` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Events.EventId`, `Events.EventName`, `Events.EventSource`, `Events.EventTime`, `Events.Username`, `Events.ReadOnly` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_LookupEvents.html) |
+| `cloudtrail-describe-trails` | service operation | `DescribeTrails` | cloudtrail | `cloudtrail:DescribeTrails` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `trailList.Name`, `trailList.TrailARN`, `trailList.IsMultiRegionTrail`, `trailList.LogFileValidationEnabled` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_DescribeTrails.html) |
+| `cloudtrail-get-trail-status` | service operation | `GetTrailStatus` | cloudtrail | `cloudtrail:GetTrailStatus` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `IsLogging` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetTrailStatus.html) |
+| `cloudtrail-get-event-selectors` | service operation | `GetEventSelectors` | cloudtrail | `cloudtrail:GetEventSelectors` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `EventSelectors`, `AdvancedEventSelectors` | [Official documentation](https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetEventSelectors.html) |
+| `securityhub-describe-hub` | service operation | `DescribeHub` | securityhub | `securityhub:DescribeHub` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `HubArn` | [Official documentation](https://docs.aws.amazon.com/securityhub/latest/APIReference/API_DescribeHub.html) |
+| `securityhub-get-enabled-standards` | service operation | `GetEnabledStandards` | securityhub | `securityhub:GetEnabledStandards` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `StandardsSubscriptions` | [Official documentation](https://docs.aws.amazon.com/securityhub/latest/APIReference/API_GetEnabledStandards.html) |
+| `config-describe-configuration-recorders` | service operation | `DescribeConfigurationRecorders` | config | `config:DescribeConfigurationRecorders` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `ConfigurationRecorders` | [Official documentation](https://docs.aws.amazon.com/config/latest/APIReference/API_DescribeConfigurationRecorders.html) |
+| `config-describe-configuration-recorder-status` | service operation | `DescribeConfigurationRecorderStatus` | config | `config:DescribeConfigurationRecorderStatus` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `ConfigurationRecordersStatus` | [Official documentation](https://docs.aws.amazon.com/config/latest/APIReference/API_DescribeConfigurationRecorderStatus.html) |
+| `guardduty-list-detectors` | service operation | `ListDetectors` | guardduty | `guardduty:ListDetectors` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `DetectorIds` | [Official documentation](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_ListDetectors.html) |
+| `guardduty-get-detector` | service operation | `GetDetector` | guardduty | `guardduty:GetDetector` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Status`, `ServiceRole` | [Official documentation](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_GetDetector.html) |
+| `organizations-describe-organization` | service operation | `DescribeOrganization` | organizations | `organizations:DescribeOrganization` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Organization.Id`, `Organization.Arn`, `Organization.FeatureSet` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_DescribeOrganization.html) |
+| `organizations-list-accounts` | service operation | `ListAccounts` | organizations | `organizations:ListAccounts` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Accounts.Id`, `Accounts.Name`, `Accounts.Email`, `Accounts.Status` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListAccounts.html) |
+| `organizations-list-policies` | service operation | `ListPolicies` | organizations | `organizations:ListPolicies` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Policies.Id`, `Policies.Name`, `Policies.Arn`, `Policies.Type`, `Policies.AwsManaged` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListPolicies.html) |
+| `organizations-list-targets-for-policy` | service operation | `ListTargetsForPolicy` | organizations | `organizations:ListTargetsForPolicy` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Targets.TargetId`, `Targets.Name`, `Targets.Type` | [Official documentation](https://docs.aws.amazon.com/organizations/latest/APIReference/API_ListTargetsForPolicy.html) |
+| `access-analyzer-list-analyzers` | service operation | `ListAnalyzers` | access-analyzer | `access-analyzer:ListAnalyzers` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `analyzers.arn`, `analyzers.name`, `analyzers.status`, `analyzers.type` | [Official documentation](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/API_ListAnalyzers.html) |
+| `access-analyzer-list-findings` | service operation | `ListFindings` | access-analyzer | `access-analyzer:ListFindings` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `findings.id`, `findings.resource`, `findings.resourceType`, `findings.status`, `findings.createdAt`, `findings.updatedAt` | [Official documentation](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/API_ListFindings.html) |
+| `sso-admin-list-instances` | service operation | `ListInstances` | sso-admin | `sso:ListInstances` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Instances.InstanceArn`, `Instances.IdentityStoreId`, `Instances.Name`, `Instances.Status` | [Official documentation](https://docs.aws.amazon.com/singlesignon/latest/APIReference/API_ListInstances.html) |
+| `auditmanager-list-assessments` | service operation | `ListAssessments` | auditmanager | `auditmanager:ListAssessments` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `assessmentMetadata.id`, `assessmentMetadata.name`, `assessmentMetadata.status` | [Official documentation](https://docs.aws.amazon.com/auditmanager/latest/APIReference/API_ListAssessments.html) |
+| `account-get-alternate-contact` | service operation | `GetAlternateContact` | account | `account:GetAlternateContact` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `AlternateContact.Name`, `AlternateContact.Title`, `AlternateContact.EmailAddress`, `AlternateContact.PhoneNumber` | [Official documentation](https://docs.aws.amazon.com/accounts/latest/APIReference/API_GetAlternateContact.html) |
+| `ec2-describe-regions` | service operation | `DescribeRegions` | ec2 | `ec2:DescribeRegions` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Regions.RegionName`, `Regions.OptInStatus` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeRegions.html) |
+| `s3-get-account-public-access-block` | service operation | `GetPublicAccessBlock` | s3-control | `s3:GetAccountPublicAccessBlock` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `PublicAccessBlockConfiguration` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/API/API_control_GetPublicAccessBlock.html) |
+| `s3-list-buckets` | service operation | `ListBuckets` | s3 | `s3:ListBuckets` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Buckets.Name`, `Buckets.CreationDate`, `ContinuationToken` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_ListBuckets.html) |
+| `s3-get-public-access-block` | service operation | `GetPublicAccessBlock` | s3 | `s3:GetPublicAccessBlock` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `PublicAccessBlockConfiguration` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetPublicAccessBlock.html) |
+| `s3-get-bucket-policy-status` | service operation | `GetBucketPolicyStatus` | s3 | `s3:GetBucketPolicyStatus` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `PolicyStatus.IsPublic` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetBucketPolicyStatus.html) |
+| `s3-get-bucket-encryption` | service operation | `GetBucketEncryption` | s3 | `s3:GetBucketEncryption` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `ServerSideEncryptionConfiguration.Rules` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetBucketEncryption.html) |
+| `s3-get-bucket-policy` | service operation | `GetBucketPolicy` | s3 | `s3:GetBucketPolicy` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Policy` | [Official documentation](https://docs.aws.amazon.com/AmazonS3/latest/APIReference/API_GetBucketPolicy.html) |
+| `ec2-get-ebs-encryption-by-default` | service operation | `GetEbsEncryptionByDefault` | ec2 | `ec2:GetEbsEncryptionByDefault` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `EbsEncryptionByDefault`, `SseType` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_GetEbsEncryptionByDefault.html) |
+| `ec2-describe-vpcs` | service operation | `DescribeVpcs` | ec2 | `ec2:DescribeVpcs` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Vpcs.VpcId`, `Vpcs.IsDefault`, `Vpcs.CidrBlock`, `Vpcs.State` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeVpcs.html) |
+| `ec2-describe-flow-logs` | service operation | `DescribeFlowLogs` | ec2 | `ec2:DescribeFlowLogs` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `FlowLogs.FlowLogId`, `FlowLogs.ResourceId`, `FlowLogs.FlowLogStatus` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeFlowLogs.html) |
+| `ec2-describe-network-acls` | service operation | `DescribeNetworkAcls` | ec2 | `ec2:DescribeNetworkAcls` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `NetworkAcls.NetworkAclId`, `NetworkAcls.VpcId`, `NetworkAcls.Entries` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeNetworkAcls.html) |
+| `ec2-describe-security-groups` | service operation | `DescribeSecurityGroups` | ec2 | `ec2:DescribeSecurityGroups` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `SecurityGroups.GroupId`, `SecurityGroups.GroupName`, `SecurityGroups.VpcId`, `SecurityGroups.IpPermissions` | [Official documentation](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeSecurityGroups.html) |
+| `rds-describe-db-instances` | service operation | `DescribeDBInstances` | rds | `rds:DescribeDBInstances` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `DBInstances.DBInstanceIdentifier`, `DBInstances.StorageEncrypted`, `DBInstances.Engine`, `DBInstances.KmsKeyId` | [Official documentation](https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DescribeDBInstances.html) |
+| `kms-list-keys` | service operation | `ListKeys` | kms | `kms:ListKeys` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `Keys.KeyId`, `Keys.KeyArn` | [Official documentation](https://docs.aws.amazon.com/kms/latest/APIReference/API_ListKeys.html) |
+| `kms-describe-key` | service operation | `DescribeKey` | kms | `kms:DescribeKey` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `KeyMetadata.KeyId`, `KeyMetadata.Arn`, `KeyMetadata.KeyManager`, `KeyMetadata.KeyState`, `KeyMetadata.KeySpec`, `KeyMetadata.Origin` | [Official documentation](https://docs.aws.amazon.com/kms/latest/APIReference/API_DescribeKey.html) |
+| `kms-get-key-rotation-status` | service operation | `GetKeyRotationStatus` | kms | `kms:GetKeyRotationStatus` | read | Fields name the normalized record returned by the read client and then used in finding evidence. Raw service responses are never exported. | `KeyRotationEnabled`, `RotationPeriodInDays`, `NextRotationDate` | [Official documentation](https://docs.aws.amazon.com/kms/latest/APIReference/API_GetKeyRotationStatus.html) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `sts-get-caller-identity` | client | The configured home region. | yes |
+| `sts-get-caller-identity` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `sts-get-caller-identity` | response | Account: string | yes |
+| `iam-get-account-summary` | client | The configured home region. | yes |
+| `iam-get-account-summary` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-get-account-summary` | response | SummaryMap: map | yes |
+| `iam-get-account-password-policy` | client | The configured home region. | yes |
+| `iam-get-account-password-policy` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-get-account-password-policy` | response | PasswordPolicy: structure | yes |
+| `iam-list-users` | client | The configured home region. | yes |
+| `iam-list-users` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-list-users` | response | Users: list | yes |
+| `iam-list-users` | operation-input:Marker | Previous page marker | no |
+| `iam-list-users` | operation-input:MaxItems | min(100, remaining item budget) | yes |
+| `iam-list-mfa-devices` | client | The configured home region. | yes |
+| `iam-list-mfa-devices` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-list-mfa-devices` | response | MFADevices: list | yes |
+| `iam-list-mfa-devices` | operation-input:UserName | Current IAM user name | yes |
+| `iam-list-access-keys` | client | The configured home region. | yes |
+| `iam-list-access-keys` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-list-access-keys` | response | AccessKeyMetadata: list | yes |
+| `iam-list-access-keys` | operation-input:UserName | Current IAM user name | yes |
+| `iam-get-access-key-last-used` | client | The configured home region. | yes |
+| `iam-get-access-key-last-used` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-get-access-key-last-used` | response | AccessKeyLastUsed: structure | yes |
+| `iam-get-access-key-last-used` | operation-input:AccessKeyId | Current access key identifier | yes |
+| `iam-get-account-authorization-details` | client | The configured home region. | yes |
+| `iam-get-account-authorization-details` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-get-account-authorization-details` | response | RoleDetailList: list, UserDetailList: list, GroupDetailList: list, Policies: list | yes |
+| `iam-get-account-authorization-details` | operation-input:Filter | ['Role'] | yes |
+| `iam-get-account-authorization-details` | operation-input:Marker | Previous page marker | no |
+| `iam-get-account-authorization-details` | operation-input:MaxItems | min(100, remaining item budget) | yes |
+| `iam-list-policies` | client | The configured home region. | yes |
+| `iam-list-policies` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-list-policies` | response | Policies: list | yes |
+| `iam-list-policies` | operation-input:Scope | Local | yes |
+| `iam-list-policies` | operation-input:OnlyAttached | false | yes |
+| `iam-list-policies` | operation-input:Marker | Previous page marker | no |
+| `iam-list-policies` | operation-input:MaxItems | 100 | yes |
+| `iam-get-policy-version` | client | The configured home region. | yes |
+| `iam-get-policy-version` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `iam-get-policy-version` | response | PolicyVersion: structure | yes |
+| `iam-get-policy-version` | operation-input:PolicyArn | ARN from ListPolicies | yes |
+| `iam-get-policy-version` | operation-input:VersionId | DefaultVersionId from ListPolicies, falling back to v1 only when absent | yes |
+| `cloudtrail-lookup-events` | client | us-east-1 for global root activity, then the configured region only as a fallback when the global lookup fails and differs. | yes |
+| `cloudtrail-lookup-events` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `cloudtrail-lookup-events` | response | Events: list | yes |
+| `cloudtrail-lookup-events` | operation-input:LookupAttributes | [{AttributeKey: Username, AttributeValue: root}] | yes |
+| `cloudtrail-lookup-events` | operation-input:StartTime | Current time minus lookback_days, clamped to the 90-day service history | yes |
+| `cloudtrail-lookup-events` | operation-input:EndTime | Current time | yes |
+| `cloudtrail-lookup-events` | operation-input:MaxResults | 50 | yes |
+| `cloudtrail-lookup-events` | operation-input:NextToken | Previous page token | no |
+| `cloudtrail-describe-trails` | client | The configured home region. | yes |
+| `cloudtrail-describe-trails` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `cloudtrail-describe-trails` | response | trailList: list | yes |
+| `cloudtrail-describe-trails` | operation-input:includeShadowTrails | false | yes |
+| `cloudtrail-get-trail-status` | client | The configured home region. | yes |
+| `cloudtrail-get-trail-status` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `cloudtrail-get-trail-status` | response | IsLogging: boolean | yes |
+| `cloudtrail-get-trail-status` | operation-input:Name | TrailARN, falling back to Name | yes |
+| `cloudtrail-get-event-selectors` | client | The configured home region. | yes |
+| `cloudtrail-get-event-selectors` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `cloudtrail-get-event-selectors` | response | TrailARN: string, EventSelectors: list, AdvancedEventSelectors: list | yes |
+| `cloudtrail-get-event-selectors` | operation-input:TrailName | TrailARN, falling back to Name | yes |
+| `securityhub-describe-hub` | client | The configured home region. | yes |
+| `securityhub-describe-hub` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `securityhub-describe-hub` | response | HubArn: string | yes |
+| `securityhub-get-enabled-standards` | client | The configured home region. | yes |
+| `securityhub-get-enabled-standards` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `securityhub-get-enabled-standards` | response | StandardsSubscriptions: list | yes |
+| `securityhub-get-enabled-standards` | operation-input:MaxResults | 100 | yes |
+| `securityhub-get-enabled-standards` | operation-input:NextToken | Previous page token | no |
+| `config-describe-configuration-recorders` | client | The configured home region. | yes |
+| `config-describe-configuration-recorders` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `config-describe-configuration-recorders` | response | ConfigurationRecorders: list | yes |
+| `config-describe-configuration-recorder-status` | client | The configured home region. | yes |
+| `config-describe-configuration-recorder-status` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `config-describe-configuration-recorder-status` | response | ConfigurationRecordersStatus: list | yes |
+| `guardduty-list-detectors` | client | The configured home region. | yes |
+| `guardduty-list-detectors` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `guardduty-list-detectors` | response | DetectorIds: list | yes |
+| `guardduty-list-detectors` | operation-input:MaxResults | 50 | yes |
+| `guardduty-list-detectors` | operation-input:NextToken | Previous page token | no |
+| `guardduty-get-detector` | client | The configured home region. | yes |
+| `guardduty-get-detector` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `guardduty-get-detector` | response | Status: string, ServiceRole: string | yes |
+| `guardduty-get-detector` | operation-input:DetectorId | Identifier from ListDetectors | yes |
+| `organizations-describe-organization` | client | The configured home region. | yes |
+| `organizations-describe-organization` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `organizations-describe-organization` | response | Organization: structure | yes |
+| `organizations-list-accounts` | client | The configured home region. | yes |
+| `organizations-list-accounts` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `organizations-list-accounts` | response | Accounts: list | yes |
+| `organizations-list-accounts` | operation-input:NextToken | Previous page token | no |
+| `organizations-list-accounts` | operation-input:MaxResults | min(20, remaining item budget) | yes |
+| `organizations-list-policies` | client | The configured home region. | yes |
+| `organizations-list-policies` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `organizations-list-policies` | response | Policies: list | yes |
+| `organizations-list-policies` | operation-input:Filter | SERVICE_CONTROL_POLICY | yes |
+| `organizations-list-policies` | operation-input:NextToken | Previous page token | no |
+| `organizations-list-policies` | operation-input:MaxResults | 20 | yes |
+| `organizations-list-targets-for-policy` | client | The configured home region. | yes |
+| `organizations-list-targets-for-policy` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `organizations-list-targets-for-policy` | response | Targets: list | yes |
+| `organizations-list-targets-for-policy` | operation-input:PolicyId | Identifier from ListPolicies | yes |
+| `organizations-list-targets-for-policy` | operation-input:NextToken | Previous page token | no |
+| `access-analyzer-list-analyzers` | client | The configured home region. | yes |
+| `access-analyzer-list-analyzers` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `access-analyzer-list-analyzers` | response | analyzers: list | yes |
+| `access-analyzer-list-analyzers` | operation-input:nextToken | Previous page token | no |
+| `access-analyzer-list-analyzers` | operation-input:maxResults | 100 | yes |
+| `access-analyzer-list-findings` | client | The configured home region. | yes |
+| `access-analyzer-list-findings` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `access-analyzer-list-findings` | response | findings: list | yes |
+| `access-analyzer-list-findings` | operation-input:analyzerArn | ARN of each ACTIVE analyzer | yes |
+| `access-analyzer-list-findings` | operation-input:maxResults | min(100, remaining finding budget) | yes |
+| `access-analyzer-list-findings` | operation-input:nextToken | Previous page token | no |
+| `sso-admin-list-instances` | client | The configured home region. | yes |
+| `sso-admin-list-instances` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `sso-admin-list-instances` | response | Instances: list | yes |
+| `sso-admin-list-instances` | operation-input:MaxResults | 100 | yes |
+| `sso-admin-list-instances` | operation-input:NextToken | Previous page token | no |
+| `auditmanager-list-assessments` | client | The configured home region. | yes |
+| `auditmanager-list-assessments` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `auditmanager-list-assessments` | response | assessmentMetadata: list | yes |
+| `auditmanager-list-assessments` | operation-input:status | ACTIVE | yes |
+| `auditmanager-list-assessments` | operation-input:maxResults | 100 | yes |
+| `auditmanager-list-assessments` | operation-input:nextToken | Previous page token | no |
+| `account-get-alternate-contact` | client | The configured home region. | yes |
+| `account-get-alternate-contact` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `account-get-alternate-contact` | response | AlternateContact: structure | yes |
+| `account-get-alternate-contact` | operation-input:AlternateContactType | SECURITY | yes |
+| `ec2-describe-regions` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `ec2-describe-regions` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `ec2-describe-regions` | response | Regions: list | yes |
+| `ec2-describe-regions` | operation-input:Filters | opt-in-status in [opt-in-not-required, opted-in] | yes |
+| `s3-get-account-public-access-block` | client | The configured home region. | yes |
+| `s3-get-account-public-access-block` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `s3-get-account-public-access-block` | response | PublicAccessBlockConfiguration: structure | yes |
+| `s3-get-account-public-access-block` | operation-input:AccountId | Account from GetCallerIdentity, falling back to account_id configuration | yes |
+| `s3-list-buckets` | client | The configured home region. | yes |
+| `s3-list-buckets` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `s3-list-buckets` | response | Buckets: list | yes |
+| `s3-list-buckets` | operation-input:ContinuationToken | Previous page token | no |
+| `s3-list-buckets` | operation-input:MaxBuckets | min(1000, remaining item budget) | yes |
+| `s3-get-public-access-block` | client | The configured home region. | yes |
+| `s3-get-public-access-block` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `s3-get-public-access-block` | response | PublicAccessBlockConfiguration: structure | yes |
+| `s3-get-public-access-block` | operation-input:Bucket | Bucket name from ListBuckets | yes |
+| `s3-get-bucket-policy-status` | client | The configured home region. | yes |
+| `s3-get-bucket-policy-status` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `s3-get-bucket-policy-status` | response | PolicyStatus: structure | yes |
+| `s3-get-bucket-policy-status` | operation-input:Bucket | Bucket name from ListBuckets | yes |
+| `s3-get-bucket-encryption` | client | The configured home region. | yes |
+| `s3-get-bucket-encryption` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `s3-get-bucket-encryption` | response | ServerSideEncryptionConfiguration: structure | yes |
+| `s3-get-bucket-encryption` | operation-input:Bucket | Bucket name from ListBuckets | yes |
+| `s3-get-bucket-policy` | client | The configured home region. | yes |
+| `s3-get-bucket-policy` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `s3-get-bucket-policy` | response | Policy: policyDocument | yes |
+| `s3-get-bucket-policy` | operation-input:Bucket | Bucket name from ListBuckets | yes |
+| `ec2-get-ebs-encryption-by-default` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `ec2-get-ebs-encryption-by-default` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `ec2-get-ebs-encryption-by-default` | response | EbsEncryptionByDefault: boolean | yes |
+| `ec2-describe-vpcs` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `ec2-describe-vpcs` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `ec2-describe-vpcs` | response | Vpcs: list | yes |
+| `ec2-describe-vpcs` | operation-input:NextToken | Previous page token | no |
+| `ec2-describe-vpcs` | operation-input:MaxResults | 1000 | yes |
+| `ec2-describe-flow-logs` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `ec2-describe-flow-logs` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `ec2-describe-flow-logs` | response | FlowLogs: list | yes |
+| `ec2-describe-flow-logs` | operation-input:NextToken | Previous page token | no |
+| `ec2-describe-flow-logs` | operation-input:MaxResults | 1000 | yes |
+| `ec2-describe-network-acls` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `ec2-describe-network-acls` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `ec2-describe-network-acls` | response | NetworkAcls: list | yes |
+| `ec2-describe-network-acls` | operation-input:NextToken | Previous page token | no |
+| `ec2-describe-network-acls` | operation-input:MaxResults | 1000 | yes |
+| `ec2-describe-security-groups` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `ec2-describe-security-groups` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `ec2-describe-security-groups` | response | SecurityGroups: list | yes |
+| `ec2-describe-security-groups` | operation-input:NextToken | Previous page token | no |
+| `ec2-describe-security-groups` | operation-input:MaxResults | 1000 | yes |
+| `rds-describe-db-instances` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `rds-describe-db-instances` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `rds-describe-db-instances` | response | DBInstances: list | yes |
+| `rds-describe-db-instances` | operation-input:Marker | Previous page marker | no |
+| `rds-describe-db-instances` | operation-input:MaxRecords | 100 | yes |
+| `kms-list-keys` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `kms-list-keys` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `kms-list-keys` | response | Keys: list | yes |
+| `kms-list-keys` | operation-input:Marker | Previous page marker | no |
+| `kms-list-keys` | operation-input:Limit | 1000 | yes |
+| `kms-describe-key` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `kms-describe-key` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `kms-describe-key` | response | KeyMetadata: structure | yes |
+| `kms-describe-key` | operation-input:KeyId | KeyId from ListKeys | yes |
+| `kms-get-key-rotation-status` | client | Each assessed region; DescribeRegions itself uses the configured region. | yes |
+| `kms-get-key-rotation-status` | headers | Service request signed with AWS Signature Version 4 by the resolved credential provider. | yes |
+| `kms-get-key-rotation-status` | response | KeyRotationEnabled: boolean | yes |
+| `kms-get-key-rotation-status` | operation-input:KeyId | Eligible KeyId from DescribeKey | yes |
 
 ## Pagination
 
 | Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
 |---|---|---|---|---|---|---|
-| `iam-list-users`, `iam-get-account-authorization-details`, `iam-list-policies`, `organizations-list-policies` | `Marker`, `IsTruncated` | 100 | caller limit | 1000 | IAM does not return a stable population total; report items seen and truncation. | IsTruncated is false; Configured item cap; Page cap; Missing or repeated marker |
-| `cloudtrail-lookup-events`, `securityhub-get-enabled-standards`, `guardduty-list-detectors`, `organizations-list-accounts`, `organizations-list-targets-for-policy`, `access-analyzer-list-analyzers`, `access-analyzer-list-findings`, `sso-admin-list-instances`, `auditmanager-list-assessments`, `ec2-describe-vpcs`, `ec2-describe-flow-logs`, `ec2-describe-network-acls`, `ec2-describe-security-groups` | `NextToken`, `nextToken` | service default | caller limit | 1000 | The service does not provide a dependable total; report items seen and truncation. | No next token; Configured item cap; Page cap; Missing or repeated token |
+| `iam-list-users`, `iam-list-policies`, `iam-get-account-authorization-details` | `Marker`, `IsTruncated` | 100 | caller limit | 1000 | IAM does not return a stable population total; report items seen and truncation. | IsTruncated is false; Configured item cap; Page cap; Missing or repeated marker |
+| `cloudtrail-lookup-events`, `securityhub-get-enabled-standards`, `guardduty-list-detectors`, `organizations-list-accounts`, `organizations-list-policies`, `organizations-list-targets-for-policy`, `access-analyzer-list-analyzers`, `access-analyzer-list-findings`, `sso-admin-list-instances`, `auditmanager-list-assessments`, `ec2-describe-vpcs`, `ec2-describe-flow-logs`, `ec2-describe-network-acls`, `ec2-describe-security-groups` | `NextToken`, `nextToken` | service default | caller limit | 1000 | The service does not provide a dependable total; report items seen and truncation. | No next token; Configured item cap; Page cap; Missing or repeated token |
 | `s3-list-buckets` | `ContinuationToken` | 1000 | 1000 | 1000 | No total is returned; only exhaustion proves completeness. | No continuation token; Bucket cap; Page cap; Missing or repeated token |
-| `rds-describe-db-instances`, `kms-list-keys` | `Marker`, `NextMarker`, `Truncated` | 100 | caller limit | 1000 | No total is returned; only exhaustion proves completeness. | No marker; Configured item cap; Page cap; Missing or repeated marker |
+| `rds-describe-db-instances` | `Marker` | 100 | caller limit | 1000 | No total is returned; only exhaustion proves completeness. | No marker; Configured item cap; Page cap; Missing or repeated marker |
+| `kms-list-keys` | `Marker request`, `NextMarker response when Truncated=true` | 1000 | 1000 | 1000 | KMS returns no total; only Truncated=false proves exhaustion. | Truncated is false; Configured key cap; Page cap; Missing or repeated NextMarker |
 
 ## Rate limits
 
@@ -288,63 +500,214 @@ Credential and deployment variants: Long-lived access keys, Temporary session cr
 
 | # | Control | Finding | Verdict semantics |
 |---|---|---|---|
-| 1 | MFA Enforcement | AWS-IAM-01, AWS-IAM-02 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 2 | Password Policy | AWS-IAM-03 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 3 | Access Key Rotation | AWS-IAM-04 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 4 | Root Account Usage | AWS-IAM-01, AWS-IAM-07 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 5 | Unused Credentials | AWS-IAM-06 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 6 | CloudTrail Enabled | AWS-LOG-01 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 7 | CloudTrail Log Integrity | AWS-LOG-01 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 8 | Security Hub Enabled | AWS-LOG-03 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 9 | GuardDuty Enabled | AWS-LOG-04 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 10 | Config Enabled | AWS-LOG-05 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 11 | S3 Public Access | AWS-DATA-11 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 12 | Encryption at Rest | AWS-DATA-12 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 13 | Encryption in Transit | AWS-DATA-13 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 14 | VPC Flow Logs | AWS-NET-14 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 15 | Cross-Account Access | AWS-ORG-03, AWS-ORG-04 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 16 | SCP Enforcement | AWS-ORG-01, AWS-ORG-02 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 17 | Permission Boundaries | AWS-IAM-05 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 18 | Least Privilege | AWS-IAM-08 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 19 | Logging Configuration | AWS-LOG-02 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 20 | Network ACLs | AWS-NET-20 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 21 | Security Group Rules | AWS-NET-21 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 22 | KMS Key Rotation | AWS-DATA-22 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 23 | Identity Center Configuration | AWS-ORG-05 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 24 | Audit Manager Evidence | AWS-ORG-06 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| 25 | Account Contacts | AWS-ORG-07 | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
+| 1 | MFA Enforcement | AWS-IAM-01, AWS-IAM-02 | GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM. ListUsers is unreadable, or every sampled user's MFA-device list is unreadable. |
+| 2 | Password Policy | AWS-IAM-03 | GetAccountPasswordPolicy is unreadable. |
+| 3 | Access Key Rotation | AWS-IAM-04 | ListUsers is unreadable, every user's key list is unreadable, or every sampled key's last-use read is unreadable. |
+| 4 | Root Account Usage | AWS-IAM-01, AWS-IAM-07 | GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM. Root LookupEvents is unreadable. |
+| 5 | Unused Credentials | AWS-IAM-06 | ListUsers is unreadable. |
+| 6 | CloudTrail Enabled | AWS-LOG-01 | DescribeTrails is unreadable, or a qualifying trail exists but every qualifying logging state is unreadable. |
+| 7 | CloudTrail Log Integrity | AWS-LOG-01 | DescribeTrails is unreadable, or a qualifying trail exists but every qualifying logging state is unreadable. |
+| 8 | Security Hub Enabled | AWS-LOG-03 | DescribeHub is unreadable. |
+| 9 | GuardDuty Enabled | AWS-LOG-04 | ListDetectors is unreadable, or detector IDs exist but enablement is unreadable. |
+| 10 | Config Enabled | AWS-LOG-05 | Recorder listing or recorder-status listing is unreadable. |
+| 11 | S3 Public Access | AWS-DATA-11 | Account-level S3 Control GetPublicAccessBlock or ListBuckets is unreadable. |
+| 12 | Encryption at Rest | AWS-DATA-12 | EBS default encryption is unreadable in every assessed region or ListBuckets is unreadable. |
+| 13 | Encryption in Transit | AWS-DATA-13 | ListBuckets is unreadable or returns zero buckets; load-balancer and endpoint TLS remain manual. |
+| 14 | VPC Flow Logs | AWS-NET-14 | VPCs are unreadable in every region, no VPC exists, or every VPC's flow-log state is unreadable or missing. |
+| 15 | Cross-Account Access | AWS-ORG-03, AWS-ORG-04 | ListAnalyzers is unreadable. Analyzers are unreadable, no ACTIVE analyzer exists, or no ACTIVE analyzer has a readable findings list. |
+| 16 | SCP Enforcement | AWS-ORG-01, AWS-ORG-02 | DescribeOrganization is unreadable. ListPolicies is unreadable, or SCPs exist but target lists needed to settle attachment are unreadable. |
+| 17 | Permission Boundaries | AWS-IAM-05 | GetAccountAuthorizationDetails for roles is unreadable. |
+| 18 | Least Privilege | AWS-IAM-08 | ListPolicies is unreadable or returns zero customer-managed policies; inline policies remain manual. |
+| 19 | Logging Configuration | AWS-LOG-02 | DescribeTrails is unreadable or any required GetEventSelectors read is unreadable. |
+| 20 | Network ACLs | AWS-NET-20 | NACLs are unreadable in every region or no NACL is returned. |
+| 21 | Security Group Rules | AWS-NET-21 | Security groups are unreadable in every region or no security group is returned. |
+| 22 | KMS Key Rotation | AWS-DATA-22 | KMS lists fail in every region, no customer key exists, or no customer key can be confirmed because every KeyManager is unreadable. |
+| 23 | Identity Center Configuration | AWS-ORG-05 | ListInstances is unreadable. |
+| 24 | Audit Manager Evidence | AWS-ORG-06 | ListAssessments is unreadable; verify applicability in Audit Manager or the alternate evidence process. |
+| 25 | Account Contacts | AWS-ORG-07 | GetAlternateContact is unreadable. |
 
 ### Finding criteria
 
 | Finding | Severity | Owning tool | Sources | Pass | Warn | Fail | Manual |
 |---|---|---|---|---|---|---|---|
-| `AWS-IAM-01` | critical | `aws_assess_identity` | `iam-get-account-summary` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-IAM-02` | high | `aws_assess_identity` | `iam-list-users`, `iam-list-mfa-devices` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-IAM-03` | high | `aws_assess_identity` | `iam-get-account-password-policy` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-IAM-04` | high | `aws_assess_identity` | `iam-list-users`, `iam-list-access-keys`, `iam-get-access-key-last-used` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-IAM-05` | medium | `aws_assess_identity` | `iam-get-account-authorization-details` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-IAM-06` | low | `aws_assess_identity` | `iam-list-users`, `iam-list-access-keys`, `iam-get-access-key-last-used` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-IAM-07` | high | `aws_assess_identity` | `cloudtrail-lookup-events` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-IAM-08` | high | `aws_assess_identity` | `iam-list-policies`, `iam-get-policy-version` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-LOG-01` | critical | `aws_assess_logging_detection` | `cloudtrail-describe-trails`, `cloudtrail-get-trail-status` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-LOG-02` | high | `aws_assess_logging_detection` | `cloudtrail-get-event-selectors` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-LOG-03` | high | `aws_assess_logging_detection` | `securityhub-describe-hub`, `securityhub-get-enabled-standards` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-LOG-04` | high | `aws_assess_logging_detection` | `guardduty-list-detectors`, `guardduty-get-detector` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-LOG-05` | high | `aws_assess_logging_detection` | `config-describe-configuration-recorders`, `config-describe-configuration-recorder-status` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-ORG-01` | medium | `aws_assess_org_guardrails` | `organizations-describe-organization`, `organizations-list-accounts` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-ORG-02` | high | `aws_assess_org_guardrails` | `organizations-list-policies`, `organizations-list-targets-for-policy` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-ORG-03` | high | `aws_assess_org_guardrails` | `access-analyzer-list-analyzers` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-ORG-04` | high | `aws_assess_org_guardrails` | `access-analyzer-list-findings` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-ORG-05` | medium | `aws_assess_org_guardrails` | `sso-admin-list-instances` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-ORG-06` | medium | `aws_assess_org_guardrails` | `auditmanager-list-assessments` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-ORG-07` | medium | `aws_assess_org_guardrails` | `account-get-alternate-contact` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-DATA-11` | critical | `aws_assess_data_protection` | `s3-get-account-public-access-block`, `s3-list-buckets`, `s3-get-public-access-block`, `s3-get-bucket-policy-status` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-DATA-12` | high | `aws_assess_data_protection` | `ec2-get-ebs-encryption-by-default`, `s3-get-bucket-encryption`, `rds-describe-db-instances` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-DATA-13` | high | `aws_assess_data_protection` | `s3-get-bucket-policy` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-DATA-22` | high | `aws_assess_data_protection` | `kms-list-keys`, `kms-describe-key`, `kms-get-key-rotation-status` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-NET-14` | high | `aws_assess_network_security` | `ec2-describe-vpcs`, `ec2-describe-flow-logs` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-NET-20` | high | `aws_assess_network_security` | `ec2-describe-network-acls` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
-| `AWS-NET-21` | high | `aws_assess_network_security` | `ec2-describe-security-groups` | Every required source is complete and the observed configuration satisfies the check. | The evidence is partial, scope-limited, or contains a condition that needs review without proving noncompliance. | Complete readable evidence proves that the required configuration is absent or noncompliant. | A required operation is unreadable, denied, not requested, or does not expose enough evidence for an automated verdict. |
+| `AWS-IAM-01` | critical | `aws_assess_identity` | `iam-get-account-summary` | GetAccountSummary is readable, AccountMFAEnabled equals 1, and AccountAccessKeysPresent is absent or equals 0. | No warn verdict is emitted directly. | AccountMFAEnabled is not 1 or AccountAccessKeysPresent is greater than 0. | GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM. |
+| `AWS-IAM-02` | high | `aws_assess_identity` | `iam-list-users`, `iam-list-mfa-devices` | ListUsers is readable and every sampled user whose ListMFADevices call is readable has at least one MFA device. | The pass result is demoted when the user inventory is truncated or one or more user MFA-device lists is unreadable. | At least one sampled IAM user has a readable empty MFA-device list. | ListUsers is unreadable, or every sampled user's MFA-device list is unreadable. |
+| `AWS-IAM-03` | high | `aws_assess_identity` | `iam-get-account-password-policy` | A password policy exists, MinimumPasswordLength is at least 14, and RequireSymbols, RequireNumbers, RequireUppercaseCharacters, and RequireLowercaseCharacters are all true. | No warn verdict is emitted directly. | No password policy exists, minimum length is below 14, or any required complexity flag is not true. | GetAccountPasswordPolicy is unreadable. |
+| `AWS-IAM-04` | high | `aws_assess_identity` | `iam-list-users`, `iam-list-access-keys`, `iam-get-access-key-last-used` | ListUsers is readable and no judged access key is older than stale_days since LastUsedDate, or since CreateDate when never used; stale_days defaults to 90. | The pass result is demoted when users are truncated or any user's key list or any sampled key's last-use read is unreadable. | At least one judged key exceeds stale_days. | ListUsers is unreadable, every user's key list is unreadable, or every sampled key's last-use read is unreadable. |
+| `AWS-IAM-05` | medium | `aws_assess_identity` | `iam-get-account-authorization-details` | The role inventory is readable and no role with AdministratorAccess or an inline Allow Action='*' Resource='*' policy lacks PermissionsBoundary. | One to max_privileged_roles privileged roles lack boundaries, or an otherwise-passing role inventory is truncated; max_privileged_roles defaults to 5. | More than max_privileged_roles privileged roles lack permission boundaries. | GetAccountAuthorizationDetails for roles is unreadable. |
+| `AWS-IAM-06` | low | `aws_assess_identity` | `iam-list-users`, `iam-list-access-keys`, `iam-get-access-key-last-used` | ListUsers is readable and no user has PasswordLastUsed older than stale_days and no user with no password activity is proven to have zero access keys. | At least one user appears dormant, or an otherwise-passing user/key inventory is partial; stale_days defaults to 90. | No fail verdict is emitted; dormant users require review. | ListUsers is unreadable. |
+| `AWS-IAM-07` | high | `aws_assess_identity` | `cloudtrail-lookup-events` | No CloudTrail event attributed to username root is found in the lookback window, first queried in us-east-1. | No root ConsoleLogin exists but another root API event exists, or an otherwise-passing lookup is truncated, contains undated events, or falls back after the us-east-1 lookup fails. | At least one root ConsoleLogin event exists. | Root LookupEvents is unreadable. |
+| `AWS-IAM-08` | high | `aws_assess_identity` | `iam-list-policies`, `iam-get-policy-version` | At least one customer-managed policy is readable and none has an Allow statement with wildcard Action and wildcard Resource. | An unattached policy grants Action='*' and Resource='*', a policy grants a service-wide action such as service:* on Resource='*', or an otherwise-passing inventory is partial. | An attached policy or permission-boundary policy has an Allow statement with Action='*' and Resource='*'. | ListPolicies is unreadable or returns zero customer-managed policies; inline policies remain manual. |
+| `AWS-LOG-01` | critical | `aws_assess_logging_detection` | `cloudtrail-describe-trails`, `cloudtrail-get-trail-status` | At least one trail has IsMultiRegionTrail=true, LogFileValidationEnabled=true and GetTrailStatus.IsLogging=true. | A pass is demoted when GetTrailStatus is unreadable for any trail. | Trails are readable but no trail satisfies all three required values. | DescribeTrails is unreadable, or a qualifying trail exists but every qualifying logging state is unreadable. |
+| `AWS-LOG-02` | medium | `aws_assess_logging_detection` | `cloudtrail-describe-trails`, `cloudtrail-get-event-selectors` | At least one readable trail has a nonempty EventSelectors.DataResources list or any AdvancedEventSelectors entry. | Trails and selectors are readable but no data-event selector exists. | No fail verdict is emitted; absent data events are a review condition. | DescribeTrails is unreadable or any required GetEventSelectors read is unreadable. |
+| `AWS-LOG-03` | high | `aws_assess_logging_detection` | `securityhub-describe-hub`, `securityhub-get-enabled-standards` | DescribeHub confirms a hub and GetEnabledStandards returns at least one standards subscription. | The hub exists but standards are unreadable, empty, or truncated. | DescribeHub reports that the hub is not subscribed. | DescribeHub is unreadable. |
+| `AWS-LOG-04` | high | `aws_assess_logging_detection` | `guardduty-list-detectors`, `guardduty-get-detector` | At least one listed detector has GetDetector.Status equal to ENABLED. | A pass is demoted when detector listing is truncated or any detector detail is unreadable. | No detector exists, or all readable detectors have a status other than ENABLED. | ListDetectors is unreadable, or detector IDs exist but enablement is unreadable. |
+| `AWS-LOG-05` | high | `aws_assess_logging_detection` | `config-describe-configuration-recorders`, `config-describe-configuration-recorder-status` | At least one configuration recorder has a same-name status with recording=true. | No warn verdict is emitted directly. | No configuration recorder exists, or recorders exist but none reports recording=true. | Recorder listing or recorder-status listing is unreadable. |
+| `AWS-ORG-01` | medium | `aws_assess_org_guardrails` | `organizations-describe-organization`, `organizations-list-accounts` | DescribeOrganization returns an organization; account listing may be readable or unreadable, but a pass is demoted if accounts are unreadable or truncated. | The account is standalone, or organization visibility passes while member accounts are unreadable or truncated. | No fail verdict is emitted directly. | DescribeOrganization is unreadable. |
+| `AWS-ORG-02` | high | `aws_assess_org_guardrails` | `organizations-list-policies`, `organizations-list-targets-for-policy` | At least one SERVICE_CONTROL_POLICY exists and at least one policy has one or more targets. | The account is standalone, no SCP exists, or a pass is demoted by unreadable/truncated policy or target lists. | SCPs exist, every target list is readable, and no SCP has a root, OU, or account target. | ListPolicies is unreadable, or SCPs exist but target lists needed to settle attachment are unreadable. |
+| `AWS-ORG-03` | high | `aws_assess_org_guardrails` | `access-analyzer-list-analyzers` | At least one analyzer has status ACTIVE. | A pass is demoted when the analyzer listing is truncated. | The analyzer listing is readable and contains no ACTIVE analyzer. | ListAnalyzers is unreadable. |
+| `AWS-ORG-04` | dynamic | `aws_assess_org_guardrails` | `access-analyzer-list-analyzers`, `access-analyzer-list-findings` | At least one ACTIVE analyzer has a readable, complete findings list and no returned finding has missing status or status ACTIVE; severity is low. | At least one active external finding is returned; severity is high. A pass is also demoted by unreadable or truncated findings from another ACTIVE analyzer. | No fail verdict is emitted; active external access is a review condition. | Analyzers are unreadable, no ACTIVE analyzer exists, or no ACTIVE analyzer has a readable findings list. |
+| `AWS-ORG-05` | low | `aws_assess_org_guardrails` | `sso-admin-list-instances` | ListInstances returns at least one IAM Identity Center instance. | No instance is visible, or an otherwise-passing list is truncated. | No fail verdict is emitted. | ListInstances is unreadable. |
+| `AWS-ORG-06` | medium | `aws_assess_org_guardrails` | `auditmanager-list-assessments` | ListAssessments(status=ACTIVE) returns at least one assessment with a creation or update timestamp and the list is complete. | A pass is demoted when any assessment lacks both timestamps or the list is truncated. | The read is successful but returns zero ACTIVE assessments. | ListAssessments is unreadable; verify applicability in Audit Manager or the alternate evidence process. |
+| `AWS-ORG-07` | medium | `aws_assess_org_guardrails` | `account-get-alternate-contact` | GetAlternateContact(SECURITY) returns a contact with nonempty EmailAddress and PhoneNumber. | A SECURITY contact exists but email or phone is missing. | GetAlternateContact reports ResourceNotFoundException, meaning no SECURITY contact exists. | GetAlternateContact is unreadable. |
+| `AWS-DATA-11` | critical | `aws_assess_data_protection` | `s3-get-account-public-access-block`, `s3-list-buckets`, `s3-get-public-access-block`, `s3-get-bucket-policy-status` | All four account Block Public Access flags are true, no readable bucket policy evaluates public, all bucket reads are complete, and no bucket public-access detail is unreadable. | The account block is incomplete but every bucket has all four bucket flags and no public policy, or the account block is complete but a policy evaluates public; a pass is also demoted by partial bucket evidence. | The account block is absent, or incomplete while any bucket lacks a full bucket block or has a public policy. | Account-level S3 Control GetPublicAccessBlock or ListBuckets is unreadable. |
+| `AWS-DATA-12` | high | `aws_assess_data_protection` | `ec2-get-ebs-encryption-by-default`, `s3-get-bucket-encryption`, `rds-describe-db-instances` | Every readable assessed region has EbsEncryptionByDefault=true, every bucket has at least one default SSEAlgorithm, and every RDS instance with a readable StorageEncrypted field reports true. | The base pass is demoted by partial region scope, unreadable regional/bucket sources, truncated inventories, or any RDS instance missing StorageEncrypted. | Any readable region reports EbsEncryptionByDefault=false, any bucket lacks default encryption, or any RDS instance reports StorageEncrypted=false. | EBS default encryption is unreadable in every assessed region or ListBuckets is unreadable. |
+| `AWS-DATA-13` | high | `aws_assess_data_protection` | `s3-list-buckets`, `s3-get-bucket-policy` | Every listed bucket has a Deny statement whose condition requires aws:SecureTransport=false; bucket and policy reads are complete. | The pass is demoted when any bucket policy is unreadable or the bucket list is truncated. | At least one readable bucket lacks the required Deny statement. | ListBuckets is unreadable or returns zero buckets; load-balancer and endpoint TLS remain manual. |
+| `AWS-DATA-22` | medium | `aws_assess_data_protection` | `kms-list-keys`, `kms-describe-key`, `kms-get-key-rotation-status` | Every eligible key reports KeyRotationEnabled=true. Eligibility requires KeyManager=CUSTOMER, KeyState=Enabled, KeySpec=SYMMETRIC_DEFAULT and Origin=AWS_KMS. | Customer keys exist but none is eligible for automatic rotation, or a pass is demoted by unreadable/truncated regional scope, key metadata, or rotation status. | At least one eligible key reports KeyRotationEnabled=false. | KMS lists fail in every region, no customer key exists, or no customer key can be confirmed because every KeyManager is unreadable. |
+| `AWS-NET-14` | medium | `aws_assess_network_security` | `ec2-describe-vpcs`, `ec2-describe-flow-logs` | Every readable VPC has at least one matching flow log whose FlowLogStatus is ACTIVE. | The base pass is demoted by partial region scope, unreadable/truncated VPC or flow-log inventories, or missing FlowLogStatus on some logs. | At least one readable VPC has no ACTIVE flow log. | VPCs are unreadable in every region, no VPC exists, or every VPC's flow-log state is unreadable or missing. |
+| `AWS-NET-20` | medium | `aws_assess_network_security` | `ec2-describe-network-acls` | At least one network ACL is readable and none has an inbound allow entry from 0.0.0.0/0 or ::/0 whose protocol/range covers any configured sensitive port or all ports. | A pass is demoted by partial region scope or unreadable/truncated NACL inventories. | At least one NACL has a matching permissive inbound entry. | NACLs are unreadable in every region or no NACL is returned. |
+| `AWS-NET-21` | high | `aws_assess_network_security` | `ec2-describe-security-groups` | At least one security group is readable and none has an inbound IPv4 or IPv6 world source whose protocol/range covers any configured sensitive port or all ports. | A pass is demoted by partial region scope or unreadable/truncated security-group inventories. | At least one security group has a matching unrestricted inbound permission. | Security groups are unreadable in every region or no security group is returned. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `AWS-IAM-01` | `mfaEnabled` | 1 |
+| `AWS-IAM-01` | `accessKeysPresent` | 0 |
+| `AWS-IAM-03` | `minimumLength` | 14 |
+| `AWS-IAM-03` | `requiredComplexityFields` | RequireSymbols, RequireNumbers, RequireUppercaseCharacters, RequireLowercaseCharacters |
+| `AWS-IAM-04` | `defaultStaleDays` | 90 |
+| `AWS-IAM-05` | `administratorPolicyName` | AdministratorAccess |
+| `AWS-IAM-05` | `defaultMaximum` | 5 |
+| `AWS-IAM-06` | `defaultStaleDays` | 90 |
+| `AWS-IAM-07` | `consoleLoginEventName` | ConsoleLogin |
+| `AWS-IAM-07` | `defaultLookbackDays` | 90 |
+| `AWS-IAM-07` | `globalRegion` | us-east-1 |
+| `AWS-IAM-08` | `wildcard` | * |
+| `AWS-LOG-04` | `enabledStatus` | ENABLED |
+| `AWS-ORG-02` | `filter` | SERVICE_CONTROL_POLICY |
+| `AWS-ORG-03` | `activeStatus` | ACTIVE |
+| `AWS-ORG-04` | `activeAnalyzerStatus` | ACTIVE |
+| `AWS-ORG-04` | `activeFindingStatus` | ACTIVE |
+| `AWS-ORG-06` | `requestedStatus` | ACTIVE |
+| `AWS-ORG-07` | `contactType` | SECURITY |
+| `AWS-DATA-11` | `requiredFlags` | BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets |
+| `AWS-DATA-13` | `conditionKey` | aws:SecureTransport |
+| `AWS-DATA-13` | `deniedValue` | false |
+| `AWS-DATA-22` | `keyManager` | CUSTOMER |
+| `AWS-DATA-22` | `keyState` | Enabled |
+| `AWS-DATA-22` | `keySpec` | SYMMETRIC_DEFAULT |
+| `AWS-DATA-22` | `keyOrigin` | AWS_KMS |
+| `AWS-NET-14` | `activeStatus` | ACTIVE |
+| `AWS-NET-20` | `publicIpv4` | 0.0.0.0/0 |
+| `AWS-NET-20` | `publicIpv6` | ::/0 |
+| `AWS-NET-20` | `defaultSensitivePorts` | 21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017 |
+| `AWS-NET-21` | `publicIpv4` | 0.0.0.0/0 |
+| `AWS-NET-21` | `publicIpv6` | ::/0 |
+| `AWS-NET-21` | `defaultSensitivePorts` | 21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017 |
+
+### Criterion examples
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `AWS-IAM-01` | compliant | GetAccountSummary is readable, AccountMFAEnabled equals 1, and AccountAccessKeysPresent is absent or equals 0. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-01` | noncompliant | AccountMFAEnabled is not 1 or AccountAccessKeysPresent is greater than 0. | fail | The noncompliant predicate emits fail. |
+| `AWS-IAM-01` | partial | No warn verdict is emitted directly. | warn | The partial predicate emits warn. |
+| `AWS-IAM-01` | unreadable | GetAccountSummary is unreadable; verify root MFA and absence of root access keys in IAM. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-IAM-02` | compliant | ListUsers is readable and every sampled user whose ListMFADevices call is readable has at least one MFA device. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-02` | noncompliant | At least one sampled IAM user has a readable empty MFA-device list. | fail | The noncompliant predicate emits fail. |
+| `AWS-IAM-02` | partial | The pass result is demoted when the user inventory is truncated or one or more user MFA-device lists is unreadable. | warn | The partial predicate emits warn. |
+| `AWS-IAM-02` | unreadable | ListUsers is unreadable, or every sampled user's MFA-device list is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-IAM-03` | compliant | A password policy exists, MinimumPasswordLength is at least 14, and RequireSymbols, RequireNumbers, RequireUppercaseCharacters, and RequireLowercaseCharacters are all true. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-03` | noncompliant | No password policy exists, minimum length is below 14, or any required complexity flag is not true. | fail | The noncompliant predicate emits fail. |
+| `AWS-IAM-03` | partial | No warn verdict is emitted directly. | warn | The partial predicate emits warn. |
+| `AWS-IAM-03` | unreadable | GetAccountPasswordPolicy is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-IAM-04` | compliant | ListUsers is readable and no judged access key is older than stale_days since LastUsedDate, or since CreateDate when never used; stale_days defaults to 90. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-04` | noncompliant | At least one judged key exceeds stale_days. | fail | The noncompliant predicate emits fail. |
+| `AWS-IAM-04` | partial | The pass result is demoted when users are truncated or any user's key list or any sampled key's last-use read is unreadable. | warn | The partial predicate emits warn. |
+| `AWS-IAM-04` | unreadable | ListUsers is unreadable, every user's key list is unreadable, or every sampled key's last-use read is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-IAM-05` | compliant | The role inventory is readable and no role with AdministratorAccess or an inline Allow Action='*' Resource='*' policy lacks PermissionsBoundary. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-05` | noncompliant | More than max_privileged_roles privileged roles lack permission boundaries. | fail | The noncompliant predicate emits fail. |
+| `AWS-IAM-05` | partial | One to max_privileged_roles privileged roles lack boundaries, or an otherwise-passing role inventory is truncated; max_privileged_roles defaults to 5. | warn | The partial predicate emits warn. |
+| `AWS-IAM-05` | unreadable | GetAccountAuthorizationDetails for roles is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-IAM-06` | compliant | ListUsers is readable and no user has PasswordLastUsed older than stale_days and no user with no password activity is proven to have zero access keys. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-06` | noncompliant | No fail verdict is emitted; dormant users require review. | warn | The noncompliant predicate emits warn. |
+| `AWS-IAM-06` | partial | At least one user appears dormant, or an otherwise-passing user/key inventory is partial; stale_days defaults to 90. | warn | The partial predicate emits warn. |
+| `AWS-IAM-06` | unreadable | ListUsers is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-IAM-07` | compliant | No CloudTrail event attributed to username root is found in the lookback window, first queried in us-east-1. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-07` | noncompliant | At least one root ConsoleLogin event exists. | fail | The noncompliant predicate emits fail. |
+| `AWS-IAM-07` | partial | No root ConsoleLogin exists but another root API event exists, or an otherwise-passing lookup is truncated, contains undated events, or falls back after the us-east-1 lookup fails. | warn | The partial predicate emits warn. |
+| `AWS-IAM-07` | unreadable | Root LookupEvents is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-IAM-08` | compliant | At least one customer-managed policy is readable and none has an Allow statement with wildcard Action and wildcard Resource. | pass | The compliant predicate emits pass. |
+| `AWS-IAM-08` | noncompliant | An attached policy or permission-boundary policy has an Allow statement with Action='*' and Resource='*'. | fail | The noncompliant predicate emits fail. |
+| `AWS-IAM-08` | partial | An unattached policy grants Action='*' and Resource='*', a policy grants a service-wide action such as service:* on Resource='*', or an otherwise-passing inventory is partial. | warn | The partial predicate emits warn. |
+| `AWS-IAM-08` | unreadable | ListPolicies is unreadable or returns zero customer-managed policies; inline policies remain manual. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-LOG-01` | compliant | At least one trail has IsMultiRegionTrail=true, LogFileValidationEnabled=true and GetTrailStatus.IsLogging=true. | pass | The compliant predicate emits pass. |
+| `AWS-LOG-01` | noncompliant | Trails are readable but no trail satisfies all three required values. | fail | The noncompliant predicate emits fail. |
+| `AWS-LOG-01` | partial | A pass is demoted when GetTrailStatus is unreadable for any trail. | warn | The partial predicate emits warn. |
+| `AWS-LOG-01` | unreadable | DescribeTrails is unreadable, or a qualifying trail exists but every qualifying logging state is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-LOG-02` | compliant | At least one readable trail has a nonempty EventSelectors.DataResources list or any AdvancedEventSelectors entry. | pass | The compliant predicate emits pass. |
+| `AWS-LOG-02` | noncompliant | No fail verdict is emitted; absent data events are a review condition. | warn | The noncompliant predicate emits warn. |
+| `AWS-LOG-02` | partial | Trails and selectors are readable but no data-event selector exists. | manual | The partial predicate emits manual. |
+| `AWS-LOG-02` | unreadable | DescribeTrails is unreadable or any required GetEventSelectors read is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-LOG-03` | compliant | DescribeHub confirms a hub and GetEnabledStandards returns at least one standards subscription. | pass | The compliant predicate emits pass. |
+| `AWS-LOG-03` | noncompliant | DescribeHub reports that the hub is not subscribed. | fail | The noncompliant predicate emits fail. |
+| `AWS-LOG-03` | partial | The hub exists but standards are unreadable, empty, or truncated. | warn | The partial predicate emits warn. |
+| `AWS-LOG-03` | unreadable | DescribeHub is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-LOG-04` | compliant | At least one listed detector has GetDetector.Status equal to ENABLED. | pass | The compliant predicate emits pass. |
+| `AWS-LOG-04` | noncompliant | No detector exists, or all readable detectors have a status other than ENABLED. | fail | The noncompliant predicate emits fail. |
+| `AWS-LOG-04` | partial | A pass is demoted when detector listing is truncated or any detector detail is unreadable. | warn | The partial predicate emits warn. |
+| `AWS-LOG-04` | unreadable | ListDetectors is unreadable, or detector IDs exist but enablement is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-LOG-05` | compliant | At least one configuration recorder has a same-name status with recording=true. | pass | The compliant predicate emits pass. |
+| `AWS-LOG-05` | noncompliant | No configuration recorder exists, or recorders exist but none reports recording=true. | fail | The noncompliant predicate emits fail. |
+| `AWS-LOG-05` | partial | No warn verdict is emitted directly. | warn | The partial predicate emits warn. |
+| `AWS-LOG-05` | unreadable | Recorder listing or recorder-status listing is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-ORG-01` | compliant | DescribeOrganization returns an organization; account listing may be readable or unreadable, but a pass is demoted if accounts are unreadable or truncated. | pass | The compliant predicate emits pass. |
+| `AWS-ORG-01` | noncompliant | No fail verdict is emitted directly. | warn | The noncompliant predicate emits warn. |
+| `AWS-ORG-01` | partial | The account is standalone, or organization visibility passes while member accounts are unreadable or truncated. | warn | The partial predicate emits warn. |
+| `AWS-ORG-01` | unreadable | DescribeOrganization is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-ORG-02` | compliant | At least one SERVICE_CONTROL_POLICY exists and at least one policy has one or more targets. | pass | The compliant predicate emits pass. |
+| `AWS-ORG-02` | noncompliant | SCPs exist, every target list is readable, and no SCP has a root, OU, or account target. | fail | The noncompliant predicate emits fail. |
+| `AWS-ORG-02` | partial | The account is standalone, no SCP exists, or a pass is demoted by unreadable/truncated policy or target lists. | warn | The partial predicate emits warn. |
+| `AWS-ORG-02` | unreadable | ListPolicies is unreadable, or SCPs exist but target lists needed to settle attachment are unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-ORG-03` | compliant | At least one analyzer has status ACTIVE. | pass | The compliant predicate emits pass. |
+| `AWS-ORG-03` | noncompliant | The analyzer listing is readable and contains no ACTIVE analyzer. | fail | The noncompliant predicate emits fail. |
+| `AWS-ORG-03` | partial | A pass is demoted when the analyzer listing is truncated. | warn | The partial predicate emits warn. |
+| `AWS-ORG-03` | unreadable | ListAnalyzers is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-ORG-04` | compliant | At least one ACTIVE analyzer has a readable, complete findings list and no returned finding has missing status or status ACTIVE; severity is low. | pass | The compliant predicate emits pass. |
+| `AWS-ORG-04` | noncompliant | No fail verdict is emitted; active external access is a review condition. | warn | The noncompliant predicate emits warn. |
+| `AWS-ORG-04` | partial | At least one active external finding is returned; severity is high. A pass is also demoted by unreadable or truncated findings from another ACTIVE analyzer. | warn | The partial predicate emits warn. |
+| `AWS-ORG-04` | unreadable | Analyzers are unreadable, no ACTIVE analyzer exists, or no ACTIVE analyzer has a readable findings list. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-ORG-05` | compliant | ListInstances returns at least one IAM Identity Center instance. | pass | The compliant predicate emits pass. |
+| `AWS-ORG-05` | noncompliant | No fail verdict is emitted. | warn | The noncompliant predicate emits warn. |
+| `AWS-ORG-05` | partial | No instance is visible, or an otherwise-passing list is truncated. | warn | The partial predicate emits warn. |
+| `AWS-ORG-05` | unreadable | ListInstances is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-ORG-06` | compliant | ListAssessments(status=ACTIVE) returns at least one assessment with a creation or update timestamp and the list is complete. | pass | The compliant predicate emits pass. |
+| `AWS-ORG-06` | noncompliant | The read is successful but returns zero ACTIVE assessments. | fail | The noncompliant predicate emits fail. |
+| `AWS-ORG-06` | partial | A pass is demoted when any assessment lacks both timestamps or the list is truncated. | warn | The partial predicate emits warn. |
+| `AWS-ORG-06` | unreadable | ListAssessments is unreadable; verify applicability in Audit Manager or the alternate evidence process. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-ORG-07` | compliant | GetAlternateContact(SECURITY) returns a contact with nonempty EmailAddress and PhoneNumber. | pass | The compliant predicate emits pass. |
+| `AWS-ORG-07` | noncompliant | GetAlternateContact reports ResourceNotFoundException, meaning no SECURITY contact exists. | fail | The noncompliant predicate emits fail. |
+| `AWS-ORG-07` | partial | A SECURITY contact exists but email or phone is missing. | warn | The partial predicate emits warn. |
+| `AWS-ORG-07` | unreadable | GetAlternateContact is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-DATA-11` | compliant | All four account Block Public Access flags are true, no readable bucket policy evaluates public, all bucket reads are complete, and no bucket public-access detail is unreadable. | pass | The compliant predicate emits pass. |
+| `AWS-DATA-11` | noncompliant | The account block is absent, or incomplete while any bucket lacks a full bucket block or has a public policy. | fail | The noncompliant predicate emits fail. |
+| `AWS-DATA-11` | partial | The account block is incomplete but every bucket has all four bucket flags and no public policy, or the account block is complete but a policy evaluates public; a pass is also demoted by partial bucket evidence. | warn | The partial predicate emits warn. |
+| `AWS-DATA-11` | unreadable | Account-level S3 Control GetPublicAccessBlock or ListBuckets is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-DATA-12` | compliant | Every readable assessed region has EbsEncryptionByDefault=true, every bucket has at least one default SSEAlgorithm, and every RDS instance with a readable StorageEncrypted field reports true. | pass | The compliant predicate emits pass. |
+| `AWS-DATA-12` | noncompliant | Any readable region reports EbsEncryptionByDefault=false, any bucket lacks default encryption, or any RDS instance reports StorageEncrypted=false. | fail | The noncompliant predicate emits fail. |
+| `AWS-DATA-12` | partial | The base pass is demoted by partial region scope, unreadable regional/bucket sources, truncated inventories, or any RDS instance missing StorageEncrypted. | warn | The partial predicate emits warn. |
+| `AWS-DATA-12` | unreadable | EBS default encryption is unreadable in every assessed region or ListBuckets is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-DATA-13` | compliant | Every listed bucket has a Deny statement whose condition requires aws:SecureTransport=false; bucket and policy reads are complete. | pass | The compliant predicate emits pass. |
+| `AWS-DATA-13` | noncompliant | At least one readable bucket lacks the required Deny statement. | fail | The noncompliant predicate emits fail. |
+| `AWS-DATA-13` | partial | The pass is demoted when any bucket policy is unreadable or the bucket list is truncated. | warn | The partial predicate emits warn. |
+| `AWS-DATA-13` | unreadable | ListBuckets is unreadable or returns zero buckets; load-balancer and endpoint TLS remain manual. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-DATA-22` | compliant | Every eligible key reports KeyRotationEnabled=true. Eligibility requires KeyManager=CUSTOMER, KeyState=Enabled, KeySpec=SYMMETRIC_DEFAULT and Origin=AWS_KMS. | pass | The compliant predicate emits pass. |
+| `AWS-DATA-22` | noncompliant | At least one eligible key reports KeyRotationEnabled=false. | fail | The noncompliant predicate emits fail. |
+| `AWS-DATA-22` | partial | Customer keys exist but none is eligible for automatic rotation, or a pass is demoted by unreadable/truncated regional scope, key metadata, or rotation status. | warn | The partial predicate emits warn. |
+| `AWS-DATA-22` | unreadable | KMS lists fail in every region, no customer key exists, or no customer key can be confirmed because every KeyManager is unreadable. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-NET-14` | compliant | Every readable VPC has at least one matching flow log whose FlowLogStatus is ACTIVE. | pass | The compliant predicate emits pass. |
+| `AWS-NET-14` | noncompliant | At least one readable VPC has no ACTIVE flow log. | fail | The noncompliant predicate emits fail. |
+| `AWS-NET-14` | partial | The base pass is demoted by partial region scope, unreadable/truncated VPC or flow-log inventories, or missing FlowLogStatus on some logs. | warn | The partial predicate emits warn. |
+| `AWS-NET-14` | unreadable | VPCs are unreadable in every region, no VPC exists, or every VPC's flow-log state is unreadable or missing. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-NET-20` | compliant | At least one network ACL is readable and none has an inbound allow entry from 0.0.0.0/0 or ::/0 whose protocol/range covers any configured sensitive port or all ports. | pass | The compliant predicate emits pass. |
+| `AWS-NET-20` | noncompliant | At least one NACL has a matching permissive inbound entry. | fail | The noncompliant predicate emits fail. |
+| `AWS-NET-20` | partial | A pass is demoted by partial region scope or unreadable/truncated NACL inventories. | warn | The partial predicate emits warn. |
+| `AWS-NET-20` | unreadable | NACLs are unreadable in every region or no NACL is returned. | manual | The required evidence cannot be evaluated automatically. |
+| `AWS-NET-21` | compliant | At least one security group is readable and none has an inbound IPv4 or IPv6 world source whose protocol/range covers any configured sensitive port or all ports. | pass | The compliant predicate emits pass. |
+| `AWS-NET-21` | noncompliant | At least one security group has a matching unrestricted inbound permission. | fail | The noncompliant predicate emits fail. |
+| `AWS-NET-21` | partial | A pass is demoted by partial region scope or unreadable/truncated security-group inventories. | warn | The partial predicate emits warn. |
+| `AWS-NET-21` | unreadable | Security groups are unreadable in every region or no security group is returned. | manual | The required evidence cannot be evaluated automatically. |
 
 ### Compliance framework mappings
 
@@ -389,13 +752,25 @@ Credential and deployment variants: Long-lived access keys, Temporary session cr
 
 ## Integration-specific scrubbing
 
-Shared contract version: 1.0.
+Shared contract version: 1.1.
+
+Projection stage: Each service response is normalized to the listed members before assessment. Findings and summaries contain only normalized evidence. Every JSON artifact is recursively snapshot-scrubbed again at the write sink.
 
 Sensitive fields and values: AccessKeyId, SecretAccessKey, SessionToken, Authorization, Cookie, Policy credentials, AlternateContact.EmailAddress, AlternateContact.PhoneNumber
 
 Credential formats: AWS access key identifiers, AWS secret access keys, Session tokens, Signature Version 4 authorization values, Shared-configuration credential values, Private key material
 
 Reviewed benign exceptions: Masked access key identifiers, Resource ARNs, Account identifiers, Region names, Policy names
+
+Integration-specific rules:
+
+- Register AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN from the environment at client construction, then register SecretAccessKey and SessionToken returned by the resolved credential provider before a signed request.
+- Replace AWS access-key identifiers shaped like AKIA or ASIA plus 16 uppercase letters/digits, 40-character secret keys, Signature Version 4 Signature/Credential proofs, session tokens, authorization values, cookies, private-key material and credential assignments.
+- Under snapshot keys ending in token, secret, password, credential, authorization, private key, secret key, session token, or bearer-id variants, replace every nonempty value or subtree with [REDACTED]. Keep null, undefined and the empty string to preserve absence.
+- Snapshot recursion keeps scalar values through depth 32; a container deeper than 32 is replaced whole with [REDACTED].
+- Mask access-key identifiers in findings as first four characters + **** + last four; identifiers of eight characters or fewer become ****.
+- Preserve resource ARNs, account and region identifiers, policy names, status/code tokens, setting booleans and numeric limits unless they contain a registered configured secret.
+- Never copy an HTTP response body into an error. Record fixed operation, region, sanitized error code, HTTP status, content type and byte length only.
 
 Projected fields by surface:
 
@@ -469,6 +844,83 @@ Required paths:
 Conditional paths:
 
 - `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `README.md` | markdown | Always | Evidence-bundle heading, Contents list, and credential-resolution notice. | UTF-8 with a trailing newline. |
+| `QUICK_REFERENCE.md` | markdown | Always | Access summary, finding counts, Where to look, and every finding ID/title/status. | UTF-8 with a trailing newline. |
+| `metadata.json` | json | Always | Object: region, profile\|null, account_id\|null, account_id_hint\|null, source_chain string[], generated_at ISO string, finding/control counts, pass/warn/fail/manual counts, options object with effective limits and regions. | Snapshot scrub, two-space JSON, insertion-order keys, one trailing newline. |
+| `core_data/access.json` | json | Always | AwsAccessCheckResult record described below. | Snapshot scrub, two-space JSON, insertion-order keys, one trailing newline. |
+| `analysis/findings.json` | json | Always | Array of AwsFinding records in category order: identity, logging-detection, org-guardrails, data-protection, network-security. | Snapshot scrub, two-space JSON, one trailing newline. |
+| `analysis/{category}.json` | json | One each for identity, logging-detection, org-guardrails, data-protection and network-security | AwsAssessmentResult: title, summary, findings, optional errors. | Snapshot scrub, two-space JSON, insertion-order keys, one trailing newline. |
+| `analysis/summary.json` | json | Always | Object: findings, controls_covered, pass, warn, fail, manual, categories[{category,pass,warn,fail,manual}]. | Snapshot scrub, two-space JSON, one trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always | Run metadata; Result Counts; up to 10 fail/warn findings ordered by status then severity; Manual Evidence Required; optional Collection Warnings. | UTF-8 Markdown with one trailing newline. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always | Finding, Controls, Title, Status, Severity and eight framework columns; pipe/newline escaped. | UTF-8 Markdown table with one trailing newline. |
+| `compliance/frameworks/{framework}.md` | markdown | One file for every configured framework | Framework heading, mapped finding/status counts, then Finding, Title, Status, Severity, Mapping, Summary table. | UTF-8 Markdown with one trailing newline. |
+| `_errors.log` | text | At least one collection error or truncation warning exists | Deduplicated sanitized collection messages, one per line. | UTF-8 text with one final newline. |
+| `{allocated-bundle-name}.zip` | zip | Always after directory files are complete | Archive contains every bundle file under relative paths with no enclosing bundle directory. | Zip archive paired to the exact allocated directory basename; only already-scrubbed files enter the archive. |
+
+### Record schemas
+
+#### AwsFinding
+
+- `id:string`
+- `title:string`
+- `severity:critical|high|medium|low|info`
+- `status:pass|warn|fail|manual`
+- `summary:string`
+- `evidence?:object`
+- `mappings:string[]`
+
+#### AwsAssessmentResult
+
+- `title:string`
+- `summary:object`
+- `findings:AwsFinding[]`
+- `errors?:string[]`
+
+#### AwsAccessCheckResult
+
+- `status:healthy|limited`
+- `accountId?:string`
+- `arn?:string`
+- `surfaces:AwsAccessSurface[]`
+- `notes:string[]`
+- `recommendedNextStep:string`
+
+#### AwsAccessSurface
+
+- `name:string`
+- `service:string`
+- `command:IAM action string`
+- `region:string`
+- `status:readable|not_readable`
+- `count:number|null`
+- `truncated:boolean|null`
+- `error?:string`
+- `error_code?:string|null`
+- `http_status?:number|null`
+
+#### NotCollectedMarker
+
+- `collected:false`
+- `command:string`
+- `error:string|null`
+- `error_code:string|null`
+- `http_status:number|null`
+
+#### RegionScope
+
+- `regions:string[]`
+- `regionsTotal:number|null`
+- `regionsSeen:number`
+- `partial:boolean`
+- `source:arguments|describe-regions|configured-region-fallback`
+- `error?:string`
+
+JSON formatting: Before every JSON write, recursively scrub the complete value. Serialize with two-space indentation, preserve object insertion order, encode Date values as ISO strings through normal JSON conversion, and append exactly one newline.
 
 Overwrite policy: Allocate a new suffixed bundle directory on every rerun; never replace an earlier bundle.
 
