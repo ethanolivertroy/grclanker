@@ -810,6 +810,29 @@ test("foreign-origin next link: LaunchdarklyApiClient.list refuses a server-supp
   });
 });
 
+test("malformed next link keeps collected pages and records a fixed truncation reason", async () => {
+  const requests = [];
+  const client = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async (input) => {
+      requests.push(String(input));
+      return jsonResponse({
+        items: [{ _id: "a" }],
+        totalCount: 1,
+        _links: { next: { href: "https://%" } },
+      });
+    },
+  });
+
+  const members = await client.list("/api/v2/members", {}, { limit: 10, pageSize: 1 });
+  assert.equal(requests.length, 1, "the malformed link never becomes a request");
+  assert.deepEqual(members.items.map((item) => item._id), ["a"]);
+  assert.equal(members.truncated, true, "the malformed remainder is unread even when totalCount equals the records seen");
+  assert.equal(
+    members.truncationReason,
+    "LaunchDarkly next link was malformed, so it was not followed and no request was sent; only the configured origin https://app.launchdarkly.com is requested",
+  );
+});
+
 test("foreign-origin next link: a same-origin link whose authority carries credentials is refused before any request, with fixed text that names neither the credentials nor the link", async () => {
   const planted = "Qw7ZpL2rTk9VbN4xHs8FdC3yMe6GjA5u";
   for (const [label, href] of [
@@ -3440,6 +3463,17 @@ test("verdict rule 1 (silent success): LaunchdarklyApiClient treats a 200 with a
   const none = await documented.listMembers(5);
   assert.deepEqual({ items: none.items, truncated: none.truncated, seen: none.seen, total: none.total }, { items: [], truncated: false, seen: 0, total: 0 }, "a documented empty listing stays a readable empty inventory");
   assert.equal((await documented.getCallerIdentity()).accountId, "acct-1");
+
+  const nullOnly = new LaunchdarklyApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [null], totalCount: 1 }),
+    maxRetries: 0,
+  });
+  await assert.rejects(nullOnly.listMembers(5), (error) => {
+    assert.ok(error instanceof LaunchdarklyApiError);
+    assert.equal(error.status, 200);
+    assert.match(error.message, /JSON body that is not the documented list object with an items array/);
+    return true;
+  });
 });
 
 test("verdict rule 1 (silent success): a silent 200 on any LaunchDarkly inventory is recorded not_readable with the observed 200, nothing passes or fails on it, no value falls back, and nothing from the body is echoed", async () => {

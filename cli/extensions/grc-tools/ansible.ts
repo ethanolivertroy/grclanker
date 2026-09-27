@@ -2570,7 +2570,7 @@ export async function collectAnsibleJobHealthData(client: AnsibleClientSurface, 
     { type: "job", started__gt: since, order_by: "-started" },
     clampNumber(options.jobLimit, DEFAULT_JOB_LIMIT, 1, 5000),
   );
-  const jobSettings = await fetchObject(client, "job settings", "/api/v2/settings/jobs/");
+  const jobSettings = await fetchSettings(client, "job settings", "/api/v2/settings/jobs/", JOB_SETTING_FIELDS);
   const instanceGroups = await collect(client, "instance groups", "/api/v2/instance_groups/", {}, 200);
   return { days, since, scope, jobs, jobSettings, instanceGroups };
 }

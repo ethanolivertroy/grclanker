@@ -724,6 +724,10 @@ export function launchdarklyRefusedLinkMessage(kind: LaunchdarklyRefusedLinkKind
   }
 }
 
+function launchdarklyMalformedLinkMessage(configuredOrigin: string): string {
+  return `LaunchDarkly next link was malformed, so it was not followed and no request was sent; only the configured origin ${configuredOrigin} is requested`;
+}
+
 /** A link that names its own scheme (RFC 3986 scheme characters, any case) and so is not a path on the configured base. */
 const ABSOLUTE_LINK_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
 
@@ -1363,7 +1367,9 @@ const MEMBER_SHAPE: LaunchdarklyResponseShape = { kind: "object", documentedKeys
 function matchesResponseShape(payload: unknown, shape: LaunchdarklyResponseShape): payload is JsonRecord {
   const record = asObject(payload);
   if (!record) return false;
-  if (shape.kind === "list") return Array.isArray(record.items);
+  if (shape.kind === "list") {
+    return Array.isArray(record.items) && (record.items.length === 0 || record.items.some((item) => asObject(item) !== undefined));
+  }
   return shape.documentedKeys.some((key) => key in record);
 }
 
@@ -1700,10 +1706,12 @@ export class LaunchdarklyApiClient {
           nextUrl = this.buildUrl(nextHref);
           requestedPageSize = requestedLimit(nextUrl);
         } catch (error) {
-          if (!(error instanceof LaunchdarklyForeignOriginError)) throw error;
-          // The link is refused before any request is built: the pages already read stay, the rest is reported unseen.
+          if (!(error instanceof LaunchdarklyForeignOriginError) && !(error instanceof TypeError)) throw error;
+          // A refused or malformed link stops before another request is built. Pages already read stay, and the rest is unseen.
           remaining = true;
-          truncationReason = error.message;
+          truncationReason = error instanceof LaunchdarklyForeignOriginError
+            ? error.message
+            : launchdarklyMalformedLinkMessage(new URL(this.config.baseUrl).origin);
           break;
         }
       } else if (total !== undefined && offset < total && pageItems.length >= Math.min(pageSize, limit)) {
@@ -1728,7 +1736,7 @@ export class LaunchdarklyApiClient {
     return {
       items: items.map(scrubCollectedRecord),
       // A refused next link leaves the remainder unread even when the server total matches the items seen so far.
-      truncated: truncationReason !== undefined || (total !== undefined ? total > items.length : remaining),
+      truncated: truncationReason !== undefined || remaining || (total !== undefined && total > items.length),
       seen: items.length,
       total,
       endpoint,
