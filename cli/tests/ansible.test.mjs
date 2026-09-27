@@ -916,6 +916,20 @@ test("control 28 warns on unlimited instance groups and goes manual when limit f
   assert.match(byId(legacy, "AAP-JOB-06").summary, /SCHEDULE_MAX_JOBS absent/);
 });
 
+test("control 28 treats an empty job-settings object as unreadable", async () => {
+  const result = await assessAnsibleJobHealth(createMockClient({
+    routes: { "/api/v2/settings/jobs/": {} },
+  }));
+  const finding = byId(result, "AAP-JOB-06");
+  assert.equal(finding.status, "manual");
+  assert.match(finding.summary, /job settings \(\/api\/v2\/settings\/jobs\/\): no documented settings key returned/);
+  assert.deepEqual(finding.evidence, {
+    error: "job settings (/api/v2/settings/jobs/): no documented settings key returned",
+    http_status: null,
+    endpoint: "/api/v2/settings/jobs/",
+  });
+});
+
 test("assessAnsibleHostCoverage flags unmanaged, stale, disabled, and sync health gaps", async () => {
   const client = createMockClient({
     routes: {
