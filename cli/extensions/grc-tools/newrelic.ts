@@ -906,9 +906,8 @@ function isRetryableStatus(status: number): boolean {
 
 function parseLinkNext(linkHeader: string | null): string | undefined {
   if (!linkHeader) return undefined;
-  for (const part of linkHeader.split(",")) {
-    const match = part.match(/<([^>]+)>\s*;\s*rel="?next"?/i);
-    if (match) return match[1];
+  for (const match of linkHeader.matchAll(/<([^>]+)>\s*;\s*([^,]*)/gi)) {
+    if (/(?:^|;)\s*rel\s*=\s*"?next"?(?:\s*;|$)/i.test(match[2] ?? "")) return match[1];
   }
   return undefined;
 }
