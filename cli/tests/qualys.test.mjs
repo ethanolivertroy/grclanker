@@ -1548,6 +1548,22 @@ test("QualysApiClient follows only same-origin WARNING/URL continuations without
   assert.equal(userinfo.requests.length, 1);
 });
 
+test("QualysApiClient marks an empty page with a WARNING/URL continuation truncated", async () => {
+  let requests = 0;
+  const client = new QualysApiClient(sampleConfig(), {
+    fetchImpl: async () => {
+      requests += 1;
+      return xmlResponse("<HOST_LIST_OUTPUT><RESPONSE><HOST_LIST /><WARNING><CODE>1980</CODE><TEXT>truncated</TEXT><URL><![CDATA[?id_min=2]]></URL></WARNING></RESPONSE></HOST_LIST_OUTPUT>");
+    },
+    sleepImpl: async () => {},
+  });
+
+  const result = await client.listHosts(50);
+  assert.equal(requests, 1, "the stalled walk stops before requesting another empty page");
+  assert.equal(result.truncated, true);
+  assert.match(result.truncationReason, /empty page.*WARNING\/URL continuation/);
+});
+
 test("rule 7: QualysApiClient runs pagination to completion or records truncation instead of trusting the first page", async () => {
   const client = routedClient(partialRouter);
 

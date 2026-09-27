@@ -1765,7 +1765,8 @@ export class NewrelicApiClient {
     let url: string | undefined = path;
     let limitReached = false;
     for (let page = 0; url && page < MAX_PAGES && items.length < limit; page += 1) {
-      const { payload, nextUrl } = await this.restGet(url);
+      const currentUrl = this.buildRestUrl(url);
+      const { payload, nextUrl } = await this.restGet(currentUrl);
       const pageItems = asRecords(payload[collectionKey]);
       const kept = pageItems.slice(0, Math.max(0, limit - items.length));
       items.push(...kept);
@@ -1774,7 +1775,7 @@ export class NewrelicApiClient {
         url = undefined;
       } else {
         try {
-          url = resolveSameOriginUrl(nextUrl, this.config.restBaseUrl).toString();
+          url = resolveSameOriginUrl(nextUrl, currentUrl).toString();
         } catch (error) {
           if (!(error instanceof NextLinkError)) throw error;
           return { items, complete: false, note: `stopped after ${items.length} items because ${error.message}` };

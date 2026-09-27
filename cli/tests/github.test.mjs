@@ -828,7 +828,7 @@ test("GitHubAuditorClient handles installation token refresh, rate limits, and p
 });
 
 test("GitHubAuditorClient follows only same-origin REST next links without userinfo", async () => {
-  function clientFor(nextLink, requests) {
+  function clientFor(nextLink, requests, relation = 'rel="next"') {
     return new GitHubAuditorClient(createSampleConfig(), async (input, init = {}) => {
       const url = new URL(input.toString());
       requests.push({ url, authorization: init.headers?.Authorization });
@@ -839,7 +839,7 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
             status: 200,
             headers: {
               "content-type": "application/json",
-              link: `<${nextLink}>; rel="next"`,
+              link: `<${nextLink}>; ${relation}`,
             },
           },
         );
@@ -873,6 +873,26 @@ test("GitHubAuditorClient follows only same-origin REST next links without useri
     /carries userinfo/,
   );
   assert.equal(userinfoRequests.length, 1, "a userinfo-bearing next link must never be requested");
+
+  const variantRequests = [];
+  const variant = await clientFor(
+    "https://api.github.com/orgs/example-org/repos?per_page=100&page=2",
+    variantRequests,
+    'type="application/json"; rel=next; title="more"',
+  ).listRepositories();
+  assert.deepEqual(variant.map((repo) => repo.full_name), ["example-org/repo-one", "example-org/repo-two"]);
+  assert.equal(variantRequests.length, 2, "valid Link parameters before an unquoted rel=next are followed");
+
+  const rejectedVariantRequests = [];
+  await assert.rejects(
+    clientFor(
+      "https://attacker.example/collect",
+      rejectedVariantRequests,
+      'type="application/json"; rel=next',
+    ).listRepositories(),
+    /does not share the configured origin https:\/\/api\.github\.com/,
+  );
+  assert.equal(rejectedVariantRequests.length, 1, "a foreign Link relation variant is rejected, not treated as exhaustion");
 });
 
 test("GitHub assessment helpers classify sample posture correctly", () => {

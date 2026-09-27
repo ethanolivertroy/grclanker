@@ -1,4 +1,5 @@
 import test from "node:test";
+import assert from "node:assert/strict";
 
 import { GitHubAuditorClient } from "../dist/extensions/grc-tools/github.js";
 import { NewrelicApiClient } from "../dist/extensions/grc-tools/newrelic.js";
@@ -139,5 +140,64 @@ test("credentialed pagination integrations pass the class 8 next-link leak probe
   ]) {
     const result = await runLeakProbe({ integration, nextLinkRunner });
     assertNoLeaks(result);
+  }
+});
+
+test("credentialed pagination resolves query- and path-relative links from the current page", async () => {
+  const cases = [
+    {
+      name: "Webex",
+      runner: webexNextLinkRunner,
+      base: "https://api.example.com/custom/v1",
+      queryPath: "/custom/v1/people",
+      relativePath: "/custom/v1/next",
+    },
+    {
+      name: "New Relic",
+      runner: newrelicNextLinkRunner,
+      base: "https://api.example.com/custom",
+      queryPath: "/custom/v2/users.json",
+      relativePath: "/custom/v2/next",
+    },
+    {
+      name: "GitHub",
+      runner: githubNextLinkRunner,
+      base: "https://api.example.com/api/v3",
+      queryPath: "/api/v3/orgs/example-org/repos",
+      relativePath: "/api/v3/orgs/example-org/next",
+    },
+    {
+      name: "Qualys",
+      runner: qualysNextLinkRunner,
+      base: "https://api.example.com/custom",
+      queryPath: "/custom/api/2.0/fo/asset/host/",
+      relativePath: "/custom/api/2.0/fo/asset/host/next",
+    },
+  ];
+
+  for (const entry of cases) {
+    const queryRequests = [];
+    const queryResult = await entry.runner({
+      nextLink: "?cursor=query-relative",
+      requests: queryRequests,
+      origin: entry.base,
+    });
+    assert.equal(queryResult.truncated, false, `${entry.name} query-relative walk completes`);
+    assert.equal(queryRequests.length, 1, `${entry.name} follows the query-relative page`);
+    const queryUrl = new URL(queryRequests[0].url);
+    assert.equal(queryUrl.pathname, entry.queryPath, `${entry.name} keeps the current endpoint path`);
+    assert.equal(queryUrl.searchParams.get("cursor"), "query-relative");
+
+    const pathRequests = [];
+    const pathResult = await entry.runner({
+      nextLink: "next?cursor=path-relative",
+      requests: pathRequests,
+      origin: entry.base,
+    });
+    assert.equal(pathResult.truncated, false, `${entry.name} path-relative walk completes`);
+    assert.equal(pathRequests.length, 1, `${entry.name} follows the path-relative page`);
+    const pathUrl = new URL(pathRequests[0].url);
+    assert.equal(pathUrl.pathname, entry.relativePath, `${entry.name} resolves from the current page directory`);
+    assert.equal(pathUrl.searchParams.get("cursor"), "path-relative");
   }
 });

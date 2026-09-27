@@ -1206,7 +1206,8 @@ export class QualysApiClient {
     let dropped = false;
     let truncationReason: string | undefined;
     while (nextUrl && items.length < limit && pages < maxPages) {
-      const document: XmlNode = await this.getXml(nextUrl);
+      const currentUrl = nextUrl;
+      const document: XmlNode = await this.getXml(currentUrl);
       pages += 1;
       const pageItems = xmlRecords(document, elementName);
       const room = limit - items.length;
@@ -1218,7 +1219,7 @@ export class QualysApiClient {
         nextUrl = undefined;
       } else {
         try {
-          nextUrl = resolveSameOriginUrl(continuation, this.config.baseUrl).toString();
+          nextUrl = resolveSameOriginUrl(continuation, currentUrl).toString();
         } catch (error) {
           if (!(error instanceof NextLinkError)) throw error;
           truncationReason = error.message;
@@ -1226,7 +1227,10 @@ export class QualysApiClient {
           break;
         }
       }
-      if (pageItems.length === 0) break;
+      if (pageItems.length === 0) {
+        if (nextUrl) truncationReason = "the server returned an empty page while still offering a WARNING/URL continuation";
+        break;
+      }
     }
     if (!truncationReason && (dropped || (nextUrl && items.length >= limit))) {
       truncationReason = `item cap ${limit} reached with more records available`;

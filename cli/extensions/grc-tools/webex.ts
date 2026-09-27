@@ -18,7 +18,15 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { ConfigFileError, NextLinkError, parseJsonConfigText, parseYamlConfigText, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
+import {
+  ConfigFileError,
+  NextLinkError,
+  parseJsonConfigText,
+  parseYamlConfigText,
+  readConfigText,
+  resolveSameOriginUrl,
+  scrubDataText as scrubSharedDataText,
+} from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -422,11 +430,9 @@ function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string
   ].filter((value): value is string => typeof value === "string" && value.length >= 4);
 }
 
-/** Final bundle sink scrub: exact configured/runtime credentials plus free-text credential carriers. */
+/** Final bundle sink scrub: configured/runtime credential encodings plus free-text credential carriers. */
 function scrubBundleText(content: string, secrets: readonly string[]): string {
-  let scrubbed = content;
-  for (const secret of secrets) scrubbed = scrubbed.split(secret).join("[REDACTED]");
-  return scrubErrorText(scrubbed);
+  return scrubValue(scrubSharedDataText(content, { secrets: [...secrets] }));
 }
 
 /**
@@ -989,7 +995,8 @@ export class WebexApiClient {
     let nextUrl: string | null = this.buildUrl(path, { ...pageQuery, ...query });
 
     while (nextUrl) {
-      const response = await this.fetchJson(nextUrl);
+      const currentUrl = nextUrl;
+      const response = await this.fetchJson(currentUrl);
       pageCount += 1;
       const pageItems = extractItems(response.payload);
       const remaining = limit - items.length;
@@ -1003,7 +1010,7 @@ export class WebexApiClient {
       }
       if (nextUrl) {
         try {
-          nextUrl = resolveSameOriginUrl(nextUrl, this.config.baseUrl).toString();
+          nextUrl = resolveSameOriginUrl(nextUrl, currentUrl).toString();
         } catch (error) {
           if (!(error instanceof NextLinkError)) throw error;
           return { items, truncated: true, pageCount };

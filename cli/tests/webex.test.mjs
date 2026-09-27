@@ -1743,7 +1743,13 @@ test("rule 9: no fake secret from any carrier reaches any bundle file or any zip
 });
 
 test("exportWebexAuditBundle applies configured-secret and credential-carrier redaction at the write sink", async () => {
-  const configuredSecret = "SINKCONFIGUREDq7w2e9r4t6y8";
+  const configuredSecret = "S3cr3t???Value";
+  const encodedSecrets = [
+    encodeURIComponent(configuredSecret),
+    Buffer.from(configuredSecret).toString("base64"),
+    Buffer.from(configuredSecret).toString("base64url"),
+  ];
+  assert.equal(new Set(encodedSecrets).size, 3, "the URL, base64, and base64url fixtures are distinct");
   const bearerSecret = "SINKBEARERm4n8b2v6c0x5";
   const assignmentSecret = "SINKASSIGNMENTp3o7i1u5y9t2";
   const baseClient = compliantClient();
@@ -1756,14 +1762,18 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
     },
     async listPeople() {
       const people = await baseClient.listPeople();
-      return page(people.items.map((person, index) => ({
-        ...person,
-        displayName: index === 0
-          ? `Bearer ${bearerSecret}`
-          : index === 1
-            ? `token=${assignmentSecret}`
-            : person.displayName,
-      })));
+      return page([
+        ...people.items.map((person, index) => ({
+          ...person,
+          displayName: index === 0
+            ? `Bearer ${bearerSecret}`
+            : index === 1
+              ? `token=${assignmentSecret}`
+              : encodedSecrets[index - 2] ?? person.displayName,
+        })),
+        { id: "legit-monkey", displayName: "Monkey: Business", emails: ["monkey@example.com"], type: "person", roles: [] },
+        { id: "legit-basic", displayName: "Basic authentication", emails: ["basic@example.com"], type: "person", roles: [] },
+      ]);
     },
   });
   const base = createTempBase("grclanker-webex-sink-redaction-");
@@ -1773,7 +1783,7 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
     base,
   );
 
-  const forbidden = [configuredSecret, bearerSecret, assignmentSecret];
+  const forbidden = [configuredSecret, ...encodedSecrets, bearerSecret, assignmentSecret];
   for (const file of walkFiles(result.outputDir)) {
     const content = readFileSync(file, "utf8");
     for (const secret of forbidden) assert.equal(content.includes(secret), false, `${secret} leaked into ${relative(result.outputDir, file)}`);
@@ -1781,6 +1791,19 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
   for (const entry of readZipEntries(readFileSync(result.zipPath))) {
     for (const secret of forbidden) assert.equal(entry.content.includes(secret), false, `${secret} leaked into zip:${entry.name}`);
   }
+
+  const peoplePath = "core_data/identity/people.json";
+  const peopleJson = readFileSync(join(result.outputDir, peoplePath), "utf8");
+  const people = JSON.parse(peopleJson);
+  assert.ok(people.some((person) => person.displayName === "Monkey: Business"));
+  assert.ok(people.some((person) => person.displayName === "Basic authentication"));
+  for (const secret of encodedSecrets) assert.equal(peopleJson.includes(secret), false, `${secret} leaked into ${peoplePath}`);
+
+  const peopleZip = readZipEntries(readFileSync(result.zipPath)).find((entry) => entry.name === peoplePath);
+  assert.ok(peopleZip, `${peoplePath} must be present in the zip`);
+  assert.match(peopleZip.content, /Monkey: Business/);
+  assert.match(peopleZip.content, /Basic authentication/);
+  for (const secret of encodedSecrets) assert.equal(peopleZip.content.includes(secret), false, `${secret} leaked into zip:${peoplePath}`);
 });
 
 /** Rule 9 error path: one canary per carrier that only an error response can bring into the bundle. */

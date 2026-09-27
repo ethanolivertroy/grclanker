@@ -2030,7 +2030,8 @@ export class GitHubAuditorClient {
     let truncationReason: string | undefined;
 
     while (nextPath) {
-      visited.add(this.buildUrl(nextPath));
+      const currentUrl = this.buildUrl(nextPath);
+      visited.add(currentUrl);
       const { response, payload } = await this.requestJson(nextPath);
       const pageRecords = extractRecords(payload);
       for (const record of pageRecords) {
@@ -2045,7 +2046,7 @@ export class GitHubAuditorClient {
       const advertisedNext = parseNextLink(response.headers.get("link"));
       if (advertisedNext) {
         try {
-          nextPath = resolveSameOriginUrl(advertisedNext, this.config.apiBaseUrl).toString();
+          nextPath = resolveSameOriginUrl(advertisedNext, currentUrl).toString();
         } catch (error) {
           if (!(error instanceof NextLinkError)) throw error;
           truncated = true;
@@ -2078,8 +2079,10 @@ export function clearGitHubTokenCacheForTests(): void {
 
 function parseNextLink(linkHeader: string | null): string | null {
   if (!linkHeader) return null;
-  const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/i);
-  return match?.[1] ?? null;
+  for (const match of linkHeader.matchAll(/<([^>]+)>\s*;\s*([^,]*)/gi)) {
+    if (/(?:^|;)\s*rel\s*=\s*"?next"?(?:\s*;|$)/i.test(match[2] ?? "")) return match[1];
+  }
+  return null;
 }
 
 interface GraphqlPageStep {
