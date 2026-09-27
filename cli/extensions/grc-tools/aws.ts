@@ -95,154 +95,69 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  AWS_CONTROL_CATALOG,
+  AWS_DEFAULTS,
+  AWS_FINDING_CONTROLS,
+  AWS_FRAMEWORKS,
+  AWS_IAM_ACTIONS,
+  AWS_REQUIRED_OUTPUT_MEMBERS,
+  AWS_REQUIRED_PUBLIC_ACCESS_FLAGS,
+  AWS_SPEC,
+  AWS_VERDICT_VALUES,
+} from "./aws.spec.js";
+import type {
+  AwsControlDescriptor,
+  AwsFrameworkDescriptor,
+  AwsFrameworkKey,
+  AwsOutputMemberKind,
+} from "./aws.spec.js";
+import { checkContract, defineGrcTool, evaluateVerdictCriteria, toolContract } from "./spec-model.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+
+export {
+  AWS_CONTROL_CATALOG,
+  AWS_FINDING_CONTROLS,
+  AWS_FRAMEWORKS,
+  AWS_REQUIRED_OUTPUT_MEMBERS,
+} from "./aws.spec.js";
+export type {
+  AwsControlDescriptor,
+  AwsFrameworkDescriptor,
+  AwsFrameworkKey,
+  AwsOutputMemberKind,
+} from "./aws.spec.js";
 
 type JsonRecord = Record<string, unknown>;
 
-const DEFAULT_REGION = "us-east-1";
-const DEFAULT_OUTPUT_DIR = "./export/aws";
-const DEFAULT_USER_LIMIT = 500;
-const DEFAULT_ROLE_LIMIT = 500;
-const DEFAULT_STALE_DAYS = 90;
-const DEFAULT_MAX_PRIVILEGED_ROLES = 5;
-const DEFAULT_MAX_FINDINGS = 200;
-const DEFAULT_REGION_LIMIT = 30;
-const DEFAULT_BUCKET_LIMIT = 1000;
-const DEFAULT_KEY_LIMIT = 1000;
-const DEFAULT_INSTANCE_LIMIT = 500;
-const DEFAULT_RESOURCE_LIMIT = 2000;
-const DEFAULT_POLICY_LIMIT = 1000;
-const DEFAULT_EVENT_LIMIT = 500;
-const DEFAULT_ACCOUNT_LIMIT = 1000;
-const DEFAULT_TARGET_LIMIT = 1000;
-const DEFAULT_ANALYZER_LIMIT = 100;
-const DEFAULT_STANDARD_LIMIT = 100;
-const DEFAULT_DETECTOR_LIMIT = 50;
-/** Upper bound on pages walked per list call; a token that never stops advancing is reported as truncation. */
-const MAX_PAGES_PER_LIST = 1000;
-const DEFAULT_ROOT_LOOKBACK_DAYS = 90;
+const DEFAULT_REGION = AWS_DEFAULTS.region;
+const DEFAULT_OUTPUT_DIR = AWS_DEFAULTS.outputDir;
+const DEFAULT_USER_LIMIT: number = AWS_DEFAULTS.userLimit;
+const DEFAULT_ROLE_LIMIT: number = AWS_DEFAULTS.roleLimit;
+const DEFAULT_STALE_DAYS: number = AWS_DEFAULTS.staleDays;
+const DEFAULT_MAX_PRIVILEGED_ROLES: number = AWS_DEFAULTS.maxPrivilegedRoles;
+const DEFAULT_MAX_FINDINGS: number = AWS_DEFAULTS.maxFindings;
+const DEFAULT_REGION_LIMIT: number = AWS_DEFAULTS.regionLimit;
+const DEFAULT_BUCKET_LIMIT: number = AWS_DEFAULTS.bucketLimit;
+const DEFAULT_KEY_LIMIT: number = AWS_DEFAULTS.keyLimit;
+const DEFAULT_INSTANCE_LIMIT: number = AWS_DEFAULTS.instanceLimit;
+const DEFAULT_RESOURCE_LIMIT: number = AWS_DEFAULTS.resourceLimit;
+const DEFAULT_POLICY_LIMIT: number = AWS_DEFAULTS.policyLimit;
+const DEFAULT_EVENT_LIMIT: number = AWS_DEFAULTS.eventLimit;
+const DEFAULT_ACCOUNT_LIMIT: number = AWS_DEFAULTS.accountLimit;
+const DEFAULT_TARGET_LIMIT: number = AWS_DEFAULTS.targetLimit;
+const DEFAULT_ANALYZER_LIMIT: number = AWS_DEFAULTS.analyzerLimit;
+const DEFAULT_STANDARD_LIMIT: number = AWS_DEFAULTS.standardLimit;
+const DEFAULT_DETECTOR_LIMIT: number = AWS_DEFAULTS.detectorLimit;
+const MAX_PAGES_PER_LIST: number = AWS_DEFAULTS.maxPagesPerList;
+const DEFAULT_ROOT_LOOKBACK_DAYS: number = AWS_DEFAULTS.rootLookbackDays;
 /** Global service events such as root ConsoleLogin are delivered to CloudTrail in us-east-1 only. */
-export const ROOT_EVENT_REGION = "us-east-1";
-const DEFAULT_CONCURRENCY = 8;
-const DEFAULT_SENSITIVE_PORTS = [21, 22, 23, 445, 1433, 1521, 3306, 3389, 5432, 5900, 6379, 9200, 27017];
-const ANY_IPV4 = "0.0.0.0/0";
-const ANY_IPV6 = "::/0";
-const REQUIRED_PUBLIC_ACCESS_FLAGS = [
-  "BlockPublicAcls",
-  "IgnorePublicAcls",
-  "BlockPublicPolicy",
-  "RestrictPublicBuckets",
-] as const;
-
-export type AwsFrameworkKey =
-  | "fedramp"
-  | "cmmc"
-  | "soc2"
-  | "cis"
-  | "pci_dss"
-  | "disa_stig"
-  | "irap"
-  | "ismap";
-
-export interface AwsFrameworkDescriptor {
-  key: AwsFrameworkKey;
-  label: string;
-  file: string;
-}
-
-/** Framework labels double as mapping prefixes, matching the existing "CIS AWS 1.4" style. */
-export const AWS_FRAMEWORKS: ReadonlyArray<AwsFrameworkDescriptor> = [
-  { key: "fedramp", label: "FedRAMP", file: "fedramp" },
-  { key: "cmmc", label: "CMMC", file: "cmmc" },
-  { key: "soc2", label: "SOC 2", file: "soc2" },
-  { key: "cis", label: "CIS AWS", file: "cis" },
-  { key: "pci_dss", label: "PCI-DSS", file: "pci-dss" },
-  { key: "disa_stig", label: "DISA STIG", file: "disa-stig" },
-  { key: "irap", label: "IRAP", file: "irap" },
-  { key: "ismap", label: "ISMAP", file: "ismap" },
-];
-
-export interface AwsControlDescriptor {
-  title: string;
-  frameworks: Record<AwsFrameworkKey, string[]>;
-}
-
-function control(
-  title: string,
-  fedramp: string[],
-  cmmc: string[],
-  soc2: string[],
-  cis: string[],
-  pciDss: string[],
-  disaStig: string[],
-  irap: string[],
-  ismap: string[],
-): AwsControlDescriptor {
-  return {
-    title,
-    frameworks: { fedramp, cmmc, soc2, cis, pci_dss: pciDss, disa_stig: disaStig, irap, ismap },
-  };
-}
-
-/** Section 5 of specs/aws-sec-inspector.spec.md, one row per numbered control. */
-export const AWS_CONTROL_CATALOG: Record<number, AwsControlDescriptor> = {
-  1: control("MFA Enforcement", ["IA-2(1)", "IA-2(2)"], ["AC.L2-3.1.1"], ["CC6.1", "CC6.6"], ["1.5", "1.6", "1.10"], ["8.4.2"], ["SRG-APP-000149"], ["ISM-1401"], ["7.2.1"]),
-  2: control("Password Policy", ["IA-5(1)"], ["IA.L2-3.5.7"], ["CC6.1"], ["1.8", "1.9"], ["8.3.6"], ["SRG-APP-000166"], ["ISM-0421"], ["7.2.2"]),
-  3: control("Access Key Rotation", ["IA-5(1)"], ["IA.L2-3.5.8"], ["CC6.1", "CC6.2"], ["1.12", "1.14"], ["8.6.3"], ["SRG-APP-000175"], ["ISM-1590"], ["7.2.3"]),
-  4: control("Root Account Usage", ["AC-6(1)", "AC-6(5)"], ["AC.L2-3.1.5"], ["CC6.1", "CC6.3"], ["1.4", "1.7"], ["8.6.1"], ["SRG-APP-000340"], ["ISM-1507"], ["7.1.1"]),
-  5: control("Unused Credentials", ["AC-2(3)"], ["AC.L2-3.1.12"], ["CC6.2"], ["1.12"], ["8.1.4"], ["SRG-APP-000163"], ["ISM-1404"], ["7.2.4"]),
-  6: control("CloudTrail Enabled", ["AU-2", "AU-3", "AU-12"], ["AU.L2-3.3.1"], ["CC7.2", "CC7.3"], ["3.1", "3.2"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.1"]),
-  7: control("CloudTrail Log Integrity", ["AU-9", "AU-10"], ["AU.L2-3.3.8"], ["CC7.2"], ["3.4", "3.7"], ["10.3.2"], ["SRG-APP-000125"], ["ISM-0859"], ["8.1.2"]),
-  8: control("Security Hub Enabled", ["CA-7", "SI-4"], ["CA.L2-3.12.3"], ["CC7.1", "CC7.2"], [], ["11.5.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.1"]),
-  9: control("GuardDuty Enabled", ["SI-4", "IR-4"], ["SI.L2-3.14.6"], ["CC7.2", "CC7.3"], [], ["11.5.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.2"]),
-  10: control("Config Enabled", ["CM-2", "CM-6", "CM-8"], ["CM.L2-3.4.1"], ["CC7.1"], ["3.5"], ["10.2.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.2.3"]),
-  11: control("S3 Public Access", ["AC-3", "AC-4"], ["AC.L2-3.1.3"], ["CC6.1", "CC6.6"], ["2.1.4"], ["1.3.1"], ["SRG-APP-000516"], ["ISM-0263"], ["6.1.1"]),
-  12: control("Encryption at Rest", ["SC-28"], ["SC.L2-3.13.16"], ["CC6.1", "CC6.7"], ["2.2.1"], ["3.4.1"], ["SRG-APP-000231"], ["ISM-0457"], ["6.2.1"]),
-  13: control("Encryption in Transit", ["SC-8", "SC-23"], ["SC.L2-3.13.8"], ["CC6.1", "CC6.7"], [], ["4.1.1"], ["SRG-APP-000014"], ["ISM-0469"], ["6.2.2"]),
-  14: control("VPC Flow Logs", ["AU-12", "SI-4"], ["AU.L2-3.3.1"], ["CC7.2"], ["3.9"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.3"]),
-  15: control("Cross-Account Access", ["AC-3", "AC-6"], ["AC.L2-3.1.2"], ["CC6.1", "CC6.3"], ["1.16"], ["7.2.1"], ["SRG-APP-000033"], ["ISM-1380"], ["7.1.2"]),
-  16: control("SCP Enforcement", ["AC-3", "CM-7"], ["AC.L2-3.1.7"], ["CC6.1", "CC6.8"], [], ["7.2.1"], ["SRG-APP-000246"], ["ISM-1380"], ["7.1.3"]),
-  17: control("Permission Boundaries", ["AC-6(1)", "AC-6(2)"], ["AC.L2-3.1.5"], ["CC6.3"], [], ["7.2.2"], ["SRG-APP-000340"], ["ISM-1380"], ["7.1.4"]),
-  18: control("Least Privilege", ["AC-6"], ["AC.L2-3.1.5"], ["CC6.1", "CC6.3"], ["1.16"], ["7.2.2"], ["SRG-APP-000342"], ["ISM-1380"], ["7.1.5"]),
-  19: control("Logging Configuration", ["AU-2", "AU-3", "AU-6"], ["AU.L2-3.3.1"], ["CC7.2", "CC7.3"], ["3.1", "3.3", "3.5"], ["10.2.1"], ["SRG-APP-000089"], ["ISM-0580"], ["8.1.4"]),
-  20: control("Network ACLs", ["AC-4", "SC-7"], ["SC.L2-3.13.1"], ["CC6.1", "CC6.6"], ["5.1"], ["1.3.1"], ["SRG-APP-000142"], ["ISM-1416"], ["6.1.2"]),
-  21: control("Security Group Rules", ["AC-4", "SC-7"], ["SC.L2-3.13.1"], ["CC6.1", "CC6.6"], ["5.2", "5.3"], ["1.3.2"], ["SRG-APP-000142"], ["ISM-1416"], ["6.1.3"]),
-  22: control("KMS Key Rotation", ["SC-12", "SC-28"], ["SC.L2-3.13.10"], ["CC6.1", "CC6.7"], ["3.8"], ["3.6.4"], ["SRG-APP-000231"], ["ISM-0457"], ["6.2.3"]),
-  23: control("Identity Center Configuration", ["AC-2", "IA-2"], ["AC.L2-3.1.1"], ["CC6.1", "CC6.2"], [], ["8.4.2"], ["SRG-APP-000149"], ["ISM-1401"], ["7.2.5"]),
-  24: control("Audit Manager Evidence", ["CA-2", "CA-7"], ["CA.L2-3.12.1"], ["CC4.1"], [], ["12.4.1"], ["SRG-APP-000516"], ["ISM-1228"], ["8.3.1"]),
-  25: control("Account Contacts", ["IR-6", "PM-2"], ["IR.L2-3.6.2"], ["CC7.4"], ["1.1", "1.2"], ["12.10.5"], ["SRG-APP-000516"], ["ISM-0072"], ["9.1.1"]),
-};
-
-/** Spec control numbers covered by each finding id, used for coverage and framework reports. */
-export const AWS_FINDING_CONTROLS: Record<string, number[]> = {
-  "AWS-IAM-01": [1, 4],
-  "AWS-IAM-02": [1],
-  "AWS-IAM-03": [2],
-  "AWS-IAM-04": [3],
-  "AWS-IAM-05": [17],
-  "AWS-IAM-06": [5],
-  "AWS-IAM-07": [4],
-  "AWS-IAM-08": [18],
-  "AWS-LOG-01": [6, 7],
-  "AWS-LOG-02": [19],
-  "AWS-LOG-03": [8],
-  "AWS-LOG-04": [9],
-  "AWS-LOG-05": [10],
-  "AWS-ORG-01": [16],
-  "AWS-ORG-02": [16],
-  "AWS-ORG-03": [15],
-  "AWS-ORG-04": [15],
-  "AWS-ORG-05": [23],
-  "AWS-ORG-06": [24],
-  "AWS-ORG-07": [25],
-  "AWS-DATA-11": [11],
-  "AWS-DATA-12": [12],
-  "AWS-DATA-13": [13],
-  "AWS-DATA-22": [22],
-  "AWS-NET-14": [14],
-  "AWS-NET-20": [20],
-  "AWS-NET-21": [21],
-};
+export const ROOT_EVENT_REGION = AWS_DEFAULTS.rootEventRegion;
+const DEFAULT_CONCURRENCY: number = AWS_DEFAULTS.concurrency;
+const DEFAULT_SENSITIVE_PORTS: number[] = [...AWS_DEFAULTS.sensitivePorts];
+const ANY_IPV4 = AWS_VERDICT_VALUES.publicIpv4Cidr;
+const ANY_IPV6 = AWS_VERDICT_VALUES.publicIpv6Cidr;
+const REQUIRED_PUBLIC_ACCESS_FLAGS = AWS_REQUIRED_PUBLIC_ACCESS_FLAGS;
 
 export function buildAwsMappings(controlNumber: number): string[] {
   const descriptor = AWS_CONTROL_CATALOG[controlNumber];
@@ -442,8 +357,14 @@ function finding(
   summary: string,
   mappings: string[],
   evidence?: JsonRecord,
+  decisionFacts?: JsonRecord,
 ): AwsFinding {
-  return { id, title, severity, status, summary, mappings, evidence };
+  const publishedCheck = checkContract(AWS_SPEC, id);
+  const evaluatedStatus = evaluateVerdictCriteria(publishedCheck.criteria, { ...(evidence ?? {}), ...(decisionFacts ?? {}) });
+  if (evaluatedStatus !== status) {
+    throw new Error(`Check ${id} runtime status ${status} disagrees with metadata status ${evaluatedStatus}`);
+  }
+  return { id, title, severity, status: evaluatedStatus, summary, mappings, evidence };
 }
 
 /** Every JSON file the bundle writes goes through the snapshot walk first (rule 9 at every depth, with the cap). */
@@ -1286,68 +1207,6 @@ type SdkClientPrototype = {
 };
 
 /**
- * The documented shape of a top-level output member: a list, a map or structure (which the service never answers
- * empty), a non-empty string, a boolean, or a string that is a JSON policy document carrying a Statement.
- */
-export type AwsOutputMemberKind = "list" | "map" | "structure" | "string" | "boolean" | "policyDocument";
-
-/**
- * The top-level output member each command the client sends is answered with, and its documented shape; a list
- * member is present (empty) even when the account holds nothing. When a command can answer with one of several
- * members, any one counts, and every one that is present must have its documented shape. A 2xx whose deserialized
- * output carries none of them, or carries one in another shape (a string where a list is documented, an empty
- * structure, bare text inside an XML list element the deserializer read as empty, a Policy that is not a policy
- * document), was not a service response (a proxy's HTML page, an empty body the SDK turns into an output without
- * members, a foreign document bound to a payload member) and is thrown as IncompleteResponse rather than read as
- * an empty inventory or a default.
- */
-export const AWS_REQUIRED_OUTPUT_MEMBERS: Readonly<Record<string, Readonly<Record<string, AwsOutputMemberKind>>>> = Object.freeze({
-  GetCallerIdentity: { Account: "string" },
-  GetAccountSummary: { SummaryMap: "map" },
-  GetAccountPasswordPolicy: { PasswordPolicy: "structure" },
-  ListUsers: { Users: "list" },
-  ListMFADevices: { MFADevices: "list" },
-  ListAccessKeys: { AccessKeyMetadata: "list" },
-  GetAccessKeyLastUsed: { AccessKeyLastUsed: "structure" },
-  GetAccountAuthorizationDetails: { RoleDetailList: "list", UserDetailList: "list", GroupDetailList: "list", Policies: "list" },
-  ListPolicies: { Policies: "list" },
-  GetPolicyVersion: { PolicyVersion: "structure" },
-  LookupEvents: { Events: "list" },
-  DescribeTrails: { trailList: "list" },
-  GetTrailStatus: { IsLogging: "boolean" },
-  GetEventSelectors: { TrailARN: "string", EventSelectors: "list", AdvancedEventSelectors: "list" },
-  DescribeHub: { HubArn: "string" },
-  GetEnabledStandards: { StandardsSubscriptions: "list" },
-  DescribeConfigurationRecorders: { ConfigurationRecorders: "list" },
-  DescribeConfigurationRecorderStatus: { ConfigurationRecordersStatus: "list" },
-  ListDetectors: { DetectorIds: "list" },
-  GetDetector: { Status: "string", ServiceRole: "string" },
-  DescribeOrganization: { Organization: "structure" },
-  ListAccounts: { Accounts: "list" },
-  ListTargetsForPolicy: { Targets: "list" },
-  ListAnalyzers: { analyzers: "list" },
-  ListFindings: { findings: "list" },
-  ListInstances: { Instances: "list" },
-  ListAssessments: { assessmentMetadata: "list" },
-  GetAlternateContact: { AlternateContact: "structure" },
-  DescribeRegions: { Regions: "list" },
-  GetPublicAccessBlock: { PublicAccessBlockConfiguration: "structure" },
-  ListBuckets: { Buckets: "list" },
-  GetBucketPolicyStatus: { PolicyStatus: "structure" },
-  GetBucketEncryption: { ServerSideEncryptionConfiguration: "structure" },
-  GetBucketPolicy: { Policy: "policyDocument" },
-  GetEbsEncryptionByDefault: { EbsEncryptionByDefault: "boolean" },
-  DescribeVpcs: { Vpcs: "list" },
-  DescribeFlowLogs: { FlowLogs: "list" },
-  DescribeNetworkAcls: { NetworkAcls: "list" },
-  DescribeSecurityGroups: { SecurityGroups: "list" },
-  DescribeDBInstances: { DBInstances: "list" },
-  ListKeys: { Keys: "list" },
-  DescribeKey: { KeyMetadata: "structure" },
-  GetKeyRotationStatus: { KeyRotationEnabled: "boolean" },
-});
-
-/**
  * The XML element that carries a member when it is not the member's own name. Only the EC2 query protocol renames
  * its top-level members on the wire; the IAM, STS, and RDS query protocol and the S3 REST-XML protocol use the
  * member name.
@@ -1900,7 +1759,8 @@ export function statementDeniesInsecureTransport(statement: JsonRecord): boolean
     const operandRecord = asObject(operands);
     if (!operandRecord) continue;
     for (const [key, value] of Object.entries(operandRecord)) {
-      if (key.toLowerCase() === "aws:securetransport" && conditionValues(value).includes("false")) {
+      if (key.toLowerCase() === AWS_VERDICT_VALUES.secureTransportConditionKey.toLowerCase()
+        && conditionValues(value).includes(AWS_VERDICT_VALUES.secureTransportDeniedValue)) {
         return true;
       }
     }
@@ -2131,7 +1991,7 @@ function hasAdministratorPolicy(role: JsonRecord): boolean {
   const attached = Array.isArray(role.AttachedManagedPolicies) ? role.AttachedManagedPolicies : [];
   if (attached.some((policy) => {
     const item = asObject(policy);
-    return asString(item?.PolicyName) === "AdministratorAccess";
+    return asString(item?.PolicyName) === AWS_VERDICT_VALUES.administratorPolicyName;
   })) {
     return true;
   }
@@ -2907,33 +2767,33 @@ export async function checkAwsAccess(client: AwsAccessCheckClient): Promise<AwsA
   const region = config.region;
   const optionalProbes: Array<Promise<AwsAccessSurface>> = [];
   if (client.describeRegions) {
-    optionalProbes.push(surface("ec2_regions", "ec2", "ec2:DescribeRegions", region, () => client.describeRegions!(), arrayObservation));
+    optionalProbes.push(surface("ec2_regions", "ec2", AWS_IAM_ACTIONS["ec2-describe-regions"], region, () => client.describeRegions!(), arrayObservation));
   }
   if (client.listBuckets) {
-    optionalProbes.push(surface("s3_buckets", "s3", "s3:ListBuckets", region, () => client.listBuckets!(1), pagedObservation));
+    optionalProbes.push(surface("s3_buckets", "s3", AWS_IAM_ACTIONS["s3-list-buckets"], region, () => client.listBuckets!(1), pagedObservation));
   }
   if (client.listKmsKeys) {
-    optionalProbes.push(surface("kms_keys", "kms", "kms:ListKeys", region, () => client.listKmsKeys!(region, 1), pagedObservation));
+    optionalProbes.push(surface("kms_keys", "kms", AWS_IAM_ACTIONS["kms-list-keys"], region, () => client.listKmsKeys!(region, 1), pagedObservation));
   }
   if (client.describeDbInstances) {
-    optionalProbes.push(surface("rds_instances", "rds", "rds:DescribeDBInstances", region, () => client.describeDbInstances!(region, 1), pagedObservation));
+    optionalProbes.push(surface("rds_instances", "rds", AWS_IAM_ACTIONS["rds-describe-db-instances"], region, () => client.describeDbInstances!(region, 1), pagedObservation));
   }
   if (client.listActiveAuditManagerAssessments) {
-    optionalProbes.push(surface("audit_manager", "auditmanager", "auditmanager:ListAssessments", region, () => client.listActiveAuditManagerAssessments!(1), pagedObservation));
+    optionalProbes.push(surface("audit_manager", "auditmanager", AWS_IAM_ACTIONS["auditmanager-list-assessments"], region, () => client.listActiveAuditManagerAssessments!(1), pagedObservation));
   }
   if (client.getSecurityAlternateContact) {
-    optionalProbes.push(surface("account_contacts", "account", "account:GetAlternateContact", region, () => client.getSecurityAlternateContact!(), presenceObservation));
+    optionalProbes.push(surface("account_contacts", "account", AWS_IAM_ACTIONS["account-get-alternate-contact"], region, () => client.getSecurityAlternateContact!(), presenceObservation));
   }
   const surfaces = await Promise.all([
-    surface("iam_summary", "iam", "iam:GetAccountSummary", region, () => client.getAccountSummary(), () => ({ count: 1, truncated: null })),
-    surface("iam_users", "iam", "iam:ListUsers", region, () => client.listIamUsers(1), pagedObservation),
-    surface("cloudtrail", "cloudtrail", "cloudtrail:DescribeTrails", region, () => client.describeTrails(), arrayObservation),
-    surface("security_hub", "securityhub", "securityhub:GetEnabledStandards", region, () => client.getEnabledSecurityHubStandards(), pagedObservation),
-    surface("config", "config", "config:DescribeConfigurationRecorders", region, () => client.describeConfigurationRecorders(), arrayObservation),
-    surface("guardduty", "guardduty", "guardduty:ListDetectors", region, () => client.listDetectors(), pagedObservation),
-    surface("access_analyzer", "access-analyzer", "access-analyzer:ListAnalyzers", region, () => client.listAnalyzers(), pagedObservation),
-    surface("organizations", "organizations", "organizations:DescribeOrganization", region, () => client.describeOrganization(), presenceObservation),
-    surface("identity_center", "sso-admin", "sso:ListInstances", region, () => client.listIdentityCenterInstances(), pagedObservation),
+    surface("iam_summary", "iam", AWS_IAM_ACTIONS["iam-get-account-summary"], region, () => client.getAccountSummary(), () => ({ count: 1, truncated: null })),
+    surface("iam_users", "iam", AWS_IAM_ACTIONS["iam-list-users"], region, () => client.listIamUsers(1), pagedObservation),
+    surface("cloudtrail", "cloudtrail", AWS_IAM_ACTIONS["cloudtrail-describe-trails"], region, () => client.describeTrails(), arrayObservation),
+    surface("security_hub", "securityhub", AWS_IAM_ACTIONS["securityhub-get-enabled-standards"], region, () => client.getEnabledSecurityHubStandards(), pagedObservation),
+    surface("config", "config", AWS_IAM_ACTIONS["config-describe-configuration-recorders"], region, () => client.describeConfigurationRecorders(), arrayObservation),
+    surface("guardduty", "guardduty", AWS_IAM_ACTIONS["guardduty-list-detectors"], region, () => client.listDetectors(), pagedObservation),
+    surface("access_analyzer", "access-analyzer", AWS_IAM_ACTIONS["access-analyzer-list-analyzers"], region, () => client.listAnalyzers(), pagedObservation),
+    surface("organizations", "organizations", AWS_IAM_ACTIONS["organizations-describe-organization"], region, () => client.describeOrganization(), presenceObservation),
+    surface("identity_center", "sso-admin", AWS_IAM_ACTIONS["sso-admin-list-instances"], region, () => client.listIdentityCenterInstances(), pagedObservation),
     ...optionalProbes,
   ]);
 
@@ -2972,7 +2832,7 @@ function classifyPolicyStatements(document: JsonRecord | null): { fullAdmin: num
   let fullAdmin = 0;
   let serviceWildcard = 0;
   for (const statement of normalizeStatements(document, "iam-url-encoded")) {
-    if (asString(statement.Effect)?.toLowerCase() !== "allow") continue;
+    if (asString(statement.Effect)?.toLowerCase() !== AWS_VERDICT_VALUES.allowedNetworkAction) continue;
     if (matchesWildcard(statement.Action) && matchesWildcard(statement.Resource)) {
       fullAdmin += 1;
     } else if (isServiceWildcardAction(statement.Action) && matchesWildcard(statement.Resource)) {
@@ -3238,20 +3098,18 @@ export async function assessAwsIdentity(
   if (summaryRead.error) {
     rootMfaStatus = "manual";
     rootMfaSummary = `The IAM account summary could not be read (${summaryRead.error}); verify root MFA and the absence of root access keys under IAM > Dashboard.`;
-  } else if (accountMfaEnabled !== 1 || (accountAccessKeysPresent ?? 0) > 0) {
+  } else if (accountMfaEnabled !== AWS_VERDICT_VALUES.accountMfaEnabled
+    || (accountAccessKeysPresent ?? AWS_VERDICT_VALUES.accountAccessKeysPresent) > AWS_VERDICT_VALUES.accountAccessKeysPresent) {
     rootMfaStatus = "fail";
-    rootMfaSummary = `Root MFA enabled=${accountMfaEnabled === 1}; root access keys present=${accountAccessKeysPresent ?? "unknown (AccountAccessKeysPresent missing from the summary)"}.`;
+    rootMfaSummary = `Root MFA enabled=${accountMfaEnabled === AWS_VERDICT_VALUES.accountMfaEnabled}; root access keys present=${accountAccessKeysPresent ?? "unknown (AccountAccessKeysPresent missing from the summary)"}.`;
   } else {
     rootMfaStatus = "pass";
     rootMfaSummary = "Root account shows MFA enabled and no access keys present.";
   }
 
-  const passwordComplexityPresent = [
-    passwordPolicy?.RequireSymbols,
-    passwordPolicy?.RequireNumbers,
-    passwordPolicy?.RequireUppercaseCharacters,
-    passwordPolicy?.RequireLowercaseCharacters,
-  ].every((value) => value === true);
+  const passwordComplexityPresent = AWS_VERDICT_VALUES.passwordComplexityFields
+    .map((field) => passwordPolicy?.[field])
+    .every((value) => value === true);
   const passwordMinimumLength = asNumber(passwordPolicy?.MinimumPasswordLength) ?? 0;
   let passwordStatus: AwsFinding["status"];
   let passwordSummary: string;
@@ -3262,7 +3120,7 @@ export async function assessAwsIdentity(
     passwordStatus = "fail";
     passwordSummary = "No account password policy is configured (GetAccountPasswordPolicy returned NoSuchEntity).";
   } else {
-    passwordStatus = passwordMinimumLength < 14 || !passwordComplexityPresent ? "fail" : "pass";
+    passwordStatus = passwordMinimumLength < AWS_VERDICT_VALUES.minimumPasswordLength || !passwordComplexityPresent ? "fail" : "pass";
     passwordSummary = `Minimum length ${passwordMinimumLength} with complexity requirements present=${passwordComplexityPresent}.`;
   }
 
@@ -3326,6 +3184,7 @@ export async function assessAwsIdentity(
         keys_last_used_unreadable: ifRead(userListRead, sample(lastUsedUnreadableKeys)),
         user_inventory_truncated: truncatedFlag(userListRead),
       },
+      { keys_last_used_unreadable_count: lastUsedUnreadableKeys.length },
     ),
     finding(
       "AWS-IAM-05",
@@ -3342,6 +3201,7 @@ export async function assessAwsIdentity(
         max_privileged_roles: maxPrivilegedRoles,
         role_inventory_truncated: truncatedFlag(roleListRead),
       },
+      { roles_without_boundaries_count: rolesWithoutBoundaries.length },
     ),
     finding(
       "AWS-IAM-06",
@@ -3363,8 +3223,8 @@ export async function assessAwsIdentity(
   // read from us-east-1 because root ConsoleLogin is a global event delivered only there.
   const rootLookupRegion = rootActivity.lookupRegion;
   const rootEventList = rootEvents.value?.items ?? [];
-  const rootConsoleLogins = rootEventList.filter((event) => asString(event.EventName) === "ConsoleLogin");
-  const rootOtherEvents = rootEventList.filter((event) => asString(event.EventName) !== "ConsoleLogin");
+  const rootConsoleLogins = rootEventList.filter((event) => asString(event.EventName) === AWS_VERDICT_VALUES.rootConsoleLoginEvent);
+  const rootOtherEvents = rootEventList.filter((event) => asString(event.EventName) !== AWS_VERDICT_VALUES.rootConsoleLoginEvent);
   const undatedRootEvents = rootEventList.filter((event) => extractTimestamp(event.EventTime) === undefined);
   let rootStatus: AwsFinding["status"];
   let rootSummary: string;
@@ -3409,6 +3269,7 @@ export async function assessAwsIdentity(
       root_other_events: ifRead(rootEvents, sample(rootOtherEvents.map((event) => ({ time: event.EventTime, name: event.EventName, source: event.EventSource })))),
       lookup_truncated: truncatedFlag(rootEvents),
     },
+    { undated_root_events: undatedRootEvents.length },
   ));
 
   // Control 18 (least privilege): customer-managed policies with wildcard Action and Resource.
@@ -3612,7 +3473,7 @@ export async function assessAwsLoggingDetection(client: AwsLoggingDetectionClien
     id: detectorId,
     detail: await attemptAwsRead(`guardduty:GetDetector ${labelIdentifier(detectorId)}`, () => client.getDetector(detectorId), errors),
   }));
-  const enabledDetectors = detectors.filter((detector) => asString(detector.detail.value?.Status) === "ENABLED");
+  const enabledDetectors = detectors.filter((detector) => asString(detector.detail.value?.Status) === AWS_VERDICT_VALUES.enabledGuardDutyStatus);
   const unreadableDetectors = detectors.filter((detector) => detector.detail.error);
   const detectorsAllUnreadable = detectors.length > 0 && unreadableDetectors.length === detectors.length;
   let detectorStatus: AwsFinding["status"];
@@ -3807,7 +3668,7 @@ export async function assessAwsOrgGuardrails(
   const scpTargetsAllUnreadable = scpTargets.length > 0 && unreadableScps.length === scpTargets.length;
 
   const analyzerList = analyzers.value?.items ?? [];
-  const activeAnalyzers = analyzerList.filter((analyzer) => asString(analyzer.status) === "ACTIVE");
+  const activeAnalyzers = analyzerList.filter((analyzer) => asString(analyzer.status) === AWS_VERDICT_VALUES.activeAnalyzerStatus);
   const findingLists = await mapWithConcurrency(activeAnalyzers, DEFAULT_CONCURRENCY, async (analyzer) => {
     const analyzerArn = asString(analyzer.arn) ?? "";
     const name = asString(analyzer.name) ?? analyzerArn;
@@ -3825,7 +3686,7 @@ export async function assessAwsOrgGuardrails(
     .flatMap((item) => (item.findings.value?.items ?? []).map((entry): JsonRecord => ({ ...entry, analyzer: item.name })))
     .filter((entry) => {
       const status = asString(entry.status)?.toUpperCase();
-      return !status || status === "ACTIVE";
+      return !status || status === AWS_VERDICT_VALUES.activeFindingStatus;
     });
   const identityCenterList = identityCenterInstances.value?.items ?? [];
 
@@ -4042,6 +3903,7 @@ export async function assessAwsOrgGuardrails(
       assessments: ifRead(auditAssessments, sample(activeAssessments.map((assessment) => ({ name: assessment.name, compliance_type: assessment.complianceType, last_updated: assessment.lastUpdated ?? null })))),
       list_truncated: truncatedFlag(auditAssessments),
     },
+    { undated_assessments: undatedAssessments.length },
   ));
 
   // Control 25: account security alternate contact.
@@ -4228,10 +4090,10 @@ export async function assessAwsDataProtection(
       const keyId = asString(key.KeyId) ?? asString(key.KeyArn) ?? "";
       const metadata = await attemptAwsRead(`kms:DescribeKey ${region}/${keyId}`, () => client.describeKmsKey(region, keyId), errors);
       const manager = asString(metadata.value?.KeyManager);
-      const eligible = manager === "CUSTOMER"
-        && asString(metadata.value?.KeyState) === "Enabled"
-        && asString(metadata.value?.KeySpec) === "SYMMETRIC_DEFAULT"
-        && asString(metadata.value?.Origin) === "AWS_KMS";
+      const eligible = manager === AWS_VERDICT_VALUES.customerKeyManager
+        && asString(metadata.value?.KeyState) === AWS_VERDICT_VALUES.eligibleKeyState
+        && asString(metadata.value?.KeySpec) === AWS_VERDICT_VALUES.eligibleKeySpec
+        && asString(metadata.value?.Origin) === AWS_VERDICT_VALUES.eligibleKeyOrigin;
       const rotation = eligible
         ? await attemptAwsRead(`kms:GetKeyRotationStatus ${region}/${keyId}`, () => client.getKeyRotationStatus(region, keyId), errors)
         : undefined;
@@ -4399,7 +4261,7 @@ export async function assessAwsDataProtection(
   const keyRows = regionResults.flatMap((result) => result.keys);
   const kmsListErrors = regionResults.filter((result) => result.kmsKeys.error);
   const kmsListsAllFailed = regionResults.length > 0 && kmsListErrors.length === regionResults.length;
-  const customerKeys = keyRows.filter((key) => key.manager === "CUSTOMER");
+  const customerKeys = keyRows.filter((key) => key.manager === AWS_VERDICT_VALUES.customerKeyManager);
   const managerUnknown = keyRows.filter((key) => key.manager === undefined);
   // Key classification counts are unknown, not zero, when DescribeKey failed for every listed key.
   const keyMetadataUnknown = kmsListsAllFailed || (keyRows.length > 0 && managerUnknown.length === keyRows.length);
@@ -4577,7 +4439,7 @@ export function permissiveNaclEntries(acl: JsonRecord, sensitivePorts: number[])
   const permissive: JsonRecord[] = [];
   for (const entry of entries) {
     if (entry.Egress !== false) continue;
-    if (asString(entry.RuleAction)?.toLowerCase() !== "allow") continue;
+    if (asString(entry.RuleAction)?.toLowerCase() !== AWS_VERDICT_VALUES.allowedNetworkAction) continue;
     const anySource = asString(entry.CidrBlock) === ANY_IPV4 || asString(entry.Ipv6CidrBlock) === ANY_IPV6;
     if (!anySource) continue;
     const coverage = protocolCoversPorts(asString(entry.Protocol));
@@ -4663,7 +4525,7 @@ export async function assessAwsNetworkSecurity(
     return vpcs.map((vpc) => {
       const vpcId = asString(vpc.VpcId) ?? "";
       const matching = flowLogs.filter((flowLog) => asString(flowLog.ResourceId) === vpcId);
-      const active = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === "ACTIVE");
+      const active = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === AWS_VERDICT_VALUES.activeFlowLogStatus);
       const statusUnknown = matching.filter((flowLog) => asString(flowLog.FlowLogStatus) === undefined);
       return {
         region: result.region,
@@ -4803,6 +4665,7 @@ export async function assessAwsNetworkSecurity(
         regions_with_vpc_errors: vpcRegionErrors.map((result) => result.region),
         regions_with_flow_log_errors: flowLogRegionErrors.map((result) => result.region),
       },
+      { vpcs_unverified_count: vpcsUnverified.length },
     ),
     finding(
       "AWS-NET-20",
@@ -5305,7 +5168,7 @@ const authParams = {
 };
 
 export function registerAwsTools(pi: any): void {
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_check_access",
     label: "Check AWS audit access",
     description:
@@ -5323,9 +5186,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_check_access")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_identity",
     label: "Assess AWS identity posture",
     description:
@@ -5358,9 +5221,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_identity")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_logging_detection",
     label: "Assess AWS logging and detection",
     description:
@@ -5378,9 +5241,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_logging_detection")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_org_guardrails",
     label: "Assess AWS organization guardrails",
     description:
@@ -5403,9 +5266,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_org_guardrails")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_data_protection",
     label: "Assess AWS data protection",
     description:
@@ -5432,9 +5295,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_data_protection")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_assess_network_security",
     label: "Assess AWS network security",
     description:
@@ -5462,9 +5325,9 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_assess_network_security")));
 
-  pi.registerTool({
+  pi.registerTool(defineGrcTool({
     name: "aws_export_audit_bundle",
     label: "Export AWS audit bundle",
     description:
@@ -5514,7 +5377,7 @@ export function registerAwsTools(pi: any): void {
         );
       }
     },
-  });
+  }, toolContract(AWS_SPEC, "aws_export_audit_bundle")));
 }
 
 /** The IncompleteResponse error the shape guard throws for a command, produced by the guard itself. */

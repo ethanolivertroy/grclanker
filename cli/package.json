@@ -22,6 +22,8 @@
     "sync:fedramp": "tsx scripts/sync-fedramp.ts",
     "sync:tool-catalog": "npm run build && node scripts/generate-tool-catalog-docs.mjs",
     "sync:agent-sdk-tools": "npm run build && node scripts/generate-agent-sdk-tools.mjs",
+    "sync:integration-specs": "npm run build && node scripts/generate-integration-specs.mjs",
+    "check:integration-specs": "npm run build && node scripts/generate-integration-specs.mjs --check",
     "agent-sdk:validate": "agent-sdk validate --dir agent-sdk",
     "agent-sdk:info": "agent-sdk info --dir agent-sdk",
     "agent-sdk:dev": "agent-sdk dev agent-sdk --mode single",
