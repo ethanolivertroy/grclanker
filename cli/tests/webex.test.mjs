@@ -2118,7 +2118,7 @@ test("WebexApiClient stops an endless rel=next chain at the page ceiling and rep
   assert.equal(calls, 5);
 
   calls = 0;
-  const defaulted = await new WebexApiClient(sampleConfig(), { fetchImpl }).listRoles();
+  const defaulted = await new WebexApiClient(sampleConfig(), { fetchImpl }).listRoles(5000);
   assert.equal(defaulted.truncated, true);
   assert.equal(defaulted.pageCount, 1000);
   assert.equal(calls, 1000);
