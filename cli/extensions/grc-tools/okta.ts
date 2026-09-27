@@ -20,6 +20,8 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -3273,6 +3275,7 @@ function buildFinding(
   },
 ): OktaFinding {
   const definition = OKTA_CHECKS[id];
+  status = preserveRuntimeFindingStatus(OKTA_SPEC, id, status);
   return {
     id: definition.id,
     title: definition.title,
@@ -5910,6 +5913,7 @@ function buildExportText(config: OktaResolvedConfig, result: OktaAuditBundleResu
 }
 
 export function registerOktaTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, OKTA_SPEC);
   const authParams = {
     org_url: Type.Optional(
       Type.String({

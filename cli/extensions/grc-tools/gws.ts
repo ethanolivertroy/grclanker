@@ -32,7 +32,9 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
+import { GWS_SPEC } from "./gws.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -1091,6 +1093,7 @@ function buildFinding(
 ): GwsFinding {
   const definition = GWS_CHECKS[definitionId];
   if (!definition) throw new Error(`Unknown GWS check definition: ${definitionId}`);
+  status = preserveRuntimeFindingStatus(GWS_SPEC, definitionId, status);
   return {
     id: definition.id,
     title: definition.title,
@@ -4024,6 +4027,7 @@ export async function exportGwsAuditBundle(
 }
 
 export function registerGwsTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, GWS_SPEC);
   const authParams = {
     auth_mode: Type.Optional(
       Type.String({

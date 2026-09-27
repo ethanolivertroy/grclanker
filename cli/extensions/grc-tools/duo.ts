@@ -18,6 +18,8 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -2524,6 +2526,7 @@ function buildFinding(
   options?: { severity?: DuoSeverity; manualNote?: string },
 ): DuoFinding {
   const definition = DUO_CHECKS[id];
+  status = preserveRuntimeFindingStatus(DUO_SPEC, id, status);
   return {
     id: definition.id,
     title: definition.title,
@@ -5311,6 +5314,7 @@ function normalizeExportArgs(args: RawConfigArgs & { output_dir?: string }): Raw
 }
 
 export function registerDuoTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, DUO_SPEC);
   const authParams = {
     api_host: Type.Optional(
       Type.String({

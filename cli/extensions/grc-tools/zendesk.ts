@@ -21,7 +21,9 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { ZENDESK_SPEC } from "./zendesk.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -2356,6 +2358,7 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): ZendeskFinding {
+  status = preserveRuntimeFindingStatus(ZENDESK_SPEC, `ZD-${String(control).padStart(2, "0")}`, status);
   return {
     id: `ZD-${String(control).padStart(2, "0")}`,
     control,
@@ -4267,6 +4270,7 @@ function registerAssessmentTool(
 }
 
 export function registerZendeskTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, ZENDESK_SPEC);
   pi.registerTool({
     name: "zendesk_check_access",
     label: "Check Zendesk audit access",

@@ -19,7 +19,9 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -1860,6 +1862,7 @@ function finding(
   manualEvidence?: string,
 ): SalesforceFinding {
   const definition = controlDefinition(control);
+  status = preserveRuntimeFindingStatus(SALESFORCE_SPEC, `SF-${String(control).padStart(2, "0")}`, status);
   return {
     id: `SF-${String(control).padStart(2, "0")}`,
     control,
@@ -3441,6 +3444,7 @@ const assessParams = {
 };
 
 export function registerSalesforceTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, SALESFORCE_SPEC);
   pi.registerTool({
     name: "salesforce_check_access",
     label: "Check Salesforce audit access",

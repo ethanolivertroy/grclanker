@@ -18,8 +18,10 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { ZOOM_SPEC } from "./zoom.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -1516,6 +1518,7 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): ZoomFinding {
+  status = preserveRuntimeFindingStatus(ZOOM_SPEC, id, status);
   return { id, title, severity, status, summary, controls, evidence, mappings: controlMappings(controls) };
 }
 
@@ -3194,6 +3197,7 @@ const collaborationParams = {
 };
 
 export function registerZoomTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, ZOOM_SPEC);
   pi.registerTool({
     name: "zoom_check_access",
     label: "Check Zoom audit access",

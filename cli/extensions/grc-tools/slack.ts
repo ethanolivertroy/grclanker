@@ -19,8 +19,10 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { SLACK_SPEC } from "./slack.spec.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_USER_LIMIT = 1000;
@@ -503,6 +505,7 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): SlackFinding {
+  status = preserveRuntimeFindingStatus(SLACK_SPEC, id, status);
   return { id, title, control, severity, status, summary, mappings: mappingsFor(control), evidence };
 }
 
@@ -2993,6 +2996,7 @@ function registerAssessment(
 }
 
 export function registerSlackTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, SLACK_SPEC);
   registerAssessment(
     pi,
     "slack_check_access",

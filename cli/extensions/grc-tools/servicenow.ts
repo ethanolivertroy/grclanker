@@ -20,7 +20,9 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { SERVICENOW_SPEC } from "./servicenow.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -1723,12 +1725,13 @@ function gatedPrincipals(principals: Record<string, unknown[] | number> | undefi
 
 function finding(controlNumber: number, evaluation: Evaluation): ServicenowFinding {
   const definition = SERVICENOW_CONTROLS[controlNumber];
+  const status = preserveRuntimeFindingStatus(SERVICENOW_SPEC, findingId(controlNumber), evaluation.status);
   return {
     id: findingId(controlNumber),
     control: controlNumber,
     title: definition.title,
     severity: definition.severity,
-    status: evaluation.status,
+    status,
     summary: evaluation.summary,
     evidence: evaluation.evidence,
     mappings: mappingsForControl(controlNumber),
@@ -4006,6 +4009,7 @@ function runTool<TArgs extends AuthArgs>(
 }
 
 export function registerServicenowTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, SERVICENOW_SPEC);
   pi.registerTool({
     name: "servicenow_check_access",
     label: "Check ServiceNow audit access",

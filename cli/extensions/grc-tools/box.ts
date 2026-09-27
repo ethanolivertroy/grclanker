@@ -20,6 +20,8 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -2082,6 +2084,7 @@ function finding(
   manualEvidence?: string,
 ): BoxFinding {
   const definition = BOX_CONTROLS[controlNumber];
+  status = preserveRuntimeFindingStatus(BOX_SPEC, findingId(controlNumber), status);
   return {
     id: findingId(controlNumber),
     control: controlNumber,
@@ -4204,6 +4207,7 @@ function runTool<TArgs extends AuthArgs>(
 }
 
 export function registerBoxTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, BOX_SPEC);
   pi.registerTool({
     name: "box_check_access",
     label: "Check Box audit access",
