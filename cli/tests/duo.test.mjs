@@ -32,7 +32,8 @@ import {
   runDuoAccessCheck,
   scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/duo.js";
-import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { DUO_SPEC } from "../dist/extensions/grc-tools/duo.spec.js";
+import { assertBundlePathsMatchSpec, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   CANARY,
   CANARY_VALUES,
@@ -1565,6 +1566,7 @@ test("exportDuoAuditBundle writes the expected package and secure paths stay roo
   };
 
   const result = await exportDuoAuditBundle(client, config, outputRoot);
+  assertBundlePathsMatchSpec(assert, result.outputDir, DUO_SPEC);
 
   // The bundle moved from assessments/, frameworks/, summary.md, and README.md to the
   // shared grclanker layout (core_data/, analysis/, compliance/, QUICK_REFERENCE.md).

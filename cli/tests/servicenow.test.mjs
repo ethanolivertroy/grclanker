@@ -33,8 +33,9 @@ import {
   resolveSecureOutputPath,
   resolveServicenowConfiguration,
 } from "../dist/extensions/grc-tools/servicenow.js";
+import { SERVICENOW_SPEC } from "../dist/extensions/grc-tools/servicenow.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
@@ -1290,6 +1291,7 @@ test("exportServicenowAuditBundle writes core data, analysis, compliance reports
   const { fetchImpl } = fixtureFetch(healthyFixture());
   const config = sampleConfig();
   const result = await exportServicenowAuditBundle(createClient(fetchImpl), config, base);
+  assertBundlePathsMatchSpec(assert, result.outputDir, SERVICENOW_SPEC);
 
   assert.equal(basename(result.outputDir), "dev12345-audit-bundle");
   assert.equal(result.zipPath, join(base, "dev12345-audit-bundle.zip"));

@@ -40,6 +40,8 @@ import {
   resolveSecureOutputPath,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/box.js";
+import { BOX_SPEC } from "../dist/extensions/grc-tools/box.spec.js";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
@@ -2214,6 +2216,7 @@ test("assessBoxShieldMonitoring fails when Shield rules and monitoring signals a
 test("exportBoxAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {
   const base = createTempBase("grclanker-box-export-");
   const result = await exportBoxAuditBundle(createStubClient(hardenedFixture()), sampleConfig(), base);
+  assertBundlePathsMatchSpec(assert, result.outputDir, BOX_SPEC);
 
   assert.ok(existsSync(result.outputDir));
   assert.ok(result.outputDir.startsWith(base));

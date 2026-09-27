@@ -28,6 +28,15 @@ export function readBundleFiles(rootDir) {
   return files;
 }
 
+/** Compares paths emitted by a real exporter with its adjacent portable contract. */
+export function assertBundlePathsMatchSpec(assert, rootDir, spec) {
+  const actual = new Set(readBundleFiles(rootDir).keys());
+  const required = new Set(spec.output.files);
+  const allowed = new Set([...spec.output.files, ...spec.output.conditionalFiles]);
+  for (const path of required) assert.ok(actual.has(path), `${spec.identity.slug}: exporter omitted required ${path}`);
+  for (const path of actual) assert.ok(allowed.has(path), `${spec.identity.slug}: exporter emitted undeclared ${path}`);
+}
+
 function findEndOfCentralDirectory(buffer) {
   for (let offset = buffer.length - 22; offset >= 0; offset -= 1) {
     if (buffer.readUInt32LE(offset) === END_OF_CENTRAL_DIRECTORY) return offset;

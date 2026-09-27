@@ -33,6 +33,8 @@ import {
   resolveZoomConfiguration,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/zoom.js";
+import { ZOOM_SPEC } from "../dist/extensions/grc-tools/zoom.spec.js";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1005,6 +1007,7 @@ test("checkZoomAccess reports readable Zoom audit surfaces per documented option
 test("exportZoomAuditBundle writes the shared layout, one report per framework, and never overwrites a prior bundle", async () => {
   const base = createTempBase("grclanker-zoom-export-");
   const first = await exportZoomAuditBundle(compliantClient(), sampleConfig(), base, { now: NOW });
+  assertBundlePathsMatchSpec(assert, first.outputDir, ZOOM_SPEC);
   assert.ok(existsSync(first.outputDir));
   assert.ok(existsSync(first.zipPath));
   assert.equal(basename(first.zipPath), `${basename(first.outputDir)}.zip`);

@@ -33,8 +33,9 @@ import {
   resolveSalesforceConfiguration,
   resolveSecureOutputPath,
 } from "../dist/extensions/grc-tools/salesforce.js";
+import { SALESFORCE_SPEC } from "../dist/extensions/grc-tools/salesforce.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertLeavesNullUnderDenial } from "./helpers/leaf-diff.mjs";
@@ -1291,6 +1292,7 @@ test("exportSalesforceAuditBundle writes core_data, analysis, compliance reports
     async listTenantSecrets() { throw forbidden(); },
   });
   const result = await exportSalesforceAuditBundle(client, sampleConfig(), base, { now: NOW });
+  assertBundlePathsMatchSpec(assert, result.outputDir, SALESFORCE_SPEC);
   assert.ok(existsSync(result.outputDir));
   assert.ok(existsSync(result.zipPath));
   assert.equal(result.zipPath, `${result.outputDir}.zip`);

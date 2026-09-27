@@ -39,6 +39,8 @@ import {
   resolveSecureOutputPath,
   runGwsAccessCheck,
 } from "../dist/extensions/grc-tools/gws.js";
+import { GWS_SPEC } from "../dist/extensions/grc-tools/gws.spec.js";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOGIN = new Date(Date.now() - 2 * DAY_MS).toISOString();
@@ -1076,6 +1078,7 @@ test("exportGwsAuditBundle writes the shared bundle layout and a zip named after
   const base = createTempBase("grclanker-gws-export-");
   const config = createSampleConfig();
   const result = await exportGwsAuditBundle(createFakeCollector(), config, base);
+  assertBundlePathsMatchSpec(assert, result.outputDir, GWS_SPEC);
 
   assert.ok(existsSync(result.outputDir));
   assert.equal(basename(result.outputDir), "example.com-gws-audit");

@@ -36,8 +36,9 @@ import {
   resolveSecureOutputPath,
   resolveZendeskConfiguration,
 } from "../dist/extensions/grc-tools/zendesk.js";
+import { ZENDESK_SPEC } from "../dist/extensions/grc-tools/zendesk.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1691,6 +1692,7 @@ test("exportZendeskAuditBundle writes the bundle layout, archive, and never over
   const base = createTempBase("grclanker-zendesk-export-");
   const config = sampleConfig();
   const first = await exportZendeskAuditBundle(healthyClient(), config, base, { now: () => NOW });
+  assertBundlePathsMatchSpec(assert, first.outputDir, ZENDESK_SPEC);
 
   assert.equal(first.findingCount, 25);
   assert.equal(first.errorCount, 0);

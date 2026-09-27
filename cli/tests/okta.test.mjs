@@ -35,7 +35,8 @@ import {
   scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/okta.js";
-import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { OKTA_SPEC } from "../dist/extensions/grc-tools/okta.spec.js";
+import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -853,6 +854,7 @@ test("exportOktaAuditBundle writes the expected package and secure paths stay ro
   const outputRoot = createTempBase("grclanker-okta-export-");
   const config = createSampleConfig();
   const result = await exportOktaAuditBundle(createSampleClient(), config, outputRoot);
+  assertBundlePathsMatchSpec(assert, result.outputDir, OKTA_SPEC);
   assert.equal(result.errorCount, 0);
   assert.ok(existsSync(result.outputDir));
   assert.ok(existsSync(result.zipPath));

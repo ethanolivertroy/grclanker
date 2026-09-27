@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
 import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
+import { SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
 import {
   SLACK_DOCUMENTED_ERROR_CODES,
   SLACK_EXTERNAL_SHARING_AUDIT_ACTIONS,
@@ -1433,6 +1435,7 @@ test("exportSlackAuditBundle writes the shared layout and never overwrites a pri
   const config = resolveSlackConfiguration({ token: "xoxp-test", scim_token: "scim-test", org_id: "E1" }, EMPTY_ENV);
 
   const first = await exportSlackAuditBundle(client, config, base);
+  assertBundlePathsMatchSpec(assert, first.outputDir, SLACK_SPEC);
   assert.ok(existsSync(first.outputDir));
   assert.equal(first.zipPath, `${first.outputDir}.zip`);
   assert.ok(existsSync(first.zipPath));
