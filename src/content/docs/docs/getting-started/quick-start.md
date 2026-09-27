@@ -59,6 +59,6 @@ grclanker investigate "CVE-2024-3094"
 grclanker "read specs/aws-sec-inspector.spec.md, inspect the shipped AWS tools, and propose an extension"
 ```
 
-All 35 repository integration specs are implemented. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
+grclanker ships 35 integrations, each with a repository spec. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
 
 The Pi terminal CLI is the default path. A source checkout can run the same domain tools through the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) or [Flue](/docs/getting-started/flue-runtime/).

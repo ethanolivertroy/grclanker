@@ -53,7 +53,7 @@ const workflowCards = [
 const releaseFacts = [
   {
     label: '241 domain tools',
-    detail: 'Native checks, assessments, and evidence exports cover all 35 repository spec integrations, plus CMVP, KEV, EPSS, FedRAMP, Vanta, SCF, and OSCAL.',
+    detail: 'Native checks, assessments, and evidence exports cover 35 integrations, each with a repository spec, plus CMVP, KEV, EPSS, FedRAMP, Vanta, SCF, and OSCAL.',
   },
   {
     label: 'Three runtime paths',
@@ -61,11 +61,11 @@ const releaseFacts = [
   },
   {
     label: 'Hardened evidence',
-    detail: 'Runtime adapters classify read effects, approval-gate writers, and redact credential-shaped arguments. Integration exports scrub sensitive values and avoid overwriting prior bundles.',
+    detail: 'Runtime adapters classify read effects, approval-gate writers, and redact credential-shaped arguments. Integration exports document sensitive-data handling and partial collection.',
   },
   {
-    label: 'Implemented specs',
-    detail: `All ${specCount} repository specs now have native tool families and remain reusable build plans for extending grclanker or another agent.`,
+    label: `${specCount} integration specs`,
+    detail: 'Each shipped integration has a repository spec that remains a reusable design record and build input.',
   },
 ];
 
@@ -73,7 +73,7 @@ const brandFrames = [
   {
     image: '/hero/assembly.webp',
     eyebrow: 'Specs in',
-    title: 'Feed a spec to any agent. It has enough context to build.',
+    title: 'Use each integration spec to review coverage or plan an extension.',
   },
   {
     image: '/hero/holographic.webp',
@@ -98,7 +98,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
 );
 ---
 
-<Base title="grclanker: Put a Clanker on Your Compliance" description="241 domain tools across 35 implemented integrations, with Pi, Cursor Agent SDK, and Flue runtime paths.">
+<Base title="grclanker: Put a Clanker on Your Compliance" description="241 domain tools, 35 integrations with repository specs, and Pi, Cursor Agent SDK, and Flue runtime paths.">
   <section class="relative overflow-hidden border-b border-surface0/60">
     <div class="absolute inset-0 w-full h-full">
       <img src="/hero/command-center.webp" alt="Clanker command center" class="w-full h-full object-cover object-center" loading="eager" />
@@ -112,7 +112,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
             Your compliance evidence is scattered.<br />Put a clanker on it.
           </h1>
           <p class="mx-auto mt-5 max-w-2xl text-base md:text-lg text-subtext1 leading-relaxed italic hero-copy-lede">
-            241 domain tools. 35 implemented integrations. Pi, Cursor Agent SDK, and Flue runtime paths.
+            241 domain tools. 35 integrations with repository specs. Pi, Cursor Agent SDK, and Flue runtime paths.
           </p>
         </div>
 
