@@ -435,15 +435,15 @@ function scrubBundleText(content: string, secrets: readonly string[]): string {
  * first is the per-surface allowlist in WEBEX_SURFACE_FIELDS, which decides
  * what reaches the bundle at all.
  */
-export function redactSecrets(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactSecrets);
-  if (typeof value === "string") return scrubValue(value);
+export function redactSecrets(value: unknown, knownSecrets: readonly string[] = []): unknown {
+  if (Array.isArray(value)) return value.map((entry) => redactSecrets(entry, knownSecrets));
+  if (typeof value === "string") return scrubBundleText(value, knownSecrets);
   const object = asObject(value);
   if (!object) return value;
   const output: JsonRecord = {};
   for (const [key, entry] of Object.entries(object)) {
     const sensitive = SECRET_KEY_PATTERN.test(key) && !POLICY_KEY_PATTERN.test(key);
-    output[key] = sensitive && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry);
+    output[key] = sensitive && entry !== null && entry !== undefined ? "[REDACTED]" : redactSecrets(entry, knownSecrets);
   }
   return output;
 }
@@ -2350,38 +2350,40 @@ export async function exportWebexAuditBundle(
     outputRoot,
     `${safeDirName(config.orgId ?? access.orgId ?? "webex-org")}-audit-bundle`,
   );
-  const write = (relativePathname: string, content: string): Promise<void> =>
+  const writeText = (relativePathname: string, content: string): Promise<void> =>
     writeSecureTextFile(outputDir, relativePathname, scrubBundleText(content, secrets));
+  const writeJson = (relativePathname: string, value: unknown): Promise<void> =>
+    writeSecureTextFile(outputDir, relativePathname, serializeJson(redactSecrets(value, secrets)));
 
-  await write("QUICK_REFERENCE.md", buildQuickReference());
-  await write("metadata.json", serializeJson({
+  await writeText("QUICK_REFERENCE.md", buildQuickReference());
+  await writeJson("metadata.json", {
     generated_at: new Date().toISOString(),
     org_id: config.orgId ?? access.orgId ?? null,
     token_type: access.tokenType,
     source_chain: config.sourceChain,
     config_file: config.configFile ? basename(config.configFile) : null,
-  }));
-  await write("core_data/access.json", serializeJson(access));
+  });
+  await writeJson("core_data/access.json", access);
   for (const assessment of assessments) {
     for (const [name, value] of Object.entries(assessment.rawData)) {
-      await write(`core_data/${assessment.category}/${name}.json`, serializeJson(value));
+      await writeJson(`core_data/${assessment.category}/${name}.json`, value);
     }
-    await write(`analysis/${assessment.category}.json`, serializeJson({
+    await writeJson(`analysis/${assessment.category}.json`, {
       title: assessment.title,
       category: assessment.category,
       summary: assessment.summary,
       findings: assessment.findings,
       errors: assessment.errors,
-    }));
+    });
   }
-  await write("analysis/findings.json", serializeJson(findings));
-  await write("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
-  await write("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
+  await writeJson("analysis/findings.json", findings);
+  await writeText("compliance/executive_summary.md", buildExecutiveSummary(config, assessments, errors));
+  await writeText("compliance/unified_compliance_matrix.md", buildUnifiedMatrix(findings));
   for (const key of Object.keys(FRAMEWORK_REPORT_PATHS) as WebexFrameworkKey[]) {
-    await write(FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
+    await writeText(FRAMEWORK_REPORT_PATHS[key], buildFrameworkReport(key, findings));
   }
   if (errors.length > 0) {
-    await write("_errors.log", `${errors.join("\n")}\n`);
+    await writeText("_errors.log", `${errors.join("\n")}\n`);
   }
 
   const zipPath = `${outputDir}.zip`;
