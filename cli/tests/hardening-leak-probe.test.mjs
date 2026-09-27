@@ -139,6 +139,17 @@ function flawedTruncationRunner({ inventory, mode }) {
   return { findings, summaries, principals };
 }
 
+function capContainers(value, depth = 0, cap = 5) {
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= cap) return "[REDACTED]";
+  if (Array.isArray(value)) return value.map((item) => capContainers(item, depth + 1, cap));
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, capContainers(item, depth + 1, cap)]));
+}
+
+function cappedDataWalker(value) {
+  return capContainers(redactSecretValues(value, { secrets: [CONFIGURED_SECRET] }));
+}
+
 const CONFIGURED_SECRET = "Xq7Vw2Lm9Tp4Rb8Kd3Fh6Jn1Zs5Yc0Ag";
 
 /** A paginated listing built on `resolveSameOriginUrl`: the shape every walk must take for a server-supplied next link. */
@@ -320,7 +331,7 @@ test("leak-probe harness: the class table names all ten classes", () => {
   assert.deepEqual([...BEARER_ID_KEYS], ["secret_id", "VAULT_SECRET_ID", "role_secret_id", "roleSecretId", "token_id", "tokenId"]);
   assert.deepEqual([...SESSION_ID_KEYS], ["session_id", "sid", "jsessionid", "PHPSESSID"]);
   assert.equal(FIXED_PASSWORDS.length, 12);
-  assert.deepEqual(SETTING_SUFFIX_CONTROLS.map(([key]) => key), ["secret_id_ttl", "secret_id_num_uses", "token_max_ttl", "token_num_uses", "secret_id_bound_cidrs", "token_bound_cidrs", "webhook_count"]);
+  assert.deepEqual(SETTING_SUFFIX_CONTROLS.map(([key]) => key), ["secret_id_ttl", "secret_id_num_uses", "token_max_ttl", "token_num_uses", "secret_id_bound_cidrs", "token_bound_cidrs", "webhook_count", "webhook_retry_count"]);
   assert.deepEqual(SETTING_SUFFIX_UUID_CONTROL_KEYS, ["secret_id_accessor", "token_accessor"]);
   assert.deepEqual([...FIXED_SCHEME_WORDS], ["Bearer", "Basic", "Token", "Digest", "OAuth", "Negotiate", "NTLM", "SSWS", "ApiKey", "Api-Key", "Splunk", "Snowflake", "AWS4-HMAC-SHA256"]);
   assert.deepEqual([...INFORMATIONAL_ESCAPE_FORMS], ["%0A", "%0D%0A", "%09", "\\x0a", "\\x09", "\\x0d\\x0a"]);
@@ -601,6 +612,19 @@ test("leak-probe harness: the model collector built on the collection-status hel
   const cls = byClass(result, 9);
   assert.equal(cls.cells, 6);
   assert.equal(cls.leaks, 0, result.report);
+});
+
+test("leak-probe harness: class 7 detects a walker's cap with the same record wrapper used by its rows", async () => {
+  const result = await runLeakProbe({
+    integration: "capped-walker",
+    dataWalker: { name: "cappedDataWalker", fn: cappedDataWalker, cap: null },
+  });
+  const cls = byClass(result, 7);
+  assert.equal(cls.skipped, null);
+  assert.ok(cls.notes.some((note) => note === "cap detected at depth 3"), result.report);
+  assert.equal(cls.mustKeepLosses, 0, result.report);
+  assert.equal(cls.leaks, 0, result.report);
+  assert.equal(cls.idempotenceFailures, 0, result.report);
 });
 
 test("leak-probe harness: classes 7 and 10 catch an export that writes the raw response into its bundle", async () => {
