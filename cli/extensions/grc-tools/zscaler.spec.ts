@@ -3,7 +3,13 @@ import {
   buildBatchOutputContract,
 } from "./batch-spec-builder.js";
 import {
+  batch2All,
+  batch2Any,
   batch2Checks,
+  batch2Eq,
+  batch2Gt,
+  batch2Ne,
+  batch2Rule,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
@@ -62,6 +68,61 @@ function owner(area: "zia_policy" | "zia_access_control" | "zpa"): string {
 
 const checks = batch2Checks(rows.map(([title, severity, area], index) => {
   const control = index + 1;
+  const custom = control === 1
+    ? {
+        decisionInputs: {
+          evidence_readable: "Boolean. True only when GET /urlFilteringRules returned a readable inventory.",
+          evidence_complete: "Boolean. True only when URL-rule pagination proved exhaustion; false means the rule counts are lower bounds.",
+          rule_count: "Complete number of URL filtering rules before presentation slicing; zero is a readable empty inventory.",
+          enabled_rule_count: "Count of rules whose state is exactly ENABLED.",
+          blocking_rule_count: "Count of enabled rules whose action is exactly BLOCK.",
+          missing_required_category_count: "Count of required categories absent from enabled BLOCK rules. Required categories are ANONYMIZER, OTHER_SECURITY, ADULT_THEMES, PORNOGRAPHY, and GAMBLING.",
+        },
+        decisionRules: [
+          batch2Rule("manual", batch2Ne("evidence_readable", true)),
+          batch2Rule("fail", batch2Any(batch2Eq("rule_count", 0), batch2Eq("enabled_rule_count", 0), batch2Eq("blocking_rule_count", 0))),
+          batch2Rule("warn", batch2Any(batch2Ne("evidence_complete", true), batch2Gt("missing_required_category_count", 0))),
+          batch2Rule("pass", batch2All(
+            batch2Eq("evidence_readable", true),
+            batch2Eq("evidence_complete", true),
+            batch2Gt("rule_count", 0),
+            batch2Gt("enabled_rule_count", 0),
+            batch2Gt("blocking_rule_count", 0),
+            batch2Eq("missing_required_category_count", 0),
+          )),
+          batch2Rule("manual", { op: "always" }),
+        ],
+      }
+    : control === 2
+      ? {
+          decisionInputs: {
+            evidence_readable: "Boolean. True only when GET /firewallFilteringRules returned a readable inventory.",
+            evidence_complete: "Boolean. True only when firewall-rule pagination proved exhaustion; false means the rule counts are lower bounds.",
+            rule_count: "Complete number of firewall filtering rules before presentation slicing; zero is a readable empty inventory and fails.",
+            enabled_rule_count: "Count of rules whose state is exactly ENABLED.",
+            default_rule_present: "Boolean. True when a returned rule has defaultRule=true.",
+            default_rule_allows: "Boolean. True when the default rule action is exactly ALLOW.",
+            unbounded_allow_rule_count: "Count of enabled ALLOW rules with no destination or service restriction.",
+            blocking_rule_without_full_logging_count: "Count of enabled BLOCK rules whose documented enableFullLogging field is not true.",
+            enabled_non_default_rule_count: "Count of enabled rules that are not the default rule.",
+          },
+          decisionRules: [
+            batch2Rule("manual", batch2Ne("evidence_readable", true)),
+            batch2Rule("fail", batch2Any(
+              batch2Eq("rule_count", 0),
+              batch2Eq("default_rule_allows", true),
+              batch2Gt("unbounded_allow_rule_count", 0),
+            )),
+            batch2Rule("warn", batch2Any(
+              batch2Ne("evidence_complete", true),
+              batch2Eq("default_rule_present", false),
+              batch2Eq("enabled_non_default_rule_count", 0),
+              batch2Gt("blocking_rule_without_full_logging_count", 0),
+            )),
+            batch2Rule("pass", { op: "always" }),
+          ],
+        }
+      : {};
   return {
     id: `ZS-${String(control).padStart(2, "0")}`,
     control,
@@ -70,6 +131,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
     owner: owner(area),
     surfaces: [area === "zpa" ? "zpa-policy" : area === "zia_policy" ? "zia-policy" : "zia-administration"],
     emptyOutcome: "manual" as const,
+    ...custom,
     decision: `Evaluate ${title} from the complete ${area === "zpa" ? "ZPA" : "ZIA"} inventory: missing product credentials and unreadable or ambiguous feature responses remain manual, a proved insecure record takes precedence, partial or review records warn, and pass requires complete readable evidence with no violation.`,
   };
 }));
@@ -119,7 +181,10 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Honor bounded Retry-After and retry transient responses up to the configured retry count; exhausted reads remain unreadable.",
   },
   runtimeBehavior: ZSCALER_RUNTIME_BEHAVIOR,
-  knownGaps: ["ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only."],
+  knownGaps: [
+    "Current-runtime limitation preserved for parity: secondary ZIA and ZPA inventories processed by capForUnreadableAll cap pass when unreadable, but truncation alone is not completeness-gating. Some single-dataset truncations therefore remain pass until the runtime is corrected.",
+    "ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only.",
+  ],
   sensitiveFields: ["apiKey", "password", "clientSecret", "authorization", "cookie", "token"],
   credentialFormats: ["ZIA API keys", "ZIA administrator passwords", "ZIA session cookies", "ZPA OAuth client secrets and bearer tokens"],
   output: buildBatchOutputContract({

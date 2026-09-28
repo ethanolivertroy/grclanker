@@ -6,9 +6,11 @@ import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2Defined,
   batch2Eq,
   batch2Gt,
   batch2Ne,
+  batch2Not,
   batch2Rule,
   restSurface,
   type Batch2CheckRow,
@@ -86,17 +88,64 @@ function owner(id: string): string {
   return "gcp_assess_network_security";
 }
 
-const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome, violationOutcome]) => ({
-  id,
-  control,
-  title,
-  severity,
-  owner: owner(id),
-  surfaces: sourceSurfaces,
-  emptyOutcome,
-  violationOutcome,
-  decisionRules: id === "GCP-DATA-07"
-    ? [
+const orgPolicyDecision = (outcome: "fail" | "warn") => ({
+  decisionInputs: {
+    evidence_readable: "Boolean. True only when the effective organization policy response was readable and its enforced state was present; null or missing means unavailable, never disabled.",
+    evidence_complete: "Boolean. True only when the complete project inventory supports applying the sampled effective policy to the assessed scope; false means the scope is partial.",
+    policy_enabled: "Boolean raw interpretation of booleanPolicy.enforced or a non-empty listPolicy.allowedValues/deniedValues result from the effective policy response; null means the documented policy fields were absent.",
+  },
+  decisionRules: [
+    batch2Rule("manual", batch2Any(
+      batch2Ne("evidence_readable", true),
+      batch2Not(batch2Defined("policy_enabled")),
+      batch2Eq("policy_enabled", null),
+    )),
+    batch2Rule(outcome, batch2Eq("policy_enabled", false)),
+    batch2Rule("warn", batch2Ne("evidence_complete", true)),
+    batch2Rule("pass", batch2All(batch2Eq("evidence_readable", true), batch2Eq("evidence_complete", true), batch2Eq("policy_enabled", true))),
+    batch2Rule("manual", { op: "always" }),
+  ],
+});
+
+function customDecision(id: string): Partial<Pick<Batch2CheckRow, "decisionInputs" | "decisionRules">> | undefined {
+  if (id === "GCP-ORG-02") return orgPolicyDecision("warn");
+  if (id === "GCP-ORG-03") return orgPolicyDecision("fail");
+  if (id === "GCP-ORG-04") return orgPolicyDecision("warn");
+  if (id === "GCP-ORG-05") {
+    return {
+      decisionInputs: {
+        evidence_readable: "Boolean. True only when both effective policy responses were readable; null or missing means unavailable.",
+        evidence_complete: "Boolean. True only when project inventory scope was complete; false means the sampled effective policies may not represent every project.",
+        serial_port_access_disabled: "Boolean raw interpretation of constraints/compute.disableSerialPortAccess from booleanPolicy.enforced or listPolicy presence.",
+        shielded_vm_required: "Boolean raw interpretation of constraints/compute.requireShieldedVm from booleanPolicy.enforced or listPolicy presence.",
+      },
+      decisionRules: [
+        batch2Rule("manual", batch2Any(
+          batch2Ne("evidence_readable", true),
+          batch2Not(batch2Defined("serial_port_access_disabled")),
+          batch2Eq("serial_port_access_disabled", null),
+          batch2Not(batch2Defined("shielded_vm_required")),
+          batch2Eq("shielded_vm_required", null),
+        )),
+        batch2Rule("fail", batch2All(batch2Eq("serial_port_access_disabled", false), batch2Eq("shielded_vm_required", false))),
+        batch2Rule("warn", batch2Any(
+          batch2Ne("evidence_complete", true),
+          batch2Eq("serial_port_access_disabled", false),
+          batch2Eq("shielded_vm_required", false),
+        )),
+        batch2Rule("pass", batch2All(
+          batch2Eq("evidence_readable", true),
+          batch2Eq("evidence_complete", true),
+          batch2Eq("serial_port_access_disabled", true),
+          batch2Eq("shielded_vm_required", true),
+        )),
+        batch2Rule("manual", { op: "always" }),
+      ],
+    };
+  }
+  if (id === "GCP-DATA-07") {
+    return {
+      decisionRules: [
         batch2Rule("manual", batch2Ne("evidence_readable", true)),
         batch2Rule("fail", batch2All(
           batch2Eq("inventory_count", 0),
@@ -114,8 +163,22 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
           batch2Eq("review_count", 0),
         )),
         batch2Rule("manual", { op: "always" }),
-      ]
-    : undefined,
+      ],
+    };
+  }
+  return undefined;
+}
+
+const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome, violationOutcome]) => ({
+  id,
+  control,
+  title,
+  severity,
+  owner: owner(id),
+  surfaces: sourceSurfaces,
+  emptyOutcome,
+  violationOutcome,
+  ...customDecision(id),
   decision: `From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return ${violationOutcome ?? "fail"} when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record.`,
 })));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);

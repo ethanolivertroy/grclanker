@@ -1203,8 +1203,8 @@ function zscalerDecisionFacts(
   };
 }
 
-function zscalerManualFacts(inventoryCount = 0): Readonly<Record<string, unknown>> {
-  return zscalerDecisionFacts(inventoryCount, 0, 0, { readable: false, complete: false });
+function zscalerManualFacts(_inventoryCount = 0): Readonly<Record<string, unknown>> {
+  return {};
 }
 
 function finding(
@@ -1303,14 +1303,11 @@ function capForUnreadableAll(item: ZscalerFinding, dependencies: InventoryDepend
   };
   const facts = (item as ZscalerFindingWithFacts)[ZSCALER_DECISION_FACTS] ?? {};
   if (unreadable.length === 0) {
-    const complete = facts.evidence_complete === true
-      && dependencies.every((dependency) => dependency.dataset.truncated !== true);
     const result = {
       ...item,
-      status: evaluateBatchCheckVerdict(ZSCALER_SPEC, item.id, { ...facts, evidence_complete: complete }) as ZscalerFindingStatus,
       evidence,
     };
-    Object.defineProperty(result, ZSCALER_DECISION_FACTS, { value: { ...facts, evidence_complete: complete } });
+    Object.defineProperty(result, ZSCALER_DECISION_FACTS, { value: facts });
     return result;
   }
   const status = evaluateBatchCheckVerdict(ZSCALER_SPEC, item.id, { ...facts, evidence_complete: false }) as ZscalerFindingStatus;
@@ -2158,7 +2155,14 @@ function assessUrlFiltering(data: ZiaPolicyData): ZscalerFinding {
   const rules = data.urlFilteringRules;
   if (rules.error) return unreadableFinding(1, "GET /urlFilteringRules", rules, evidenceNote);
   if (rules.data.length === 0) {
-    return finding(1, "fail", "Empty inventory: zero URL filtering rules exist, so no web category is blocked and all traffic is implicitly allowed.", { rule_count: 0 }, evidenceNote, zscalerDecisionFacts(0, 1));
+    return finding(1, "fail", "Empty inventory: zero URL filtering rules exist, so no web category is blocked and all traffic is implicitly allowed.", { rule_count: 0 }, evidenceNote, {
+      evidence_readable: true,
+      evidence_complete: !rules.truncated,
+      rule_count: 0,
+      enabled_rule_count: 0,
+      blocking_rule_count: 0,
+      missing_required_category_count: REQUIRED_URL_BLOCK_CATEGORIES.length,
+    });
   }
   const active = enabledRules(rules.data);
   const blockRules = active.filter((rule) => (asString(rule.action) ?? "").toUpperCase() === "BLOCK");
@@ -2174,12 +2178,14 @@ function assessUrlFiltering(data: ZiaPolicyData): ZscalerFinding {
     rules: ruleSummaries(rules.data),
     partial_inventory: rules.truncated === true,
   };
-  const facts = zscalerDecisionFacts(
-    rules.data.length,
-    rules.data.length === 0 || active.length === 0 || blockRules.length === 0 ? 1 : 0,
-    missing.length,
-    { complete: !rules.truncated },
-  );
+  const facts = {
+    evidence_readable: true,
+    evidence_complete: !rules.truncated,
+    rule_count: rules.data.length,
+    enabled_rule_count: active.length,
+    blocking_rule_count: blockRules.length,
+    missing_required_category_count: missing.length,
+  };
   if (active.length === 0) {
     return finding(1, "fail", `${rules.data.length} URL filtering rules exist but every rule has state DISABLED, so nothing is enforced.`, evidence, evidenceNote, facts);
   }
@@ -2203,7 +2209,17 @@ function assessFirewall(data: ZiaPolicyData): ZscalerFinding {
   const rules = data.firewallRules;
   if (rules.error) return unreadableFinding(2, "GET /firewallFilteringRules", rules, evidenceNote);
   if (rules.data.length === 0) {
-    return finding(2, "fail", "Empty inventory: zero firewall filtering rules were returned, so no cloud firewall policy is enforced (a live tenant always returns at least the default rule, so the credential may also be scoped).", { rule_count: 0 }, evidenceNote, zscalerDecisionFacts(0, 1));
+    return finding(2, "fail", "Empty inventory: zero firewall filtering rules were returned, so no cloud firewall policy is enforced (a live tenant always returns at least the default rule, so the credential may also be scoped).", { rule_count: 0 }, evidenceNote, {
+      evidence_readable: true,
+      evidence_complete: !rules.truncated,
+      rule_count: 0,
+      enabled_rule_count: 0,
+      default_rule_present: false,
+      default_rule_allows: false,
+      unbounded_allow_rule_count: 0,
+      blocking_rule_without_full_logging_count: 0,
+      enabled_non_default_rule_count: 0,
+    });
   }
   const active = enabledRules(rules.data);
   const defaultRules = rules.data.filter((rule) => asBoolean(rule.defaultRule) === true);
@@ -2227,12 +2243,17 @@ function assessFirewall(data: ZiaPolicyData): ZscalerFinding {
     rules: ruleSummaries(rules.data),
     partial_inventory: rules.truncated === true,
   };
-  const facts = zscalerDecisionFacts(
-    rules.data.length,
-    rules.data.length === 0 || defaultAction === "ALLOW" || unbounded.length > 0 ? 1 : 0,
-    (!defaultRule ? 1 : 0) + (active.length === defaultRules.length ? 1 : 0) + blockWithoutLogging.length,
-    { complete: !rules.truncated },
-  );
+  const facts = {
+    evidence_readable: true,
+    evidence_complete: !rules.truncated,
+    rule_count: rules.data.length,
+    enabled_rule_count: active.length,
+    default_rule_present: defaultRule !== undefined,
+    default_rule_allows: defaultAction === "ALLOW",
+    unbounded_allow_rule_count: unbounded.length,
+    blocking_rule_without_full_logging_count: blockWithoutLogging.length,
+    enabled_non_default_rule_count: active.filter((rule) => asBoolean(rule.defaultRule) !== true).length,
+  };
   if (!defaultRule) {
     return finding(2, "warn", `${rules.data.length} firewall rules were returned but none is flagged defaultRule, so the fallback action is unknown; the inventory may be partial.${partialSuffix(rules, "firewall rule")}`, evidence, evidenceNote, facts);
   }

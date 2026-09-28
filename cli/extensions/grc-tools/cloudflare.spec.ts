@@ -3,7 +3,13 @@ import {
   buildBatchOutputContract,
 } from "./batch-spec-builder.js";
 import {
+  batch2All,
+  batch2Any,
   batch2Checks,
+  batch2Eq,
+  batch2Gt,
+  batch2Ne,
+  batch2Rule,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
@@ -56,16 +62,69 @@ function owner(id: string): string {
   return "cloudflare_assess_traffic_controls";
 }
 
-const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces]) => ({
-  id,
-  control,
-  title,
-  severity,
-  owner: owner(id),
-  surfaces: sourceSurfaces,
-  emptyOutcome: id === "CF-IAM-05" ? "fail" : id === "CF-TRF-05" ? "pass" : "manual",
-  decision: `Evaluate ${title} from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account.`,
-})));
+const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces]) => {
+  const custom = id === "CF-IAM-02"
+    ? {
+        decisionInputs: {
+          evidence_readable: "Boolean. True only when token verification and the current-token detail response were readable; Global API Key authentication has no token and is false.",
+          evidence_complete: "Boolean. True because token verification and current-token detail are single-object reads; false means either read was incomplete.",
+          verified_status: "String from /user/tokens/verify result.status; null means absent or unreadable. The only compliant value is active.",
+          token_policy_count: "Complete count of current-token policy objects before presentation slicing.",
+          write_capable_permission_group_count: "Complete count of permission groups whose name does not end in Read.",
+          broad_resource_policy_count: "Complete count of policies whose resources object is empty or contains wildcard resource selectors.",
+        },
+        decisionRules: [
+          batch2Rule("manual", batch2Ne("evidence_readable", true)),
+          batch2Rule("fail", batch2Any(
+            batch2Ne("verified_status", "active"),
+            batch2Eq("token_policy_count", 0),
+          )),
+          batch2Rule("warn", batch2Any(
+            batch2Ne("evidence_complete", true),
+            batch2Gt("write_capable_permission_group_count", 0),
+            batch2Gt("broad_resource_policy_count", 0),
+          )),
+          batch2Rule("pass", { op: "always" }),
+        ],
+      }
+    : id === "CF-TRF-06"
+      ? {
+          decisionInputs: {
+            evidence_readable: "Boolean. True only when Gateway rules and, for an empty rule list, the Gateway account provisioning object were readable.",
+            evidence_complete: "Boolean. True only when Gateway rule pagination proved exhaustion.",
+            gateway_provisioned: "Boolean. True when /accounts/{account_id}/gateway returns a non-empty gateway_tag.",
+            gateway_rule_count: "Complete count of Gateway rules before presentation slicing.",
+            enabled_rule_count: "Count of Gateway rules whose enabled field is not false.",
+            blocking_or_isolating_rule_count: "Count of enabled rules whose action is block, isolate, or override.",
+            dns_or_http_filter_present: "Boolean. True when at least one enabled rule names a DNS or HTTP filter.",
+          },
+          decisionRules: [
+            batch2Rule("manual", batch2Ne("evidence_readable", true)),
+            batch2Rule("fail", batch2Any(
+              batch2All(batch2Eq("gateway_rule_count", 0), batch2Eq("gateway_provisioned", true)),
+              batch2All(batch2Gt("gateway_rule_count", 0), batch2Any(
+                batch2Eq("blocking_or_isolating_rule_count", 0),
+                batch2Eq("dns_or_http_filter_present", false),
+              )),
+            )),
+            batch2Rule("manual", batch2All(batch2Eq("gateway_rule_count", 0), batch2Eq("gateway_provisioned", false))),
+            batch2Rule("warn", batch2Ne("evidence_complete", true)),
+            batch2Rule("pass", { op: "always" }),
+          ],
+        }
+      : {};
+  return {
+    id,
+    control,
+    title,
+    severity,
+    owner: owner(id),
+    surfaces: sourceSurfaces,
+    emptyOutcome: id === "CF-IAM-05" ? "fail" : id === "CF-TRF-05" ? "pass" : "manual",
+    ...custom,
+    decision: `Evaluate ${title} from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account.`,
+  };
+}));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 
 export const CLOUDFLARE_RUNTIME_BEHAVIOR = [

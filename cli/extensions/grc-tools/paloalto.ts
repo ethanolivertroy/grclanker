@@ -3847,7 +3847,7 @@ export function assessPrismaCloudPosture(
   findings.push(gate(finding(
     1,
     "high",
-    passRate === undefined ? "manual" : passRate >= minPassRate ? "pass" : passRate >= minPassRate - 20 ? "warn" : "fail",
+    "manual",
     passRate === undefined
       ? "Compliance posture returned zero evaluated resources; emptiness is treated as manual because it usually means no cloud account has finished scanning. Manual evidence required: confirm onboarded accounts have completed their first scan and export the compliance dashboard."
       : `${passRate}% of ${total} evaluated resources passed across ${standards.length} compliance standards (threshold ${minPassRate}%).`,
@@ -3858,11 +3858,13 @@ export function assessPrismaCloudPosture(
       high_severity_failed: asNumber(summary.highSeverityFailedResources) ?? null,
       standards: nullUnless(postureReadable, standards.slice(0, 25).map((item) => ({ name: asString(item.name), passed: asNumber(item.passedResources), failed: asNumber(item.failedResources) }))),
     },
-    paloaltoDecisionFacts(
-      total,
-      passRate !== undefined && passRate < minPassRate - 20 ? 1 : 0,
-      passRate !== undefined && passRate < minPassRate && passRate >= minPassRate - 20 ? 1 : 0,
-    ),
+    {
+      evidence_readable: true,
+      evidence_complete: true,
+      passed_resource_count: passed,
+      total_resource_count: total,
+      minimum_pass_rate_percent: minPassRate,
+    },
   ), prismaGate(snapshot, ["compliance posture"]), "export the Prisma Cloud compliance dashboard with per-standard pass rates."));
 
   const enabledRules = snapshot.alertRules.filter((rule) => asBoolean(rule.enabled) === true);
@@ -4779,12 +4781,7 @@ export function assessAdminAccess(prisma: PrismaSnapshot | undefined, snapshots:
   const complexity = snapshots.map(passwordComplexityEnabled);
   const complexityDisabled = complexity.some((value) => value !== true);
   const sysadminRoles = prisma ? prisma.userRoles.filter((role) => /system admin/i.test(asString(role.roleType) ?? asString(role.name) ?? "")) : [];
-  const panosFail = snapshots.length > 0 && (superusers.length > maxSuperusers || complexityDisabled);
-  const panosWarn = snapshots.length > 0 && localOnly.length > 0;
-  const prismaWarn = prisma !== undefined && (sysadminRoles.length > maxSuperusers || prisma.userRoles.length === 0);
   const panosEmpty = snapshots.length > 0 && admins.length === 0;
-  const singleProduct = !prisma || snapshots.length === 0;
-  const status: PaloaltoStatus = panosEmpty ? "manual" : panosFail ? "fail" : panosWarn || prismaWarn || singleProduct ? "warn" : "pass";
   const parts = [
     snapshots.length > 0
       ? panosEmpty
@@ -4796,16 +4793,24 @@ export function assessAdminAccess(prisma: PrismaSnapshot | undefined, snapshots:
   const gateInfo = mergeGates(prisma ? prismaGate(prisma, ["user roles"]) : undefined, snapshots.length > 0 ? panosGate(snapshots, DEVICE_XPATHS) : undefined);
   const deviceReadable = snapshots.length > 0 && panosReadable(snapshots, DEVICE_XPATHS);
   const rolesReadable = prisma !== undefined && prismaReadable(prisma, "user roles");
-  return gate(finding(19, "high", status, parts.join(" "), {
+  return gate(finding(19, "high", "manual", parts.join(" "), {
     panos_admins: nullUnless(deviceReadable, admins.map((admin) => `${admin.host}/${admin.name}${admin.superuser ? " (superuser)" : ""}`).slice(0, 50)),
     panos_local_password_only: nullUnless(deviceReadable, localOnly.map((admin) => `${admin.host}/${admin.name}`).slice(0, 50)),
     password_complexity_by_device: nullUnless(deviceReadable, snapshots.map((snapshot, index) => ({ host: snapshot.host, enabled: complexity[index] ?? null }))),
     prisma_roles: nullUnless(rolesReadable, prisma?.userRoles.map((role) => `${asString(role.name)} (${asString(role.roleType) ?? "unknown"})`).slice(0, 50) ?? null),
-  }, paloaltoDecisionFacts(
-    panosEmpty ? 0 : Number(Boolean(prisma)) + Number(snapshots.length > 0),
-    panosFail ? 1 : 0,
-    panosWarn || prismaWarn || singleProduct ? 1 : 0,
-  )), gateInfo, instruction);
+  }, {
+    evidence_readable: true,
+    evidence_complete: true,
+    panos_configured: snapshots.length > 0,
+    prisma_configured: prisma !== undefined,
+    panos_administrator_count: admins.length,
+    panos_superuser_count: superusers.length,
+    maximum_superuser_count: maxSuperusers,
+    password_complexity_disabled_device_count: complexity.filter((value) => value !== true).length,
+    local_password_only_administrator_count: localOnly.length,
+    prisma_system_admin_role_count: sysadminRoles.length,
+    prisma_role_count: prisma?.userRoles.length ?? 0,
+  }), gateInfo, instruction);
 }
 
 export function assessLogging(prisma: PrismaSnapshot | undefined, snapshots: PanosDeviceSnapshot[]): PaloaltoFinding {
@@ -4832,11 +4837,6 @@ export function assessLogging(prisma: PrismaSnapshot | undefined, snapshots: Pan
   }
   const externalForwarding = syslogServers > 0 || panoramaForwarding;
   const siemIntegrations = prisma ? prisma.integrations.filter((item) => /splunk|siem|syslog|qradar|sentinel|webhook|sqs|pubsub|snow|servicenow/i.test(`${asString(item.integrationType) ?? ""} ${asString(item.name) ?? ""}`)) : [];
-  const panosFail = snapshots.length > 0 && (unlogged.length > 0 || !externalForwarding);
-  const panosWarn = snapshots.length > 0 && (noForwarding.length > 0 || implicitLog.length > 0 || enabled.length === 0);
-  const prismaWarn = Boolean(prisma) && siemIntegrations.length === 0;
-  const singleProduct = !prisma || snapshots.length === 0;
-  const status: PaloaltoStatus = panosFail ? "fail" : panosWarn || prismaWarn || singleProduct ? "warn" : "pass";
   const parts = [
     snapshots.length > 0
       ? `PAN-OS: ${unlogged.length}/${enabled.length} rules set log-end=no, ${implicitLog.length} rely on the implicit log-end default, ${noForwarding.length} lack a log forwarding profile, ${syslogServers} syslog server profiles, Panorama forwarding ${panoramaForwarding ? "configured" : "not configured"}.${enabled.length === 0 ? " Zero enabled rules were readable, so rule logging could not be evaluated (warn)." : ""} Log retention must be confirmed against the storage quota.`
@@ -4847,18 +4847,25 @@ export function assessLogging(prisma: PrismaSnapshot | undefined, snapshots: Pan
   const rulesReadable = snapshots.length > 0 && panosReadable(snapshots, POLICY_XPATHS);
   const forwardingReadable = snapshots.length > 0 && panosReadable(snapshots, [...POLICY_XPATHS, ...DEVICE_XPATHS]);
   const integrationsReadable = prisma !== undefined && prismaReadable(prisma, "integrations");
-  return gate(finding(20, "high", status, parts.join(" "), {
+  return gate(finding(20, "high", "manual", parts.join(" "), {
     unlogged_rules: nullUnless(rulesReadable, unlogged.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     rules_without_log_forwarding: nullUnless(rulesReadable, noForwarding.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     syslog_server_profiles: nullUnless(forwardingReadable, syslogServers),
     log_forwarding_profiles: nullUnless(forwardingReadable, forwardingProfiles),
     panorama_forwarding: nullUnless(forwardingReadable, panoramaForwarding),
     prisma_integrations: nullUnless(integrationsReadable, prisma?.integrations.map((item) => `${asString(item.name)} (${asString(item.integrationType) ?? "unknown"})`).slice(0, 25) ?? null),
-  }, paloaltoDecisionFacts(
-    Number(Boolean(prisma)) + Number(snapshots.length > 0),
-    panosFail ? 1 : 0,
-    panosWarn || prismaWarn || singleProduct ? 1 : 0,
-  )), gateInfo, instruction);
+  }, {
+    evidence_readable: true,
+    evidence_complete: true,
+    panos_configured: snapshots.length > 0,
+    prisma_configured: prisma !== undefined,
+    enabled_security_rule_count: enabled.length,
+    log_end_disabled_rule_count: unlogged.length,
+    implicit_log_end_rule_count: implicitLog.length,
+    rule_without_forwarding_profile_count: noForwarding.length,
+    external_forwarding_configured: externalForwarding,
+    prisma_siem_integration_count: siemIntegrations.length,
+  }), gateInfo, instruction);
 }
 
 export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): PaloaltoFinding[] {
