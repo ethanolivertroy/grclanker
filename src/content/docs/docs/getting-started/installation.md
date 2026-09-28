@@ -24,7 +24,8 @@ These are on `main` but not in the `v0.0.1` bundle:
 - 241 domain tools, including the 35 platform integrations (AWS, Okta, GitHub, and the rest of the [integrations](/docs/integrations/aws/) section) plus the FedRAMP, OSCAL, and SCF tools
 - `grclanker tools`, which lists every bundled tool
 - `grclanker flue run`, which runs the same agent under the [Flue runtime](/docs/getting-started/flue-runtime/)
-- `grclanker env list`, `grclanker setup --compute <kind>`, and `--compute <kind>` on `investigate` and `audit`
+- `grclanker env list`
+- `--compute <kind>` to pick a compute backend: for one run of `investigate`, `audit`, `assess`, or `validate`; with `grclanker setup --compute <kind>` to save it as the preferred backend; and as an alias for `--backend` on `env smoke-test` and `env exec`. A bare `grclanker --compute <kind>` is rejected as an unknown command.
 
 To use any of those now, [install from source](#install-from-source).
 
@@ -54,7 +55,7 @@ That setup step is where you choose the local-first or hosted model path.
 
 - Detects your OS and architecture. Bundles exist for `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64` (glibc), `win32-arm64`, and `win32-x64`. Linux musl hosts (such as Alpine) are not supported; use a [source checkout](#install-from-source) there.
 - Scans the GitHub release list for the newest release that has a bundle for your platform and downloads it.
-- Verifies the archive against the release's `SHA256SUMS.txt`.
+- Checks the archive against the release's `SHA256SUMS.txt` when it can, and aborts on a mismatch. If the checksum file cannot be fetched, has no entry for the archive, or no SHA-256 tool is available, or if `GRCLANKER_ASSET_URL` points at a custom archive, it prints a warning and installs without verification.
 - Replaces `~/.local/share/grclanker` with the unpacked bundle. The bundle includes its own Node.js runtime, so you do not need Node installed.
 - Links `grclanker` into `~/.local/bin`. On Windows it writes a `grclanker.cmd` launcher there instead.
 - Warns if `~/.local/bin` is not on your `PATH`. On macOS and Linux it prints the `export PATH=...` line to add to your shell profile.
@@ -120,7 +121,7 @@ npm --prefix cli run build:bundle
 bash public/install
 ```
 
-When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one, and verifies it against the `SHA256SUMS.txt` written next to it. The install banner still reads `v0.0.1`, because that is the version in `cli/package.json` until the next release.
+When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one, and checks it against the `SHA256SUMS.txt` that `build:bundle` writes next to it. The install banner still reads `v0.0.1`, because that is the version in `cli/package.json` until the next release.
 
 To update a source install, run `git pull`, then repeat `npm --prefix cli ci` and `npm --prefix cli run build` (and `build:bundle` plus `bash public/install` if you use the bundle layout).
 
@@ -128,10 +129,17 @@ To update a source install, run `git pull`, then repeat `npm --prefix cli ci` an
 
 Install and model setup are separate on purpose.
 
-If you want grclanker to stay local-first instead of using a hosted provider, do this after install:
+If you want grclanker to stay local-first instead of using a hosted provider, install Ollama first from [ollama.com/download](https://ollama.com/download). The grclanker installer does not install it.
+
+Ollama must be serving before setup. If the Ollama app or background service is already running, skip this step. Otherwise start the server in its own terminal and leave it running:
 
 ```bash
 ollama serve
+```
+
+Then, in a second terminal:
+
+```bash
 ollama pull gemma4
 grclanker setup
 ```

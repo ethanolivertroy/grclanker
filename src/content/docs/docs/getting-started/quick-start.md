@@ -15,10 +15,17 @@ This installs the newest release bundle, currently the `v0.0.1` pre-release with
 
 ## 2. Prepare the local-first path
 
-The recommended first local backend is Ollama with Gemma 4.
+The recommended first local backend is Ollama with Gemma 4. Install Ollama from [ollama.com/download](https://ollama.com/download); the grclanker installer does not install it.
+
+If the Ollama app or background service is already running, skip this command. Otherwise start the server in its own terminal and leave it running:
 
 ```bash
 ollama serve
+```
+
+Then, in a second terminal:
+
+```bash
 ollama pull gemma4
 grclanker setup
 ```
@@ -55,14 +62,14 @@ grclanker tools
 In the session, try:
 
 ```text
-What is the CMVP certificate for BoringCrypto?
-```
-
-```text
 Is CVE-2024-3400 in the CISA KEV catalog, and what is its EPSS score?
 ```
 
-Both work on the `v0.0.1` bundle and on `main`.
+```text
+Which vulnerabilities were added to the CISA KEV catalog in the last 30 days?
+```
+
+Both are answered by the KEV and EPSS tools (`kevs_search`, `kevs_get_epss`, `kevs_recent`), which ship in the `v0.0.1` bundle and on `main`.
 
 ## 5. Review or extend a shipped integration
 
