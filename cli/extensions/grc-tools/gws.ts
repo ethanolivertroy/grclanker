@@ -19,6 +19,7 @@
  * - policies.list: https://cloud.google.com/identity/docs/reference/rest/v1/policies/list
  * - Policy API settings catalog: https://cloud.google.com/identity/docs/concepts/supported-policy-api-settings
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createPrivateKey, sign as signData } from "node:crypto";
 import {
   createWriteStream,
@@ -32,7 +33,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1096,6 +1097,23 @@ function countByStatus(findings: GwsFinding[]): Record<GwsFindingStatus, number>
   );
 }
 
+const GWS_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordGwsDecisionFacts(definitionId: string, facts: Readonly<Record<string, unknown>>): void {
+  const store = GWS_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${definitionId} decision facts were recorded outside a GWS assessment`);
+  store.set(definitionId, facts);
+}
+
+function completeGwsDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
+  return datasets.every((dataset) =>
+    dataset !== undefined
+    && !dataset.error
+    && !dataset.notCollected
+    && dataset.truncated !== true
+  );
+}
+
 function buildFinding(
   definitionId: string,
   status: GwsFindingStatus,
@@ -1106,7 +1124,9 @@ function buildFinding(
 ): GwsFinding {
   const definition = GWS_CHECKS[definitionId];
   if (!definition) throw new Error(`Unknown GWS check definition: ${definitionId}`);
-  status = preserveRuntimeFindingStatus(GWS_SPEC, definitionId, status);
+  const facts = GWS_DECISION_CONTEXT.getStore()?.get(definitionId);
+  if (!facts) throw new Error(`${definitionId} has no runtime decision facts`);
+  status = materializeBatchCheckVerdict(GWS_SPEC, definitionId, facts, status);
   return {
     id: definition.id,
     title: definition.title,
@@ -2801,6 +2821,14 @@ function tokenReadFailureEvidence(dataset: TokenInventoryDataset, privilegedIds:
 
 function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined): GwsFinding {
   if (!dataset) {
+    recordGwsDecisionFacts("GWS-ID-005", {
+      readable: false,
+      complete: false,
+      policy_count: 0,
+      enforcement_policy_count: 0,
+      enforced_policy_count: 0,
+      enrollment_disabled_count: 0,
+    });
     return buildFinding(
       "GWS-ID-005",
       "Manual",
@@ -2811,6 +2839,14 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     );
   }
   if (dataset.error) {
+    recordGwsDecisionFacts("GWS-ID-005", {
+      readable: false,
+      complete: false,
+      policy_count: 0,
+      enforcement_policy_count: 0,
+      enforced_policy_count: 0,
+      enrollment_disabled_count: 0,
+    });
     return unreadableFinding(
       "GWS-ID-005",
       "Cloud Identity policies.list",
@@ -2825,6 +2861,14 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
   const enrollment = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_ENROLLMENT_SETTING);
   const factors = dataset.data.filter((policy) => asString(asRecord(policy.setting).type) === TWO_STEP_FACTOR_SETTING);
   if (enforcement.length === 0) {
+    recordGwsDecisionFacts("GWS-ID-005", {
+      readable: true,
+      complete: completeGwsDatasets(dataset),
+      policy_count: dataset.data.length,
+      enforcement_policy_count: 0,
+      enforced_policy_count: 0,
+      enrollment_disabled_count: 0,
+    });
     return buildFinding(
       "GWS-ID-005",
       "Manual",
@@ -2854,6 +2898,14 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     const value = asRecord(asRecord(policy.setting).value);
     return asString(value.allowedSignInFactorSet) ?? "unspecified";
   })));
+  recordGwsDecisionFacts("GWS-ID-005", {
+    readable: true,
+    complete: completeGwsDatasets(dataset),
+    policy_count: dataset.data.length,
+    enforcement_policy_count: enforcement.length,
+    enforced_policy_count: enforced.length,
+    enrollment_disabled_count: enrollmentDisabled.length,
+  });
   const evidence = [
     countLine("Enforcement policies returned", enforcement.length, [policiesStatus]),
     `Enforcement policy scopes: ${enforcement.map((policy) => `${describeScope(policy)} [${asString(policy.type) ?? "type unknown"}]`).join("; ")}`,
@@ -2897,6 +2949,7 @@ export function assessGwsIdentity(
   data: GwsIdentityData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
+  return GWS_DECISION_CONTEXT.run(new Map(), () => {
   const users = data.users.data;
   const roles = data.roles.data;
   const roleAssignments = data.roleAssignments.data;
@@ -2917,6 +2970,41 @@ export function assessGwsIdentity(
   const usersStatus = sourceStatus(USERS_ENDPOINT, data.users);
   const roleAssignmentsStatus = sourceStatus(ROLE_ASSIGNMENTS_ENDPOINT, data.roleAssignments);
   const directoryStatuses = [usersStatus, sourceStatus(ROLES_ENDPOINT, data.roles), roleAssignmentsStatus];
+  const directoryReadable = !directoryProblem;
+  const directoryComplete = completeGwsDatasets(data.users, data.roles, data.roleAssignments)
+    && privileged.unresolvedAssignments === 0;
+  const privilegedCoverage = privileged.privilegedUsers.length === 0
+    ? 0
+    : privilegedEnforced.length / privileged.privilegedUsers.length;
+  const activeCoverage = activeUsers.length === 0 ? 0 : enforcedUsers.length / activeUsers.length;
+  recordGwsDecisionFacts("GWS-ID-001", {
+    readable: directoryReadable,
+    complete: directoryComplete,
+    privileged_user_count: privileged.privilegedUsers.length,
+    enforced_user_count: privilegedEnforced.length,
+    coverage: privilegedCoverage,
+  });
+  recordGwsDecisionFacts("GWS-ID-002", {
+    readable: !data.users.error,
+    complete: completeGwsDatasets(data.users),
+    active_user_count: activeUsers.length,
+    enforced_user_count: enforcedUsers.length,
+    coverage: activeCoverage,
+  });
+  recordGwsDecisionFacts("GWS-ID-003", {
+    readable: !data.users.error,
+    complete: completeGwsDatasets(data.users),
+    active_user_count: activeUsers.length,
+    dormant_user_count: dormancy.dormant,
+    unknown_login_count: dormancy.unknownLastLogin,
+    warning_dormant_maximum: Math.max(2, Math.ceil(activeUsers.length * 0.05)),
+  });
+  recordGwsDecisionFacts("GWS-ID-004", {
+    readable: directoryReadable,
+    complete: directoryComplete,
+    super_admin_count: privileged.superAdmins.length,
+    unenforced_super_admin_count: privileged.superAdmins.length - superAdminEnforced.length,
+  });
 
   const findings: GwsFinding[] = [];
 
@@ -3146,12 +3234,14 @@ export function assessGwsIdentity(
     snapshotSummary,
     text: buildAssessmentText("Google Workspace identity assessment", getDisplayOrganization(config), findings, snapshotSummary),
   };
+  });
 }
 
 export function assessGwsAdminAccess(
   data: GwsAdminAccessData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
+  return GWS_DECISION_CONTEXT.run(new Map(), () => {
   const users = data.users.data;
   const roles = data.roles.data;
   const roleAssignments = data.roleAssignments.data;
@@ -3170,6 +3260,36 @@ export function assessGwsAdminAccess(
   const roleAssignmentsStatus = sourceStatus(ROLE_ASSIGNMENTS_ENDPOINT, data.roleAssignments);
   const directoryStatuses = [usersStatus, sourceStatus(ROLES_ENDPOINT, data.roles), roleAssignmentsStatus];
   const adminActivitiesStatus = sourceStatus(activitiesEndpoint("admin"), data.adminActivities);
+  const directoryReadable = !directoryProblem;
+  const directoryComplete = completeGwsDatasets(data.users, data.roles, data.roleAssignments)
+    && privileged.unresolvedAssignments === 0;
+  recordGwsDecisionFacts("GWS-ADMIN-001", {
+    readable: directoryReadable,
+    complete: directoryComplete,
+    super_admin_count: privileged.superAdmins.length,
+  });
+  recordGwsDecisionFacts("GWS-ADMIN-002", {
+    readable: directoryReadable,
+    complete: directoryComplete,
+    privileged_user_count: privileged.privilegedUsers.length,
+    suspended_privileged_count: suspendedPrivileged.length,
+  });
+  recordGwsDecisionFacts("GWS-ADMIN-003", {
+    readable: directoryReadable,
+    complete: directoryComplete,
+    delegated_admin_count: privileged.delegatedAdmins.length,
+  });
+  recordGwsDecisionFacts("GWS-ADMIN-004", {
+    readable: !data.adminActivities.error,
+    complete: completeGwsDatasets(data.adminActivities),
+    event_count: data.adminActivities.data.length,
+  });
+  recordGwsDecisionFacts("GWS-ADMIN-005", {
+    readable: !data.roleAssignments.error,
+    complete: directoryComplete,
+    assignment_count: roleAssignments.length,
+    group_assignment_count: privileged.groupAssignmentCount,
+  });
 
   const findings: GwsFinding[] = [];
 
@@ -3392,12 +3512,14 @@ export function assessGwsAdminAccess(
     snapshotSummary,
     text: buildAssessmentText("Google Workspace admin-access assessment", getDisplayOrganization(config), findings, snapshotSummary),
   };
+  });
 }
 
 export function assessGwsIntegrations(
   data: GwsIntegrationData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
+  return GWS_DECISION_CONTEXT.run(new Map(), () => {
   const privileged = getPrivilegedUsers(data.users.data, data.roles.data, data.roleAssignments.data);
   const privilegedIds = new Set(privileged.privilegedUsers.map((user) => asString(user.id)).filter((value): value is string => Boolean(value)));
   const allTokens = data.tokenInventory.data;
@@ -3430,6 +3552,38 @@ export function assessGwsIntegrations(
     countLine("Users sampled for token inventory", sampled, [tokenInventoryStatus(data.tokenInventory, "sample")]),
     tokenCountLine("Token records collected", allTokens.length, data.tokenInventory),
   ];
+  const privilegedSampled = privileged.privilegedUsers.length <= MAX_TOKEN_USERS;
+  const integrationDirectoryComplete = completeGwsDatasets(data.users, data.roles, data.roleAssignments)
+    && privileged.unresolvedAssignments === 0;
+  const tokenReadsComplete = failed === 0
+    && sampled >= population
+    && sampleDependency.notes.length === 0;
+  recordGwsDecisionFacts("GWS-INTEG-001", {
+    users_readable: !data.users.error,
+    complete: tokenReadsComplete,
+    sampled_user_count: sampled,
+    failed_read_count: failed,
+    token_count: allTokens.length,
+  });
+  recordGwsDecisionFacts("GWS-INTEG-002", {
+    directory_readable: !directoryProblem,
+    complete: integrationDirectoryComplete && tokenReadsComplete && privilegedSampled,
+    privileged_user_count: privileged.privilegedUsers.length,
+    token_count: allTokens.length,
+    failed_read_count: failed,
+    privileged_token_count: privilegedTokens.length,
+  });
+  recordGwsDecisionFacts("GWS-INTEG-003", {
+    users_readable: !data.users.error,
+    complete: tokenReadsComplete,
+    token_count: allTokens.length,
+    high_risk_token_count: highRiskTokens,
+  });
+  recordGwsDecisionFacts("GWS-INTEG-004", {
+    readable: !data.tokenActivities.error,
+    complete: completeGwsDatasets(data.tokenActivities),
+    event_count: data.tokenActivities.data.length,
+  });
 
   const findings: GwsFinding[] = [];
 
@@ -3489,7 +3643,6 @@ export function assessGwsIntegrations(
     ));
   }
 
-  const privilegedSampled = privileged.privilegedUsers.length <= MAX_TOKEN_USERS;
   if (directoryProblem) {
     findings.push(unreadableFinding(
       "GWS-INTEG-002",
@@ -3682,18 +3835,48 @@ export function assessGwsIntegrations(
     snapshotSummary,
     text: buildAssessmentText("Google Workspace integrations assessment", getDisplayOrganization(config), findings, snapshotSummary),
   };
+  });
 }
 
 export function assessGwsMonitoring(
   data: GwsMonitoringData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
+  return GWS_DECISION_CONTEXT.run(new Map(), () => {
   const suspiciousLogins = countMatchingEvents(data.loginActivities.data, SUSPICIOUS_LOGIN_NAMES);
   const alerts = bucketAlerts(data.alerts.data);
   const loginStatus = sourceStatus(activitiesEndpoint("login"), data.loginActivities);
   const adminStatus = sourceStatus(activitiesEndpoint("admin"), data.adminActivities);
   const tokenStatus = sourceStatus(activitiesEndpoint("token"), data.tokenActivities);
   const alertsStatus = sourceStatus(ALERTS_ENDPOINT, data.alerts);
+  recordGwsDecisionFacts("GWS-MON-001", {
+    readable: !data.alerts.error,
+    complete: completeGwsDatasets(data.alerts),
+    alert_count: data.alerts.data.length,
+  });
+  recordGwsDecisionFacts("GWS-MON-002", {
+    readable: !data.loginActivities.error,
+    complete: completeGwsDatasets(data.loginActivities),
+    event_count: data.loginActivities.data.length,
+    suspicious_login_count: suspiciousLogins,
+  });
+  recordGwsDecisionFacts("GWS-MON-003", {
+    readable: !data.adminActivities.error,
+    complete: completeGwsDatasets(data.adminActivities),
+    event_count: data.adminActivities.data.length,
+  });
+  recordGwsDecisionFacts("GWS-MON-004", {
+    readable: !data.tokenActivities.error,
+    complete: completeGwsDatasets(data.tokenActivities),
+    event_count: data.tokenActivities.data.length,
+  });
+  recordGwsDecisionFacts("GWS-MON-005", {
+    readable: !data.alerts.error,
+    complete: completeGwsDatasets(data.alerts),
+    alert_count: data.alerts.data.length,
+    open_alert_count: alerts.open,
+    unknown_status_count: alerts.unknownStatus,
+  });
 
   const findings: GwsFinding[] = [];
 
@@ -3908,6 +4091,7 @@ export function assessGwsMonitoring(
     snapshotSummary,
     text: buildAssessmentText("Google Workspace monitoring assessment", getDisplayOrganization(config), findings, snapshotSummary),
   };
+  });
 }
 
 function buildExecutiveSummary(

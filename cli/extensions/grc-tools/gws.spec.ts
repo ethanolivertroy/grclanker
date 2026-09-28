@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const GWS_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "GWS-ID-001": ["directory-users"], "GWS-ID-002": ["directory-users"], "GWS-ID-003": ["directory-users"],
@@ -54,31 +55,265 @@ const decisions = {
   ID: [
     "for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent.",
     "for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent.",
-    "return fail when more than 10 percent of active users have no login within the configured stale period, warn when one through 10 percent are dormant or login dates are missing, and pass when none are dormant or undated.",
-    "return pass when every super admin enforces 2-step verification and has recent activity, fail when any super admin lacks enforced 2-step verification, and warn for stale, undated, or partial evidence.",
+    "return fail when dormant active users exceed the greater of two or five percent of active users, warn for a smaller non-zero dormant set, missing login dates, or partial evidence, and pass when complete evidence has neither.",
+    "return pass when every super admin enforces 2-step verification, fail when any super admin does not, and demote pass to warn when directory or assignment evidence is partial.",
     "return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable.",
   ],
   ADMIN: [
-    "return pass when the complete privileged inventory has at most two super admins, warn with three through five, and fail above five.",
+    "return pass when the complete privileged inventory has at most four super admins, warn with five or six, and fail above six.",
     "return fail when any privileged user is suspended or archived and pass when none is, with partial evidence demoting pass to warn.",
-    "return pass when at least one active delegated role assignment exists outside the Super Admin role, warn when none exists or role evidence is partial, and manual when role definitions or assignments are unavailable.",
-    "return pass when the complete admin-audit lookback contains activity, warn when it is empty or truncated, and manual when the audit read is denied or unreadable.",
+    "return pass when at least one active delegated role assignment exists outside the Super Admin role, manual when none exists or role evidence is unavailable, and demote pass to warn when role evidence is partial.",
+    "return pass when the complete admin-audit lookback contains activity, manual when it is empty, denied, or unreadable, and demote pass to warn when the read is truncated.",
     "always return manual when group-based role assignments exist because expanded group membership is not collected; return pass only when complete role-assignment evidence proves no group-based grant.",
   ],
   INTEG: [
-    "return pass when every required per-user token read completes and at least one token is inventoried, warn when the complete inventory is empty, and manual when any token read is denied, failed, unattributed, or skipped.",
+    "return pass when every required per-user token read completes and at least one token is inventoried, warn when only some per-user reads succeed, and manual when the sample is absent, every read fails, or the readable inventory is empty.",
     "return fail when any privileged user has more than the configured token threshold, warn when any has a smaller non-zero exposure or reads are partial, and pass when complete reads show no excessive privileged exposure.",
     "return fail when any visible application grant contains a high-risk scope, warn when high-scope applications remain below the configured count or token evidence is partial, and pass when complete token evidence contains none.",
-    "return pass when the complete token audit lookback contains at least one event, warn when it is empty or truncated, and manual when token audit telemetry is unreadable.",
+    "return pass when the complete token audit lookback contains at least one event, manual when it is empty or unreadable, and demote pass to warn when the read is truncated.",
   ],
   MON: [
-    "return pass when the Alert Center endpoint is readable, including a complete empty alert inventory, warn when its inventory is truncated, and manual when access is denied or unreadable.",
-    "return fail when open suspicious-login alerts exceed the configured threshold, warn when one through the threshold remain or alert evidence is partial, and pass when the complete inventory contains none.",
-    "return pass when the complete admin-audit lookback contains events, warn when the window is empty or truncated, and manual when the Reports read is unavailable.",
-    "return pass when the complete token-audit lookback contains events, warn when the window is empty or truncated, and manual when the Reports read is unavailable.",
-    "return fail when open alerts exceed the configured backlog threshold, warn when a non-zero backlog is within the threshold or the inventory is partial, and pass when a complete inventory has no open alerts.",
+    "return pass when Alert Center is readable and returns at least one alert, manual when the list is empty or unreadable, and demote pass to warn when the inventory is truncated.",
+    "for a non-empty readable login-audit window, return fail above five suspicious-login signals, warn for one through five or partial evidence, and pass when complete evidence contains none.",
+    "return pass when the admin-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated.",
+    "return pass when the token-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated.",
+    "for a non-empty readable alert inventory, return fail above ten open alerts, warn for four through ten, unknown statuses, or partial evidence, and pass with at most three open alerts.",
   ],
 } as const;
+
+interface GwsExecutableDecision {
+  inputs: Readonly<Record<string, string>>;
+  constants?: Readonly<Record<string, PortableValue>>;
+  rules: readonly VerdictRule[];
+}
+
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const compare = (
+  op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte",
+  name: string,
+  entry: PortableValue,
+): VerdictCondition => ({ op, left: path(name), right: value(entry) });
+const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", name, entry);
+const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
+const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
+const gte = (name: string, entry: PortableValue): VerdictCondition => compare("gte", name, entry);
+const lte = (name: string, entry: PortableValue): VerdictCondition => compare("lte", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
+  status,
+  condition,
+  ...(note ? { note } : {}),
+});
+const ordered = (branches: {
+  fail?: VerdictCondition;
+  manual?: VerdictCondition;
+  warn?: VerdictCondition;
+  pass?: VerdictCondition;
+}): readonly VerdictRule[] => [
+  ...(branches.manual ? [rule("manual", branches.manual)] : []),
+  ...(branches.fail ? [rule("fail", branches.fail)] : []),
+  ...(branches.warn ? [rule("warn", branches.warn)] : []),
+  ...(branches.pass ? [rule("pass", branches.pass)] : []),
+  rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
+];
+const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} computed from the complete declared source inventories.`]),
+);
+const unreadable = ne("readable", true);
+const incomplete = ne("complete", true);
+
+const GWS_EXECUTABLE_DECISIONS: Readonly<Record<string, GwsExecutableDecision>> = {
+  "GWS-ID-001": {
+    inputs: input("readable", "complete", "privileged_user_count", "enforced_user_count", "coverage"),
+    constants: { warning_minimum: 0.8, pass_minimum: 1 },
+    rules: ordered({
+      manual: any(unreadable, eq("privileged_user_count", 0)),
+      fail: { op: "lt", left: path("coverage"), right: value(0.8) },
+      warn: any(incomplete, { op: "lt", left: path("coverage"), right: value(1) }),
+      pass: gte("coverage", 1),
+    }),
+  },
+  "GWS-ID-002": {
+    inputs: input("readable", "complete", "active_user_count", "enforced_user_count", "coverage"),
+    constants: { warning_minimum: 0.85, pass_minimum: 0.98 },
+    rules: ordered({
+      manual: any(unreadable, eq("active_user_count", 0)),
+      fail: { op: "lt", left: path("coverage"), right: value(0.85) },
+      warn: any(incomplete, { op: "lt", left: path("coverage"), right: value(0.98) }),
+      pass: gte("coverage", 0.98),
+    }),
+  },
+  "GWS-ID-003": {
+    inputs: input("readable", "complete", "active_user_count", "dormant_user_count", "unknown_login_count", "warning_dormant_maximum"),
+    constants: { dormant_days: 90 },
+    rules: ordered({
+      manual: any(unreadable, eq("active_user_count", 0)),
+      fail: { op: "gt", left: path("dormant_user_count"), right: path("warning_dormant_maximum") },
+      warn: any(incomplete, gt("dormant_user_count", 0), gt("unknown_login_count", 0)),
+      pass: all(eq("dormant_user_count", 0), eq("unknown_login_count", 0)),
+    }),
+  },
+  "GWS-ID-004": {
+    inputs: input("readable", "complete", "super_admin_count", "unenforced_super_admin_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("super_admin_count", 0)),
+      fail: gt("unenforced_super_admin_count", 0),
+      warn: incomplete,
+      pass: eq("unenforced_super_admin_count", 0),
+    }),
+  },
+  "GWS-ID-005": {
+    inputs: input("readable", "complete", "policy_count", "enforcement_policy_count", "enforced_policy_count", "enrollment_disabled_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("enforcement_policy_count", 0)),
+      fail: eq("enforced_policy_count", 0),
+      warn: any(
+        incomplete,
+        { op: "lt", left: path("enforced_policy_count"), right: path("enforcement_policy_count") },
+        gt("enrollment_disabled_count", 0),
+      ),
+      pass: all(
+        { op: "eq", left: path("enforced_policy_count"), right: path("enforcement_policy_count") },
+        eq("enrollment_disabled_count", 0),
+      ),
+    }),
+  },
+  "GWS-ADMIN-001": {
+    inputs: input("readable", "complete", "super_admin_count"),
+    constants: { pass_maximum: 4, warning_maximum: 6 },
+    rules: ordered({
+      manual: any(unreadable, eq("super_admin_count", 0)),
+      fail: gt("super_admin_count", 6),
+      warn: any(incomplete, gt("super_admin_count", 4)),
+      pass: lte("super_admin_count", 4),
+    }),
+  },
+  "GWS-ADMIN-002": {
+    inputs: input("readable", "complete", "privileged_user_count", "suspended_privileged_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("privileged_user_count", 0)),
+      fail: gt("suspended_privileged_count", 0),
+      warn: incomplete,
+      pass: eq("suspended_privileged_count", 0),
+    }),
+  },
+  "GWS-ADMIN-003": {
+    inputs: input("readable", "complete", "delegated_admin_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("delegated_admin_count", 0)),
+      warn: incomplete,
+      pass: gt("delegated_admin_count", 0),
+    }),
+  },
+  "GWS-ADMIN-004": {
+    inputs: input("readable", "complete", "event_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("event_count", 0)),
+      warn: incomplete,
+      pass: gt("event_count", 0),
+    }),
+  },
+  "GWS-ADMIN-005": {
+    inputs: input("readable", "complete", "assignment_count", "group_assignment_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("assignment_count", 0), gt("group_assignment_count", 0)),
+      warn: incomplete,
+      pass: eq("group_assignment_count", 0),
+    }),
+  },
+  "GWS-INTEG-001": {
+    inputs: input("users_readable", "complete", "sampled_user_count", "failed_read_count", "token_count"),
+    rules: ordered({
+      manual: any(
+        ne("users_readable", true),
+        eq("sampled_user_count", 0),
+        { op: "eq", left: path("failed_read_count"), right: path("sampled_user_count") },
+        eq("token_count", 0),
+      ),
+      warn: any(incomplete, gt("failed_read_count", 0)),
+      pass: gt("token_count", 0),
+    }),
+  },
+  "GWS-INTEG-002": {
+    inputs: input("directory_readable", "complete", "privileged_user_count", "token_count", "failed_read_count", "privileged_token_count"),
+    constants: { warning_maximum: 3 },
+    rules: ordered({
+      manual: any(
+        ne("directory_readable", true),
+        eq("privileged_user_count", 0),
+        eq("token_count", 0),
+        all(gt("failed_read_count", 0), eq("privileged_token_count", 0)),
+      ),
+      fail: gt("privileged_token_count", 3),
+      warn: any(incomplete, gt("privileged_token_count", 0)),
+      pass: eq("privileged_token_count", 0),
+    }),
+  },
+  "GWS-INTEG-003": {
+    inputs: input("users_readable", "complete", "token_count", "high_risk_token_count"),
+    constants: { warning_maximum: 5 },
+    rules: ordered({
+      manual: any(ne("users_readable", true), eq("token_count", 0)),
+      fail: gt("high_risk_token_count", 5),
+      warn: any(incomplete, gt("high_risk_token_count", 0)),
+      pass: eq("high_risk_token_count", 0),
+    }),
+  },
+  "GWS-INTEG-004": {
+    inputs: input("readable", "complete", "event_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("event_count", 0)),
+      warn: incomplete,
+      pass: gt("event_count", 0),
+    }),
+  },
+  "GWS-MON-001": {
+    inputs: input("readable", "complete", "alert_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("alert_count", 0)),
+      warn: incomplete,
+      pass: gt("alert_count", 0),
+    }),
+  },
+  "GWS-MON-002": {
+    inputs: input("readable", "complete", "event_count", "suspicious_login_count"),
+    constants: { warning_maximum: 5 },
+    rules: ordered({
+      manual: any(unreadable, eq("event_count", 0)),
+      fail: gt("suspicious_login_count", 5),
+      warn: any(incomplete, gt("suspicious_login_count", 0)),
+      pass: eq("suspicious_login_count", 0),
+    }),
+  },
+  "GWS-MON-003": {
+    inputs: input("readable", "complete", "event_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("event_count", 0)),
+      warn: incomplete,
+      pass: gt("event_count", 0),
+    }),
+  },
+  "GWS-MON-004": {
+    inputs: input("readable", "complete", "event_count"),
+    rules: ordered({
+      manual: any(unreadable, eq("event_count", 0)),
+      warn: incomplete,
+      pass: gt("event_count", 0),
+    }),
+  },
+  "GWS-MON-005": {
+    inputs: input("readable", "complete", "alert_count", "open_alert_count", "unknown_status_count"),
+    constants: { pass_maximum: 3, warning_maximum: 10 },
+    rules: ordered({
+      manual: any(unreadable, eq("alert_count", 0)),
+      fail: gt("open_alert_count", 10),
+      warn: any(incomplete, gt("open_alert_count", 3), gt("unknown_status_count", 0)),
+      pass: lte("open_alert_count", 3),
+    }),
+  },
+};
 
 let control = 0;
 const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([key, titles]) => {
@@ -91,6 +326,9 @@ const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([key, tit
     owner: owners[group],
     surfaces: GWS_CHECK_SURFACES[`GWS-${group}-${String(index + 1).padStart(3, "0")}`],
     evidenceFields: [...GWS_CHECK_SURFACES[`GWS-${group}-${String(index + 1).padStart(3, "0")}`], "complete_source_counts"],
+    decisionInputs: GWS_EXECUTABLE_DECISIONS[`GWS-${group}-${String(index + 1).padStart(3, "0")}`].inputs,
+    decisionConstants: GWS_EXECUTABLE_DECISIONS[`GWS-${group}-${String(index + 1).padStart(3, "0")}`].constants,
+    decisionRules: GWS_EXECUTABLE_DECISIONS[`GWS-${group}-${String(index + 1).padStart(3, "0")}`].rules,
     decision: decisions[group][index],
   }));
 });
