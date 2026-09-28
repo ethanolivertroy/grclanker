@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "hackIDLE" }
+$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "ethanolivertroy" }
 $RepoName = if ($env:GRCLANKER_REPO_NAME) { $env:GRCLANKER_REPO_NAME } else { "grclanker" }
 $Version = if ($Version) { $Version } elseif ($env:GRCLANKER_VERSION) { $env:GRCLANKER_VERSION } else { "latest" }
 $InstallDir = if ($env:GRCLANKER_INSTALL_DIR) { $env:GRCLANKER_INSTALL_DIR } else { Join-Path $HOME ".local\share\grclanker" }
@@ -149,9 +149,13 @@ function Get-Target {
 function Fallback-And-Fail([string]$Target) {
   Write-Host ""
   Write-Warn "Release bundle unavailable for $Target."
-  Write-Host "  Fallbacks:"
-  Write-Host "    npm install -g @grclanker/cli"
-  Write-Host "    bun install -g @grclanker/cli"
+  Write-Host "  Build from source instead (Node.js 22.19+):"
+  Write-Host "    git clone https://github.com/$RepoOwner/$RepoName.git"
+  Write-Host "    cd $RepoName"
+  Write-Host "    npm --prefix cli ci"
+  Write-Host "    npm --prefix cli run build"
+  Write-Host "    node cli/bin/grclanker.js"
+  Write-Host "  Guide: https://grclanker.com/docs/getting-started/installation/"
   throw "Install aborted."
 }
 
@@ -160,7 +164,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
   $ChecksumsUrl = $null
 
   if ($AssetUrlOverride) {
-    Write-Warn "Skipping checksum verification — custom GRCLANKER_ASSET_URL in use"
+    Write-Warn "Skipping checksum verification: custom GRCLANKER_ASSET_URL in use"
     return $false
   }
 
@@ -170,7 +174,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
     if (Test-Path $LocalChecksums) {
       Copy-Item -LiteralPath $LocalChecksums -Destination $ChecksumsPath -Force
     } else {
-      Write-Warn "No SHA256SUMS.txt found alongside local artifact — skipping verification"
+      Write-Warn "No SHA256SUMS.txt found alongside local artifact, skipping verification"
       return $false
     }
   } elseif ($ReleaseBaseUrl) {
@@ -183,7 +187,7 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
     try {
       Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath | Out-Null
     } catch {
-      Write-Warn "Could not fetch SHA256SUMS.txt — skipping checksum verification"
+      Write-Warn "Could not fetch SHA256SUMS.txt, skipping checksum verification"
       return $false
     }
   }
@@ -193,14 +197,14 @@ function Verify-Checksum([string]$ArchivePath, [string]$AssetName, [string]$Tag,
   } | Select-Object -First 1
 
   if (-not $Entry) {
-    Write-Warn "No checksum entry for $AssetName in SHA256SUMS.txt — skipping verification"
+    Write-Warn "No checksum entry for $AssetName in SHA256SUMS.txt, skipping verification"
     return $false
   }
 
   $ExpectedHash = ($Entry -split "\s+")[0].ToLowerInvariant()
   $ActualHash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($ActualHash -ne $ExpectedHash) {
-    throw "Checksum mismatch for $AssetName — expected $ExpectedHash, got $ActualHash. The download may be corrupted or tampered with."
+    throw "Checksum mismatch for ${AssetName}: expected $ExpectedHash, got $ActualHash. The download may be corrupted or tampered with."
   }
 
   return $true
@@ -316,7 +320,7 @@ try {
   }
 
   Write-Host ""
-  Write-Host "  Ready. Run grclanker to start." -ForegroundColor Green
+  Write-Host "  Ready. Run grclanker setup to start." -ForegroundColor Green
   Write-Host ""
 } finally {
   if (Test-Path $TempRoot) {

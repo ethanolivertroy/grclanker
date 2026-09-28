@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "hackIDLE" }
+$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "ethanolivertroy" }
 $RepoName = if ($env:GRCLANKER_REPO_NAME) { $env:GRCLANKER_REPO_NAME } else { "grclanker" }
 $Ref = if ($env:GRCLANKER_REF) { $env:GRCLANKER_REF } else { "main" }
 $Version = if ($env:GRCLANKER_VERSION) { $env:GRCLANKER_VERSION } else { $null }
