@@ -2009,7 +2009,11 @@ test("silent success: empty, whitespace-only, and foreign-JSON stdout on exit 0 
 });
 
 test("byte differential fixtures: OCI assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
-  writeByteDifferentialFixture("oci", "representative", await runAllAssessments(compliantClient()));
+  const representativeClient = compliantClient();
+  representativeClient.listUsers = async () => [
+    { id: "ocid1.user.oc1..alice", name: "alice", lifecycleState: "ACTIVE", isMfaActivated: false, capabilities: { canUseConsolePassword: true, canUseApiKeys: true } },
+  ];
+  writeByteDifferentialFixture("oci", "representative", await runAllAssessments(representativeClient));
   writeByteDifferentialFixture("oci", "denied", await runAllAssessments(deniedClient()));
   writeByteDifferentialFixture("oci", "missing-null", await runAllAssessments(emptyClient()));
   writeByteDifferentialFixture("oci", "partial", await runAllAssessments(partialClient()));

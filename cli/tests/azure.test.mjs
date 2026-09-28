@@ -1122,6 +1122,9 @@ test("rule 10: AZURE-MON-04 and AZURE-MON-05 cap at warn on a truncated pricing 
   assert.equal(diagnostics.status, "warn");
   assert.match(diagnostics.summary, /Inventory of diagnostic settings is partial \(1 seen of 3 total\); verdict capped at warn\./);
   assert.deepEqual({ seen: diagnostics.evidence.seen, total: diagnostics.evidence.total, truncated: diagnostics.evidence.truncated }, { seen: 1, total: 3, truncated: true });
+  const retention = result.findings.find((item) => item.id === "AZURE-MON-06");
+  assert.equal(retention.status, "pass", "parent-parity limitation: diagnostic-settings truncation does not cap AZURE-MON-06");
+  assert.equal(retention.summary, "1/1 linked Log Analytics workspaces retain data for 90+ days.");
   // A non-compliant page is still fail or warn on its own merits, never masked by the cap.
   const mixed = clientWith({ ...compliantClient(), async listDefenderPricings() { return { items: [{ properties: { pricingTier: "Standard" } }, { properties: { pricingTier: "Free" } }], truncated: true, seen: 2 }; } });
   assert.equal((await assessAzureMonitoring(mixed)).findings.find((item) => item.id === "AZURE-MON-04").status, "warn");
@@ -2345,7 +2348,12 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
 
 test("byte differential fixtures: Azure assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
   const assess = async (client) => Promise.all(ASSESSORS.map(([, run]) => run(client)));
-  writeByteDifferentialFixture("azure", "representative", await assess(compliantClient()));
+  const representative = clientWith({
+    async listSecureScores() {
+      return [{ currentScore: 60, maxScore: 100 }];
+    },
+  }, compliantClient());
+  writeByteDifferentialFixture("azure", "representative", await assess(representative));
   writeByteDifferentialFixture("azure", "denied", await assess(forbiddenClient()));
 
   const missing = clientWith(
@@ -2359,7 +2367,20 @@ test("byte differential fixtures: Azure assessments and export artifacts", { ski
       throw forbidden();
     },
   }, compliantClient());
-  writeByteDifferentialFixture("azure", "partial", await assess(partial));
+  const diagnosticTruncation = clientWith({
+    async listDiagnosticSettings() {
+      return {
+        items: [{ id: "diag-1", properties: { workspaceId: "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law", logs: [{ category: "Administrative", enabled: true }] } }],
+        truncated: true,
+        seen: 1,
+        total: 3,
+      };
+    },
+  }, compliantClient());
+  writeByteDifferentialFixture("azure", "partial", {
+    deniedSecurityAlerts: await assess(partial),
+    diagnosticSettingsTruncated: await assess(diagnosticTruncation),
+  });
   writeByteDifferentialFixture("azure", "compliant", await assess(compliantClient()));
 
   const scoreAt = async (score) => assessAzureMonitoring(clientWith({
@@ -2368,7 +2389,7 @@ test("byte differential fixtures: Azure assessments and export artifacts", { ski
     },
   }, compliantClient()));
   writeByteDifferentialFixture("azure", "boundary", {
-    secureScore: await Promise.all([59, 60, 61].map(scoreAt)),
+    secureScore: await Promise.all([0, 49, 50, 74, 75].map(scoreAt)),
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("azure");

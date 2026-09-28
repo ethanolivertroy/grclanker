@@ -13,7 +13,6 @@ import {
   batch2Not,
   batch2Path,
   batch2Rule,
-  batch2Value,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
@@ -21,6 +20,10 @@ import { PALOALTO_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 
 const PRISMA_DOCS = "https://pan.dev/prisma-cloud/api/cspm/";
 const PANOS_DOCS = "https://docs.paloaltonetworks.com/pan-os/11-2/pan-os-panorama-api";
+export const PALOALTO_DEFAULT_MAX_CRITICAL_CVES = 0;
+export const PALOALTO_DEFAULT_MIN_HOST_COMPLIANCE_RATE = 90;
+export const PALOALTO_DEFAULT_MAX_SUPERUSERS = 3;
+export const PALOALTO_DEFAULT_MIN_COMPLIANCE_PASS_RATE = 90;
 const surfaces = [
   restSurface("prisma-cspm", "/{compliance|alert|policy|cloud|user|integration} read endpoints", "Prisma Cloud CSPM", PRISMA_DOCS, ["compliance", "severity", "status", "policy", "cloudAccount", "role", "integration"]),
   restSurface("prisma-compute", "/api/v1/{defenders|policies|registry|stats|cloud-discovery|ci-scans}", "Prisma Cloud Compute", "https://pan.dev/compute/api/", ["rules", "collections", "effect", "status", "specifications", "vulnerabilities"]),
@@ -99,7 +102,7 @@ function paloaltoDecision(control: number): Partial<Pick<Batch2CheckRow, "decisi
         evidence_complete: "Boolean. True only when the posture inventory was complete; false means the result is partial.",
         passed_resource_count: "Non-negative integer from summary.passedResources; null means the field was unavailable.",
         total_resource_count: "Non-negative integer from summary.totalResources, or the complete sum of passedResources and failedResources when totalResources is absent; zero means no evaluated resources.",
-        minimum_pass_rate_percent: "Number from the minCompliancePassRate operator option after clamping to 1 through 100; the default is 90.",
+        minimum_pass_rate_percent: `Number from the minCompliancePassRate operator option after clamping to 1 through 100; the default is ${PALOALTO_DEFAULT_MIN_COMPLIANCE_PASS_RATE}.`,
       },
       decisionRules: [
         batch2Rule("manual", batch2Any(

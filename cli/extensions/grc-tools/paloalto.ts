@@ -31,7 +31,13 @@ import {
   PALOALTO_AUTH_RESOLVER,
   readResolverEnvironment,
 } from "./auth-resolver-contracts.js";
-import { PALOALTO_SPEC } from "./paloalto.spec.js";
+import {
+  PALOALTO_DEFAULT_MAX_CRITICAL_CVES as DEFAULT_MAX_CRITICAL_CVES,
+  PALOALTO_DEFAULT_MAX_SUPERUSERS as DEFAULT_MAX_SUPERUSERS,
+  PALOALTO_DEFAULT_MIN_COMPLIANCE_PASS_RATE as DEFAULT_MIN_COMPLIANCE_PASS_RATE,
+  PALOALTO_DEFAULT_MIN_HOST_COMPLIANCE_RATE as DEFAULT_MIN_HOST_COMPLIANCE_RATE,
+  PALOALTO_SPEC,
+} from "./paloalto.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -44,10 +50,6 @@ const DEFAULT_ALERT_LIMIT = 500;
 const DEFAULT_ALERT_PAGE_SIZE = 100;
 const DEFAULT_COMPUTE_PAGE_SIZE = 50;
 const DEFAULT_COMPUTE_LIMIT = 500;
-const DEFAULT_MAX_CRITICAL_CVES = 0;
-const DEFAULT_MIN_HOST_COMPLIANCE_RATE = 90;
-const DEFAULT_MAX_SUPERUSERS = 3;
-const DEFAULT_MIN_COMPLIANCE_PASS_RATE = 90;
 const PRISMA_TOKEN_TTL_MS = 9 * 60 * 1000;
 const DEFAULT_PRISMA_API_URL = "https://api.prismacloud.io";
 const DEFAULT_CONFIG_FILE = join(homedir(), ".grclanker", "paloalto.json");
@@ -3934,7 +3936,11 @@ export function assessPrismaCloudPosture(
           : `No open network exposure alerts across ${networkPolicies.length} enabled network policies in the sampled window; emptiness is compliant here because detection policies are active and alerts were readable.`
         : `${networkAlerts.length} open network exposure alerts (${networkHighOrCritical.length} critical or high).`,
     { network_policies_enabled: nullUnless(policiesReadable, networkPolicies.length), ...summarizeAlerts(networkAlerts, snapshot) },
-    paloaltoDecisionFacts(networkPolicies.length, networkHighOrCritical.length, networkAlerts.length - networkHighOrCritical.length),
+    paloaltoDecisionFacts(
+      networkPolicies.length,
+      networkHighOrCritical.length,
+      networkAlerts.length - networkHighOrCritical.length + (alertsTruncated ? 1 : 0),
+    ),
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export open network exposure alerts and the enabled network policy list."));
 
   const encryptionPolicies = snapshot.policies.filter((policy) => ENCRYPTION_PATTERN.test(policyLabels(policy)));

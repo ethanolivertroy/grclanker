@@ -2848,7 +2848,18 @@ test("silent-success class: a 200 with an HTML, empty, or whitespace body on eve
 
 test("byte differential fixtures: GCP assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
   const compliantClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init)));
-  writeByteDifferentialFixture("gcp", "representative", await runAllAssessments(compliantClient, { maxProjects: 5 }));
+  const representativeData = {
+    ...COMPLIANT,
+    publicPolicies: {
+      results: [{
+        resource: "//cloudresourcemanager.googleapis.com/projects/prod-audit",
+        assetType: "cloudresourcemanager.googleapis.com/Project",
+        policy: { bindings: [{ role: "roles/viewer", members: ["allUsers"] }] },
+      }],
+    },
+  };
+  const representativeClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init, representativeData)));
+  writeByteDifferentialFixture("gcp", "representative", await runAllAssessments(representativeClient, { maxProjects: 5 }));
   writeByteDifferentialFixture("gcp", "denied", await runAllAssessments(createClient(async () => forbidden()), { maxProjects: 5 }));
   writeByteDifferentialFixture("gcp", "missing-null", await runAllAssessments(createClient(async () => jsonResponse(null)), { maxProjects: 5 }));
 

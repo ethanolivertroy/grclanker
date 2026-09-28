@@ -28,7 +28,15 @@ import {
   CLOUDFLARE_AUTH_RESOLVER,
   readResolverEnvironment,
 } from "./auth-resolver-contracts.js";
-import { CLOUDFLARE_SPEC } from "./cloudflare.spec.js";
+import {
+  CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS as AUDIT_LOG_LOOKBACK_DAYS,
+  CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS as CERTIFICATE_EXPIRY_WARNING_DAYS,
+  CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS as DEFAULT_MAX_SUPER_ADMINS,
+  CLOUDFLARE_HSTS_MIN_MAX_AGE_SECONDS as HSTS_MIN_MAX_AGE_SECONDS,
+  CLOUDFLARE_REQUIRED_SECURITY_HEADERS as REQUIRED_SECURITY_HEADERS,
+  CLOUDFLARE_SPEC,
+  CLOUDFLARE_STALE_IP_RULE_DAYS as STALE_IP_RULE_DAYS,
+} from "./cloudflare.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -42,11 +50,6 @@ const DEFAULT_TOKEN_LIMIT = 200;
 const DEFAULT_AUDIT_LIMIT = 200;
 const DEFAULT_HOSTNAME_ASSOCIATION_LIMIT = 5000;
 const DEFAULT_DNS_RECORD_LIMIT = 500;
-const DEFAULT_MAX_SUPER_ADMINS = 2;
-const HSTS_MIN_MAX_AGE_SECONDS = 15_552_000;
-const STALE_IP_RULE_DAYS = 365;
-const CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
-const AUDIT_LOG_LOOKBACK_DAYS = 30;
 const CURSOR_PAGE_BUDGET = 100;
 
 /**
@@ -102,13 +105,6 @@ export const CLOUDFLARE_ZONE_SETTING_IDS = [
   "browser_check",
   "email_obfuscation",
   "tls_client_auth",
-] as const;
-
-const REQUIRED_SECURITY_HEADERS = [
-  "content-security-policy",
-  "x-frame-options",
-  "x-content-type-options",
-  "referrer-policy",
 ] as const;
 
 export interface CloudflareResolvedConfig {

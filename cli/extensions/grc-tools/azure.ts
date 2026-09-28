@@ -1365,7 +1365,7 @@ function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<
     case "AZURE-ID-07": {
       const guestRole = asLower(item.guestUserRoleId);
       const invites = asLower(item.allowInvitesFrom);
-      return { readable, guest_role_present: guestRole !== undefined, guest_role_restricted: guestRole === GUEST_ROLE_RESTRICTED, guest_role_same_as_member: guestRole === GUEST_ROLE_SAME_AS_MEMBER, invites_restricted: invites === "none" || invites === "adminsandguestinviters", invites_from_everyone: invites === "everyone" };
+      return { readable, guest_role_id: guestRole ?? null, allow_invites_from: invites ?? null };
     }
     case "AZURE-ID-08":
       return { readable, complete, inventory_count: asNumber(item.guests) ?? 0, stale_guest_count: evidenceCount(item, "stale_guests"), unknown_activity_count: asNumber(item.unknown_activity) ?? 0 };

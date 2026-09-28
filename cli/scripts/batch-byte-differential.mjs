@@ -17,8 +17,9 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
-const mainWorktree = join(runRoot, "main");
-const mainFixtures = join(runRoot, "fixtures-main");
+const baselineRef = "origin/etroy/generated-specs-batch-1-7352";
+const mainWorktree = join(runRoot, "stacked-parent");
+const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
 const exportRoot = join(runRoot, "exports");
 const testFiles = [
@@ -38,6 +39,8 @@ const testFiles = [
   "paloalto.test.mjs",
   "zscaler.test.mjs",
 ];
+const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
+const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -115,6 +118,17 @@ function filesUnder(root, relativePath = "") {
 function compareFixtureTrees() {
   const expectedPaths = filesUnder(mainFixtures);
   const actualPaths = filesUnder(branchFixtures);
+  const expectedFixtureCount = testFiles.length * fixtureClasses.length;
+  if (expectedPaths.length !== expectedFixtureCount) {
+    throw new Error(`stacked-parent fixture cardinality mismatch: expected ${expectedFixtureCount}, found ${expectedPaths.length}`);
+  }
+  const exactExpectedPaths = testFiles.flatMap((testFile) => {
+    const integration = testFile.replace(/\.test\.mjs$/, "");
+    return fixtureClasses.map((fixtureClass) => `${integration}/${fixtureClass}.json`);
+  }).sort();
+  if (JSON.stringify(expectedPaths) !== JSON.stringify(exactExpectedPaths)) {
+    throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${exactExpectedPaths.join(", ")}\nactual: ${expectedPaths.join(", ")}`);
+  }
   if (JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)) {
     throw new Error(`fixture path mismatch\nmain: ${expectedPaths.join(", ")}\nbranch: ${actualPaths.join(", ")}`);
   }
@@ -135,12 +149,19 @@ function compareFixtureTrees() {
       );
     }
   }
+  for (const integration of batch2Integrations) {
+    const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
+    const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
+    if (representative.equals(compliant)) {
+      throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
+    }
+  }
   return expectedPaths;
 }
 
 let worktreeAdded = false;
 try {
-  run("git", ["worktree", "add", "--detach", mainWorktree, "origin/main"]);
+  run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
   worktreeAdded = true;
   symlinkSync(join(repoRoot, "cli", "node_modules"), join(mainWorktree, "cli", "node_modules"), "dir");
   copyDifferentialTestsToMain();

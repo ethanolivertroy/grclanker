@@ -29,7 +29,19 @@ import {
   OCI_AUTH_RESOLVER,
   readResolverEnvironment,
 } from "./auth-resolver-contracts.js";
-import { OCI_RUNTIME_FRAMEWORK_MAPPINGS, OCI_SPEC } from "./oci.spec.js";
+import {
+  OCI_AUDIT_RETENTION_REQUIRED_DAYS as AUDIT_RETENTION_REQUIRED_DAYS,
+  OCI_BASTION_MAX_TTL_SECONDS as BASTION_MAX_TTL_SECONDS,
+  OCI_BASTION_SESSION_MAX_HOURS as BASTION_SESSION_MAX_HOURS,
+  OCI_ECDSA_ACCEPTED_CURVES as ECDSA_ACCEPTED_CURVES,
+  OCI_KEY_MIN_AES_BYTES,
+  OCI_KEY_MIN_RSA_BYTES,
+  OCI_KEY_ROTATION_MAX_DAYS as KEY_ROTATION_MAX_DAYS,
+  OCI_PAR_LONG_LIVED_DAYS as PAR_LONG_LIVED_DAYS,
+  OCI_RUNTIME_FRAMEWORK_MAPPINGS,
+  OCI_SENSITIVE_PORTS as SENSITIVE_PORTS,
+  OCI_SPEC,
+} from "./oci.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -46,9 +58,6 @@ const DEFAULT_MAX_COMPARTMENTS = 25;
 const DEFAULT_MAX_BUCKETS = 100;
 const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
 const DEFAULT_COMMAND_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
-const AUDIT_RETENTION_REQUIRED_DAYS = 365;
-const KEY_ROTATION_MAX_DAYS = 365;
-const BASTION_MAX_TTL_SECONDS = 10_800;
 /**
  * KeyShape.length is documented in bytes (AES 16, 24, 32; RSA 256, 384, 512;
  * ECDSA 32, 48, 66). Spec control 19 requires AES-256 or RSA-4096, so the
@@ -56,12 +65,8 @@ const BASTION_MAX_TTL_SECONDS = 10_800;
  * documented curveId (NIST_P256, NIST_P384, NIST_P521, all FIPS 186-4 curves)
  * is accepted and a missing or undocumented curve is weak.
  */
-const KEY_MIN_LENGTH_BYTES = { AES: 32, RSA: 512 } as const;
-const ECDSA_ACCEPTED_CURVES = ["NIST_P256", "NIST_P384", "NIST_P521"] as const;
+const KEY_MIN_LENGTH_BYTES = { AES: OCI_KEY_MIN_AES_BYTES, RSA: OCI_KEY_MIN_RSA_BYTES } as const;
 const ECDSA_RULE = "ECDSA keys pass on any documented KeyShape.curveId (NIST_P256, NIST_P384, NIST_P521); spec control 19 names only the AES-256 and RSA-4096 floors.";
-const BASTION_SESSION_MAX_HOURS = 8;
-const PAR_LONG_LIVED_DAYS = 30;
-const SENSITIVE_PORTS = [22, 3389, 1433, 3306, 5432];
 
 /**
  * Documentation anchors for every surface this module reads.

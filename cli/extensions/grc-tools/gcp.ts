@@ -29,7 +29,14 @@ import {
   GCP_AUTH_RESOLVER,
   readResolverEnvironment,
 } from "./auth-resolver-contracts.js";
-import { GCP_SPEC } from "./gcp.spec.js";
+import {
+  GCP_ADMIN_PORTS as ADMIN_PORTS,
+  GCP_FLOW_LOG_UNSUPPORTED_PURPOSES,
+  GCP_HTTP_BACKEND_PROTOCOLS,
+  GCP_MAX_KMS_ROTATION_DAYS as MAX_KMS_ROTATION_DAYS,
+  GCP_MIN_LOG_RETENTION_DAYS as MIN_LOG_RETENTION_DAYS,
+  GCP_SPEC,
+} from "./gcp.spec.js";
 import { REDACTED, seenVersusTotal, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -49,11 +56,8 @@ const MAX_SCC_SOURCES = 1000;
 const MAX_ACCESS_POLICIES = 1000;
 const MAX_SERVICE_PERIMETERS = 5000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
-const MAX_KMS_ROTATION_DAYS = 365;
-const MIN_LOG_RETENTION_DAYS = 90;
 const OAUTH_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 const DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
-const ADMIN_PORTS = [22, 3389];
 
 /** Official reference pages backing each request and field read in this module. */
 export const GCP_DOCS = {
@@ -3637,10 +3641,10 @@ function isOpenAdminFirewall(rule: JsonRecord): boolean {
   });
 }
 
-const FLOW_LOG_UNSUPPORTED_PURPOSES = new Set(["REGIONAL_MANAGED_PROXY", "GLOBAL_MANAGED_PROXY", "INTERNAL_HTTPS_LOAD_BALANCER", "PRIVATE_SERVICE_CONNECT", "PRIVATE_NAT"]);
+const FLOW_LOG_UNSUPPORTED_PURPOSES = new Set<string>(GCP_FLOW_LOG_UNSUPPORTED_PURPOSES);
 
 /** BackendService.protocol values that front HTTP(S) traffic (GCP_DOCS.backendServicesAggregatedList). */
-const HTTP_BACKEND_PROTOCOLS = new Set(["HTTP", "HTTPS", "HTTP2", "H2C"]);
+const HTTP_BACKEND_PROTOCOLS = new Set<string>(GCP_HTTP_BACKEND_PROTOCOLS);
 
 function lastSegment(value: unknown): string | undefined {
   return asString(value)?.split("/").at(-1);

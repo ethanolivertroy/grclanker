@@ -2107,7 +2107,12 @@ test("byte differential fixtures: Cloudflare assessments and export artifacts", 
     zones: await assessCloudflareZoneSecurity(client),
     traffic: await assessCloudflareTrafficControls(client),
   });
-  writeByteDifferentialFixture("cloudflare", "representative", await assess(fixtureClient("compliant")));
+  const representativeClient = fixtureClient("compliant", {
+    async getDnssec() {
+      return { status: "pending", algorithm: "13" };
+    },
+  });
+  writeByteDifferentialFixture("cloudflare", "representative", await assess(representativeClient));
   writeByteDifferentialFixture("cloudflare", "denied", await assess(fixtureClient("forbidden")));
   writeByteDifferentialFixture("cloudflare", "missing-null", await assess(fixtureClient("empty")));
   writeByteDifferentialFixture("cloudflare", "partial", await assess(fixtureClient("partial")));
