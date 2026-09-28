@@ -122,10 +122,12 @@ function comparisonWitnesses(condition, desired, constants) {
       const values = equal ? [left.value] : alternativeValues(left.value);
       return values.map((value) => new Map([[right.path, value]]));
     }
-    const rightValues = equal ? [0] : [1, -1];
-    return rightValues.map((value) => new Map([
-      [left.path, 0],
-      [right.path, value],
+    const pairs = equal
+      ? [[0, 0]]
+      : [[0, 1], [0, -1], [1, 0], [-1, 0]];
+    return pairs.map(([leftValue, rightValue]) => new Map([
+      [left.path, leftValue],
+      [right.path, rightValue],
     ]));
   }
   const comparison = condition.op === "gt" ? "gt" : "lte";
