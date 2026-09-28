@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   findRegisteredTool,
@@ -11,6 +14,7 @@ import {
 import { buildToolCatalogMarkdown } from "../scripts/generate-tool-catalog-docs.mjs";
 
 const BASELINE_DOMAIN_TOOL_COUNT = 107;
+const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function countTools(tools, kind) {
   return tools.filter((tool) => tool.kind === kind).length;
@@ -60,6 +64,34 @@ test("tool catalog reflects the bundled extension registration surface", () => {
   assert.ok(tools.some((tool) => tool.name === "webex_export_audit_bundle"));
   assert.ok(tools.some((tool) => tool.name === "zoom_check_access"));
   assert.ok(tools.some((tool) => tool.name === "zoom_export_audit_bundle"));
+});
+
+test("audit and assess prompts name the exact Google Workspace operator tools", () => {
+  const registered = new Set(getRegisteredToolSummaries().map((tool) => tool.name));
+  const operatorTools = [
+    ["gws_ops_investigate_alerts", "alerts"],
+    ["gws_ops_trace_admin_activity", "admin activity"],
+    ["gws_ops_review_tokens", "token activity"],
+    ["gws_ops_collect_evidence_bundle", "evidence"],
+  ];
+
+  for (const prompt of ["audit", "assess"]) {
+    const text = readFileSync(resolve(cliRoot, "prompts", `${prompt}.md`), "utf8");
+    assert.doesNotMatch(text, /gws_ops_\*/, `${prompt}.md must not reference the non-invokable gws_ops_* wildcard`);
+
+    const line = text.split("\n").find((entry) => entry.includes("`gws_ops_check_cli`"));
+    assert.ok(line, `${prompt}.md must route operator work through gws_ops_check_cli`);
+    const checkIndex = line.indexOf("`gws_ops_check_cli`");
+    for (const [name, purpose] of operatorTools) {
+      assert.ok(registered.has(name), `${name} is not a registered tool`);
+      const toolIndex = line.indexOf(`\`${name}\``);
+      assert.ok(toolIndex > checkIndex, `${prompt}.md must name ${name} after gws_ops_check_cli`);
+      const afterTool = toolIndex + name.length + 2;
+      const nextReference = line.indexOf("`", afterTool);
+      const pairing = line.slice(afterTool, nextReference === -1 ? undefined : nextReference);
+      assert.match(pairing, new RegExp(`\\bfor\\b.*\\b${purpose}\\b`), `${prompt}.md must pair ${name} with ${purpose}`);
+    }
+  }
 });
 
 test("tool catalog groups tools by domain for CLI display", () => {

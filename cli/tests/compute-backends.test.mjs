@@ -235,6 +235,20 @@ test("extractComputeFlag plumbs --compute for setup, investigate, and audit", ()
   assert.throws(() => extractComputeFlag(["--compute"]), /Missing value/);
 });
 
+test("CLI help scopes --compute to the workflow commands that extract it", () => {
+  const cliEntry = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
+  const help = spawnSync(process.execPath, [cliEntry, "--help"], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(help.status, 0, `--help exited ${help.status}: ${help.stderr}`);
+  assert.match(help.stdout, /--compute <kind>\s+Run investigate\/audit\/assess\/validate on a specific backend/);
+  assert.match(help.stdout, /interactive mode uses the backend saved by setup --compute/);
+  assert.doesNotMatch(help.stdout, /Run investigate\/audit on a specific backend/);
+
+  // Interactive mode has no command to carry the flag, so a leading --compute is rejected.
+  const interactive = spawnSync(process.execPath, [cliEntry, "--compute", "docker"], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(interactive.status, 1);
+  assert.match(interactive.stderr, /Unknown command: --compute/);
+});
+
 test("docker run args keep the phase 1 shape and honor computeDefaults", () => {
   const identity = { uid: 1000, gid: 1000 };
   const args = buildDockerRunArgs({
