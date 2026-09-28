@@ -370,7 +370,21 @@ function recordOperandUsage(
   expectedType?: PortableInputType,
   comparedValue?: PortableValue,
 ): void {
-  if (operand.kind === "value") return;
+  switch (operand.kind) {
+    case "value":
+      return;
+    case "subtract":
+      recordOperandUsage(usage, operand.left, derivedFact, "number");
+      recordOperandUsage(usage, operand.right, derivedFact, "number");
+      return;
+    case "path":
+    case "length":
+      break;
+    default: {
+      const exhaustive: never = operand;
+      return exhaustive;
+    }
+  }
   const name = operand.path;
   const entry = usage.get(name) ?? { types: new Set<PortableInputType>(), values: new Set<string>(), derivedFacts: new Set<string>() };
   if (operand.kind === "length") entry.types.add("array");
