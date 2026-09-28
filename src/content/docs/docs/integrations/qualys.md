@@ -138,7 +138,7 @@ Runs the access check and all four assessments, then writes `qualys-<platform>-a
 - `_errors.log` when any collection step failed
 - a sibling `.zip` archive of the whole directory
 
-`output_dir` is resolved against the working directory and may be any path. Every file inside the bundle is resolved with traversal and symlink-parent protection: a path that escapes the output root or passes through a symlinked parent is rejected.
+`output_dir` is resolved against the working directory and may be any path, including a symlink; the bundle is written under its resolved target. Paths below that resolved root are checked for traversal and symlinked parents and rejected when either check fails.
 
 ## Control coverage
 
