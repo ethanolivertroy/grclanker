@@ -244,9 +244,7 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
     for (const name of check.evidenceFields) {
       const definition = check.evidenceFieldDefinitions[name];
       if (name.endsWith("_configured_value")) facts[name] = null;
-      else if (/Type\/domain: [^.]*boolean/.test(definition)) {
-        facts[name] = !/(?:failure|violation|review|undated|missing|without|unreadable|external|no_)/.test(name);
-      }
+      else if (/Type\/domain: [^.]*boolean/.test(definition)) facts[name] = !name.endsWith("_no_remediation_due");
       else if (/Type\/domain: [^.]*array/.test(definition)) facts[name] = [];
       else if (/Type\/domain: [^.]*number/.test(definition)) {
         facts[name] = /(?:failure|violation|review|undated|missing|without|unreadable|external)/.test(name) ? 0 : 100;
