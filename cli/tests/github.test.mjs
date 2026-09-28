@@ -424,11 +424,72 @@ test("resolveGitHubConfiguration honors the spec env aliases for API, GraphQL, a
   assert.equal(defaults.enterprise, undefined);
 
   const explicitArgs = await resolveGitHubConfiguration(
-    { organization: "example-org", api_token: "token", enterprise: "arg-enterprise", graphql_url: "https://gql.example.test/graphql" },
+    {
+      organization: "example-org",
+      api_token: "token",
+      enterprise: "arg-enterprise",
+      api_base_url: "https://gql.example.test/api/v3",
+      graphql_url: "https://gql.example.test/graphql",
+    },
     { GITHUB_ENTERPRISE: "env-enterprise", GITHUB_GRAPHQL_URL: "https://env.example.test/graphql" },
   );
   assert.equal(explicitArgs.enterprise, "arg-enterprise");
   assert.equal(explicitArgs.graphqlUrl, "https://gql.example.test/graphql");
+});
+
+test("resolveGitHubConfiguration rejects unsafe GraphQL endpoints", async () => {
+  const base = {
+    organization: "example-org",
+    api_token: "ghp_config_canary",
+    api_base_url: "https://ghes.example.test/api/v3",
+  };
+  const unsafeEndpoints = [
+    ["https://foreign.example/graphql", /must share the REST API origin/],
+    ["https://svc:graphql-userinfo-canary@ghes.example.test/api/graphql", /must not carry userinfo/],
+    ["http://ghes.example.test/api/graphql", /must share the REST API origin/],
+    ["https://[malformed", /must be a valid absolute URL/],
+  ];
+
+  for (const [graphqlUrl, expectedError] of unsafeEndpoints) {
+    await assert.rejects(
+      () => resolveGitHubConfiguration({ ...base, graphql_url: graphqlUrl }, {}),
+      expectedError,
+    );
+  }
+});
+
+test("GitHubAuditorClient accepts derived and explicit same-origin HTTP endpoints for GHES", async () => {
+  const derived = await resolveGitHubConfiguration({
+    organization: "example-org",
+    api_token: "ghp_http_test",
+    api_base_url: "http://ghes.example.test/api/v3",
+  }, {});
+  const explicit = await resolveGitHubConfiguration({
+    organization: "example-org",
+    api_token: "ghp_http_test",
+    api_base_url: "http://ghes.example.test/api/v3",
+    graphql_url: "http://ghes.example.test/custom/graphql",
+  }, {});
+  assert.equal(derived.graphqlUrl, "http://ghes.example.test/api/graphql");
+  assert.equal(explicit.graphqlUrl, "http://ghes.example.test/custom/graphql");
+
+  const requests = [];
+  const fetchImpl = async (input, init = {}) => {
+    requests.push({ url: input.toString(), authorization: init.headers?.Authorization });
+    return jsonResponse({ data: { viewer: { login: "example-user" } } });
+  };
+  await new GitHubAuditorClient(derived, fetchImpl).graphql("query { viewer { login } }");
+  await new GitHubAuditorClient(explicit, fetchImpl).graphql("query { viewer { login } }");
+  assert.deepEqual(requests, [
+    {
+      url: "http://ghes.example.test/api/graphql",
+      authorization: "Bearer ghp_http_test",
+    },
+    {
+      url: "http://ghes.example.test/custom/graphql",
+      authorization: "Bearer ghp_http_test",
+    },
+  ]);
 });
 
 test("GitHubAuditorClient.graphql posts to the GraphQL endpoint and surfaces partial errors", async () => {
@@ -473,6 +534,54 @@ test("GitHubAuditorClient.graphql posts to the GraphQL endpoint and surfaces par
     { status: 401, headers: { "content-type": "application/json" } },
   ));
   await assert.rejects(() => failing.graphql("query { viewer { login } }"), /Bad credentials/);
+});
+
+test("GitHubAuditorClient blocks foreign and downgraded GraphQL origins before sending a request or bearer token", async () => {
+  const requests = [];
+  const token = "ghp_foreign_origin_canary";
+  for (const graphqlUrl of [
+    "https://foreign.example/collect",
+    "http://ghes.example.test/api/graphql",
+  ]) {
+    const client = new GitHubAuditorClient(
+      createSampleConfig({
+        apiToken: token,
+        apiBaseUrl: "https://ghes.example.test/api/v3",
+        graphqlUrl,
+      }),
+      async (input, init = {}) => {
+        requests.push({ input, authorization: init.headers?.Authorization });
+        return jsonResponse({ data: { viewer: { login: "unexpected" } } });
+      },
+    );
+
+    await assert.rejects(
+      () => client.graphql("query { viewer { login } }"),
+      /must share the REST API origin/,
+    );
+  }
+  assert.deepEqual(requests, [], "foreign and downgraded origins must receive neither a request nor an Authorization header");
+});
+
+test("GitHubAuditorClient accepts a custom same-origin GraphQL endpoint for GHES", async () => {
+  const requests = [];
+  const client = new GitHubAuditorClient(
+    createSampleConfig({
+      apiBaseUrl: "https://ghes.example.test/api/v3",
+      graphqlUrl: "https://ghes.example.test/custom/graphql",
+    }),
+    async (input, init = {}) => {
+      requests.push({ url: input.toString(), authorization: init.headers?.Authorization });
+      return jsonResponse({ data: { viewer: { login: "example-user" } } });
+    },
+  );
+
+  const result = await client.graphql("query { viewer { login } }");
+  assert.equal(result.data.viewer.login, "example-user");
+  assert.deepEqual(requests, [{
+    url: "https://ghes.example.test/custom/graphql",
+    authorization: "Bearer ghp_test",
+  }]);
 });
 
 test("resolveGitHubConfiguration loads GitHub App private key from a file path", async () => {
