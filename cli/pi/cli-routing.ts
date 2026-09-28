@@ -101,7 +101,10 @@ export function routeCliInvocation(
     return { kind: "unknown-command", command };
   }
 
-  if (commands.some((known) => known !== "setup" && isOneEditAway(command, known))) {
+  if (
+    command === command.toLowerCase() &&
+    commands.some((known) => known !== "setup" && isOneEditAway(command, known))
+  ) {
     return { kind: "unknown-command", command };
   }
 
