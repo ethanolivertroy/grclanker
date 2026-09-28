@@ -222,6 +222,7 @@ function __corpusSweep(name, args, original) {
   }
 }
 function __corpusClientMethods(client) {
+  const domainReadMethod = /^(?:count|list|search|get(?:Device|Dynamic|Firewall|Sca|Self|Summary|User|Users))/;
   const transportMethods = new Set([
     "get",
     "getByIds",
@@ -244,6 +245,7 @@ function __corpusClientMethods(client) {
       if (
         name !== "constructor"
         && name !== "getResolvedConfig"
+        && domainReadMethod.test(name)
         && !transportMethods.has(name)
         && typeof client[name] === "function"
       ) methods.add(name);
