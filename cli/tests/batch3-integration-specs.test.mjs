@@ -133,7 +133,7 @@ test("batch 3 completeness names exact datasets and all six collection failure m
       }
     }
   }
-  assert.equal(contracts, 104);
+  assert.equal(contracts, 105);
   assert.ok(sources > contracts);
 });
 
@@ -212,7 +212,7 @@ test("hidden threshold bands execute below, equal, and above against primitive f
   const tenable06 = { tenable_06_agent_group_reads_succeeded: true, tenable_06_agent_and_group_lists_complete: true, tenable_06_agent_count: 100, tenable_06_agent_group_count: 1 };
   assert.deepEqual([9, 10, 11].map((count) => verdict("TENABLE-06", { ...tenable06, tenable_06_ungrouped_agent_count: count })), ["warn", "warn", "fail"]);
 
-  const qualys10 = { qualys_c10_host_and_detection_reads_succeeded: true, qualys_c10_host_and_detection_lists_complete: true, qualys_c10_sla_scoped_detection_count: 100, qualys_c10_dated_detection_count: 100, qualys_c10_undated_detection_count: 0 };
+  const qualys10 = { qualys_c10_host_and_detection_reads_succeeded: true, qualys_c10_host_and_detection_lists_complete: true, qualys_c10_detection_list_complete: true, qualys_c10_sla_scoped_detection_count: 100, qualys_c10_dated_detection_count: 100, qualys_c10_undated_detection_count: 0 };
   assert.deepEqual([79, 80, 81, 94, 95, 96].map((count) => verdict("QUALYS-C10", { ...qualys10, qualys_c10_on_sla_detection_count: count })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
 
   const kb04 = { knowbe4_04_user_and_enrollment_reads_succeeded: true, knowbe4_04_user_and_enrollment_lists_complete: true, knowbe4_04_new_user_count: 100 };

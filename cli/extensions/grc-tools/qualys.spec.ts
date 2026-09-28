@@ -13,7 +13,7 @@ import {
   restSurface,
 } from "./batch2-spec-helpers.js";
 import { QUALYS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { BATCH3_FRAMEWORK_FILES, batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://docs.qualys.com/en/vm/api/";
 const vm = (id: string, path: string, fields: readonly string[]) => {
@@ -114,6 +114,16 @@ const rows: readonly Batch3CheckRow[] = [
       qualys_c10_dated_detection_count: "Non-negative count of SLA-scoped detections carrying a parseable FIRST_FOUND_DATETIME.",
       qualys_c10_on_sla_detection_count: "Non-negative count of dated detections whose first-found age is at most the configured 90-day medium, 30-day high, or 15-day critical SLA.",
       qualys_c10_undated_detection_count: "Non-negative count of SLA-scoped detections without a parseable FIRST_FOUND_DATETIME; these rows are excluded from the ratio and require review.",
+    },
+    completeness: {
+      qualys_c10_host_and_detection_lists_complete: {
+        sources: [batch3Source("hosts"), batch3Source("detections")],
+        semantics: "For QUALYS-C10, qualys_c10_host_and_detection_lists_complete is true only when both host and detection pagination exhaust. Exact source-state effects: hosts sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field; detections sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field. Finding previews and exported samples never establish source cardinality.",
+      },
+      qualys_c10_detection_list_complete: {
+        sources: [batch3Source("detections")],
+        semantics: "For QUALYS-C10, qualys_c10_detection_list_complete is true when detection pagination exhausts regardless of host-list coverage. Exact source-state effects: detections sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field. Finding previews and exported samples never establish source cardinality.",
+      },
     },
     decisionRules: [
       batch2Rule("manual", batch2Ne("qualys_c10_host_and_detection_reads_succeeded", true)),

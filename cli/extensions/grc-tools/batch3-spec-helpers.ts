@@ -13,6 +13,7 @@ import {
 } from "./batch2-spec-helpers.js";
 import type {
   BatchCheckDefinition,
+  BatchCompletenessDefinition,
   BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
 import type { FindingSeverity, PortableValue, VerdictRule } from "./spec-model.js";
@@ -31,6 +32,7 @@ export interface Batch3CheckRow {
   constants?: Readonly<Record<string, PortableValue>>;
   decisionInputs?: Readonly<Record<string, string>>;
   decisionRules?: readonly VerdictRule[];
+  completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
   completenessSources?: readonly BatchCompletenessSourceDefinition[];
   completenessSemantics?: string;
   runtimeFactNames?: Batch3FactNames;
@@ -221,7 +223,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       constants: row.constants,
       decisionInputs,
       decisionRules,
-      completeness: batch2Completeness(
+      completeness: row.completeness ?? batch2Completeness(
         decisionInputs,
         completenessSources,
         row.completenessSemantics ?? exactCompletenessSemantics,
