@@ -41,6 +41,12 @@ import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -2952,4 +2958,34 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "knowbe4 scrubErrorText");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "knowbe4 redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "knowbe4 redactCredentialValues, error list");
+});
+
+test("byte differential fixtures: KnowBe4 assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assessAll = async (client, options = {}) => {
+    const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["phishing", "training", "risk", "governance"], now: NOW, ...options });
+    return [
+      assessKnowbe4PhishingProgram(snapshot, { now: NOW, ...options }),
+      assessKnowbe4TrainingProgram(snapshot, { now: NOW, ...options }),
+      assessKnowbe4UserRisk(snapshot, { now: NOW, ...options }),
+      assessKnowbe4AccountGovernance(snapshot, { now: NOW, ...options }),
+    ];
+  };
+  writeByteDifferentialFixture("knowbe4", "representative", await assessAll(mockClient(failingFixture())));
+  writeByteDifferentialFixture("knowbe4", "compliant", await assessAll(mockClient(healthyFixture(), { phisher: true })));
+  writeByteDifferentialFixture("knowbe4", "denied", await assessAll(mockClient(healthyFixture(), { failures: { listSecurityTests: forbidden("/v1/phishing/security_tests") } })));
+  writeByteDifferentialFixture("knowbe4", "missing-null", await assessAll(mockClient(sparseFixture())));
+  writeByteDifferentialFixture("knowbe4", "partial", await assessAll(mockClient(failingFixture())));
+  writeByteDifferentialFixture("knowbe4", "boundary", {
+    completion: await assessAll(mockClient(healthyFixture()), { minCompletionPct: 90, failCompletionPct: 80 }),
+    coverage: await assessAll(mockClient(healthyFixture()), { minCoveragePct: 90 }),
+    admins: await assessAll(mockClient(healthyFixture()), { maxAdminCount: 3 }),
+  });
+  const config = sampleConfig({ phisherApiToken: "phisher-token" });
+  const exported = await exportKnowbe4AuditBundle(
+    mockClient(healthyFixture(), { phisher: true, config }),
+    config,
+    prepareByteDifferentialExportRoot("knowbe4"),
+    { now: NOW },
+  );
+  writeByteDifferentialFixture("knowbe4", "export", snapshotExportBundle(exported));
 });

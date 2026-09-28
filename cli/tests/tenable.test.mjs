@@ -34,6 +34,12 @@ import {
 } from "../dist/extensions/grc-tools/tenable.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = Date.parse("2026-09-21T12:00:00Z");
 const RECENT_SECONDS = Math.floor((NOW - 2 * 86_400_000) / 1000);
@@ -3829,4 +3835,23 @@ test("Tenable tools appear in the registered tool catalog under the Tenable grou
   const tools = getRegisteredToolSummaries().filter((tool) => tool.name.startsWith("tenable_"));
   assert.equal(tools.length, 6);
   for (const tool of tools) assert.equal(tool.group, "Tenable");
+});
+
+test("byte differential fixtures: Tenable assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("tenable", "representative", await runAll(clientsFor(partialRoutes()), { maxChunks: 1, expectedAssetCount: 2 }));
+  writeByteDifferentialFixture("tenable", "compliant", await runAll(clientsFor(healthyRoutes()), { expectedAssetCount: 2 }));
+  writeByteDifferentialFixture("tenable", "denied", await runAll(clientsFor(healthyRoutes(), { status: 403 })));
+  writeByteDifferentialFixture("tenable", "missing-null", await runAll(clientsFor(emptyRoutes())));
+  writeByteDifferentialFixture("tenable", "partial", await runAll(clientsFor(partialRoutes()), { maxChunks: 1 }));
+  writeByteDifferentialFixture("tenable", "boundary", {
+    credentialRatio: await runAll(clientsFor(healthyRoutes()), { credentialThreshold: 0.8 }),
+    taggedRatio: await runAll(clientsFor(healthyRoutes()), { taggedThreshold: 0.9 }),
+    administratorCount: await runAll(clientsFor(healthyRoutes()), { maxAdmins: 5 }),
+  });
+  const exported = await exportTenableAuditBundle(
+    clientsFor(healthyRoutes()),
+    prepareByteDifferentialExportRoot("tenable"),
+    { expectedAssetCount: 2 },
+  );
+  writeByteDifferentialFixture("tenable", "export", snapshotExportBundle(exported));
 });

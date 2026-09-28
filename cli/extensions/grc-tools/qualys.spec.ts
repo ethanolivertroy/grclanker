@@ -1,8 +1,8 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
-  restSurface,
 } from "./batch-spec-builder.js";
+import { restSurface } from "./batch2-spec-helpers.js";
 import { QUALYS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { BATCH3_FRAMEWORK_FILES, batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 

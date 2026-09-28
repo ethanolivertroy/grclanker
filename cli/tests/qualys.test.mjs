@@ -38,6 +38,12 @@ import {
   xmlToRecord,
 } from "../dist/extensions/grc-tools/qualys.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date();
 const daysAgo = (days) => new Date(NOW.getTime() - days * 86_400_000).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -4312,4 +4318,29 @@ test("Qualys tools are registered in the tool catalog under the Qualys group", (
   assert.ok(tools.every((tool) => tool.group === "Qualys"));
   assert.ok(tools.every((tool) => tool.kind === "domain"));
   assert.ok(tools.every((tool) => typeof tool.description === "string" && tool.description.length > 40));
+});
+
+test("byte differential fixtures: Qualys assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("qualys", "representative", await runAllAssessments(createFakeClient(failingFixtures)));
+  writeByteDifferentialFixture("qualys", "compliant", await runAllAssessments(createFakeClient(healthyFixtures)));
+  writeByteDifferentialFixture("qualys", "denied", await runAllAssessments(createFakeClient(forbiddenFixtures())));
+  writeByteDifferentialFixture("qualys", "missing-null", await runAllAssessments(createFakeClient({
+    ...healthyFixtures,
+    listHosts: async () => [],
+    listAssetGroups: async () => [],
+    listDetections: async () => [],
+  })));
+  writeByteDifferentialFixture("qualys", "partial", await runAllAssessments(createFakeClient(partialFixtures(healthyFixtures))));
+  writeByteDifferentialFixture("qualys", "boundary", {
+    authenticated: await runAllAssessments(createFakeClient(healthyFixtures), { minAuthScanPercent: 80 }),
+    agents: await runAllAssessments(createFakeClient(healthyFixtures), { minAgentCoveragePercent: 50 }),
+    managers: await runAllAssessments(createFakeClient(healthyFixtures), { maxManagers: 5 }),
+  });
+  const config = sampleConfig();
+  const exported = await exportQualysAuditBundle(
+    createFakeClient(healthyFixtures, config),
+    config,
+    prepareByteDifferentialExportRoot("qualys"),
+  );
+  writeByteDifferentialFixture("qualys", "export", snapshotExportBundle(exported));
 });

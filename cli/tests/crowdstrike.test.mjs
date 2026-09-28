@@ -40,6 +40,12 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const ALL_CONTROL_IDS = Array.from({ length: 25 }, (_, index) => `CS-${String(index + 1).padStart(2, "0")}`);
 const EXPECTED_TOOLS = [
@@ -2957,4 +2963,23 @@ test("CrowdStrike tools are registered in the tool catalog under the CrowdStrike
   }
   const exportTool = tools.find((entry) => entry.name === "crowdstrike_export_audit_bundle");
   assert.ok(exportTool.parameterSummaries.some((parameter) => parameter.name === "output_dir"));
+});
+
+test("byte differential fixtures: CrowdStrike assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("crowdstrike", "representative", await runAllCrowdstrikeAssessments(createPartialClient()));
+  writeByteDifferentialFixture("crowdstrike", "compliant", await runAllCrowdstrikeAssessments(createFakeClient()));
+  writeByteDifferentialFixture("crowdstrike", "denied", await runAllCrowdstrikeAssessments(createForbiddenClient()));
+  writeByteDifferentialFixture("crowdstrike", "missing-null", await runAllCrowdstrikeAssessments(createEmptyClient()));
+  writeByteDifferentialFixture("crowdstrike", "partial", await runAllCrowdstrikeAssessments(createPartialClient()));
+  writeByteDifferentialFixture("crowdstrike", "boundary", {
+    administrators: await runAllCrowdstrikeAssessments(createFakeClient(), { maxAdmins: 5 }),
+    sessions: await runAllCrowdstrikeAssessments(createFakeClient(), { maxSessionMinutes: 30, maxConcurrentSessions: 3 }),
+    zeroTrust: await runAllCrowdstrikeAssessments(createFakeClient(), { minZtaScore: 60 }),
+  });
+  const exported = await exportCrowdstrikeAuditBundle(
+    createFakeClient(),
+    sampleConfig(),
+    prepareByteDifferentialExportRoot("crowdstrike"),
+  );
+  writeByteDifferentialFixture("crowdstrike", "export", snapshotExportBundle(exported));
 });
