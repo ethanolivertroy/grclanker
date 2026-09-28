@@ -3535,7 +3535,9 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("requirement"),
           Type.Literal("ksi"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "FedRAMP source section to search.",
+        }),
       ),
       applies_to: Type.Optional(
         Type.Union([
@@ -3543,7 +3545,9 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("rev5"),
           Type.Literal("both"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: any).",
+        }),
       ),
       limit: Type.Optional(
         Type.Number({
@@ -3752,14 +3756,18 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("rev5"),
           Type.Literal("both"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: any).",
+        }),
       ),
       audience: Type.Optional(
         Type.Union([
           Type.Literal("provider"),
           Type.Literal("trust-center"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "Intended audience for the readiness brief (default: provider).",
+        }),
       ),
       limit: Type.Optional(
         Type.Number({
@@ -3845,14 +3853,18 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("rev5"),
           Type.Literal("both"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: any).",
+        }),
       ),
       audience: Type.Optional(
         Type.Union([
           Type.Literal("provider"),
           Type.Literal("trust-center"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "Intended audience for the artifact plan (default: provider).",
+        }),
       ),
     }),
     prepareArguments: normalizePlanningArgs,
@@ -3908,14 +3920,18 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("rev5"),
           Type.Literal("both"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: 20x).",
+        }),
       ),
       audience: Type.Optional(
         Type.Union([
           Type.Literal("provider"),
           Type.Literal("trust-center"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "Intended audience for the ADS package plan (default: trust-center).",
+        }),
       ),
     }),
     prepareArguments: normalizeAdsPackageArgs,
@@ -3971,14 +3987,18 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("rev5"),
           Type.Literal("both"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: 20x).",
+        }),
       ),
       audience: Type.Optional(
         Type.Union([
           Type.Literal("provider"),
           Type.Literal("trust-center"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "Intended audience for the generated ADS bundle (default: trust-center).",
+        }),
       ),
     }),
     prepareArguments: normalizeAdsBundleArgs,
@@ -4036,14 +4056,18 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("rev5"),
           Type.Literal("both"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: 20x).",
+        }),
       ),
       audience: Type.Optional(
         Type.Union([
           Type.Literal("provider"),
           Type.Literal("trust-center"),
           Type.Literal("any"),
-        ]),
+        ], {
+          description: "Intended audience for the generated ADS site (default: trust-center).",
+        }),
       ),
       provider_name: Type.Optional(
         Type.String({
