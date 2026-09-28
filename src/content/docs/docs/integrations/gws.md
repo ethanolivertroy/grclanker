@@ -36,7 +36,7 @@ export GWS_CUSTOMER_ID=my_customer     # optional, defaults to my_customer
 export GWS_LOOKBACK_DAYS=30            # optional audit window, 1-180
 ```
 
-`GWS_SERVICE_ACCOUNT_FILE` and then `GOOGLE_APPLICATION_CREDENTIALS` are read when `GWS_CREDENTIALS_FILE` is unset, and `GWS_SERVICE_ACCOUNT_JSON` when `GWS_CREDENTIALS_JSON` is unset. When both inline JSON and a file path resolve, the inline JSON is used.
+`GWS_SERVICE_ACCOUNT_FILE` and then `GOOGLE_APPLICATION_CREDENTIALS` are read when `GWS_CREDENTIALS_FILE` is unset, and `GWS_SERVICE_ACCOUNT_JSON` when `GWS_CREDENTIALS_JSON` is unset. These credentials are read only in `service_account` mode; when both inline JSON and a file path resolve, the inline JSON is used.
 
 grclanker signs an RS256 JWT with `sub` set to the admin email and exchanges it at `https://oauth2.googleapis.com/token` with the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant, as documented at [Using OAuth 2.0 for Server to Server Applications](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority). Tokens are cached per scope set and refreshed on 401.
 
