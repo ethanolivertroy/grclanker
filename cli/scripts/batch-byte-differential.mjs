@@ -245,7 +245,7 @@ function runCorpusSuite(root, fixtureDirectory) {
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-name-pattern=^(?!all 25 Palo Alto checks replay|all 25 Zscaler checks replay)",
+    "--test-skip-pattern=^all 25 (?:Palo Alto|Zscaler) checks replay",
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
