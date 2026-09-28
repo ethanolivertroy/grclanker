@@ -108,7 +108,7 @@ const decisions = [
   "return pass when an active SSO or LDAP integration is visible with enabled redirect policy and valid dated certificates, fail when complete evidence has no active external identity provider or an active certificate is expired, warn for weak redirect policy or near-expiry and undated certificates, and manual when integration evidence is unreadable or partial.",
   "return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable.",
   "return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable.",
-  "return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected.",
+  "for sys_user, sys_user_has_role, sys_user_role, sys_properties, sys_script, sys_security_acl, syslog, and sys_audit, return fail when a complete ACL inventory contains no record ACL for any table, warn when a covered table lacks read, write, or delete operations or the inventory is incomplete, pass when every table has coverage for all three operations, and manual when the ACL aggregate is unavailable or zero.",
   "return fail when unrestricted server-side script execution is enabled, pass when the documented script restrictions are enabled, warn for mixed settings, and manual when the required properties are absent.",
   "return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial.",
   "return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities.",
@@ -302,6 +302,7 @@ export const SERVICENOW_RUNTIME_BEHAVIOR = [
   "Table API rows and Aggregate API counts are cross-checked; missing totals, ACL-filtered visibility, truncation, denied reads, and skipped child requests prevent pass.",
   "Encoded-query pagination uses sysparm_offset plus X-Total-Count, rejects foreign next links, and preserves exact seen, total, page, and stop-reason evidence.",
   "MFA, encryption, script, IP, email, and outbound TLS controls use documented properties and tables available to the runtime; unavailable Instance Security Center and product-specific proofs remain manual.",
+  "SNOW-11 evaluates record ACL coverage for exactly these sensitive tables: sys_user, sys_user_has_role, sys_user_role, sys_properties, sys_script, sys_security_acl, syslog, and sys_audit.",
 ] as const;
 
 export const SERVICENOW_SPEC = buildBatchIntegrationSpec({

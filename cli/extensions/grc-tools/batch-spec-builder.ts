@@ -16,6 +16,7 @@ import {
   type PermissionKind,
   type PortableValue,
   type VerdictCondition,
+  type VerdictOperand,
   type VerdictRule,
   toolContract,
 } from "./spec-model.js";
@@ -335,6 +336,154 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
   };
 }
 
+type PortableInputType = "array" | "boolean" | "null" | "number" | "string";
+
+interface PortableInputUsage {
+  types: Set<PortableInputType>;
+  values: Set<string>;
+  derivedFacts: Set<string>;
+}
+
+function portableValueType(value: PortableValue): PortableInputType {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  switch (typeof value) {
+    case "boolean":
+      return "boolean";
+    case "number":
+      return "number";
+    case "string":
+      return "string";
+    default: {
+      const exhaustive: never = value;
+      return exhaustive;
+    }
+  }
+}
+
+function recordOperandUsage(
+  usage: Map<string, PortableInputUsage>,
+  operand: VerdictOperand,
+  derivedFact: string,
+  expectedType?: PortableInputType,
+  comparedValue?: PortableValue,
+): void {
+  if (operand.kind === "value") return;
+  const name = operand.path;
+  const entry = usage.get(name) ?? { types: new Set<PortableInputType>(), values: new Set<string>(), derivedFacts: new Set<string>() };
+  if (operand.kind === "length") entry.types.add("array");
+  if (expectedType) entry.types.add(expectedType);
+  if (comparedValue !== undefined && comparedValue !== null && !Array.isArray(comparedValue)) {
+    entry.values.add(JSON.stringify(comparedValue));
+  }
+  entry.derivedFacts.add(derivedFact);
+  usage.set(name, entry);
+}
+
+function collectPortableInputUsage(
+  condition: VerdictCondition,
+  derivedFact: string,
+  usage: Map<string, PortableInputUsage>,
+): void {
+  switch (condition.op) {
+    case "always":
+      return;
+    case "and":
+    case "or":
+      for (const child of condition.conditions) collectPortableInputUsage(child, derivedFact, usage);
+      return;
+    case "not":
+      collectPortableInputUsage(condition.condition, derivedFact, usage);
+      return;
+    case "eq":
+    case "ne":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte": {
+      const leftValue = condition.left.kind === "value" ? condition.left.value : undefined;
+      const rightValue = condition.right.kind === "value" ? condition.right.value : undefined;
+      recordOperandUsage(
+        usage,
+        condition.left,
+        derivedFact,
+        rightValue === undefined ? undefined : portableValueType(rightValue),
+        rightValue,
+      );
+      recordOperandUsage(
+        usage,
+        condition.right,
+        derivedFact,
+        leftValue === undefined ? undefined : portableValueType(leftValue),
+        leftValue,
+      );
+      return;
+    }
+    case "ratio":
+      recordOperandUsage(usage, condition.numerator, derivedFact, "number");
+      recordOperandUsage(usage, condition.denominator, derivedFact, "number");
+      recordOperandUsage(usage, condition.threshold, derivedFact, "number");
+      return;
+    case "matches":
+      recordOperandUsage(usage, condition.operand, derivedFact, "string");
+      return;
+    case "defined":
+    case "null":
+      recordOperandUsage(usage, condition.operand, derivedFact);
+      return;
+    case "some":
+    case "every":
+      recordOperandUsage(usage, { kind: "path", path: condition.path }, derivedFact, "array");
+      collectPortableInputUsage(condition.condition, derivedFact, usage);
+      return;
+    default: {
+      const exhaustive: never = condition;
+      return exhaustive;
+    }
+  }
+}
+
+function portableInputType(name: string, usage: PortableInputUsage | undefined): string {
+  if (usage && usage.types.size > 0) return [...usage.types].sort().join(" or ");
+  if (/(?:^|_)(?:count|days?|hours?|minutes?|percent|ratio|threshold|limit|maximum|max|pages?|total|age)(?:_|$)/.test(name)) {
+    return "number";
+  }
+  if (/(?:^|_)(?:readable|complete|present|enabled|active|known|configured|federal|truncated)(?:_|$)/.test(name)) {
+    return "boolean";
+  }
+  return "string, number, boolean, or null as documented by the named vendor field";
+}
+
+function portableInputDefinitions(
+  definition: BatchSpecDefinition,
+  check: BatchCheckDefinition,
+): Readonly<Record<string, string>> | undefined {
+  if (!check.decisionInputs) return undefined;
+  const usage = new Map<string, PortableInputUsage>();
+  for (const [name, rule] of Object.entries(check.derivedFactRules ?? {})) {
+    collectPortableInputUsage(rule.condition, name, usage);
+  }
+  const source = check.surfaces.length > 0
+    ? check.surfaces.map((surface) => `\`${surface}\``).join(", ")
+    : "the explicitly manual collector state (no vendor read surface exists)";
+  return Object.fromEntries(Object.entries(check.decisionInputs).map(([name, supplied]) => {
+    const inputUsage = usage.get(name);
+    const values = inputUsage && inputUsage.values.size > 0
+      ? ` Compared literal domain: ${[...inputUsage.values].sort().join(", ")}.`
+      : "";
+    const completeSemantics = /(?:count|total|ratio|percent|maximum|max|complete)/.test(name)
+      ? " Cardinalities and ratios use the complete collector inventory, never a rendered or 25-item evidence sample, unless the input name explicitly says sampled."
+      : " The value is computed before evidence rendering or display caps.";
+    const usedBy = inputUsage && inputUsage.derivedFacts.size > 0
+      ? ` It feeds executable derived facts ${[...inputUsage.derivedFacts].sort().map((fact) => `\`${fact}\``).join(", ")}.`
+      : " It is declared for the finding's explicit manual-only contract.";
+    return [
+      name,
+      `Type/domain: ${portableInputType(name, inputUsage)}.${values} Source: ${definition.vendor} vendor evidence or collector state from ${source}.${completeSemantics} Null or missing means the source did not establish the value; it cannot independently prove a passing branch.${usedBy} Integration semantics: ${supplied}`,
+    ];
+  }));
+}
+
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {
   for (const check of definition.checks) {
     if (!check.decision.trim()) {
@@ -397,6 +546,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       ? Object.keys(check.decisionInputs)
       : [...new Set(check.evidenceFields.flatMap((field) =>
         definition.surfaces.find((surface) => surface.id === field)?.fields ?? [field]))],
+    ...(check.decisionInputs ? { evidenceFieldDefinitions: portableInputDefinitions(definition, check) } : {}),
     derivedFacts: check.decisionInputs
       ? Object.fromEntries(Object.entries(check.derivedFactRules ?? {}).map(([name, rule]) => [name, rule.description]))
       : {

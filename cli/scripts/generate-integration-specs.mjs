@@ -200,6 +200,8 @@ function renderChecks(spec) {
         : derivation;
       return `| \`${check.id}\` | \`${name}\` | ${escapeCell(rendered)} |`;
     }));
+  const primitiveRows = spec.checks.flatMap((check) => Object.entries(check.evidenceFieldDefinitions ?? {})
+    .map(([name, definition]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(definition)} |`));
   return [
     "## Checks",
     "",
@@ -223,9 +225,19 @@ function renderChecks(spec) {
     "|---|---|---|---|---|---|---|---|---|",
     ...spec.checks.map((check) => `| \`${check.id}\` | ${check.severity} | \`${check.owningTool}\` | ${listCell(check.sourceSurfaceIds)} | ${listCell(check.evidenceFields)} | ${escapeCell(check.criteria.pass)} | ${escapeCell(check.criteria.warn)} | ${escapeCell(check.criteria.fail)} | ${escapeCell(check.criteria.manual)} |`),
     "",
+    "### Primitive decision inputs",
+    "",
+    "Every primitive is read from the named vendor surface or collector state before evidence lists are rendered or capped. Null and missing retain unavailable semantics; they are not empty inventories, false values, or zero counts.",
+    "",
+    "| Finding | Input | Portable definition |",
+    "|---|---|---|",
+    ...(primitiveRows.length > 0 ? primitiveRows : ["| None |  |  |"]),
+    "",
     "### Ordered decision rules",
     "",
     "Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.",
+    "",
+    "A `matches` condition performs a regular-expression search; anchors are required for whole-value matching, and an `i` flag requests case-insensitive matching. A `ratio` condition divides the numerator by the denominator, applies the declared scale, and rounds to the declared decimal places by choosing the nearest value with exact half cases rounded toward positive infinity; a zero, null, or missing denominator does not match.",
     "",
     "| Finding | Order | Outcome | First-match condition | Explanatory note |",
     "|---|---|---|---|---|",
