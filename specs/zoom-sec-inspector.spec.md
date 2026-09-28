@@ -809,6 +809,7 @@ Required paths:
 - `README.md`
 - `QUICK_REFERENCE.md`
 - `metadata.json`
+- `summary.md`
 - `core_data/access.json`
 - `core_data/current_user.json`
 - `core_data/account_settings.json`
@@ -848,6 +849,7 @@ Conditional paths:
 | `README.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 | `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 | `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `summary.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 | `core_data/access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `core_data/current_user.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `core_data/account_settings.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |

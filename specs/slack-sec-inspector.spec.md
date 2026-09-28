@@ -950,19 +950,19 @@ Required paths:
 - `metadata.json`
 - `core_data/access.json`
 - `core_data/identity.json`
-- `core_data/admin_access.json`
+- `core_data/admin-access.json`
 - `core_data/integrations.json`
-- `core_data/channel_governance.json`
+- `core_data/channel-governance.json`
 - `core_data/monitoring.json`
 - `analysis/identity.json`
-- `analysis/admin_access.json`
+- `analysis/admin-access.json`
 - `analysis/integrations.json`
-- `analysis/channel_governance.json`
+- `analysis/channel-governance.json`
 - `analysis/monitoring.json`
 - `reports/identity.md`
-- `reports/admin_access.md`
+- `reports/admin-access.md`
 - `reports/integrations.md`
-- `reports/channel_governance.md`
+- `reports/channel-governance.md`
 - `reports/monitoring.md`
 - `analysis/findings.json`
 - `compliance/executive_summary.md`
@@ -989,19 +989,19 @@ Conditional paths:
 | `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `core_data/access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `core_data/identity.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `core_data/admin_access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/admin-access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `core_data/integrations.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `core_data/channel_governance.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/channel-governance.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `core_data/monitoring.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `analysis/identity.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `analysis/admin_access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/admin-access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `analysis/integrations.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
-| `analysis/channel_governance.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/channel-governance.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `analysis/monitoring.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `reports/identity.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
-| `reports/admin_access.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `reports/admin-access.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 | `reports/integrations.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
-| `reports/channel_governance.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `reports/channel-governance.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 | `reports/monitoring.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 | `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
 | `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
