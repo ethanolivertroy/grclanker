@@ -5,8 +5,10 @@ import {
 import {
   checkContract,
   defineGrcTool,
+  evaluateCheckVerdict,
   evaluateVerdictCriteria,
   type CheckContract,
+  type DerivedFactRule,
   type EvaluatedFindingStatus,
   type ExportContract,
   type FindingSeverity,
@@ -49,7 +51,11 @@ export interface BatchCheckDefinition {
   surfaces: readonly string[];
   frameworks?: Partial<Record<FrameworkKey, readonly string[]>>;
   evidenceFields: readonly string[];
+  decisionInputs?: Readonly<Record<string, string>>;
+  decisionConstants?: Readonly<Record<string, PortableValue>>;
+  decisionRules?: readonly VerdictRule[];
   derivedFacts?: Readonly<Record<string, string>>;
+  derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   decision: string;
   outcomes?: {
     fail?: boolean;
@@ -271,7 +277,7 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     warn: `Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: ${check.decision}`,
     fail: `Complete readable evidence satisfies the violation branch, which has first-match precedence: ${check.decision}`,
     manual: `The required evidence for ${check.title} is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict.`,
-    constants: {
+    constants: check.decisionConstants ?? {
       requiredEvidenceReadable: true,
       requiredEvidenceComplete: true,
     },
@@ -301,7 +307,7 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
         reason: "Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes.",
       },
     ],
-    rules,
+    rules: check.decisionRules ?? rules,
   };
 }
 
@@ -363,16 +369,21 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     severity: check.severity,
     owningTool: check.owner,
     sourceSurfaceIds: check.surfaces,
-    evidenceFields: [...new Set(check.evidenceFields.flatMap((field) =>
-      definition.surfaces.find((surface) => surface.id === field)?.fields ?? [field]))],
-    derivedFacts: {
-      [factName(check, "required_evidence_readable")]: `From the declared source surfaces, set true only when every value required by ${check.id} was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false.`,
-      [factName(check, "required_evidence_complete")]: `From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false.`,
-      [factName(check, "failure_matches")]: `Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: ${check.decision}`,
-      [factName(check, "warning_matches")]: `Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: ${check.decision}`,
-      [factName(check, "compliant_matches")]: `Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: ${check.decision}`,
-      ...check.derivedFacts,
-    },
+    evidenceFields: check.decisionInputs
+      ? Object.keys(check.decisionInputs)
+      : [...new Set(check.evidenceFields.flatMap((field) =>
+        definition.surfaces.find((surface) => surface.id === field)?.fields ?? [field]))],
+    derivedFacts: check.decisionInputs
+      ? Object.fromEntries(Object.entries(check.derivedFactRules ?? {}).map(([name, rule]) => [name, rule.description]))
+      : {
+        [factName(check, "required_evidence_readable")]: `From the declared source surfaces, set true only when every value required by ${check.id} was returned and is non-null; denied, missing, malformed, not-requested, and unreadable dependencies set false.`,
+        [factName(check, "required_evidence_complete")]: `From complete source cardinalities rather than rendered samples, set true only after every required list proves exhaustion; any cap, repeated cursor, missing total, rejected link, sampled child read, or other partial state sets false.`,
+        [factName(check, "failure_matches")]: `Using the declared evidence fields and complete counts, evaluate only the failure branch of this portable derivation and return a boolean: ${check.decision}`,
+        [factName(check, "warning_matches")]: `Using the declared evidence fields and complete counts, evaluate only the warning or review branch of this portable derivation and return a boolean: ${check.decision}`,
+        [factName(check, "compliant_matches")]: `Using the declared evidence fields and complete counts, evaluate only the compliant branch of this portable derivation and return a boolean: ${check.decision}`,
+        ...check.derivedFacts,
+      },
+    ...(check.derivedFactRules ? { derivedFactRules: check.derivedFactRules } : {}),
     criteria: criterion(check),
   }));
   const tools = Object.entries(definition.tools).map(([name, checkIds]) => ({
@@ -460,6 +471,52 @@ export function evaluateObservedFindingStatus(
     [factName(check, "compliant_matches")]: status === "pass",
   };
   return evaluateVerdictCriteria(check.criteria, facts);
+}
+
+export function evaluateBatchCheckVerdict(
+  spec: IntegrationSpecContract,
+  checkId: string,
+  rawFacts: Readonly<Record<string, unknown>>,
+): EvaluatedFindingStatus {
+  return evaluateCheckVerdict(checkContract(spec, checkId), rawFacts);
+}
+
+export function assertBatchCheckVerdict<T extends string>(
+  spec: IntegrationSpecContract,
+  checkId: string,
+  rawFacts: Readonly<Record<string, unknown>>,
+  expectedStatus: T,
+): T {
+  const normalizedExpected = ({
+    Pass: "pass",
+    Partial: "warn",
+    Fail: "fail",
+    Manual: "manual",
+    Info: "manual",
+  } as Record<string, EvaluatedFindingStatus>)[expectedStatus]
+    ?? expectedStatus.toLowerCase() as EvaluatedFindingStatus;
+  const evaluated = evaluateBatchCheckVerdict(spec, checkId, rawFacts);
+  if (evaluated !== normalizedExpected) {
+    throw new Error(`${checkId} runtime status ${expectedStatus} disagrees with evidence contract (${evaluated})`);
+  }
+  return expectedStatus;
+}
+
+export function materializeBatchCheckVerdict<T extends string>(
+  spec: IntegrationSpecContract,
+  checkId: string,
+  rawFacts: Readonly<Record<string, unknown>>,
+  manualLabel: T,
+): T {
+  const evaluated = evaluateBatchCheckVerdict(spec, checkId, rawFacts);
+  if (evaluated === "manual") {
+    return (manualLabel === "Info" ? "Info" : "Manual") as T;
+  }
+  return ({
+    pass: "Pass",
+    warn: "Partial",
+    fail: "Fail",
+  } as const)[evaluated] as T;
 }
 
 export function preserveRuntimeFindingStatus<T extends string>(

@@ -4,6 +4,7 @@ import {
   type BatchCheckDefinition,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const OKTA_SURFACES: readonly BatchSurfaceDefinition[] = [
   { id: "sign-on-policies", path: "/api/v1/policies?type=OKTA_SIGN_ON", service: "Okta Management API", documentationUrl: "https://developer.okta.com/docs/api/openapi/okta-management/management/tag/Policy/", fields: ["id", "name", "type", "status", "conditions", "settings"] },
@@ -139,6 +140,341 @@ const decisions: Readonly<Record<string, string>> = {
   "OKTA-MON-009": "always return manual because administrator security-notification email preferences have no Management API read surface.",
 };
 
+interface OktaExecutableDecision {
+  inputs: Readonly<Record<string, string>>;
+  constants?: Readonly<Record<string, PortableValue>>;
+  rules: readonly VerdictRule[];
+}
+
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const compare = (
+  op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte",
+  name: string,
+  entry: PortableValue,
+): VerdictCondition => ({ op, left: path(name), right: value(entry) });
+const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", name, entry);
+const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
+const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
+const lte = (name: string, entry: PortableValue): VerdictCondition => compare("lte", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
+  status,
+  condition,
+  ...(note ? { note } : {}),
+});
+const ordered = (branches: {
+  fail?: VerdictCondition;
+  manual?: VerdictCondition;
+  warn?: VerdictCondition;
+  pass?: VerdictCondition;
+  failFirst?: boolean;
+}): readonly VerdictRule[] => [
+  ...(branches.failFirst && branches.fail ? [rule("fail", branches.fail, "A proven violation retains precedence over incomplete companion evidence.")] : []),
+  ...(branches.manual ? [rule("manual", branches.manual)] : []),
+  ...(!branches.failFirst && branches.fail ? [rule("fail", branches.fail)] : []),
+  ...(branches.warn ? [rule("warn", branches.warn)] : []),
+  ...(branches.pass ? [rule("pass", branches.pass)] : []),
+  rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
+];
+const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} computed from the complete declared source inventories.`]),
+);
+const unavailable = any(ne("readable", true), { op: "not", condition: { op: "defined", operand: path("readable") } });
+const incomplete = ne("complete", true);
+
+const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>> = {
+  "OKTA-AUTH-001": {
+    inputs: input("readable", "complete", "classic_engine", "authenticator_count", "phishing_resistant_count", "strong_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("classic_engine", true)),
+      fail: any(eq("authenticator_count", 0), all(eq("phishing_resistant_count", 0), eq("strong_count", 0))),
+      warn: any(incomplete, all(eq("phishing_resistant_count", 0), gt("strong_count", 0))),
+      pass: gt("phishing_resistant_count", 0),
+    }),
+  },
+  "OKTA-AUTH-002": {
+    inputs: input("policy_inventory_readable", "complete", "admin_policy_count", "admin_mfa_rule_count", "strong_authenticator_count", "mfa_control_count"),
+    rules: ordered({
+      manual: ne("policy_inventory_readable", true),
+      fail: all(eq("admin_policy_count", 0), eq("mfa_control_count", 0), eq("strong_authenticator_count", 0)),
+      warn: any(incomplete, eq("admin_mfa_rule_count", 0), eq("strong_authenticator_count", 0)),
+      pass: all(gt("admin_policy_count", 0), gt("admin_mfa_rule_count", 0), gt("strong_authenticator_count", 0)),
+    }),
+  },
+  "OKTA-AUTH-003": {
+    inputs: input("readable", "complete", "inventory_count", "policy_count", "compliant_policy_count", "all_policies_compliant"),
+    rules: ordered({
+      manual: any(unavailable, eq("inventory_count", 0)),
+      fail: eq("compliant_policy_count", 0),
+      warn: any(incomplete, eq("all_policies_compliant", false)),
+      pass: eq("all_policies_compliant", true),
+    }),
+  },
+  "OKTA-AUTH-004": {
+    inputs: input("readable", "complete", "inventory_count", "policy_count", "compliant_policy_count", "all_policies_compliant"),
+    rules: ordered({
+      manual: any(unavailable, eq("inventory_count", 0)),
+      fail: eq("compliant_policy_count", 0),
+      warn: any(incomplete, eq("all_policies_compliant", false)),
+      pass: eq("all_policies_compliant", true),
+    }),
+  },
+  "OKTA-AUTH-005": {
+    inputs: input("readable", "complete", "inventory_count", "policy_count", "compliant_policy_count", "all_policies_compliant"),
+    rules: ordered({
+      manual: any(unavailable, eq("inventory_count", 0)),
+      fail: eq("compliant_policy_count", 0),
+      warn: any(incomplete, eq("all_policies_compliant", false)),
+      pass: eq("all_policies_compliant", true),
+    }),
+  },
+  "OKTA-AUTH-006": {
+    inputs: input("readable", "complete", "exposed_value_count", "over_limit_count"),
+    constants: { max_idle_minutes: 15 },
+    rules: ordered({
+      manual: any(unavailable, eq("exposed_value_count", 0)),
+      fail: gt("over_limit_count", 0),
+      warn: incomplete,
+      pass: eq("over_limit_count", 0),
+      failFirst: true,
+    }),
+  },
+  "OKTA-AUTH-007": {
+    inputs: input("readable", "complete", "exposed_value_count", "over_limit_count", "persistent_cookie_count"),
+    constants: { max_lifetime_minutes: 1080 },
+    rules: ordered({
+      manual: any(unavailable, eq("exposed_value_count", 0)),
+      fail: any(gt("over_limit_count", 0), gt("persistent_cookie_count", 0)),
+      warn: incomplete,
+      pass: all(eq("over_limit_count", 0), eq("persistent_cookie_count", 0)),
+      failFirst: true,
+    }),
+  },
+  "OKTA-AUTH-008": {
+    inputs: input("idp_readable", "authenticator_readable", "certificate_method_count", "federal_tenant"),
+    rules: ordered({
+      manual: any(
+        all(eq("idp_readable", false), eq("authenticator_readable", false)),
+        all(eq("certificate_method_count", 0), any(eq("idp_readable", false), eq("authenticator_readable", false))),
+        all(eq("certificate_method_count", 0), eq("federal_tenant", false)),
+      ),
+      fail: all(eq("certificate_method_count", 0), eq("federal_tenant", true)),
+      warn: any(eq("idp_readable", false), eq("authenticator_readable", false)),
+      pass: gt("certificate_method_count", 0),
+    }),
+  },
+  "OKTA-AUTH-009": {
+    inputs: input("readable", "complete", "classic_engine", "authenticator_count", "federal_tenant", "okta_verify_active", "fips_required", "restricted_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("classic_engine", true)),
+      fail: any(
+        eq("authenticator_count", 0),
+        all(eq("federal_tenant", true), any(gt("restricted_count", 0), all(eq("okta_verify_active", true), eq("fips_required", false)))),
+      ),
+      warn: any(
+        incomplete,
+        all(eq("federal_tenant", true), eq("okta_verify_active", false)),
+        all(eq("federal_tenant", false), gt("restricted_count", 0)),
+      ),
+      pass: { op: "always" },
+    }),
+  },
+  "OKTA-ADMIN-001": {
+    inputs: input("readable", "complete", "privileged_user_count", "super_admin_count"),
+    constants: { pass_maximum: 2, warn_maximum: 5 },
+    rules: ordered({
+      manual: any(unavailable, eq("privileged_user_count", 0)),
+      fail: gt("super_admin_count", 5),
+      warn: any(incomplete, gt("super_admin_count", 2)),
+      pass: lte("super_admin_count", 2),
+    }),
+  },
+  "OKTA-ADMIN-002": {
+    inputs: input("readable", "complete", "privileged_user_count", "stale_count", "unknown_activity_count"),
+    constants: { inactive_days: 90 },
+    rules: ordered({
+      manual: any(unavailable, eq("privileged_user_count", 0)),
+      fail: gt("stale_count", 0),
+      warn: any(incomplete, gt("unknown_activity_count", 0)),
+      pass: { op: "always" },
+      failFirst: true,
+    }),
+  },
+  "OKTA-ADMIN-003": {
+    inputs: input("readable", "complete", "privileged_group_count", "oversized_group_count"),
+    constants: { maximum_members: 25 },
+    rules: ordered({
+      manual: any(unavailable, eq("privileged_group_count", 0)),
+      warn: any(incomplete, gt("oversized_group_count", 0)),
+      pass: eq("oversized_group_count", 0),
+    }),
+  },
+  "OKTA-ADMIN-004": {
+    inputs: input("readable", "complete", "privileged_user_count", "inspected_user_count", "unenrolled_count", "weak_factor_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("privileged_user_count", 0), eq("inspected_user_count", 0)),
+      fail: gt("unenrolled_count", 0),
+      warn: any(incomplete, gt("weak_factor_count", 0)),
+      pass: { op: "always" },
+      failFirst: true,
+    }),
+  },
+  "OKTA-ADMIN-005": {
+    inputs: input("readable", "complete", "user_count", "stale_active_count", "never_activated_count", "unknown_activity_count", "attention_status_count"),
+    constants: { inactive_days: 90, activation_days: 30 },
+    rules: ordered({
+      manual: any(unavailable, eq("user_count", 0)),
+      fail: any(gt("stale_active_count", 0), gt("never_activated_count", 0)),
+      warn: any(incomplete, gt("unknown_activity_count", 0), gt("attention_status_count", 0)),
+      pass: { op: "always" },
+      failFirst: true,
+    }),
+  },
+  "OKTA-ADMIN-006": {
+    inputs: input("support_readable", "third_party_readable", "support_present", "support_disabled", "third_party_admin"),
+    rules: ordered({
+      manual: any(eq("support_readable", false), eq("support_present", false)),
+      warn: any(eq("third_party_readable", false), eq("support_disabled", false), ne("third_party_admin", false)),
+      pass: all(eq("support_disabled", true), eq("third_party_admin", false)),
+    }),
+  },
+  "OKTA-INTEG-001": {
+    inputs: input("readable", "complete", "active_origin_count", "insecure_active_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("active_origin_count", 0)),
+      fail: gt("insecure_active_count", 0),
+      warn: incomplete,
+      pass: { op: "always" },
+      failFirst: true,
+    }),
+  },
+  "OKTA-INTEG-002": {
+    inputs: input("readable", "complete", "zone_count", "custom_zone_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("zone_count", 0)),
+      warn: any(incomplete, eq("custom_zone_count", 0)),
+      pass: gt("custom_zone_count", 0),
+    }),
+  },
+  "OKTA-INTEG-003": {
+    inputs: input("readable", "complete", "app_count", "risky_active_count", "risky_inactive_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("app_count", 0)),
+      fail: gt("risky_active_count", 0),
+      warn: any(incomplete, gt("risky_inactive_count", 0)),
+      pass: { op: "always" },
+      failFirst: true,
+    }),
+  },
+  "OKTA-INTEG-004": {
+    inputs: input("policy_readable", "complete", "risk_aware_rule_count", "custom_zone_count"),
+    rules: ordered({
+      manual: eq("policy_readable", false),
+      fail: all(eq("risk_aware_rule_count", 0), eq("custom_zone_count", 0)),
+      warn: any(incomplete, eq("risk_aware_rule_count", 0)),
+      pass: gt("risk_aware_rule_count", 0),
+    }),
+  },
+  "OKTA-INTEG-005": {
+    inputs: input("readable", "complete", "app_count", "inactive_app_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("app_count", 0)),
+      warn: any(incomplete, gt("inactive_app_count", 0)),
+      pass: eq("inactive_app_count", 0),
+    }),
+  },
+  "OKTA-INTEG-006": {
+    inputs: input("readable", "complete", "app_count", "provisioning_app_count", "deactivation_app_count"),
+    rules: ordered({
+      manual: any(unavailable, eq("app_count", 0)),
+      fail: all(gt("provisioning_app_count", 0), eq("deactivation_app_count", 0)),
+      warn: any(incomplete, eq("provisioning_app_count", 0)),
+      pass: gt("deactivation_app_count", 0),
+      failFirst: true,
+    }),
+  },
+  "OKTA-MON-001": {
+    inputs: input("streams_readable", "hooks_readable", "complete", "active_stream_count", "active_hook_count"),
+    rules: ordered({
+      manual: any(
+        all(eq("streams_readable", false), eq("hooks_readable", false)),
+        all(eq("streams_readable", false), eq("active_hook_count", 0)),
+      ),
+      fail: all(eq("active_stream_count", 0), eq("active_hook_count", 0)),
+      warn: any(incomplete, eq("active_stream_count", 0)),
+      pass: gt("active_stream_count", 0),
+    }),
+  },
+  "OKTA-MON-002": {
+    inputs: input("readable", "complete", "event_count"),
+    rules: ordered({
+      manual: unavailable,
+      warn: any(incomplete, eq("event_count", 0)),
+      pass: gt("event_count", 0),
+    }),
+  },
+  "OKTA-MON-003": {
+    inputs: input("readable", "configuration_present", "mode"),
+    rules: ordered({
+      manual: any(unavailable, eq("configuration_present", false)),
+      fail: all(ne("mode", "block"), ne("mode", "audit"), ne("mode", "log_only")),
+      warn: any(eq("mode", "audit"), eq("mode", "log_only")),
+      pass: eq("mode", "block"),
+    }),
+  },
+  "OKTA-MON-004": {
+    inputs: input("readable", "complete", "active_behavior_count"),
+    rules: ordered({
+      manual: unavailable,
+      warn: any(incomplete, eq("active_behavior_count", 0)),
+      pass: gt("active_behavior_count", 0),
+    }),
+  },
+  "OKTA-MON-005": {
+    inputs: input("readable", "complete", "token_count", "ssws_auth", "stale_count", "undated_count"),
+    constants: { maximum_age_days: 90 },
+    rules: ordered({
+      manual: any(unavailable, all(eq("token_count", 0), eq("ssws_auth", true))),
+      warn: any(incomplete, gt("stale_count", 0), gt("undated_count", 0)),
+      pass: { op: "always" },
+    }),
+  },
+  "OKTA-MON-006": {
+    inputs: input("readable", "complete", "policy_count"),
+    rules: ordered({
+      manual: unavailable,
+      warn: any(incomplete, eq("policy_count", 0)),
+      pass: gt("policy_count", 0),
+    }),
+  },
+  "OKTA-MON-007": {
+    inputs: input("readable", "complete", "token_count", "ssws_auth", "expired_count", "unrestricted_count", "missing_expiry_count", "long_window_count"),
+    constants: { maximum_window_days: 30 },
+    rules: ordered({
+      manual: any(unavailable, all(eq("token_count", 0), eq("ssws_auth", true))),
+      fail: gt("expired_count", 0),
+      warn: any(incomplete, gt("unrestricted_count", 0), gt("missing_expiry_count", 0), gt("long_window_count", 0)),
+      pass: { op: "always" },
+      failFirst: true,
+    }),
+  },
+  "OKTA-MON-008": {
+    inputs: input("readable", "complete", "contact_count", "technical_contact_present", "technical_user_assigned", "technical_status_known", "technical_user_active", "technical_lookup_failed"),
+    rules: ordered({
+      manual: any(unavailable, eq("contact_count", 0)),
+      fail: any(eq("technical_contact_present", false), eq("technical_user_assigned", false), all(eq("technical_status_known", true), eq("technical_user_active", false))),
+      warn: any(incomplete, eq("technical_lookup_failed", true), eq("technical_status_known", false)),
+      pass: eq("technical_user_active", true),
+    }),
+  },
+  "OKTA-MON-009": {
+    inputs: {},
+    rules: [rule("manual", { op: "always" })],
+  },
+};
+
 function owner(id: string): string {
   if (id.includes("-AUTH-")) return "okta_assess_authentication";
   if (id.includes("-ADMIN-")) return "okta_assess_admin_access";
@@ -154,6 +490,9 @@ const checks: BatchCheckDefinition[] = Object.entries(titles).map(([id, title], 
   owner: owner(id),
   surfaces: OKTA_CHECK_SURFACES[id],
   evidenceFields: [...OKTA_CHECK_SURFACES[id], "complete_source_counts"],
+  decisionInputs: OKTA_EXECUTABLE_DECISIONS[id].inputs,
+  decisionConstants: OKTA_EXECUTABLE_DECISIONS[id].constants,
+  decisionRules: OKTA_EXECUTABLE_DECISIONS[id].rules,
   decision: decisions[id],
 }));
 
