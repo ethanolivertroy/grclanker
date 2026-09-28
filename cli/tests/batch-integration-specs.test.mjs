@@ -149,6 +149,20 @@ function ratioWitnesses(condition, desired, constants) {
       if (evaluateVerdictCondition(condition, facts) === desired) candidates.push(assignment);
     }
   }
+  if (!numerator.known && !denominator.known) {
+    const integers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25, 26, 100];
+    for (const denominatorValue of integers.filter((value) => value > 0)) {
+      for (const numeratorValue of integers) {
+        const assignment = new Map([
+          [numerator.path, numeratorValue],
+          [denominator.path, denominatorValue],
+        ]);
+        if (evaluateVerdictCondition(condition, { ...constants, ...rawFacts(assignment) }) === desired) {
+          candidates.push(assignment);
+        }
+      }
+    }
+  }
   if (!desired && !numerator.known) candidates.push(new Map([[numerator.path, null]]));
   return candidates;
 }
