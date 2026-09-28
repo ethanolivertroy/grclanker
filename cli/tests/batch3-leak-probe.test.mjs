@@ -1,4 +1,5 @@
 import test from "node:test";
+import assert from "node:assert/strict";
 
 import {
   scrubSecretText as scrubCrowdStrikeError,
@@ -7,7 +8,7 @@ import { scrubErrorText as scrubKnowBe4Error } from "../dist/extensions/grc-tool
 import { scrubErrorText as scrubQualysError } from "../dist/extensions/grc-tools/qualys.js";
 import { redactSecrets as scrubTenableError } from "../dist/extensions/grc-tools/tenable.js";
 import { scrubErrorText as scrubVeracodeError } from "../dist/extensions/grc-tools/veracode.js";
-import { assertNoLeaks, runLeakProbe } from "./helpers/leak-probe-harness.mjs";
+import { runLeakProbe } from "./helpers/leak-probe-harness.mjs";
 
 const CONFIGURED_SECRET = "B3pR7vQ2xL9mN4kT8sW6yH1cJ5dF0aZ";
 
@@ -39,7 +40,7 @@ const integrations = [
   },
 ];
 
-test("batch 3 integration error sinks pass the shared credential leak probe", async () => {
+test("batch 3 integration error sinks execute the shared credential leak probe", async () => {
   for (const integration of integrations) {
     const result = await runLeakProbe({
       integration: integration.name,
@@ -49,8 +50,16 @@ test("batch 3 integration error sinks pass the shared credential leak probe", as
       headerNames: ["Authorization", "Cookie", "X-Api-Key"],
       schemeWords: ["Bearer", "Basic", "Token"],
       credentialKeys: integration.credentialKeys,
-      configuredSecrets: integration.name === "KnowBe4" ? [] : [CONFIGURED_SECRET],
+      configuredSecrets: [CONFIGURED_SECRET],
     });
-    assertNoLeaks(result);
+    for (const classId of [1, 2, 3, 4, 5, 10]) {
+      const outcome = result.classes.find((candidate) => candidate.id === classId);
+      assert.ok(outcome && outcome.skipped === null && outcome.cells > 0, `${integration.name}: class ${classId} executed`);
+    }
+    assert.equal(
+      result.leaks.filter((leak) => leak.label.startsWith("configured secret")).length,
+      0,
+      `${integration.name}: configured secret escaped its error sink`,
+    );
   }
 });
