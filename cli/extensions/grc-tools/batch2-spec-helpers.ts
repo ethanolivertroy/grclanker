@@ -31,6 +31,7 @@ export interface Batch2CheckRow {
   decisionInputs?: Readonly<Record<string, string>>;
   decisionRules?: readonly VerdictRule[];
   completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
+  specificCriteria?: boolean;
 }
 
 export const batch2Value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
@@ -250,6 +251,7 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
       derivedFactRules: executable.derivedFactRules,
       completeness: row.completeness,
       decision: row.decision,
+      specificCriteria: row.specificCriteria,
     };
   });
 }

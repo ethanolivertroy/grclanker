@@ -68,6 +68,7 @@ export interface BatchCheckDefinition {
   derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
   decision: string;
+  specificCriteria?: boolean;
   outcomes?: {
     fail?: boolean;
     warn?: boolean;
@@ -314,6 +315,45 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     note: "Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual.",
   });
   const renderedRules = check.decisionRules ?? rules;
+  if (!check.specificCriteria) {
+    return {
+      pass: `Complete readable evidence satisfies the compliant branch of this derivation: ${check.decision}`,
+      warn: `Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: ${check.decision}`,
+      fail: `Complete readable evidence satisfies the violation branch, which has first-match precedence: ${check.decision}`,
+      manual: `The required evidence for ${check.title} is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict.`,
+      constants: check.decisionConstants ?? {
+        requiredEvidenceReadable: true,
+        requiredEvidenceComplete: true,
+      },
+      examples: [
+        {
+          kind: "compliant",
+          input: `All required source reads are complete and this derivation returns pass: ${check.decision}`,
+          expected: "pass",
+          reason: "A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence.",
+        },
+        {
+          kind: "noncompliant",
+          input: `A complete source read satisfies the fail branch of this derivation: ${check.decision}`,
+          expected: "fail",
+          reason: "A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence.",
+        },
+        {
+          kind: "partial",
+          input: "At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists.",
+          expected: "warn",
+          reason: "Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime.",
+        },
+        {
+          kind: "unreadable",
+          input: "A required value is null, missing, denied, never requested, malformed, or unreadable.",
+          expected: "manual",
+          reason: "Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes.",
+        },
+      ],
+      rules: renderedRules,
+    };
+  }
   const sourceConditionFor = (status: EvaluatedFindingStatus): string => {
     const rendered = renderedRules.find((entry) => entry.status === status);
     if (!rendered) return `No ${status} branch exists for this check.`;

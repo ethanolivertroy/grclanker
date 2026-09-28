@@ -226,6 +226,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
         completenessSources,
         row.completenessSemantics ?? exactCompletenessSemantics,
       ),
+      specificCriteria: true,
     };
   }));
 }
