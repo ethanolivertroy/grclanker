@@ -5,6 +5,8 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1644,6 +1646,35 @@ test("exportDuoAuditBundle omits _errors.log when every read succeeds", async ()
   const failed = findings.filter((finding) => finding.status === "Fail" || finding.status === "Partial").map((finding) => finding.id);
   assert.deepEqual(failed, [], "the fully compliant fixture produces no Fail or Partial findings");
   assert.equal(findings.filter((finding) => finding.status === "Manual").map((finding) => finding.id).join(","), "DUO-AUTH-011");
+});
+
+test("exportDuoAuditBundle keeps bundle directories, evidence files, and archives private under umask 022", async () => {
+  const outputRoot = createTempBase("grclanker-duo-private-export-");
+  const config = createSampleConfig();
+  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
+  const previousUmask = process.umask(0o022);
+  let result;
+
+  try {
+    result = await exportDuoAuditBundle(client, config, outputRoot);
+  } finally {
+    process.umask(previousUmask);
+  }
+
+  const assertPrivate = (path, expectedType) => {
+    const stats = statSync(path);
+    assert.equal(stats.mode & 0o077, 0, `${path} exposes ${expectedType} permissions to group or other users`);
+  };
+  const assertPrivateTree = (directory) => {
+    assertPrivate(directory, "directory");
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) assertPrivateTree(path);
+      else assertPrivate(path, "file");
+    }
+  };
+  assertPrivateTree(result.outputDir);
+  assertPrivate(result.zipPath, "archive");
 });
 
 function okEnvelope(response, metadata) {

@@ -8,6 +8,7 @@
  */
 import { createHash, createHmac } from "node:crypto";
 import {
+  chmodSync,
   createWriteStream,
   existsSync,
   lstatSync,
@@ -5037,7 +5038,8 @@ function buildUnifiedMatrix(findings: DuoFinding[]): string {
 
 export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
   const root = resolve(baseDir);
-  mkdirSync(root, { recursive: true });
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
   const rootReal = realpathSync(root);
   const destination = resolve(root, targetDir);
 
@@ -5050,11 +5052,12 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   const parent = dirname(destination);
-  mkdirSync(parent, { recursive: true });
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
   const parentReal = realpathSync(parent);
   if (relative(rootReal, parentReal).startsWith("..")) {
     throw new Error(`Refusing to write outside output root: ${destination}`);
   }
+  chmodSync(parent, 0o700);
   return destination;
 }
 
@@ -5083,16 +5086,24 @@ function ensureUniqueRelativePath(root: string, preferredName: string): string {
 /** Every JSON file the bundle writes goes through the snapshot walk first (rule 9 at every depth, with the cap). */
 async function writeJson(rootDir: string, relativePathname: string, value: unknown): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  await writeFile(destination, `${JSON.stringify(scrubSnapshotValue(value), null, 2)}\n`, "utf8");
+  await writeFile(destination, `${JSON.stringify(scrubSnapshotValue(value), null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(destination, 0o600);
 }
 
 async function writeText(rootDir: string, relativePathname: string, value: string): Promise<void> {
   const destination = resolveSecureOutputPath(rootDir, relativePathname);
-  await writeFile(destination, `${value.trimEnd()}\n`, "utf8");
+  await writeFile(destination, `${value.trimEnd()}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(destination, 0o600);
 }
 
 async function zipDirectory(sourceDir: string, zipPath: string): Promise<void> {
-  const output = createWriteStream(zipPath);
+  const output = createWriteStream(zipPath, { mode: 0o600 });
   const archive = new ZipArchive({ zlib: { level: 9 } });
 
   await new Promise<void>((resolveZip, rejectZip) => {
@@ -5102,6 +5113,7 @@ async function zipDirectory(sourceDir: string, zipPath: string): Promise<void> {
     archive.directory(sourceDir, false);
     archive.finalize().catch(rejectZip);
   });
+  await chmod(zipPath, 0o600);
 }
 
 async function countFiles(rootDir: string): Promise<number> {
@@ -5180,8 +5192,8 @@ export async function exportDuoAuditBundle(
   const timestamp = new Date().toISOString().replace(/[:]/g, "-");
   const folderRelative = ensureUniqueRelativePath(outputRoot, sanitizeSegment(`${config.apiHost}_${timestamp}`));
   const outputDir = resolveSecureOutputPath(outputRoot, folderRelative);
-  mkdirSync(outputDir, { recursive: true });
-  await chmod(outputDir, 0o755);
+  mkdirSync(outputDir, { recursive: true, mode: 0o700 });
+  await chmod(outputDir, 0o700);
 
   await writeText(outputDir, "QUICK_REFERENCE.md", buildQuickReference());
   await writeJson(outputDir, "config.json", {
