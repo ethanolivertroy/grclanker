@@ -44,6 +44,8 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { GCP_COMPLETENESS_SOURCES, GCP_SPEC } from "../dist/extensions/grc-tools/gcp.spec.js";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 
@@ -225,6 +227,15 @@ async function runAllAssessments(client, options = {}) {
 
 function statuses(assessments) {
   return Object.fromEntries(assessments.flatMap((assessment) => assessment.findings.map((item) => [item.id, item.status])));
+}
+
+function gcpFactsByCheck(captures) {
+  const facts = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, GCP_SPEC.identity.slug);
+    for (const [id, values] of capture.checks) facts.set(id, values);
+  }
+  return facts;
 }
 
 test("resolveGcpConfiguration prefers explicit args and accepts the GCP_ORG_ID alias", () => {
@@ -1123,6 +1134,38 @@ function surface(key, endpoint, perProject, match, dependents, id = key) {
   return { key, id, name: GCP_INVENTORIES[key].dataset, endpoint, perProject, match, dependents };
 }
 
+const GCP_SPEC_SURFACE_BY_INVENTORY = {
+  organization: "organization",
+  projects: "projects",
+  iamPolicies: "iam-policies",
+  publicBindings: "public-iam-bindings",
+  cryptoKeys: "kms",
+  serviceAccounts: "service-accounts",
+  serviceAccountKeys: "service-account-keys",
+  adminActivity: "admin-activity-entries",
+  dataAccess: "data-access-entries",
+  sinks: "log-sinks",
+  logBuckets: "log-buckets",
+  sccSources: "scc-sources",
+  sccFindings: "scc-findings",
+  effectiveOrgPolicy: "effective-org-policy",
+  computeProject: "compute-project",
+  instances: "compute-instances",
+  binaryAuthorization: "binary-authorization",
+  buckets: "storage-buckets",
+  disks: "compute-disks",
+  managedZones: "dns",
+  apiKeys: "api-keys",
+  accessPolicies: "access-policies",
+  servicePerimeters: "service-perimeters",
+  firewalls: "compute-firewalls",
+  subnetworks: "compute-subnetworks",
+  routers: "compute-routers",
+  sslPolicies: "compute-ssl-policies",
+  targetHttpsProxies: "compute-target-https-proxies",
+  backendServices: "compute-backend-services",
+};
+
 /**
  * Every inventory the five assessments read, the URL shape that identifies it,
  * whether it is read per project, and exactly which findings depend on it.
@@ -1164,6 +1207,26 @@ const INVENTORY_SURFACES = [
   surface("backendServices", "aggregated/backendServices", true, (r) => r.path.endsWith("/aggregated/backendServices"), ["GCP-NET-06"]),
 ];
 const PER_PROJECT_SURFACE_IDS = new Set(INVENTORY_SURFACES.filter((row) => row.perProject).map((row) => row.id));
+
+function assertGcpCompletenessMutation(row, mode, facts, scope) {
+  const surfaceId = GCP_SPEC_SURFACE_BY_INVENTORY[row.key];
+  for (const checkId of ALL_FINDING_IDS) {
+    const source = surfaceId
+      ? GCP_COMPLETENESS_SOURCES[checkId]?.find((entry) => entry.surfaceId === surfaceId)
+      : undefined;
+    assert.equal(
+      Boolean(source),
+      row.dependents.includes(checkId),
+      `${row.id}/${checkId}: runtime dependency and spec source agree`,
+    );
+    const expected = source?.falseWhen.includes(mode) ? false : true;
+    assert.equal(
+      facts.get(checkId)?.evidence_complete,
+      expected,
+      `${row.id}/${mode}/${scope}/${checkId}: completeness fact`,
+    );
+  }
+}
 
 /** The one evidence field that grows, rather than nulls, when a read fails: the list of unreadable inventories itself. */
 const ENGINE_EVIDENCE = new Set(["unreadable_inventories"]);
@@ -1757,11 +1820,16 @@ test("per-inventory sweep: exactly the dependent findings drop below pass when a
   const baseline = await sweepBaseline();
 
   const table = [];
+  let semanticAssertions = 0;
   for (const row of INVENTORY_SURFACES) {
     const expected = [...row.dependents].sort();
     for (const status of [403, 401, 500]) {
       const requests = [];
-      const full = await runAllAssessments(sweepClient(requests, row.match, status, "full"));
+      const fullCapture = await captureBatchDecisionFacts(() =>
+        runAllAssessments(sweepClient(requests, row.match, status, "full")));
+      const full = fullCapture.result;
+      assertGcpCompletenessMutation(row, status === 500 ? "error" : "denied", gcpFactsByCheck(fullCapture.captures), "full");
+      semanticAssertions += ALL_FINDING_IDS.length;
       const fullStatuses = statuses(full);
       const demoted = Object.entries(fullStatuses).filter(([, value]) => value !== "pass").map(([id]) => id).sort();
       assert.deepEqual(demoted, expected, `${row.name} unreadable (${status}, fully) must demote exactly ${expected.join(", ") || "nothing"}`);
@@ -1773,7 +1841,11 @@ test("per-inventory sweep: exactly the dependent findings drop below pass when a
 
       if (!row.perProject) continue;
       const partialRequests = [];
-      const partial = await runAllAssessments(sweepClient(partialRequests, row.match, status, "project"));
+      const partialCapture = await captureBatchDecisionFacts(() =>
+        runAllAssessments(sweepClient(partialRequests, row.match, status, "project")));
+      const partial = partialCapture.result;
+      assertGcpCompletenessMutation(row, status === 500 ? "error" : "denied", gcpFactsByCheck(partialCapture.captures), "partial-project");
+      semanticAssertions += ALL_FINDING_IDS.length;
       assertEveryRequestClassified(partialRequests, `${row.name} unreadable (${status}, ${SECOND_PROJECT} only)`);
       assert.deepEqual([...blockedSurfaces(partialRequests)], [], `${row.name} unreadable for one project blocks no other read`);
       const partialStatuses = statuses(partial);
@@ -1807,6 +1879,10 @@ test("per-inventory sweep: exactly the dependent findings drop below pass when a
     }
   }
   assert.equal(table.length, INVENTORY_SURFACES.length + INVENTORY_SURFACES.filter((row) => row.perProject).length);
+  assert.equal(
+    semanticAssertions,
+    (INVENTORY_SURFACES.length + INVENTORY_SURFACES.filter((row) => row.perProject).length) * 3 * ALL_FINDING_IDS.length,
+  );
 });
 
 const PROJECTS_ROW = INVENTORY_SURFACES.find((row) => row.key === "projects");

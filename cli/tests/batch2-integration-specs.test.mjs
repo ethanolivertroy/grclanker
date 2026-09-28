@@ -137,7 +137,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   }
   assert.equal(checksWithCompleteness, 156);
   assert.equal(completenessFields, 156);
-  assert.equal(sourceEntries, 317);
+  assert.equal(sourceEntries, 315);
 
   assert.deepEqual(check(AZURE_SPEC, "AZURE-MON-06").completeness.complete.sources, [
     { surfaceId: "diagnostic-settings", falseWhen: [] },
