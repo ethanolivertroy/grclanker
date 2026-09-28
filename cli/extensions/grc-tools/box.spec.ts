@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const BOX_SURFACES = [
   ["current-user", "/2.0/users/me"], ["enterprise-configuration", "/2.0/enterprise_configurations/{enterpriseId}"],
@@ -60,7 +61,7 @@ const decisions = [
   "return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy.",
   "return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists.",
   "return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none.",
-  "return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists.",
+  "return pass when at least one enabled information barrier has a visible segment, including a lower-bound segment listing that stopped after proving one; return warn when no visible segment is proved, barriers or required segment reads are unreadable, no barrier is enabled, or no barrier exists.",
   "return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption.",
   "return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum.",
   "return pass when the complete user inventory has no co-admin, warn when user evidence is partial, and manual when any co-admin exists because individual co-admin permissions are not exposed.",
@@ -73,16 +74,326 @@ const decisions = [
   "return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event.",
 ] as const;
 
+interface BoxExecutableDecision {
+  inputs: Readonly<Record<string, string>>;
+  constants?: Readonly<Record<string, PortableValue>>;
+  rules: readonly VerdictRule[];
+}
+
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const compare = (
+  op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte",
+  name: string,
+  entry: PortableValue,
+): VerdictCondition => ({ op, left: path(name), right: value(entry) });
+const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", name, entry);
+const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
+const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
+const gte = (name: string, entry: PortableValue): VerdictCondition => compare("gte", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
+  status,
+  condition,
+  ...(note ? { note } : {}),
+});
+const ordered = (branches: {
+  manual?: VerdictCondition;
+  fail?: VerdictCondition;
+  warn?: VerdictCondition;
+  pass?: VerdictCondition;
+}): readonly VerdictRule[] => [
+  ...(branches.manual ? [rule("manual", branches.manual)] : []),
+  ...(branches.fail ? [rule("fail", branches.fail)] : []),
+  ...(branches.warn ? [rule("warn", branches.warn)] : []),
+  ...(branches.pass ? [rule("pass", branches.pass)] : []),
+  rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
+];
+const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete collector state before evidence samples are capped.`]),
+);
+const manual = (): BoxExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
+
+const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> = {
+  "BOX-01": {
+    inputs: input("settings_readable", "setting_unused", "sso_required", "sso_testing"),
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("warn", eq("setting_unused", true)),
+      rule("fail", eq("sso_required", false)),
+      rule("warn", any(ne("sso_required", true), eq("sso_testing", true))),
+      rule("pass", all(eq("sso_required", true), ne("sso_testing", true))),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-02": {
+    inputs: input("settings_readable", "users_readable", "setting_unused", "mfa_required", "sso_required", "exempt_privileged_count", "inventory_gap"),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), ne("users_readable", true))),
+      rule("warn", eq("setting_unused", true)),
+      rule("fail", any(
+        all(eq("mfa_required", true), gt("exempt_privileged_count", 0)),
+        all(eq("mfa_required", false), ne("sso_required", true)),
+      )),
+      rule("warn", any(
+        ne("mfa_required", true),
+        eq("inventory_gap", true),
+      )),
+      rule("pass", all(eq("mfa_required", true), eq("exempt_privileged_count", 0), eq("inventory_gap", false))),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-03": {
+    inputs: input("settings_readable", "users_readable", "setting_unused", "mfa_required", "sso_required", "exempt_user_count", "inventory_gap"),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), ne("users_readable", true))),
+      rule("warn", eq("setting_unused", true)),
+      rule("fail", all(eq("mfa_required", false), ne("sso_required", true))),
+      rule("warn", any(
+        ne("mfa_required", true),
+        gt("exempt_user_count", 0),
+        eq("inventory_gap", true),
+      )),
+      rule("pass", all(eq("mfa_required", true), eq("exempt_user_count", 0), eq("inventory_gap", false))),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-04": {
+    inputs: input("settings_readable", "allowlist_readable", "setting_unused", "external_status", "allowlist_entry_count", "allowlist_truncated"),
+    rules: [
+      rule("manual", all(ne("settings_readable", true), any(ne("allowlist_readable", true), eq("allowlist_entry_count", 0)))),
+      rule("warn", eq("setting_unused", true)),
+      rule("fail", eq("external_status", "enable_external_collaboration")),
+      rule("warn", any(
+        ne("settings_readable", true),
+        ne("allowlist_readable", true),
+        all(eq("external_status", "limit_collaboration_to_allowlisted_domains"), eq("allowlist_entry_count", 0)),
+        all(
+          ne("external_status", "limit_collaboration_to_users_within_enterprise"),
+          ne("external_status", "limit_collaboration_to_allowlisted_domains"),
+        ),
+      )),
+      rule("pass", any(
+        eq("external_status", "limit_collaboration_to_users_within_enterprise"),
+        all(eq("external_status", "limit_collaboration_to_allowlisted_domains"), gt("allowlist_entry_count", 0)),
+      )),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-05": {
+    inputs: input("allowlist_readable", "config_readable", "exempt_targets_readable", "complete", "allowlist_entry_count", "public_domain_count", "stale_entry_count", "undated_entry_count", "exempt_target_count", "allowlist_required"),
+    rules: ordered({
+      manual: ne("allowlist_readable", true),
+      fail: gt("public_domain_count", 0),
+      warn: any(
+        ne("complete", true),
+        ne("config_readable", true),
+        ne("exempt_targets_readable", true),
+        all(eq("allowlist_entry_count", 0), eq("allowlist_required", true)),
+        gt("stale_entry_count", 0),
+        gt("undated_entry_count", 0),
+        gt("exempt_target_count", 0),
+      ),
+      pass: { op: "always" },
+    }),
+  },
+  "BOX-06": {
+    inputs: input("settings_readable", "setting_unused", "default_open", "default_restricted", "open_links_allowed"),
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("warn", eq("setting_unused", true)),
+      rule("fail", eq("default_open", true)),
+      rule("warn", any(ne("default_restricted", true), eq("open_links_allowed", true))),
+      rule("pass", all(eq("default_restricted", true), ne("open_links_allowed", true))),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-07": {
+    inputs: input("settings_readable", "setting_unused", "expiration_enabled", "public_expiration_enabled"),
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("warn", eq("setting_unused", true)),
+      rule("pass", eq("expiration_enabled", true)),
+      rule("warn", eq("public_expiration_enabled", true)),
+      rule("fail", eq("expiration_enabled", false)),
+      rule("warn", { op: "always" }),
+    ],
+  },
+  "BOX-08": manual(),
+  "BOX-09": {
+    inputs: input("settings_readable", "setting_unused", "watermarking_enabled"),
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("warn", eq("setting_unused", true)),
+      rule("pass", eq("watermarking_enabled", true)),
+      rule("fail", eq("watermarking_enabled", false)),
+      rule("warn", { op: "always" }),
+    ],
+  },
+  "BOX-10": {
+    inputs: input("readable", "complete", "pin_count"),
+    rules: ordered({
+      manual: any(ne("readable", true), gt("pin_count", 0), all(ne("complete", true), eq("pin_count", 0))),
+      warn: all(eq("complete", true), eq("pin_count", 0)),
+    }),
+  },
+  "BOX-11": {
+    inputs: input("readable", "classification_count"),
+    rules: ordered({
+      manual: ne("readable", true),
+      fail: eq("classification_count", 0),
+      pass: gt("classification_count", 0),
+    }),
+  },
+  "BOX-12": {
+    inputs: input("policies_readable", "assignments_readable", "complete", "active_policy_count", "assigned_policy_count"),
+    rules: ordered({
+      manual: ne("policies_readable", true),
+      fail: all(eq("complete", true), eq("active_policy_count", 0)),
+      warn: any(ne("complete", true), ne("assignments_readable", true), eq("assigned_policy_count", 0)),
+      pass: gt("assigned_policy_count", 0),
+    }),
+  },
+  "BOX-13": {
+    inputs: input("policies_readable", "assignments_readable", "complete", "active_policy_count", "assigned_policy_count"),
+    rules: ordered({
+      manual: ne("policies_readable", true),
+      warn: any(ne("complete", true), ne("assignments_readable", true), eq("assigned_policy_count", 0)),
+      pass: gt("assigned_policy_count", 0),
+    }),
+  },
+  "BOX-14": {
+    inputs: input("settings_readable", "shield_rule_count"),
+    rules: ordered({
+      manual: ne("settings_readable", true),
+      fail: eq("shield_rule_count", 0),
+      pass: gt("shield_rule_count", 0),
+    }),
+  },
+  "BOX-15": {
+    inputs: input("barriers_readable", "segments_readable", "complete", "barrier_count", "enabled_barrier_count", "enabled_with_segments_count"),
+    rules: [
+      rule("manual", ne("barriers_readable", true)),
+      rule("warn", ne("segments_readable", true)),
+      rule("pass", gt("enabled_with_segments_count", 0)),
+      rule("warn", { op: "always" }),
+    ],
+  },
+  "BOX-16": {
+    inputs: input("events_readable", "event_count"),
+    rules: ordered({
+      manual: ne("events_readable", true),
+      warn: eq("event_count", 0),
+      pass: gt("event_count", 0),
+    }),
+  },
+  "BOX-17": {
+    inputs: input("users_readable", "complete", "privileged_user_count", "max_admins"),
+    rules: ordered({
+      manual: ne("users_readable", true),
+      warn: any(ne("complete", true), { op: "gt", left: path("privileged_user_count"), right: path("max_admins") }),
+      pass: { op: "lte", left: path("privileged_user_count"), right: path("max_admins") },
+    }),
+  },
+  "BOX-18": {
+    inputs: input("users_readable", "complete", "coadmin_count"),
+    rules: ordered({
+      manual: any(ne("users_readable", true), gt("coadmin_count", 0)),
+      warn: ne("complete", true),
+      pass: eq("coadmin_count", 0),
+    }),
+  },
+  "BOX-19": manual(),
+  "BOX-20": {
+    inputs: input("terms_readable", "managed_term_count", "enabled_managed_term_count"),
+    rules: ordered({
+      manual: ne("terms_readable", true),
+      fail: eq("enabled_managed_term_count", 0),
+      pass: gt("enabled_managed_term_count", 0),
+    }),
+  },
+  "BOX-21": {
+    inputs: input("settings_readable", "setting_unused", "minimum_length", "required_minimum_length", "weak_password_prevention", "complexity_rule_count"),
+    constants: { absolute_minimum_length: 8 },
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("warn", eq("setting_unused", true)),
+      rule("warn", { op: "not", condition: { op: "defined", operand: path("minimum_length") } }),
+      rule("pass", all(
+        { op: "gte", left: path("minimum_length"), right: path("required_minimum_length") },
+        eq("weak_password_prevention", true),
+        gte("complexity_rule_count", 2),
+      )),
+      rule("warn", any(
+        { op: "not", condition: { op: "defined", operand: path("minimum_length") } },
+        all(gte("minimum_length", 8), any(
+          { op: "lt", left: path("minimum_length"), right: path("required_minimum_length") },
+          ne("weak_password_prevention", true),
+          { op: "lt", left: path("complexity_rule_count"), right: value(2) },
+        )),
+      )),
+      rule("fail", lt("minimum_length", 8)),
+      rule("warn", any(
+        ne("weak_password_prevention", true),
+        { op: "lt", left: path("complexity_rule_count"), right: value(2) },
+      )),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-22": {
+    inputs: input("settings_readable", "setting_unused", "session_duration_present", "session_duration_parsed", "session_hours", "custom_session_enabled", "custom_session_parsed", "custom_session_hours", "max_session_hours"),
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("warn", any(eq("setting_unused", true), ne("session_duration_present", true), ne("session_duration_parsed", true))),
+      rule("fail", { op: "gt", left: path("session_hours"), right: path("max_session_hours") }),
+      rule("pass", ne("custom_session_enabled", true)),
+      rule("warn", ne("custom_session_parsed", true)),
+      rule("pass", { op: "lte", left: path("custom_session_hours"), right: path("max_session_hours") }),
+      rule("fail", { op: "gt", left: path("custom_session_hours"), right: path("max_session_hours") }),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-23": manual(),
+  "BOX-24": {
+    inputs: input("users_readable", "events_readable", "complete", "active_user_count", "inactive_user_count", "inactive_ratio"),
+    constants: { failure_ratio: 0.25 },
+    rules: [
+      rule("manual", any(ne("users_readable", true), ne("events_readable", true))),
+      rule("warn", any(ne("complete", true), eq("active_user_count", 0))),
+      rule("pass", eq("inactive_user_count", 0)),
+      rule("fail", gt("inactive_ratio", 0.25)),
+      rule("warn", gt("inactive_user_count", 0)),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "BOX-25": {
+    inputs: input("shield_readable", "events_readable", "events_complete", "anomaly_rule_count", "anomaly_event_count", "access_event_count"),
+    rules: [
+      rule("manual", all(ne("shield_readable", true), ne("events_readable", true))),
+      rule("warn", any(ne("shield_readable", true), ne("events_readable", true))),
+      rule("pass", any(gt("anomaly_rule_count", 0), gt("anomaly_event_count", 0))),
+      rule("warn", any(gt("access_event_count", 0), ne("events_complete", true))),
+      rule("fail", { op: "always" }),
+    ],
+  },
+};
+
 const checks: BatchCheckDefinition[] = controls.map((title, index) => {
   const control = index + 1;
+  const id = `BOX-${String(control).padStart(2, "0")}`;
+  const executable = BOX_EXECUTABLE_DECISIONS[id];
   return {
-    id: `BOX-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title,
     severity: [1, 2].includes(control) ? "critical" : [3, 4, 6, 14, 16, 17, 21, 25].includes(control) ? "high" : "medium",
     owner: ownerFor(control),
     surfaces: BOX_CHECK_SURFACES[control],
     evidenceFields: [...BOX_CHECK_SURFACES[control], "complete_source_counts"],
+    decisionInputs: executable.inputs,
+    decisionConstants: executable.constants,
+    decisionRules: executable.rules,
     decision: decisions[index],
   };
 });
