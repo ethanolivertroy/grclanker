@@ -179,7 +179,7 @@ export function checkSite({ distDir = 'dist', hubs = HUB_LINKED_DOCS } = {}) {
         continue;
       }
       if (!pages.has(resolved)) continue;
-      if (resolved !== key) {
+      if (nav && resolved !== key) {
         if (!inbound.has(resolved)) inbound.set(resolved, new Set());
         inbound.get(resolved).add(key);
       }
@@ -192,7 +192,7 @@ export function checkSite({ distDir = 'dist', hubs = HUB_LINKED_DOCS } = {}) {
   const sidebar = new Set();
   const sidebarNav = readFileSync(join(distDir, 'docs', 'index.html'), 'utf8')
     .match(/<nav class="docs-sidebar-nav"[\s\S]*?<\/nav>/)?.[0];
-  for (const { ref } of linksFrom(parseTags(sidebarNav ?? ''))) {
+  for (const { ref } of linksFrom(parseTags(sidebarNav ?? '')).filter(({ nav }) => nav)) {
     sidebar.add(resolveTarget(new URL(ref, ORIGIN).pathname, files));
   }
   if (sidebar.size === 0) problems.push(`${join(distDir, 'docs', 'index.html')}: no docs sidebar links found`);

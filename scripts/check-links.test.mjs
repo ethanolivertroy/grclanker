@@ -185,6 +185,28 @@ test('only same-site paths are internal and only http(s) is external', () => {
   assert.match(problems[2], /\/also:missing \(no built file\)/);
 });
 
+test('only <a href> and <area href> count as sidebar and hub backlinks', () => {
+  const embedOnly = problemsFor({
+    'docs/hub/index.html': `${sidebar}
+      <img src="/docs/hub/detail/"><script src="/docs/hub/detail/"></script>
+      <img srcset="/docs/hub/detail/ 1x"><video poster="/docs/hub/detail/"></video>
+      <link rel="prefetch" href="/docs/hub/detail/">`,
+  });
+  assert.equal(embedOnly.length, 1);
+  assert.match(embedOnly[0], /docs\/hub\/detail\/index\.html: not linked from its hub page/);
+
+  const areaLink = problemsFor({
+    'docs/hub/index.html': `${sidebar}<map name="m"><area href="/docs/hub/detail/" alt="Detail"></map>`,
+  });
+  assert.deepEqual(areaLink, []);
+
+  const imageInNav = problemsFor({
+    'docs/index.html': `<nav class="docs-sidebar-nav"><a href="/docs">Overview</a><a href="/docs/hub">Hub</a><img src="/docs/guide/"></nav>`,
+  });
+  assert.equal(imageInNav.length, 1);
+  assert.match(imageInNav[0], /docs\/guide\/index\.html: not in the docs sidebar/);
+});
+
 test('docs pages must be in the sidebar or linked from their hub', () => {
   const orphan = problemsFor({ 'docs/orphan/index.html': sidebar });
   assert.equal(orphan.length, 1);
