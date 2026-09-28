@@ -20,7 +20,7 @@ The GCP integration implements the `gcp-sec-inspector` spec as native grclanker 
 | Variable | Purpose |
 |----------|---------|
 | `GCP_ORGANIZATION_ID` (alias `GCP_ORG_ID`) | Organization to inventory. Projects are enumerated through Cloud Asset Inventory under this organization. |
-| `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, or `GCLOUD_PROJECT` | Single-project fallback when no organization is configured, or a focus project for effective org policy reads. When none is set, the `project_id` of a service account key file is used. |
+| `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, or `GCLOUD_PROJECT` | Single-project fallback when no organization is configured, or a focus project for effective org policy reads. When none is set, the `project_id` of the credential file the chain below loads is used, but only if that file is a service account key; an access token (argument or environment) means no file is loaded, so set a project variable or `organization_id` in that case. |
 
 Every tool also accepts `organization_id` and `project_id` arguments that take precedence over the environment.
 
