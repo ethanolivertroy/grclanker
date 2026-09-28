@@ -36,6 +36,8 @@ import {
   scrubSnapshotValue,
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { AZURE_COMPLETENESS_SOURCES, AZURE_SPEC } from "../dist/extensions/grc-tools/azure.spec.js";
 import {
   CANARY,
   CANARY_URL,
@@ -1212,6 +1214,26 @@ test("assessAzureSubscriptionGuardrails flags RBAC and missing contacts", async 
   assert.equal(statuses["AZURE-SUB-03"], "fail");
   assert.equal(statuses["AZURE-SUB-04"], "warn");
   assert.equal(statuses["AZURE-SUB-05"], "fail");
+});
+
+test("AZURE-SUB-04 network-watcher truncation matches its executable completeness contract", async () => {
+  const source = AZURE_COMPLETENESS_SOURCES["AZURE-SUB-04"].find((entry) => entry.surfaceId === "network-watchers");
+  assert.deepEqual(source?.falseWhen, ["truncated"]);
+  const client = clientWith({
+    ...compliantClient(),
+    async listNetworkWatchers() {
+      return {
+        items: [{ id: WATCHER_ID, name: "NetworkWatcher_eastus", location: "eastus" }],
+        truncated: true,
+        seen: 1,
+        total: 2,
+      };
+    },
+  });
+  const { result, captures } = await captureBatchDecisionFacts(() => assessAzureSubscriptionGuardrails(client));
+  const facts = captures.find((capture) => capture.integration === AZURE_SPEC.identity.slug)?.checks.get("AZURE-SUB-04");
+  assert.equal(facts?.complete, false);
+  assert.equal(result.findings.find((item) => item.id === "AZURE-SUB-04")?.status, "warn");
 });
 
 test("assessAzureDataProtection and assessAzureNetworkAndPolicy detect misconfigurations", async () => {

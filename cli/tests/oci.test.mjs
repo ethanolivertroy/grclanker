@@ -41,6 +41,8 @@ import {
   scopedStatus,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/oci.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { OCI_COMPLETENESS_SOURCES, OCI_SPEC } from "../dist/extensions/grc-tools/oci.spec.js";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -396,6 +398,15 @@ async function runAllAssessments(client, options = {}) {
   ];
 }
 
+function ociFactsByCheck(captures) {
+  const facts = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, OCI_SPEC.identity.slug);
+    for (const [id, values] of capture.checks) facts.set(id, values);
+  }
+  return facts;
+}
+
 test("resolveOciConfiguration prefers explicit arguments over environment and config", () => {
   const resolved = resolveOciConfiguration(
     {
@@ -731,6 +742,48 @@ test("self-check fixture (c): partial inventories never pass and report seen ver
     assert.match(inventory.status, /^partial: .*denied or unreadable in 1 compartment\(s\): prod/, `${id}: ${inventory.status}`);
     assert.deepEqual(inventory.denied_compartments, ["prod"]);
   }
+});
+
+test("OCI prerequisite and nested-read failures match declared primitive completeness without changing parent verdicts", async () => {
+  const cases = [
+    {
+      surface: "identity-compartments",
+      ids: ["OCI-IAM-04", "OCI-LOG-05", "OCI-GRD-01", "OCI-GRD-02", "OCI-GRD-03", "OCI-GRD-04", "OCI-GRD-05", "OCI-GRD-06", "OCI-CMP-01", "OCI-CMP-02", "OCI-CMP-03"],
+      mutate(client) { client.listCompartments = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+    {
+      surface: "identity-availability-domains",
+      ids: ["OCI-CMP-03"],
+      mutate(client) { client.listAvailabilityDomains = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+    {
+      surface: "object-storage-namespace",
+      ids: ["OCI-GRD-06"],
+      mutate(client) { client.getObjectStorageNamespace = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+    {
+      surface: "network-security-group-rules",
+      ids: ["OCI-GRD-02"],
+      mutate(client) { client.listNetworkSecurityGroupRules = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+  ];
+  let replays = 0;
+  for (const fixture of cases) {
+    const client = compliantClient();
+    fixture.mutate(client);
+    const { result, captures } = await captureBatchDecisionFacts(() => runAllAssessments(client));
+    const facts = ociFactsByCheck(captures);
+    const findings = result.flatMap((assessment) => assessment.findings);
+    for (const id of fixture.ids) {
+      const source = OCI_COMPLETENESS_SOURCES[id].find((entry) => entry.surfaceId === fixture.surface);
+      assert.ok(source, `${id}: ${fixture.surface} is declared`);
+      assert.deepEqual(source.falseWhen, [], `${id}: prerequisite failure does not lower completeness`);
+      assert.equal(facts.get(id)?.evidence_complete, true, `${id}: primitive remains true`);
+      assert.notEqual(byId(findings, id).status, "pass", `${id}: failed prerequisite cannot pass`);
+      replays += 1;
+    }
+  }
+  assert.equal(replays, 14);
 });
 
 test("compartment cap withholds pass and records truncation", async () => {
