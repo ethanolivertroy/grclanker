@@ -477,8 +477,10 @@ const searchData = searchEnabled
         var url = el.getAttribute('data-raw-url');
         if (!url) return;
         navigator.clipboard.writeText(url);
+        copyToast.textContent = 'URL copied to clipboard';
         copyToast.classList.add('show');
         setTimeout(function() { copyToast.classList.remove('show'); }, 1500);
+        setTimeout(function() { if (!copyToast.classList.contains('show')) copyToast.textContent = ''; }, 1800);
       }
 
       searchInput.addEventListener('input', function() { renderResults(searchSite(this.value)); });
@@ -513,9 +515,6 @@ const searchData = searchEnabled
             mobileNavToggle.setAttribute('aria-expanded', 'false');
             mobileNavToggle.focus();
           }
-          if (e.key === 'Tab') {
-            trapFocus(e, mobileNavPanel);
-          }
         });
       }
 
@@ -531,7 +530,7 @@ const searchData = searchEnabled
         if (searchOpen) {
           if (e.key==='ArrowDown') { e.preventDefault(); selectedIndex = Math.min(selectedIndex+1, results.length-1); updateActive(); return; }
           if (e.key==='ArrowUp') { e.preventDefault(); selectedIndex = Math.max(selectedIndex-1, 0); updateActive(); return; }
-          if (e.key==='Enter') { e.preventDefault(); var els = searchResults.querySelectorAll('.search-result'); if (els[selectedIndex]) { closeSearch(); window.location.href = els[selectedIndex].getAttribute('href'); } return; }
+          if (e.key==='Enter') { if (e.target !== searchInput) return; e.preventDefault(); var els = searchResults.querySelectorAll('.search-result'); if (els[selectedIndex]) { closeSearch(); window.location.href = els[selectedIndex].getAttribute('href'); } return; }
           return;
         }
         if (helpOpen) { if (e.key==='?') { closeHelp(); e.preventDefault(); } return; }

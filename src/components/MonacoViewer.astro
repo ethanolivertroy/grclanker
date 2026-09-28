@@ -10,9 +10,9 @@ const { content } = Astro.props;
 <div class="editor-toolbar">
   <div class="toolbar-actions">
     <button id="tb-copy" class="toolbar-btn" title="Copy markdown">COPY</button>
-    <button id="tb-wrap" class="toolbar-btn active" title="Toggle word wrap">WRAP</button>
+    <button id="tb-wrap" class="toolbar-btn active" title="Toggle word wrap" aria-pressed="true">WRAP</button>
     <button id="tb-load" class="toolbar-btn active" title="Load enhanced editor">EDITOR</button>
-    <button id="tb-map" class="toolbar-btn" title="Toggle minimap" disabled>MAP</button>
+    <button id="tb-map" class="toolbar-btn" title="Toggle minimap" aria-pressed="false" disabled>MAP</button>
   </div>
 </div>
 
@@ -36,7 +36,7 @@ const { content } = Astro.props;
 <div id="monaco-container" style="display:none;"></div>
 
 <!-- Fallback / default viewer -->
-<pre id="monaco-fallback-pre" class="fallback-pre fallback-pre-wrap" aria-label="Raw markdown">{content}</pre>
+<pre id="monaco-fallback-pre" class="fallback-pre fallback-pre-wrap" aria-label="Raw markdown" tabindex="0">{content}</pre>
 
 <script>
 (() => {
@@ -83,6 +83,7 @@ const { content } = Astro.props;
   wrapBtn.addEventListener('click', () => {
     wrapOn = !wrapOn;
     wrapBtn.classList.toggle('active', wrapOn);
+    wrapBtn.setAttribute('aria-pressed', String(wrapOn));
     syncFallbackWrap();
     if (controller) controller.setWrap(wrapOn);
   });
@@ -91,6 +92,7 @@ const { content } = Astro.props;
     if (!controller) return;
     mapOn = !mapOn;
     mapBtn.classList.toggle('active', mapOn);
+    mapBtn.setAttribute('aria-pressed', String(mapOn));
     controller.setMap(mapOn);
   });
 

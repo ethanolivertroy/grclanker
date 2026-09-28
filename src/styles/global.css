@@ -1964,12 +1964,15 @@ details[open] > .agent-group-toggle::before {
   max-width: 32rem;
   z-index: 101;
   opacity: 0;
-  transition: opacity 0.15s ease, transform 0.15s ease;
+  visibility: hidden;
+  transition: opacity 0.15s ease, transform 0.15s ease, visibility 0s linear 0.15s;
   pointer-events: none;
 }
 .overlay-modal.open {
   opacity: 1;
+  visibility: visible;
   transform: translateX(-50%) translateY(0);
+  transition-delay: 0s;
   pointer-events: auto;
 }
 
