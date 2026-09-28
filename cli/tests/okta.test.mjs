@@ -37,6 +37,12 @@ import {
 } from "../dist/extensions/grc-tools/okta.js";
 import { OKTA_SPEC } from "../dist/extensions/grc-tools/okta.spec.js";
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -3920,4 +3926,48 @@ test("class 10: a single object carrying a documented member is kept whatever el
   const absent = await collectOktaMonitoringData({ ...createSampleClient(), async getThreatInsight() { return null; } });
   assert.equal(absent.threatInsight.data, null);
   assert.equal(absent.threatInsight.notCollected, undefined, "a 404 (null) is an absent feature, not a shape failure");
+});
+
+test("byte differential fixtures: Okta assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const representative = await runAllAssessments(createSampleClient(), createSampleConfig());
+  writeByteDifferentialFixture("okta", "representative", representative);
+
+  const denied = await runAllAssessments(createAll403Client(), createSampleConfig());
+  writeByteDifferentialFixture("okta", "denied", denied);
+
+  const missingNull = await runAllAssessments(createAllEmptyClient(), createSampleConfig());
+  writeByteDifferentialFixture("okta", "missing-null", missingNull);
+
+  const partial = await runAllAssessments(createPartialInventoryClient(), createSampleConfig());
+  writeByteDifferentialFixture("okta", "partial", partial);
+
+  const compliant = await runAllAssessments(
+    createSampleClient(),
+    createSampleConfig({ authMode: "PrivateKey", token: undefined, clientId: "service-app" }),
+  );
+  writeByteDifferentialFixture("okta", "compliant", compliant);
+
+  const boundaryBase = createSampleClient();
+  const boundary = await runAllAssessments({
+    ...boundaryBase,
+    async listPolicies(type) {
+      if (type !== "PASSWORD") return boundaryBase.listPolicies(type);
+      const policies = await boundaryBase.listPolicies(type);
+      return policies.map((policy) => ({
+        ...policy,
+        settings: {
+          ...policy.settings,
+          password: {
+            ...policy.settings.password,
+            complexity: { ...policy.settings.password.complexity, minLength: 13 },
+          },
+        },
+      }));
+    },
+  }, createSampleConfig());
+  writeByteDifferentialFixture("okta", "boundary", boundary);
+
+  const exportRoot = prepareByteDifferentialExportRoot("okta");
+  const exported = await exportOktaAuditBundle(createSampleClient(), createSampleConfig(), exportRoot);
+  writeByteDifferentialFixture("okta", "export", snapshotExportBundle(exported));
 });

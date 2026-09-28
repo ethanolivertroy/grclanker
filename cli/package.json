@@ -34,6 +34,7 @@
     "build:bundle": "node scripts/build-native-bundle.mjs",
     "prepack": "npm run build",
     "test:cli": "npm run build && node --test \"tests/*.test.mjs\"",
+    "test:batch-byte-differential": "node scripts/batch-byte-differential.mjs",
     "test:agent-sdk:validate": "npm run build && node scripts/agent-sdk-validate-smoke.mjs",
     "test:ansible:live": "npm run build && node scripts/ansible-live-smoke.mjs",
     "test:aws:live": "npm run build && node scripts/aws-live-smoke.mjs",

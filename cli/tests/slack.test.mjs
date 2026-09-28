@@ -9,6 +9,12 @@ import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import { SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
 import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
   SLACK_DOCUMENTED_ERROR_CODES,
   SLACK_EXTERNAL_SHARING_AUDIT_ACTIONS,
   SLACK_FILE_UPLOAD_VERDICTS,
@@ -2092,4 +2098,56 @@ test("vendor-code vocabulary: a 32-hex credential returned as the error value re
     if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
     else process.env.SLACK_CONFIG_FILE = previous;
   }
+});
+
+test("byte differential fixtures: Slack assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const representative = await runAll(makeClient((request) => {
+    if (request.pathname === "/api/team.preferences.list") {
+      return { ...compliantFixture(request), disable_file_uploads: "type:admin" };
+    }
+    return compliantFixture(request);
+  }));
+  writeByteDifferentialFixture("slack", "representative", representative);
+
+  const denied = await runAll(makeClient((request) => (
+    request.pathname === "/api/auth.test" ? { ok: true, team_id: "T1" } : deniedFixture()
+  )));
+  writeByteDifferentialFixture("slack", "denied", denied);
+
+  const missingNull = await runAll(makeClient(emptyFixture));
+  writeByteDifferentialFixture("slack", "missing-null", missingNull);
+
+  const partial = await runAll(
+    makeClient(partialFixture),
+    { userLimit: 3, workspaceLimit: 1, appLimit: 1 },
+  );
+  writeByteDifferentialFixture("slack", "partial", partial);
+
+  const compliant = await runAll(makeClient(compliantFixture));
+  writeByteDifferentialFixture("slack", "compliant", compliant);
+
+  const boundary = await runAll(makeClient((request) => {
+    if (request.pathname === "/api/admin.users.session.getSettings") {
+      const userIds = (request.params.get("user_ids") ?? "").split(",").filter(Boolean);
+      return {
+        ok: true,
+        session_settings: userIds.map((userId) => ({
+          user_id: userId,
+          desktop_app_browser_quit: true,
+          duration: 24 * 60 * 60,
+        })),
+        no_settings_applied: [],
+      };
+    }
+    return compliantFixture(request);
+  }), { maxSessionHours: 24 });
+  writeByteDifferentialFixture("slack", "boundary", boundary);
+
+  const config = resolveSlackConfiguration(
+    { token: "xoxp-test", scim_token: "scim-test", org_id: "E1" },
+    EMPTY_ENV,
+  );
+  const exportRoot = prepareByteDifferentialExportRoot("slack");
+  const exported = await exportSlackAuditBundle(makeClient(compliantFixture), config, exportRoot);
+  writeByteDifferentialFixture("slack", "export", snapshotExportBundle(exported));
 });
