@@ -109,6 +109,7 @@ const rows: readonly Batch3CheckRow[] = [
     decisionInputs: {
       qualys_c10_host_and_detection_reads_succeeded: "Boolean true only when a non-empty host inventory and the VM detection listing returned parseable status, severity, and first-found fields.",
       qualys_c10_host_and_detection_lists_complete: "Boolean true only when host and detection VM XML continuation chains exhausted before item and page caps.",
+      qualys_c10_detection_list_complete: "Boolean true only when the VM detection XML continuation chain exhausted before item and page caps; host-list truncation does not change this fact.",
       qualys_c10_sla_scoped_detection_count: "Non-negative complete count of open normalized severity 3, 4, or 5 detections after fixed, closed, and informational records are excluded.",
       qualys_c10_dated_detection_count: "Non-negative count of SLA-scoped detections carrying a parseable FIRST_FOUND_DATETIME.",
       qualys_c10_on_sla_detection_count: "Non-negative count of dated detections whose first-found age is at most the configured 90-day medium, 30-day high, or 15-day critical SLA.",
@@ -116,8 +117,9 @@ const rows: readonly Batch3CheckRow[] = [
     },
     decisionRules: [
       batch2Rule("manual", batch2Ne("qualys_c10_host_and_detection_reads_succeeded", true)),
-      batch2Rule("manual", batch2All(batch2Eq("qualys_c10_sla_scoped_detection_count", 0), batch2Ne("qualys_c10_host_and_detection_lists_complete", true))),
+      batch2Rule("manual", batch2All(batch2Eq("qualys_c10_sla_scoped_detection_count", 0), batch2Ne("qualys_c10_detection_list_complete", true))),
       batch2Rule("pass", batch2All(batch2Eq("qualys_c10_sla_scoped_detection_count", 0), batch2Eq("qualys_c10_host_and_detection_lists_complete", true))),
+      batch2Rule("warn", batch2Eq("qualys_c10_sla_scoped_detection_count", 0)),
       batch2Rule("warn", batch2Eq("qualys_c10_dated_detection_count", 0)),
       batch2Rule("fail", { op: "ratio", numerator: batch2Path("qualys_c10_on_sla_detection_count"), denominator: batch2Path("qualys_c10_dated_detection_count"), comparator: "lt", threshold: batch2Path("fail_below_sla_percent"), scale: 100 }),
       batch2Rule("warn", batch2Any(

@@ -3696,6 +3696,7 @@ export async function assessQualysVulnerabilityManagement(
       : {
           qualys_c10_host_and_detection_reads_succeeded: true,
           qualys_c10_host_and_detection_lists_complete: detectionsFullyRead && !hosts.truncated,
+          qualys_c10_detection_list_complete: detectionsFullyRead,
           qualys_c10_sla_scoped_detection_count: slaScoped.length,
           qualys_c10_dated_detection_count: slaDated.length,
           qualys_c10_on_sla_detection_count: Math.max(0, slaDated.length - slaBreaches.length),

@@ -91,7 +91,7 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
       }
     }
   }
-  assert.equal(inputs, 522);
+  assert.equal(inputs, 523);
 });
 
 test("batch 3 completeness names exact datasets and all six collection failure modes", () => {

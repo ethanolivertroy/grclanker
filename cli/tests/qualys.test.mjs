@@ -2262,6 +2262,13 @@ test("assessQualysVulnerabilityManagement: empty fixture never passes, and zero 
   assert.equal(findingById(cleanHosts, "QUALYS-C11").status, "pass");
   assert.equal(findingById(cleanHosts, "QUALYS-C17").status, "manual");
 
+  const cleanDetectionsWithPartialHosts = await assessQualysVulnerabilityManagement(createFakeClient({
+    ...healthyFixtures,
+    listDetections: async () => [],
+    listHosts: async () => truncated(await healthyFixtures.listHosts(), "host cap reached"),
+  }));
+  assert.equal(findingById(cleanDetectionsWithPartialHosts, "QUALYS-C10").status, "warn");
+
   const cleanTruncated = await assessQualysVulnerabilityManagement(createFakeClient({
     ...healthyFixtures,
     listDetections: async () => truncated([], "page cap 25 reached with a WARNING/URL continuation not followed"),
