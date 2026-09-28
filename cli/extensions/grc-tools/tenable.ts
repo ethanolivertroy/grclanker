@@ -3009,7 +3009,9 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const jobs = value("external_export_jobs_in_window") ?? 0;
       const days = count("external_export_days");
       if (jobs === 0) return {};
-      const complete = evidence.vuln_export_jobs_listed !== null && evidence.asset_export_jobs_listed !== null;
+      const complete = evidence.vuln_export_jobs_listed !== null
+        && evidence.asset_export_jobs_listed !== null
+        && evidence.caller_is_administrator === true;
       return fact(jobs, 0, days < 2 || !complete ? 1 : 0, complete);
     }
     case "TENABLE-20": {
@@ -4784,7 +4786,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       asset_export_jobs_listed: countOrNull(data.assetExportJobs),
       excluded_own_exports: [...ownUuids],
       excluded_own_shaped_jobs: ownShaped.map((job) => asString(job.uuid)).slice(0, 50),
-    }));
+    }, "", { caller_is_administrator: callerIsAdministrator }));
   }
 
   const errors = [
