@@ -33,7 +33,7 @@ const batch = [
   [ZENDESK_SPEC, ZENDESK_RUNTIME_BEHAVIOR],
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
-const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK)-/.test(check.id);
+const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM)-/.test(check.id);
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -331,6 +331,43 @@ test("Slack executable rules ignore legacy status and preserve boundaries, prece
     without_mfa_count: 0,
     unknown_mfa_count: 0,
   }), "warn", "the complete 26-user collector state, not a 25-item rendering sample, prevents pass");
+});
+
+test("Zoom executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+  const legacyStatus = "pass";
+  const meetingFacts = { available: true, compliant: true, enforced: true };
+  assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-MTG-01", meetingFacts), "pass");
+  assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-MTG-01", {
+    ...meetingFacts,
+    compliant: false,
+    enforced: false,
+  }), "fail", "mutating the meeting setting changes the verdict while the legacy status is held constant");
+  assert.equal(legacyStatus, "pass");
+  assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-ID-04", {
+    available: true,
+    complete: true,
+    admin_count: 5,
+    max_admins: 5,
+  }), "pass");
+  assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-ID-04", {
+    available: true,
+    complete: true,
+    admin_count: 6,
+    max_admins: 5,
+  }), "warn", "administrator concentration changes immediately above the configured maximum");
+  assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-ID-03", {
+    readable: true,
+    complete: false,
+    count: 26,
+    bad_count: 1,
+  }), "fail", "a proven unverified domain precedes partial evidence");
+  assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-ID-01", {
+    readable: true,
+    complete: false,
+    count: 26,
+    bad_count: 0,
+    unknown_count: 0,
+  }), "warn", "the complete 26-user collector state, not a 25-item evidence sample, prevents pass");
 });
 
 test("runtime behavior statements are explicit and generator-visible", () => {
