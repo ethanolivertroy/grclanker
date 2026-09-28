@@ -74,6 +74,7 @@ import type { mountMonacoViewer } from '../lib/monaco-viewer';
     } catch {
       return;
     }
+    (window as Window & { __announce?: (message: string) => void }).__announce?.('Spec markdown copied to clipboard');
     copyBtn.textContent = 'COPIED';
     copyBtn.classList.add('copied');
     setTimeout(() => {

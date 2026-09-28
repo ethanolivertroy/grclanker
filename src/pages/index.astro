@@ -375,6 +375,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
         if (!command) return;
 
         navigator.clipboard.writeText(command).then(() => {
+          window.__announce && window.__announce('Install command copied to clipboard');
           copyIcon.classList.add('hidden');
           checkIcon.classList.remove('hidden');
           setTimeout(() => {
