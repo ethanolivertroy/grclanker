@@ -492,6 +492,45 @@ portableContractTest("MFA and SSO population primitives count every active user,
   assert.doesNotMatch(ssoDefinition, /administrators with SSO disabled/);
 });
 
+portableContractTest("SLACK-APP-06 coverage completeness follows all three auth.test identity-gap variants", async () => {
+  const variants = [
+    ["HTTP 500", () => jsonResponse({ ok: false, error: "server_error" }, 500)],
+    ["ok:false", () => ({ ok: false, error: "missing_scope" })],
+    ["missing team_id", (request) => {
+      const response = compliantFixture(request);
+      const { team_id: _teamId, ...withoutTeamId } = response;
+      return withoutTeamId;
+    }],
+  ];
+  for (const [label, authResponse] of variants) {
+    const { result, facts } = await captureSlackFacts("SLACK-APP-06", () =>
+      assessSlackIntegrations(makeClient((request) =>
+        request.pathname === "/api/auth.test" ? authResponse(request) : compliantFixture(request))));
+    assert.equal(facts.coverage_complete, false, label);
+    const finding = byId(result, "SLACK-APP-06");
+    assert.equal(finding.status, "warn", label);
+    assert.match(finding.summary, /workspace the preference applies to could not be identified/, label);
+  }
+  const contract = SLACK_SPEC.checks.find((check) => check.id === "SLACK-APP-06").completeness.coverage_complete;
+  assert.deepEqual(contract.sources.map((source) => source.surfaceId), ["workspaces", "auth-test"]);
+  assert.deepEqual(
+    contract.sources.find((source) => source.surfaceId === "auth-test").falseWhen,
+    ["error", "denied", "not-collected", "missing-required-field"],
+  );
+});
+
+portableContractTest("SLACK-ADMIN-08 roster completeness includes a truncated workspace list", async () => {
+  const { result, facts } = await captureSlackFacts("SLACK-ADMIN-08", () =>
+    assessSlackAdminAccess(makeClient(partialFixture)));
+  assert.equal(facts.roster_complete, false);
+  const finding = byId(result, "SLACK-ADMIN-08");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /incomplete admin roster/);
+  const contract = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ADMIN-08").completeness.roster_complete;
+  assert.deepEqual(contract.sources.map((source) => source.surfaceId), ["admin-users", "workspaces", "workspace-admins"]);
+  assert.ok(contract.sources.find((source) => source.surfaceId === "workspaces").falseWhen.includes("truncated"));
+});
+
 test("verdict rules: failing evidence, undated entries, and stale audit logs are graded correctly", async () => {
   const failing = makeClient((request) => {
     const method = request.pathname.replace(/^\/api\//, "");
