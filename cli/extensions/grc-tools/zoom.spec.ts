@@ -456,7 +456,10 @@ export const ZOOM_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Honor Retry-After up to 30 seconds and retry three times with bounded backoff.",
   },
   runtimeBehavior: ZOOM_RUNTIME_BEHAVIOR,
-  knownGaps: ["User OAuth, per-user settings drift, deeper Zoom Phone policy, and usage analytics are deferred."],
+  knownGaps: [
+    "User OAuth, per-user settings drift, deeper Zoom Phone policy, and usage analytics are deferred.",
+    "ZOOM-COLLAB-01 legacy finding construction does not demote a non-empty trusted-domain result when that listing is truncated, while the executable metadata requires complete evidence for Pass. The collector cannot currently produce this combination, but a synthetic truncated result can make the strict metadata/runtime assertion throw; a separate runtime fix must choose and apply one behavior.",
+  ],
   sensitiveFields: ["client_secret", "access_token", "authorization", "cookie", "join_url", "start_url"],
   credentialFormats: ["Zoom OAuth bearer tokens", "OAuth client secrets", "meeting start and join URLs"],
   output: buildBatchOutputContract({

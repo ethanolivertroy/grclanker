@@ -383,7 +383,10 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-AUTH-009": {
-    inputs: input("readable", "complete", "classic_engine", "authenticator_count", "federal_tenant", "okta_verify_active", "fips_required", "restricted_count"),
+    inputs: {
+      ...input("readable", "complete", "classic_engine", "authenticator_count", "federal_tenant", "okta_verify_active", "fips_required", "restricted_count"),
+      restricted_count: "Non-negative cardinality of ACTIVE authenticators whose key is `phone_number`, `security_question`, or `okta_email`, excluding email authenticators whose normalized `settings.allowedFor` value is `recovery` or `none`.",
+    },
     rules: ordered({
       manual: any(unavailable, eq("classic_engine", true)),
       fail: any(
@@ -534,7 +537,10 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-MON-003": {
-    inputs: input("readable", "configuration_present", "mode"),
+    inputs: {
+      ...input("readable", "configuration_present", "mode"),
+      mode: "Raw Okta ThreatInsight action mode selected in this order from the configuration object: top-level `action`, top-level `mode`, then `settings.action`; the string `unknown` is used only when none is present.",
+    },
     rules: ordered({
       manual: any(unavailable, eq("configuration_present", false)),
       fail: all(ne("mode", "block"), ne("mode", "audit"), ne("mode", "log_only")),
@@ -568,7 +574,10 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-MON-007": {
-    inputs: input("readable", "complete", "token_count", "ssws_auth", "expired_count", "unrestricted_count", "missing_expiry_count", "long_window_count"),
+    inputs: {
+      ...input("readable", "complete", "token_count", "ssws_auth", "expired_count", "unrestricted_count", "missing_expiry_count", "long_window_count"),
+      unrestricted_count: "Non-negative cardinality of API tokens whose normalized uppercase `network.connection` value is not `ZONE`; an absent value defaults to `ANYWHERE` and is counted.",
+    },
     constants: { maximum_window_days: 30 },
     rules: ordered({
       manual: any(unavailable, all(eq("token_count", 0), eq("ssws_auth", true))),
@@ -706,8 +715,9 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
   runtimeBehavior: OKTA_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Lifecycle workflow and broader trust-center evidence remain manual or deferred.",
-    "OKTA-ADMIN-004 has a collector-unreachable mismatched-ID state in which zero of N identified privileged users receive factor results. Main emits Pass for 32 observed variants, Partial for 3 variants, and Manual for 2 variants; this branch preserves the Manual variants but its strict metadata/runtime assertion throws for the 32 Pass and 3 Partial variants. A separate runtime fix must define one stable non-pass outcome and matching prose without disguising the current inconsistency.",
+    "OKTA-ADMIN-004 has a collector-unreachable mismatched-ID state in which zero of N identified privileged users receive factor results. Across 36 deduplicated measured variants, main emits Pass for 31, Partial for 3, and Manual for 2; this branch preserves the 2 Manual variants but its strict metadata/runtime assertion throws for the other 34. A separate runtime fix must define one stable non-pass outcome and matching prose without disguising the current inconsistency.",
     "OKTA-INTEG-004 can emit Pass when a readable contextual policy rule exists even if the network-zone read is denied. Network-zone denial does not make its `complete` fact false; this main-compatible limitation requires a separate runtime change if zone evidence is to gate Pass.",
+    "OKTA-AUTH-001 and OKTA-AUTH-009 can retain Pass when the organization-factor read is denied because their runtime readability gate is owned by the authenticator inventory and their completeness fact considers truncation, not organization-factor read errors or denials. A separate runtime change is required if organization-factor readability should gate Pass.",
   ],
   sensitiveFields: ["apiToken", "clientAssertion", "privateKey", "credentials", "authorization", "cookie"],
   credentialFormats: ["SSWS tokens", "OAuth bearer tokens", "private keys", "signed JWT assertions"],

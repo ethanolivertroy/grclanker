@@ -17,7 +17,7 @@ const SLACK_SURFACES = [
   ["channels", "POST", "/api/admin.conversations.search"], ["channel-preferences", "POST", "/api/admin.conversations.getConversationPrefs"],
   ["channel-retention", "POST", "/api/admin.conversations.getCustomRetention"], ["emoji", "GET", "/api/admin.emoji.list"],
   ["analytics-export", "GET", "/api/admin.analytics.getFile"], ["team-preferences", "POST", "/api/team.preferences.list"],
-  ["scim-users", "GET", "/scim/v1/Users"], ["audit-logs", "GET", "/audit/v1/logs"], ["audit-schemas", "GET", "/audit/v1/schemas"],
+  ["scim-users", "GET", "/scim/v2/Users"], ["audit-logs", "GET", "/audit/v1/logs"], ["audit-schemas", "GET", "/audit/v1/schemas"],
 ].map(([id, method, path]) => ({
   id,
   method: method as "GET" | "POST",
@@ -248,7 +248,10 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   },
   "SLACK-ID-03": inventory("scim", { empty: "fail" }),
   "SLACK-ID-04": {
-    inputs: input("users_readable", "scim_readable", "complete", "scim_user_count", "mismatch_count"),
+    inputs: {
+      ...input("users_readable", "scim_readable", "complete", "scim_user_count", "mismatch_count"),
+      mismatch_count: "Non-negative cardinality of SCIM user records whose `active` field is not false and whose primary email equals the email of a deactivated Slack user.",
+    },
     rules: ordered(any(ne("users_readable", true), ne("scim_readable", true)), gt("mismatch_count", 0), any(ne("complete", true), eq("scim_user_count", 0)), gt("scim_user_count", 0)),
   },
   "SLACK-ID-05": {
@@ -269,12 +272,18 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   },
   "SLACK-ADMIN-04": manual(),
   "SLACK-ADMIN-05": {
-    inputs: input("teams_readable", "teams_complete", "workspace_count", "open_count", "unknown_count"),
+    inputs: {
+      ...input("teams_readable", "teams_complete", "workspace_count", "open_count", "unknown_count"),
+      open_count: "Non-negative cardinality of Slack Grid workspaces whose normalized `discoverability` value from admin.teams.list equals `open`.",
+    },
     rules: ordered(any(ne("teams_readable", true), eq("workspace_count", 0)), gt("open_count", 0), any(gt("unknown_count", 0), ne("teams_complete", true)), gt("workspace_count", 0)),
   },
   "SLACK-ADMIN-06": manual(),
   "SLACK-ADMIN-07": {
-    inputs: input("teams_readable", "teams_complete", "domain_count", "unrestricted_count", "settings_error_count"),
+    inputs: {
+      ...input("teams_readable", "teams_complete", "domain_count", "unrestricted_count", "settings_error_count"),
+      unrestricted_count: "Non-negative cardinality of readable admin.teams.settings.info responses whose trimmed `team.email_domain` value is an empty string.",
+    },
     rules: ordered(any(ne("teams_readable", true), eq("domain_count", 0)), gt("unrestricted_count", 0), any(gt("settings_error_count", 0), ne("teams_complete", true)), gt("domain_count", 0)),
   },
   "SLACK-ADMIN-08": {
@@ -285,7 +294,10 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   "SLACK-APP-01": inventory("approved"),
   "SLACK-APP-02": inventory("restricted"),
   "SLACK-APP-03": {
-    inputs: input("approved_readable", "approved_complete", "approved_count", "flagged_count"),
+    inputs: {
+      ...input("approved_readable", "approved_complete", "approved_count", "flagged_count"),
+      flagged_count: "Non-negative cardinality of distinct approved-app names for which the app is internal, is outside the Slack Marketplace, or has at least one scope whose `is_sensitive` field is true.",
+    },
     rules: ordered(ne("approved_readable", true), undefined, any(eq("approved_count", 0), gt("flagged_count", 0), ne("approved_complete", true)), all(gt("approved_count", 0), eq("flagged_count", 0))),
   },
   "SLACK-APP-04": inventory("barrier"),
@@ -318,7 +330,11 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
     ],
   },
   "SLACK-CHAN-02": {
-    inputs: input("channels_readable", "channel_count", "announcement_channel_count", "preference_count", "complete", "unrestricted_count", "unknown_count"),
+    inputs: {
+      ...input("channels_readable", "channel_count", "announcement_channel_count", "preference_count", "complete", "unrestricted_count", "unknown_count"),
+      preference_count: "Non-negative cardinality of announcement-channel records with a successful admin.conversations.getConversationPrefs response.",
+      unrestricted_count: "Non-negative cardinality of announcement-channel preference records whose posting-restriction classifier returns false.",
+    },
     rules: ordered(any(ne("channels_readable", true), eq("channel_count", 0), eq("announcement_channel_count", 0), eq("preference_count", 0)), gt("unrestricted_count", 0), any(gt("unknown_count", 0), ne("complete", true)), eq("unrestricted_count", 0)),
   },
   "SLACK-CHAN-03": {
