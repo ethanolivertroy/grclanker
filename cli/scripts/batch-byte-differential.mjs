@@ -116,7 +116,17 @@ function compareFixtureTrees() {
     const expected = readFileSync(join(mainFixtures, path));
     const actual = readFileSync(join(branchFixtures, path));
     if (!actual.equals(expected)) {
-      throw new Error(`byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes)`);
+      let offset = 0;
+      while (offset < expected.length && offset < actual.length && expected[offset] === actual[offset]) offset += 1;
+      const contextStart = Math.max(0, offset - 160);
+      const contextEnd = offset + 320;
+      const mainContext = expected.subarray(contextStart, contextEnd).toString("utf8");
+      const branchContext = actual.subarray(contextStart, contextEnd).toString("utf8");
+      throw new Error(
+        `byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset})`
+        + `\nmain context: ${JSON.stringify(mainContext)}`
+        + `\nbranch context: ${JSON.stringify(branchContext)}`,
+      );
     }
   }
   return expectedPaths;

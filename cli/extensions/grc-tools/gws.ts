@@ -3877,10 +3877,9 @@ export function assessGwsMonitoring(
   });
   recordGwsDecisionFacts("GWS-MON-005", {
     readable: !data.alerts.error,
-    complete: completeGwsDatasets(data.alerts),
+    complete: completeGwsDatasets(data.alerts) && alerts.unknownStatus === 0,
     alert_count: data.alerts.data.length,
     open_alert_count: alerts.open,
-    alert_without_known_state_count: alerts.unknownStatus,
   });
 
   const findings: GwsFinding[] = [];

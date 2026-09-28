@@ -1,4 +1,9 @@
-import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  deriveDecisionRules,
+  type BatchCheckDefinition,
+} from "./batch-spec-builder.js";
 import { ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
@@ -118,6 +123,7 @@ const cmp = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry:
 const eq = (name: string, entry: PortableValue) => cmp("eq", name, entry);
 const ne = (name: string, entry: PortableValue) => cmp("ne", name, entry);
 const gt = (name: string, entry: PortableValue) => cmp("gt", name, entry);
+const lte = (name: string, entry: PortableValue) => cmp("lte", name, entry);
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
@@ -135,23 +141,23 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
     ],
   },
   "ZD-02": {
-    inputs: input("team_readable", "team_count", "security_readable", "enforcement_present", "enforcement_enabled", "sso_enforced", "without_two_factor_count", "unknown_two_factor_count", "complete"),
+    inputs: input("team_readable", "team_count", "security_readable", "two_factor_enforce_present", "two_factor_enforce_value", "enforce_sso_value", "without_two_factor_count", "unknown_two_factor_count", "complete"),
     rules: [
       rule("manual", any(ne("team_readable", true), eq("team_count", 0))),
       rule("fail", all(gt("without_two_factor_count", 0), ne("security_readable", true))),
-      rule("manual", any(ne("security_readable", true), ne("enforcement_present", true))),
-      rule("manual", all(eq("enforcement_enabled", false), eq("sso_enforced", true))),
-      rule("fail", eq("enforcement_enabled", false)),
+      rule("manual", any(ne("security_readable", true), ne("two_factor_enforce_present", true))),
+      rule("manual", all(eq("two_factor_enforce_value", false), eq("enforce_sso_value", true))),
+      rule("fail", eq("two_factor_enforce_value", false)),
       rule("warn", any(gt("without_two_factor_count", 0), gt("unknown_two_factor_count", 0), ne("complete", true))),
       rule("pass", { op: "always" }),
     ],
   },
   "ZD-03": {
-    inputs: input("readable", "policy_present", "recommended", "custom", "high", "custom_gap_count"),
+    inputs: input("readable", "security_policy_name", "custom_gap_count"),
     rules: [
-      rule("manual", any(ne("readable", true), ne("policy_present", true))),
-      rule("pass", any(eq("recommended", true), all(eq("custom", true), eq("custom_gap_count", 0)))),
-      rule("warn", any(eq("custom", true), eq("high", true))),
+      rule("manual", any(ne("readable", true), { op: "not", condition: { op: "defined", operand: path("security_policy_name") } })),
+      rule("pass", any(eq("security_policy_name", "recommended"), all(eq("security_policy_name", "custom"), eq("custom_gap_count", 0)))),
+      rule("warn", any(eq("security_policy_name", "custom"), eq("security_policy_name", "high"))),
       rule("fail", { op: "always" }),
     ],
   },
@@ -165,11 +171,18 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
     ],
   },
   "ZD-05": {
-    inputs: input("readable", "timeout_present", "severe", "issue_count"),
+    inputs: input("readable", "agent_session_timeout", "mobile_app_access", "mobile_app_session_timeout", "threshold_minutes", "severe_threshold_minutes"),
     rules: [
-      rule("manual", any(ne("readable", true), ne("timeout_present", true))),
-      rule("fail", eq("severe", true)),
-      rule("warn", gt("issue_count", 0)),
+      rule("manual", any(ne("readable", true), { op: "not", condition: { op: "defined", operand: path("agent_session_timeout") } })),
+      rule("fail", any(lte("agent_session_timeout", 0), { op: "gt", left: path("agent_session_timeout"), right: path("severe_threshold_minutes") })),
+      rule("warn", any(
+        { op: "gt", left: path("agent_session_timeout"), right: path("threshold_minutes") },
+        all(
+          ne("mobile_app_access", false),
+          { op: "defined", operand: path("mobile_app_session_timeout") },
+          any(lte("mobile_app_session_timeout", 0), { op: "gt", left: path("mobile_app_session_timeout"), right: path("threshold_minutes") }),
+        ),
+      )),
       rule("pass", { op: "always" }),
     ],
   },
@@ -200,10 +213,10 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
     ],
   },
   "ZD-09": {
-    inputs: input("readable", "entry_count", "sample_cut_short"),
+    inputs: input("readable", "entry_count", "truncated", "sample_size"),
     rules: [
       rule("manual", any(ne("readable", true), eq("entry_count", 0))),
-      rule("warn", eq("sample_cut_short", true)),
+      rule("warn", all(eq("truncated", true), { op: "lt", left: path("entry_count"), right: path("sample_size") })),
       rule("pass", { op: "always" }),
     ],
   },
@@ -227,22 +240,32 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
     ],
   },
   "ZD-13": {
-    inputs: input("settings_readable", "token_access_disabled", "token_history_readable", "token_history_complete", "outstanding_token_count"),
+    inputs: input("settings_readable", "api_token_access", "token_history_readable", "token_history_complete", "outstanding_token_count"),
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("warn", all(eq("token_access_disabled", true), ne("token_history_complete", true))),
-      rule("pass", eq("token_access_disabled", true)),
+      rule("warn", all(eq("api_token_access", false), ne("token_history_complete", true))),
+      rule("pass", eq("api_token_access", false)),
       rule("manual", ne("token_history_readable", true)),
       rule("warn", eq("outstanding_token_count", 0)),
       rule("manual", { op: "always" }),
     ],
   },
   "ZD-14": {
-    inputs: input("clients_readable", "clients_complete", "client_count", "unscoped_count", "insecure_redirect_count", "tokens_readable", "tokens_complete", "token_count", "hygiene_warning_count"),
+    inputs: input("clients_readable", "clients_complete", "client_count", "unscoped_count", "insecure_redirect_count", "tokens_readable", "tokens_complete", "token_count", "public_client_count", "privileged_token_count", "non_expiring_token_count", "stale_token_count", "undated_token_count"),
     rules: [
       rule("manual", ne("clients_readable", true)),
       rule("fail", any(gt("unscoped_count", 0), gt("insecure_redirect_count", 0))),
-      rule("warn", any(ne("tokens_readable", true), ne("clients_complete", true), ne("tokens_complete", true), gt("hygiene_warning_count", 0), all(eq("client_count", 0), gt("token_count", 0)))),
+      rule("warn", any(
+        ne("tokens_readable", true),
+        ne("clients_complete", true),
+        ne("tokens_complete", true),
+        gt("public_client_count", 0),
+        gt("privileged_token_count", 0),
+        gt("non_expiring_token_count", 0),
+        gt("stale_token_count", 0),
+        gt("undated_token_count", 0),
+        all(eq("client_count", 0), gt("token_count", 0)),
+      )),
       rule("pass", { op: "always" }),
     ],
   },
@@ -289,11 +312,11 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
     ],
   },
   "ZD-21": {
-    inputs: input("security_readable", "fields_present", "enforce_sso", "zendesk_login", "sso_method_count", "strong_password_policy", "account_settings_complete"),
+    inputs: input("security_readable", "fields_present", "enforce_sso", "zendesk_login", "sso_method_count", "security_policy_name", "account_settings_complete"),
     rules: [
       rule("manual", any(ne("security_readable", true), ne("fields_present", true))),
       rule("warn", all(eq("enforce_sso", true), eq("sso_method_count", 0))),
-      rule("warn", all(eq("zendesk_login", true), ne("strong_password_policy", true))),
+      rule("warn", all(eq("zendesk_login", true), ne("security_policy_name", "recommended"), ne("security_policy_name", "high"))),
       rule("fail", all(eq("enforce_sso", false), eq("zendesk_login", false), eq("sso_method_count", 0))),
       rule("warn", ne("account_settings_complete", true)),
       rule("pass", { op: "always" }),
@@ -340,6 +363,8 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
 const checks: BatchCheckDefinition[] = titles.map((title, index) => {
   const control = index + 1;
   const id = `ZD-${String(control).padStart(2, "0")}`;
+  const decision = ZENDESK_EXECUTABLE_DECISIONS[id];
+  const executable = deriveDecisionRules(id, decision.rules);
   return {
     id,
     control,
@@ -348,8 +373,9 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
     owner: ownerFor(control),
     surfaces: ZENDESK_CHECK_SURFACES[control],
     evidenceFields: [...ZENDESK_CHECK_SURFACES[control], "complete_source_counts"],
-    decisionInputs: ZENDESK_EXECUTABLE_DECISIONS[id].inputs,
-    decisionRules: ZENDESK_EXECUTABLE_DECISIONS[id].rules,
+    decisionInputs: decision.inputs,
+    decisionRules: executable.rules,
+    derivedFactRules: executable.derivedFactRules,
     decision: decisions[index],
   };
 });

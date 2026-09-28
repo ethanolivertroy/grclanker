@@ -2307,7 +2307,10 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   const withoutRanges = profileView.resolved.filter((record) => loginIpRangeCount(record) === 0);
   recordSalesforceDecisionFacts(5, {
     settings_readable: settingsReadable,
-    profile_evidence_available: profileIssue === undefined,
+    profiles_readable: data.profiles.status === "ok",
+    profile_count: data.profiles.data.length,
+    admin_profile_count: data.profiles.data.filter(isAdminProfile).length,
+    profile_metadata_readable: data.profileMetadata.status === "ok",
     resolved_profile_count: profileView.resolved.length,
     profiles_with_ranges_count: withRanges.length,
     org_range_count: ranges.length,
@@ -2356,7 +2359,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   recordSalesforceDecisionFacts(18, {
     readable: data.myDomainSettings.status === "ok",
     has_my_domain: hasMyDomain,
-    enforcement_present: preventLegacyLogin !== undefined,
+    can_only_login_with_my_domain_url_present: preventLegacyLogin !== undefined,
     prevent_legacy_login: preventLegacyLogin,
     require_domain_for_api: requireDomainForApi,
   });
@@ -2382,11 +2385,13 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
     enable_clickjack_nonsetup_user: metadataBoolean(session.enableClickjackNonsetupUser),
     enable_clickjack_nonsetup_user_headerless: metadataBoolean(session.enableClickjackNonsetupUserHeaderless),
   };
-  const clickjackValues = Object.values(clickjackFlags);
   const clickjackDisabled = Object.entries(clickjackFlags).filter(([, value]) => value === false).map(([key]) => key);
   recordSalesforceDecisionFacts(19, {
     settings_readable: settingsReadable,
-    all_enabled: clickjackValues.every((value) => value === true),
+    setup_flag: clickjackFlags.enable_clickjack_setup,
+    nonsetup_sfdc_flag: clickjackFlags.enable_clickjack_nonsetup_sfdc,
+    nonsetup_user_flag: clickjackFlags.enable_clickjack_nonsetup_user,
+    nonsetup_user_headerless_flag: clickjackFlags.enable_clickjack_nonsetup_user_headerless,
     disabled_count: clickjackDisabled.length,
   });
   if (!settingsReadable) {
@@ -2512,6 +2517,14 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   const adminProfileIds = new Set(adminProfiles.map((profile) => asString(profile.Id) ?? ""));
   const admins = activeUsers.filter((user) => adminProfileIds.has(asString(user.ProfileId) ?? ""));
   const population = populationIssue(data, admins);
+  const populationDecisionFacts = {
+    users_readable: usersReadable,
+    profiles_readable: profilesReadable,
+    user_count: users.length,
+    profile_count: profiles.length,
+    admin_profile_count: adminProfiles.length,
+    admin_count: admins.length,
+  };
   // Counts derived from a dataset that was not read render null rather than the empty fallback's zero.
   const populationEvidence = {
     users_seen: whenOk(data.users.seen, data.users),
@@ -2566,16 +2579,16 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.seen} rows, ${capSignal}, so enrollment coverage is incomplete.`
     : "";
   recordSalesforceDecisionFacts(4, {
-    requirement_available: data.securitySettings.status === "ok" || mfaRisk !== undefined,
-    requirement_failed: mfaRequired === false || mfaRiskMeets === false,
-    requirement_met: mfaRequired === true || mfaRiskMeets === true,
-    enrollment_readable: data.twoFactorMethods.status === "ok",
-    population_sane: population === undefined,
+    security_settings_readable: data.securitySettings.status === "ok",
+    mfa_required: mfaRequired,
+    mfa_risk_present: mfaRisk !== undefined,
+    mfa_risk_type: mfaRisk ? asString(mfaRisk.RiskType) : undefined,
+    two_factor_methods_readable: data.twoFactorMethods.status === "ok",
+    ...populationDecisionFacts,
     active_standard_user_count: standardActiveUsers.length,
     unenrolled_count: unenrolled.length,
-    quarter_user_count: standardActiveUsers.length / 4,
     enrollment_complete: enrollmentComplete,
-    secondary_sources_complete: data.securitySettings.status === "ok" && data.healthCheckRisks.status === "ok",
+    health_check_risks_readable: data.healthCheckRisks.status === "ok",
   });
   if (data.securitySettings.status !== "ok" && !mfaRisk) {
     findings.push(finding(4, "manual", `MFA enforcement could not be verified because ${unreadableReason(data.securitySettings)} and Health Check exposed no MFA setting.`, mfaEvidence, mfaManual));
@@ -2617,7 +2630,10 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   });
   const unrestricted = hoursView.resolved.filter((record) => loginHoursView(record).bounded.length === 0);
   recordSalesforceDecisionFacts(6, {
-    profile_evidence_available: hoursIssue === undefined,
+    profiles_readable: profilesReadable,
+    profile_count: profiles.length,
+    admin_profile_count: adminProfiles.length,
+    profile_metadata_readable: data.profileMetadata.status === "ok",
     resolved_profile_count: hoursView.resolved.length,
     fully_restricted_count: restricted.length,
     partially_restricted_count: partiallyRestricted.length,
@@ -2658,9 +2674,9 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   const ratio = profiles.length > 0 ? apiProfiles.length / profiles.length : 0;
   const inputsComplete = !data.profiles.truncated && !data.users.truncated;
   recordSalesforceDecisionFacts(7, {
-    population_sane: population === undefined,
+    ...populationDecisionFacts,
     complete: inputsComplete,
-    api_profile_ratio: ratio,
+    api_profile_count: apiProfiles.length,
   });
   if (population) {
     findings.push(populationManual(7, apiManual));
@@ -2697,7 +2713,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
   const assignees = new Set(activeElevatedAssignments.map((assignment) => asString(assignment.AssigneeId) ?? ""));
   recordSalesforceDecisionFacts(9, {
     sets_readable: data.permissionSets.status === "ok",
-    population_sane: population === undefined,
+    ...populationDecisionFacts,
     set_count: permissionSets.length,
     elevated_set_count: elevated.length,
     assignments_readable: assignmentsReadable,
@@ -2741,9 +2757,8 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     return lastLogin !== undefined && daysBetween(adminNow, lastLogin) > staleDays;
   });
   recordSalesforceDecisionFacts(10, {
-    population_sane: population === undefined,
+    ...populationDecisionFacts,
     complete: !data.users.truncated && !data.profiles.truncated,
-    admin_count: admins.length,
     max_admins: maxAdmins,
     stale_admin_count: staleAdmins.length,
     undated_admin_count: adminsWithoutLogin.length,
@@ -2775,7 +2790,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     return profile !== undefined && (asBoolean(profile.PermissionsApiEnabled) === true || hasElevatedPermission(profile).length > 0);
   });
   recordSalesforceDecisionFacts(13, {
-    population_sane: population === undefined,
+    ...populationDecisionFacts,
     users_complete: !data.users.truncated,
     active_guest_count: activeGuests.length,
     risky_guest_count: riskyGuests.length,
@@ -2890,7 +2905,7 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
   const strict = values.filter((item) => item.value !== undefined && STRICT_OWD_VALUES.test(item.value));
   recordSalesforceDecisionFacts(12, {
     readable: data.organization.status === "ok" && organization !== undefined,
-    defaults_visible: missing.length < owdKeys.length,
+    default_field_count: owdKeys.length - missing.length,
     open_default_count: open.length,
   });
   if (data.organization.status !== "ok" || !organization) {
@@ -3072,9 +3087,8 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
   recordSalesforceDecisionFacts(11, {
     readable: data.connectedApplications.status === "ok",
     app_count: apps.length,
-    policy_visible: unknownPolicy.length < apps.length,
+    unknown_policy_count: unknownPolicy.length,
     open_app_count: openApps.length,
-    half_app_count: apps.length / 2,
   });
   if (data.connectedApplications.status !== "ok") {
     findings.push(manualForUnreadable(11, data.connectedApplications, appManual));
@@ -3122,8 +3136,11 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
     readable: data.loginHistory.status === "ok",
     login_count: logins.length,
     complete: data.loginHistory.status === "ok" && !data.loginHistory.truncated,
-    severe_anomaly: bruteForceIps.length > 0 || failureRatio > 0.25 || legacyTls.length > 0,
-    warning_anomaly: failureRatio > 0.1 || countries.length > 5 || undatedLogins.length > 0,
+    failed_count: failed.length,
+    brute_force_source_count: bruteForceIps.length,
+    legacy_tls_count: legacyTls.length,
+    country_count: countries.length,
+    undated_count: undatedLogins.length,
   });
   if (data.loginHistory.status !== "ok") {
     findings.push(manualForUnreadable(14, data.loginHistory, loginManual));

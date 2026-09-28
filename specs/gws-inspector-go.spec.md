@@ -261,11 +261,11 @@ These notes explain intent only. The ordered rule table is normative.
 
 | Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
 |---|---|---|---|---|---|---|---|---|
-| `GWS-ID-001` | high | `gws_assess_identity` | `directory-users` | `readable`, `complete`, `privileged_user_count`, `enforced_user_count`, `coverage` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent. | The required evidence for Privileged users enforce 2-step verification is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `GWS-ID-002` | high | `gws_assess_identity` | `directory-users` | `readable`, `complete`, `active_user_count`, `enforced_user_count`, `coverage` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent. | The required evidence for Broad 2-step verification coverage for active users is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `GWS-ID-003` | medium | `gws_assess_identity` | `directory-users` | `readable`, `complete`, `active_user_count`, `dormant_user_count`, `unknown_login_count`, `warning_dormant_maximum` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when dormant active users exceed the greater of two or five percent of active users, warn for a smaller non-zero dormant set, missing login dates, or partial evidence, and pass when complete evidence has neither. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when dormant active users exceed the greater of two or five percent of active users, warn for a smaller non-zero dormant set, missing login dates, or partial evidence, and pass when complete evidence has neither. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when dormant active users exceed the greater of two or five percent of active users, warn for a smaller non-zero dormant set, missing login dates, or partial evidence, and pass when complete evidence has neither. | The required evidence for Dormant active accounts stay limited is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `GWS-ID-004` | high | `gws_assess_identity` | `directory-users`, `login-activities` | `readable`, `complete`, `super_admin_count`, `unenforced_super_admin_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every super admin enforces 2-step verification, fail when any super admin does not, and demote pass to warn when directory or assignment evidence is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every super admin enforces 2-step verification, fail when any super admin does not, and demote pass to warn when directory or assignment evidence is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every super admin enforces 2-step verification, fail when any super admin does not, and demote pass to warn when directory or assignment evidence is partial. | The required evidence for Super admins stay strongly protected is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `GWS-ID-005` | high | `gws_assess_identity` | `two-step-policies` | `readable`, `complete`, `policy_count`, `enforcement_policy_count`, `enforced_policy_count`, `enrollment_disabled_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable. | The required evidence for 2-step verification is enforced by organization policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GWS-ID-001` | high | `gws_assess_identity` | `directory-users` | `readable`, `complete`, `privileged_user_count`, `two_step_required_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty privileged-user population, return pass when 100 percent enforce 2-step verification, warn from 80 percent through below 100 percent, and fail below 80 percent. | The required evidence for Privileged users enforce 2-step verification is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GWS-ID-002` | high | `gws_assess_identity` | `directory-users` | `readable`, `complete`, `active_user_count`, `two_step_required_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty active-user population, return pass when at least 98 percent enforce 2-step verification, warn from 85 percent through below 98 percent, and fail below 85 percent. | The required evidence for Broad 2-step verification coverage for active users is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GWS-ID-003` | medium | `gws_assess_identity` | `directory-users` | `readable`, `complete`, `active_user_count`, `dormant_user_count`, `unknown_login_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when dormant active users exceed the greater of two or five percent of active users, warn for a smaller non-zero dormant set, missing login dates, or partial evidence, and pass when complete evidence has neither. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when dormant active users exceed the greater of two or five percent of active users, warn for a smaller non-zero dormant set, missing login dates, or partial evidence, and pass when complete evidence has neither. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when dormant active users exceed the greater of two or five percent of active users, warn for a smaller non-zero dormant set, missing login dates, or partial evidence, and pass when complete evidence has neither. | The required evidence for Dormant active accounts stay limited is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GWS-ID-004` | high | `gws_assess_identity` | `directory-users`, `login-activities` | `readable`, `complete`, `super_admin_count`, `super_admin_without_two_step_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every super admin enforces 2-step verification, fail when any super admin does not, and demote pass to warn when directory or assignment evidence is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every super admin enforces 2-step verification, fail when any super admin does not, and demote pass to warn when directory or assignment evidence is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every super admin enforces 2-step verification, fail when any super admin does not, and demote pass to warn when directory or assignment evidence is partial. | The required evidence for Super admins stay strongly protected is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GWS-ID-005` | high | `gws_assess_identity` | `two-step-policies` | `readable`, `complete`, `policy_count`, `two_step_policy_count`, `effective_policy_count`, `policy_disallowing_enrollment_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every returned enforcement policy has a past enforcedFrom date and enrollment is allowed, warn when only some scopes satisfy that state, fail when none do, and manual when the policy token or enforcement setting is unavailable. | The required evidence for 2-step verification is enforced by organization policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `GWS-ADMIN-001` | high | `gws_assess_admin_access` | `directory-users`, `roles`, `role-assignments` | `readable`, `complete`, `super_admin_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete privileged inventory has at most four super admins, warn with five or six, and fail above six. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete privileged inventory has at most four super admins, warn with five or six, and fail above six. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete privileged inventory has at most four super admins, warn with five or six, and fail above six. | The required evidence for Super admin population stays constrained is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `GWS-ADMIN-002` | high | `gws_assess_admin_access` | `directory-users`, `roles`, `role-assignments` | `readable`, `complete`, `privileged_user_count`, `suspended_privileged_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any privileged user is suspended or archived and pass when none is, with partial evidence demoting pass to warn. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any privileged user is suspended or archived and pass when none is, with partial evidence demoting pass to warn. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any privileged user is suspended or archived and pass when none is, with partial evidence demoting pass to warn. | The required evidence for Suspended or archived privileged accounts are removed is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `GWS-ADMIN-003` | high | `gws_assess_admin_access` | `roles`, `role-assignments` | `readable`, `complete`, `delegated_admin_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one active delegated role assignment exists outside the Super Admin role, manual when none exists or role evidence is unavailable, and demote pass to warn when role evidence is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one active delegated role assignment exists outside the Super Admin role, manual when none exists or role evidence is unavailable, and demote pass to warn when role evidence is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one active delegated role assignment exists outside the Super Admin role, manual when none exists or role evidence is unavailable, and demote pass to warn when role evidence is partial. | The required evidence for Delegated roles reduce Super Admin dependence is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
@@ -279,7 +279,7 @@ These notes explain intent only. The ordered rule table is normative.
 | `GWS-MON-002` | high | `gws_assess_monitoring` | `alerts` | `readable`, `complete`, `event_count`, `suspicious_login_count` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty readable login-audit window, return fail above five suspicious-login signals, warn for one through five or partial evidence, and pass when complete evidence contains none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty readable login-audit window, return fail above five suspicious-login signals, warn for one through five or partial evidence, and pass when complete evidence contains none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty readable login-audit window, return fail above five suspicious-login signals, warn for one through five or partial evidence, and pass when complete evidence contains none. | The required evidence for Suspicious login backlog stays low is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `GWS-MON-003` | medium | `gws_assess_monitoring` | `admin-activities` | `readable`, `complete`, `event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the admin-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the admin-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the admin-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated. | The required evidence for Admin audit telemetry stays available is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `GWS-MON-004` | medium | `gws_assess_monitoring` | `token-activities` | `readable`, `complete`, `event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the token-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the token-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the token-audit lookback contains events, manual when the window is empty or unreadable, and demote pass to warn when the read is truncated. | The required evidence for Token audit telemetry stays available is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `GWS-MON-005` | medium | `gws_assess_monitoring` | `alerts` | `readable`, `complete`, `alert_count`, `open_alert_count`, `unknown_status_count` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty readable alert inventory, return fail above ten open alerts, warn for four through ten, unknown statuses, or partial evidence, and pass with at most three open alerts. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty readable alert inventory, return fail above ten open alerts, warn for four through ten, unknown statuses, or partial evidence, and pass with at most three open alerts. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty readable alert inventory, return fail above ten open alerts, warn for four through ten, unknown statuses, or partial evidence, and pass with at most three open alerts. | The required evidence for Open alert backlog is manageable is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GWS-MON-005` | medium | `gws_assess_monitoring` | `alerts` | `readable`, `complete`, `alert_count`, `open_alert_count` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty readable alert inventory, return fail above ten open alerts, warn for four through ten, unknown statuses, or partial evidence, and pass with at most three open alerts. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty readable alert inventory, return fail above ten open alerts, warn for four through ten, unknown statuses, or partial evidence, and pass with at most three open alerts. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty readable alert inventory, return fail above ten open alerts, warn for four through ten, unknown statuses, or partial evidence, and pass with at most three open alerts. | The required evidence for Open alert backlog is manageable is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
 ### Ordered decision rules
 
@@ -287,99 +287,185 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 
 | Finding | Order | Outcome | First-match condition | Explanatory note |
 |---|---|---|---|---|
-| `GWS-ID-001` | 1 | manual | any of (`readable` does not equal true; `privileged_user_count` equals 0) |  |
-| `GWS-ID-001` | 2 | fail | `coverage` is less than 0.8 |  |
-| `GWS-ID-001` | 3 | warn | any of (`complete` does not equal true; `coverage` is less than 1) |  |
-| `GWS-ID-001` | 4 | pass | `coverage` is at least 1 |  |
-| `GWS-ID-001` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ID-002` | 1 | manual | any of (`readable` does not equal true; `active_user_count` equals 0) |  |
-| `GWS-ID-002` | 2 | fail | `coverage` is less than 0.85 |  |
-| `GWS-ID-002` | 3 | warn | any of (`complete` does not equal true; `coverage` is less than 0.98) |  |
-| `GWS-ID-002` | 4 | pass | `coverage` is at least 0.98 |  |
-| `GWS-ID-002` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ID-003` | 1 | manual | any of (`readable` does not equal true; `active_user_count` equals 0) |  |
-| `GWS-ID-003` | 2 | fail | `dormant_user_count` is greater than `warning_dormant_maximum` |  |
-| `GWS-ID-003` | 3 | warn | any of (`complete` does not equal true; `dormant_user_count` is greater than 0; `unknown_login_count` is greater than 0) |  |
-| `GWS-ID-003` | 4 | pass | all of (`dormant_user_count` equals 0; `unknown_login_count` equals 0) |  |
-| `GWS-ID-003` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ID-004` | 1 | manual | any of (`readable` does not equal true; `super_admin_count` equals 0) |  |
-| `GWS-ID-004` | 2 | fail | `unenforced_super_admin_count` is greater than 0 |  |
-| `GWS-ID-004` | 3 | warn | `complete` does not equal true |  |
-| `GWS-ID-004` | 4 | pass | `unenforced_super_admin_count` equals 0 |  |
-| `GWS-ID-004` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ID-005` | 1 | manual | any of (`readable` does not equal true; `enforcement_policy_count` equals 0) |  |
-| `GWS-ID-005` | 2 | fail | `enforced_policy_count` equals 0 |  |
-| `GWS-ID-005` | 3 | warn | any of (`complete` does not equal true; `enforced_policy_count` is less than `enforcement_policy_count`; `enrollment_disabled_count` is greater than 0) |  |
-| `GWS-ID-005` | 4 | pass | all of (`enforced_policy_count` equals `enforcement_policy_count`; `enrollment_disabled_count` equals 0) |  |
-| `GWS-ID-005` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ADMIN-001` | 1 | manual | any of (`readable` does not equal true; `super_admin_count` equals 0) |  |
-| `GWS-ADMIN-001` | 2 | fail | `super_admin_count` is greater than 6 |  |
-| `GWS-ADMIN-001` | 3 | warn | any of (`complete` does not equal true; `super_admin_count` is greater than 4) |  |
-| `GWS-ADMIN-001` | 4 | pass | `super_admin_count` is at most 4 |  |
-| `GWS-ADMIN-001` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ADMIN-002` | 1 | manual | any of (`readable` does not equal true; `privileged_user_count` equals 0) |  |
-| `GWS-ADMIN-002` | 2 | fail | `suspended_privileged_count` is greater than 0 |  |
-| `GWS-ADMIN-002` | 3 | warn | `complete` does not equal true |  |
-| `GWS-ADMIN-002` | 4 | pass | `suspended_privileged_count` equals 0 |  |
-| `GWS-ADMIN-002` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ADMIN-003` | 1 | manual | any of (`readable` does not equal true; `delegated_admin_count` equals 0) |  |
-| `GWS-ADMIN-003` | 2 | warn | `complete` does not equal true |  |
-| `GWS-ADMIN-003` | 3 | pass | `delegated_admin_count` is greater than 0 |  |
-| `GWS-ADMIN-003` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ADMIN-004` | 1 | manual | any of (`readable` does not equal true; `event_count` equals 0) |  |
-| `GWS-ADMIN-004` | 2 | warn | `complete` does not equal true |  |
-| `GWS-ADMIN-004` | 3 | pass | `event_count` is greater than 0 |  |
-| `GWS-ADMIN-004` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-ADMIN-005` | 1 | manual | any of (`readable` does not equal true; `assignment_count` equals 0; `group_assignment_count` is greater than 0) |  |
-| `GWS-ADMIN-005` | 2 | warn | `complete` does not equal true |  |
-| `GWS-ADMIN-005` | 3 | pass | `group_assignment_count` equals 0 |  |
-| `GWS-ADMIN-005` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-INTEG-001` | 1 | manual | any of (`users_readable` does not equal true; `sampled_user_count` equals 0; `failed_read_count` equals `sampled_user_count`; `token_count` equals 0) |  |
-| `GWS-INTEG-001` | 2 | warn | any of (`complete` does not equal true; `failed_read_count` is greater than 0) |  |
-| `GWS-INTEG-001` | 3 | pass | `token_count` is greater than 0 |  |
-| `GWS-INTEG-001` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-INTEG-002` | 1 | manual | any of (`directory_readable` does not equal true; `privileged_user_count` equals 0; `token_count` equals 0; all of (`failed_read_count` is greater than 0; `privileged_token_count` equals 0)) |  |
-| `GWS-INTEG-002` | 2 | fail | `privileged_token_count` is greater than 3 |  |
-| `GWS-INTEG-002` | 3 | warn | any of (`complete` does not equal true; `privileged_token_count` is greater than 0) |  |
-| `GWS-INTEG-002` | 4 | pass | `privileged_token_count` equals 0 |  |
-| `GWS-INTEG-002` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-INTEG-003` | 1 | manual | any of (`users_readable` does not equal true; `token_count` equals 0) |  |
-| `GWS-INTEG-003` | 2 | fail | `high_risk_token_count` is greater than 5 |  |
-| `GWS-INTEG-003` | 3 | warn | any of (`complete` does not equal true; `high_risk_token_count` is greater than 0) |  |
-| `GWS-INTEG-003` | 4 | pass | `high_risk_token_count` equals 0 |  |
-| `GWS-INTEG-003` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-INTEG-004` | 1 | manual | any of (`readable` does not equal true; `event_count` equals 0) |  |
-| `GWS-INTEG-004` | 2 | warn | `complete` does not equal true |  |
-| `GWS-INTEG-004` | 3 | pass | `event_count` is greater than 0 |  |
-| `GWS-INTEG-004` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-MON-001` | 1 | manual | any of (`readable` does not equal true; `alert_count` equals 0) |  |
-| `GWS-MON-001` | 2 | warn | `complete` does not equal true |  |
-| `GWS-MON-001` | 3 | pass | `alert_count` is greater than 0 |  |
-| `GWS-MON-001` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-MON-002` | 1 | manual | any of (`readable` does not equal true; `event_count` equals 0) |  |
-| `GWS-MON-002` | 2 | fail | `suspicious_login_count` is greater than 5 |  |
-| `GWS-MON-002` | 3 | warn | any of (`complete` does not equal true; `suspicious_login_count` is greater than 0) |  |
-| `GWS-MON-002` | 4 | pass | `suspicious_login_count` equals 0 |  |
-| `GWS-MON-002` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-MON-003` | 1 | manual | any of (`readable` does not equal true; `event_count` equals 0) |  |
-| `GWS-MON-003` | 2 | warn | `complete` does not equal true |  |
-| `GWS-MON-003` | 3 | pass | `event_count` is greater than 0 |  |
-| `GWS-MON-003` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-MON-004` | 1 | manual | any of (`readable` does not equal true; `event_count` equals 0) |  |
-| `GWS-MON-004` | 2 | warn | `complete` does not equal true |  |
-| `GWS-MON-004` | 3 | pass | `event_count` is greater than 0 |  |
-| `GWS-MON-004` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `GWS-MON-005` | 1 | manual | any of (`readable` does not equal true; `alert_count` equals 0) |  |
-| `GWS-MON-005` | 2 | fail | `open_alert_count` is greater than 10 |  |
-| `GWS-MON-005` | 3 | warn | any of (`complete` does not equal true; `open_alert_count` is greater than 3; `unknown_status_count` is greater than 0) |  |
-| `GWS-MON-005` | 4 | pass | `open_alert_count` is at most 3 |  |
-| `GWS-MON-005` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
+| `GWS-ID-001` | 1 | manual | `gws_id_001_branch_01_matches` equals true |  |
+| `GWS-ID-001` | 2 | fail | `gws_id_001_branch_02_matches` equals true |  |
+| `GWS-ID-001` | 3 | warn | `gws_id_001_branch_03_matches` equals true |  |
+| `GWS-ID-001` | 4 | pass | `gws_id_001_branch_04_matches` equals true |  |
+| `GWS-ID-001` | 5 | manual | `gws_id_001_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ID-002` | 1 | manual | `gws_id_002_branch_01_matches` equals true |  |
+| `GWS-ID-002` | 2 | fail | `gws_id_002_branch_02_matches` equals true |  |
+| `GWS-ID-002` | 3 | warn | `gws_id_002_branch_03_matches` equals true |  |
+| `GWS-ID-002` | 4 | pass | `gws_id_002_branch_04_matches` equals true |  |
+| `GWS-ID-002` | 5 | manual | `gws_id_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ID-003` | 1 | manual | `gws_id_003_branch_01_matches` equals true |  |
+| `GWS-ID-003` | 2 | fail | `gws_id_003_branch_02_matches` equals true |  |
+| `GWS-ID-003` | 3 | warn | `gws_id_003_branch_03_matches` equals true |  |
+| `GWS-ID-003` | 4 | pass | `gws_id_003_branch_04_matches` equals true |  |
+| `GWS-ID-003` | 5 | manual | `gws_id_003_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ID-004` | 1 | manual | `gws_id_004_branch_01_matches` equals true |  |
+| `GWS-ID-004` | 2 | fail | `gws_id_004_branch_02_matches` equals true |  |
+| `GWS-ID-004` | 3 | warn | `gws_id_004_branch_03_matches` equals true |  |
+| `GWS-ID-004` | 4 | pass | `gws_id_004_branch_04_matches` equals true |  |
+| `GWS-ID-004` | 5 | manual | `gws_id_004_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ID-005` | 1 | manual | `gws_id_005_branch_01_matches` equals true |  |
+| `GWS-ID-005` | 2 | fail | `gws_id_005_branch_02_matches` equals true |  |
+| `GWS-ID-005` | 3 | warn | `gws_id_005_branch_03_matches` equals true |  |
+| `GWS-ID-005` | 4 | pass | `gws_id_005_branch_04_matches` equals true |  |
+| `GWS-ID-005` | 5 | manual | `gws_id_005_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ADMIN-001` | 1 | manual | `gws_admin_001_branch_01_matches` equals true |  |
+| `GWS-ADMIN-001` | 2 | fail | `gws_admin_001_branch_02_matches` equals true |  |
+| `GWS-ADMIN-001` | 3 | warn | `gws_admin_001_branch_03_matches` equals true |  |
+| `GWS-ADMIN-001` | 4 | pass | `gws_admin_001_branch_04_matches` equals true |  |
+| `GWS-ADMIN-001` | 5 | manual | `gws_admin_001_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ADMIN-002` | 1 | manual | `gws_admin_002_branch_01_matches` equals true |  |
+| `GWS-ADMIN-002` | 2 | fail | `gws_admin_002_branch_02_matches` equals true |  |
+| `GWS-ADMIN-002` | 3 | warn | `gws_admin_002_branch_03_matches` equals true |  |
+| `GWS-ADMIN-002` | 4 | pass | `gws_admin_002_branch_04_matches` equals true |  |
+| `GWS-ADMIN-002` | 5 | manual | `gws_admin_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ADMIN-003` | 1 | manual | `gws_admin_003_branch_01_matches` equals true |  |
+| `GWS-ADMIN-003` | 2 | warn | `gws_admin_003_branch_02_matches` equals true |  |
+| `GWS-ADMIN-003` | 3 | pass | `gws_admin_003_branch_03_matches` equals true |  |
+| `GWS-ADMIN-003` | 4 | manual | `gws_admin_003_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ADMIN-004` | 1 | manual | `gws_admin_004_branch_01_matches` equals true |  |
+| `GWS-ADMIN-004` | 2 | warn | `gws_admin_004_branch_02_matches` equals true |  |
+| `GWS-ADMIN-004` | 3 | pass | `gws_admin_004_branch_03_matches` equals true |  |
+| `GWS-ADMIN-004` | 4 | manual | `gws_admin_004_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-ADMIN-005` | 1 | manual | `gws_admin_005_branch_01_matches` equals true |  |
+| `GWS-ADMIN-005` | 2 | warn | `gws_admin_005_branch_02_matches` equals true |  |
+| `GWS-ADMIN-005` | 3 | pass | `gws_admin_005_branch_03_matches` equals true |  |
+| `GWS-ADMIN-005` | 4 | manual | `gws_admin_005_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-INTEG-001` | 1 | manual | `gws_integ_001_branch_01_matches` equals true |  |
+| `GWS-INTEG-001` | 2 | warn | `gws_integ_001_branch_02_matches` equals true |  |
+| `GWS-INTEG-001` | 3 | pass | `gws_integ_001_branch_03_matches` equals true |  |
+| `GWS-INTEG-001` | 4 | manual | `gws_integ_001_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-INTEG-002` | 1 | manual | `gws_integ_002_branch_01_matches` equals true |  |
+| `GWS-INTEG-002` | 2 | fail | `gws_integ_002_branch_02_matches` equals true |  |
+| `GWS-INTEG-002` | 3 | warn | `gws_integ_002_branch_03_matches` equals true |  |
+| `GWS-INTEG-002` | 4 | pass | `gws_integ_002_branch_04_matches` equals true |  |
+| `GWS-INTEG-002` | 5 | manual | `gws_integ_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-INTEG-003` | 1 | manual | `gws_integ_003_branch_01_matches` equals true |  |
+| `GWS-INTEG-003` | 2 | fail | `gws_integ_003_branch_02_matches` equals true |  |
+| `GWS-INTEG-003` | 3 | warn | `gws_integ_003_branch_03_matches` equals true |  |
+| `GWS-INTEG-003` | 4 | pass | `gws_integ_003_branch_04_matches` equals true |  |
+| `GWS-INTEG-003` | 5 | manual | `gws_integ_003_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-INTEG-004` | 1 | manual | `gws_integ_004_branch_01_matches` equals true |  |
+| `GWS-INTEG-004` | 2 | warn | `gws_integ_004_branch_02_matches` equals true |  |
+| `GWS-INTEG-004` | 3 | pass | `gws_integ_004_branch_03_matches` equals true |  |
+| `GWS-INTEG-004` | 4 | manual | `gws_integ_004_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-MON-001` | 1 | manual | `gws_mon_001_branch_01_matches` equals true |  |
+| `GWS-MON-001` | 2 | warn | `gws_mon_001_branch_02_matches` equals true |  |
+| `GWS-MON-001` | 3 | pass | `gws_mon_001_branch_03_matches` equals true |  |
+| `GWS-MON-001` | 4 | manual | `gws_mon_001_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-MON-002` | 1 | manual | `gws_mon_002_branch_01_matches` equals true |  |
+| `GWS-MON-002` | 2 | fail | `gws_mon_002_branch_02_matches` equals true |  |
+| `GWS-MON-002` | 3 | warn | `gws_mon_002_branch_03_matches` equals true |  |
+| `GWS-MON-002` | 4 | pass | `gws_mon_002_branch_04_matches` equals true |  |
+| `GWS-MON-002` | 5 | manual | `gws_mon_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-MON-003` | 1 | manual | `gws_mon_003_branch_01_matches` equals true |  |
+| `GWS-MON-003` | 2 | warn | `gws_mon_003_branch_02_matches` equals true |  |
+| `GWS-MON-003` | 3 | pass | `gws_mon_003_branch_03_matches` equals true |  |
+| `GWS-MON-003` | 4 | manual | `gws_mon_003_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-MON-004` | 1 | manual | `gws_mon_004_branch_01_matches` equals true |  |
+| `GWS-MON-004` | 2 | warn | `gws_mon_004_branch_02_matches` equals true |  |
+| `GWS-MON-004` | 3 | pass | `gws_mon_004_branch_03_matches` equals true |  |
+| `GWS-MON-004` | 4 | manual | `gws_mon_004_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GWS-MON-005` | 1 | manual | `gws_mon_005_branch_01_matches` equals true |  |
+| `GWS-MON-005` | 2 | fail | `gws_mon_005_branch_02_matches` equals true |  |
+| `GWS-MON-005` | 3 | warn | `gws_mon_005_branch_03_matches` equals true |  |
+| `GWS-MON-005` | 4 | pass | `gws_mon_005_branch_04_matches` equals true |  |
+| `GWS-MON-005` | 5 | manual | `gws_mon_005_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
 
 ### Derived decision facts
 
 | Finding | Input | Portable derivation |
 |---|---|---|
-| None |  |  |
+| `GWS-ID-001` | `gws_id_001_branch_01_matches` | GWS-ID-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `privileged_user_count` equals 0). |
+| `GWS-ID-001` | `gws_id_001_branch_02_matches` | GWS-ID-001 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `two_step_required_user_count` divided by `privileged_user_count` is less than 0.8; a missing, nonnumeric, or nonpositive denominator does not match. |
+| `GWS-ID-001` | `gws_id_001_branch_03_matches` | GWS-ID-001 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `two_step_required_user_count` divided by `privileged_user_count` is less than 1; a missing, nonnumeric, or nonpositive denominator does not match). |
+| `GWS-ID-001` | `gws_id_001_branch_04_matches` | GWS-ID-001 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `two_step_required_user_count` divided by `privileged_user_count` is at least 1; a missing, nonnumeric, or nonpositive denominator does not match. |
+| `GWS-ID-001` | `gws_id_001_branch_05_matches` | GWS-ID-001 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ID-002` | `gws_id_002_branch_01_matches` | GWS-ID-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `active_user_count` equals 0). |
+| `GWS-ID-002` | `gws_id_002_branch_02_matches` | GWS-ID-002 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `two_step_required_user_count` divided by `active_user_count` is less than 0.85; a missing, nonnumeric, or nonpositive denominator does not match. |
+| `GWS-ID-002` | `gws_id_002_branch_03_matches` | GWS-ID-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `two_step_required_user_count` divided by `active_user_count` is less than 0.98; a missing, nonnumeric, or nonpositive denominator does not match). |
+| `GWS-ID-002` | `gws_id_002_branch_04_matches` | GWS-ID-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `two_step_required_user_count` divided by `active_user_count` is at least 0.98; a missing, nonnumeric, or nonpositive denominator does not match. |
+| `GWS-ID-002` | `gws_id_002_branch_05_matches` | GWS-ID-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ID-003` | `gws_id_003_branch_01_matches` | GWS-ID-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `active_user_count` equals 0). |
+| `GWS-ID-003` | `gws_id_003_branch_02_matches` | GWS-ID-003 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`dormant_user_count` is greater than 2; `dormant_user_count` divided by `active_user_count` is greater than 0.05; a missing, nonnumeric, or nonpositive denominator does not match). |
+| `GWS-ID-003` | `gws_id_003_branch_03_matches` | GWS-ID-003 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `dormant_user_count` is greater than 0; `unknown_login_count` is greater than 0). |
+| `GWS-ID-003` | `gws_id_003_branch_04_matches` | GWS-ID-003 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`dormant_user_count` equals 0; `unknown_login_count` equals 0). |
+| `GWS-ID-003` | `gws_id_003_branch_05_matches` | GWS-ID-003 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ID-004` | `gws_id_004_branch_01_matches` | GWS-ID-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `super_admin_count` equals 0). |
+| `GWS-ID-004` | `gws_id_004_branch_02_matches` | GWS-ID-004 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `super_admin_without_two_step_count` is greater than 0. |
+| `GWS-ID-004` | `gws_id_004_branch_03_matches` | GWS-ID-004 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-ID-004` | `gws_id_004_branch_04_matches` | GWS-ID-004 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `super_admin_without_two_step_count` equals 0. |
+| `GWS-ID-004` | `gws_id_004_branch_05_matches` | GWS-ID-004 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ID-005` | `gws_id_005_branch_01_matches` | GWS-ID-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `two_step_policy_count` equals 0). |
+| `GWS-ID-005` | `gws_id_005_branch_02_matches` | GWS-ID-005 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `effective_policy_count` equals 0. |
+| `GWS-ID-005` | `gws_id_005_branch_03_matches` | GWS-ID-005 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `effective_policy_count` is less than `two_step_policy_count`; `policy_disallowing_enrollment_count` is greater than 0). |
+| `GWS-ID-005` | `gws_id_005_branch_04_matches` | GWS-ID-005 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`effective_policy_count` equals `two_step_policy_count`; `policy_disallowing_enrollment_count` equals 0). |
+| `GWS-ID-005` | `gws_id_005_branch_05_matches` | GWS-ID-005 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ADMIN-001` | `gws_admin_001_branch_01_matches` | GWS-ADMIN-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `super_admin_count` equals 0). |
+| `GWS-ADMIN-001` | `gws_admin_001_branch_02_matches` | GWS-ADMIN-001 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `super_admin_count` is greater than 6. |
+| `GWS-ADMIN-001` | `gws_admin_001_branch_03_matches` | GWS-ADMIN-001 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `super_admin_count` is greater than 4). |
+| `GWS-ADMIN-001` | `gws_admin_001_branch_04_matches` | GWS-ADMIN-001 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `super_admin_count` is at most 4. |
+| `GWS-ADMIN-001` | `gws_admin_001_branch_05_matches` | GWS-ADMIN-001 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ADMIN-002` | `gws_admin_002_branch_01_matches` | GWS-ADMIN-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `privileged_user_count` equals 0). |
+| `GWS-ADMIN-002` | `gws_admin_002_branch_02_matches` | GWS-ADMIN-002 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `suspended_privileged_count` is greater than 0. |
+| `GWS-ADMIN-002` | `gws_admin_002_branch_03_matches` | GWS-ADMIN-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-ADMIN-002` | `gws_admin_002_branch_04_matches` | GWS-ADMIN-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `suspended_privileged_count` equals 0. |
+| `GWS-ADMIN-002` | `gws_admin_002_branch_05_matches` | GWS-ADMIN-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ADMIN-003` | `gws_admin_003_branch_01_matches` | GWS-ADMIN-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `delegated_admin_count` equals 0). |
+| `GWS-ADMIN-003` | `gws_admin_003_branch_02_matches` | GWS-ADMIN-003 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-ADMIN-003` | `gws_admin_003_branch_03_matches` | GWS-ADMIN-003 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `delegated_admin_count` is greater than 0. |
+| `GWS-ADMIN-003` | `gws_admin_003_branch_04_matches` | GWS-ADMIN-003 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ADMIN-004` | `gws_admin_004_branch_01_matches` | GWS-ADMIN-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `event_count` equals 0). |
+| `GWS-ADMIN-004` | `gws_admin_004_branch_02_matches` | GWS-ADMIN-004 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-ADMIN-004` | `gws_admin_004_branch_03_matches` | GWS-ADMIN-004 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `event_count` is greater than 0. |
+| `GWS-ADMIN-004` | `gws_admin_004_branch_04_matches` | GWS-ADMIN-004 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-ADMIN-005` | `gws_admin_005_branch_01_matches` | GWS-ADMIN-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `assignment_count` equals 0; `group_assignment_count` is greater than 0). |
+| `GWS-ADMIN-005` | `gws_admin_005_branch_02_matches` | GWS-ADMIN-005 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-ADMIN-005` | `gws_admin_005_branch_03_matches` | GWS-ADMIN-005 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `group_assignment_count` equals 0. |
+| `GWS-ADMIN-005` | `gws_admin_005_branch_04_matches` | GWS-ADMIN-005 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-INTEG-001` | `gws_integ_001_branch_01_matches` | GWS-INTEG-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`users_readable` does not equal true; `sampled_user_count` equals 0; `failed_read_count` equals `sampled_user_count`; `token_count` equals 0). |
+| `GWS-INTEG-001` | `gws_integ_001_branch_02_matches` | GWS-INTEG-001 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `failed_read_count` is greater than 0). |
+| `GWS-INTEG-001` | `gws_integ_001_branch_03_matches` | GWS-INTEG-001 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `token_count` is greater than 0. |
+| `GWS-INTEG-001` | `gws_integ_001_branch_04_matches` | GWS-INTEG-001 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-INTEG-002` | `gws_integ_002_branch_01_matches` | GWS-INTEG-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`directory_readable` does not equal true; `privileged_user_count` equals 0; `token_count` equals 0; all of (`failed_read_count` is greater than 0; `privileged_token_count` equals 0)). |
+| `GWS-INTEG-002` | `gws_integ_002_branch_02_matches` | GWS-INTEG-002 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `privileged_token_count` is greater than 3. |
+| `GWS-INTEG-002` | `gws_integ_002_branch_03_matches` | GWS-INTEG-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `privileged_token_count` is greater than 0). |
+| `GWS-INTEG-002` | `gws_integ_002_branch_04_matches` | GWS-INTEG-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `privileged_token_count` equals 0. |
+| `GWS-INTEG-002` | `gws_integ_002_branch_05_matches` | GWS-INTEG-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-INTEG-003` | `gws_integ_003_branch_01_matches` | GWS-INTEG-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`users_readable` does not equal true; `token_count` equals 0). |
+| `GWS-INTEG-003` | `gws_integ_003_branch_02_matches` | GWS-INTEG-003 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `high_risk_token_count` is greater than 5. |
+| `GWS-INTEG-003` | `gws_integ_003_branch_03_matches` | GWS-INTEG-003 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `high_risk_token_count` is greater than 0). |
+| `GWS-INTEG-003` | `gws_integ_003_branch_04_matches` | GWS-INTEG-003 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `high_risk_token_count` equals 0. |
+| `GWS-INTEG-003` | `gws_integ_003_branch_05_matches` | GWS-INTEG-003 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-INTEG-004` | `gws_integ_004_branch_01_matches` | GWS-INTEG-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `event_count` equals 0). |
+| `GWS-INTEG-004` | `gws_integ_004_branch_02_matches` | GWS-INTEG-004 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-INTEG-004` | `gws_integ_004_branch_03_matches` | GWS-INTEG-004 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `event_count` is greater than 0. |
+| `GWS-INTEG-004` | `gws_integ_004_branch_04_matches` | GWS-INTEG-004 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-MON-001` | `gws_mon_001_branch_01_matches` | GWS-MON-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `alert_count` equals 0). |
+| `GWS-MON-001` | `gws_mon_001_branch_02_matches` | GWS-MON-001 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-MON-001` | `gws_mon_001_branch_03_matches` | GWS-MON-001 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `alert_count` is greater than 0. |
+| `GWS-MON-001` | `gws_mon_001_branch_04_matches` | GWS-MON-001 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-MON-002` | `gws_mon_002_branch_01_matches` | GWS-MON-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `event_count` equals 0). |
+| `GWS-MON-002` | `gws_mon_002_branch_02_matches` | GWS-MON-002 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `suspicious_login_count` is greater than 5. |
+| `GWS-MON-002` | `gws_mon_002_branch_03_matches` | GWS-MON-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `suspicious_login_count` is greater than 0). |
+| `GWS-MON-002` | `gws_mon_002_branch_04_matches` | GWS-MON-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `suspicious_login_count` equals 0. |
+| `GWS-MON-002` | `gws_mon_002_branch_05_matches` | GWS-MON-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-MON-003` | `gws_mon_003_branch_01_matches` | GWS-MON-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `event_count` equals 0). |
+| `GWS-MON-003` | `gws_mon_003_branch_02_matches` | GWS-MON-003 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-MON-003` | `gws_mon_003_branch_03_matches` | GWS-MON-003 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `event_count` is greater than 0. |
+| `GWS-MON-003` | `gws_mon_003_branch_04_matches` | GWS-MON-003 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-MON-004` | `gws_mon_004_branch_01_matches` | GWS-MON-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `event_count` equals 0). |
+| `GWS-MON-004` | `gws_mon_004_branch_02_matches` | GWS-MON-004 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `GWS-MON-004` | `gws_mon_004_branch_03_matches` | GWS-MON-004 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `event_count` is greater than 0. |
+| `GWS-MON-004` | `gws_mon_004_branch_04_matches` | GWS-MON-004 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GWS-MON-005` | `gws_mon_005_branch_01_matches` | GWS-MON-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `alert_count` equals 0). |
+| `GWS-MON-005` | `gws_mon_005_branch_02_matches` | GWS-MON-005 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `open_alert_count` is greater than 10. |
+| `GWS-MON-005` | `gws_mon_005_branch_03_matches` | GWS-MON-005 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `open_alert_count` is greater than 3). |
+| `GWS-MON-005` | `gws_mon_005_branch_04_matches` | GWS-MON-005 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `open_alert_count` is at most 3. |
+| `GWS-MON-005` | `gws_mon_005_branch_05_matches` | GWS-MON-005 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 
 ### Criterion constants
 
@@ -390,6 +476,8 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `GWS-ID-002` | `warning_minimum` | 0.85 |
 | `GWS-ID-002` | `pass_minimum` | 0.98 |
 | `GWS-ID-003` | `dormant_days` | 90 |
+| `GWS-ID-003` | `absolute_warning_maximum` | 2 |
+| `GWS-ID-003` | `proportional_warning_maximum` | 0.05 |
 | `GWS-ID-004` | `requiredEvidenceReadable` | true |
 | `GWS-ID-004` | `requiredEvidenceComplete` | true |
 | `GWS-ID-005` | `requiredEvidenceReadable` | true |

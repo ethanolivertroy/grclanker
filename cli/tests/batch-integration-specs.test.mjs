@@ -786,15 +786,16 @@ test("Zendesk executable rules ignore legacy status and preserve boundaries, pre
   const legacyStatus = "pass";
   const sessionFacts = {
     readable: true,
-    timeout_present: true,
-    severe: false,
-    issue_count: 0,
+    agent_session_timeout: 120,
+    mobile_app_access: true,
+    mobile_app_session_timeout: 120,
+    threshold_minutes: 120,
+    severe_threshold_minutes: 360,
   };
   assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-05", sessionFacts), "pass");
   assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-05", {
     ...sessionFacts,
-    severe: true,
-    issue_count: 1,
+    agent_session_timeout: 361,
   }), "fail", "mutating the timeout evidence changes the verdict while the legacy status is held constant");
   assert.equal(legacyStatus, "pass");
   assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-10", {
@@ -856,11 +857,18 @@ test("Salesforce executable rules ignore legacy status and preserve boundaries, 
     readable: true,
     login_count: 26,
     complete: false,
-    severe_anomaly: true,
-    warning_anomaly: true,
+    failed_count: 26,
+    brute_force_source_count: 1,
+    legacy_tls_count: 0,
+    country_count: 1,
+    undated_count: 0,
   }), "warn", "the runtime's partial-window guard precedes sample anomaly classifications");
   assert.equal(evaluateBatchCheckVerdict(SALESFORCE_SPEC, "SF-10", {
-    population_sane: true,
+    users_readable: true,
+    profiles_readable: true,
+    user_count: 100,
+    profile_count: 10,
+    admin_profile_count: 1,
     complete: true,
     admin_count: 26,
     max_admins: 25,
