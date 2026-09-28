@@ -1689,6 +1689,16 @@ function ensurePrivateDir(pathname: string): void {
   }
 }
 
+function pathEntryExists(pathname: string): boolean {
+  try {
+    lstatSync(pathname);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
   ensurePrivateDir(baseDir);
   const realBase = realpathSync(baseDir);
@@ -1720,7 +1730,8 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   ensurePrivateDir(root);
   for (const suffix of ["", "-2", "-3", "-4", "-5", "-6"]) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
+    if (!pathEntryExists(candidate) && !pathEntryExists(zipCandidate)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -1744,7 +1755,7 @@ async function writeSecureJsonFile(rootDir: string, relativePathname: string, va
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
     output.on("close", () => resolvePromise());
     output.on("error", rejectPromise);
