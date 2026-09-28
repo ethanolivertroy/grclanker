@@ -1303,7 +1303,8 @@ function capForUnreadableAll(item: ZscalerFinding, dependencies: InventoryDepend
   };
   const facts = (item as ZscalerFindingWithFacts)[ZSCALER_DECISION_FACTS] ?? {};
   if (unreadable.length === 0) {
-    const complete = dependencies.every((dependency) => dependency.dataset.truncated !== true);
+    const complete = facts.evidence_complete === true
+      && dependencies.every((dependency) => dependency.dataset.truncated !== true);
     const result = {
       ...item,
       status: evaluateBatchCheckVerdict(ZSCALER_SPEC, item.id, { ...facts, evidence_complete: complete }) as ZscalerFindingStatus,
