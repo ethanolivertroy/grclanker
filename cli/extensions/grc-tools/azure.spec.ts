@@ -141,7 +141,7 @@ const completenessSource = (
   surfaceId: string,
   falseWhen: BatchCompletenessSourceDefinition["falseWhen"],
 ): BatchCompletenessSourceDefinition => ({ surfaceId, falseWhen });
-const AZURE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = {
+export const AZURE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = {
   "AZURE-ID-01": [
     completenessSource("conditional-access", TRUNCATION_ONLY),
     completenessSource("security-defaults", NO_COMPLETENESS_FAILURE_MODES),

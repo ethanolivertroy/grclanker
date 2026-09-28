@@ -1231,7 +1231,8 @@ test("AZURE-SUB-04 network-watcher truncation matches its executable completenes
     },
   });
   const { result, captures } = await captureBatchDecisionFacts(() => assessAzureSubscriptionGuardrails(client));
-  const facts = captures.find((capture) => capture.integration === AZURE_SPEC.identity.slug)?.checks.get("AZURE-SUB-04");
+  const facts = captures.find((capture) =>
+    capture.integration === AZURE_SPEC.identity.slug && capture.checks.has("AZURE-SUB-04"))?.checks.get("AZURE-SUB-04");
   assert.equal(facts?.complete, false);
   assert.equal(result.findings.find((item) => item.id === "AZURE-SUB-04")?.status, "warn");
 });
