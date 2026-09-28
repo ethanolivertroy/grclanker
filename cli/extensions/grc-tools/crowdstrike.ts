@@ -764,7 +764,6 @@ function crowdstrikeDecisionFacts(
 
 function finding(
   id: ControlId,
-  _legacyStatus: CrowdstrikeFinding["status"],
   summary: string,
   evidence?: JsonRecord,
   decisionFacts: Readonly<Record<string, unknown>> = {},
@@ -787,7 +786,7 @@ function finding(
 }
 
 function manualFinding(id: ControlId, reason: string, consoleEvidence: string, evidence?: JsonRecord): CrowdstrikeFinding {
-  return finding(id, "manual", `${reason} Verdict: manual (unknown). Collect manually: ${consoleEvidence}`, evidence);
+  return finding(id, `${reason} Verdict: manual (unknown). Collect manually: ${consoleEvidence}`, evidence);
 }
 
 function unreadableFinding(id: ControlId, dataset: string, error: string, consoleEvidence: string): CrowdstrikeFinding {
@@ -1984,11 +1983,10 @@ function missingPlatforms(policies: JsonRecord[]): string[] {
 function noAssignedPolicyFinding(id: ControlId, policyKind: string, policies: JsonRecord[]): CrowdstrikeFinding {
   const inventory = { ...policyInventory(policies), absence_claim: true };
   if (policies.length === 0) {
-    return finding(id, "fail", `The ${policyKind} policies endpoint was readable but returned zero policies; with no ${policyKind} policy defined this control fails.`, inventory, crowdstrikeDecisionFacts(0, 1));
+    return finding(id, `The ${policyKind} policies endpoint was readable but returned zero policies; with no ${policyKind} policy defined this control fails.`, inventory, crowdstrikeDecisionFacts(0, 1));
   }
   return finding(
     id,
-    "fail",
     `None of the ${policies.length} ${policyKind} policies is both enabled and assigned to host groups (${inventory.enabled_policies} enabled, ${inventory.enabled_but_unassigned_policies.length} enabled but unassigned), so the control is not enforced on any host.`,
     inventory,
     crowdstrikeDecisionFacts(policies.length, 1),
@@ -2044,7 +2042,6 @@ function evaluateMlDetectionLevels(policies: JsonRecord[], partial = false): Cro
   const weak = perPolicy.filter((item) => item.status !== "pass").map((item) => item.policy);
   return finding(
     "CS-01",
-    status,
     status === "pass"
       ? `All ${applied.length} enabled and host-assigned prevention policies keep Cloud and Sensor Anti-malware detection and prevention at AGGRESSIVE or higher.`
       : `${weak.length}/${applied.length} enabled and host-assigned prevention policies have ML sliders below AGGRESSIVE, missing, or incomplete${missing && missing.length > 0 ? `; no assigned policy covers ${missing.join(", ")}` : ""}.`,
@@ -2089,14 +2086,13 @@ function evaluateToggleControl(
   }
 
   if (perPolicy.length === 0) {
-    return finding(id, "warn", `None of the ${applied.length} enabled and host-assigned ${options.policyKind} policies expose ${requiredToggles.join(", ")}, so the control could not be evaluated from the API and cannot pass.`, { ...policyInventory(policies), required_settings: requiredToggles }, crowdstrikeDecisionFacts(applied.length, 0, applied.length));
+    return finding(id, `None of the ${applied.length} enabled and host-assigned ${options.policyKind} policies expose ${requiredToggles.join(", ")}, so the control could not be evaluated from the API and cannot pass.`, { ...policyInventory(policies), required_settings: requiredToggles }, crowdstrikeDecisionFacts(applied.length, 0, applied.length));
   }
 
   const status = worstStatus(perPolicy.map((item) => item.status));
   const weak = perPolicy.filter((item) => item.status !== "pass");
   return finding(
     id,
-    status,
     status === "pass"
       ? `${options.passSummary} across ${perPolicy.length} enabled and host-assigned ${options.policyKind} policies.`
       : `${weak.length}/${perPolicy.length} enabled and host-assigned ${options.policyKind} policies have ${requiredToggles.join(", ")} disabled or missing: ${weak.map((item) => `${item.policy} [${[...item.disabled, ...item.missing.map((toggle) => `${toggle}?`)].join(", ")}]`).join("; ")}.`,
@@ -2136,7 +2132,6 @@ function evaluateOnWriteDetection(policies: JsonRecord[]): CrowdstrikeFinding {
   const weak = perPolicy.filter((item) => item.status !== "pass");
   return finding(
     "CS-05",
-    status,
     status === "pass"
       ? `DetectOnWrite and QuarantineOnWrite are enabled across ${perPolicy.length} enabled and host-assigned prevention policies.`
       : `${weak.length}/${perPolicy.length} enabled and host-assigned prevention policies do not fully enable on-write detection and quarantine: ${weak.map((item) => item.policy).join(", ")}.`,
@@ -2243,7 +2238,6 @@ function evaluateRtrPolicies(policies: JsonRecord[]): CrowdstrikeFinding {
     : worstStatus(perPolicy.map((item) => item.status === "fail" ? "warn" : item.status));
   return finding(
     "CS-06",
-    status,
     !anyRtr
       ? "Real Time Response is disabled in every enabled and host-assigned response policy, which removes remote investigation and containment capability."
       : status === "pass"
@@ -2325,7 +2319,6 @@ function evaluateSessionLimits(
   if (long.length > 0 || concurrency.concurrent > maxConcurrentSessions) {
     return withPartialInventory(finding(
       "CS-07",
-      "warn",
       `${long.length}/${sessions.data.items.length} RTR sessions in the last ${lookbackDays} days exceeded ${maxSessionMinutes} minutes and peak per-user concurrency was ${concurrency.concurrent}; the Falcon API does not expose the configured timeout, so confirm the policy values in the console.`,
       evidence,
       crowdstrikeDecisionFacts(
@@ -2403,7 +2396,6 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
   const status: CrowdstrikeFinding["status"] = dated === 0 ? (partial ? "warn" : "pass") : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
   const base = finding(
     "CS-22",
-    status,
     dated === 0
       ? partial
         ? truncatedBeforeVisible("critical/high alerts", "dated alert", "response within the SLA")
@@ -2451,7 +2443,6 @@ function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>
   const status: CrowdstrikeFinding["status"] = contained.length === 0 && !partial ? "pass" : "warn";
   const base = finding(
     "CS-23",
-    status,
     contained.length === 0
       ? partial
         ? "The containment status filter read was truncated before any matching host was visible, so active containment cannot be confirmed or ruled out from the visible rows; document each containment and its incident reference."
@@ -2673,7 +2664,6 @@ function evaluateUsbBlocking(views: DeviceControlView[], policies: JsonRecord[],
   const weak = perPolicy.filter((item) => item.status !== "pass");
   return finding(
     "CS-08",
-    status,
     status === "pass"
       ? `All ${perPolicy.length} enabled and host-assigned device control policies enforce USB mass storage blocking with at most ${maxExceptions} exceptions each.`
       : `${weak.length}/${perPolicy.length} enabled and host-assigned device control policies do not enforce USB mass storage blocking or carry more than ${maxExceptions} exceptions: ${weak.map((item) => `${item.policy} [${item.usb_enforcement_mode ?? "mode?"}/${item.mass_storage_action ?? "action?"}/${item.mass_storage_exceptions} exceptions]`).join("; ")}.`,
@@ -2702,7 +2692,6 @@ function evaluatePeripheralRestrictions(views: DeviceControlView[], policies: Js
   const weak = perPolicy.filter((item) => item.status !== "pass");
   return finding(
     "CS-09",
-    status,
     status === "pass"
       ? `Bluetooth, PCIe/Thunderbolt, and mass storage (SD card) restrictions are enforced across ${perPolicy.length} enabled and host-assigned device control policies.`
       : `${weak.length}/${perPolicy.length} enabled and host-assigned device control policies leave Bluetooth, PCIe/Thunderbolt, or mass storage (SD card) unenforced: ${weak.map((item) => item.policy).join(", ")}.`,
@@ -2755,7 +2744,6 @@ function evaluateHostFirewall(policies: JsonRecord[], containers: JsonRecord[], 
   const weak = perPolicy.filter((item) => item.status !== "pass");
   return finding(
     "CS-10",
-    status,
     status === "pass"
       ? `All ${perPolicy.length} enabled and host-assigned firewall policies enforce at least one enabled, non-empty rule group outside test mode.`
       : `${weak.length}/${perPolicy.length} enabled and host-assigned firewall policies are not verifiably enforcing active rule groups: ${weak.map((item) => `${item.policy} [container=${String(item.container_returned)}, enforce=${String(item.enforce)}, test_mode=${String(item.test_mode)}, active_groups=${item.active_rule_groups}, unknown_groups=${item.unknown_rule_groups}]`).join("; ")}.`,
@@ -2772,7 +2760,7 @@ function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], r
   const appliedIds = new Set(assignedPolicies(policies).map((policy) => asString(policy.id) ?? ""));
   const activeContainers = containers.filter((container) => appliedIds.has(asString(container.policy_id) ?? ""));
   if (activeContainers.length === 0) {
-    return finding("CS-11", "fail", `No firewall policy containers were returned for enabled and host-assigned firewall policies (${appliedIds.size} applied policies, ${containers.length} containers), so a default deny posture cannot be demonstrated.`, { ...policyInventory(policies), containers: containers.length, absence_claim: true }, crowdstrikeDecisionFacts(appliedIds.size, 1));
+    return finding("CS-11", `No firewall policy containers were returned for enabled and host-assigned firewall policies (${appliedIds.size} applied policies, ${containers.length} containers), so a default deny posture cannot be demonstrated.`, { ...policyInventory(policies), containers: containers.length, absence_claim: true }, crowdstrikeDecisionFacts(appliedIds.size, 1));
   }
   const perContainer = activeContainers.map((container) => {
     const inbound = asString(container.default_inbound)?.toUpperCase();
@@ -2788,7 +2776,6 @@ function evaluateDefaultDeny(policies: JsonRecord[], containers: JsonRecord[], r
   const status = worstStatus(statuses);
   return finding(
     "CS-11",
-    status,
     status === "pass"
       ? `All ${perContainer.length} enforced firewall policy containers default inbound traffic to DENY and every one of the ${allowRules.length} enabled allow rules carries a description.`
       : rules.length === 0 && perContainer.every((item) => item.status === "pass")
@@ -2982,7 +2969,6 @@ function evaluateSensorUpdate(policies: JsonRecord[], buildsByPlatform: Map<stri
   return withUnreadableSecondary(
     finding(
       "CS-12",
-      status,
       status === "pass"
         ? `All ${perPolicy.length} enabled and host-assigned sensor update policies auto-update or pin a build within N-2 with uninstall protection enabled.`
         : `${weak.length}/${perPolicy.length} enabled and host-assigned sensor update policies disable updates, pin builds older than N-2 or unverifiable against the build catalog, or lack uninstall protection: ${weak.map((item) => item.policy).join(", ")}.`,
@@ -3033,7 +3019,6 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
           : "fail";
   const base = finding(
     "CS-13",
-    status,
     items.length === 0
       ? emptyPartial
         ? truncatedBeforeVisible("hosts", "host", "sensor deployment coverage")
@@ -3088,7 +3073,6 @@ function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<Jso
   const status: CrowdstrikeFinding["status"] = items.length === 0 || groups.data.items.length === 0 ? "fail" : pct >= 95 ? "pass" : pct >= 80 ? "warn" : "fail";
   const base = finding(
     "CS-14",
-    status,
     groups.data.items.length === 0
       ? emptyPartialGroups
         ? truncatedBeforeVisible("host groups", "host group", "policy assignment coverage")
@@ -3165,7 +3149,6 @@ function evaluateUnmanagedAssets(
   const status: CrowdstrikeFinding["status"] = unmanaged === 0 ? "pass" : pct <= 5 ? "warn" : "fail";
   return finding(
     "CS-15",
-    status,
     unmanaged === 0
       ? `Falcon Discover reports no unmanaged assets against ${managed} managed assets (server-side totals).`
       : `Falcon Discover reports ${unmanaged} unmanaged assets (${pct}% of ${managed + unmanaged} discovered assets, server-side totals).`,
@@ -3230,7 +3213,6 @@ function evaluateZeroTrust(
   const status: CrowdstrikeFinding["status"] = belowTotalReported ? computed : computed === "pass" ? "warn" : computed;
   return finding(
     "CS-25",
-    status,
     belowTotalReported
       ? `${below} of ${scored} scored hosts (${pct}%, server-side totals) fall below the ZTA threshold of ${minScore}.`
       : `At least ${below} of ${scored} scored hosts (${pct}%) fall below the ZTA threshold of ${minScore}; the API did not report a server-side total for the below-threshold query, so the sampled count is a lower bound and this verdict cannot exceed warn.`,
@@ -3407,7 +3389,6 @@ function evaluateAdminCount(views: UserView[], maxAdmins: number): CrowdstrikeFi
       : "pass";
   return finding(
     "CS-16",
-    status,
     `${admins.length} of ${views.length} Falcon users hold admin roles (threshold ${maxAdmins}); ${sharedAdmins.length} admin and ${sharedOthers.length} non-admin accounts look like shared or generic identities.`,
     {
       users_reviewed: views.length,
@@ -3438,7 +3419,6 @@ function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginD
   // unread rows, so the sentence never asserts an absence across users it did not see.
   const base = finding(
     "CS-17",
-    status,
     `${views.length} users reviewed; ${overprivileged.length} carry more than ${maxRoles} roles or redundant roles on top of an admin grant, and ${stalePrivileged.length} of ${admins.length} admin accounts have a last login older than ${staleLoginDays} days.`,
     {
       users_reviewed: views.length,
@@ -3576,7 +3556,6 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
   ].filter((note): note is string => Boolean(note));
   return withPartialInventory(finding(
     "CS-18",
-    status,
     status === "pass"
       ? `None of the ${views.length} API clients hold write-action scopes on sensitive collections; the scopes array with its action and group fields was read for every client. ${lastUsedCoverage}`
       : `${writeClients.length} of ${views.length} API clients hold write-action scopes on sensitive collections (threshold ${maxWriteClients})${coverageNotes.length > 0 ? `; ${coverageNotes.join("; ")}` : ""}. ${lastUsedCoverage}`,
@@ -3626,7 +3605,6 @@ function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<Json
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : broadGlobal.length > 0 ? "fail" : broad.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-19",
-    status,
     views.length === 0
       ? partial
         ? truncatedBeforeVisible("IOA exclusions", "exclusion", "suppression of detection logic")
@@ -3662,7 +3640,6 @@ function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonR
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : sensitiveGlobal.length > 0 ? "fail" : sensitive.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-20",
-    status,
     views.length === 0
       ? partial
         ? truncatedBeforeVisible("ML exclusions", "exclusion", "suppression of machine learning coverage")
@@ -3697,7 +3674,6 @@ function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<Crowdst
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? (partial ? "warn" : "pass") : hidingGlobal.length > 0 ? "fail" : hiding.length > 0 ? "warn" : "pass";
   return withPartialInventory(finding(
     "CS-21",
-    status,
     views.length === 0
       ? partial
         ? truncatedBeforeVisible("sensor visibility exclusions", "exclusion", "paths hidden from the sensor")
@@ -3740,7 +3716,6 @@ function evaluateIdentityProtection(rules: CollectedDataset<CrowdstrikePage<Json
   const status: CrowdstrikeFinding["status"] = views.length === 0 ? "fail" : enforcing.length > 0 ? "pass" : active.length > 0 ? "warn" : "fail";
   return withPartialInventory(finding(
     "CS-24",
-    status,
     views.length === 0
       ? emptyPartial
         ? truncatedBeforeVisible("Identity Protection policy rules", "rule", "identity-based lateral movement prevention")

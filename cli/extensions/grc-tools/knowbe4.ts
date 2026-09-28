@@ -2357,7 +2357,6 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
 function finding(
   number: number,
   severity: Knowbe4Finding["severity"],
-  _legacyStatus: Knowbe4Finding["status"],
   summary: string,
   evidence?: JsonRecord,
   manualEvidence?: string,
@@ -2404,7 +2403,6 @@ function unavailableFinding(number: number, severity: Knowbe4Finding["severity"]
   return finding(
     number,
     severity,
-    "manual",
     inventoryGapCaveat(gap),
     { collection_error: gap.error, unreadable_inventories: [gap] },
     `Collect ${gap.collect_manually}.`,
@@ -2506,7 +2504,6 @@ function emptyUserListFinding(number: number, severity: Knowbe4Finding["severity
   return finding(
     number,
     severity,
-    "warn",
     `The Reporting API returned no active users, so ${subject} cannot be evaluated. Anonymized KnowBe4 accounts cannot retrieve user data through the API; confirm the account's anonymization setting and the API key before treating this control as met.`,
     { active_users: 0, user_list_empty: true, ...evidence },
   );
@@ -2679,7 +2676,6 @@ function assessPhishingFrequency(snapshot: Knowbe4Snapshot, now: Date, maxGapDay
   return withInventoryCaveats(finding(
     1,
     "high",
-    status,
     !latest
       ? "No phishing security tests have ever run in this account."
       : status === "pass"
@@ -2766,7 +2762,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     summary = `Only ${coverage ?? 0}% of ${active.size} active users were tested in the last ${lookbackDays} days (policy minimum ${minCoveragePct}%).`;
   }
 
-  return withInventoryCaveats(finding(2, "high", status, summary, {
+  return withInventoryCaveats(finding(2, "high", summary, {
     active_users: whenComplete(snapshot.activeUsers, active.size),
     users_read: active.size,
     tested_users: complete ? tested.size : null,
@@ -2810,7 +2806,7 @@ function assessPhishPronePercentage(snapshot: Knowbe4Snapshot, now: Date, lookba
     summary = `The current phish-prone percentage is ${roundTo(current, 2)}%, within the ${maxPhishPronePct}% ceiling${baseline !== undefined ? ` and at or below the ${baseline}% baseline` : ""}.`;
   }
 
-  return withInventoryCaveats(finding(6, "high", status, summary, {
+  return withInventoryCaveats(finding(6, "high", summary, {
     current_phish_prone_pct: current === undefined ? null : roundTo(current, 2),
     current_source: current === undefined ? "unverified" : "security_tests",
     // The per-user average is a population statistic, so it is unknown on a partial user list.
@@ -2845,7 +2841,7 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
     { inventory: "account_risk_score_history", notChecked: "the organization risk score history was not attached", verdict: false },
   ];
   if (tests.length < MIN_TREND_TESTS) {
-    return withInventoryCaveats(finding(7, "medium", "warn", `Only ${tests.length} phishing security tests with results ran in the last ${windowDays} days; at least ${MIN_TREND_TESTS} are needed to evaluate a trend.`, {
+    return withInventoryCaveats(finding(7, "medium", `Only ${tests.length} phishing security tests with results ran in the last ${windowDays} days; at least ${MIN_TREND_TESTS} are needed to evaluate a trend.`, {
       security_tests_considered: tests.length,
       window_days: windowDays,
       risk_score_history_points: whenComplete(snapshot.accountRiskHistory, riskHistory.length),
@@ -2861,7 +2857,6 @@ function assessFailureTrend(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
   return withInventoryCaveats(finding(
     7,
     "medium",
-    status,
     status === "pass"
       ? `Phish-prone results moved from ${roundTo(earlier, 2)}% to ${roundTo(later, 2)}% across ${tests.length} tests, which is stable or improving.`
       : `Phish-prone results worsened from ${roundTo(earlier, 2)}% to ${roundTo(later, 2)}% across ${tests.length} tests (+${delta} points).`,
@@ -2943,7 +2938,7 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
 
   // An All Users campaign proves coverage from the campaign list alone; otherwise the estimate joins users and groups.
   const estimateKnown = fullCampaigns.length > 0 || activeCampaigns.length === 0 || (isComplete(snapshot.activeUsers) && isComplete(snapshot.groups));
-  return withInventoryCaveats(finding(9, "medium", status, summary, {
+  return withInventoryCaveats(finding(9, "medium", summary, {
     active_campaigns: whenComplete(snapshot.phishingCampaigns, activeCampaigns.length),
     full_targeting_campaigns: fullCampaigns.map(campaignName),
     partial_targeting_campaigns: partialCampaigns.slice(0, SAMPLE_SIZE).map((campaign) => ({
@@ -3015,7 +3010,7 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
     summary += ` PhishER inbox: ${phisher.data.length} user-reported messages in the window${loaded}.`;
   }
 
-  return withInventoryCaveats(finding(19, "medium", status, summary, {
+  return withInventoryCaveats(finding(19, "medium", summary, {
     delivered_count: whenComplete(snapshot.securityTests, delivered),
     reported_count: whenComplete(snapshot.securityTests, reported),
     report_rate_pct: reportRate === undefined ? null : whenComplete(snapshot.securityTests, reportRate),
@@ -3043,7 +3038,7 @@ function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookback
   if (snapshot.securityTests.error) return unavailableFinding(20, "medium", "security_tests", snapshot);
   const allTests = runTests(snapshot.securityTests.data, now);
   if (allTests.length === 0) {
-    return withInventoryCaveats(finding(20, "medium", "fail", "No phishing security tests have ever run, so there is no scheduling cadence to evaluate.", {
+    return withInventoryCaveats(finding(20, "medium", "No phishing security tests have ever run, so there is no scheduling cadence to evaluate.", {
       security_tests_in_window: 0,
       security_tests_all_time: 0,
       lookback_days: lookbackDays,
@@ -3076,7 +3071,6 @@ function assessScheduleRegularity(snapshot: Knowbe4Snapshot, now: Date, lookback
   return withInventoryCaveats(finding(
     20,
     "medium",
-    status,
     status === "pass"
       ? `${inWindow.length} phishing security tests ran in the last ${lookbackDays} days with a maximum gap of ${maxGap} days including the ${daysSinceLatest} days since the latest test (policy maximum ${maxScheduleGapDays}); average gap ${averageGap} days.`
       : `${overThreshold.length} scheduling gaps exceeded ${maxScheduleGapDays} days (largest ${maxGap} days)${latestOverdue ? `, including the ${daysSinceLatest} days since the most recent test` : ""}, across ${inWindow.length} phishing security tests in the last ${lookbackDays} days.`,
@@ -3292,7 +3286,7 @@ function assessTrainingCompletion(snapshot: Knowbe4Snapshot, now: Date, lookback
     summary = `All ${evaluated.length} completed training campaigns in the last ${lookbackDays} days met the ${minCompletionPct}% completion target.`;
   }
 
-  return withInventoryCaveats(finding(3, "high", status, summary, {
+  return withInventoryCaveats(finding(3, "high", summary, {
     campaigns_evaluated: evaluated,
     // Which campaigns fell back to a truncated enrollment list is only known once the enrollment list was read at all.
     campaigns_with_truncated_enrollments: whenRead(snapshot.trainingEnrollments, truncated),
@@ -3370,7 +3364,7 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
     summary = `${late.length} of ${newUsers.length} recently joined users (${latePct}%) had no training enrollment within ${graceDays} days of joining.`;
   }
 
-  return withInventoryCaveats(finding(4, "medium", status, summary, {
+  return withInventoryCaveats(finding(4, "medium", summary, {
     new_users_evaluated: whenComplete(snapshot.activeUsers, newUsers.length),
     new_users_read: newUsers.length,
     late_or_missing_enrollments: populationComplete ? late.length : null,
@@ -3459,7 +3453,7 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
 
   // Every count derived from the recipient samples is unknown, not zero, when no per-test read completed.
   const sampled = recipients.anyRead;
-  return withInventoryCaveats(finding(10, "medium", status, summary, {
+  return withInventoryCaveats(finding(10, "medium", summary, {
     security_tests_in_window: whenComplete(snapshot.securityTests, testsInWindow.length),
     sampled_security_tests: sampled ? samples.map((sample) => sample.pst_id) : null,
     unsampled_security_tests: unsampled,
@@ -3565,7 +3559,7 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
       : `All ${reviewed} assigned training modules carry campaign-content publish dates within the last ${maxContentAgeDays} days and none are marked retired in the campaign content; the ModStore catalog was not read, so publisher retirement was not cross-checked.`;
   }
 
-  return withInventoryCaveats(finding(11, "low", status, summary, {
+  return withInventoryCaveats(finding(11, "low", summary, {
     modules_reviewed: reviewed,
     modules_with_publish_date: whenComplete(snapshot.storePurchases, dated),
     retired_modules: observedList([snapshot.storePurchases], retired.slice(0, SAMPLE_SIZE)),
@@ -3656,7 +3650,7 @@ function assessComplianceModules(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     summary = `Compliance training modules are assigned and enrolled for ${topicList(topicResults)} with completion at or above ${minCompletionPct}%.`;
   }
 
-  return withInventoryCaveats(finding(17, "medium", status, summary, {
+  return withInventoryCaveats(finding(17, "medium", summary, {
     required_compliance_topics: requiredTopics,
     // Population figures need the whole enrollment list; the "_loaded" figures describe only the records read.
     topics: topicResults.map((item) => ({
@@ -3777,7 +3771,7 @@ function assessRiskDistribution(snapshot: Knowbe4Snapshot, maxMeanRiskScore: num
 
   // The statistics describe the users read; they are population figures only when the user list was read in full.
   const ranked = highest.map((item) => ({ user: userLabel(item.user, redact), risk_score: item.score }));
-  return withInventoryCaveats(finding(5, "medium", status, summary, {
+  return withInventoryCaveats(finding(5, "medium", summary, {
     users_scored: whenComplete(snapshot.activeUsers, scores.length),
     users_scored_read: scores.length,
     mean_risk_score: average === undefined ? null : roundTo(average),
@@ -3859,7 +3853,7 @@ function assessGroupCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDays:
     summary = `${missingPhishing.length} groups lacked a phishing campaign and ${missingTraining.length} groups lacked a training campaign in the last ${lookbackDays} days.`;
   }
 
-  return withInventoryCaveats(finding(8, "medium", status, summary, {
+  return withInventoryCaveats(finding(8, "medium", summary, {
     active_groups: whenComplete(snapshot.groups, groups.length),
     active_groups_read: groups.length,
     phishing_campaigns_in_window: whenComplete(snapshot.phishingCampaigns, phishingCampaigns.length),
@@ -3944,7 +3938,7 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     summary = `${inactive.length} of ${candidates.length} active users (${inactivePct}%) have not participated in any campaign or signed in for ${inactiveDays}+ days and should be reviewed for archival.`;
   }
 
-  return withInventoryCaveats(finding(18, "medium", status, summary, {
+  return withInventoryCaveats(finding(18, "medium", summary, {
     users_evaluated: whenComplete(snapshot.activeUsers, candidates.length),
     users_evaluated_read: candidates.length,
     inactive_users: populationComplete ? inactive.length : null,
@@ -4036,7 +4030,7 @@ function assessAdminRoles(snapshot: Knowbe4Snapshot, maxAdminCount: number, reda
     summary = `${admins.length} console administrators are within the policy maximum of ${maxAdminCount} and all use allowed account domains.`;
   }
 
-  return finding(12, "high", status, summary, {
+  return finding(12, "high", summary, {
     admin_count: admins.length,
     max_admin_count: maxAdminCount,
     admins: admins.slice(0, SAMPLE_SIZE).map((admin) => ({ id: recordId(admin) ?? null, user: userLabel(admin, redact) })),
@@ -4050,7 +4044,6 @@ function assessSsoStatus(snapshot: Knowbe4Snapshot): Knowbe4Finding {
   return finding(
     13,
     "high",
-    "manual",
     "The KMSAT Reporting API does not expose SAML SSO or admin MFA settings, so SSO enforcement for the KnowBe4 console must be verified manually.",
     {
       api_visibility: "not_exposed_by_reporting_api",
@@ -4074,7 +4067,6 @@ function assessReportingFrequency(snapshot: Knowbe4Snapshot, now: Date): Knowbe4
   return finding(
     14,
     "medium",
-    "manual",
     "The KMSAT Reporting API has no log of generated or reviewed reports, so report generation and review cadence must be evidenced from console report schedules and review records.",
     {
       api_visibility: "not_exposed_by_reporting_api",
@@ -4098,7 +4090,6 @@ function assessUsbTests(now: Date, lookbackDays: number, requireUsbTests: boolea
     return finding(
       15,
       "low",
-      "manual",
       "USB drop testing was scoped out by configuration (require_usb_tests is false); this control was not evaluated and is not satisfied by the API. Record the documented risk decision that physical media testing is out of scope, or enable require_usb_tests and evidence the tests.",
       {
         require_usb_tests: false,
@@ -4112,7 +4103,6 @@ function assessUsbTests(now: Date, lookbackDays: number, requireUsbTests: boolea
   return finding(
     15,
     "low",
-    "manual",
     "USB Drive Test campaigns are not exposed by the KMSAT Reporting API, so physical security awareness testing must be evidenced from the console.",
     {
       api_visibility: "not_exposed_by_reporting_api",
@@ -4130,7 +4120,6 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
     return finding(
       16,
       "low",
-      "manual",
       "Voice-channel (vishing) testing was scoped out by configuration (require_vishing_tests is false); this control was not evaluated and is not satisfied by the API. Record the documented risk decision that voice-channel testing is out of scope, or enable require_vishing_tests to evaluate callback phishing tests.",
       {
         require_vishing_tests: false,
@@ -4148,7 +4137,6 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
     return finding(
       16,
       "low",
-      "manual",
       "Callback phishing security tests were not requested in this run (the governance scope was not collected), so voice-channel testing must be evidenced from the console.",
       {
         api_visibility: "callback_security_tests_not_requested",
@@ -4167,7 +4155,6 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
   return withInventoryCaveats(finding(
     16,
     "low",
-    status,
     status === "pass"
       ? `${recent.length} callback (voice-channel) phishing security tests started in the last ${lookbackDays} days.`
       : status === "warn"

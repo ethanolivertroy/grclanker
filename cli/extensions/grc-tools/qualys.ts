@@ -1948,7 +1948,6 @@ export function resolveViewScope(config: QualysResolvedConfig, users: Collected,
 function finding(
   control: number,
   severity: QualysFindingSeverity,
-  _legacyStatus: QualysFindingStatus,
   summary: string,
   evidence: JsonRecord = {},
   decisionFacts: Readonly<Record<string, unknown>> = {},
@@ -2031,7 +2030,7 @@ function guardedFinding(input: VerdictInput): QualysFinding {
     parts.push(`Collect manually: ${input.manualEvidence}`);
   }
   // Bucket counts describe records that were read; once any input was denied or blocked they are unknown too.
-  return finding(input.control, input.severity, status, parts.join(" "), renderRecord({
+  return finding(input.control, input.severity, parts.join(" "), renderRecord({
     ...input.evidence,
     verdict_basis: input.status,
     manual_evidence: input.manualEvidence,
