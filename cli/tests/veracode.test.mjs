@@ -664,7 +664,12 @@ test("assessVeracodePolicyCompliance flags failing, unassigned, and default poli
 });
 
 test("flaw aging passes when complete finding lists contain only resolved findings", async () => {
-  const result = await assessVeracodeFindingsHygiene(mockClient(healthyFixture()), { now: NOW });
+  const fixture = healthyFixture();
+  fixture.findings = fixture.findings.map((item) => ({
+    ...item,
+    finding_status: { ...item.finding_status, status: "CLOSED", resolution_status: "APPROVED" },
+  }));
+  const result = await assessVeracodeFindingsHygiene(mockClient(fixture), { now: NOW });
   const finding = result.findings.find((item) => item.id === "VERACODE-03");
   assert.equal(finding.status, "pass");
   assert.equal(finding.evidence.open_findings_evaluated, 0);
