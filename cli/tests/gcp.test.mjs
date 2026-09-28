@@ -348,6 +348,9 @@ test("self-check (a): every endpoint forbidden yields only manual verdicts", asy
   const access = await checkGcpAccess(client);
   assert.equal(access.status, "limited");
   assert.ok(access.surfaces.every((surface) => surface.status === "not_readable"));
+  assert.match(access.recommendedNextStep, /roles\/storage\.bucketViewer/);
+  assert.match(access.recommendedNextStep, /storage\.buckets\.list/);
+  assert.doesNotMatch(access.recommendedNextStep, /roles\/storage\.admin \(read\)/);
 });
 
 test("self-check (b): empty inventories never pass except where emptiness is compliant by intent", async () => {
