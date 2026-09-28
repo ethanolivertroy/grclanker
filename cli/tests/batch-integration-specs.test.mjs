@@ -2,14 +2,32 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   evaluateBatchCheckVerdict,
-  evaluateObservedFindingStatus,
   materializeBatchCheckVerdict,
-  preserveRuntimeFindingStatus,
 } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import {
+  BOX_AUTH_RESOLVER,
+  DUO_AUTH_RESOLVER,
+  GWS_AUTH_RESOLVER,
+  OKTA_AUTH_RESOLVER,
+  SALESFORCE_AUTH_RESOLVER,
+  SERVICENOW_AUTH_RESOLVER,
+  SLACK_AUTH_RESOLVER,
+  ZENDESK_AUTH_RESOLVER,
+  ZOOM_AUTH_RESOLVER,
+} from "../dist/extensions/grc-tools/auth-resolver-contracts.js";
 import { BOX_RUNTIME_BEHAVIOR, BOX_SPEC } from "../dist/extensions/grc-tools/box.spec.js";
 import { DUO_RUNTIME_BEHAVIOR, DUO_SPEC } from "../dist/extensions/grc-tools/duo.spec.js";
 import { GWS_RUNTIME_BEHAVIOR, GWS_SPEC } from "../dist/extensions/grc-tools/gws.spec.js";
 import { OKTA_RUNTIME_BEHAVIOR, OKTA_SPEC } from "../dist/extensions/grc-tools/okta.spec.js";
+import { resolveOktaConfiguration } from "../dist/extensions/grc-tools/okta.js";
+import { resolveDuoConfiguration } from "../dist/extensions/grc-tools/duo.js";
+import { resolveGwsConfiguration } from "../dist/extensions/grc-tools/gws.js";
+import { resolveBoxConfiguration } from "../dist/extensions/grc-tools/box.js";
+import { resolveSlackConfiguration } from "../dist/extensions/grc-tools/slack.js";
+import { resolveZoomConfiguration } from "../dist/extensions/grc-tools/zoom.js";
+import { resolveZendeskConfiguration } from "../dist/extensions/grc-tools/zendesk.js";
+import { resolveSalesforceConfiguration } from "../dist/extensions/grc-tools/salesforce.js";
+import { resolveServicenowConfiguration } from "../dist/extensions/grc-tools/servicenow.js";
 import { SALESFORCE_RUNTIME_BEHAVIOR, SALESFORCE_SPEC } from "../dist/extensions/grc-tools/salesforce.spec.js";
 import { SERVICENOW_RUNTIME_BEHAVIOR, SERVICENOW_SPEC } from "../dist/extensions/grc-tools/servicenow.spec.js";
 import { SLACK_RUNTIME_BEHAVIOR, SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
@@ -65,32 +83,50 @@ test("every batch tool definition carries adjacent non-enumerable metadata witho
   }
 });
 
-test("ordered rules preserve runtime statuses byte-for-byte and enforce first-match precedence", () => {
-  for (const [spec] of batch) {
+test("Okta, Slack, and Zoom execute declared derived facts with ordered first-match precedence", () => {
+  for (const spec of [OKTA_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
     for (const check of spec.checks) {
-      if (usesExecutableEvidenceRules(check)) continue;
-      const emitted = new Set(check.criteria.rules.map((rule) => rule.status));
-      for (const status of emitted) {
-        const payload = { id: check.id, status, values: [null, 0, 25, 26] };
-        const before = JSON.stringify(payload);
-        payload.status = preserveRuntimeFindingStatus(spec, check.id, status);
-        assert.equal(JSON.stringify(payload), before, `${check.id}: ${status} byte identity`);
-        assert.equal(evaluateObservedFindingStatus(spec, check.id, status), status);
-      }
-      const named = (suffix) => Object.keys(check.derivedFacts).find((name) => name.endsWith(`_${suffix}`));
-      const readable = named("required_evidence_readable");
-      const complete = named("required_evidence_complete");
-      const failure = named("failure_matches");
-      if (emitted.has("fail")) {
-        assert.equal(evaluateVerdictCriteria(check.criteria, {
-          [readable]: true,
-          [complete]: false,
-          [failure]: true,
-        }), "fail", `${check.id}: proven failure wins over incomplete companion evidence`);
+      assert.ok(Object.keys(check.derivedFactRules ?? {}).length > 0, `${check.id}: executable derived facts`);
+      assert.ok(check.criteria.rules.every((entry) => entry.condition.op === "eq"), `${check.id}: outcomes consume derived branches`);
+      const nullFacts = Object.fromEntries(check.evidenceFields.map((name) => [name, null]));
+      assert.equal(evaluateCheckVerdict(check, {}), "manual", `${check.id}: missing evidence`);
+      assert.notEqual(evaluateCheckVerdict(check, nullFacts), "pass", `${check.id}: null evidence`);
+      assert.throws(
+        () => evaluateCheckVerdict(check, { ...nullFacts, legacy_selected_status: "pass" }),
+        new RegExp(`${check.id} received undeclared decision input`),
+      );
+    }
+  }
+});
+
+test("Okta, Slack, and Zoom decision inputs contain no preselected conclusion tokens", () => {
+  const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant|availability|available|enforcement|enforced)(?:_|$)/;
+  for (const spec of [OKTA_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+    for (const check of spec.checks) {
+      for (const inputName of check.evidenceFields) {
+        assert.doesNotMatch(inputName, forbidden, `${check.id}: ${inputName}`);
       }
     }
   }
-  assert.equal(preserveRuntimeFindingStatus(DUO_SPEC, DUO_SPEC.checks[0].id, "Info"), "Info");
+});
+
+test("Okta Info is an explicit evidence outcome and cannot be selected by a legacy label", () => {
+  const emptyOrigins = {
+    readable: true,
+    complete: true,
+    active_origin_count: 0,
+    insecure_active_count: 0,
+  };
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", emptyOrigins), "info");
+  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", emptyOrigins), "Info");
+  assert.throws(
+    () => evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", { ...emptyOrigins, manualLabel: "Manual" }),
+    /OKTA-INTEG-001 received undeclared decision input/,
+  );
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-INTEG-001", {
+    ...emptyOrigins,
+    active_origin_count: 1,
+  }), "pass");
 });
 
 test("every rule has boundary coverage and null, missing, denied, or unreadable evidence cannot pass", () => {
@@ -157,12 +193,12 @@ test("Okta executable rules ignore legacy status and use complete counts with or
     phishing_resistant_count: 1,
     strong_count: 1,
   };
-  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", phishingFacts, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", phishingFacts), "Pass");
   assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", {
     ...phishingFacts,
     phishing_resistant_count: 0,
     strong_count: 0,
-  }, "Pass"), "Fail");
+  }), "Fail");
   assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-006", {
     readable: true,
     complete: false,
@@ -174,16 +210,14 @@ test("Okta executable rules ignore legacy status and use complete counts with or
     complete: true,
     inventory_count: 26,
     policy_count: 26,
-    compliant_policy_count: 25,
-    all_policies_compliant: false,
+    gap_count: 1,
   }), "warn", "the complete 26-policy count, not a 25-item sample, controls the result");
   assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-003", {
     readable: true,
     complete: true,
     inventory_count: 25,
     policy_count: 25,
-    compliant_policy_count: 25,
-    all_policies_compliant: true,
+    gap_count: 0,
   }), "pass");
 });
 
@@ -296,26 +330,23 @@ test("Slack executable rules ignore legacy status and preserve boundaries, prece
   const legacyStatus = "pass";
   const uploadFacts = {
     preferences_readable: true,
-    setting_present: true,
+    setting_value: "disallow_all",
     coverage_complete: true,
-    verdict: "pass",
   };
   assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-APP-06", uploadFacts), "pass");
   assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-APP-06", {
     ...uploadFacts,
-    verdict: "fail",
+    setting_value: "allow_all",
   }), "fail", "mutating the preference evidence changes the verdict while the legacy status is held constant");
   assert.equal(legacyStatus, "pass");
   assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-MON-02", {
     audit_readable: true,
     audit_complete: true,
-    latest_age_known: true,
     latest_age_days: 1,
   }), "pass");
   assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-MON-02", {
     audit_readable: true,
     audit_complete: true,
-    latest_age_known: true,
     latest_age_days: 1.01,
   }), "fail", "audit recency fails strictly above one day");
   assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-ADMIN-01", {
@@ -335,22 +366,34 @@ test("Slack executable rules ignore legacy status and preserve boundaries, prece
 
 test("Zoom executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
   const legacyStatus = "pass";
-  const meetingFacts = { available: true, compliant: true, enforced: true };
+  const meetingFacts = {
+    settings_readable: true,
+    setting_present: true,
+    setting_value: true,
+    lock_value: true,
+    relaxing_group_count: 0,
+    group_list_state: "ok",
+    unreadable_group_setting_count: 0,
+    group_list_truncated: false,
+  };
   assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-MTG-01", meetingFacts), "pass");
   assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-MTG-01", {
     ...meetingFacts,
-    compliant: false,
-    enforced: false,
+    setting_value: false,
   }), "fail", "mutating the meeting setting changes the verdict while the legacy status is held constant");
   assert.equal(legacyStatus, "pass");
   assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-ID-04", {
-    available: true,
+    roles_readable: true,
+    admin_role_count: 1,
+    member_read_denied: false,
     complete: true,
     admin_count: 5,
     max_admins: 5,
   }), "pass");
   assert.equal(evaluateBatchCheckVerdict(ZOOM_SPEC, "ZOOM-ID-04", {
-    available: true,
+    roles_readable: true,
+    admin_role_count: 1,
+    member_read_denied: false,
     complete: true,
     admin_count: 6,
     max_admins: 5,
@@ -596,6 +639,71 @@ test("contracts enumerate exact surfaces, permission unlocks, framework mappings
   }
   assert.ok(!SERVICENOW_SPEC.authentication.modes.some((mode) => /mtls/i.test(mode)));
   assert.ok(SERVICENOW_SPEC.knownGaps.some((gap) => /reject.*unsupported-mode/i.test(gap)));
+});
+
+test("all-nine authentication environment names exactly match the variables read by each resolver", async () => {
+  const trackedEnvironment = (values = {}) => {
+    const accessed = new Set();
+    const env = new Proxy(values, {
+      get(target, property) {
+        if (typeof property === "string" && /^[A-Z][A-Z0-9_]+$/.test(property)) accessed.add(property);
+        return target[property];
+      },
+    });
+    return { env, accessed };
+  };
+  const cases = [
+    [OKTA_SPEC, OKTA_AUTH_RESOLVER, resolveOktaConfiguration, {
+      OKTA_CLIENT_ORGURL: "https://example.okta.com",
+      OKTA_CLIENT_TOKEN: "token-value",
+    }, [{}, undefined, "/tmp/grclanker-auth-contract", "/tmp/grclanker-auth-contract"]],
+    [DUO_SPEC, DUO_AUTH_RESOLVER, resolveDuoConfiguration, {
+      DUO_API_HOST: "api-example.duosecurity.com",
+      DUO_IKEY: "integration-key",
+      DUO_SKEY: "secret-key",
+    }, []],
+    [GWS_SPEC, GWS_AUTH_RESOLVER, resolveGwsConfiguration, {
+      GWS_AUTH_MODE: "access_token",
+      GWS_ACCESS_TOKEN: "access-token",
+    }, []],
+    [BOX_SPEC, BOX_AUTH_RESOLVER, resolveBoxConfiguration, {
+      BOX_ACCESS_TOKEN: "access-token",
+    }, [{}, undefined, { cwd: "/tmp/grclanker-auth-contract", homeDir: "/tmp/grclanker-auth-contract" }]],
+    [SLACK_SPEC, SLACK_AUTH_RESOLVER, resolveSlackConfiguration, {
+      SLACK_USER_TOKEN: "xoxp-test-token",
+    }, []],
+    [ZOOM_SPEC, ZOOM_AUTH_RESOLVER, resolveZoomConfiguration, {
+      ZOOM_ACCOUNT_ID: "account-id",
+      ZOOM_TOKEN: "access-token",
+    }, []],
+    [ZENDESK_SPEC, ZENDESK_AUTH_RESOLVER, resolveZendeskConfiguration, {
+      ZENDESK_SUBDOMAIN: "example",
+      ZENDESK_OAUTH_TOKEN: "oauth-token",
+    }, [{}, undefined, "/tmp/grclanker-auth-contract"]],
+    [SALESFORCE_SPEC, SALESFORCE_AUTH_RESOLVER, resolveSalesforceConfiguration, {
+      SF_INSTANCE_URL: "https://example.my.salesforce.com",
+      SF_ACCESS_TOKEN: "access-token",
+    }, []],
+    [SERVICENOW_SPEC, SERVICENOW_AUTH_RESOLVER, resolveServicenowConfiguration, {
+      SERVICENOW_INSTANCE: "example",
+      SERVICENOW_USERNAME: "audit-user",
+      SERVICENOW_PASSWORD: "password-value",
+    }, [{}, undefined, { cwd: "/tmp/grclanker-auth-contract", homeDir: "/tmp/grclanker-auth-contract" }]],
+  ];
+  for (const [spec, resolverContract, resolver, values, extraArguments] of cases) {
+    const { env, accessed } = trackedEnvironment(values);
+    const args = extraArguments.length > 0 ? [...extraArguments] : [{}];
+    args[1] = env;
+    await resolver(...args);
+    assert.deepEqual(
+      [...accessed].sort(),
+      [...resolverContract.environment].sort(),
+      `${spec.identity.slug}: no missing or invented resolver environment names`,
+    );
+    assert.deepEqual(spec.authentication.environmentVariables, resolverContract.environment);
+    assert.deepEqual(spec.authentication.configLocations, resolverContract.configLocations);
+    assert.deepEqual(spec.authentication.configFields, resolverContract.configFields);
+  }
 });
 
 test("batch export schemas cover every required and conditional bundle path", () => {
