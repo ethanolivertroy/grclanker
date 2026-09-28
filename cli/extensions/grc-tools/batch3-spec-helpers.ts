@@ -46,7 +46,7 @@ export function batch3Source(
 
 export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinition[] {
   return batch2Checks(rows.map((row): Batch2CheckRow => {
-    const decisionInputs = row.decisionInputs ?? batch2GenericDecisionInputs(row.predicate);
+    const decisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : batch2GenericDecisionInputs(row.predicate));
     const completenessSources = row.completenessSources
       ?? row.surfaces.map((surfaceId) => batch3Source(surfaceId));
     return {

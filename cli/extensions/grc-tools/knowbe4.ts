@@ -21,7 +21,13 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
+import { KNOWBE4_SPEC } from "./knowbe4.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -164,6 +170,19 @@ export const KNOWBE4_CONTROLS: readonly Knowbe4ControlDefinition[] = [
   controlDefinition(19, "Phishing report rate", "phishing", ["AT-2(1)", "L2 3.2.3", "CC1.4", "14.4", "12.6.3.1", "SRG-APP-000516", "ISM-0252", "HR-03"]),
   controlDefinition(20, "Campaign scheduling regularity", "phishing", ["AT-2", "L2 3.2.1", "CC1.4", "14.1", "12.6.2", "SRG-APP-000516", "ISM-0252", "HR-01"]),
 ];
+
+hydrateBatchFrameworkMappings(KNOWBE4_SPEC, Object.fromEntries(
+  KNOWBE4_CONTROLS.map((control) => [findingId(control.number), {
+    fedramp: [control.frameworks.fedramp],
+    cmmc: [control.frameworks.cmmc],
+    soc2: [control.frameworks.soc2],
+    cis: [control.frameworks.cis_v8],
+    pci_dss: [control.frameworks.pci_dss],
+    disa_stig: [control.frameworks.disa_stig],
+    irap: [control.frameworks.irap],
+    ismap: [control.frameworks.ismap],
+  }]),
+));
 
 export interface Knowbe4ResolvedConfig {
   apiToken: string;
@@ -2230,12 +2249,22 @@ function finding(
   manualEvidence?: string,
 ): Knowbe4Finding {
   const definition = controlById(number);
+  const id = findingId(number);
+  const facts = {
+    evidence_readable: status !== "manual",
+    evidence_complete: status !== "manual",
+    inventory_count: 1,
+    violation_count: status === "fail" ? 1 : 0,
+    review_count: status === "warn" ? 1 : 0,
+  };
   return {
-    id: findingId(number),
+    id,
     control: number,
     title: definition.title,
     severity,
-    status,
+    status: number === 15
+      ? "manual"
+      : evaluateBatchRuntimeCheckVerdict(KNOWBE4_SPEC, id, facts) as Knowbe4Finding["status"],
     summary,
     evidence,
     mappings: knowbe4ControlMappings(number),
@@ -4589,6 +4618,7 @@ function assessmentTool(
 }
 
 export function registerKnowbe4Tools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, KNOWBE4_SPEC);
   pi.registerTool({
     name: "knowbe4_check_access",
     label: "Check KnowBe4 audit access",
