@@ -399,8 +399,8 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     inputs: input("streams_readable", "hooks_readable", "complete", "active_stream_count", "active_hook_count"),
     rules: ordered({
       manual: any(
-        all(eq("streams_readable", false), eq("hooks_readable", false)),
-        all(eq("streams_readable", false), eq("active_hook_count", 0)),
+        all(ne("streams_readable", true), ne("hooks_readable", true)),
+        all(ne("streams_readable", true), eq("active_hook_count", 0)),
       ),
       fail: all(eq("active_stream_count", 0), eq("active_hook_count", 0)),
       warn: any(incomplete, eq("active_stream_count", 0)),

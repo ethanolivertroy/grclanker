@@ -518,7 +518,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-INTEG-006` | 3 | warn | any of (`complete` does not equal true; `provisioning_app_count` equals 0) |  |
 | `OKTA-INTEG-006` | 4 | pass | `deactivation_app_count` is greater than 0 |  |
 | `OKTA-INTEG-006` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `OKTA-MON-001` | 1 | manual | any of (all of (`streams_readable` equals false; `hooks_readable` equals false); all of (`streams_readable` equals false; `active_hook_count` equals 0)) |  |
+| `OKTA-MON-001` | 1 | manual | any of (all of (`streams_readable` does not equal true; `hooks_readable` does not equal true); all of (`streams_readable` does not equal true; `active_hook_count` equals 0)) |  |
 | `OKTA-MON-001` | 2 | fail | all of (`active_stream_count` equals 0; `active_hook_count` equals 0) |  |
 | `OKTA-MON-001` | 3 | warn | any of (`complete` does not equal true; `active_stream_count` equals 0) |  |
 | `OKTA-MON-001` | 4 | pass | `active_stream_count` is greater than 0 |  |
