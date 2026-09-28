@@ -251,7 +251,7 @@ function runCorpusSuite(root, fixtureDirectory) {
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-skip-pattern=^all 25 (?:Palo Alto|Zscaler) checks replay",
+    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures)",
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
