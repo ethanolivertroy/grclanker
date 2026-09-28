@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { BOX_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const BOX_SURFACES = [
@@ -414,15 +415,7 @@ export const BOX_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped Box identity, sharing, governance, Shield, and monitoring assessments.",
   sourceModule: "cli/extensions/grc-tools/box.ts",
   baseServices: ["Box Content API", "Box OAuth 2.0 token service"],
-  authentication: {
-    modes: ["JWT server authentication", "Client Credentials Grant", "OAuth refresh token", "Explicit access token"],
-    precedence: ["Explicit arguments", "Explicit config path", "Box inspector config", "BOX_* environment variables"],
-    environment: ["BOX_CLIENT_ID", "BOX_CLIENT_SECRET", "BOX_ENTERPRISE_ID", "BOX_ACCESS_TOKEN", "BOX_REFRESH_TOKEN", "BOX_JWT_CONFIG"],
-    configLocations: ["~/.box-sec-inspector/config.yaml"],
-    variants: ["Enterprise or user subject", "JWT RS256, RS384, or RS512 assertion"],
-    configFields: ["clientId", "clientSecret", "enterpriseId", "subjectType", "subjectId", "accessToken", "refreshToken", "jwt"],
-    refreshRequest: "POST https://api.box.com/oauth2/token using the selected JWT, client_credentials, or refresh_token grant.",
-  },
+  authentication: BOX_AUTH_RESOLVER,
   permissions: [
     { id: "box-enterprise-read", kind: "role", value: "Box application scopes and enterprise authorization for users, groups, events, governance, and enterprise configuration", unlocks: BOX_SURFACES.map((surface) => surface.id) },
     { id: "box-governance", kind: "license", value: "Box Governance entitlement", unlocks: ["retention-policies", "retention-assignments", "legal-hold-policies", "legal-hold-assignments"] },

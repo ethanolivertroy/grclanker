@@ -4,6 +4,7 @@ import {
   deriveDecisionRules,
   type BatchCheckDefinition,
 } from "./batch-spec-builder.js";
+import { SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const SLACK_SURFACES = [
@@ -298,14 +299,7 @@ export const SLACK_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped Slack Enterprise Grid identity, administration, app, channel, and monitoring assessments.",
   sourceModule: "cli/extensions/grc-tools/slack.ts",
   baseServices: ["Slack Web API", "Slack Admin API", "Slack SCIM API", "Slack Audit Logs API"],
-  authentication: {
-    modes: ["User OAuth token", "Bot OAuth token", "SCIM bearer token"],
-    precedence: ["Explicit tool arguments", "Explicit config file", "SLACK_* environment variables"],
-    environment: ["SLACK_USER_TOKEN", "SLACK_BOT_TOKEN", "SLACK_SCIM_TOKEN", "SLACK_ORG_ID", "SLACK_CONFIG_FILE"],
-    configLocations: ["~/.config/grclanker/slack.json"],
-    variants: ["Enterprise Grid org token plus optional bot and SCIM credentials"],
-    configFields: ["token", "botToken", "scimToken", "orgId", "webApiBaseUrl", "scimBaseUrl", "auditBaseUrl"],
-  },
+  authentication: SLACK_AUTH_RESOLVER,
   permissions: [
     { id: "users-read", kind: "oauth-scope", value: "users:read", unlocks: ["users"] },
     { id: "admin-teams-read", kind: "oauth-scope", value: "admin.teams:read", unlocks: ["workspaces", "workspace-settings", "workspace-admins", "team-preferences"] },

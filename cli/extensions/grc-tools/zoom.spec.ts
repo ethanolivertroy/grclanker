@@ -4,6 +4,7 @@ import {
   deriveDecisionRules,
   type BatchCheckDefinition,
 } from "./batch-spec-builder.js";
+import { ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const ZOOM_SURFACES = [
@@ -359,15 +360,7 @@ export const ZOOM_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped Zoom identity, collaboration-governance, and meeting-security assessments.",
   sourceModule: "cli/extensions/grc-tools/zoom.ts",
   baseServices: ["Zoom REST API", "Zoom Server-to-Server OAuth"],
-  authentication: {
-    modes: ["Server-to-Server OAuth client credentials", "Explicit access token"],
-    precedence: ["Explicit access token", "Explicit account/client credentials", "Config file", "ZOOM_* environment variables"],
-    environment: ["ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET", "ZOOM_ACCESS_TOKEN", "ZOOM_BASE_URL"],
-    configLocations: [".zoom.json", ".grclanker-zoom.json"],
-    variants: ["Master or sub-account ID supplied explicitly"],
-    configFields: ["accountId", "clientId", "clientSecret", "accessToken", "baseUrl", "oauthBaseUrl", "timeoutMs"],
-    refreshRequest: "POST /oauth/token?grant_type=account_credentials&account_id={accountId} with client Basic authentication.",
-  },
+  authentication: ZOOM_AUTH_RESOLVER,
   permissions: [
     { id: "account-settings-read", kind: "oauth-scope", value: "account:read:admin", unlocks: ["account-settings", "account-lock-settings", "managed-domains", "trusted-domains"] },
     { id: "users-read", kind: "oauth-scope", value: "user:read:list_users:admin", unlocks: ["current-user", "users", "user-settings"] },

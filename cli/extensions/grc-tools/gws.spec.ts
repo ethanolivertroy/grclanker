@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { GWS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const GWS_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
@@ -349,15 +350,7 @@ export const GWS_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped Google Workspace tenant inspector, distinct from the gws operator bridge.",
   sourceModule: "cli/extensions/grc-tools/gws.ts",
   baseServices: ["Admin SDK Directory API", "Admin SDK Reports API", "Alert Center API", "Cloud Identity API"],
-  authentication: {
-    modes: ["Service-account JWT assertion with domain-wide delegation", "Explicit access tokens for directory/reporting and Cloud Identity policy reads"],
-    precedence: ["Explicit tool arguments and tokens", "Explicit service-account JSON", "GOOGLE_* and GWS_* environment variables"],
-    environment: ["GOOGLE_APPLICATION_CREDENTIALS", "GWS_SERVICE_ACCOUNT_FILE", "GWS_ADMIN_EMAIL", "GWS_CUSTOMER_ID", "GWS_ACCESS_TOKEN", "GWS_POLICY_ACCESS_TOKEN"],
-    configLocations: ["Service-account JSON supplied by path"],
-    variants: ["my_customer alias or explicit customer ID", "Separate delegated subject and Cloud Identity policy token"],
-    configFields: ["client_email", "private_key", "private_key_id", "adminEmail", "customerId", "accessToken", "policyAccessToken"],
-    refreshRequest: "POST https://oauth2.googleapis.com/token with a signed JWT bearer grant and delegated administrator subject.",
-  },
+  authentication: GWS_AUTH_RESOLVER,
   permissions: [
     { id: "directory-users-read", kind: "oauth-scope", value: "https://www.googleapis.com/auth/admin.directory.user.readonly", unlocks: ["directory-users"] },
     { id: "directory-roles-read", kind: "oauth-scope", value: "https://www.googleapis.com/auth/admin.directory.rolemanagement.readonly", unlocks: ["roles", "role-assignments"] },

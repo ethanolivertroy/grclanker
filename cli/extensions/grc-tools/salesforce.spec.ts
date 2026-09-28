@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const SALESFORCE_SURFACES = [
@@ -244,15 +245,7 @@ export const SALESFORCE_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped Salesforce platform, identity, data-protection, and monitoring assessments.",
   sourceModule: "cli/extensions/grc-tools/salesforce.ts",
   baseServices: ["Salesforce REST API", "Salesforce Tooling API", "Salesforce Metadata API"],
-  authentication: {
-    modes: ["JWT bearer", "username/password plus security token", "OAuth refresh token", "explicit access token"],
-    precedence: ["Explicit access token and instance URL", "Explicit refresh token", "Explicit JWT credentials", "Password grant", "Credentials file and SF_* environment variables"],
-    environment: ["SF_INSTANCE_URL", "SF_LOGIN_URL", "SF_USERNAME", "SF_PASSWORD", "SF_SECURITY_TOKEN", "SF_CONSUMER_KEY", "SF_CONSUMER_SECRET", "SF_PRIVATE_KEY", "SF_REFRESH_TOKEN", "SF_ACCESS_TOKEN"],
-    configLocations: ["Explicit credentials JSON file"],
-    variants: ["Production login", "Sandbox login", "Custom My Domain login"],
-    configFields: ["instanceUrl", "loginUrl", "username", "password", "securityToken", "consumerKey", "consumerSecret", "privateKey", "refreshToken", "accessToken", "apiVersion"],
-    refreshRequest: "POST /services/oauth2/token with the selected JWT bearer, refresh_token, or password grant.",
-  },
+  authentication: SALESFORCE_AUTH_RESOLVER,
   permissions: [
     { id: "api-enabled", kind: "role", value: "API Enabled", unlocks: SALESFORCE_SURFACES.filter((surface) => surface.service !== "Salesforce Metadata API").map((surface) => surface.id) },
     { id: "view-setup", kind: "role", value: "View Setup and Configuration", unlocks: ["organization", "users", "profiles", "permission-sets", "permission-set-assignments", "field-permissions", "tenant-secrets", "certificates", "connected-applications", "oauth-tokens", "caller-permissions", "setup-audit-trail"] },

@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const tableSurface = (id: string, table: string, fields: readonly string[]) => ({
@@ -264,15 +265,7 @@ export const SERVICENOW_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped ServiceNow identity, hardening, access-control, and operations-governance assessments.",
   sourceModule: "cli/extensions/grc-tools/servicenow.ts",
   baseServices: ["ServiceNow Table API", "ServiceNow Aggregate API", "ServiceNow OAuth token endpoint"],
-  authentication: {
-    modes: ["Basic username and password", "OAuth client credentials or refresh token", "Explicit OAuth access token"],
-    precedence: ["Explicit access token", "Explicit OAuth client credentials or refresh token", "Explicit Basic credentials", "Config file", "SERVICENOW_* environment variables"],
-    environment: ["SERVICENOW_INSTANCE", "SERVICENOW_USERNAME", "SERVICENOW_PASSWORD", "SERVICENOW_CLIENT_ID", "SERVICENOW_CLIENT_SECRET", "SERVICENOW_ACCESS_TOKEN", "SERVICENOW_REFRESH_TOKEN"],
-    configLocations: ["~/.servicenow-sec-inspector/config.yaml"],
-    variants: ["Instance name or explicit HTTPS instance URL"],
-    configFields: ["instanceUrl", "instanceName", "authMode", "username", "password", "clientId", "clientSecret", "accessToken", "refreshToken", "pageSize"],
-    refreshRequest: "POST /oauth_token.do with client_credentials or refresh_token form fields.",
-  },
+  authentication: SERVICENOW_AUTH_RESOLVER,
   permissions: [
     { id: "table-read", kind: "role", value: "Table API read ACLs for every listed table", unlocks: SERVICENOW_SURFACES.filter((surface) => surface.service === "ServiceNow Table API").map((surface) => surface.id), notes: "The exact ServiceNow roles are instance-specific because table and field ACLs can be customized." },
     { id: "aggregate-read", kind: "role", value: "Aggregate API count ACLs matching the Table API population", unlocks: SERVICENOW_SURFACES.filter((surface) => surface.service === "ServiceNow Aggregate API").map((surface) => surface.id) },

@@ -5,6 +5,7 @@ import {
   type BatchCheckDefinition,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
+import { OKTA_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const OKTA_SURFACES: readonly BatchSurfaceDefinition[] = [
@@ -530,15 +531,7 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped read-only Okta identity, administrator, integration, and monitoring assessments.",
   sourceModule: "cli/extensions/grc-tools/okta.ts",
   baseServices: ["Okta Management API", "Okta OAuth 2.0"],
-  authentication: {
-    modes: ["SSWS API token", "OAuth service application private-key JWT", "prebuilt client assertion"],
-    precedence: ["Explicit tool arguments", "Explicit config file", "Okta CLI-style config files", "OKTA_* environment variables"],
-    environment: ["OKTA_ORG_URL", "OKTA_CLIENT_ORGURL", "OKTA_API_TOKEN", "OKTA_CLIENT_TOKEN", "OKTA_CLIENT_ID", "OKTA_CLIENT_PRIVATEKEY", "OKTA_CLIENT_PRIVATEKEY_ID"],
-    configLocations: [".okta.yaml", "~/.okta/okta.yaml"],
-    variants: ["Commercial, preview, and custom Okta organization origins"],
-    configFields: ["orgUrl", "token", "clientId", "privateKey", "privateKeyId", "clientAssertion", "scopes"],
-    refreshRequest: "POST /oauth2/v1/token with the client_credentials grant and a private_key_jwt assertion.",
-  },
+  authentication: OKTA_AUTH_RESOLVER,
   permissions: [
     ...[
       "okta.users.read", "okta.groups.read", "okta.apps.read", "okta.authenticators.read",

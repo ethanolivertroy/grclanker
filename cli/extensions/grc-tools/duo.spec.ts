@@ -4,6 +4,7 @@ import {
   type BatchCheckDefinition,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
+import { DUO_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const DUO_SURFACES: readonly BatchSurfaceDefinition[] = [
@@ -508,14 +509,7 @@ export const DUO_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped Duo authentication, administrator, protected-application, and monitoring assessments.",
   sourceModule: "cli/extensions/grc-tools/duo.ts",
   baseServices: ["Duo Admin API"],
-  authentication: {
-    modes: ["Duo Admin API HMAC integration key and secret key"],
-    precedence: ["Explicit tool arguments", "Explicit config file", "DUO_* environment variables"],
-    environment: ["DUO_IKEY", "DUO_SKEY", "DUO_API_HOSTNAME", "DUO_CONFIG_FILE"],
-    configLocations: ["Explicit JSON or YAML config file"],
-    variants: ["Commercial and FedRAMP Duo API hostnames selected by api_hostname"],
-    configFields: ["integrationKey", "secretKey", "apiHostname", "timeoutMs"],
-  },
+  authentication: DUO_AUTH_RESOLVER,
   permissions: [
     { id: "resource-read", kind: "role", value: "Grant resource - Read", unlocks: ["global-policy", "policies", "users", "bypass-codes", "webauthn-credentials", "integrations", "offline-enrollment-logs"] },
     { id: "admins-read", kind: "role", value: "Grant administrators - Read", unlocks: ["admins", "admin-auth-methods"] },

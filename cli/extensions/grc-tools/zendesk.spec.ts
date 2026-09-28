@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import { ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const zendeskSurface = (id: string, path: string, fields: readonly string[]) => ({
@@ -368,14 +369,7 @@ export const ZENDESK_SPEC = buildBatchIntegrationSpec({
   summary: "Portable contract for the shipped Zendesk authentication, access-control, data-protection, and integration assessments.",
   sourceModule: "cli/extensions/grc-tools/zendesk.ts",
   baseServices: ["Zendesk Support API"],
-  authentication: {
-    modes: ["API token with email Basic authentication", "OAuth bearer token"],
-    precedence: ["Explicit OAuth token", "Explicit API token and email", "Explicit config file", "ZENDESK_* environment variables"],
-    environment: ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN", "ZENDESK_OAUTH_TOKEN", "ZENDESK_CONFIG_FILE"],
-    configLocations: ["~/.zendesk/config.json"],
-    variants: ["Zendesk subdomain or explicit same-origin API base URL"],
-    configFields: ["subdomain", "email", "apiToken", "oauthToken", "baseUrl", "timeoutMs"],
-  },
+  authentication: ZENDESK_AUTH_RESOLVER,
   permissions: [
     { id: "agent-role", kind: "role", value: "Zendesk agent", unlocks: ["current-user", "team-members", "groups", "group-memberships"] },
     { id: "admin-role", kind: "role", value: "Zendesk administrator", unlocks: ZENDESK_SURFACES.filter((surface) => !["custom-roles", "audit-logs-recent", "audit-log-oldest", "api-token-audit-logs"].includes(surface.id)).map((surface) => surface.id), notes: "Individual endpoint and plan entitlements still apply." },
