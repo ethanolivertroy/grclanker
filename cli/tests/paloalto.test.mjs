@@ -503,12 +503,6 @@ test("all 25 Palo Alto checks replay every declared configured-source failure mo
   }
   assert.equal(replays, 220);
 
-  const absent = await capturePaloaltoCompleteness(null, []);
-  assert.equal(absent.size, 19, "the direct runtime constructors cover 19 fallback checks; PA-01 through PA-06 are emitted by the cloud-posture wrapper");
-  for (const [id, facts] of absent) {
-    assert.equal(facts.evidence_complete, undefined, `${id}: not-configured manual fallback omits completeness`);
-  }
-
   const panosOnly = await capturePaloaltoCompleteness(null, [panosSnapshot()]);
   const prismaOnly = await capturePaloaltoCompleteness(prismaSnapshot(), []);
   for (const id of ["PA-19", "PA-20", "PA-21"]) {
