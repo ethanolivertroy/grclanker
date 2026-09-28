@@ -1479,12 +1479,14 @@ test("access control findings flag truncated key and shared dashboard inventorie
   assert.equal(sharing.evidence.shared_dashboards, null);
   assert.equal(sharing.evidence.shared_dashboards_seen, 2000);
   assert.equal(sharing.evidence.shared_dashboard_titles, null);
-  assert.deepEqual(sharing.evidence.verdict_caveats, ["shared_dashboards inventory is truncated at 2000 items (2000 of an unknown total loaded; raise the dashboard limit), so the verdict covers a partial view and violators from it are neither counted nor named."]);
+  assert.deepEqual(sharing.evidence.verdict_caveats, ["shared_dashboards inventory is truncated at 2000 items (2000 of an unknown total loaded; inspect the full inventory manually in Dashboards > Shared Dashboards with each share type), so the verdict covers a partial view and violators from it are neither counted nor named."]);
   assert.equal(result.summary.api_keys, null);
   assert.equal(result.summary.api_keys_seen, 20);
   assert.equal(result.summary.shared_dashboards, null);
   assert.equal(result.summary.shared_dashboards_seen, 2000);
-  assert.ok(result.errors.some((error) => /shared_dashboards: inventory truncated at 2000 items/.test(error)));
+  const dashboardTruncation = result.errors.find((error) => error.startsWith("shared_dashboards: inventory truncated"));
+  assert.match(dashboardTruncation, /inspect the full inventory manually in Dashboards > Shared Dashboards with each share type$/);
+  assert.doesNotMatch(dashboardTruncation, /raise .*limit/);
 });
 
 test("assessDatadogSecurityMonitoring passes with enabled rules, clean signals, CSPM, coverage, and routed monitors", async () => {
@@ -1923,8 +1925,10 @@ test("DD-20 warns on indexes without a retention value and flags truncated org c
   assert.equal(connections.evidence.org_connection_sample, null);
   assert.match(connections.summary, /an uncounted number of cross-org connections read share data with other orgs/);
   assert.equal(truncated.summary.org_connections, null);
-  assert.match(connections.evidence.verdict_caveats[0], /org_connections inventory is truncated at 10000 items/);
-  assert.ok(truncated.errors.some((error) => /org_connections: inventory truncated at 10000 items/.test(error)));
+  assert.equal(connections.evidence.verdict_caveats[0], "org_connections inventory is truncated at 10000 items (10000 of an unknown total loaded; inspect the full inventory manually in Organization Settings > Org Connections), so the verdict covers a partial view and violators from it are neither counted nor named.");
+  const connectionTruncation = truncated.errors.find((error) => error.startsWith("org_connections: inventory truncated"));
+  assert.match(connectionTruncation, /inspect the full inventory manually in Organization Settings > Org Connections$/);
+  assert.doesNotMatch(connectionTruncation, /raise .*limit/);
 });
 
 test("DD-07 and DD-10 are manual when one of their surfaces is unreadable and warn on undated events", async () => {
@@ -2917,7 +2921,8 @@ test("exportDatadogAuditBundle writes collection_status.json with readable, comp
 
   const errorLog = readFileSync(join(result.outputDir, "_errors.log"), "utf8");
   assert.match(errorLog, /users: inventory truncated at 50 items \(50 of an unknown total loaded; more than 50 items exist\); raise user_limit to inspect the full list/);
-  assert.match(errorLog, /org_connections: inventory truncated at 10000 items \(10000 of 12000 loaded; the listing stopped early\); raise the org connection limit/);
+  assert.match(errorLog, /org_connections: inventory truncated at 10000 items \(10000 of 12000 loaded; the listing stopped early\); inspect the full inventory manually in Organization Settings > Org Connections/);
+  assert.doesNotMatch(errorLog, /raise (?:the )?(?:dashboard|org connection) limit/);
   const findings = JSON.parse(readFileSync(join(result.outputDir, "analysis", "findings.json"), "utf8"));
   const cspm = findings.find((item) => item.id === "DD-12");
   assert.equal(cspm.status, "warn");
@@ -2929,7 +2934,7 @@ test("exportDatadogAuditBundle writes collection_status.json with readable, comp
   const orgSettings = findings.find((item) => item.id === "DD-20");
   assert.equal(orgSettings.status, "warn");
   // DD-20 already warns on the readable inventories, so the truncation caveat is recorded in evidence rather than re-demoting the verdict.
-  assert.match(orgSettings.evidence.verdict_caveats.join(" "), /org_connections inventory is truncated at 10000 items \(10000 of 12000 loaded; raise the org connection limit\)/);
+  assert.match(orgSettings.evidence.verdict_caveats.join(" "), /org_connections inventory is truncated at 10000 items \(10000 of 12000 loaded; inspect the full inventory manually in Organization Settings > Org Connections\)/);
 });
 
 test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
@@ -2965,6 +2970,26 @@ test("Datadog tools are registered in the tool catalog under the Datadog group",
     const tool = tools.find((candidate) => candidate.name === name);
     assert.ok(tool.parameterSummaries.some((parameter) => parameter.name === "key_limit"), `${name} accepts key_limit`);
   }
+});
+
+test("Datadog truncation remediation only names limit arguments exposed by each tool schema", () => {
+  const registered = [];
+  registerDatadogTools({ registerTool: (tool) => registered.push(tool) });
+  const limitArgumentsByTool = new Map(registered.map((tool) => [
+    tool.name,
+    Object.keys(tool.parameters.properties).filter((name) => name.endsWith("_limit")).sort(),
+  ]));
+
+  assert.deepEqual(Object.fromEntries(limitArgumentsByTool), {
+    datadog_check_access: [],
+    datadog_assess_identity: ["key_limit", "role_limit", "user_limit"],
+    datadog_assess_access_controls: ["key_limit"],
+    datadog_assess_security_monitoring: ["finding_limit", "monitor_limit", "rule_limit", "signal_limit"],
+    datadog_assess_data_protection: [],
+    datadog_export_audit_bundle: ["finding_limit", "key_limit", "monitor_limit", "role_limit", "rule_limit", "signal_limit", "user_limit"],
+  });
+  assert.ok(registered.every((tool) => !("dashboard_limit" in tool.parameters.properties)));
+  assert.ok(registered.every((tool) => !("org_connection_limit" in tool.parameters.properties)));
 });
 
 // ---------------------------------------------------------------------------------------------------------------
