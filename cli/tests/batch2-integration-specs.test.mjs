@@ -186,7 +186,7 @@ test("batch 2 generic decisions use complete source counts and preserve violatio
   }
 });
 
-test("portable numeric operands reject booleans and numeric strings", () => {
+test("portable subtract operands reject booleans and numeric strings without changing legacy comparisons", () => {
   const check = checkContract(PALOALTO_SPEC, "PA-01");
   const base = {
     evidence_readable: true,
@@ -195,8 +195,18 @@ test("portable numeric operands reject booleans and numeric strings", () => {
     total_resource_count: 100,
   };
   assert.equal(evaluateCheckVerdict(check, { ...base, minimum_pass_rate_percent: 90 }), "fail");
-  assert.equal(evaluateCheckVerdict(check, { ...base, minimum_pass_rate_percent: "90" }), "manual");
-  assert.equal(evaluateCheckVerdict(check, { ...base, minimum_pass_rate_percent: true }), "manual");
+  assert.equal(evaluateCheckVerdict(check, { ...base, minimum_pass_rate_percent: "90" }), "warn");
+  const booleanSubtractCheck = {
+    ...check,
+    criteria: {
+      ...check.criteria,
+      constants: {
+        ...check.criteria.constants,
+        warning_margin_percentage_points: true,
+      },
+    },
+  };
+  assert.equal(evaluateCheckVerdict(booleanSubtractCheck, { ...base, minimum_pass_rate_percent: 90 }), "warn");
 });
 
 test("batch 2 configurable and numeric decision boundaries execute below, equal, and above", () => {
