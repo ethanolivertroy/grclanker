@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const ZOOM_SURFACES = [
   ["current-user", "/v2/users/me"], ["account-settings", "/v2/accounts/{accountId}/settings"],
@@ -88,6 +89,48 @@ const decisions = [
   "return pass when every participant sees the recording disclaimer, warn for guest-only, unknown, or group-relaxed settings, fail when the legacy disclaimer is explicitly false, and manual when no documented setting is exposed.",
 ] as const;
 
+interface ZoomExecutableDecision { inputs: Readonly<Record<string, string>>; rules: readonly VerdictRule[] }
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const cmp = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry: PortableValue): VerdictCondition => ({ op, left: path(name), right: value(entry) });
+const eq = (name: string, entry: PortableValue) => cmp("eq", name, entry);
+const ne = (name: string, entry: PortableValue) => cmp("ne", name, entry);
+const gt = (name: string, entry: PortableValue) => cmp("gt", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from complete collector state before evidence samples are capped.`]));
+const standard = (): ZoomExecutableDecision => ({
+  inputs: input("available", "compliant", "enforced"),
+  rules: [rule("manual", ne("available", true)), rule("fail", ne("compliant", true)), rule("warn", ne("enforced", true)), rule("pass", eq("enforced", true)), rule("manual", { op: "always" })],
+});
+const manual = (): ZoomExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
+const inventory = (empty: "manual" | "warn", bad: "fail" | "warn"): ZoomExecutableDecision => ({
+  inputs: input("readable", "complete", "count", "bad_count"),
+  rules: [rule("manual", ne("readable", true)), rule(empty, eq("count", 0)), rule(bad, gt("bad_count", 0)), rule("warn", ne("complete", true)), rule("pass", { op: "always" })],
+});
+const ZOOM_EXECUTABLE_DECISIONS: Readonly<Record<string, ZoomExecutableDecision>> = {
+  "ZOOM-ID-01": inventory("manual", "fail"),
+  "ZOOM-ID-02": standard(),
+  "ZOOM-ID-03": inventory("manual", "fail"),
+  "ZOOM-ID-04": { inputs: input("available", "complete", "admin_count", "max_admins"), rules: [rule("manual", ne("available", true)), rule("warn", any(ne("complete", true), { op: "gt", left: path("admin_count"), right: path("max_admins") })), rule("pass", { op: "always" })] },
+  "ZOOM-ID-05": { inputs: input("readable", "complete", "count", "bad_count", "unknown_count"), rules: [rule("manual", any(ne("readable", true), eq("count", 0))), rule("fail", gt("bad_count", 0)), rule("warn", any(gt("unknown_count", 0), ne("complete", true))), rule("pass", { op: "always" })] },
+  "ZOOM-ID-06": standard(),
+  "ZOOM-ID-07": manual(),
+  "ZOOM-COLLAB-01": inventory("manual", "fail"),
+  "ZOOM-COLLAB-02": standard(),
+  "ZOOM-COLLAB-03": standard(),
+  "ZOOM-COLLAB-04": standard(),
+  "ZOOM-COLLAB-05": inventory("warn", "warn"),
+  "ZOOM-COLLAB-06": inventory("manual", "warn"),
+  "ZOOM-COLLAB-07": standard(),
+  "ZOOM-COLLAB-08": manual(),
+  "ZOOM-MTG-01": standard(), "ZOOM-MTG-02": standard(), "ZOOM-MTG-03": standard(),
+  "ZOOM-MTG-04": standard(), "ZOOM-MTG-05": standard(), "ZOOM-MTG-06": standard(),
+  "ZOOM-MTG-07": standard(), "ZOOM-MTG-08": standard(), "ZOOM-MTG-09": standard(),
+  "ZOOM-MTG-10": standard(),
+};
+
 const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, owner], index) => ({
   id,
   control,
@@ -96,6 +139,8 @@ const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, 
   owner,
   surfaces: ZOOM_CHECK_SURFACES[id],
   evidenceFields: [...ZOOM_CHECK_SURFACES[id], "complete_source_counts"],
+  decisionInputs: ZOOM_EXECUTABLE_DECISIONS[id].inputs,
+  decisionRules: ZOOM_EXECUTABLE_DECISIONS[id].rules,
   decision: decisions[index],
 }));
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
