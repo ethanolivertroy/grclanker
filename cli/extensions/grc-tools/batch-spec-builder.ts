@@ -256,10 +256,11 @@ function factEquals(check: BatchCheckDefinition, suffix: string, value: Portable
 function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
   const manualOnly = /^always return manual\b/i.test(check.decision)
     && !/\b(?:pass|warn|fail)\b/i.test(check.decision.replace(/^always return manual\b/i, ""));
+  const declaredStatuses = new Set(check.decisionRules?.map((rule) => rule.status) ?? []);
   const outcomes = {
-    fail: check.outcomes?.fail ?? (!manualOnly && /\bfail\b/i.test(check.decision)),
-    warn: check.outcomes?.warn ?? (!manualOnly && /\bwarn\b/i.test(check.decision)),
-    pass: check.outcomes?.pass ?? (!manualOnly && /\bpass\b/i.test(check.decision)),
+    fail: check.outcomes?.fail ?? (check.decisionRules ? declaredStatuses.has("fail") : !manualOnly && /\bfail\b/i.test(check.decision)),
+    warn: check.outcomes?.warn ?? (check.decisionRules ? declaredStatuses.has("warn") : !manualOnly && /\bwarn\b/i.test(check.decision)),
+    pass: check.outcomes?.pass ?? (check.decisionRules ? declaredStatuses.has("pass") : !manualOnly && /\bpass\b/i.test(check.decision)),
   };
   const rules: VerdictRule[] = [];
   if (outcomes.fail) {
@@ -312,11 +313,28 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     condition: { op: "always" },
     note: "Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual.",
   });
+  const renderedRules = check.decisionRules ?? rules;
+  const sourceConditionFor = (status: EvaluatedFindingStatus): string => {
+    const rendered = renderedRules.find((entry) => entry.status === status);
+    if (!rendered) return `No ${status} branch exists for this check.`;
+    if (rendered.condition.op === "eq" && rendered.condition.left.kind === "path") {
+      const derivation = check.derivedFactRules?.[rendered.condition.left.path];
+      if (derivation) return JSON.stringify(derivation.condition);
+    }
+    return JSON.stringify(rendered.condition);
+  };
+  const noncompliantStatus: EvaluatedFindingStatus = outcomes.fail
+    ? "fail"
+    : outcomes.warn
+      ? "warn"
+      : "manual";
+  const partialStatus: EvaluatedFindingStatus = outcomes.warn ? "warn" : "manual";
+  const compliantStatus: EvaluatedFindingStatus = outcomes.pass ? "pass" : "manual";
   return {
-    pass: `Complete readable evidence satisfies the compliant branch of this derivation: ${check.decision}`,
-    warn: `Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: ${check.decision}`,
-    fail: `Complete readable evidence satisfies the violation branch, which has first-match precedence: ${check.decision}`,
-    manual: `The required evidence for ${check.title} is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict.`,
+    pass: `${check.id} returns pass at the first ordered pass condition ${sourceConditionFor("pass")}. Portable derivation: ${check.decision}`,
+    warn: `${check.id} returns warn at the first ordered warn condition ${sourceConditionFor("warn")}. Portable derivation: ${check.decision}`,
+    fail: `${check.id} returns fail at the first ordered fail condition ${sourceConditionFor("fail")}. Portable derivation: ${check.decision}`,
+    manual: `${check.id} returns manual at the first ordered manual condition ${sourceConditionFor("manual")}; absent, null, denied, unreadable, not-requested, and malformed primitives cannot pass.`,
     constants: check.decisionConstants ?? {
       requiredEvidenceReadable: true,
       requiredEvidenceComplete: true,
@@ -324,30 +342,30 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     examples: [
       {
         kind: "compliant",
-        input: `All required source reads are complete and this derivation returns pass: ${check.decision}`,
-        expected: "pass",
-        reason: "A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence.",
+        input: `${check.id} primitive assignment satisfies this exact first-match condition: ${sourceConditionFor(compliantStatus)}`,
+        expected: compliantStatus,
+        reason: `${check.id} evaluates the rendered ordered rules directly; the assignment reaches ${compliantStatus} without a preselected label.`,
       },
       {
         kind: "noncompliant",
-        input: `A complete source read satisfies the fail branch of this derivation: ${check.decision}`,
-        expected: "fail",
-        reason: "A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence.",
+        input: `${check.id} primitive assignment satisfies this exact first-match condition: ${sourceConditionFor(noncompliantStatus)}`,
+        expected: noncompliantStatus,
+        reason: `${check.id} reaches the first executable ${noncompliantStatus} branch from the named primitive fields and constants.`,
       },
       {
         kind: "partial",
-        input: "At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists.",
-        expected: "warn",
-        reason: "Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime.",
+        input: `${check.id} has no earlier proved violation and satisfies this exact partial/review condition: ${sourceConditionFor(partialStatus)}`,
+        expected: partialStatus,
+        reason: `${check.id} applies the rendered ${partialStatus} branch to its explicitly named source-completeness primitives.`,
       },
       {
         kind: "unreadable",
-        input: "A required value is null, missing, denied, never requested, malformed, or unreadable.",
+        input: `${check.id} satisfies this exact unreadable or fallback condition: ${sourceConditionFor("manual")}`,
         expected: "manual",
-        reason: "Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes.",
+        reason: `${check.id} does not coerce unavailable vendor evidence to an empty collection, zero, false, or passing fact.`,
       },
     ],
-    rules: check.decisionRules ?? rules,
+    rules: renderedRules,
   };
 }
 
