@@ -104,7 +104,7 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
     zscaler_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [{
-    surfaceIds: surfaces,
+    surfaceIds: surfaces.map((surface) => surface.id),
     cursorFields: ["page", "pageSize", "totalPages", "totalElements", "next"],
     pageSize: null,
     itemCap: null,

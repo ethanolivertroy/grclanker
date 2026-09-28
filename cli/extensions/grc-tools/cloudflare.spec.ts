@@ -97,7 +97,7 @@ export const CLOUDFLARE_SPEC = buildBatchIntegrationSpec({
     cloudflare_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [{
-    surfaceIds: surfaces,
+    surfaceIds: surfaces.map((surface) => surface.id),
     cursorFields: ["result_info.page", "result_info.total_pages", "result_info.total_count"],
     pageSize: null,
     itemCap: null,
