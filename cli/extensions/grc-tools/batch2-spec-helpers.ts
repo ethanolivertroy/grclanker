@@ -24,56 +24,69 @@ export interface Batch2CheckRow {
   emptyOutcome?: "pass" | "warn" | "fail" | "manual" | "info";
   violationOutcome?: "fail" | "warn";
   constants?: Readonly<Record<string, PortableValue>>;
+  decisionInputs?: Readonly<Record<string, string>>;
+  decisionRules?: readonly VerdictRule[];
 }
 
-const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
-const path = (name: string) => ({ kind: "path" as const, path: name });
-const compare = (
+export const batch2Value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+export const batch2Path = (name: string) => ({ kind: "path" as const, path: name });
+export const batch2Compare = (
   op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte",
   name: string,
   entry: PortableValue,
-): VerdictCondition => ({ op, left: path(name), right: value(entry) });
-const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", name, entry);
-const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
-const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
-const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
-const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
-const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
+): VerdictCondition => ({ op, left: batch2Path(name), right: batch2Value(entry) });
+export const batch2ComparePaths = (
+  op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte",
+  left: string,
+  right: string,
+): VerdictCondition => ({ op, left: batch2Path(left), right: batch2Path(right) });
+export const batch2Eq = (name: string, entry: PortableValue): VerdictCondition => batch2Compare("eq", name, entry);
+export const batch2Ne = (name: string, entry: PortableValue): VerdictCondition => batch2Compare("ne", name, entry);
+export const batch2Gt = (name: string, entry: PortableValue): VerdictCondition => batch2Compare("gt", name, entry);
+export const batch2Gte = (name: string, entry: PortableValue): VerdictCondition => batch2Compare("gte", name, entry);
+export const batch2Lt = (name: string, entry: PortableValue): VerdictCondition => batch2Compare("lt", name, entry);
+export const batch2Lte = (name: string, entry: PortableValue): VerdictCondition => batch2Compare("lte", name, entry);
+export const batch2All = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+export const batch2Any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+export const batch2Defined = (name: string): VerdictCondition => ({ op: "defined", operand: batch2Path(name) });
+export const batch2Not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", condition });
+export const batch2Rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
   status,
   condition,
   ...(note ? { note } : {}),
 });
 
 function executableRules(row: Batch2CheckRow): readonly VerdictRule[] {
-  if (row.manualOnly) return [rule("manual", { op: "always" }, "The shipped runtime has no decisive read surface for this check.")];
+  if (row.decisionRules) return row.decisionRules;
+  if (row.manualOnly) return [batch2Rule("manual", { op: "always" }, "The shipped runtime has no decisive read surface for this check.")];
   const emptyOutcome = row.emptyOutcome ?? "manual";
   const violationOutcome = row.violationOutcome ?? "fail";
   return [
-    rule("manual", any(
-      ne("evidence_readable", true),
-      { op: "not", condition: { op: "defined", operand: path("evidence_readable") } },
+    batch2Rule("manual", batch2Any(
+      batch2Ne("evidence_readable", true),
+      batch2Not(batch2Defined("evidence_readable")),
     ), "Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass."),
-    rule(violationOutcome, gt("violation_count", 0), "A violation proved by readable evidence has precedence over partial companion inventories."),
+    batch2Rule(violationOutcome, batch2Gt("violation_count", 0), "A violation proved by readable evidence has precedence over partial companion inventories."),
     ...(emptyOutcome === "manual"
-      ? [rule("manual", eq("inventory_count", 0), "This check's documented empty-inventory behavior requires manual confirmation.")]
-      : [rule(emptyOutcome, all(eq("inventory_count", 0), eq("evidence_complete", true)))]),
-    rule("warn", any(
-      ne("evidence_complete", true),
-      gt("review_count", 0),
+      ? [batch2Rule("manual", batch2Eq("inventory_count", 0), "This check's documented empty-inventory behavior requires manual confirmation.")]
+      : [batch2Rule(emptyOutcome, batch2All(batch2Eq("inventory_count", 0), batch2Eq("evidence_complete", true)))]),
+    batch2Rule("warn", batch2Any(
+      batch2Ne("evidence_complete", true),
+      batch2Gt("review_count", 0),
     ), "Incomplete source cardinality or an explicit review condition prevents pass."),
-    rule("pass", all(
-      eq("evidence_readable", true),
-      eq("evidence_complete", true),
-      eq("violation_count", 0),
-      eq("review_count", 0),
+    batch2Rule("pass", batch2All(
+      batch2Eq("evidence_readable", true),
+      batch2Eq("evidence_complete", true),
+      batch2Eq("violation_count", 0),
+      batch2Eq("review_count", 0),
     )),
-    rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
+    batch2Rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
   ];
 }
 
 export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinition[] {
   return rows.map((row) => {
-    const inputs = row.manualOnly
+    const inputs = row.decisionInputs ?? (row.manualOnly
       ? {}
       : {
           evidence_readable: "True only when every raw vendor field required by this finding was returned and is non-null.",
@@ -81,7 +94,7 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
           inventory_count: "The complete number of source records evaluated by this finding, before presentation truncation.",
           violation_count: "The complete count of source records that satisfy the finding-specific violation predicate.",
           review_count: "The complete count of readable source records that satisfy the finding-specific warning or review predicate.",
-        };
+        });
     const executable = deriveDecisionRules(row.id, executableRules(row));
     return {
       id: row.id,
