@@ -13,7 +13,7 @@ The Zscaler integration inspects Zscaler Internet Access (ZIA) and Zscaler Priva
 
 ## Setup and authentication
 
-Credentials resolve with the precedence explicit tool arguments, then environment variables, then a YAML config file (`ZSCALER_CONFIG_FILE` or `~/.zscaler/zscaler.yaml` with `zia.client` and `zpa.client` blocks using `cloud`, `apiKey`, `username`, `password`, `clientId`, `clientSecret`, and `customerId` keys). Configure either product or both; controls for a product without credentials render as `manual` findings that name the missing variables.
+Credentials resolve with the precedence explicit tool arguments, then environment variables, then a YAML config file (`ZSCALER_CONFIG_FILE` or `~/.zscaler/zscaler.yaml` with `zia.client` and `zpa.client` blocks using `cloud`, `baseUrl`, `apiKey`, `username`, `password`, `clientId`, `clientSecret`, and `customerId` keys, plus an optional `zscaler.client` block whose OneAPI `clientId` and `clientSecret` are only detected). A config file path that does not exist is skipped. Configure either product or both; controls for a product without credentials render as `manual` findings that name the missing variables.
 
 ### ZIA (legacy API key plus session)
 
@@ -49,7 +49,7 @@ The client posts `client_id` and `client_secret` as a form body to `POST /signin
 | `zscaler_assess_zia_access_control` | Controls 6, 7, 14 (admin MFA evidence, RBAC, audit log export) |
 | `zscaler_assess_zia_policy` | Controls 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 25 |
 | `zscaler_assess_zpa` | Controls 8, 9, 10, 11, 12, 13, 15, 21, 22, 23, 24 |
-| `zscaler_export_audit_bundle` | Runs everything and writes `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` when collection partially failed, and a zip named after the allocated directory (reruns allocate a new directory) |
+| `zscaler_export_audit_bundle` | Runs everything into `zscaler-audit-<ZIA cloud or ZPA customer ID>-<YYYY-MM-DD>` under `output_dir` (default `./export/zscaler`) and writes `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework), `QUICK_REFERENCE.md`, `_errors.log` when collection partially failed, and a zip named after the allocated directory (reruns allocate a new directory) |
 
 Findings are normalized as `{id, control, title, severity, status, summary, evidence, mappings, manualEvidence}` with `status` in `pass`, `warn`, `fail`, `manual`. Verdict rules: a 401, 403, or errored endpoint never yields `pass`: when it is the finding's primary inventory the finding is `manual` and names the cause, and when it is a secondary inventory the finding also reads (for example ZPA `GET /serviceEdgeGroup` for control 21, or `GET /dlpDictionaries` for control 3) the finding caps at `warn`, names the inventory and endpoint with the HTTP status in its summary, and lists it under `evidence.unreadable_inventories`; an empty inventory fails or is `manual` per the control's intent (the summary says which); products that are not configured or not licensed render `manual`; undated items (no last connect time, no certificate validity) never count as healthy and cap at `warn`; every inventory a finding reads, primary or secondary, that came back partial caps that finding at `warn`, sets `evidence.partial_inventory`, and names the partial inventory with the records read over the pages read versus the total pages, or "total unknown" when the API published no total (or parents read versus total for sub-locations).
 

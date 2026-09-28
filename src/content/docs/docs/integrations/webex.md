@@ -19,7 +19,7 @@ Token types, detected from `GET /people/me` (`type` is `person`, `bot`, or `appu
 - Service App token: machine account authorized by a Full Administrator in Control Hub; supports the refresh flow below.
 - Bot token: cannot read admin surfaces. `webex_check_access` marks those surfaces `manual` and every admin-only control renders `manual` naming the token type.
 
-Scopes for full coverage: `spark-admin:people_read`, `spark-admin:organizations_read`, `spark-admin:roles_read`, `spark-admin:licenses_read`, `spark-admin:devices_read`, `spark-admin:hybrid_clusters_read`, `spark-admin:workspaces_read`, `spark-compliance:events_read`, `spark-compliance:recordings_read`, `audit:events_read`, `meeting:admin_config_read`, `meeting:schedules_read`, `meeting:preferences_read`, `guest-issuer:read`, `spark:rooms_read`, and `spark:webhooks_read`. Compliance scopes require the Compliance Officer role; `meeting:admin_config_read` requires a site administrator.
+Scopes for full coverage: `spark:people_read` (for `GET /people/me`), `spark-admin:people_read`, `spark-admin:organizations_read`, `spark-admin:roles_read`, `spark-admin:licenses_read`, `spark-admin:devices_read`, `spark-admin:hybrid_clusters_read`, `spark-admin:workspaces_read`, `spark-compliance:events_read`, `spark-compliance:recordings_read`, `audit:events_read`, `meeting:admin_config_read`, `meeting:schedules_read` (or `meeting:admin_schedule_read`), `meeting:preferences_read` (or `meeting:admin_preferences_read`), `guest-issuer:read`, `spark:rooms_read`, and `spark:webhooks_read`. Compliance scopes require the Compliance Officer role; `meeting:admin_config_read` requires a site administrator.
 
 Configuration precedence: tool arguments, then environment variables, then a config file.
 
