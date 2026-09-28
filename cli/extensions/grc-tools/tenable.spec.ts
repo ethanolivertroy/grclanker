@@ -112,6 +112,7 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Fail when no assets are exported or fresh_assets divided by expected_asset_count is below 0.95; incomplete export chunks or network rows prevent pass.",
     emptyOutcome: "fail",
     constants: { default_stale_asset_days: 30, minimum_fresh_asset_ratio: 0.95 },
+    thresholds: [batch3Threshold("TENABLE-03", "default_stale_asset_days", "maximum_asset_last_seen_age_days", "gt", "fail", "Greatest elapsed days since last_seen among all dated exported assets.", "stale_asset_days")],
     runtimeFactNames: {
       readable: "tenable_03_asset_and_network_reads_succeeded",
       complete: "tenable_03_asset_export_and_networks_complete",
@@ -145,6 +146,7 @@ const rows: readonly Batch3CheckRow[] = [
     surfaces: ["agents", "asset-export", "asset-export-status", "asset-export-chunks"],
     predicate: "Fail when offline_agents plus stale_connect_agents divided by agent_count exceeds 0.1; undated or outdated agents and incomplete source inventories require review.",
     constants: { default_agent_offline_days: 7, maximum_unhealthy_agent_ratio: 0.1 },
+    thresholds: [batch3Threshold("TENABLE-05", "default_agent_offline_days", "maximum_agent_last_connect_age_days", "gt", "fail", "Greatest elapsed days since last_connect among every dated linked agent.", "agent_offline_days")],
     runtimeFactNames: {
       readable: "tenable_05_agent_reads_succeeded",
       complete: "tenable_05_agent_and_asset_sources_complete",

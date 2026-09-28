@@ -72,6 +72,7 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Fail when more than 5 percent of evaluated new users lack an enrollment inside enrollment_grace_days; warn for any positive late count at or below 5 percent or incomplete reads.",
     emptyOutcome: "pass",
     constants: { default_enrollment_grace_days: 30, fail_above_late_enrollment_percent: 5 },
+    thresholds: [batch3Threshold("KNOWBE4-04", "default_enrollment_grace_days", "maximum_enrollment_delay_days", "gt", "warn", "Greatest elapsed days from active-user creation to first training enrollment.", "enrollment_grace_days")],
     runtimeFactNames: {
       readable: "knowbe4_04_user_and_enrollment_reads_succeeded",
       complete: "knowbe4_04_user_and_enrollment_lists_complete",
@@ -114,6 +115,7 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Fail when the raw current phish-prone percentage exceeds configured_max_phish_prone_percent; warn when no measurable test exists, recipient reads are incomplete, or the current percentage rose above a readable baseline.",
     emptyOutcome: "warn",
     constants: { default_max_phish_prone_pct: 15 },
+    thresholds: [batch3Threshold("KNOWBE4-06", "default_max_phish_prone_pct", "current_phish_prone_pct", "gt", "fail", "Raw current failed-recipient percentage over every evaluable delivered recipient.", "max_phish_prone_pct")],
     runtimeFactNames: {
       readable: "knowbe4_06_security_test_sources_readable",
       complete: "knowbe4_06_recipient_population_complete",
@@ -206,6 +208,7 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Among failed users with measurable follow-up, fail below 50 percent remediated inside remedial_window_days, warn from 50 through below 90 percent, and pass at 90 percent or when no sampled failure requires remediation.",
     emptyOutcome: "warn",
     constants: { default_remedial_window_days: 14, pass_remediated_percent: 90, fail_below_remediated_percent: 50 },
+    thresholds: [batch3Threshold("KNOWBE4-10", "default_remedial_window_days", "maximum_remedial_enrollment_delay_days", "gt", "warn", "Greatest elapsed days from phishing failure to remedial enrollment among followed-up failed users.", "remedial_window_days")],
     runtimeFactNames: {
       readable: "knowbe4_10_remediation_reads_succeeded",
       complete: "knowbe4_10_recipient_and_enrollment_reads_complete",
@@ -249,6 +252,7 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Fail when the raw administrator count exceeds configured_max_admin_count; warn when no administrator is visible, any administrator identifier is absent from the active-user inventory, or either source is incomplete.",
     emptyOutcome: "warn",
     constants: { default_max_admin_count: 3 },
+    thresholds: [batch3Threshold("KNOWBE4-12", "default_max_admin_count", "admin_count", "gt", "fail", "Uncapped administrator identifier count from the account object.", "max_admin_count")],
     runtimeFactNames: {
       readable: "knowbe4_12_account_and_user_sources_readable",
       complete: "knowbe4_12_account_and_user_population_complete",
@@ -312,6 +316,10 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Compute reported recipients divided by delivered evaluable recipients; fail below one half of min_report_rate_pct, warn from that half through below the configured minimum, and pass at or above the minimum.",
     emptyOutcome: "warn",
     constants: { default_min_report_rate_pct: 50, default_fail_report_rate_pct: 25 },
+    thresholds: [
+      batch3Threshold("KNOWBE4-19", "default_fail_report_rate_pct", "report_rate_pct", "lt", "fail", "Reported-recipient count divided by delivered-recipient count, multiplied by 100."),
+      batch3Threshold("KNOWBE4-19", "default_min_report_rate_pct", "report_rate_pct", "lt", "warn", "Reported-recipient count divided by delivered-recipient count, multiplied by 100.", "min_report_rate_pct"),
+    ],
     runtimeFactNames: {
       readable: "knowbe4_19_security_test_reads_succeeded",
       complete: "knowbe4_19_security_test_and_recipient_lists_complete",

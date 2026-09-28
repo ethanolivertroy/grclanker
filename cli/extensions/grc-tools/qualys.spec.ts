@@ -135,6 +135,7 @@ const rows: readonly Batch3CheckRow[] = [
     surfaces: ["hosts"],
     predicate: "Compute hosts carrying LAST_VM_AUTH_SCANNED_DATE inside the resolved lookback divided by hosts carrying a vulnerability scan date; fail when the percentage is below configured_min_auth_scan_percent.",
     constants: { default_min_auth_scan_percent: 80 },
+    thresholds: [batch3Threshold("QUALYS-C02", "default_min_auth_scan_percent", "authenticated_percent", "lt", "fail", "Authenticated scanned hosts divided by all hosts carrying a vulnerability-scan date, multiplied by 100.", "min_auth_scan_percent")],
     runtimeFactNames: {
       readable: "qualys_c02_host_list_readable",
       complete: "qualys_c02_host_list_complete",
@@ -194,6 +195,11 @@ const rows: readonly Batch3CheckRow[] = [
       pass_sla_percent: 95,
       fail_below_sla_percent: 80,
     },
+    thresholds: [
+      batch3Threshold("QUALYS-C10", "default_sla_critical_days", "maximum_severity_5_age_days", "gt", "fail", "Greatest first-found age in days among dated open severity-5 detections.", "sla_critical_days"),
+      batch3Threshold("QUALYS-C10", "default_sla_high_days", "maximum_severity_4_age_days", "gt", "fail", "Greatest first-found age in days among dated open severity-4 detections.", "sla_high_days"),
+      batch3Threshold("QUALYS-C10", "default_sla_medium_days", "maximum_severity_3_age_days", "gt", "fail", "Greatest first-found age in days among dated open severity-3 detections.", "sla_medium_days"),
+    ],
     runtimeFactNames: {
       readable: "qualys_c10_host_and_detection_reads_succeeded",
       complete: "qualys_c10_host_and_detection_lists_complete",
@@ -246,6 +252,7 @@ const rows: readonly Batch3CheckRow[] = [
     surfaces: ["users", "user-list"],
     predicate: "Fail when the uncapped active Manager or super-user count exceeds configured_max_managers or any email address is shared by multiple accounts; otherwise review stale, generic, pending, or source-incomplete accounts.",
     constants: { default_max_managers: 5 },
+    thresholds: [batch3Threshold("QUALYS-C13", "default_max_managers", "length:managers", "gt", "fail", "Uncapped joined active Manager, Unit Manager, and super-user account count.", "max_managers")],
     runtimeFactNames: {
       readable: "qualys_c13_user_sources_readable",
       complete: "qualys_c13_user_population_complete",

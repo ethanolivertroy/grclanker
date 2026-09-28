@@ -315,7 +315,14 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       ...(row.incompleteOutcome === "manual" ? [batch2Ne(names.complete, true)] : []),
     ));
     const violationRule = batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0));
-    const suppliedDecisionRules = row.decisionRules ?? (row.manualOnly ? undefined : [
+    const explicitRules = row.decisionRules && thresholdRules.length > 0
+      ? [
+          ...row.decisionRules.slice(0, -1),
+          ...thresholdRules,
+          row.decisionRules.at(-1) as VerdictRule,
+        ]
+      : row.decisionRules;
+    const suppliedDecisionRules = explicitRules ?? (row.manualOnly ? undefined : [
       ...(row.incompleteOutcome === "manual"
         ? [unreadableRule, ...thresholdRules, ...(row.thresholdOnly ? [] : [violationRule])]
         : [...thresholdRules, ...(row.thresholdOnly ? [] : [violationRule]), unreadableRule]),
