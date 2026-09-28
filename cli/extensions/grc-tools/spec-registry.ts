@@ -5,6 +5,8 @@ import { registerAzureTools } from "./azure.js";
 import { AZURE_SPEC } from "./azure.spec.js";
 import { registerBoxTools } from "./box.js";
 import { BOX_SPEC } from "./box.spec.js";
+import { registerCloudflareTools } from "./cloudflare.js";
+import { CLOUDFLARE_SPEC } from "./cloudflare.spec.js";
 import { registerDuoTools } from "./duo.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { registerGcpTools } from "./gcp.js";
@@ -12,6 +14,8 @@ import { GCP_SPEC } from "./gcp.spec.js";
 import { registerGwsTools } from "./gws.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import type { IntegrationSpecContract } from "./spec-model.js";
+import { registerOciTools } from "./oci.js";
+import { OCI_SPEC } from "./oci.spec.js";
 import { registerOktaTools } from "./okta.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { registerSalesforceTools } from "./salesforce.js";
@@ -54,6 +58,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     registerTools: registerBoxTools,
   },
   {
+    contract: CLOUDFLARE_SPEC,
+    narrativePath: "specs/narratives/cloudflare.md",
+    outputPath: "specs/cloudflare-sec-inspector.spec.md",
+    registerTools: registerCloudflareTools,
+  },
+  {
     contract: DUO_SPEC,
     narrativePath: "specs/narratives/duo.md",
     outputPath: "specs/duo-sec-inspector.spec.md",
@@ -70,6 +80,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/gws.md",
     outputPath: "specs/gws-inspector-go.spec.md",
     registerTools: registerGwsTools,
+  },
+  {
+    contract: OCI_SPEC,
+    narrativePath: "specs/narratives/oci.md",
+    outputPath: "specs/oci-sec-inspector.spec.md",
+    registerTools: registerOciTools,
   },
   {
     contract: OKTA_SPEC,

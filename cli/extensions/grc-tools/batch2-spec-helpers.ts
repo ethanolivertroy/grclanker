@@ -5,6 +5,7 @@ import {
 } from "./batch-spec-builder.js";
 import type {
   FindingSeverity,
+  FrameworkKey,
   PortableValue,
   VerdictCondition,
   VerdictRule,
@@ -18,6 +19,7 @@ export interface Batch2CheckRow {
   owner: string;
   surfaces: readonly string[];
   decision: string;
+  frameworks?: Partial<Record<FrameworkKey, readonly string[]>>;
   manualOnly?: boolean;
   emptyOutcome?: "pass" | "warn" | "fail" | "manual" | "info";
   violationOutcome?: "fail" | "warn";
@@ -88,6 +90,7 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
       severity: row.severity,
       owner: row.owner,
       surfaces: row.surfaces,
+      frameworks: row.frameworks,
       evidenceFields: [...row.surfaces, "complete_source_counts"],
       decisionInputs: inputs,
       decisionConstants: row.constants,

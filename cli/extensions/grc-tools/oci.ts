@@ -24,6 +24,12 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { withIntegrationToolContracts } from "./batch-spec-builder.js";
+import {
+  OCI_AUTH_RESOLVER,
+  readResolverEnvironment,
+} from "./auth-resolver-contracts.js";
+import { OCI_SPEC } from "./oci.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -1106,6 +1112,7 @@ export function resolveOciConfiguration(
     }
   },
 ): OciResolvedConfig {
+  env = readResolverEnvironment(OCI_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const configFile = expandHome(
     asString(input.config_file)
@@ -3692,6 +3699,7 @@ const scopeParams = {
 };
 
 export function registerOciTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, OCI_SPEC);
   pi.registerTool({
     name: "oci_check_access",
     label: "Check OCI audit access",
