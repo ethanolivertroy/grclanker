@@ -1341,6 +1341,17 @@ test("campaign targeting retains the observed All Users proof when the campaign 
   assert.match(failingTargeting.summary, /estimated 50%.*Truncated listing: users/);
 });
 
+test("report-rate failures remain proved when the security-test inventory is truncated", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["phishing"], now: NOW });
+  snapshot.securityTests.truncated = true;
+  snapshot.securityTests.total = snapshot.securityTests.data.length + 1;
+  snapshot.securityTests.limit = 20_000;
+
+  const reportRate = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 19);
+  assert.equal(reportRate.status, "fail");
+  assert.match(reportRate.summary, /Only 10%.*Truncated listing: security_tests/);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });

@@ -3025,7 +3025,7 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
     summary += ` PhishER inbox: ${phisher.data.length} user-reported messages in the window${loaded}.`;
   }
 
-  return withInventoryCaveats(finding(19, "medium", summary, {
+  const evidence = {
     delivered_count: whenComplete(snapshot.securityTests, delivered),
     reported_count: whenComplete(snapshot.securityTests, reported),
     report_rate_pct: reportRate === undefined ? null : whenComplete(snapshot.securityTests, reportRate),
@@ -3033,6 +3033,22 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
     security_tests_in_window: whenComplete(snapshot.securityTests, recent.length),
     security_tests_read: snapshot.securityTests.data.length,
     phisher: phisherEvidence,
+  };
+  const violationCount = delivered > 0
+    && reportRate !== undefined
+    && reportRate < minReportRatePct / 2
+    ? 1
+    : 0;
+  const reviewCount = violationCount === 0
+    && (delivered === 0 || reportRate === undefined || reportRate < minReportRatePct)
+    ? 1
+    : 0;
+  return withInventoryCaveats(finding(19, "medium", summary, evidence, undefined, {
+    evidence_readable: true,
+    evidence_complete: true,
+    inventory_count: recent.length,
+    violation_count: violationCount,
+    review_count: reviewCount,
   }), snapshot, [
     SECURITY_TEST_READ,
     // PhishER enrichment is context: the rate itself comes from the security test counters, so the inbox only demotes when unreadable.
