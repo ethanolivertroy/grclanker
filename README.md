@@ -152,7 +152,7 @@ On `main`, the native cloud and SaaS tools answer directly in the same session, 
 check my AWS audit access, then assess identity posture and export an audit bundle
 ```
 
-A single quoted prompt on the command line is not supported: `grclanker "..."` exits with `Unknown command`.
+On `main`, `grclanker "..."` sends a quoted prompt straight to the agent, and a workflow command takes its subject, for example `grclanker investigate "CVE-2021-44228"`. The `v0.0.1` bundle answers `Unknown command` to the quoted form and drops workflow subjects.
 
 Built-in workflow rails, as slash commands inside a session or as `grclanker investigate`, `grclanker audit`, `grclanker assess`, and `grclanker validate` to open a session that starts with that workflow (then name the vendor, CVE, or framework):
 
