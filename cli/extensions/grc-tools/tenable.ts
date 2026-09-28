@@ -2840,31 +2840,197 @@ function collectionSummary(datasets: Record<string, TenableDataset<unknown>>): J
   return Object.fromEntries(Object.entries(datasets).map(([name, dataset]) => [name, collectionStatusOf(dataset)]));
 }
 
+const TENABLE_DECISION_FACTS = Symbol("tenable-decision-facts");
+
+type TenableFindingWithFacts = TenableFinding & {
+  [TENABLE_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
+};
+
+function tenableEvidenceCount(evidence: JsonRecord, name: string): number {
+  const value = evidence[name];
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === "object") {
+    return Object.values(value).reduce((total, entry) => total + (asNumber(entry) ?? 0), 0);
+  }
+  return asNumber(value) ?? 0;
+}
+
+function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
+  const value = (name: string) => asNumber(evidence[name]);
+  const count = (...names: string[]) => names.reduce((total, name) => total + tenableEvidenceCount(evidence, name), 0);
+  const statusIsIncomplete = (...names: string[]) => names.some((name) => {
+    const status = asString(evidence[name]);
+    return status !== undefined && status !== "ok";
+  });
+  const partial = evidence.inventory_truncated === true
+    || count("unevaluable_records", "asset_unevaluable_records") > 0;
+  const fact = (inventoryCount: number, violationCount = 0, reviewCount = 0, complete = !partial) => ({
+    evidence_readable: true,
+    evidence_complete: complete,
+    inventory_count: inventoryCount,
+    violation_count: violationCount,
+    review_count: reviewCount,
+  });
+  if (evidence.not_collected === true) return {};
+
+  switch (id) {
+    case "TENABLE-01": {
+      const scans = value("scan_count") ?? 0;
+      const policies = asRecords(evidence.policies_evaluated);
+      const unreadable = policies.filter((item) => ["unreadable", "unverified"].includes(asString(item.verdict) ?? "")).length;
+      if (asString(evidence.policy_details_status) !== "ok" || unreadable > 0 || (policies.length === 0 && count("scans_without_policy_id") === scans && scans > 0)) return {};
+      const violations = (value("discovery_only_scans") ?? 0) === scans && scans > 0
+        ? 1
+        : policies.filter((item) => asString(item.verdict) === "fail").length;
+      const reviews = policies.filter((item) => asString(item.verdict) === "warn").length
+        + count("scans_without_policy_id")
+        + (evidence.caller_is_administrator === true ? 0 : 1)
+        + (statusIsIncomplete("scan_templates_status") ? 1 : 0);
+      return fact(scans, scans === 0 ? 1 : violations, reviews, !statusIsIncomplete("scan_templates_status") && evidence.caller_is_administrator === true);
+    }
+    case "TENABLE-02": {
+      const scans = value("scan_count") ?? 0;
+      const recurring = value("enabled_recurring_scans") ?? 0;
+      const violations = scans === 0 || recurring === 0 ? 1 : count("stale_recurring_scans");
+      return fact(scans, violations, count("never_run_or_undated_scans") + (evidence.caller_is_administrator === true ? 0 : 1), evidence.caller_is_administrator === true);
+    }
+    case "TENABLE-03": {
+      const assets = value("asset_count") ?? 0;
+      const expected = value("expected_asset_count");
+      if (assets > 0 && expected === undefined) return {};
+      const coverageFailure = expected !== undefined && expected > 0 && (value("fresh_assets") ?? 0) / expected < 0.95 ? 1 : 0;
+      const complete = !partial && !statusIsIncomplete("networks_status");
+      return fact(assets, assets === 0 ? 1 : coverageFailure, complete ? 0 : 1, complete);
+    }
+    case "TENABLE-04": {
+      const assets = value("asset_count") ?? 0;
+      if (assets === 0) return {};
+      const coverage = value("coverage_ratio");
+      const threshold = value("threshold");
+      return fact(assets, coverage !== undefined && threshold !== undefined && coverage < threshold ? 1 : 0, partial ? 1 : 0);
+    }
+    case "TENABLE-05": {
+      const agents = value("agent_count");
+      if (agents === undefined || agents === 0) return {};
+      const unhealthy = count("offline_agents", "stale_connect_agents");
+      const complete = !partial && !statusIsIncomplete("server_properties_status");
+      return fact(agents, unhealthy / agents > 0.1 ? unhealthy : 0, count("undated_agents", "outdated_agents_count") + (complete ? 0 : 1), complete);
+    }
+    case "TENABLE-06": {
+      const agents = value("agent_count");
+      const groups = value("agent_group_count");
+      if (agents === undefined || agents === 0 || groups === undefined || statusIsIncomplete("agent_groups_status")) return {};
+      const ungrouped = value("ungrouped_agents_count") ?? 0;
+      return fact(agents, groups === 0 || ungrouped / agents > 0.1 ? Math.max(1, ungrouped) : 0, ungrouped, !partial);
+    }
+    case "TENABLE-07": {
+      const scanners = value("linked_scanner_count");
+      if (scanners === undefined || scanners === 0) return {};
+      const violations = count("unlinked", "off", "stale_connect");
+      const reviews = count("undated", "outdated") + (evidence.caller_is_administrator === true ? 0 : 1) + (partial ? 1 : 0);
+      return fact(scanners, violations, reviews, !partial && evidence.caller_is_administrator === true);
+    }
+    case "TENABLE-08": {
+      const age = value("plugin_set_age_hours");
+      const evaluated = count("evaluated_scanners");
+      const threshold = value("threshold_hours") ?? 0;
+      const stale = count("stale_scanners");
+      if (age === undefined || (stale === 0 && (statusIsIncomplete("scanners_status") || evaluated === 0))) return {};
+      const reviews = count("undated_scanners", "stale_online_agents") + (statusIsIncomplete("agents_status") || partial ? 1 : 0);
+      return fact(evaluated, age > threshold || stale > 0 ? Math.max(1, stale) : 0, reviews, !statusIsIncomplete("agents_status") && !partial);
+    }
+    case "TENABLE-09": {
+      const networks = value("network_count");
+      if (networks === undefined || networks === 0) return {};
+      return fact(networks, value("networks_without_scanners") ?? 0, (value("networks_without_scanner_count") ?? 0) + (partial ? 1 : 0), !partial);
+    }
+    case "TENABLE-10": {
+      const users = value("user_count") ?? 0;
+      const enabled = value("enabled_users");
+      if (users === 0 || enabled === undefined || enabled === 0 || evidence.caller_is_administrator === false) return {};
+      const admins = count("administrators");
+      const violations = count("administrators_without_strong_auth", "inactive_users") + (admins > (value("max_admins") ?? 0) ? admins - (value("max_admins") ?? 0) : 0);
+      const reviews = count("never_logged_in_users", "stale_api_key_users", "locked_out_users", "repeated_login_failures", "users_without_enabled_flag")
+        + (statusIsIncomplete("roles_status") ? 1 : 0);
+      return fact(enabled, violations, reviews, !statusIsIncomplete("roles_status"));
+    }
+    case "TENABLE-11": {
+      const permissions = value("permission_count");
+      if (permissions === undefined || permissions === 0) return {};
+      const complete = !partial && !statusIsIncomplete("access_groups_status") && evidence.user_groups !== null;
+      return fact(permissions, count("broad_permissions"), count("legacy_access_group_count") + (complete ? 0 : 1), complete);
+    }
+    case "TENABLE-12": {
+      const credentials = value("credential_count");
+      if (credentials === undefined || credentials === 0) return {};
+      return fact(credentials, 0, count("unused_credentials_count", "older_than_one_year_count", "undated_credentials") + (partial ? 1 : 0), !partial);
+    }
+    case "TENABLE-13":
+      return fact(value("exclusion_count") ?? 0, count("permanent_exclusions_count", "broad_exclusions_count"), count("undocumented_exclusions_count") + (partial ? 1 : 0), !partial);
+    case "TENABLE-14": {
+      const open = value("open_findings") ?? 0;
+      if ((value("asset_count") ?? 0) === 0 || open === 0) return {};
+      const coverage = value("vpr_coverage") ?? 0;
+      return fact(open, 0, coverage < 0.5 || partial ? 1 : 0);
+    }
+    case "TENABLE-15": {
+      if ((value("asset_count") ?? 0) === 0) return {};
+      const open = tenableEvidenceCount(evidence, "open_by_severity");
+      const overdue = asObject(evidence.overdue_by_severity) ?? {};
+      const severe = (asNumber(overdue.critical) ?? 0) + (asNumber(overdue.high) ?? 0);
+      const review = (asNumber(overdue.medium) ?? 0) + (asNumber(overdue.low) ?? 0) + (value("undated_open_findings") ?? 0) + (partial ? 1 : 0);
+      return fact(open, severe, review, !partial);
+    }
+    case "TENABLE-16": {
+      const assets = value("asset_count") ?? 0;
+      const categories = value("tag_category_count");
+      if (assets === 0 || categories === undefined) return {};
+      const ratio = value("tagged_ratio") ?? 0;
+      const threshold = value("threshold") ?? 0;
+      const complete = !partial && evidence.tag_categories_truncated !== true && evidence.tag_values_truncated !== true;
+      return fact(assets, categories === 0 && evidence.tag_categories_truncated !== true || ratio < threshold ? 1 : 0, complete ? 0 : 1, complete);
+    }
+    case "TENABLE-17":
+      return fact(1, count("enabled_recurring_compliance_scans") === 0 ? 1 : 0, 0);
+    case "TENABLE-18": {
+      const events = value("event_count") ?? 0;
+      return fact(events, 0, events === 0 ? 1 : count("sensitive_events") + (evidence.inventory_truncated === true ? 1 : 0), evidence.inventory_truncated !== true);
+    }
+    case "TENABLE-19": {
+      const jobs = value("external_export_jobs_in_window") ?? 0;
+      const days = count("external_export_days");
+      if (jobs === 0) return {};
+      const complete = evidence.vuln_export_jobs_listed !== null && evidence.asset_export_jobs_listed !== null;
+      return fact(jobs, 0, days < 2 || !complete ? 1 : 0, complete);
+    }
+    case "TENABLE-20":
+      return fact(value("target_group_count") ?? 0, 0, count("stale_or_undated_groups", "overlapping_targets"));
+    default:
+      return {};
+  }
+}
+
 function finding(
   control: number,
-  status: TenableFindingStatus,
+  _legacyStatus: TenableFindingStatus,
   severity: TenableSeverity,
   summary: string,
   evidence: JsonRecord = {},
   idSuffix = "",
 ): TenableFinding {
   const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
-  const facts = {
-    evidence_readable: status !== "manual",
-    evidence_complete: status !== "manual",
-    inventory_count: 1,
-    violation_count: status === "fail" ? 1 : 0,
-    review_count: status === "warn" ? 1 : 0,
-  };
-  return {
+  const facts = tenableDecisionFacts(id, evidence);
+  const result: TenableFindingWithFacts = {
     id,
     title: CONTROL_TITLES[control] + (idSuffix ? " (Tenable Security Center)" : ""),
     severity,
-    status: idSuffix ? status : evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, id, facts) as TenableFindingStatus,
+    status: idSuffix ? _legacyStatus : evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, id, facts) as TenableFindingStatus,
     summary,
     evidence,
     mappings: CONTROL_MAPPINGS[control],
   };
+  Object.defineProperty(result, TENABLE_DECISION_FACTS, { value: facts });
+  return result;
 }
 
 /**
@@ -2936,9 +3102,24 @@ function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>)
     records_seen: readable ? seenOrNull(dataset) ?? null : null,
     records_total: readable ? dataset.total ?? null : null,
   };
-  if (!readable || !dataset.truncated || item.summary.includes(" records were retrieved")) return { ...item, evidence };
+  const previousFacts = (item as TenableFindingWithFacts)[TENABLE_DECISION_FACTS] ?? {};
+  const facts = !readable
+    ? {}
+    : dataset.truncated
+      ? { ...previousFacts, evidence_complete: false }
+      : previousFacts;
+  const status = item.id.endsWith("-SC")
+    ? item.status
+    : evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, item.id, facts) as TenableFindingStatus;
+  if (!readable || !dataset.truncated || item.summary.includes(" records were retrieved")) {
+    const result: TenableFindingWithFacts = { ...item, status, evidence };
+    Object.defineProperty(result, TENABLE_DECISION_FACTS, { value: facts });
+    return result;
+  }
   const partial = ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}; the verdict rests on the records retrieved.`;
-  return { ...item, summary: `${item.summary}${partial}`, evidence };
+  const result: TenableFindingWithFacts = { ...item, status, summary: `${item.summary}${partial}`, evidence };
+  Object.defineProperty(result, TENABLE_DECISION_FACTS, { value: facts });
+  return result;
 }
 
 // Rule 1 corollary: a finding that reads several inventories cannot pass while any of
