@@ -147,7 +147,7 @@ function zscalerCompletenessSemantics(id: string): string {
         : "an error or 403 denial does not change evidence_complete";
     return `${entry.surfaceId}: ${truncated}; ${failed}`;
   });
-  return `For ${id}, product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
+  return `Product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
 }
 
 const rows: ReadonlyArray<readonly [string, Batch2CheckRow["severity"], "zia_policy" | "zia_access_control" | "zpa"]> = [
@@ -368,7 +368,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
       completenessSources.map(({ surfaceId, falseWhen }) => ({ surfaceId, falseWhen })),
       zscalerCompletenessSemantics(id),
     ),
-    decision: `${decisionPredicate[index]} Missing product credentials and unreadable or ambiguous feature responses remain manual; a proved violation has first-match precedence. The known truncation exceptions are listed as implementation gaps rather than silently hardened.`,
+    decision: `${decisionPredicate[index]} Missing product credentials and unreadable or ambiguous feature responses remain manual; a proved violation has first-match precedence. The known truncation exceptions are listed as collector gaps.`,
   };
 }));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
@@ -418,7 +418,7 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
   },
   runtimeBehavior: ZSCALER_RUNTIME_BEHAVIOR,
   knownGaps: [
-    "Known implementation limitation retained for output parity: across the 41 ZIA-policy and ZPA single-dataset truncation replays, 16 affected finding cases remain pass for ZS-03, ZS-04, ZS-05, ZS-16, ZS-17, ZS-20, and ZS-25. Secondary inventories cap pass when unreadable, but those truncations and several primary ZIA truncations are not completeness-gating.",
+    "Across the 41 ZIA-policy and ZPA single-dataset truncation replays, 16 affected finding cases currently remain pass for ZS-03, ZS-04, ZS-05, ZS-16, ZS-17, ZS-20, and ZS-25. Secondary inventories cap pass when unreadable, but those truncations and several primary ZIA truncations are not completeness-gating; a collector follow-up must close these paths.",
     "ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only.",
   ],
   sensitiveFields: ["apiKey", "password", "clientSecret", "authorization", "cookie", "token"],

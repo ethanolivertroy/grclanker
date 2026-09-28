@@ -59,6 +59,7 @@ const surfaces = [
   panosConfigSurface("panos-zone-config", "{/network|/template}", ["zones", "zone-protection-profile"]),
   panosConfigSurface("panos-device-config", "{/deviceconfig|/mgt-config|/config/shared|/template|/config/panorama}", ["administrators", "password complexity", "logging", "system settings", "Panorama forwarding"]),
   panosConfigSurface("panos-globalprotect-config", "{/vsys|/network|/template|/config/shared}", ["GlobalProtect portals", "GlobalProtect gateways", "authentication profiles", "multi-factor-auth"]),
+  restSurface("panos-system-info", "/api/?type=op&cmd=show system info", "PAN-OS XML API", PANOS_DOCS, ["hostname", "model", "family", "system-mode", "sw-version"]),
   restSurface("panos-ha-state", "/api/?type=op&cmd=show high-availability state", "PAN-OS XML API", PANOS_DOCS, ["enabled", "state"]),
 ] as const;
 
@@ -86,18 +87,18 @@ export const PALOALTO_COMPLETENESS_SOURCES: Readonly<Record<string, readonly Pal
   "PA-09": [paloaltoSource("compute-runtime-container-policy", PTF, "compute"), paloaltoSource("compute-defenders", PTF, "compute")],
   "PA-10": [paloaltoSource("compute-defenders", PTF, "compute")],
   "PA-11": [paloaltoSource("compute-registry-settings", PTF, "compute"), paloaltoSource("compute-registry-scans", PTF, "compute")],
-  "PA-12": [paloaltoSource("panos-policy-config", PE, "panos")],
-  "PA-13": [paloaltoSource("panos-zone-config", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
-  "PA-14": [paloaltoSource("panos-policy-config", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos")],
-  "PA-15": [paloaltoSource("panos-globalprotect-config", PE, "panos")],
-  "PA-16": [paloaltoSource("panos-policy-config", PE, "panos")],
-  "PA-17": [paloaltoSource("panos-policy-config", PE, "panos")],
-  "PA-18": [paloaltoSource("panos-policy-config", PE, "panos")],
-  "PA-19": [paloaltoSource("prisma-user-roles", PF, "cspm"), paloaltoSource("panos-device-config", PE, "panos")],
-  "PA-20": [paloaltoSource("prisma-integrations", PF, "cspm"), paloaltoSource("panos-policy-config", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos")],
-  "PA-21": [paloaltoSource("prisma-policies", PF, "cspm"), paloaltoSource("panos-policy-config", PE, "panos")],
-  "PA-22": [paloaltoSource("panos-policy-config", PE, "panos")],
-  "PA-23": [paloaltoSource("panos-device-config", PE, "panos"), paloaltoSource("panos-ha-state", PE, "panos")],
+  "PA-12": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-13": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-zone-config", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-14": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos")],
+  "PA-15": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-globalprotect-config", PE, "panos")],
+  "PA-16": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-17": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-18": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-19": [paloaltoSource("prisma-user-roles", PF, "cspm"), paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos")],
+  "PA-20": [paloaltoSource("prisma-integrations", PF, "cspm"), paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos")],
+  "PA-21": [paloaltoSource("prisma-policies", PF, "cspm"), paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-22": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-23": [paloaltoSource("panos-system-info", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos"), paloaltoSource("panos-ha-state", PE, "panos")],
   "PA-24": [paloaltoSource("compute-cloud-discovery", PTF, "compute")],
   "PA-25": [paloaltoSource("compute-ci-scans", PTF, "compute")],
 };
@@ -110,7 +111,7 @@ function paloaltoCompletenessSemantics(id: string): string {
   const configurationEffect = products.length === 1
     ? `The ${products[0]} product not configured makes the finding manual and omits evidence_complete.`
     : "Only configured products participate in source gates: an unconfigured product is omitted and does not make evidence_complete false when another product is configured. With neither product configured, the manual fallback omits evidence_complete.";
-  return `For ${id}, ${configurationEffect} Exact configured-source effects: ${sources}.`;
+  return `${configurationEffect} Exact configured-source effects: ${sources}.`;
 }
 
 const titles = [

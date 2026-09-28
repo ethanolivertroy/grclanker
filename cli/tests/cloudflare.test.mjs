@@ -28,6 +28,8 @@ import {
   resolveSecureOutputPath,
   scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/cloudflare.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { CLOUDFLARE_COMPLETENESS_SOURCES, CLOUDFLARE_SPEC } from "../dist/extensions/grc-tools/cloudflare.spec.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   CANARY_VALUES,
@@ -1108,6 +1110,71 @@ test("verdict rule 10: listCursorPaginated reports an empty page with a cursor, 
 
   const firstPageNotFound = await cursorClient(() => ({ status: 404, payload: { success: false, errors: [{ code: 10000, message: "not found" }] } })).listIpAccessRules("acc-123");
   assert.deepEqual(firstPageNotFound, { items: [], truncated: false, totalCount: 0 }, "a 404 on the first page still means the product is not provisioned");
+});
+
+test("CF-IAM-06 treats token-list 404 as complete safe-empty evidence and other failures as incomplete", async () => {
+  const notFoundClient = new CloudflareApiClient(sampleConfig(), {
+    fetchImpl: fakeFetch(() => ({
+      status: 404,
+      payload: { success: false, errors: [{ code: 10000, message: "not found" }] },
+    })).fetchImpl,
+  });
+  const userTokens = await notFoundClient.listUserTokens();
+  const accountTokens = await notFoundClient.listAccountTokens();
+  assert.deepEqual(userTokens, { items: [], truncated: false, totalCount: 0 });
+  assert.deepEqual(accountTokens, { items: [], truncated: false, totalCount: 0 });
+
+  const safeEmptyCases = [
+    { async listUserTokens() { return userTokens; } },
+    { async listAccountTokens() { return accountTokens; } },
+  ];
+  for (const overrides of safeEmptyCases) {
+    const safeEmpty = await captureBatchDecisionFacts(() =>
+      assessCloudflareIdentity(fixtureClient("compliant", overrides)));
+    const safeFacts = safeEmpty.captures.find((capture) =>
+      capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
+    assert.equal(safeFacts?.evidence_complete, true);
+    assert.equal(byId(safeEmpty.result, "CF-IAM-06").status, "pass");
+  }
+
+  const failed = await captureBatchDecisionFacts(() => assessCloudflareIdentity(fixtureClient("compliant", {
+    async listUserTokens() { throw forbidden("/user/tokens"); },
+  })));
+  const failedFacts = failed.captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
+  assert.equal(failedFacts?.evidence_complete, false);
+  assert.equal(byId(failed.result, "CF-IAM-06").status, "warn");
+});
+
+test("CF-TRF-06 preserves the unpaginated Gateway-rules limitation in facts and metadata", async () => {
+  assert.deepEqual(
+    CLOUDFLARE_COMPLETENESS_SOURCES["CF-TRF-06"].find((entry) => entry.surfaceId === "gateway-rules")?.falseWhen,
+    [],
+  );
+  const gatewayClient = new CloudflareApiClient(sampleConfig(), {
+    fetchImpl: fakeFetch(() => ({
+      payload: {
+        success: true,
+        result: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
+        result_info: { page: 1, per_page: 1, total_pages: 2, total_count: 2 },
+      },
+    })).fetchImpl,
+  });
+  const firstPage = await gatewayClient.listGatewayRules();
+  assert.deepEqual(firstPage, {
+    items: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
+    truncated: false,
+    totalCount: 1,
+  });
+  const { result, captures } = await captureBatchDecisionFacts(() => assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listGatewayRules() {
+      return firstPage;
+    },
+  })));
+  const facts = captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-TRF-06"))?.checks.get("CF-TRF-06");
+  assert.equal(facts?.evidence_complete, true);
+  assert.equal(byId(result, "CF-TRF-06").status, "pass");
 });
 
 test("verdict rule 10: CF-IAM-04 caps at warn when the reusable Access policy list is truncated and names seen versus total", async () => {

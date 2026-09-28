@@ -141,7 +141,7 @@ const completenessSource = (
   surfaceId: string,
   falseWhen: BatchCompletenessSourceDefinition["falseWhen"],
 ): BatchCompletenessSourceDefinition => ({ surfaceId, falseWhen });
-const AZURE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = {
+export const AZURE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = {
   "AZURE-ID-01": [
     completenessSource("conditional-access", TRUNCATION_ONLY),
     completenessSource("security-defaults", NO_COMPLETENESS_FAILURE_MODES),
@@ -185,7 +185,7 @@ const AZURE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchComplete
     completenessSource("role-assignments", TRUNCATION_ONLY),
     completenessSource("role-definitions", TRUNCATION_ONLY),
   ],
-  "AZURE-SUB-04": [completenessSource("network-watchers", NO_COMPLETENESS_FAILURE_MODES)],
+  "AZURE-SUB-04": [completenessSource("network-watchers", TRUNCATION_ONLY)],
   "AZURE-SUB-05": [
     completenessSource("role-assignments", TRUNCATION_ONLY),
     completenessSource("role-definitions", TRUNCATION_ONLY),
@@ -220,7 +220,7 @@ function azureCompletenessSemantics(id: string, title: string): string {
     case "AZURE-MON-06":
       return "true when the Log Analytics workspace inventory is untruncated; diagnostic-settings truncation leaves this primitive true.";
     case "AZURE-SUB-04":
-      return "true after a readable Network Watcher response; Network Watcher pagination truncation leaves this primitive true.";
+      return "true only after a readable Network Watcher response whose pagination reached the final page; truncation makes this primitive false and caps an otherwise passing finding at warn.";
     case "AZURE-DP-06":
       return "true when the member-user inventory is untruncated; individual mailbox-rule read failures are represented by mailbox_unreadable_count instead.";
     default:
@@ -646,7 +646,7 @@ export const AZURE_SPEC = buildBatchIntegrationSpec({
   },
   runtimeBehavior: AZURE_RUNTIME_BEHAVIOR,
   knownGaps: [
-    "Current-runtime limitation preserved for parity: AZURE-MON-06 caps pass only when the Log Analytics workspace inventory is truncated; truncation of diagnostic settings alone does not cap the finding. A runtime follow-up must make both dependencies completeness-gating.",
+    "AZURE-MON-06 currently caps pass only when the Log Analytics workspace inventory is truncated. Diagnostic-settings truncation leaves complete true and can pass; a collector follow-up must make both dependencies completeness-gating.",
     "Certificate authentication, managed identity, several mailbox and device surfaces, alternate reporters, and standalone binaries are not shipped.",
   ],
   sensitiveFields: ["client_secret", "graph_token", "management_token", "access_token", "authorization", "cookie"],

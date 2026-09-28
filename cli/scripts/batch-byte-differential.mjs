@@ -78,6 +78,10 @@ function instrumentedMainTest(source) {
     .replace(/^import \{ ZENDESK_SPEC \} from .*zendesk\.spec\.js";\n/m, "")
     .replace(/^import \{ SALESFORCE_SPEC \} from .*salesforce\.spec\.js";\n/m, "")
     .replace(/^import \{ SERVICENOW_SPEC \} from .*servicenow\.spec\.js";\n/m, "")
+    .replace(/^import \{ AZURE_COMPLETENESS_SOURCES, AZURE_SPEC \} from .*azure\.spec\.js";\n/m, "")
+    .replace(/^import \{ CLOUDFLARE_COMPLETENESS_SOURCES, CLOUDFLARE_SPEC \} from .*cloudflare\.spec\.js";\n/m, "")
+    .replace(/^import \{ GCP_COMPLETENESS_SOURCES, GCP_SPEC \} from .*gcp\.spec\.js";\n/m, "")
+    .replace(/^import \{ OCI_COMPLETENESS_SOURCES, OCI_SPEC \} from .*oci\.spec\.js";\n/m, "")
     .replace(/^import \{ PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC \} from .*paloalto\.spec\.js";\n/m, "")
     .replace(/^import \{ ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC \} from .*zscaler\.spec\.js";\n/m, "")
     .replace(/^import \{ captureBatchDecisionFacts \} from .*batch-spec-builder\.js";\n/m, "")
@@ -255,7 +259,7 @@ function runCorpusSuite(root, fixtureDirectory) {
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-skip-pattern=^all 25 (?:Palo Alto|Zscaler) checks replay",
+    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures)",
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,

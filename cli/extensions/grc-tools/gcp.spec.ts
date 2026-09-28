@@ -39,16 +39,30 @@ const surfaces = [
   restSurface("iam-policies", "cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies", "Cloud Asset Inventory", ASSET_DOCS, ["resource", "policy.bindings.role", "policy.bindings.members"]),
   restSurface("service-accounts", "iam.googleapis.com/v1/projects/{project}/serviceAccounts", "IAM", "https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts/list", ["name", "email", "disabled"]),
   restSurface("service-account-keys", "iam.googleapis.com/v1/projects/{project}/serviceAccounts/{account}/keys", "IAM", "https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts.keys/list", ["name", "keyType", "validAfterTime", "validBeforeTime"]),
-  restSurface("logging", "logging.googleapis.com/v2/{resource}", "Cloud Logging", "https://cloud.google.com/logging/docs/reference/v2/rest", ["name", "disabled", "destination", "retentionDays", "timestamp"]),
-  restSurface("security-command-center", "securitycenter.googleapis.com/v1/organizations/{organization}/{resource}", "Security Command Center", "https://cloud.google.com/security-command-center/docs/reference/rest", ["name", "state", "category", "severity"]),
+  restSurface("admin-activity-entries", "logging.googleapis.com/v2/entries:list (cloudaudit.googleapis.com/activity)", "Cloud Logging", "https://cloud.google.com/logging/docs/reference/v2/rest/v2/entries/list", ["insertId", "timestamp", "protoPayload"]),
+  restSurface("data-access-entries", "logging.googleapis.com/v2/entries:list (cloudaudit.googleapis.com/data_access)", "Cloud Logging", "https://cloud.google.com/logging/docs/reference/v2/rest/v2/entries/list", ["insertId", "timestamp", "protoPayload"]),
+  restSurface("log-sinks", "logging.googleapis.com/v2/projects/{project}/sinks", "Cloud Logging", "https://cloud.google.com/logging/docs/reference/v2/rest/v2/projects.sinks/list", ["name", "disabled", "destination"]),
+  restSurface("log-buckets", "logging.googleapis.com/v2/projects/{project}/locations/-/buckets", "Cloud Logging", "https://cloud.google.com/logging/docs/reference/v2/rest/v2/projects.locations.buckets/list", ["name", "retentionDays"]),
+  restSurface("scc-sources", "securitycenter.googleapis.com/v1/organizations/{organization}/sources", "Security Command Center", "https://cloud.google.com/security-command-center/docs/reference/rest/v1/organizations.sources/list", ["name", "displayName"]),
+  restSurface("scc-findings", "securitycenter.googleapis.com/v1/organizations/{organization}/sources/-/findings", "Security Command Center", "https://cloud.google.com/security-command-center/docs/reference/rest/v1/organizations.sources.findings/list", ["finding.name", "finding.state", "finding.category", "finding.severity"]),
   restSurface("effective-org-policy", "cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/projects/getEffectiveOrgPolicy", ["constraint", "booleanPolicy.enforced", "listPolicy"]),
-  restSurface("compute", "compute.googleapis.com/compute/v1/projects/{project}/{resource}", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1", ["name", "metadata", "shieldedInstanceConfig", "networkInterfaces", "logConfig", "sslPolicy", "securityPolicy"]),
+  restSurface("compute-project", "compute.googleapis.com/compute/v1/projects/{project}", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/projects/get", ["name", "commonInstanceMetadata"]),
+  restSurface("compute-instances", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/instances", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/instances/aggregatedList", ["name", "metadata", "shieldedInstanceConfig", "networkInterfaces"]),
+  restSurface("compute-disks", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/disks", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/disks/aggregatedList", ["name", "diskEncryptionKey.kmsKeyName"]),
+  restSurface("compute-firewalls", "compute.googleapis.com/compute/v1/projects/{project}/global/firewalls", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/firewalls/list", ["name", "direction", "sourceRanges", "allowed"]),
+  restSurface("compute-subnetworks", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/subnetworks", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/subnetworks/aggregatedList", ["name", "purpose", "logConfig", "privateIpGoogleAccess"]),
+  restSurface("compute-routers", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/routers", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/routers/aggregatedList", ["name", "network", "nats"]),
+  restSurface("compute-ssl-policies", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/sslPolicies", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/sslPolicies/aggregatedList", ["name", "minTlsVersion", "profile"]),
+  restSurface("compute-target-https-proxies", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/targetHttpsProxies", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/targetHttpsProxies/aggregatedList", ["name", "sslPolicy"]),
+  restSurface("compute-backend-services", "compute.googleapis.com/compute/v1/projects/{project}/aggregated/backendServices", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1/backendServices/aggregatedList", ["name", "loadBalancingScheme", "protocol", "securityPolicy"]),
   restSurface("binary-authorization", "binaryauthorization.googleapis.com/v1/projects/{project}/policy", "Binary Authorization", "https://cloud.google.com/binary-authorization/docs/reference/rest/v1/projects/getPolicy", ["defaultAdmissionRule", "clusterAdmissionRules", "kubernetesNamespaceAdmissionRules", "serviceAccountAdmissionRules", "istioServiceIdentityAdmissionRules"]),
-  restSurface("storage", "storage.googleapis.com/storage/v1/b?project={project}", "Cloud Storage", "https://cloud.google.com/storage/docs/json_api/v1/buckets/list", ["name", "iamConfiguration", "encryption"]),
+  restSurface("storage-buckets", "storage.googleapis.com/storage/v1/b?project={project}", "Cloud Storage", "https://cloud.google.com/storage/docs/json_api/v1/buckets/list", ["name", "iamConfiguration", "encryption"]),
+  restSurface("public-iam-bindings", "cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies?query=memberTypes:(allUsers OR allAuthenticatedUsers)", "Cloud Asset Inventory", ASSET_DOCS, ["resource", "policy.bindings.role", "policy.bindings.members"]),
   restSurface("kms", "cloudasset.googleapis.com/v1/{scope}/assets?assetTypes=cloudkms.googleapis.com/CryptoKey", "Cloud Asset Inventory", ASSET_DOCS, ["name", "resource.data.rotationPeriod", "resource.data.nextRotationTime"]),
   restSurface("dns", "dns.googleapis.com/dns/v1/projects/{project}/managedZones", "Cloud DNS", "https://cloud.google.com/dns/docs/reference/rest/v1/managedZones/list", ["name", "dnssecConfig.state"]),
   restSurface("api-keys", "apikeys.googleapis.com/v2/projects/{project}/locations/global/keys", "API Keys", "https://cloud.google.com/api-keys/docs/reference/rest/v2/projects.locations.keys/list", ["name", "restrictions"]),
-  restSurface("access-context-manager", "accesscontextmanager.googleapis.com/v1/{resource}", "Access Context Manager", "https://cloud.google.com/access-context-manager/docs/reference/rest/v1", ["name", "parent", "status.resources", "spec.resources"]),
+  restSurface("access-policies", "accesscontextmanager.googleapis.com/v1/accessPolicies?parent=organizations/{organization}", "Access Context Manager", "https://cloud.google.com/access-context-manager/docs/reference/rest/v1/accessPolicies/list", ["name", "parent", "title"]),
+  restSurface("service-perimeters", "accesscontextmanager.googleapis.com/v1/{accessPolicy}/servicePerimeters", "Access Context Manager", "https://cloud.google.com/access-context-manager/docs/reference/rest/v1/accessPolicies.servicePerimeters/list", ["name", "status.resources", "status.restrictedServices", "spec"]),
 ] as const;
 
 type Row = readonly [
@@ -62,51 +76,54 @@ type Row = readonly [
 ];
 
 const rows: readonly Row[] = [
-  ["GCP-IAM-01", 2, "Privileged IAM bindings", "high", ["iam-policies"], "manual"],
+  ["GCP-IAM-01", 2, "Privileged IAM bindings", "high", ["projects", "iam-policies"], "manual"],
   ["GCP-IAM-02", 1, "Service account key rotation", "high", ["projects", "service-accounts", "service-account-keys"], "pass"],
   ["GCP-IAM-03", 1, "User-managed service account key minimization", "medium", ["projects", "service-accounts", "service-account-keys"], "manual", "warn"],
-  ["GCP-IAM-04", 14, "Cross-project service account access", "medium", ["iam-policies"], "manual", "warn"],
-  ["GCP-IAM-05", 13, "Default service account privilege", "high", ["iam-policies"], "manual"],
-  ["GCP-LOG-01", 5, "Admin Activity visibility", "medium", ["projects", "logging"], "manual", "warn"],
-  ["GCP-LOG-02", 5, "Data Access logging coverage", "high", ["projects", "logging"], "manual"],
-  ["GCP-LOG-03", 5, "Log sink coverage", "high", ["projects", "logging"], "manual"],
-  ["GCP-LOG-04", 5, "Log bucket retention", "medium", ["projects", "logging"], "manual"],
-  ["GCP-LOG-05", 5, "Security Command Center visibility", "info", ["organization", "security-command-center"], "warn", "warn"],
+  ["GCP-IAM-04", 14, "Cross-project service account access", "medium", ["projects", "iam-policies"], "manual", "warn"],
+  ["GCP-IAM-05", 13, "Default service account privilege", "high", ["projects", "iam-policies"], "manual"],
+  ["GCP-LOG-01", 5, "Admin Activity visibility", "medium", ["projects", "admin-activity-entries"], "manual", "warn"],
+  ["GCP-LOG-02", 5, "Data Access logging coverage", "high", ["projects", "data-access-entries"], "manual"],
+  ["GCP-LOG-03", 5, "Log sink coverage", "high", ["projects", "log-sinks"], "manual"],
+  ["GCP-LOG-04", 5, "Log bucket retention", "medium", ["projects", "log-buckets"], "manual"],
+  ["GCP-LOG-05", 5, "Security Command Center visibility", "info", ["projects", "scc-sources", "scc-findings"], "warn", "warn"],
   ["GCP-ORG-01", 6, "Organization visibility", "medium", ["organization", "projects"], "warn", "warn"],
-  ["GCP-ORG-02", 6, "Domain-restricted sharing", "high", ["effective-org-policy"], "manual", "warn"],
-  ["GCP-ORG-03", 6, "Service account key creation restriction", "high", ["effective-org-policy"], "manual"],
-  ["GCP-ORG-04", 6, "Service account key upload restriction", "high", ["effective-org-policy"], "manual", "warn"],
-  ["GCP-ORG-05", 12, "Serial port and Shielded VM guardrails", "medium", ["effective-org-policy"], "manual"],
-  ["GCP-ORG-06", 11, "OS Login enforcement", "high", ["effective-org-policy", "compute"], "manual"],
+  ["GCP-ORG-02", 6, "Domain-restricted sharing", "high", ["projects", "effective-org-policy"], "manual", "warn"],
+  ["GCP-ORG-03", 6, "Service account key creation restriction", "high", ["projects", "effective-org-policy"], "manual"],
+  ["GCP-ORG-04", 6, "Service account key upload restriction", "high", ["projects", "effective-org-policy"], "manual", "warn"],
+  ["GCP-ORG-05", 12, "Serial port and Shielded VM guardrails", "medium", ["projects", "effective-org-policy"], "manual"],
+  ["GCP-ORG-06", 11, "OS Login enforcement", "high", ["projects", "effective-org-policy", "compute-project", "compute-instances"], "manual"],
   ["GCP-ORG-07", 8, "Binary Authorization admission policy", "medium", ["projects", "binary-authorization"], "manual"],
-  ["GCP-ORG-08", 12, "Shielded VM and serial port instance configuration", "medium", ["projects", "compute"], "manual"],
-  ["GCP-DATA-01", 15, "Uniform bucket-level access", "high", ["projects", "storage"], "manual"],
-  ["GCP-DATA-02", 3, "Public resource exposure", "critical", ["iam-policies"], "manual"],
-  ["GCP-DATA-03", 7, "KMS key rotation", "medium", ["kms"], "manual"],
-  ["GCP-DATA-04", 16, "Customer-managed encryption keys", "medium", ["projects", "storage", "compute"], "manual", "warn"],
+  ["GCP-ORG-08", 12, "Shielded VM and serial port instance configuration", "medium", ["projects", "compute-instances"], "manual"],
+  ["GCP-DATA-01", 15, "Uniform bucket-level access", "high", ["projects", "storage-buckets"], "manual"],
+  ["GCP-DATA-02", 3, "Public resource exposure", "critical", ["projects", "storage-buckets", "public-iam-bindings"], "manual"],
+  ["GCP-DATA-03", 7, "KMS key rotation", "medium", ["projects", "kms"], "manual"],
+  ["GCP-DATA-04", 16, "Customer-managed encryption keys", "medium", ["projects", "storage-buckets", "compute-disks"], "manual", "warn"],
   ["GCP-DATA-05", 17, "Cloud DNS DNSSEC", "medium", ["projects", "dns"], "manual"],
   ["GCP-DATA-06", 20, "API key restrictions", "high", ["projects", "api-keys"], "pass"],
-  ["GCP-DATA-07", 21, "VPC Service Controls perimeters", "medium", ["organization", "access-context-manager"], "fail", "warn"],
-  ["GCP-NET-01", 4, "Firewall rules open to the internet on administrative ports", "high", ["projects", "compute"], "manual"],
-  ["GCP-NET-02", 9, "VPC flow logs", "medium", ["projects", "compute"], "manual"],
-  ["GCP-NET-03", 22, "Private Google Access", "low", ["projects", "compute"], "manual", "warn"],
-  ["GCP-NET-04", 10, "Cloud NAT coverage and external IP usage", "medium", ["projects", "compute"], "manual", "warn"],
-  ["GCP-NET-05", 18, "Load balancer SSL policies", "high", ["projects", "compute"], "manual"],
-  ["GCP-NET-06", 19, "Cloud Armor on external backend services", "medium", ["projects", "compute"], "manual", "warn"],
+  ["GCP-DATA-07", 21, "VPC Service Controls perimeters", "medium", ["projects", "access-policies", "service-perimeters"], "fail", "warn"],
+  ["GCP-NET-01", 4, "Firewall rules open to the internet on administrative ports", "high", ["projects", "compute-firewalls"], "manual"],
+  ["GCP-NET-02", 9, "VPC flow logs", "medium", ["projects", "compute-subnetworks"], "manual"],
+  ["GCP-NET-03", 22, "Private Google Access", "low", ["projects", "compute-subnetworks"], "manual", "warn"],
+  ["GCP-NET-04", 10, "Cloud NAT coverage and external IP usage", "medium", ["projects", "compute-subnetworks", "compute-routers", "compute-instances"], "manual", "warn"],
+  ["GCP-NET-05", 18, "Load balancer SSL policies", "high", ["projects", "compute-ssl-policies", "compute-target-https-proxies"], "manual"],
+  ["GCP-NET-06", 19, "Cloud Armor on external backend services", "medium", ["projects", "compute-backend-services"], "manual", "warn"],
 ] as const;
 
 const GA = ["truncated", "error", "denied", "not-collected"] as const;
 const GT = ["truncated"] as const;
 const GN = [] as const;
-function gcpCompletenessFailureModes(surfaceId: string): BatchCompletenessSourceDefinition["falseWhen"] {
-  if (surfaceId === "organization" || surfaceId === "effective-org-policy") return GN;
-  if (["iam-policies", "security-command-center", "kms", "access-context-manager"].includes(surfaceId)) return GT;
+function gcpCompletenessFailureModes(checkId: string, surfaceId: string): BatchCompletenessSourceDefinition["falseWhen"] {
+  if (surfaceId === "organization") return GN;
+  if (surfaceId === "projects") return checkId === "GCP-ORG-01" ? GT : GA;
+  if (surfaceId === "effective-org-policy") return checkId === "GCP-ORG-06" ? GA : GN;
+  if (surfaceId === "service-account-keys") return GT;
+  if (["iam-policies", "public-iam-bindings", "kms", "scc-sources", "service-perimeters"].includes(surfaceId)) return GT;
   return GA;
 }
 export const GCP_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = Object.fromEntries(
   rows.map(([id, , , , sourceSurfaces]) => [
     id,
-    sourceSurfaces.map((surfaceId) => ({ surfaceId, falseWhen: gcpCompletenessFailureModes(surfaceId) })),
+    sourceSurfaces.map((surfaceId) => ({ surfaceId, falseWhen: gcpCompletenessFailureModes(id, surfaceId) })),
   ]),
 );
 
@@ -256,7 +273,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     completeness: batch2Completeness(
       decisionInputs,
       GCP_COMPLETENESS_SOURCES[id],
-      `For ${id}, project and per-project scan failures make evidence_complete false. Organization and effective-policy object failures instead make the finding manual and omit or bypass this primitive. Direct organization-scoped list truncation makes it false, while a direct-list error makes the finding manual without lowering it.`,
+      "Project inventory and per-project scan failures lower evidence_complete except where the source-state table explicitly omits a mode. For service-account keys, an error or denial across the entire attempted key inventory makes the finding manual while leaving this primitive true; a mixed project scan with at least one readable project and at least one failed key inventory makes it false. Direct organization-scoped list errors generally make the finding manual without lowering this primitive; Security Command Center findings, OS Login effective-policy, and Access Context Manager failures are explicit exceptions.",
     ),
     decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
   };
