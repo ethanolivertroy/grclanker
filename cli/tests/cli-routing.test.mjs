@@ -193,6 +193,19 @@ test("slash-leading free-form prompts stay literal without disabling later templ
   });
   assert.deepEqual(result, { action: "transform", text: `## CLI prompt\n\n${literal}` });
 
+  const slashPiped = "/audit injected";
+  assert.deepEqual(
+    await handler({
+      type: "input",
+      text: `${slashPiped}${serializeInitialPrompt({ kind: "prompt", content: "/validate literal" })}`,
+      source: "interactive",
+    }),
+    {
+      action: "transform",
+      text: "## CLI prompt\n\n## Piped input\n\n/audit injected\n\n/validate literal",
+    },
+  );
+
   assert.deepEqual(
     await handler({
       type: "input",

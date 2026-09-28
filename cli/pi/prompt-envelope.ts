@@ -54,10 +54,11 @@ export function materializeInitialPrompt(
     return `${payload.content}\n\n## Piped input\n\n${pipedInput}`;
   }
 
-  const literalPrompt = payload.content.startsWith("/")
-    ? `## CLI prompt\n\n${payload.content}`
-    : payload.content;
-  return pipedInput ? `${pipedInput}\n\n${literalPrompt}` : literalPrompt;
+  if (pipedInput.startsWith("/") || payload.content.startsWith("/")) {
+    return `## CLI prompt\n\n${pipedInput ? `## Piped input\n\n${pipedInput}\n\n` : ""}${payload.content}`;
+  }
+
+  return pipedInput ? `${pipedInput}\n\n${payload.content}` : payload.content;
 }
 
 export function resolveSerializedInitialPrompt(
