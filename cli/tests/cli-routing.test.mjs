@@ -5,11 +5,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs } from "@earendil-works/pi-coding-agent";
+import { runPrintMode } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/print-mode.js";
 import { CLI_HELP } from "../dist/pi/cli-help.js";
 import { routeCliInvocation } from "../dist/pi/cli-routing.js";
 import { buildCliLaunchArgs } from "../dist/pi/launch.js";
 import {
   extractInitialPrompt,
+  initialPromptInputResult,
   materializeInitialPrompt,
   serializeInitialPrompt,
 } from "../dist/pi/prompt-envelope.js";
@@ -23,6 +25,38 @@ function renderWorkflow(workflow, subject) {
     readFileSync(resolve(cliRoot, "prompts", `${workflow}.md`), "utf8"),
     subject,
   );
+}
+
+async function runRecordingPrintMode(initialMessage) {
+  const promptCalls = [];
+  const lifecycle = [];
+  const session = {
+    sessionManager: { getHeader: () => undefined },
+    state: { messages: [] },
+    async bindExtensions() {},
+    subscribe() {
+      return () => {};
+    },
+    async prompt(text) {
+      lifecycle.push("prompt");
+      const result = initialPromptInputResult(text, "interactive");
+      assert.equal(result.action, "transform");
+      promptCalls.push(result.text);
+      await Promise.resolve();
+      session.state.messages.push({ role: "assistant", content: [] });
+      lifecycle.push("turn-complete");
+    },
+  };
+  const runtime = {
+    session,
+    async dispose() {
+      lifecycle.push("disposed");
+    },
+    setRebindSession() {},
+  };
+
+  await runPrintMode(runtime, { mode: "text", initialMessage });
+  return { lifecycle, promptCalls };
 }
 
 test("non-option invocations route as one free-form Pi prompt", () => {
@@ -45,6 +79,7 @@ test("non-option invocations route as one free-form Pi prompt", () => {
   assert.equal(parsed.fileArgs.length, 0);
   assert.deepEqual(parsed.messages, [args.at(-1)]);
   assert.equal(args.at(-1).startsWith("-"), false);
+  assert.equal(args.includes("--no-prompt-templates"), true);
 });
 
 test("workflow subjects survive both --compute forms and positions", () => {
@@ -135,8 +170,19 @@ test("initial prompt envelopes preserve literal user text and workflow precedenc
   assert.equal(materialized.includes("$ARGUMENTS"), false);
 });
 
+test("serialized prompts complete in print mode before runtime disposal", async () => {
+  const content = renderWorkflow("investigate", `@evidence "quoted" O'Reilly`);
+  const initialMessage = serializeInitialPrompt({ kind: "workflow", content });
+  const result = await runRecordingPrintMode(initialMessage);
+
+  assert.deepEqual(result.promptCalls, [content]);
+  assert.deepEqual(result.lifecycle, ["prompt", "turn-complete", "disposed"]);
+});
+
 test("help documents prompt, workflow, compute, and delimiter invocation forms", () => {
   assert.match(CLI_HELP, /grclanker "<prompt>"/);
-  assert.match(CLI_HELP, /investigate <subject> \[--compute <kind>\]/);
+  for (const workflow of workflows) {
+    assert.match(CLI_HELP, new RegExp(`${workflow} <subject> \\[--compute <kind>\\]`));
+  }
   assert.match(CLI_HELP, /Treat all following text literally/);
 });

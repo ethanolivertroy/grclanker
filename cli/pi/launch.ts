@@ -76,6 +76,7 @@ export function buildCliLaunchArgs(
   args.push("--system-prompt", readFileSync(resolve(appRoot, ".grclanker", "SYSTEM.md"), "utf8"));
 
   if (initialPrompt) {
+    args.push("--no-prompt-templates");
     args.push(serializeInitialPrompt(initialPrompt));
   }
 

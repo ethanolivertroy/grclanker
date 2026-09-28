@@ -15,8 +15,11 @@ Usage:
   grclanker investigate         Trace crypto status, KEVs, and exploitability
   grclanker investigate <subject> [--compute <kind>]
   grclanker audit               Map evidence against a requested framework
+  grclanker audit <subject> [--compute <kind>]
   grclanker assess              Produce a posture readout and remediation order
+  grclanker assess <subject> [--compute <kind>]
   grclanker validate            Answer a narrow FIPS validation question
+  grclanker validate <subject> [--compute <kind>]
 
 Install:
   curl -fsSL https://grclanker.com/install | bash

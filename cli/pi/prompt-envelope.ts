@@ -3,6 +3,10 @@ export type InitialPromptPayload = {
   content: string;
 };
 
+export type InitialPromptInputResult =
+  | { action: "continue" }
+  | { action: "transform"; text: string };
+
 const INITIAL_PROMPT_PREFIX = "grclanker:initial-prompt:v1:";
 
 export function serializeInitialPrompt(payload: InitialPromptPayload): string {
@@ -52,4 +56,26 @@ export function materializeInitialPrompt(
   }
 
   return `${pipedInput}\n\n${payload.content}`;
+}
+
+export function resolveSerializedInitialPrompt(
+  text: string,
+  source: "interactive" | "rpc" | "extension",
+): string | undefined {
+  if (source !== "interactive") return undefined;
+
+  const initialPrompt = extractInitialPrompt(text);
+  if (!initialPrompt) return undefined;
+
+  return materializeInitialPrompt(initialPrompt.payload, initialPrompt.pipedInput);
+}
+
+export function initialPromptInputResult(
+  text: string,
+  source: "interactive" | "rpc" | "extension",
+): InitialPromptInputResult {
+  const transformed = resolveSerializedInitialPrompt(text, source);
+  return transformed === undefined
+    ? { action: "continue" }
+    : { action: "transform", text: transformed };
 }
