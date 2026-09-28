@@ -560,9 +560,19 @@ These notes explain intent only. The ordered rule table is normative.
 | `AWS-NET-20` | medium | `aws_assess_network_security` | `ec2-describe-network-acls` | `regions_seen`, `regions_total`, `regions`, `partial`, `source`, `scope_error`, `sensitive_ports`, `network_acls`, `permissive_network_acls`, `inventory_truncated`, `regions_with_errors` | At least one network ACL is readable and none has an inbound allow entry from 0.0.0.0/0 or ::/0 whose protocol/range covers any configured sensitive port or all ports. | A pass is demoted by partial region scope or unreadable/truncated NACL inventories. | At least one NACL has a matching permissive inbound entry. | NACLs are unreadable in every region or no NACL is returned. |
 | `AWS-NET-21` | high | `aws_assess_network_security` | `ec2-describe-security-groups` | `regions_seen`, `regions_total`, `regions`, `partial`, `source`, `scope_error`, `sensitive_ports`, `security_groups`, `unrestricted_security_groups`, `inventory_truncated`, `regions_with_errors` | At least one security group is readable and none has an inbound IPv4 or IPv6 world source whose protocol/range covers any configured sensitive port or all ports. | A pass is demoted by partial region scope or unreadable/truncated security-group inventories. | At least one security group has a matching unrestricted inbound permission. | Security groups are unreadable in every region or no security group is returned. |
 
+### Primitive decision inputs
+
+Every primitive is read from the named vendor surface or collector state before evidence lists are rendered or capped. Null and missing retain unavailable semantics; they are not empty inventories, false values, or zero counts.
+
+| Finding | Input | Portable definition |
+|---|---|---|
+| None |  |  |
+
 ### Ordered decision rules
 
 Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+A `matches` condition performs a regular-expression search; anchors are required for whole-value matching, and an `i` flag requests case-insensitive matching. A `ratio` condition divides the numerator by the denominator, applies the declared scale, and rounds to the declared decimal places by choosing the nearest value with exact half cases rounded toward positive infinity; a zero, null, or missing denominator does not match.
 
 | Finding | Order | Outcome | First-match condition | Explanatory note |
 |---|---|---|---|---|
