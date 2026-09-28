@@ -24,6 +24,7 @@ export {
 export type { FailedResponse, IntegrationErrorDetails, RedactSecretValuesOptions, ScrubErrorTextOptions, ScrubbedError } from "./error-text.js";
 
 export {
+  CONFIG_FILE_MAX_BYTES,
   ConfigFileError,
   PARSER_CODE_PATTERN,
   SYSTEM_ERROR_CODE_PATTERN,
