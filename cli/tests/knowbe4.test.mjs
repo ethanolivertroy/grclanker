@@ -1331,6 +1331,14 @@ test("campaign targeting retains the observed All Users proof when the campaign 
   const targeting = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 9);
   assert.equal(targeting.status, "warn");
   assert.match(targeting.summary, /target All Users.*Truncated listing: phishing_campaigns/);
+
+  const lowCoverage = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["phishing"], now: NOW });
+  lowCoverage.activeUsers.truncated = true;
+  lowCoverage.activeUsers.total = lowCoverage.activeUsers.data.length + 1;
+  lowCoverage.activeUsers.limit = 5_000;
+  const failingTargeting = findingFor(assessKnowbe4PhishingProgram(lowCoverage, { now: NOW }), 9);
+  assert.equal(failingTargeting.status, "fail");
+  assert.match(failingTargeting.summary, /estimated 50%.*Truncated listing: users/);
 });
 
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {

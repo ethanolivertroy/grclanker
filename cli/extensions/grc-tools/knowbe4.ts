@@ -2361,10 +2361,11 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
   manualEvidence?: string,
+  decisionFacts?: Readonly<Record<string, unknown>>,
 ): Knowbe4Finding {
   const definition = controlById(number);
   const id = findingId(number);
-  const facts = knowbe4DecisionFacts(id, evidence ?? {});
+  const facts = decisionFacts ?? knowbe4DecisionFacts(id, evidence ?? {});
   const result: Knowbe4FindingWithFacts = {
     id,
     control: number,
@@ -2939,7 +2940,7 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
 
   // An All Users campaign proves coverage from the campaign list alone; otherwise the estimate joins users and groups.
   const estimateKnown = fullCampaigns.length > 0 || activeCampaigns.length === 0 || (isComplete(snapshot.activeUsers) && isComplete(snapshot.groups));
-  return withInventoryCaveats(finding(9, "medium", summary, {
+  const evidence = {
     active_campaigns: whenComplete(snapshot.phishingCampaigns, activeCampaigns.length),
     full_targeting_campaigns: fullCampaigns.map(campaignName),
     partial_targeting_campaigns: partialCampaigns.slice(0, SAMPLE_SIZE).map((campaign) => ({
@@ -2950,6 +2951,19 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     min_coverage_pct: minCoveragePct,
     require_full_targeting: requireFullTargeting,
     active_users: whenComplete(snapshot.activeUsers, activeUsers),
+  };
+  const violationCount = activeCampaigns.length === 0
+    || (fullCampaigns.length === 0
+      && requireFullTargeting
+      && (estimatedCoverage === undefined || estimatedCoverage < minCoveragePct))
+    ? 1
+    : 0;
+  return withInventoryCaveats(finding(9, "medium", summary, evidence, undefined, {
+    evidence_readable: true,
+    evidence_complete: true,
+    inventory_count: activeCampaigns.length,
+    violation_count: violationCount,
+    review_count: 0,
   }), snapshot, [
     { inventory: "phishing_campaigns", notChecked: "the campaign target groups were not available", essential: true },
     { inventory: "security_tests", notChecked: "campaigns were classed as active from their status and last run alone, not from the tests that actually ran" },
