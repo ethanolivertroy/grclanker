@@ -110,7 +110,10 @@ const inventory = (empty: "manual" | "warn", bad: "fail" | "warn"): ZoomExecutab
   rules: [rule("manual", ne("readable", true)), rule(empty, eq("count", 0)), rule(bad, gt("bad_count", 0)), rule("warn", ne("complete", true)), rule("pass", { op: "always" })],
 });
 const ZOOM_EXECUTABLE_DECISIONS: Readonly<Record<string, ZoomExecutableDecision>> = {
-  "ZOOM-ID-01": inventory("manual", "fail"),
+  "ZOOM-ID-01": {
+    inputs: input("readable", "complete", "count", "bad_count", "unknown_count"),
+    rules: [rule("manual", any(ne("readable", true), eq("count", 0))), rule("fail", gt("bad_count", 0)), rule("warn", any(gt("unknown_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
   "ZOOM-ID-02": standard(),
   "ZOOM-ID-03": inventory("manual", "fail"),
   "ZOOM-ID-04": { inputs: input("available", "complete", "admin_count", "max_admins"), rules: [rule("manual", ne("available", true)), rule("warn", any(ne("complete", true), { op: "gt", left: path("admin_count"), right: path("max_admins") })), rule("pass", { op: "always" })] },

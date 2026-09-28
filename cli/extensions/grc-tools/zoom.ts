@@ -1649,7 +1649,7 @@ export function assessZoomIdentityFromSnapshot(
     undocumented_login_codes: undocumentedCodes,
     login_type_codes: Object.fromEntries(Object.entries(LOGIN_TYPE_CATALOG).map(([code, entry]) => [code, `${entry.label} [${entry.category}]`])),
   };
-  recordZoomDecisionFacts("ZOOM-ID-01", { readable: snapshot.users.status === "ok", complete: !usersPartial, count: userRecords.length, bad_count: nonSsoUsers.length });
+  recordZoomDecisionFacts("ZOOM-ID-01", { readable: snapshot.users.status === "ok", complete: !usersPartial, count: userRecords.length, bad_count: nonSsoUsers.length, unknown_count: unknownLoginUsers.length });
   recordZoomDecisionFacts("ZOOM-ID-05", { readable: snapshot.users.status === "ok", complete: !usersPartial, count: userRecords.length, bad_count: socialUsers.length + passwordUsers.length, unknown_count: unknownLoginUsers.length + otherDocumentedUsers.length + undocumentedUsers.length });
 
   if (snapshot.users.status !== "ok") {
