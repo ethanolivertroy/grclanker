@@ -247,7 +247,9 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
       else if (/Type\/domain: [^.]*boolean/.test(definition)) facts[name] = !name.endsWith("_no_remediation_due");
       else if (/Type\/domain: [^.]*array/.test(definition)) facts[name] = [];
       else if (/Type\/domain: [^.]*number/.test(definition)) {
-        facts[name] = /(?:failure|violation|review|undated|missing|without|unreadable|external)/.test(name) ? 0 : 100;
+        facts[name] = /(?:failure|violation|review|undated|missing|without|unreadable|external)/.test(name)
+          ? 0
+          : /(?:percent|pct|ratio|coverage|compliant)/.test(name) ? 100 : 1;
       } else {
         facts[name] = "observed";
       }
