@@ -25,7 +25,7 @@ const cacheDir = resolve(companionDir, ".cache", "node");
 const packageJson = JSON.parse(readFileSync(join(companionDir, "package.json"), "utf8"));
 
 const companionVersion = process.env.GRCLANKER_VERSION || packageJson.version;
-const nodeVersion = process.env.GRCLANKER_NODE_VERSION || "22.20.0";
+const nodeVersion = process.env.GRCLANKER_NODE_VERSION || "22.23.3";
 // Zip entries store DOS timestamps, which cannot represent anything before 1980-01-01.
 const MIN_ARCHIVE_EPOCH = 315532800;
 
