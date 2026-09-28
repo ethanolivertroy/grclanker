@@ -1,6 +1,6 @@
 ---
 title: Sumo Logic
-description: Read-only Sumo Logic organization security inspector covering SSO, MFA, RBAC, access keys, audit index, retention, collectors, content sharing, and alert routing.
+description: Read-only Sumo Logic security inspector covering SSO, MFA, RBAC, access keys, audit index, retention, collectors, content sharing, and alert routing.
 ---
 
 The Sumo Logic tools inspect an organization's Management API configuration and map the results to the 20 controls in `specs/sumologic-sec-inspector.spec.md`. Every tool is read-only: no PUT, POST, or DELETE requests are ever issued.
