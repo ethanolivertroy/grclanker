@@ -347,18 +347,10 @@ interface PortableInputUsage {
 function portableValueType(value: PortableValue): PortableInputType {
   if (value === null) return "null";
   if (Array.isArray(value)) return "array";
-  switch (typeof value) {
-    case "boolean":
-      return "boolean";
-    case "number":
-      return "number";
-    case "string":
-      return "string";
-    default: {
-      const exhaustive: never = value;
-      return exhaustive;
-    }
-  }
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "number") return "number";
+  if (typeof value === "string") return "string";
+  throw new Error(`Unsupported portable value type: ${typeof value}`);
 }
 
 function recordOperandUsage(
