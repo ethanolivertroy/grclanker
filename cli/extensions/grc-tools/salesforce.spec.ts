@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const SALESFORCE_SURFACES = [
   ["limits", "GET", "/services/data/v{version}/limits"], ["organization", "GET", "/services/data/v{version}/query?q=Organization"],
@@ -70,16 +71,160 @@ const decisions = [
   "return pass when all four setup, non-setup, Visualforce-with-header, and Visualforce-without-header clickjack flags are enabled, fail when at least two are disabled, warn when one is disabled, and manual when flags are absent.",
   "return pass when CSRF protection is enabled for both GET and POST, fail when either is disabled, and manual when either flag is absent.",
 ] as const;
+
+interface SalesforceExecutableDecision { inputs: Readonly<Record<string, string>>; rules: readonly VerdictRule[] }
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const cmp = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry: PortableValue): VerdictCondition => ({ op, left: path(name), right: value(entry) });
+const eq = (name: string, entry: PortableValue) => cmp("eq", name, entry);
+const ne = (name: string, entry: PortableValue) => cmp("ne", name, entry);
+const gt = (name: string, entry: PortableValue) => cmp("gt", name, entry);
+const gte = (name: string, entry: PortableValue) => cmp("gte", name, entry);
+const lte = (name: string, entry: PortableValue) => cmp("lte", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from complete Salesforce query and metadata collector state before rendered evidence arrays are capped.`]));
+
+const SALESFORCE_EXECUTABLE_DECISIONS: Readonly<Record<string, SalesforceExecutableDecision>> = {
+  "SF-01": {
+    inputs: input("health_readable", "score_present", "risks_readable", "risks_complete", "score", "high_risk_count"),
+    rules: [
+      rule("manual", any(ne("health_readable", true), ne("score_present", true), ne("risks_readable", true))),
+      rule("pass", all(gte("score", 90), eq("high_risk_count", 0), eq("risks_complete", true))),
+      rule("warn", gte("score", 70)),
+      rule("fail", { op: "always" }),
+    ],
+  },
+  "SF-02": {
+    inputs: input("settings_readable", "required_fields_present", "timeout_minutes", "force_logout", "lock_to_ip"),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), ne("required_fields_present", true))),
+      rule("pass", all(lte("timeout_minutes", 120), eq("force_logout", true), eq("lock_to_ip", true))),
+      rule("warn", all(lte("timeout_minutes", 120), eq("force_logout", true))),
+      rule("fail", { op: "always" }),
+    ],
+  },
+  "SF-03": {
+    inputs: input("settings_readable", "required_fields_present", "gap_count"),
+    rules: [rule("manual", any(ne("settings_readable", true), ne("required_fields_present", true))), rule("pass", eq("gap_count", 0)), rule("warn", eq("gap_count", 1)), rule("fail", { op: "always" })],
+  },
+  "SF-04": {
+    inputs: input("requirement_available", "requirement_failed", "requirement_met", "enrollment_readable", "population_sane", "active_standard_user_count", "unenrolled_count", "quarter_user_count", "enrollment_complete", "secondary_sources_complete"),
+    rules: [
+      rule("manual", ne("requirement_available", true)),
+      rule("fail", eq("requirement_failed", true)),
+      rule("manual", ne("requirement_met", true)),
+      rule("manual", any(ne("enrollment_readable", true), ne("population_sane", true), eq("active_standard_user_count", 0))),
+      rule("fail", all(eq("enrollment_complete", true), { op: "gt", left: path("unenrolled_count"), right: { kind: "path", path: "quarter_user_count" } })),
+      rule("warn", any(gt("unenrolled_count", 0), ne("enrollment_complete", true), ne("secondary_sources_complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "SF-05": {
+    inputs: input("settings_readable", "profile_evidence_available", "resolved_profile_count", "profiles_with_ranges_count", "org_range_count", "profile_complete", "enforce_every_request"),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), ne("profile_evidence_available", true))),
+      rule("fail", all(eq("profiles_with_ranges_count", 0), eq("org_range_count", 0))),
+      rule("pass", all({ op: "eq", left: path("profiles_with_ranges_count"), right: path("resolved_profile_count") }, eq("profile_complete", true), eq("enforce_every_request", true), gt("org_range_count", 0))),
+      rule("warn", { op: "always" }),
+    ],
+  },
+  "SF-06": {
+    inputs: input("profile_evidence_available", "resolved_profile_count", "fully_restricted_count", "partially_restricted_count", "complete"),
+    rules: [
+      rule("manual", ne("profile_evidence_available", true)),
+      rule("pass", all({ op: "eq", left: path("fully_restricted_count"), right: path("resolved_profile_count") }, eq("complete", true))),
+      rule("fail", all(eq("fully_restricted_count", 0), eq("partially_restricted_count", 0))),
+      rule("warn", { op: "always" }),
+    ],
+  },
+  "SF-07": {
+    inputs: input("population_sane", "complete", "api_profile_ratio"),
+    rules: [rule("manual", ne("population_sane", true)), rule("warn", ne("complete", true)), rule("fail", gt("api_profile_ratio", 0.5)), rule("warn", gt("api_profile_ratio", 0.25)), rule("pass", { op: "always" })],
+  },
+  "SF-08": {
+    inputs: input("readable", "complete", "sensitive_field_count", "broad_field_count"),
+    rules: [rule("manual", any(ne("readable", true), eq("sensitive_field_count", 0))), rule("warn", gt("broad_field_count", 0)), rule("warn", ne("complete", true)), rule("pass", { op: "always" })],
+  },
+  "SF-09": {
+    inputs: input("sets_readable", "population_sane", "set_count", "elevated_set_count", "assignments_readable", "complete", "assignee_count", "max_admins"),
+    rules: [
+      rule("manual", any(ne("sets_readable", true), ne("population_sane", true), eq("set_count", 0))),
+      rule("warn", all(eq("elevated_set_count", 0), ne("complete", true))),
+      rule("pass", eq("elevated_set_count", 0)),
+      rule("manual", ne("assignments_readable", true)),
+      rule("fail", { op: "gt", left: path("assignee_count"), right: path("max_admins") }),
+      rule("warn", gt("assignee_count", 0)),
+      rule("warn", ne("complete", true)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "SF-10": {
+    inputs: input("population_sane", "complete", "admin_count", "max_admins", "stale_admin_count", "undated_admin_count"),
+    rules: [rule("manual", ne("population_sane", true)), rule("fail", any({ op: "gt", left: path("admin_count"), right: path("max_admins") }, gt("stale_admin_count", 0))), rule("warn", any(gt("undated_admin_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SF-11": {
+    inputs: input("readable", "app_count", "policy_visible", "open_app_count", "half_app_count"),
+    rules: [rule("manual", any(ne("readable", true), eq("app_count", 0), ne("policy_visible", true))), rule("fail", { op: "gt", left: { kind: "path", path: "open_app_count" }, right: { kind: "path", path: "half_app_count" } }), rule("warn", { op: "always" })],
+  },
+  "SF-12": {
+    inputs: input("readable", "defaults_visible", "open_default_count"),
+    rules: [rule("manual", any(ne("readable", true), ne("defaults_visible", true))), rule("fail", gte("open_default_count", 3)), rule("warn", { op: "always" })],
+  },
+  "SF-13": {
+    inputs: input("population_sane", "users_complete", "active_guest_count", "risky_guest_count"),
+    rules: [rule("manual", ne("population_sane", true)), rule("warn", ne("users_complete", true)), rule("pass", eq("active_guest_count", 0)), rule("fail", gt("risky_guest_count", 0)), rule("warn", { op: "always" })],
+  },
+  "SF-14": {
+    inputs: input("readable", "login_count", "complete", "severe_anomaly", "warning_anomaly"),
+    rules: [rule("manual", any(ne("readable", true), eq("login_count", 0))), rule("warn", ne("complete", true)), rule("fail", eq("severe_anomaly", true)), rule("warn", eq("warning_anomaly", true)), rule("pass", { op: "always" })],
+  },
+  "SF-15": {
+    inputs: input("audit_readable", "audit_count", "audit_complete", "high_risk_count", "undated_count", "event_log_readable"),
+    rules: [rule("manual", any(ne("audit_readable", true), eq("audit_count", 0))), rule("warn", any(ne("audit_complete", true), gt("high_risk_count", 0), gt("undated_count", 0), ne("event_log_readable", true))), rule("pass", { op: "always" })],
+  },
+  "SF-16": {
+    inputs: input("readable", "complete", "secret_count", "active_count", "undated_active_count", "oldest_active_age_days"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("manual", all(eq("secret_count", 0), ne("complete", true))),
+      rule("fail", any(eq("secret_count", 0), eq("active_count", 0))),
+      rule("warn", any(gt("undated_active_count", 0), gt("oldest_active_age_days", 365), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "SF-17": {
+    inputs: input("readable", "complete", "certificate_count", "failure_count", "warning_count"),
+    rules: [rule("manual", any(ne("readable", true), eq("certificate_count", 0))), rule("fail", gt("failure_count", 0)), rule("warn", any(gt("warning_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SF-18": {
+    inputs: input("readable", "has_my_domain", "enforcement_present", "prevent_legacy_login", "require_domain_for_api"),
+    rules: [rule("manual", ne("readable", true)), rule("fail", ne("has_my_domain", true)), rule("manual", ne("enforcement_present", true)), rule("pass", all(eq("prevent_legacy_login", true), eq("require_domain_for_api", true))), rule("warn", eq("prevent_legacy_login", true)), rule("fail", { op: "always" })],
+  },
+  "SF-19": {
+    inputs: input("settings_readable", "all_enabled", "disabled_count"),
+    rules: [rule("manual", ne("settings_readable", true)), rule("pass", eq("all_enabled", true)), rule("fail", gte("disabled_count", 2)), rule("warn", eq("disabled_count", 1)), rule("manual", { op: "always" })],
+  },
+  "SF-20": {
+    inputs: input("settings_readable", "both_present", "get_enabled", "post_enabled"),
+    rules: [rule("manual", any(ne("settings_readable", true), ne("both_present", true))), rule("pass", all(eq("get_enabled", true), eq("post_enabled", true))), rule("fail", { op: "always" })],
+  },
+};
+
 const checks: BatchCheckDefinition[] = titles.map((title, index) => {
   const control = index + 1;
+  const id = `SF-${String(control).padStart(2, "0")}`;
   return {
-    id: `SF-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title,
     severity: [4].includes(control) ? "critical" : [3, 5, 6, 9, 10, 11, 12, 16, 17].includes(control) ? "high" : "medium",
     owner: ownerFor(control),
     surfaces: SALESFORCE_CHECK_SURFACES[control],
     evidenceFields: [...SALESFORCE_CHECK_SURFACES[control], "complete_source_counts"],
+    decisionInputs: SALESFORCE_EXECUTABLE_DECISIONS[id].inputs,
+    decisionRules: SALESFORCE_EXECUTABLE_DECISIONS[id].rules,
     decision: decisions[index],
   };
 });
