@@ -46,6 +46,7 @@ function run(command, args, options = {}) {
 
 function instrumentedMainTest(source) {
   return source
+    .replace(/assertBundlePathsMatchSpec, /g, "")
     .replace(/^import \{ OKTA_SPEC \} from .*okta\.spec\.js";\n/m, "")
     .replace(/^import \{ DUO_SPEC \} from .*duo\.spec\.js";\n/m, "")
     .replace(/^import \{ GWS_SPEC \} from .*gws\.spec\.js";\n/m, "")

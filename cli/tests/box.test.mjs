@@ -3459,7 +3459,7 @@ test("byte differential fixtures: Box assessments and export artifacts", { skip:
     users: [],
     events: [],
     devicePinners: [],
-    classificationTemplate: null,
+    classificationTemplate: {},
     metadataTemplates: [],
     retentionPolicies: [],
     retentionAssignments: [],
