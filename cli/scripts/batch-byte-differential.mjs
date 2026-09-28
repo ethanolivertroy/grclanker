@@ -129,6 +129,67 @@ function __corpusRecord(name, kind, value) {
     serialized + "\\n",
   );
 }
+const __corpusSweepFunctions = new Set([
+  "assessOktaAuthentication", "assessOktaAdminAccess", "assessOktaIntegrations", "assessOktaMonitoring",
+  "assessDuoAuthentication", "assessDuoAdminAccess", "assessDuoIntegrations", "assessDuoMonitoring",
+  "assessGwsIdentity", "assessGwsAdminAccess", "assessGwsIntegrations", "assessGwsMonitoring",
+  "assessBoxIdentityAccessData", "assessBoxSharingCollaborationData", "assessBoxDataGovernanceData", "assessBoxShieldMonitoringData",
+  "assessZoomIdentityFromSnapshot", "assessZoomCollaborationGovernanceFromSnapshot", "assessZoomMeetingSecurityFromSnapshot",
+  "assessSalesforcePlatformData", "assessSalesforceIdentityData", "assessSalesforceDataProtectionData", "assessSalesforceMonitoringData",
+  "assessServicenowIdentityAccessData", "assessServicenowPlatformHardeningData", "assessServicenowAccessControlData", "assessServicenowOperationsGovernanceData",
+]);
+const __corpusSweptInputs = new Set();
+function __corpusSweep(name, args, original) {
+  if (!__corpusSweepFunctions.has(name) || !args[0] || typeof args[0] !== "object") return;
+  const signature = name + ":" + JSON.stringify(args[0]);
+  if (__corpusSweptInputs.has(signature)) return;
+  __corpusSweptInputs.add(signature);
+  for (const [datasetName, dataset] of Object.entries(args[0])) {
+    if (!dataset || typeof dataset !== "object" || Array.isArray(dataset)) continue;
+    const collectionKey = Array.isArray(dataset.data) ? "data" : Array.isArray(dataset.rows) ? "rows" : Array.isArray(dataset.items) ? "items" : undefined;
+    if (!collectionKey) continue;
+    for (const mode of ["truncated", "denied", "empty"]) {
+      const mutatedArgs = structuredClone(args);
+      const mutated = mutatedArgs[0][datasetName];
+      const rows = mutated[collectionKey];
+      if (mode === "denied") {
+        mutated[collectionKey] = [];
+        if (Object.hasOwn(mutated, "status")) mutated.status = "forbidden";
+        mutated.error = "403 Forbidden";
+        mutated.notCollected = true;
+        mutated.truncated = false;
+        mutated.partial = false;
+        if (Object.hasOwn(mutated, "seen")) mutated.seen = 0;
+        if (Object.hasOwn(mutated, "total")) mutated.total = undefined;
+      } else if (mode === "empty") {
+        mutated[collectionKey] = [];
+        if (Object.hasOwn(mutated, "status")) mutated.status = "ok";
+        delete mutated.error;
+        mutated.notCollected = false;
+        mutated.truncated = false;
+        mutated.partial = false;
+        if (Object.hasOwn(mutated, "seen")) mutated.seen = 0;
+        if (Object.hasOwn(mutated, "total")) mutated.total = 0;
+      } else {
+        if (Object.hasOwn(mutated, "status")) mutated.status = "ok";
+        delete mutated.error;
+        mutated.notCollected = false;
+        mutated.truncated = true;
+        mutated.partial = true;
+        if (Object.hasOwn(mutated, "seen")) mutated.seen = rows.length;
+        if (Object.hasOwn(mutated, "total")) mutated.total = Math.max(rows.length + 1, Number(mutated.total) || 0);
+      }
+      try {
+        __corpusRecord(name + "::sweep::" + mode + "::" + datasetName, "result", original(...mutatedArgs));
+      } catch (error) {
+        __corpusRecord(name + "::sweep::" + mode + "::" + datasetName, "error", {
+          name: error instanceof Error ? error.name : typeof error,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+}
 `;
     const wrapperSource = wrappers.map(({ async, functionName, originalName }) => async
       ? `
@@ -150,6 +211,7 @@ export function ${functionName}(...args) {
   try {
     const result = ${originalName}(...args);
     __corpusRecord(${JSON.stringify(functionName)}, "result", result);
+    __corpusSweep(${JSON.stringify(functionName)}, args, ${originalName});
     return result;
   } catch (error) {
     __corpusRecord(${JSON.stringify(functionName)}, "error", {
@@ -219,6 +281,19 @@ function corpusCallCount(root, paths) {
   return paths.reduce((total, path) => total + readFileSync(join(root, path), "utf8").trim().split("\n").filter(Boolean).length, 0);
 }
 
+function corpusSweepCounts(root, paths) {
+  const counts = { truncated: 0, denied: 0, empty: 0 };
+  for (const path of paths) {
+    for (const line of readFileSync(join(root, path), "utf8").trim().split("\n").filter(Boolean)) {
+      const name = JSON.parse(line).name;
+      for (const mode of Object.keys(counts)) {
+        if (name.includes(`::sweep::${mode}::`)) counts[mode] += 1;
+      }
+    }
+  }
+  return counts;
+}
+
 let worktreeAdded = false;
 try {
   run("git", ["worktree", "add", "--detach", mainWorktree, "origin/main"]);
@@ -237,6 +312,7 @@ try {
   }
   const corpusPaths = compareTrees(mainCorpus, branchCorpus, "assessment corpus");
   const corpusCalls = corpusCallCount(mainCorpus, corpusPaths);
+  const sweepCounts = corpusSweepCounts(mainCorpus, corpusPaths);
 
   // Rebuild after instrumentation so the curated export run uses unmodified modules.
   run("npm", ["--prefix", join(mainWorktree, "cli"), "run", "build"]);
@@ -247,6 +323,7 @@ try {
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
   const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
   console.log(`Whole-corpus replay passed: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched current main.`);
+  console.log(`Realistic single-dataset sweeps matched current main: ${sweepCounts.truncated} truncated, ${sweepCounts.denied} denied, ${sweepCounts.empty} empty.`);
   console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
   console.log(`Fixture classes: ${classes.join(", ")}.`);
 } finally {
