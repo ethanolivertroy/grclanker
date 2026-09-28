@@ -18,7 +18,7 @@ const EPSS_URL = "https://api.first.org/data/v1/epss";
 const KEV_TTL = 4 * 60 * 60 * 1000;
 
 const DEFAULT_SEARCH_LIMIT = 10;
-// Each rendered entry is about 10 lines and 600 bytes, so 50 keeps a broad search near 30 KB.
+// Each rendered entry is about 11 lines and 1.1 KB with EPSS, so 50 keeps a broad search near 60 KB.
 const MAX_SEARCH_LIMIT = 50;
 
 interface KevVulnerability {
