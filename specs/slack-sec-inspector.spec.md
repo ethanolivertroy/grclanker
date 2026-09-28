@@ -36,6 +36,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 - Cross-inventory findings require every dependent workspace, admin, channel, SCIM, or audit inventory to be complete before pass; partial secondary reads demote the dependent result.
 - SCIM, Web API, Admin API, and Audit Logs pagination use different cursor locations and preserve stalled cursors, page caps, item caps, and unknown totals as incomplete evidence.
 - Discovery DLP details, guest expiry, several workspace restrictions, and standalone reporters remain unavailable.
+- SLACK-ID-04 preserves the runtime's username-first SCIM matcher: when SCIM userName is a Slack handle, the primary email is not consulted, so a lifecycle mismatch may remain unmatched.
 
 ## Tools
 

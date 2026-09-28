@@ -559,7 +559,7 @@ test("all 1117 primitive input uses have explicit portable owner, domain, comple
   assert.equal(inputUses, 1117);
 });
 
-test("all 18 audited rule-driving facts have check-specific runtime meanings", () => {
+test("all 19 audited rule-driving facts have check-specific runtime meanings", () => {
   const expected = new Map([
     ["SLACK-ID-04.mismatch_count", /SCIM user records.*`active` field is not false.*normalized `userName`.*deactivated Slack user.*only when `userName` is absent.*normalized primary email/],
     ["SLACK-ADMIN-05.open_count", /Grid workspaces.*`discoverability`.*equals `open`/],
@@ -569,6 +569,7 @@ test("all 18 audited rule-driving facts have check-specific runtime meanings", (
     ["SLACK-CHAN-02.preference_count", /announcement-channel records.*admin\.conversations\.getConversationPrefs/],
     ["BOX-13.assigned_policy_count", /active or applying legal-hold policies.*assignment_counts.*legal-hold assignment inventory/],
     ["SNOW-08.concern_count", /active certificate concerns across all records returned by the unfiltered `sys_certificate` inventory and SSO configuration concerns.*glide\.authenticate\.multisso\.enabled.*glide\.authenticate\.sso\.redirect\.idp/],
+    ["SNOW-14.privileged_assignment_count", /privileged role assignments held by integration users.*`user\.web_service_access_only`.*`user\.internal_integration_user`.*true/],
     ["SNOW-18.unverified_count", /active SMTP email-account rows.*cannot be classified.*STARTTLS.*SSL\/TLS/],
     ["SNOW-19.not_validated_count", /MID Server rows.*`ecc_agent`.*`validated` field is not true/],
     ["SF-19.disabled_count", /four SF-19 clickjack-protection flags.*explicitly false/],
@@ -590,7 +591,7 @@ test("all 18 audited rule-driving facts have check-specific runtime meanings", (
     assert.match(definition, new RegExp(`^Semantic owner: \\\`${checkId}\\.${inputName}\\\`\\.`));
     assert.match(definition, meaning, `${qualifiedName}: exact runtime population`);
   }
-  assert.equal(expected.size, 18);
+  assert.equal(expected.size, 19);
 });
 
 test("151 completeness primitives have exact per-check sources, failure modes, and rendered semantics", () => {

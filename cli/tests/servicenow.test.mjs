@@ -832,6 +832,49 @@ portableContractTest("SNOW-08 counts an active non-IdP integration TLS certifica
   assert.doesNotMatch(definition, /identity-provider certificate concerns/);
 });
 
+portableContractTest("SNOW-14 counts privileged assignments only when they belong to integration users", async () => {
+  const humanAdminOnly = healthyFixture();
+  const humanAdmin = await captureServicenowFacts("SNOW-14", () => {
+    const { fetchImpl } = fixtureFetch(humanAdminOnly);
+    return assessServicenowIdentityAccess(createClient(fetchImpl));
+  });
+  const humanAdminFinding = findingsById(humanAdmin.result).get("SNOW-14");
+  assert.equal(humanAdmin.facts.integration_user_count, 1);
+  assert.equal(humanAdmin.facts.privileged_assignment_count, 0, "the human administrator assignment is excluded");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-14", humanAdmin.facts), "pass");
+  assert.equal(humanAdminFinding.status, "pass");
+  assert.equal(
+    humanAdminFinding.summary,
+    "1 integration accounts are flagged web service or internal integration users and none hold a privileged role.",
+  );
+
+  const privilegedIntegration = healthyFixture();
+  const integrationUser = privilegedIntegration.tables.sys_user.find((row) => row.user_name === "svc.integration");
+  assert.ok(integrationUser);
+  privilegedIntegration.tables.sys_user_has_role.push(
+    roleAssignment("uhr-integration-user-admin", integrationUser, "user_admin"),
+  );
+  const integrationAssignment = await captureServicenowFacts("SNOW-14", () => {
+    const { fetchImpl } = fixtureFetch(privilegedIntegration);
+    return assessServicenowIdentityAccess(createClient(fetchImpl));
+  });
+  const integrationFinding = findingsById(integrationAssignment.result).get("SNOW-14");
+  assert.equal(integrationAssignment.facts.integration_user_count, 1);
+  assert.equal(integrationAssignment.facts.admin_integration_count, 0);
+  assert.equal(integrationAssignment.facts.privileged_assignment_count, 1);
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-14", integrationAssignment.facts), "warn");
+  assert.equal(integrationFinding.status, "warn");
+  assert.equal(
+    integrationFinding.summary,
+    "1 integration accounts exist and none hold admin, but 1 privileged assignments (admin, security_admin, user_admin, impersonator, maint) belong to integration accounts.",
+  );
+
+  const definition = SERVICENOW_SPEC.checks.find((check) => check.id === "SNOW-14").evidenceFieldDefinitions.privileged_assignment_count;
+  assert.match(definition, /privileged role assignments held by integration users/);
+  assert.match(definition, /`user\.web_service_access_only` or `user\.internal_integration_user` field is true/);
+  assert.doesNotMatch(definition, /active privileged role assignments in the complete ServiceNow inventory/);
+});
+
 test("assessServicenowIdentityAccess fails weak identity controls and buckets users without login dates", async () => {
   const { fetchImpl } = fixtureFetch(failingFixture());
   const result = await assessServicenowIdentityAccess(createClient(fetchImpl));
