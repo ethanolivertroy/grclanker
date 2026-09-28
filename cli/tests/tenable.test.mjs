@@ -915,6 +915,22 @@ test("control 11 treats the tenant-wide All Users group as broad, alongside AllU
   assert.equal(byId(await runAll(clientsFor(readOnly)), "TENABLE-11").status, "pass");
 });
 
+test("control 11 preserves a proved broad-permission failure when the permission inventory is truncated", async () => {
+  const routes = healthyRoutes();
+  routes["GET /api/v3/access-control/permissions"] = {
+    permissions: [
+      { permission_uuid: "p-default", name: "All Assets [CanScan, CanView]", actions: ["CanView", "CanScan"], objects: [{ type: "AllAssets" }], subjects: [{ type: "AllUsers" }] },
+    ],
+  };
+  const data = await collectTenableAccessControlData(clientsFor(routes), { now: NOW });
+  data.permissions.truncated = true;
+  data.permissions.total = data.permissions.data.length + 1;
+
+  const finding = byId([assessTenableAccessControl(data, { now: NOW })], "TENABLE-11");
+  assert.equal(finding.status, "fail");
+  assert.equal(finding.evidence.broad_permissions, null);
+});
+
 test("control 19 ignores this tool's own export shape and only counts jobs within the documented three-day window", async () => {
   const ownRuns = healthyRoutes();
   ownRuns["GET /vulns/export/status"] = {

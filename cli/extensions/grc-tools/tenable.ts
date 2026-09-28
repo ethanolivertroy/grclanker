@@ -2986,7 +2986,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
         && !statusIsIncomplete("access_groups_status")
         && evidence.user_groups !== null
         && evidence.caller_is_administrator === true;
-      return fact(permissions, count("broad_permissions"), count("legacy_access_group_count") + (complete ? 0 : 1), complete);
+      return fact(permissions, value("broad_permission_count") ?? count("broad_permissions"), count("legacy_access_group_count") + (complete ? 0 : 1), complete);
     }
     case "TENABLE-12": {
       const credentials = value("credential_count");
@@ -4445,7 +4445,11 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
         user_groups: countOrNull(data.groups),
       },
       "",
-      { caller_is_administrator: callerIsAdministrator },
+      {
+        broad_permission_count: broad.length,
+        caller_is_administrator: callerIsAdministrator,
+        inventory_truncated: data.permissions.truncated,
+      },
     ));
   }
 
