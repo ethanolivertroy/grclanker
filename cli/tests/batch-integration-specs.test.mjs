@@ -675,7 +675,10 @@ test("all-nine authentication environment names exactly match the variables read
     [ZOOM_SPEC, ZOOM_AUTH_RESOLVER, resolveZoomConfiguration, {
       ZOOM_ACCOUNT_ID: "account-id",
       ZOOM_TOKEN: "access-token",
-    }, []],
+    }, [], [{
+      ZOOM_ACCOUNT_ID: "account-id",
+      ZOOM_ACCESS_TOKEN: "access-token",
+    }]],
     [ZENDESK_SPEC, ZENDESK_AUTH_RESOLVER, resolveZendeskConfiguration, {
       ZENDESK_SUBDOMAIN: "example",
       ZENDESK_OAUTH_TOKEN: "oauth-token",
@@ -690,11 +693,18 @@ test("all-nine authentication environment names exactly match the variables read
       SERVICENOW_PASSWORD: "password-value",
     }, [{}, undefined, { cwd: "/tmp/grclanker-auth-contract", homeDir: "/tmp/grclanker-auth-contract" }]],
   ];
-  for (const [spec, resolverContract, resolver, values, extraArguments] of cases) {
+  for (const [spec, resolverContract, resolver, values, extraArguments, fallbackValues = []] of cases) {
     const { env, accessed } = trackedEnvironment(values);
     const args = extraArguments.length > 0 ? [...extraArguments] : [{}];
     args[1] = env;
     await resolver(...args);
+    for (const fallback of fallbackValues) {
+      const fallbackProbe = trackedEnvironment(fallback);
+      const fallbackArgs = extraArguments.length > 0 ? [...extraArguments] : [{}];
+      fallbackArgs[1] = fallbackProbe.env;
+      await resolver(...fallbackArgs);
+      for (const variable of fallbackProbe.accessed) accessed.add(variable);
+    }
     const emptyProbe = trackedEnvironment();
     const emptyArgs = extraArguments.length > 0 ? [...extraArguments] : [{}];
     emptyArgs[1] = emptyProbe.env;
