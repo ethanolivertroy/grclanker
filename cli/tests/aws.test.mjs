@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import {
   chmodSync,
   existsSync,
@@ -7,6 +8,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -39,6 +41,7 @@ import {
   permissiveNaclEntries,
   redactCarrierText,
   redactErrorText,
+  registerAwsTools,
   resolveAwsConfiguration,
   resolveRegionScope,
   resolveSecureOutputPath,
@@ -114,6 +117,23 @@ import {
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+function registeredAwsTool(name) {
+  const tools = [];
+  registerAwsTools({ registerTool: (tool) => tools.push(tool) });
+  const tool = tools.find((candidate) => candidate.name === name);
+  assert.ok(tool, `${name} is registered`);
+  return tool;
+}
+
+function prepareAndValidateAwsTool(tool, input) {
+  const prepared = tool.prepareArguments(structuredClone(input));
+  const validated = validateToolArguments(
+    { name: tool.name, description: tool.description, parameters: tool.parameters },
+    { type: "toolCall", id: "aws-schema-test", name: tool.name, arguments: prepared },
+  );
+  return { prepared, validated };
 }
 
 /** A raw access key id the fixtures return; only its masked form (first and last four characters) may reach an output. */
@@ -1207,6 +1227,90 @@ test("resolveRegionScope prefers arguments, then DescribeRegions, then the confi
   assert.deepEqual(fallback.regions, ["us-east-1"]);
   assert.equal(fallback.partial, true);
   assert.equal(fallback.source, "configured-region-fallback");
+});
+
+test("registered AWS region and port list arguments stay schema-shaped through preparation", () => {
+  const cases = [
+    ["aws_assess_data_protection", { regions: "us-east-1, us-west-2" }],
+    ["aws_assess_network_security", { regions: "us-east-1, us-west-2", sensitive_ports: "0,22, 443,65535" }],
+    ["aws_export_audit_bundle", { regions: "us-east-1, us-west-2", sensitive_ports: "0,22, 443,65535" }],
+  ];
+  for (const [name, input] of cases) {
+    const { prepared, validated } = prepareAndValidateAwsTool(registeredAwsTool(name), input);
+    assert.equal(prepared.regions, input.regions, `${name} prepares regions as the advertised string`);
+    assert.equal(validated.regions, input.regions, `${name} validates comma-separated regions`);
+    if (input.sensitive_ports) {
+      assert.equal(prepared.sensitive_ports, input.sensitive_ports, `${name} prepares ports as the advertised string`);
+      assert.equal(validated.sensitive_ports, input.sensitive_ports, `${name} validates comma-separated ports`);
+    }
+  }
+});
+
+test("registered AWS port schemas enforce integer ports from 0 through 65535", () => {
+  for (const name of ["aws_assess_network_security", "aws_export_audit_bundle"]) {
+    const tool = registeredAwsTool(name);
+    assert.doesNotThrow(() => prepareAndValidateAwsTool(tool, { sensitive_ports: "0,22,443,65535" }), `${name} accepts both valid boundaries`);
+    for (const sensitive_ports of ["-1", "65536", "22.5", "22,invalid", "22 443"]) {
+      assert.throws(
+        () => prepareAndValidateAwsTool(tool, { sensitive_ports }),
+        /Validation failed/,
+        `${name} rejects ${sensitive_ports}`,
+      );
+    }
+  }
+});
+
+test("aws_assess_data_protection parses validated comma-separated regions during execution", async () => {
+  const tool = registeredAwsTool("aws_assess_data_protection");
+  const { validated } = prepareAndValidateAwsTool(tool, {
+    region: "us-east-1",
+    account_id: FIXTURE_ACCOUNT,
+    regions: "us-east-1, us-west-2",
+  });
+  const log = [];
+  const result = await withSdkRoutes(healthySdkRoutes(), log, () => tool.execute("aws-data-regions", validated));
+  assert.equal(result.isError, undefined);
+  assert.equal(result.details.summary.regions_seen, 2);
+  assert.ok(log.some((entry) => entry.region === "us-west-2"), "the second validated region reaches the AWS client");
+});
+
+test("aws_assess_network_security parses validated comma-separated regions and ports during execution", async () => {
+  const tool = registeredAwsTool("aws_assess_network_security");
+  const { validated } = prepareAndValidateAwsTool(tool, {
+    region: "us-east-1",
+    account_id: FIXTURE_ACCOUNT,
+    regions: "us-east-1, us-west-2",
+    sensitive_ports: "0,22,443,65535",
+  });
+  const log = [];
+  const result = await withSdkRoutes(healthySdkRoutes(), log, () => tool.execute("aws-network-lists", validated));
+  assert.equal(result.isError, undefined);
+  assert.equal(result.details.summary.regions_seen, 2);
+  assert.deepEqual(findingById(result.details, "AWS-NET-21").evidence.sensitive_ports, [0, 22, 443, 65535]);
+  assert.ok(log.some((entry) => entry.region === "us-west-2"), "the second validated region reaches the AWS client");
+});
+
+test("aws_export_audit_bundle parses validated comma-separated regions and ports during execution", async () => {
+  const tool = registeredAwsTool("aws_export_audit_bundle");
+  const outputRoot = createTempBase("grclanker-aws-tool-lists-");
+  try {
+    const { validated } = prepareAndValidateAwsTool(tool, {
+      region: "us-east-1",
+      account_id: FIXTURE_ACCOUNT,
+      regions: "us-east-1, us-west-2",
+      sensitive_ports: "0,22,443,65535",
+      output_dir: outputRoot,
+    });
+    const log = [];
+    const result = await withSdkRoutes(healthySdkRoutes(), log, () => tool.execute("aws-export-lists", validated));
+    assert.equal(result.isError, undefined);
+    const metadata = JSON.parse(readFileSync(join(result.details.output_dir, "metadata.json"), "utf8"));
+    assert.deepEqual(metadata.options.regions, ["us-east-1", "us-west-2"]);
+    assert.deepEqual(metadata.options.sensitive_ports, [0, 22, 443, 65535]);
+    assert.ok(log.some((entry) => entry.region === "us-west-2"), "the second validated region reaches the AWS client");
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true });
+  }
 });
 
 test("assessAwsDataProtection fixture (d): compliant account passes every data protection control", async () => {

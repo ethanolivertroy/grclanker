@@ -155,6 +155,10 @@ const DEFAULT_ROOT_LOOKBACK_DAYS: number = AWS_DEFAULTS.rootLookbackDays;
 export const ROOT_EVENT_REGION = AWS_DEFAULTS.rootEventRegion;
 const DEFAULT_CONCURRENCY: number = AWS_DEFAULTS.concurrency;
 const DEFAULT_SENSITIVE_PORTS: number[] = [...AWS_DEFAULTS.sensitivePorts];
+const MIN_NETWORK_PORT = 0;
+const MAX_NETWORK_PORT = 65535;
+const NETWORK_PORT_TOKEN_PATTERN = String.raw`(?:0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])`;
+const NETWORK_PORT_LIST_PATTERN = String.raw`^\s*${NETWORK_PORT_TOKEN_PATTERN}(?:\s*,\s*${NETWORK_PORT_TOKEN_PATTERN})*\s*$`;
 const ANY_IPV4 = AWS_VERDICT_VALUES.publicIpv4Cidr;
 const ANY_IPV6 = AWS_VERDICT_VALUES.publicIpv6Cidr;
 const REQUIRED_PUBLIC_ACCESS_FLAGS = AWS_REQUIRED_PUBLIC_ACCESS_FLAGS;
@@ -298,6 +302,11 @@ type ExportAuditBundleArgs = CheckAccessArgs & {
   instance_limit?: number;
   resource_limit?: number;
   sensitive_ports?: number[];
+};
+
+type ExportAuditBundleToolArgs = Omit<ExportAuditBundleArgs, "regions" | "sensitive_ports"> & {
+  regions?: string;
+  sensitive_ports?: string;
 };
 
 function asObject(value: unknown): JsonRecord | undefined {
@@ -4413,12 +4422,13 @@ export async function assessAwsDataProtection(
 }
 
 function parsePortList(value: unknown): number[] | undefined {
-  const raw = Array.isArray(value) ? value : asString(value)?.split(/[\s,]+/);
-  if (!raw) return undefined;
-  const ports = raw
-    .map((item) => asNumber(item))
-    .filter((port): port is number => port !== undefined && Number.isInteger(port) && port >= 0 && port <= 65535);
-  return ports.length > 0 ? [...new Set(ports)] : undefined;
+  const text = asString(value);
+  if (!text) return undefined;
+  const ports = text.split(",").map((item) => Number(item.trim()));
+  if (ports.some((port) => !Number.isInteger(port) || port < MIN_NETWORK_PORT || port > MAX_NETWORK_PORT)) {
+    throw new Error(`sensitive_ports must contain only comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT}`);
+  }
+  return [...new Set(ports)];
 }
 
 function protocolCoversPorts(protocol: string | undefined): "all" | "ports" | "none" {
@@ -5080,7 +5090,7 @@ function normalizeOrgGuardrailArgs(args: unknown): OrgGuardrailArgs {
 }
 
 type ScopeArgs = CheckAccessArgs & {
-  regions?: string[];
+  regions?: string;
   region_limit?: number;
 };
 
@@ -5094,7 +5104,7 @@ function normalizeScopeArgs(args: unknown): ScopeArgs {
   const value = asObject(args) ?? {};
   return {
     ...normalizeCheckAccessArgs(args),
-    regions: parseRegionList(value.regions),
+    regions: value.regions as string | undefined,
     region_limit: asNumber(value.region_limit),
   };
 }
@@ -5111,7 +5121,7 @@ function normalizeDataProtectionArgs(args: unknown): DataProtectionArgs {
 
 type NetworkSecurityArgs = ScopeArgs & {
   resource_limit?: number;
-  sensitive_ports?: number[];
+  sensitive_ports?: string;
 };
 
 function normalizeNetworkSecurityArgs(args: unknown): NetworkSecurityArgs {
@@ -5119,7 +5129,7 @@ function normalizeNetworkSecurityArgs(args: unknown): NetworkSecurityArgs {
   return {
     ...normalizeScopeArgs(args),
     resource_limit: asNumber(value.resource_limit),
-    sensitive_ports: parsePortList(value.sensitive_ports),
+    sensitive_ports: value.sensitive_ports as string | undefined,
   };
 }
 
@@ -5135,7 +5145,7 @@ const dataProtectionParams = {
   instance_limit: Type.Optional(Type.Number({ description: `Maximum RDS instances per region before flagging truncation. Defaults to ${DEFAULT_INSTANCE_LIMIT}.`, default: DEFAULT_INSTANCE_LIMIT })),
 };
 
-function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
+function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleToolArgs {
   const value = asObject(args) ?? {};
   return {
     ...normalizeCheckAccessArgs(args),
@@ -5147,13 +5157,13 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleArgs {
     lookback_days: asNumber(value.lookback_days),
     policy_limit: asNumber(value.policy_limit),
     max_findings: asNumber(value.max_findings),
-    regions: parseRegionList(value.regions),
+    regions: value.regions as string | undefined,
     region_limit: asNumber(value.region_limit),
     bucket_limit: asNumber(value.bucket_limit),
     key_limit: asNumber(value.key_limit),
     instance_limit: asNumber(value.instance_limit),
     resource_limit: asNumber(value.resource_limit),
-    sensitive_ports: parsePortList(value.sensitive_ports),
+    sensitive_ports: value.sensitive_ports as string | undefined,
   };
 }
 
@@ -5281,7 +5291,7 @@ export function registerAwsTools(pi: any): void {
     async execute(_toolCallId: string, args: DataProtectionArgs) {
       try {
         const result = await assessAwsDataProtection(createClient(args), {
-          regions: args.regions,
+          regions: parseRegionList(args.regions),
           regionLimit: args.region_limit,
           bucketLimit: args.bucket_limit,
           keyLimit: args.key_limit,
@@ -5306,16 +5316,20 @@ export function registerAwsTools(pi: any): void {
       ...authParams,
       ...scopeParams,
       resource_limit: Type.Optional(Type.Number({ description: `Maximum VPCs, flow logs, NACLs, or security groups per region before flagging truncation. Defaults to ${DEFAULT_RESOURCE_LIMIT}.`, default: DEFAULT_RESOURCE_LIMIT })),
-      sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
+      sensitive_ports: Type.Optional(Type.String({
+        description: `Comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT} treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`,
+        default: DEFAULT_SENSITIVE_PORTS.join(","),
+        pattern: NETWORK_PORT_LIST_PATTERN,
+      })),
     }),
     prepareArguments: normalizeNetworkSecurityArgs,
     async execute(_toolCallId: string, args: NetworkSecurityArgs) {
       try {
         const result = await assessAwsNetworkSecurity(createClient(args), {
-          regions: args.regions,
+          regions: parseRegionList(args.regions),
           regionLimit: args.region_limit,
           resourceLimit: args.resource_limit,
-          sensitivePorts: args.sensitive_ports,
+          sensitivePorts: parsePortList(args.sensitive_ports),
         });
         return textResult(formatAssessmentText(result), { tool: "aws_assess_network_security", ...result });
       } catch (error) {
@@ -5344,14 +5358,22 @@ export function registerAwsTools(pi: any): void {
       max_findings: Type.Optional(Type.Number({ description: "Maximum Access Analyzer findings to sample. Defaults to 200.", default: 200 })),
       ...dataProtectionParams,
       resource_limit: Type.Optional(Type.Number({ description: `Maximum VPCs, flow logs, NACLs, or security groups per region before flagging truncation. Defaults to ${DEFAULT_RESOURCE_LIMIT}.`, default: DEFAULT_RESOURCE_LIMIT })),
-      sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
+      sensitive_ports: Type.Optional(Type.String({
+        description: `Comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT} treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`,
+        default: DEFAULT_SENSITIVE_PORTS.join(","),
+        pattern: NETWORK_PORT_LIST_PATTERN,
+      })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
-    async execute(_toolCallId: string, args: ExportAuditBundleArgs) {
+    async execute(_toolCallId: string, args: ExportAuditBundleToolArgs) {
       try {
         const config = resolveAwsConfiguration(args);
         const outputRoot = resolve(process.cwd(), args.output_dir?.trim() || DEFAULT_OUTPUT_DIR);
-        const result = await exportAwsAuditBundle(new AwsAuditorClient(config), config, outputRoot, args);
+        const result = await exportAwsAuditBundle(new AwsAuditorClient(config), config, outputRoot, {
+          ...args,
+          regions: parseRegionList(args.regions),
+          sensitive_ports: parsePortList(args.sensitive_ports),
+        });
         return textResult(
           [
             "AWS audit bundle exported.",
