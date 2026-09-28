@@ -3,7 +3,13 @@ import {
   buildBatchOutputContract,
 } from "./batch-spec-builder.js";
 import {
+  batch2All,
+  batch2Any,
   batch2Checks,
+  batch2Eq,
+  batch2Gt,
+  batch2Ne,
+  batch2Rule,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
@@ -89,6 +95,27 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   surfaces: sourceSurfaces,
   emptyOutcome,
   violationOutcome,
+  decisionRules: id === "GCP-DATA-07"
+    ? [
+        batch2Rule("manual", batch2Ne("evidence_readable", true)),
+        batch2Rule("fail", batch2All(
+          batch2Eq("inventory_count", 0),
+          batch2Eq("evidence_complete", true),
+        )),
+        batch2Rule("warn", batch2Gt("violation_count", 0)),
+        batch2Rule("warn", batch2Any(
+          batch2Ne("evidence_complete", true),
+          batch2Gt("review_count", 0),
+        )),
+        batch2Rule("pass", batch2All(
+          batch2Eq("evidence_readable", true),
+          batch2Eq("evidence_complete", true),
+          batch2Eq("violation_count", 0),
+          batch2Eq("review_count", 0),
+        )),
+        batch2Rule("manual", { op: "always" }),
+      ]
+    : undefined,
   decision: `From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return ${violationOutcome ?? "fail"} when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record.`,
 })));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);

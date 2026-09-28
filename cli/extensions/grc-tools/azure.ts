@@ -1400,7 +1400,7 @@ function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<
       return { readable, complete, inventory_count: inventoryCount, effective_setting_count: asNumber(item.effective_settings) ?? 0 };
     case "AZURE-MON-06": {
       const workspaces = asRecords(item.workspaces);
-      return { readable, complete: true, inventory_count: workspaces.length, destination_workspace_count: workspaces.length, linked_workspace_count: workspaces.length, compliant_workspace_count: workspaces.filter((workspace) => (asNumber(workspace.retentionInDays) ?? 0) >= MIN_RETENTION_DAYS).length };
+      return { readable, complete: true, inventory_count: workspaces.length, destination_workspace_count: workspaces.length, linked_workspace_count: workspaces.length, workspace_retention_at_least_minimum_count: workspaces.filter((workspace) => (asNumber(workspace.retentionInDays) ?? 0) >= MIN_RETENTION_DAYS).length };
     }
     case "AZURE-SUB-01":
       return { readable, complete, inventory_count: inventoryCount, matching_assignment_count: evidenceCount(item, "owner_assignments"), warn_maximum: 2 };
@@ -2893,7 +2893,7 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
           ? "The diagnostic settings reference workspaces outside this subscription; collect their retentionInDays manually."
           : `${compliant.length}/${retention.length} linked Log Analytics workspaces retain data for ${MIN_RETENTION_DAYS}+ days.${partialNote(workspaces.value, "workspaces")}`,
       { workspaces: retention, minimum_days: MIN_RETENTION_DAYS },
-      { readable: true, complete: !diagnosticSettings.value.truncated && !workspaces.value.truncated, inventory_count: retention.length, destination_workspace_count: workspaceIds.size, linked_workspace_count: linked.length, compliant_workspace_count: compliant.length }));
+      { readable: true, complete: !diagnosticSettings.value.truncated && !workspaces.value.truncated, inventory_count: retention.length, destination_workspace_count: workspaceIds.size, linked_workspace_count: linked.length, workspace_retention_at_least_minimum_count: compliant.length }));
   }
 
   findings.push(finding("AZURE-MON-07", 19, "Entra ID audit log export", "medium", "manual",

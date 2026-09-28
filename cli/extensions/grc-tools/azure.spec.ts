@@ -246,11 +246,11 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     warn: incomplete,
     pass: gt("effective_setting_count", 0),
   }),
-  "AZURE-MON-06": countDecision(["destination_workspace_count", "linked_workspace_count", "compliant_workspace_count"], {
+  "AZURE-MON-06": countDecision(["destination_workspace_count", "linked_workspace_count", "workspace_retention_at_least_minimum_count"], {
     manual: any(unreadable, all(gt("destination_workspace_count", 0), eq("linked_workspace_count", 0))),
-    fail: any(eq("destination_workspace_count", 0), { op: "not", condition: comparePaths("eq", "compliant_workspace_count", "linked_workspace_count") }),
+    fail: any(eq("destination_workspace_count", 0), { op: "not", condition: comparePaths("eq", "workspace_retention_at_least_minimum_count", "linked_workspace_count") }),
     warn: incomplete,
-    pass: comparePaths("eq", "compliant_workspace_count", "linked_workspace_count"),
+    pass: comparePaths("eq", "workspace_retention_at_least_minimum_count", "linked_workspace_count"),
   }, { minimum_retention_days: 90 }),
   "AZURE-SUB-01": countDecision(["matching_assignment_count", "warn_maximum"], {
     manual: any(unreadable, empty),
