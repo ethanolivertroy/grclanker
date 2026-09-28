@@ -21,11 +21,14 @@
  * reached and a scrub cannot recognise a bare value with no key in front of it; the error message is
  * therefore built from fixed text plus path, position, and code, and nothing else.
  */
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { YAMLError, parseDocument } from "yaml";
 
 /** Which guard failed: the filesystem read or the parse of the text it returned. */
 export type ConfigFileFailureKind = "read" | "parse";
+
+/** Config files are deliberately capped at 1 MiB so model-supplied paths cannot cause unbounded reads. */
+export const CONFIG_FILE_MAX_BYTES = 1024 * 1024;
 
 /** Node system and internal error codes (`EISDIR`, `EACCES`, `ENOTDIR`, `ERR_FS_FILE_TOO_LARGE`). Anything else is not a code and is dropped. */
 export const SYSTEM_ERROR_CODE_PATTERN = /^E[A-Z0-9_]{1,30}$/;
@@ -178,21 +181,66 @@ function stripByteOrderMark(text: string): string {
   return text.startsWith(BYTE_ORDER_MARK) ? text.slice(1) : text;
 }
 
+class ConfigFileReadError extends Error {
+  readonly code: string;
+
+  constructor(code: string) {
+    super(code);
+    this.code = code;
+  }
+}
+
+function readBoundedUtf8File(fd: number): string {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  while (totalBytes <= CONFIG_FILE_MAX_BYTES) {
+    const remaining = CONFIG_FILE_MAX_BYTES + 1 - totalBytes;
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining));
+    const bytesRead = readSync(fd, chunk, 0, chunk.length, null);
+    if (bytesRead === 0) break;
+    chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
+    totalBytes += bytesRead;
+  }
+  if (totalBytes > CONFIG_FILE_MAX_BYTES) throw new ConfigFileReadError("EFBIG");
+  return Buffer.concat(chunks, totalBytes).toString("utf8");
+}
+
 /**
- * Step 1 of every loader: reads the file as UTF-8 inside its own guard. ENOENT is the explicit
- * missing-file result; every other thrown value becomes a `ConfigFileError` of kind `read` with the
- * validated errno code and nothing from the filesystem message. Callers that parse a format this
- * module does not (TOML, INI, dogrc) use this and throw their own `ConfigFileError` of kind `parse`.
+ * Step 1 of every loader: opens the path without following symlinks and without blocking on special
+ * files, validates the opened descriptor as a regular file no larger than 1 MiB, and reads at most
+ * one byte beyond that cap to catch concurrent growth. The descriptor is always closed. ENOENT is
+ * the explicit missing-file result; every other failure becomes a `ConfigFileError` of kind `read`
+ * with the validated errno code and nothing from the filesystem message. Callers that parse a format
+ * this module does not (TOML, INI, dogrc) use this and throw their own `ConfigFileError` of kind
+ * `parse`.
  */
 export function readConfigText(path: string, options: ConfigFileOptions = {}): ConfigFileResult<string> {
-  let text: string;
+  let fd: number | undefined;
+  let text: string | undefined;
+  let failure: unknown;
   try {
-    text = readFileSync(path, "utf8");
+    if (lstatSync(path).isSymbolicLink()) throw new ConfigFileReadError("ELOOP");
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new ConfigFileReadError(stat.isDirectory() ? "EISDIR" : "EINVAL");
+    if (stat.size > CONFIG_FILE_MAX_BYTES) throw new ConfigFileReadError("EFBIG");
+    text = readBoundedUtf8File(fd);
   } catch (error) {
-    const code = systemErrorCode(error);
+    failure = error;
+  }
+  if (fd !== undefined) {
+    try {
+      closeSync(fd);
+    } catch (error) {
+      if (failure === undefined) failure = error;
+    }
+  }
+  if (failure !== undefined) {
+    const code = systemErrorCode(failure);
     if (code === "ENOENT") return { ok: false, path, reason: "missing" };
     throw new ConfigFileError({ kind: "read", path, code, label: options.label });
   }
+  if (text === undefined) throw new ConfigFileError({ kind: "read", path, label: options.label });
   return { ok: true, path, value: text };
 }
 

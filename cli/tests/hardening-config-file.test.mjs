@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { YAMLError, parse as parseYaml, parseDocument } from "yaml";
 
 import {
+  CONFIG_FILE_MAX_BYTES,
   ConfigFileError,
   PARSER_CODE_PATTERN,
   SYSTEM_ERROR_CODE_PATTERN,
@@ -46,6 +48,32 @@ function capture(fn) {
     return error;
   }
   return assert.fail("expected the call to throw");
+}
+
+function readConfigInChild(path) {
+  const moduleUrl = new URL("../dist/extensions/grc-tools/hardening/config-file.js", import.meta.url).href;
+  const script = `
+    import { readConfigText } from ${JSON.stringify(moduleUrl)};
+    try {
+      readConfigText(${JSON.stringify(path)});
+      process.exitCode = 2;
+    } catch (error) {
+      console.log(JSON.stringify({
+        name: error?.name,
+        kind: error?.kind,
+        code: error?.code,
+        message: error?.message,
+      }));
+    }
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+    timeout: 1500,
+  });
+  assert.equal(result.error, undefined, `config read did not return promptly: ${result.error?.message}`);
+  assert.equal(result.signal, null, `config read was terminated by ${result.signal}`);
+  assert.equal(result.status, 0, `config read child failed: ${result.stderr || result.stdout}`);
+  return JSON.parse(result.stdout);
 }
 
 /** Positive control: the library's own message quotes the planted value (or the 8-character window the library quotes of it). */
@@ -200,6 +228,58 @@ test("EISDIR: a directory at the path is a read failure carrying the path and th
     const message = assertFixedTextError(error, { kind: "read", path, format: undefined, code: "EISDIR", line: undefined, column: undefined }, [], loader.name);
     assert.equal(message, `Unable to read config file ${path} (EISDIR)`);
   }
+});
+
+test("a FIFO is rejected as a non-regular file without blocking", { skip: process.platform === "win32" ? "mkfifo is not available on Windows" : false }, () => {
+  const path = join(tempBase(), "config.fifo");
+  const created = spawnSync("mkfifo", [path], { encoding: "utf8" });
+  assert.equal(created.status, 0, `mkfifo failed: ${created.stderr}`);
+
+  const error = readConfigInChild(path);
+  assert.deepEqual(
+    error,
+    {
+      name: "ConfigFileError",
+      kind: "read",
+      code: "EINVAL",
+      message: `Unable to read config file ${path} (EINVAL)`,
+    },
+  );
+});
+
+test("a special device is rejected without reading an unbounded stream", { skip: !existsSync("/dev/zero") ? "/dev/zero is not available" : false }, () => {
+  const error = readConfigInChild("/dev/zero");
+  assert.deepEqual(
+    error,
+    {
+      name: "ConfigFileError",
+      kind: "read",
+      code: "EINVAL",
+      message: "Unable to read config file /dev/zero (EINVAL)",
+    },
+  );
+});
+
+test("symbolic links are rejected instead of following a model-supplied path", { skip: process.platform === "win32" ? "symlink creation may require elevated privileges on Windows" : false }, () => {
+  const base = tempBase();
+  const target = join(base, "target.yaml");
+  const path = join(base, "config.yaml");
+  writeFileSync(target, "name: demo\n");
+  symlinkSync(target, path);
+
+  const error = capture(() => readConfigText(path));
+  const message = assertFixedTextError(error, { kind: "read", path, format: undefined, code: "ELOOP", line: undefined, column: undefined }, [], "symbolic link");
+  assert.equal(message, `Unable to read config file ${path} (ELOOP)`);
+});
+
+test("regular config files over the 1 MiB cap fail with EFBIG", () => {
+  assert.equal(CONFIG_FILE_MAX_BYTES, 1024 * 1024);
+  const path = join(tempBase(), "oversized.yaml");
+  writeFileSync(path, Buffer.alloc(CONFIG_FILE_MAX_BYTES + 1, 0x61));
+
+  const error = capture(() => readConfigText(path));
+  const message = assertFixedTextError(error, { kind: "read", path, format: undefined, code: "EFBIG", line: undefined, column: undefined }, [], "oversized config");
+  assert.equal(message, `Unable to read config file ${path} (EFBIG)`);
 });
 
 test("EACCES: an unreadable file is a read failure carrying the path and the errno code, never the fs wording", { skip: RUNNING_AS_ROOT ? "running as root, mode 000 is still readable" : false }, () => {
