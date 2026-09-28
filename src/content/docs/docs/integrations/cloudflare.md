@@ -28,7 +28,7 @@ Use a scoped API token (`CLOUDFLARE_API_TOKEN`). The legacy Global API Key pair 
 | IP access rules | Account Firewall Access Rules: Read |
 | Access apps, policies, identity providers | Access: Apps and Policies: Read, Access: Organizations, Identity Providers, and Groups: Read |
 | Gateway rules and Zero Trust account (`gateway_tag`) | Zero Trust: Read |
-| API tokens | API Tokens: Read (user level), Account API Tokens: Read |
+| API tokens | API Tokens Read (user level), Account API Tokens Read |
 
 ## Tools
 
