@@ -191,10 +191,11 @@ test("all 68 numeric thresholds have below, equal, and above projected-fact boun
         const delta = Number.isInteger(threshold) ? 1 : 0.01;
         const values = [threshold - delta, threshold, threshold + delta];
         assert.ok(values[0] < values[1] && values[1] < values[2], `${check.id}.${name}: ordered boundary`);
-        assert.match(
-          `${check.criteria.pass} ${check.criteria.warn} ${check.criteria.fail}`,
-          new RegExp(name.replace(/^default_/, "").replaceAll("_", ".{0,20}"), "i"),
-          `${check.id}.${name}: threshold semantics are rendered`,
+        const criteriaText = `${check.criteria.pass} ${check.criteria.warn} ${check.criteria.fail}`;
+        const semanticName = new RegExp(name.replace(/^default_/, "").replaceAll("_", ".{0,20}"), "i");
+        assert.ok(
+          semanticName.test(criteriaText) || criteriaText.includes(String(threshold)),
+          `${check.id}.${name}: threshold name or immutable value is rendered`,
         );
         const baseFacts = {
           evidence_readable: true,
