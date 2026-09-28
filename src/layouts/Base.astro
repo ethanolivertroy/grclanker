@@ -15,7 +15,7 @@ interface Props {
 
 const {
   title,
-  description = 'CMVP certificates, KEV feeds, EPSS scores, framework mappings. One terminal session. Nothing leaves your machine.',
+  description = 'CMVP certificates, KEV feeds, EPSS scores, framework mappings. One terminal session. Keep prompts on your machine with a local model, or choose a hosted one.',
   searchEnabled = true,
   footerVariant = 'default',
 } = Astro.props;
@@ -44,10 +44,10 @@ const siteEntries = [
   {
     href: '/',
     title: 'CLI',
-    meta: 'Homepage · 241 tools, 35 integrations, and three runtime paths',
+    meta: 'Homepage · 241 domain tools, 35 vendor integrations, and three runtime paths',
     kind: 'Page',
     priority: 0,
-    searchText: 'cli homepage 241 tools 35 integrations pi cursor agent sdk flue local first',
+    searchText: 'cli homepage install 241 domain tools 35 vendor integrations pi cursor agent sdk flue local first',
   },
   {
     href: '/docs',
@@ -60,10 +60,10 @@ const siteEntries = [
   {
     href: '/specs',
     title: 'Specs',
-    meta: 'Spec catalog · 35 shipped integrations and their repository specs',
+    meta: 'Spec catalog · Repository specs for shipped integrations and compute backends',
     kind: 'Page',
     priority: 0,
-    searchText: 'specs spec catalog 35 shipped integrations raw urls build plans compliance automation',
+    searchText: 'specs spec catalog shipped integrations compute backends raw urls build plans compliance automation',
   },
   {
     href: '/about',
@@ -71,7 +71,7 @@ const siteEntries = [
     meta: 'Project overview · What grclanker ships today',
     kind: 'Page',
     priority: 0,
-    searchText: 'about project overview 241 domain tools 35 integrations runtimes hardening',
+    searchText: 'about project overview 241 domain tools 35 vendor integrations runtimes hardening',
   },
 ];
 

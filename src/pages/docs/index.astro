@@ -12,7 +12,7 @@ const { Content } = await render(entry);
 ---
 
 <DocsLayout
-  title={`${entry.data.title}: grclanker docs`}
+  title={entry.data.title}
   description={entry.data.description}
   currentSlug=""
 >
@@ -24,7 +24,7 @@ const { Content } = await render(entry);
       loading="eager"
     />
     <div class="page-image-break-overlay">
-      <span class="page-image-break-pill">241 tools // 35 integrations // three runtime paths</span>
+      <span class="page-image-break-pill">241 domain tools // 35 vendor integrations // three runtime paths</span>
     </div>
   </section>
 
