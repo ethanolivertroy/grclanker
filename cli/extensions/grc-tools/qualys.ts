@@ -25,6 +25,7 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
   batch3SetReadability,
@@ -1970,11 +1971,12 @@ function finding(
   decisionValues?: QualysDecisionValues,
 ): QualysFinding {
   const id = `QUALYS-C${String(control).padStart(2, "0")}`;
-  const decisionFacts = isQualysDecisionValues(decisionValues)
+  const baseFacts = isQualysDecisionValues(decisionValues)
     ? batch3RuntimeFacts(id, decisionValues)
     : decisionValues && Object.keys(decisionValues).length > 0
       ? decisionValues
       : batch3UnavailableFacts(id);
+  const decisionFacts = batch3PrimitiveFacts(id, evidence, baseFacts);
   return {
     id,
     control,

@@ -26,6 +26,7 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
   batch3SetPopulation,
@@ -2048,7 +2049,11 @@ function finding(
 ): VeracodeFinding {
   const control = controlDescriptor(number);
   const id = controlId(number);
-  const facts = decisionFacts ?? veracodeDecisionFacts(id, evidence ?? {});
+  const facts = batch3PrimitiveFacts(
+    id,
+    evidence ?? {},
+    decisionFacts ?? veracodeDecisionFacts(id, evidence ?? {}),
+  );
   return {
     id,
     title: control.title,

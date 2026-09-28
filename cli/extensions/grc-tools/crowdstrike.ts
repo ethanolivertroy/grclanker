@@ -28,6 +28,7 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetReviewMinimum,
   batch3SetCompleteness,
@@ -753,11 +754,12 @@ function finding(
   if (!definition) {
     throw new Error(`Unknown CrowdStrike control ${id}`);
   }
-  const facts = decisionFacts === undefined
+  const baseFacts = decisionFacts === undefined
     ? batch3UnavailableFacts(id)
     : isBatch3RuntimeFactValues(decisionFacts)
       ? batch3RuntimeFacts(id, decisionFacts)
       : decisionFacts;
+  const facts = batch3PrimitiveFacts(id, evidence ?? {}, baseFacts);
   const result: CrowdstrikeFindingWithFacts = {
     id,
     title: definition.title,

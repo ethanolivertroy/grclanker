@@ -45,7 +45,9 @@ export interface Batch3CheckRow {
 export interface Batch3ThresholdDefinition {
   constant: string;
   observedFact: string;
+  evidencePath: string;
   configuredFact?: string;
+  configuredEvidencePath?: string;
   comparator: "gt" | "gte" | "lt" | "lte";
   status: "fail" | "warn";
   observedDescription: string;
@@ -69,6 +71,7 @@ export interface Batch3RuntimeFactValues {
 }
 
 const REGISTERED_FACT_NAMES = new Map<string, Batch3FactNames>();
+const REGISTERED_THRESHOLDS = new Map<string, readonly Batch3ThresholdDefinition[]>();
 
 function checkPrefix(id: string): string {
   return id.toLowerCase().replaceAll("-", "_");
@@ -99,6 +102,42 @@ export function batch3FactNames(id: string): Batch3FactNames {
   const registered = REGISTERED_FACT_NAMES.get(id);
   if (!registered) throw new Error(`${id}: check-owned runtime fact names were not registered by its adjacent specification`);
   return registered;
+}
+
+function evidencePathValue(evidence: Readonly<Record<string, unknown>>, path: string): unknown {
+  let current: unknown = evidence;
+  for (const segment of path.split(".")) {
+    if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
+    current = (current as Readonly<Record<string, unknown>>)[segment];
+  }
+  return current;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function batch3PrimitiveFacts(
+  id: string,
+  evidence: Readonly<Record<string, unknown>>,
+  facts: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  const thresholds = REGISTERED_THRESHOLDS.get(id) ?? [];
+  return {
+    ...facts,
+    ...Object.fromEntries(thresholds.flatMap((threshold) => [
+      [threshold.observedFact, finiteNumber(evidencePathValue(evidence, threshold.evidencePath))],
+      ...(threshold.configuredFact
+        ? [[
+            threshold.configuredFact,
+            finiteNumber(evidencePathValue(
+              evidence,
+              threshold.configuredEvidencePath ?? threshold.evidencePath,
+            )),
+          ] as const]
+        : []),
+    ])),
+  };
 }
 
 export function batch3RuntimeFacts(
@@ -181,6 +220,7 @@ export function batch3Source(
 export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinition[] {
   return batch2Checks(rows.map((row): Batch2CheckRow => {
     REGISTERED_FACT_NAMES.set(row.id, row.runtimeFactNames ?? checkOwnedFactNames(row));
+    REGISTERED_THRESHOLDS.set(row.id, row.thresholds ?? []);
     const names = batch3FactNames(row.id);
     const baseDecisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : {
       [names.readable]: `Boolean set from the named source read results before any finding is created. True only when every response and required field used by ${row.id} is readable.`,

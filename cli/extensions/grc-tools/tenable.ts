@@ -27,6 +27,7 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
   batch3UnavailableFacts,
@@ -3081,8 +3082,12 @@ function finding(
   decisionContext: JsonRecord = {},
 ): TenableFinding {
   const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
-  const facts = tenableDecisionFacts(id, { ...evidence, ...decisionContext });
   const contractId = idSuffix ? id.slice(0, -idSuffix.length) : id;
+  const facts = batch3PrimitiveFacts(
+    contractId,
+    { ...evidence, ...decisionContext },
+    tenableDecisionFacts(id, { ...evidence, ...decisionContext }),
+  );
   const result: TenableFindingWithFacts = {
     id,
     title: CONTROL_TITLES[control] + (idSuffix ? " (Tenable Security Center)" : ""),

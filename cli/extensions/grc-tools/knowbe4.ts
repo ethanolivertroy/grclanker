@@ -27,6 +27,7 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
   batch3UnavailableFacts,
@@ -2463,11 +2464,12 @@ function finding(
 ): Knowbe4Finding {
   const definition = controlById(number);
   const id = findingId(number);
-  const facts = decisionValues === undefined
+  const baseFacts = decisionValues === undefined
     ? knowbe4DecisionFacts(id, evidence ?? {})
     : isBatch3RuntimeFactValues(decisionValues)
       ? batch3RuntimeFacts(id, decisionValues)
       : decisionValues;
+  const facts = batch3PrimitiveFacts(id, evidence ?? {}, baseFacts);
   const result: Knowbe4FindingWithFacts = {
     id,
     control: number,
