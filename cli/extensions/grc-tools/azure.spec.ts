@@ -7,6 +7,7 @@ import {
   batch2Any as any,
   batch2Checks,
   batch2ComparePaths as comparePaths,
+  batch2Defined as defined,
   batch2Eq as eq,
   batch2Gt as gt,
   batch2Gte as gte,
@@ -128,7 +129,22 @@ interface AzureDecision {
 }
 
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [name, `Primitive value computed from every record in the complete declared Azure source inventory: ${name.replaceAll("_", " ")}.`]),
+  names.map((name) => [name, ({
+    readable: "Boolean. True only when every Azure API response required by this finding was returned and its decision fields were present; false, null, or missing means manual.",
+    complete: "Boolean. True only when every required Azure list exhausted its continuation links; false means counts are lower bounds and cannot support pass unless the documented parent-parity limitation says otherwise.",
+    inventory_count: "Integer. Complete source-record count before any 25-item evidence presentation slice; zero retains the check-specific empty-inventory semantics.",
+    guest_role_id: `Lowercase authorizationPolicy.guestUserRoleId GUID. ${AZURE_GUEST_ROLE_SAME_AS_MEMBER} means guests have member permissions, ${AZURE_GUEST_ROLE_LIMITED} is the default limited role, and ${AZURE_GUEST_ROLE_RESTRICTED} is the most restricted role; null means the raw field was absent.`,
+    allow_invites_from: "Lowercase authorizationPolicy.allowInvitesFrom enum. `everyone` fails; `none` and `adminsandguestinviters` are restricted; null or an undocumented value cannot pass.",
+    maximum_score: "Number from secureScores.maxScore. Zero, null, or missing means no scored record and requires manual review.",
+    score_ratio: "Number computed as secureScores.currentScore divided by secureScores.maxScore only when maxScore is positive; null means the ratio is not computable.",
+    exposed_rule_count: `Integer. Complete count, across every returned NSG and every security rule before evidence slicing, of enabled inbound Allow rules from any source whose TCP/all destination range contains one of ${AZURE_ADMIN_PORTS.join(", ")}.`,
+  } as Record<string, string>)[name] ?? (
+    name.endsWith("_count") || name.endsWith("_maximum")
+      ? `Integer. Complete unsliced Azure collector value for ${name.replaceAll("_", " ")}; null or missing cannot support pass.`
+      : name.endsWith("_ratio")
+        ? `Number. Azure evidence-derived ratio for ${name.replaceAll("_", " ")}; null, missing, or a nonpositive denominator cannot support pass.`
+        : `Primitive Azure vendor field or evidence-derived boolean for ${name.replaceAll("_", " ")}; null, missing, or undocumented values cannot support pass.`
+  )]),
 );
 const ordered = (branches: {
   manual?: VerdictCondition;
@@ -174,7 +190,7 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
   },
   "AZURE-ID-03": countDecision(["without_mfa_count", "without_mfa_ratio"], {
     manual: any(unreadable, empty),
-    fail: gt("without_mfa_ratio", 0.1),
+    fail: comparePaths("gt", "without_mfa_ratio", "warning_ratio_maximum"),
     warn: any(incomplete, gt("without_mfa_count", 0)),
     pass: eq("without_mfa_count", 0),
   }, { warning_ratio_maximum: 0.1 }),
@@ -197,12 +213,23 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     pass: { op: "always" },
   }, { maximum_permanent_privileged_assignments: 2 }),
   "AZURE-ID-07": {
-    inputs: inputs("readable", "guest_role_present", "guest_role_restricted", "guest_role_same_as_member", "invites_restricted", "invites_from_everyone"),
+    inputs: inputs("readable", "guest_role_id", "allow_invites_from"),
+    constants: {
+      guest_role_same_as_member_guid: AZURE_GUEST_ROLE_SAME_AS_MEMBER,
+      guest_role_limited_guid: AZURE_GUEST_ROLE_LIMITED,
+      guest_role_restricted_guid: AZURE_GUEST_ROLE_RESTRICTED,
+    },
     rules: ordered({
-      manual: any(unreadable, ne("guest_role_present", true)),
-      fail: any(eq("guest_role_same_as_member", true), eq("invites_from_everyone", true)),
-      warn: any(ne("guest_role_restricted", true), ne("invites_restricted", true)),
-      pass: all(eq("guest_role_restricted", true), eq("invites_restricted", true)),
+      manual: any(unreadable, { op: "not", condition: defined("guest_role_id") }, { op: "not", condition: defined("allow_invites_from") }),
+      fail: any(comparePaths("eq", "guest_role_id", "guest_role_same_as_member_guid"), eq("allow_invites_from", "everyone")),
+      warn: any(
+        { op: "not", condition: comparePaths("eq", "guest_role_id", "guest_role_restricted_guid") },
+        all(ne("allow_invites_from", "none"), ne("allow_invites_from", "adminsandguestinviters")),
+      ),
+      pass: all(
+        comparePaths("eq", "guest_role_id", "guest_role_restricted_guid"),
+        any(eq("allow_invites_from", "none"), eq("allow_invites_from", "adminsandguestinviters")),
+      ),
     }),
   },
   "AZURE-ID-08": countDecision(["stale_guest_count", "unknown_activity_count"], {
@@ -240,15 +267,15 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     fail: gt("risky_grant_count", 0),
     warn: incomplete,
     pass: eq("risky_grant_count", 0),
-  }),
+  }, { high_privilege_delegated_scopes: AZURE_HIGH_PRIVILEGE_DELEGATED_SCOPES }),
   "AZURE-MON-01": {
     inputs: inputs("readable", "maximum_score", "score_ratio"),
-    constants: { pass_minimum_ratio: 0.75, warn_minimum_ratio: 0.5 },
+    constants: { pass_minimum_ratio: AZURE_SECURE_SCORE_PASS_RATIO, warn_minimum_ratio: AZURE_SECURE_SCORE_WARN_RATIO },
     rules: ordered({
       manual: any(unreadable, lte("maximum_score", 0)),
-      fail: { op: "not", condition: gte("score_ratio", 0.5) },
-      warn: all(gte("score_ratio", 0.5), { op: "not", condition: gte("score_ratio", 0.75) }),
-      pass: gte("score_ratio", 0.75),
+      fail: { op: "not", condition: comparePaths("gte", "score_ratio", "warn_minimum_ratio") },
+      warn: all(comparePaths("gte", "score_ratio", "warn_minimum_ratio"), { op: "not", condition: comparePaths("gte", "score_ratio", "pass_minimum_ratio") }),
+      pass: comparePaths("gte", "score_ratio", "pass_minimum_ratio"),
     }),
   },
   "AZURE-MON-02": countDecision([], { manual: unreadable, warn: any(incomplete, empty), pass: gt("inventory_count", 0) }),
@@ -270,7 +297,7 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     fail: any(eq("destination_workspace_count", 0), { op: "not", condition: comparePaths("eq", "workspace_retention_at_least_minimum_count", "linked_workspace_count") }),
     warn: incomplete,
     pass: comparePaths("eq", "workspace_retention_at_least_minimum_count", "linked_workspace_count"),
-  }, { minimum_retention_days: 90 }),
+  }, { minimum_retention_days: AZURE_MIN_RETENTION_DAYS }),
   "AZURE-SUB-01": countDecision(["matching_assignment_count", "warn_maximum"], {
     manual: any(unreadable, empty),
     fail: comparePaths("gt", "matching_assignment_count", "warn_maximum"),
@@ -339,7 +366,7 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     fail: gt("exposed_rule_count", 0),
     warn: incomplete,
     pass: eq("exposed_rule_count", 0),
-  }),
+  }, { administrative_ports: AZURE_ADMIN_PORTS }),
   "AZURE-NP-02": countDecision(["assignment_not_do_not_enforce_count"], {
     manual: unreadable,
     fail: any(empty, eq("assignment_not_do_not_enforce_count", 0)),

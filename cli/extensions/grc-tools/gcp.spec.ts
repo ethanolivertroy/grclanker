@@ -18,6 +18,11 @@ import {
 import { GCP_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 
 const ASSET_DOCS = "https://cloud.google.com/asset-inventory/docs/reference/rest";
+export const GCP_MAX_KMS_ROTATION_DAYS = 365;
+export const GCP_MIN_LOG_RETENTION_DAYS = 90;
+export const GCP_ADMIN_PORTS = [22, 3389] as const;
+export const GCP_FLOW_LOG_UNSUPPORTED_PURPOSES = ["REGIONAL_MANAGED_PROXY", "GLOBAL_MANAGED_PROXY", "INTERNAL_HTTPS_LOAD_BALANCER", "PRIVATE_SERVICE_CONNECT", "PRIVATE_NAT"] as const;
+export const GCP_HTTP_BACKEND_PROTOCOLS = ["HTTP", "HTTPS", "HTTP2", "H2C"] as const;
 const surfaces = [
   restSurface("organization", "cloudresourcemanager.googleapis.com/v1/organizations/{organization}", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/organizations/get", ["name", "displayName", "state"]),
   restSurface("projects", "cloudasset.googleapis.com/v1/{scope}:searchAllResources", "Cloud Asset Inventory", ASSET_DOCS, ["name", "displayName", "state", "project"]),
@@ -87,6 +92,14 @@ function owner(id: string): string {
   if (id.startsWith("GCP-DATA-")) return "gcp_assess_data_protection";
   return "gcp_assess_network_security";
 }
+
+const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
+  "GCP-LOG-04": { minimum_log_retention_days: GCP_MIN_LOG_RETENTION_DAYS },
+  "GCP-DATA-03": { maximum_kms_rotation_days: GCP_MAX_KMS_ROTATION_DAYS },
+  "GCP-NET-01": { administrative_ports: GCP_ADMIN_PORTS },
+  "GCP-NET-02": { flow_log_unsupported_subnet_purposes: GCP_FLOW_LOG_UNSUPPORTED_PURPOSES },
+  "GCP-NET-06": { http_backend_protocols: GCP_HTTP_BACKEND_PROTOCOLS },
+} as const)[id as "GCP-LOG-04" | "GCP-DATA-03" | "GCP-NET-01" | "GCP-NET-02" | "GCP-NET-06"];
 
 const orgPolicyDecision = (outcome: "fail" | "warn") => ({
   decisionInputs: {
@@ -178,6 +191,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   surfaces: sourceSurfaces,
   emptyOutcome,
   violationOutcome,
+  constants: decisionConstants(id),
   ...customDecision(id),
   decision: `From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return ${violationOutcome ?? "fail"} when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record.`,
 })));

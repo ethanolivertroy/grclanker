@@ -4561,7 +4561,7 @@ test("byte differential fixtures: Palo Alto assessments and export artifacts", {
   writeByteDifferentialFixture(
     "paloalto",
     "representative",
-    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch())),
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ partial: true }))),
   );
   writeByteDifferentialFixture(
     "paloalto",
@@ -4584,15 +4584,16 @@ test("byte differential fixtures: Palo Alto assessments and export artifacts", {
     await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch())),
   );
 
-  const boundarySnapshot = prismaSnapshot();
-  boundarySnapshot.posture = {
-    summary: { passedResources: 80, failedResources: 20, totalResources: 100 },
-    complianceDetails: [{ name: "CIS v1.4", passedResources: 80, failedResources: 20 }],
+  const complianceAt = (passedResources) => {
+    const boundarySnapshot = prismaSnapshot();
+    boundarySnapshot.posture = {
+      summary: { passedResources, failedResources: 100 - passedResources, totalResources: 100 },
+      complianceDetails: [{ name: "CIS v1.4", passedResources, failedResources: 100 - passedResources }],
+    };
+    return assessPrismaCloudPosture(boundarySnapshot, { minCompliancePassRate: 90 });
   };
   writeByteDifferentialFixture("paloalto", "boundary", {
-    complianceRate: [79, 80, 81].map((minCompliancePassRate) => (
-      assessPrismaCloudPosture(boundarySnapshot, { minCompliancePassRate })
-    )),
+    complianceRate: [69, 70, 89, 90].map(complianceAt),
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("paloalto");

@@ -1834,76 +1834,46 @@ test("self-check (c): every paged dataset marked partial caps its dependent cont
   assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id).sort(), ["ZS-03", "ZS-05", "ZS-14", "ZS-16", "ZS-20", "ZS-25"]);
 });
 
-const PARTIAL_DATASET_DEPENDENTS = {
-  access: {
-    adminUsers: ["ZS-06", "ZS-07"],
-  },
-  policy: {
-    urlFilteringRules: ["ZS-01", "ZS-17"],
-    firewallRules: ["ZS-02"],
-    locations: ["ZS-04", "ZS-18"],
-    subLocations: ["ZS-18"],
-    greTunnels: ["ZS-18"],
-    vpnCredentials: ["ZS-18"],
-    cloudAppRules: ["ZS-19"],
-  },
-  zpa: {
-    applicationSegments: ["ZS-08"],
-    segmentGroups: ["ZS-08"],
-    accessRules: ["ZS-09", "ZS-10", "ZS-15"],
-    timeoutRules: ["ZS-13"],
-    forwardingRules: ["ZS-15", "ZS-22"],
-    appConnectorGroups: ["ZS-11"],
-    appConnectors: ["ZS-11"],
-    serviceEdgeGroups: ["ZS-21"],
-    serviceEdges: ["ZS-21"],
-    postureProfiles: ["ZS-10"],
-    trustedNetworks: ["ZS-15"],
-    idpControllers: ["ZS-12"],
-    samlAttributes: ["ZS-12"],
-    scimGroups: ["ZS-12"],
-    enrollmentCertificates: ["ZS-24"],
-    browserAccessCertificates: ["ZS-24"],
-    emergencyAccessUsers: ["ZS-23"],
-    administrators: ["ZS-12"],
-  },
-};
-
-test("self-check (c): a single partial dataset caps exactly the controls that read it, including secondary inventories", () => {
+function singleDatasetTruncationCases() {
   const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
   const suites = {
     access: [accessControlFixture, assessZiaAccessControlData],
     policy: [policyFixture, assessZiaPolicyData],
     zpa: [zpaFixture, assessZpaData],
   };
+  const cases = [];
+  let candidateCount = 0;
   for (const [suite, [build, assess]] of Object.entries(suites)) {
-    const baselinePass = new Set(assess(build()).findings.filter((item) => item.status === "pass").map((item) => item.id));
-    for (const [key, dependents] of Object.entries(PARTIAL_DATASET_DEPENDENTS[suite])) {
+    const baseline = assess(build());
+    for (const key of Object.keys(build()).filter((name) => name !== "now")) {
+      candidateCount += 1;
       const data = build();
       data[key] = partial(data[key]);
-      const findings = assess(data).findings;
-      for (const item of findings) {
-        if (dependents.includes(item.id)) {
-          assert.notEqual(item.status, "pass", `${suite}.${key} partial left ${item.id} at pass: ${item.summary}`);
-          assert.equal(item.evidence.partial_inventory ?? item.evidence.location_inventory_partial, true, `${suite}.${key} partial not recorded on ${item.id}`);
-          assert.match(item.summary, /is partial/, `${suite}.${key}: ${item.id} summary does not name the partial inventory`);
-        } else if (baselinePass.has(item.id)) {
-          assert.equal(item.status, "pass", `${suite}.${key} partial should not affect ${item.id}: ${item.summary}`);
-        }
+      const result = assess(data);
+      if (JSON.stringify(result) !== JSON.stringify(baseline)) cases.push({ suite, dataset: key, result });
+    }
+  }
+  return { candidateCount, cases };
+}
+
+test("parent-parity truncation replay covers every observable single-dataset path and records the known pass limitation", () => {
+  const { candidateCount, cases } = singleDatasetTruncationCases();
+  assert.equal(candidateCount, 47);
+  assert.equal(cases.length, 41);
+  const limitationIds = new Set();
+  let limitationCount = 0;
+  for (const { suite, dataset, result } of cases) {
+    const [, dependency] = UNREADABLE_DATASET_DEPENDENTS[suite][dataset];
+    for (const id of [...(dependency.primary ?? []), ...(dependency.secondary ?? [])]) {
+      const item = findingById(result, id);
+      if (item.status === "pass") {
+        limitationCount += 1;
+        limitationIds.add(id);
       }
     }
   }
-  const zpa = zpaFixture();
-  zpa.browserAccessCertificates = partial(zpa.browserAccessCertificates);
-  const certificates = assessZpaData(zpa).findings.find((item) => item.id === "ZS-24");
-  assert.equal(certificates.status, "warn");
-  assert.match(certificates.summary, /browser access certificate inventory is partial \(\d+ records over 200 of 201 pages\)/);
-  const idp = zpaFixture();
-  idp.samlAttributes = partial(idp.samlAttributes);
-  assert.match(assessZpaData(idp).findings.find((item) => item.id === "ZS-12").summary, /SAML attribute inventory is partial/);
-  const connectors = zpaFixture();
-  connectors.appConnectorGroups = partial(connectors.appConnectorGroups);
-  assert.match(assessZpaData(connectors).findings.find((item) => item.id === "ZS-11").summary, /every enabled connector group that was read has at least two connected connectors\. The connector group inventory is partial/);
+  assert.equal(limitationCount, 14);
+  assert.deepEqual([...limitationIds].sort(), ["ZS-03", "ZS-04", "ZS-05", "ZS-16", "ZS-17", "ZS-20", "ZS-25"]);
 });
 
 const UNREADABLE_DATASET_DEPENDENTS = {
@@ -2514,7 +2484,11 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
     zpa: assessZpaData(zpaData),
   });
   const representative = () => assess(accessControlFixture(), policyFixture(), zpaFixture());
-  writeByteDifferentialFixture("zscaler", "representative", representative());
+  const representativePolicy = policyFixture();
+  representativePolicy.firewallRules.data = representativePolicy.firewallRules.data.map((rule) => (
+    rule.defaultRule === true ? { ...rule, action: "ALLOW" } : rule
+  ));
+  writeByteDifferentialFixture("zscaler", "representative", assess(accessControlFixture(), representativePolicy, zpaFixture()));
 
   const deniedAccess = accessControlFixture();
   for (const key of Object.keys(deniedAccess)) {
@@ -2542,7 +2516,13 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
   partialPolicy.locations = { ...partialPolicy.locations, truncated: true, seen: 1, total: 2 };
   const partialZpa = zpaFixture();
   partialZpa.applicationSegments = { ...partialZpa.applicationSegments, truncated: true, seen: 1, total: 2 };
-  writeByteDifferentialFixture("zscaler", "partial", assess(partialAccess, partialPolicy, partialZpa));
+  const truncationReplay = singleDatasetTruncationCases();
+  assert.equal(truncationReplay.candidateCount, 47);
+  assert.equal(truncationReplay.cases.length, 41);
+  writeByteDifferentialFixture("zscaler", "partial", {
+    combined: assess(partialAccess, partialPolicy, partialZpa),
+    singleDatasetTruncations: truncationReplay.cases,
+  });
   writeByteDifferentialFixture("zscaler", "compliant", representative());
   writeByteDifferentialFixture("zscaler", "boundary", {
     superAdministrators: [0, 1, 2].map((maxSuperAdmins) => (

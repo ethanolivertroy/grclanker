@@ -17,6 +17,16 @@ import { ZSCALER_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 
 const ZIA_DOCS = "https://help.zscaler.com/zia/api";
 const ZPA_DOCS = "https://help.zscaler.com/zpa/api-reference";
+export const ZSCALER_DEFAULT_MAX_SUPER_ADMINS = 5;
+export const ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS = 30;
+export const ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS = 30;
+export const ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS = 24;
+export const ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES = ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"] as const;
+export const ZSCALER_REQUIRED_ATP_FLAGS = [
+  "malwareSitesBlocked", "cmdCtlServerBlocked", "cmdCtlTrafficBlocked", "knownPhishingSitesBlocked",
+  "suspectedPhishingSitesBlocked", "browserExploitsBlocked", "potentialMaliciousRequestsBlocked",
+] as const;
+export const ZSCALER_REQUIRED_MALWARE_FLAGS = ["virusBlocked", "trojanBlocked", "wormBlocked", "ransomwareBlocked", "spywareBlocked"] as const;
 const surfaces = [
   restSurface("zia-administration", "/api/v1/{adminUsers|adminRoles|authSettings|auditLogFeeds}", "ZIA API", ZIA_DOCS, ["id", "loginName", "role", "adminScope", "mfa", "status"]),
   restSurface("zia-policy", "/api/v1/{urlFilteringRules|firewallFilteringRules|dlpEngines|sslInspectionRules|sandboxRules|locations}", "ZIA API", ZIA_DOCS, ["id", "name", "state", "action", "rank", "order", "destinations", "locations"]),
@@ -65,6 +75,18 @@ function owner(area: "zia_policy" | "zia_access_control" | "zpa"): string {
     }
   }
 }
+
+const decisionConstants = (control: number): Batch2CheckRow["constants"] => ({
+  1: { required_url_block_categories: ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES },
+  7: { default_maximum_super_administrators: ZSCALER_DEFAULT_MAX_SUPER_ADMINS },
+  11: { default_stale_connector_days: ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS },
+  13: { default_maximum_timeout_hours: ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS },
+  24: { default_certificate_expiry_warning_days: ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS },
+  25: {
+    required_advanced_threat_protection_flags: ZSCALER_REQUIRED_ATP_FLAGS,
+    required_malware_protection_flags: ZSCALER_REQUIRED_MALWARE_FLAGS,
+  },
+} as const)[control as 1 | 7 | 11 | 13 | 24 | 25];
 
 const checks = batch2Checks(rows.map(([title, severity, area], index) => {
   const control = index + 1;
@@ -131,6 +153,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
     owner: owner(area),
     surfaces: [area === "zpa" ? "zpa-policy" : area === "zia_policy" ? "zia-policy" : "zia-administration"],
     emptyOutcome: "manual" as const,
+    constants: decisionConstants(control),
     ...custom,
     decision: `Evaluate ${title} from the complete ${area === "zpa" ? "ZPA" : "ZIA"} inventory: missing product credentials and unreadable or ambiguous feature responses remain manual, a proved insecure record takes precedence, partial or review records warn, and pass requires complete readable evidence with no violation.`,
   };

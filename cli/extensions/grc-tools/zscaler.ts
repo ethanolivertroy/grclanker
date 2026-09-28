@@ -30,7 +30,16 @@ import {
 } from "./auth-resolver-contracts.js";
 import { ConfigFileError, readYamlConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
-import { ZSCALER_SPEC } from "./zscaler.spec.js";
+import {
+  ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS as DEFAULT_CERT_EXPIRY_WARN_DAYS,
+  ZSCALER_DEFAULT_MAX_SUPER_ADMINS as DEFAULT_MAX_SUPER_ADMINS,
+  ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS as DEFAULT_MAX_TIMEOUT_HOURS,
+  ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS as DEFAULT_STALE_CONNECTOR_DAYS,
+  ZSCALER_REQUIRED_ATP_FLAGS as REQUIRED_ATP_FLAGS,
+  ZSCALER_REQUIRED_MALWARE_FLAGS as REQUIRED_MALWARE_FLAGS,
+  ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES as REQUIRED_URL_BLOCK_CATEGORIES,
+  ZSCALER_SPEC,
+} from "./zscaler.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -45,10 +54,6 @@ const ZIA_FIREWALL_RULE_PAGE_SIZE = 5000;
 const ZIA_MAX_PAGES = 50;
 const ZPA_PAGE_SIZE = 500;
 const ZPA_MAX_PAGES = 200;
-const DEFAULT_MAX_SUPER_ADMINS = 5;
-const DEFAULT_CERT_EXPIRY_WARN_DAYS = 30;
-const DEFAULT_STALE_CONNECTOR_DAYS = 30;
-const DEFAULT_MAX_TIMEOUT_HOURS = 24;
 const HIGH_RISK_URL_CATEGORIES = [
   "OTHER_SECURITY",
   "MALWARE_SITES",
@@ -2019,17 +2024,6 @@ export class ZpaApiClient implements ZpaReadClient {
 const MAX_SUBLOCATION_PARENTS = 100;
 const MAX_CLOUD_APP_RULE_TYPES = 25;
 const DEFAULT_MAX_SSL_EXEMPTIONS = 50;
-const REQUIRED_URL_BLOCK_CATEGORIES = ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"];
-const REQUIRED_ATP_FLAGS = [
-  "malwareSitesBlocked",
-  "cmdCtlServerBlocked",
-  "cmdCtlTrafficBlocked",
-  "knownPhishingSitesBlocked",
-  "suspectedPhishingSitesBlocked",
-  "browserExploitsBlocked",
-  "potentialMaliciousRequestsBlocked",
-];
-const REQUIRED_MALWARE_FLAGS = ["virusBlocked", "trojanBlocked", "wormBlocked", "ransomwareBlocked", "spywareBlocked"];
 
 export interface ZiaPolicyData {
   urlFilteringRules: CollectedDataset<JsonRecord[]>;

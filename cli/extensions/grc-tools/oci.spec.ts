@@ -10,6 +10,15 @@ import {
 import { OCI_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 
 const OCI_DOCS = "https://docs.oracle.com/en-us/iaas/api/";
+export const OCI_AUDIT_RETENTION_REQUIRED_DAYS = 365;
+export const OCI_KEY_ROTATION_MAX_DAYS = 365;
+export const OCI_BASTION_MAX_TTL_SECONDS = 10_800;
+export const OCI_KEY_MIN_AES_BYTES = 32;
+export const OCI_KEY_MIN_RSA_BYTES = 512;
+export const OCI_ECDSA_ACCEPTED_CURVES = ["NIST_P256", "NIST_P384", "NIST_P521"] as const;
+export const OCI_BASTION_SESSION_MAX_HOURS = 8;
+export const OCI_PAR_LONG_LIVED_DAYS = 30;
+export const OCI_SENSITIVE_PORTS = [22, 3389, 1433, 3306, 5432] as const;
 export const OCI_RUNTIME_FRAMEWORK_MAPPINGS: Readonly<Record<string, readonly string[]>> = {
   "OCI-IAM-01": ["FedRAMP IA-5", "CMMC L2 3.5.7", "SOC 2 CC6.1", "CIS OCI 1.1", "PCI-DSS 8.3.6", "STIG SRG-APP-000166", "IRAP ISM-0421", "ISMAP AM-03"],
   "OCI-IAM-02": ["FedRAMP IA-2(1)", "CMMC L2 3.5.3", "SOC 2 CC6.1", "CIS OCI 1.2", "PCI-DSS 8.4.2", "STIG SRG-APP-000149", "IRAP ISM-1401", "ISMAP AM-04"],
@@ -92,6 +101,24 @@ function owner(id: string): string {
   return "oci_assess_compute_and_storage";
 }
 
+const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
+  "OCI-IAM-03": { maximum_credential_age_days: OCI_KEY_ROTATION_MAX_DAYS },
+  "OCI-LOG-06": { minimum_audit_retention_days: OCI_AUDIT_RETENTION_REQUIRED_DAYS },
+  "OCI-GRD-01": { sensitive_ingress_ports: OCI_SENSITIVE_PORTS },
+  "OCI-GRD-02": { sensitive_ingress_ports: OCI_SENSITIVE_PORTS },
+  "OCI-GRD-04": {
+    maximum_bastion_ttl_seconds: OCI_BASTION_MAX_TTL_SECONDS,
+    maximum_session_hours: OCI_BASTION_SESSION_MAX_HOURS,
+  },
+  "OCI-GRD-05": {
+    maximum_key_rotation_days: OCI_KEY_ROTATION_MAX_DAYS,
+    minimum_aes_key_bytes: OCI_KEY_MIN_AES_BYTES,
+    minimum_rsa_key_bytes: OCI_KEY_MIN_RSA_BYTES,
+    accepted_ecdsa_curves: OCI_ECDSA_ACCEPTED_CURVES,
+  },
+  "OCI-GRD-06": { long_lived_preauthenticated_request_days: OCI_PAR_LONG_LIVED_DAYS },
+} as const)[id as "OCI-IAM-03" | "OCI-LOG-06" | "OCI-GRD-01" | "OCI-GRD-02" | "OCI-GRD-04" | "OCI-GRD-05" | "OCI-GRD-06"];
+
 const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, manualOnly]) => ({
   id,
   control,
@@ -107,6 +134,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     "OCI-LOG-05": "fail",
   } as const)[id as "OCI-IAM-05" | "OCI-LOG-02" | "OCI-LOG-04" | "OCI-LOG-05"] ?? "manual",
   violationOutcome: id === "OCI-IAM-04" || id === "OCI-GRD-03" ? "warn" : "fail",
+  constants: decisionConstants(id),
   frameworks: frameworkMappings(id),
   decision: manualOnly
     ? "Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting."

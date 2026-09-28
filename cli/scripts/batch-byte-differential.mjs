@@ -17,8 +17,9 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
-const mainWorktree = join(runRoot, "main");
-const mainFixtures = join(runRoot, "fixtures-main");
+const baselineRef = "origin/etroy/generated-specs-batch-1-7352";
+const mainWorktree = join(runRoot, "stacked-parent");
+const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
 const mainCorpus = join(runRoot, "corpus-main");
 const branchCorpus = join(runRoot, "corpus-branch");
@@ -40,6 +41,8 @@ const testFiles = [
   "paloalto.test.mjs",
   "zscaler.test.mjs",
 ];
+const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
+const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -282,6 +285,13 @@ function compareTrees(expectedRoot, actualRoot, label) {
       );
     }
   }
+  for (const integration of batch2Integrations) {
+    const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
+    const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
+    if (representative.equals(compliant)) {
+      throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
+    }
+  }
   return expectedPaths;
 }
 
@@ -304,7 +314,7 @@ function corpusSweepCounts(root, paths) {
 
 let worktreeAdded = false;
 try {
-  run("git", ["worktree", "add", "--detach", mainWorktree, "origin/main"]);
+  run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
   worktreeAdded = true;
   symlinkSync(join(repoRoot, "cli", "node_modules"), join(mainWorktree, "cli", "node_modules"), "dir");
   copyDifferentialTestsToMain();

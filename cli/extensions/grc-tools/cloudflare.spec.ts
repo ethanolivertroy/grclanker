@@ -16,6 +16,12 @@ import {
 import { CLOUDFLARE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 
 const DOCS = "https://developers.cloudflare.com/api/resources/";
+export const CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS = 2;
+export const CLOUDFLARE_HSTS_MIN_MAX_AGE_SECONDS = 15_552_000;
+export const CLOUDFLARE_STALE_IP_RULE_DAYS = 365;
+export const CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
+export const CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS = 30;
+export const CLOUDFLARE_REQUIRED_SECURITY_HEADERS = ["content-security-policy", "x-frame-options", "x-content-type-options", "referrer-policy"] as const;
 const surfaces = [
   restSurface("token-and-account", "/user/tokens/verify and /accounts/{account_id}", "Cloudflare API v4", DOCS, ["status", "expires_on", "id", "name", "settings"]),
   restSurface("members-and-tokens", "/accounts/{account_id}/{members|tokens}", "Cloudflare API v4", DOCS, ["id", "status", "roles", "policies", "expires_on", "modified_on"]),
@@ -61,6 +67,15 @@ function owner(id: string): string {
   if (id.startsWith("CF-ZONE-")) return "cloudflare_assess_zone_security";
   return "cloudflare_assess_traffic_controls";
 }
+
+const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
+  "CF-IAM-03": { default_maximum_super_administrators: CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS },
+  "CF-ZONE-04": { minimum_hsts_max_age_seconds: CLOUDFLARE_HSTS_MIN_MAX_AGE_SECONDS },
+  "CF-ZONE-10": { certificate_expiry_warning_days: CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS },
+  "CF-ZONE-14": { required_security_headers: CLOUDFLARE_REQUIRED_SECURITY_HEADERS },
+  "CF-TRF-04": { audit_log_lookback_days: CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS },
+  "CF-TRF-05": { stale_ip_access_rule_days: CLOUDFLARE_STALE_IP_RULE_DAYS },
+} as const)[id as "CF-IAM-03" | "CF-ZONE-04" | "CF-ZONE-10" | "CF-ZONE-14" | "CF-TRF-04" | "CF-TRF-05"];
 
 const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces]) => {
   const custom: Partial<Batch2CheckRow> = id === "CF-IAM-02"
@@ -121,6 +136,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     owner: owner(id),
     surfaces: sourceSurfaces,
     emptyOutcome: id === "CF-IAM-05" ? "fail" : id === "CF-TRF-05" ? "pass" : "manual",
+    constants: decisionConstants(id),
     ...custom,
     decision: `Evaluate ${title} from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account.`,
   };
