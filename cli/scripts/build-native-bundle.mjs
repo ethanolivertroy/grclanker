@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -308,13 +309,25 @@ export function resolveSourceDateEpoch({ env = process.env, cwd = companionDir }
   return /^\d+$/.test(commitTime) ? Math.max(Number(commitTime), MIN_ARCHIVE_EPOCH) : MIN_ARCHIVE_EPOCH;
 }
 
-export function normalizeTimestamps(root, epoch) {
+export const STAGED_DIRECTORY_MODE = 0o755;
+export const STAGED_EXECUTABLE_MODE = 0o755;
+export const STAGED_FILE_MODE = 0o644;
+
+// Archive bytes must depend only on content and the executable bit, never on the
+// builder's umask or source checkout permissions.
+export function normalizeStagedTree(root, epoch) {
   const timestamp = new Date(epoch * 1000);
   const visit = (path) => {
-    if (lstatSync(path).isDirectory()) {
+    const stats = lstatSync(path);
+    if (stats.isDirectory()) {
+      chmodSync(path, STAGED_DIRECTORY_MODE);
       for (const entry of readdirSync(path)) {
         visit(join(path, entry));
       }
+    } else if (stats.isFile()) {
+      chmodSync(path, stats.mode & 0o111 ? STAGED_EXECUTABLE_MODE : STAGED_FILE_MODE);
+    } else if (!stats.isSymbolicLink()) {
+      throw new Error(`Unsupported file type in release bundle: ${path}`);
     }
     lutimesSync(path, timestamp, timestamp);
   };
@@ -332,7 +345,7 @@ function isGnuTar() {
 
 export function createArchive(bundleDir, artifactPath, archiveExt, { pythonCommand, epoch }) {
   rmSync(artifactPath, { force: true });
-  normalizeTimestamps(bundleDir, epoch);
+  normalizeStagedTree(bundleDir, epoch);
 
   if (archiveExt === "zip") {
     const entries = readdirSync(bundleDir).sort();
@@ -346,10 +359,15 @@ export function createArchive(bundleDir, artifactPath, archiveExt, { pythonComma
   }
 
   const reproducibleTarArgs = isGnuTar()
-    ? ["--sort=name", "--format=gnu", "--owner=0", "--group=0", "--numeric-owner", `--mtime=@${epoch}`, "--mode=go-w"]
+    ? ["--sort=name", "--format=gnu", "--owner=0", "--group=0", "--numeric-owner", `--mtime=@${epoch}`]
     : [];
   if (reproducibleTarArgs.length === 0) {
-    console.warn("GNU tar not found; the tar.gz archive will not be byte-for-byte reproducible.");
+    console.warn(
+      "GNU tar not found (for example, macOS ships BSD tar): tar.gz archives keep this builder's " +
+        "ownership, directory order, and gzip timestamp, so they will not match release builds or " +
+        "each other byte for byte. Reproducible tar.gz bundles require GNU tar, as used by the " +
+        "Ubuntu release workflow.",
+    );
   }
   const { GZIP: _ignoredGzipOptions, ...tarEnv } = process.env;
   run("tar", [...reproducibleTarArgs, "-czf", artifactPath, "-C", bundleDir, "."], { env: tarEnv });
