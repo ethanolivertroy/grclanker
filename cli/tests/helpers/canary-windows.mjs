@@ -46,13 +46,14 @@ function stringOf(value) {
 
 /**
  * Asserts, through the supplied assert module, that neither any canary nor any of its windows (lengths 6 through 24)
- * appears in any text of `contents`. The failure message names the file or payload, the canary, and the fragment.
+ * appears in any text of `contents`. It is sufficient to search the shortest windows: every matching longer window
+ * necessarily contains one of them. The failure message names the file or payload, the canary, and the fragment.
  */
 export function assertCanaryWindowsAbsent(assert, contents, canaries, label) {
   const entries = textEntries(contents);
   for (const canary of canaries) {
     if (typeof canary !== "string" || canary.length === 0) throw new TypeError(`${label}: canaries must be non-empty strings`);
-    const windows = canaryWindows(canary);
+    const windows = canaryWindows(canary, { max: CANARY_WINDOW_MIN });
     for (const [name, text] of entries) {
       assert.ok(!text.includes(canary), `${label}: planted canary ${canary} appears whole in ${name}`);
       for (const fragment of windows) {
