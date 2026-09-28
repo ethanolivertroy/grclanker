@@ -119,6 +119,30 @@ const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
   "OCI-GRD-06": { long_lived_preauthenticated_request_days: OCI_PAR_LONG_LIVED_DAYS },
 } as const)[id as "OCI-IAM-03" | "OCI-LOG-06" | "OCI-GRD-01" | "OCI-GRD-02" | "OCI-GRD-04" | "OCI-GRD-05" | "OCI-GRD-06"];
 
+const decisionPredicate: Readonly<Record<string, string>> = {
+  "OCI-IAM-01": "Fail when the readable authentication policy permits a password shorter than 14 characters; warn when its complexity fields do not require the runtime's upper-case, lower-case, numeric, special-character, reuse, and lockout baseline.",
+  "OCI-IAM-02": "Fail when any active console-password-capable IAM user has isMfaActivated other than true; pass only after the complete user inventory has no such user.",
+  "OCI-IAM-03": `Fail when any active API key, customer secret key, or auth token has no usable timeCreated or is older than ${OCI_KEY_ROTATION_MAX_DAYS} days.`,
+  "OCI-IAM-04": "Warn when an IAM policy statement grants any verb to any-user or grants manage to a broad subject or resource scope; retain the complete policy and statement counts.",
+  "OCI-IAM-05": "Fail when no non-root compartment exists; otherwise evaluate the complete ACTIVE compartment parent graph and warn for an unresolvable parent or a hierarchy deeper than the runtime baseline.",
+  "OCI-IAM-06": "Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting.",
+  "OCI-LOG-01": "Fail when the Cloud Guard configuration status is not ENABLED or no ACTIVE target exists; pass only when both reads are complete and affirmative.",
+  "OCI-LOG-02": "Pass on a complete empty open-problem inventory; fail when any unresolved Cloud Guard problem is HIGH or CRITICAL and warn for lower-risk open problems.",
+  "OCI-LOG-03": "Fail when no ACTIVE responder recipe exists or no returned responder rule has details.isEnabled=true.",
+  "OCI-LOG-04": "Warn when the complete audit query returns no event; pass when at least one event with eventTime is visible.",
+  "OCI-LOG-05": "Fail when no enabled ACTIVE Events rule condition covers the runtime's critical-operation event types; warn when coverage is only partial.",
+  "OCI-LOG-06": `Fail when Audit config retentionPeriodDays is below ${OCI_AUDIT_RETENTION_REQUIRED_DAYS}; missing or nonnumeric retention is manual.`,
+  "OCI-GRD-01": `Fail for any ingress security-list rule from 0.0.0.0/0 or ::/0 whose protocol and TCP range expose one of ports ${OCI_SENSITIVE_PORTS.join(", ")}.`,
+  "OCI-GRD-02": `Fail for any ingress network-security-group rule from 0.0.0.0/0 or ::/0 whose protocol and TCP range expose one of ports ${OCI_SENSITIVE_PORTS.join(", ")}.`,
+  "OCI-GRD-03": "Warn when an enabled AVAILABLE internet gateway is attached in an assessed compartment; a complete empty gateway inventory passes.",
+  "OCI-GRD-04": `Fail when a bastion has maxSessionTtlInSeconds above ${OCI_BASTION_MAX_TTL_SECONDS}, a broad client CIDR, or a session TTL above ${OCI_BASTION_SESSION_MAX_HOURS} hours; warn for missing limit fields.`,
+  "OCI-GRD-05": `Fail when an enabled Vault key is older than ${OCI_KEY_ROTATION_MAX_DAYS} without a newer version, uses AES below ${OCI_KEY_MIN_AES_BYTES} bytes, RSA below ${OCI_KEY_MIN_RSA_BYTES} bytes, or an ECDSA curve outside ${OCI_ECDSA_ACCEPTED_CURVES.join(", ")}.`,
+  "OCI-GRD-06": `Fail when a bucket publicAccessType is not NoPublicAccess; warn for a pre-authenticated request with no expiry or expiry more than ${OCI_PAR_LONG_LIVED_DAYS} days away.`,
+  "OCI-CMP-01": "Fail when any RUNNING instance has instanceOptions.areLegacyImdsEndpointsDisabled other than true.",
+  "OCI-CMP-02": "Fail when any AVAILABLE block volume has no kmsKeyId; complete readable inventories with every volume using a customer-managed key pass.",
+  "OCI-CMP-03": "Fail when any AVAILABLE boot volume has no kmsKeyId; complete readable inventories with every boot volume using a customer-managed key pass.",
+};
+
 const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, manualOnly]) => ({
   id,
   control,
@@ -136,9 +160,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   violationOutcome: id === "OCI-IAM-04" || id === "OCI-GRD-03" ? "warn" : "fail",
   constants: decisionConstants(id),
   frameworks: frameworkMappings(id),
-  decision: manualOnly
-    ? "Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting."
-    : `Use complete OCI CLI result cardinalities for ${title}; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation.`,
+  decision: `${decisionPredicate[id]} A proved violation takes precedence over partial collection; otherwise partial or unreadable evidence cannot pass.`,
 })));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 

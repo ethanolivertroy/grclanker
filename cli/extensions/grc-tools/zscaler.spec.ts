@@ -88,6 +88,34 @@ const decisionConstants = (control: number): Batch2CheckRow["constants"] => ({
   },
 } as const)[control as 1 | 7 | 11 | 13 | 24 | 25];
 
+const decisionPredicate: readonly string[] = [
+  `Use the explicit enabled BLOCK-rule and required-category rules rendered below; required categories are ${ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES.join(", ")}.`,
+  "Use the explicit default-rule, unbounded-ALLOW, full-logging, and enabled non-default rule predicates rendered below.",
+  "Fail when web DLP rules or engines are empty or all rules are disabled; warn when no enabled blocking rule references a DLP engine or withoutContentInspection.",
+  "Fail when no enabled DECRYPT rule exists or an unscoped DO_NOT_DECRYPT rule exists; warn for unreadable or excessive exemptions or locations with sslScanEnabled=false.",
+  "Remain manual when no sandbox rule exists; fail when all rules are disabled; warn when enabled rules do not use BLOCK.",
+  "Fail when any enabled ZIA administrator permits password login without readable SAML authentication evidence; warn for incomplete administrators.",
+  `Fail when enabled administrator coverage is absent or enabled Super Admin membership exceeds ${ZSCALER_DEFAULT_MAX_SUPER_ADMINS}; warn for missing role resolution, local-password access, or unreadable password-expiry settings.`,
+  "Fail when no enabled application segment exists or a segment is wildcard-domain plus full-port-range or bypassType=ALWAYS; warn for wildcard domains, full ranges, bypass, ungrouped segments, or partial segment/group data.",
+  "Fail when no enabled access ALLOW rule exists or an unconditional ALLOW rule exists; warn for ALLOW rules without identity criteria.",
+  "Fail when no posture profile exists or no ALLOW access rule uses posture; warn when only a subset of ALLOW rules uses posture.",
+  `Fail when no authenticated App Connector exists; warn for disconnected, undated, older-than-${ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS}-day connectors or connector groups with fewer than two connectors.`,
+  "Fail when no user IdP is enabled; warn for absent SCIM, unsigned SAML requests, weak ZPA administrators, absent admin IdP coverage, or partial IdP companion inventories.",
+  `Fail when no enabled timeout rule exists or reauthentication exceeds ${ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS} hours; warn for missing timeout values.`,
+  "Fail when the audit report is not COMPLETE and NSS feeds exist but none is an enabled ADMIN_AUDIT feed; warn when no NSS feed exists.",
+  "Remain manual when no trusted network exists; warn when no enabled access or forwarding rule references a TRUSTED_NETWORK condition.",
+  "Remain manual when no bandwidth-control rule exists; warn when every returned rule is disabled.",
+  "Remain manual when no isolation profile exists; warn when no enabled URL filtering rule uses ISOLATE.",
+  "Fail when any location or sub-location lacks authentication, SSL scanning, or firewall enablement; warn when tunnel/VPN coverage or child-location collection is partial.",
+  "Remain manual when no cloud-application control rule exists; warn when no enabled restrictive action covers an assessed cloud-app rule type.",
+  "Fail when no non-default enabled DNS rule blocks or redirects; warn when dgaDomainsBlocked is not true.",
+  `Warn for disconnected, undated, or older-than-${ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS}-day private Service Edges; a complete empty inventory documents reliance on public edges.`,
+  "Remain manual when no forwarding rule exists; fail for an unconditional BYPASS and warn for scoped BYPASS rules.",
+  "Remain manual when no emergency-access user exists; warn when any returned emergency user is active.",
+  `Fail for expired enrollment or browser-access certificates; warn for missing expiry or expiry within ${ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS} days.`,
+  `Fail when any required ATP flag (${ZSCALER_REQUIRED_ATP_FLAGS.join(", ")}) or malware flag (${ZSCALER_REQUIRED_MALWARE_FLAGS.join(", ")}) is not true; warn when unscannable files are not blocked or the allowlist is excessive.`,
+] as const;
+
 const checks = batch2Checks(rows.map(([title, severity, area], index) => {
   const control = index + 1;
   const custom: Partial<Batch2CheckRow> = control === 1
@@ -155,7 +183,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
     emptyOutcome: "manual" as const,
     constants: decisionConstants(control),
     ...custom,
-    decision: `Evaluate ${title} from the complete ${area === "zpa" ? "ZPA" : "ZIA"} inventory: missing product credentials and unreadable or ambiguous feature responses remain manual, a proved insecure record takes precedence, partial or review records warn, and pass requires complete readable evidence with no violation.`,
+    decision: `${decisionPredicate[index]} Missing product credentials and unreadable or ambiguous feature responses remain manual; a proved violation has first-match precedence. The known truncation exceptions are listed as runtime gaps rather than silently hardened.`,
   };
 }));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);

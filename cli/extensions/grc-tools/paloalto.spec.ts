@@ -93,6 +93,34 @@ const completePassRules = [
   batch2Rule("manual", { op: "always" }),
 ] as const;
 
+const decisionPredicate: readonly string[] = [
+  "Use the explicit passed-resource, total-resource, and minimum-pass-rate ratio rules rendered below.",
+  "Fail when a readable open alert has no policy name or no severity, or when no enabled alert policy covers the observed alerts; warn for incomplete alert pagination or unevaluable alert records.",
+  "Fail when a Prisma Cloud IAM alert or policy identifies excessive, administrative, or overprivileged access; warn for lower-confidence IAM review records.",
+  "Fail when no cloud account is onboarded or an onboarded account is disabled or reports an error; warn for accounts with incomplete governance metadata.",
+  "Fail when Prisma network-policy or alert evidence proves internet exposure; warn for review-level exposure and preserve alert truncation as incomplete evidence.",
+  "Fail when an assessed cloud resource lacks encryption-at-rest or customer-managed-key evidence required by the runtime predicate.",
+  `Fail when no enabled image-vulnerability rule blocks or prevents, or critical CVEs exceed ${PALOALTO_DEFAULT_MAX_CRITICAL_CVES}; warn for partial image or registry evidence.`,
+  `Fail when host/container compliance policy is absent or the measured compliance rate is below ${PALOALTO_DEFAULT_MIN_HOST_COMPLIANCE_RATE} percent; warn for incomplete Defender or compliance evidence.`,
+  "Fail when no enabled runtime host or container protection rule has a blocking or preventive effect.",
+  "Fail when the complete Defender inventory is empty or contains disconnected Defenders; partial Defender pagination warns.",
+  "Fail when no registry scan configuration exists or an enabled registry is not covered by a vulnerability scan rule.",
+  "Fail for enabled PAN-OS allow rules with any source, destination, application, or service and for disabled or shadowed security controls; warn for incomplete rule metadata.",
+  "Fail when PAN-OS zones or enabled inter-zone rules do not establish the runtime's trust-to-untrust segmentation predicate.",
+  "Fail when no enabled decryption rule applies decrypt action; warn for broad no-decrypt exceptions or incomplete profile evidence.",
+  "Fail when GlobalProtect portal, gateway, tunnel, authentication-profile, or certificate-profile evidence required by the runtime predicate is absent.",
+  "Fail when antivirus, anti-spyware, vulnerability-protection, or security-profile-group coverage is absent from enabled security rules.",
+  "Fail when WildFire analysis profiles or required file-type forwarding are absent from enabled security rules.",
+  "Fail when enabled URL-filtering profiles do not block the runtime high-risk categories or are not attached to enabled security rules.",
+  "Use the explicit PAN-OS administrator, superuser, password-complexity, local-password, and Prisma-role rules rendered below.",
+  "Use the explicit PAN-OS log-end, forwarding-profile, external-forwarding, and Prisma-SIEM rules rendered below.",
+  "Fail when neither PAN-OS data-filtering profiles nor Prisma data-protection policy evidence provides DLP coverage; warn when only one configured product provides evidence.",
+  "Fail when no enabled file-blocking profile blocks the runtime dangerous file types or no enabled security rule attaches that profile.",
+  "Fail when PAN-OS system, management, update, NTP, SNMP, banner, and high-availability settings violate the runtime hardening predicate; unknown settings warn.",
+  "Fail when Prisma cloud-discovery evidence identifies unsanctioned services or no discovery inventory is readable; incomplete discovery warns.",
+  "Fail when CI scan results contain a failed or vulnerable build, or when no CI scanning evidence exists; partial CI pagination warns.",
+] as const;
+
 function paloaltoDecision(control: number): Partial<Pick<Batch2CheckRow, "decisionInputs" | "decisionRules" | "constants">> | undefined {
   if (control === 1) {
     return {
@@ -247,9 +275,14 @@ const checks = batch2Checks(titles.map((title, index) => {
     owner: owner(control),
     surfaces: sourceSurfaces(control),
     emptyOutcome: "manual" as const,
+    constants: ({
+      7: { maximum_critical_cves: PALOALTO_DEFAULT_MAX_CRITICAL_CVES },
+      8: { minimum_host_compliance_rate_percent: PALOALTO_DEFAULT_MIN_HOST_COMPLIANCE_RATE },
+      19: { default_maximum_superusers: PALOALTO_DEFAULT_MAX_SUPERUSERS },
+    } as const)[control as 7 | 8 | 19],
     decisionRules,
     ...paloaltoDecision(control),
-    decision: `Evaluate ${title} from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation.`,
+    decision: `${decisionPredicate[index]} Unreadable configured-product evidence remains manual, a proved violation has first-match precedence, and partial evidence cannot pass.`,
   };
 }));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);

@@ -77,6 +77,36 @@ const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
   "CF-TRF-05": { stale_ip_access_rule_days: CLOUDFLARE_STALE_IP_RULE_DAYS },
 } as const)[id as "CF-IAM-03" | "CF-ZONE-04" | "CF-ZONE-10" | "CF-ZONE-14" | "CF-TRF-04" | "CF-TRF-05"];
 
+const decisionPredicate: Readonly<Record<string, string>> = {
+  "CF-IAM-01": "Fail when authMethod is the legacy Global API Key; pass only when the resolved raw authentication method is token.",
+  "CF-IAM-02": "Use the explicit token-verification, policy, permission-group, and resource-scope rules rendered below.",
+  "CF-IAM-03": `Fail when the complete active-member inventory contains more than ${CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS} Super Administrator roles; warn for members whose two-factor authentication field is not true.`,
+  "CF-IAM-04": "Fail when an Access application has no attached or reusable policy or any policy decision is bypass; pass only after both complete application and policy inventories establish coverage without bypass.",
+  "CF-IAM-05": "Fail when the complete identity-provider inventory is empty or every provider type is on the runtime weak-provider list; warn when weak providers coexist with a stronger provider.",
+  "CF-IAM-06": "Fail for active API tokens with no expires_on or an expires_on in the past; warn for undocumented token status or active tokens with no last_used_on.",
+  "CF-ZONE-01": "For every zone, fail when the managed-firewall entry point is absent, has no enabled execute rule, or an execute rule has overrides.enabled=false.",
+  "CF-ZONE-02": "For every zone, pass only for ssl=strict, warn for full or origin_pull, fail for flexible or off, and treat every other or absent value as unreadable.",
+  "CF-ZONE-03": "For every zone, pass only for min_tls_version 1.2 or 1.3, fail for 1.0 or 1.1, and treat every other or absent value as unreadable.",
+  "CF-ZONE-04": `For every zone, fail unless HSTS is enabled with max_age at least ${CLOUDFLARE_HSTS_MIN_MAX_AGE_SECONDS}; warn when include_subdomains or preload is not true.`,
+  "CF-ZONE-05": "For every zone, pass for DNSSEC status active, warn for pending or pending-disabled, fail for disabled or error, and treat any other value as unreadable.",
+  "CF-ZONE-06": "For every zone, fail when no custom-firewall entry point or enabled custom rule exists; warn when enabled rules exist but none uses block, managed_challenge, js_challenge, or challenge.",
+  "CF-ZONE-07": "For every zone, fail when every DDoS execute override is disabled or sensitivity is eoff; warn for low; pass for default or medium, including a listed managed ddos_l7 ruleset with no override.",
+  "CF-ZONE-08": "For every zone, fail unless always_use_https is exactly on; undocumented or absent values are unreadable.",
+  "CF-ZONE-09": "For every zone, fail unless automatic_https_rewrites is exactly on; undocumented or absent values are unreadable.",
+  "CF-ZONE-10": `For every zone, fail when Universal SSL is disabled, no active certificate pack exists, or an active certificate is expired; warn for missing expiry, expiry within ${CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS} days, or truncated certificate packs.`,
+  "CF-ZONE-11": "For every zone, fail when Authenticated Origin Pulls is disabled and has no active enabled hostname association; warn for only hostname-level coverage, inactive or undated associations, or a partial association inventory.",
+  "CF-ZONE-12": "For every zone, fail unless browser_check is exactly on; undocumented or absent values are unreadable.",
+  "CF-ZONE-13": "For every zone, fail unless email_obfuscation is exactly on; undocumented or absent values are unreadable.",
+  "CF-ZONE-14": `For every zone, fail when no enabled response-header rewrite sets any of ${CLOUDFLARE_REQUIRED_SECURITY_HEADERS.join(", ")}; warn when only a proper subset is set.`,
+  "CF-ZONE-15": "For every zone, warn when any proxiable A, AAAA, or CNAME record has proxied=false or when the DNS-record inventory is partial; an empty DNS inventory remains manual.",
+  "CF-TRF-01": "For every zone, fail when the http_ratelimit entry point has no enabled rule with a ratelimit block; a readable legacy /rate_limits result is evidence-only and warns, never passes.",
+  "CF-TRF-02": "For every zone, fail when an active page rule disables security, sets security_level essentially_off, turns SSL off or flexible, disables browser or email protection, or cache-everything matches a sensitive path.",
+  "CF-TRF-03": "For every zone, pass when fight_mode=true or definitely automated traffic is blocked or challenged; fail when definitely automated traffic is allowed or fight_mode=false without an SBFM action.",
+  "CF-TRF-04": `Warn when no audit event is visible in the ${CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS}-day window, any action failed, or pagination is partial; pass requires at least one complete readable event.`,
+  "CF-TRF-05": `Warn for allow-mode IP rules, rules with no notes, or rules with no modified_on or older than ${CLOUDFLARE_STALE_IP_RULE_DAYS} days; a complete empty inventory passes.`,
+  "CF-TRF-06": "Use the explicit Gateway provisioning, rule-action, filter, and completeness rules rendered below.",
+};
+
 const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces]) => {
   const custom: Partial<Batch2CheckRow> = id === "CF-IAM-02"
     ? {
@@ -138,7 +168,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     emptyOutcome: id === "CF-IAM-05" ? "fail" : id === "CF-TRF-05" ? "pass" : "manual",
     constants: decisionConstants(id),
     ...custom,
-    decision: `Evaluate ${title} from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account.`,
+    decision: `${decisionPredicate[id]} Across zones, evaluator counts come from these raw predicates rather than rendered per-zone statuses; a proved violation has first-match precedence and incomplete or unreadable evidence cannot pass.`,
   };
 }));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);

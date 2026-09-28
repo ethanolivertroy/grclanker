@@ -182,6 +182,40 @@ function customDecision(id: string): Partial<Pick<Batch2CheckRow, "decisionInput
   return undefined;
 }
 
+const decisionPredicate: Readonly<Record<string, string>> = {
+  "GCP-IAM-01": "Fail for IAM bindings to owner, editor, or the runtime privileged-role set when a member is allUsers, allAuthenticatedUsers, a user, or an external principal outside the assessed organization.",
+  "GCP-IAM-02": "Fail for a USER_MANAGED service-account key with missing creation time, expired validity, or age beyond the runtime rotation baseline; complete empty key inventories pass.",
+  "GCP-IAM-03": "Warn when any enabled service account has a USER_MANAGED key; pass only after complete service-account and key inventories prove none.",
+  "GCP-IAM-04": "Warn when an IAM member serviceAccount principal belongs to a project different from the resource project.",
+  "GCP-IAM-05": "Fail when a default Compute or App Engine service account has an owner, editor, or other runtime broad role binding.",
+  "GCP-LOG-01": "Warn when no recent Admin Activity entry is visible for a project; unreadable Logging responses remain manual.",
+  "GCP-LOG-02": "Fail when project IAM auditConfigs do not enable DATA_READ and DATA_WRITE for allServices or equivalent complete service coverage.",
+  "GCP-LOG-03": "Fail when a project has no enabled aggregated or project log sink with a nonempty destination.",
+  "GCP-LOG-04": `Fail when a readable log bucket has retentionDays below ${GCP_MIN_LOG_RETENTION_DAYS}; missing retention warns.`,
+  "GCP-LOG-05": "Return informational or warning evidence from readable Security Command Center findings; no organization scope or unreadable SCC evidence cannot pass.",
+  "GCP-ORG-01": "Warn when no ACTIVE organization is visible or project ancestry cannot be tied to the configured organization.",
+  "GCP-ORG-02": "Use the explicit effective-policy policy_enabled rules rendered below for constraints/iam.allowedPolicyMemberDomains.",
+  "GCP-ORG-03": "Use the explicit effective-policy policy_enabled rules rendered below for constraints/iam.disableServiceAccountKeyCreation.",
+  "GCP-ORG-04": "Use the explicit effective-policy policy_enabled rules rendered below for constraints/iam.disableServiceAccountKeyUpload.",
+  "GCP-ORG-05": "Use the explicit disableSerialPortAccess and requireShieldedVm raw policy-field rules rendered below.",
+  "GCP-ORG-06": "Fail when constraints/compute.requireOsLogin is not enabled or an instance metadata item explicitly disables enable-oslogin.",
+  "GCP-ORG-07": "Fail when Binary Authorization defaultAdmissionRule evaluates to always allow or when no project policy is enforced; warn for permissive scoped admission rules.",
+  "GCP-ORG-08": "Fail when a VM enables serial-port access or lacks required Shielded VM secure boot, vTPM, or integrity monitoring fields.",
+  "GCP-DATA-01": "Fail when a bucket's iamConfiguration.uniformBucketLevelAccess.enabled is not true.",
+  "GCP-DATA-02": "Fail when any IAM policy binding grants allUsers or allAuthenticatedUsers access to a resource.",
+  "GCP-DATA-03": `Fail when a CryptoKey has no rotationPeriod, rotation exceeds ${GCP_MAX_KMS_ROTATION_DAYS} days, or nextRotationTime is absent or overdue.`,
+  "GCP-DATA-04": "Warn when a bucket, disk, or image resource lacks a customer-managed KMS key reference; a complete empty encryptable-resource inventory remains manual.",
+  "GCP-DATA-05": "Fail when a public Cloud DNS zone has dnssecConfig.state other than on.",
+  "GCP-DATA-06": "Fail when an API key lacks both application restrictions and API target restrictions; complete empty key inventories pass.",
+  "GCP-DATA-07": "Fail when no service perimeter exists; warn when a perimeter has no protected resources or is dry-run only.",
+  "GCP-NET-01": `Fail for an enabled INGRESS firewall rule from 0.0.0.0/0 or ::/0 whose allowed protocol/port range includes ${GCP_ADMIN_PORTS.join(" or ")}.`,
+  "GCP-NET-02": `Fail when a subnet whose purpose is not one of ${GCP_FLOW_LOG_UNSUPPORTED_PURPOSES.join(", ")} lacks enableFlowLogs/logConfig.enable=true.`,
+  "GCP-NET-03": "Warn when a subnet has privateIpGoogleAccess other than true.",
+  "GCP-NET-04": "Warn when an instance has an external accessConfig or a network with private workloads lacks Cloud NAT coverage.",
+  "GCP-NET-05": "Fail when an external target HTTPS/SSL proxy has no SSL policy or uses a policy profile/minimum TLS version below the runtime secure baseline.",
+  "GCP-NET-06": `Warn when an external backend service using ${GCP_HTTP_BACKEND_PROTOCOLS.join(", ")} has no securityPolicy Cloud Armor reference.`,
+};
+
 const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome, violationOutcome]) => ({
   id,
   control,
@@ -193,7 +227,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   violationOutcome,
   constants: decisionConstants(id),
   ...customDecision(id),
-  decision: `From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return ${violationOutcome ?? "fail"} when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record.`,
+  decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
 })));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 
