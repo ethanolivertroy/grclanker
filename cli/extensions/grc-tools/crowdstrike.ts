@@ -1078,7 +1078,7 @@ function withPartialInventory(
   const absenceClaim = asObject(item.evidence)?.absence_claim === true;
   const previousFacts = (item as CrowdstrikeFindingWithFacts)[CROWDSTRIKE_DECISION_FACTS] ?? {};
   const facts = absenceClaim
-    ? crowdstrikeDecisionFacts(0, 0, 0, { complete: false })
+    ? {}
     : { ...previousFacts, evidence_complete: false };
   const result: CrowdstrikeFindingWithFacts = {
     ...item,
