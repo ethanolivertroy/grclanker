@@ -13,6 +13,8 @@
     "sync:fedramp": "npm --prefix cli run sync:fedramp",
     "sync:tool-catalog": "npm --prefix cli run sync:tool-catalog",
     "generate-types": "wrangler types",
+    "check": "astro check",
+    "prebuild": "npm run check",
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
@@ -26,6 +28,9 @@
     "vite": "8.1.0"
   },
   "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "@types/node": "^22.20.4",
+    "typescript": "^6.0.3",
     "wrangler": "^4.135.0"
   }
 }
