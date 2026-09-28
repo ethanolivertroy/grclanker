@@ -936,7 +936,7 @@ export function parseServiceError(stderr: string): OciServiceErrorFields | undef
  * Each is the silent-success class: the process succeeded but produced no
  * readable inventory, so the surface is unreadable, never an empty list.
  */
-export type OciStdoutShape = "non-json" | "empty" | "whitespace" | "no-data-member";
+export type OciStdoutShape = "non-json" | "empty" | "whitespace" | "no-data-member" | "unexpected-collection";
 
 export interface OciCommandFailure {
   args: string[];
@@ -960,6 +960,8 @@ function describeStdoutShape(command: string, shape: OciStdoutShape, stdoutBytes
       return `${command} exited 0 with whitespace-only stdout (${stdoutBytes} bytes, no JSON document)`;
     case "no-data-member":
       return `${command} exited 0 with a JSON document that has no data member (${stdoutBytes} bytes)`;
+    case "unexpected-collection":
+      return `${command} exited 0 with a JSON data member that was neither a bare array nor an object with an items array (${stdoutBytes} bytes)`;
     default: {
       const exhaustive: never = shape;
       throw new Error(`Unhandled stdout shape: ${String(exhaustive)}`);
@@ -1181,6 +1183,30 @@ function flattenListResponse(payload: JsonRecord): JsonRecord[] {
   }
   const object = asObject(data);
   return object ? [object] : [];
+}
+
+/**
+ * Cloud Guard list operations return *Collection response types. With
+ * `--all`, the OCI CLI preserves that envelope as `{data:{items:[...]}}`.
+ * Older CLI output observed by this integration used a bare `data` array, so
+ * that shape remains supported. Any other shape, including a collection
+ * object without `items`, is unreadable rather than an empty inventory.
+ */
+function flattenCollectionResponse(payload: JsonRecord): JsonRecord[] | undefined {
+  const data = payload.data;
+  const wrapper = asObject(data);
+  const items = Array.isArray(data)
+    ? data
+    : (wrapper && Array.isArray(wrapper.items) ? wrapper.items : undefined);
+  if (!items) return undefined;
+
+  const records: JsonRecord[] = [];
+  for (const item of items) {
+    const record = asObject(item);
+    if (!record) return undefined;
+    records.push(record);
+  }
+  return records;
 }
 
 function cidrIsWorld(value: unknown): boolean {
@@ -1550,7 +1576,7 @@ export class OciAuditorClient {
    * empty stdout is taken as a documented empty result. Stdout is never
    * echoed; the marker names the command and the observed state.
    */
-  private runJson(args: string[]): JsonRecord {
+  private runJson(args: string[], expectedDataShape: "default" | "collection" = "default"): JsonRecord {
     const fullArgs = [...this.buildBaseArgs(), ...args];
     const output = this.commandRunner(fullArgs);
     const failure = (stdoutShape: OciStdoutShape): OciCommandError =>
@@ -1564,7 +1590,19 @@ export class OciAuditorClient {
     }
     const document = asObject(parsed);
     if (!document || !("data" in document)) throw failure("no-data-member");
+    if (expectedDataShape === "collection" && flattenCollectionResponse(document) === undefined) {
+      throw failure("unexpected-collection");
+    }
     return document;
+  }
+
+  private runCollection(args: string[]): JsonRecord[] {
+    const document = this.runJson(args, "collection");
+    const records = flattenCollectionResponse(document);
+    if (records === undefined) {
+      throw new Error("OCI collection response passed validation without readable records.");
+    }
+    return records;
   }
 
   /** OCI_SURFACE_DOCS.compartments; --all follows opc-next-page to completion. */
@@ -1659,35 +1697,35 @@ export class OciAuditorClient {
 
   /** OCI_SURFACE_DOCS.cloudGuardTargets; ListTargets supports compartmentIdInSubtree and accessLevel. */
   async listCloudGuardTargets(): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return this.runCollection([
       "cloud-guard", "target", "list",
       "--compartment-id", this.config.tenancyOcid,
       "--compartment-id-in-subtree", "true",
       "--access-level", "ACCESSIBLE",
       "--all",
-    ]));
+    ]);
   }
 
   /** OCI_SURFACE_DOCS.cloudGuardProblems; lifecycleDetail OPEN filters to unresolved problems. */
   async listCloudGuardProblems(): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return this.runCollection([
       "cloud-guard", "problem", "list",
       "--compartment-id", this.config.tenancyOcid,
       "--compartment-id-in-subtree", "true",
       "--access-level", "ACCESSIBLE",
       "--lifecycle-detail", "OPEN",
       "--all",
-    ]));
+    ]);
   }
 
   async listResponderRecipes(): Promise<JsonRecord[]> {
-    return flattenListResponse(this.runJson([
+    return this.runCollection([
       "cloud-guard", "responder-recipe", "list",
       "--compartment-id", this.config.tenancyOcid,
       "--compartment-id-in-subtree", "true",
       "--access-level", "ACCESSIBLE",
       "--all",
-    ]));
+    ]);
   }
 
   /** OCI_SURFACE_DOCS.eventRules; ListRules has no subtree parameter (limit max 50, --all pages). */
@@ -2372,6 +2410,12 @@ export async function assessOciLoggingDetection(
   } else if (!cloudGuardEnabled) {
     problemStatus = "manual";
     problemSummary = `Manual: Cloud Guard configuration status is ${cloudGuardStatus || "missing"}, not ENABLED, so the empty result from oci cloud-guard problem list is not evidence; enable Cloud Guard or review problems after enablement.`;
+  } else if (!targets.ok) {
+    problemStatus = "manual";
+    problemSummary = `Manual: oci cloud-guard target list failed (${targets.error}), so the empty result from oci cloud-guard problem list is not evidence; confirm active target coverage and review open problems in the console.`;
+  } else if (activeTargets.length === 0) {
+    problemStatus = "manual";
+    problemSummary = "Manual: oci cloud-guard target list returned no ACTIVE targets, so the empty result from oci cloud-guard problem list does not confirm a monitored tenancy; configure target coverage and review open problems in the console.";
   } else {
     problemStatus = "pass";
     problemSummary = "No OPEN Cloud Guard problems were returned while Cloud Guard is ENABLED with active targets (emptiness is compliant here).";
@@ -2482,6 +2526,7 @@ export async function assessOciLoggingDetection(
       ["FedRAMP SI-4(5)", "CMMC L2 3.14.7", "SOC 2 CC7.3", "CIS OCI 3.2", "PCI-DSS 11.5.1.1", "STIG SRG-APP-000516", "IRAP ISM-0123", "ISMAP SO-02"],
       {
         problems: readEvidence("cloud-guard problem list", problemsRead, { open_problems: openProblems.length, high_risk_problems: highRiskProblems.length }),
+        targets: readEvidence("cloud-guard target list", targetsRead, { active_targets: activeTargets.length, total_targets: targets.items.length }),
         cloud_guard_configuration: cloudGuardEvidence,
       },
     ),
