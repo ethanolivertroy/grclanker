@@ -2449,10 +2449,58 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
     singleDatasetTruncations: truncationReplay,
   });
   writeByteDifferentialFixture("zscaler", "compliant", representative());
+  const sslExemptionsAt = (count, maxSslExemptions) => {
+    const fixture = policyFixture();
+    fixture.sslExemptedUrls = readable({ urls: Array.from({ length: count }, (_, index) => `boundary-${index}.example`) });
+    return assessZiaPolicyData(fixture, maxSslExemptions === undefined ? {} : { maxSslExemptions });
+  };
+  const securityAllowlistAt = (count) => {
+    const fixture = policyFixture();
+    fixture.securityAllowlist = readable({ whitelistUrls: Array.from({ length: count }, (_, index) => `allow-${index}.example`) });
+    return assessZiaPolicyData(fixture);
+  };
+  const sslDefaultBoundaries = [49, 50, 51].map((count) => sslExemptionsAt(count));
+  const sslOverrideBoundaries = [9, 10, 11].map((count) => sslExemptionsAt(count, 10));
+  const allowlistBoundaries = [99, 100, 101].map(securityAllowlistAt);
+  const connectorAgeAt = (days, staleConnectorDays = 30) => assessZpaData(zpaFixture({
+    appConnectors: readable([
+      { id: "c-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
+      { id: "c-2", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
+    ]),
+  }), { staleConnectorDays });
+  const timeoutAt = (hours, maxTimeoutHours = 24) => assessZpaData(zpaFixture({
+    timeoutRules: readable([{ id: "t-1", name: "Boundary timeout", disabled: false, reauthTimeout: String(hours * 60 * 60), reauthIdleTimeout: "3600" }]),
+  }), { maxTimeoutHours });
+  const certificateAt = (days, certExpiryWarnDays = 30) => assessZpaData(zpaFixture({
+    enrollmentCertificates: readable([{ id: "ec-1", name: "Boundary certificate", validToInEpochSec: Math.floor((NOW.getTime() + days * 24 * 60 * 60 * 1000) / 1000) }]),
+    browserAccessCertificates: readable([]),
+  }), { certExpiryWarnDays });
+  const connectorDefaultBoundaries = [29, 30, 31].map((days) => connectorAgeAt(days));
+  const connectorOverrideBoundaries = [9, 10, 11].map((days) => connectorAgeAt(days, 10));
+  const timeoutDefaultBoundaries = [23, 24, 25].map((hours) => timeoutAt(hours));
+  const timeoutOverrideBoundaries = [9, 10, 11].map((hours) => timeoutAt(hours, 10));
+  const certificateDefaultBoundaries = [29, 30, 31].map((days) => certificateAt(days));
+  const certificateOverrideBoundaries = [9, 10, 11].map((days) => certificateAt(days, 10));
+  assert.equal(
+    sslDefaultBoundaries.length + sslOverrideBoundaries.length + allowlistBoundaries.length
+      + connectorDefaultBoundaries.length + connectorOverrideBoundaries.length
+      + timeoutDefaultBoundaries.length + timeoutOverrideBoundaries.length
+      + certificateDefaultBoundaries.length + certificateOverrideBoundaries.length,
+    27,
+  );
   writeByteDifferentialFixture("zscaler", "boundary", {
     superAdministrators: [0, 1, 2].map((maxSuperAdmins) => (
       assessZiaAccessControlData(accessControlFixture(), { maxSuperAdmins })
     )),
+    sslExemptions: sslDefaultBoundaries,
+    sslExemptionsOverrideTen: sslOverrideBoundaries,
+    securityAllowlist: allowlistBoundaries,
+    connectorAgeDays: connectorDefaultBoundaries,
+    connectorAgeOverrideTenDays: connectorOverrideBoundaries,
+    timeoutHours: timeoutDefaultBoundaries,
+    timeoutOverrideTenHours: timeoutOverrideBoundaries,
+    certificateExpiryDays: certificateDefaultBoundaries,
+    certificateExpiryOverrideTenDays: certificateOverrideBoundaries,
   });
 
   const ziaStub = ziaTenantFetch(ziaCompliantTenant());

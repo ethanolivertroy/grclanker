@@ -2117,10 +2117,29 @@ test("byte differential fixtures: Cloudflare assessments and export artifacts", 
   writeByteDifferentialFixture("cloudflare", "missing-null", await assess(fixtureClient("empty")));
   writeByteDifferentialFixture("cloudflare", "partial", await assess(fixtureClient("partial")));
   writeByteDifferentialFixture("cloudflare", "compliant", await assess(fixtureClient("compliant")));
+  const superAdministratorsAt = (count, maxSuperAdmins = 2) => assessCloudflareIdentity(fixtureClient("compliant", {
+    async listMembers() {
+      return {
+        items: Array.from({ length: count }, (_, index) => ({
+          id: `boundary-member-${index}`,
+          status: "accepted",
+          user: { email: `admin-${index}@example.com`, two_factor_authentication_enabled: true },
+          roles: [{ id: `boundary-role-${index}`, name: "Super Administrator - All Privileges" }],
+        })),
+        truncated: false,
+        totalCount: count,
+      };
+    },
+  }), { maxSuperAdmins });
+  const defaultBoundaries = await Promise.all([1, 2, 3].map((count) => superAdministratorsAt(count)));
+  const overrideBoundaries = await Promise.all([4, 5, 6].map((count) => superAdministratorsAt(count, 5)));
+  assert.equal(defaultBoundaries.length + overrideBoundaries.length, 6);
   writeByteDifferentialFixture("cloudflare", "boundary", {
     superAdministrators: await Promise.all([0, 1, 2].map((maxSuperAdmins) => (
       assessCloudflareIdentity(fixtureClient("compliant"), { maxSuperAdmins })
     ))),
+    superAdministratorDefaultThreshold: defaultBoundaries,
+    superAdministratorOverrideFive: overrideBoundaries,
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("cloudflare");

@@ -17,7 +17,9 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
-const baselineRef = "origin/etroy/generated-specs-batch-1-7352";
+// Immutable stack base integrated by merge commit 1ff1140. Update this SHA only
+// when a newer parent head is merged into this branch.
+const baselineRef = "3b8cfd043c395ac94833ab684cbe340bc1ea1c6f";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -230,6 +232,30 @@ function corpusCallCount(root, paths) {
 
 let worktreeAdded = false;
 try {
+  const baselineSha = run("git", ["rev-parse", `${baselineRef}^{commit}`], { capture: true }).stdout.trim();
+  const headSha = run("git", ["rev-parse", "HEAD^{commit}"], { capture: true }).stdout.trim();
+  if (baselineSha === headSha) {
+    throw new Error(`Differential baseline resolved to HEAD (${headSha}); self-comparison is forbidden`);
+  }
+  run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
+  const batchSpecificPaths = [
+    "cli/extensions/grc-tools/azure.ts",
+    "cli/extensions/grc-tools/cloudflare.ts",
+    "cli/extensions/grc-tools/gcp.ts",
+    "cli/extensions/grc-tools/oci.ts",
+    "cli/extensions/grc-tools/paloalto.ts",
+    "cli/extensions/grc-tools/zscaler.ts",
+  ];
+  const batchDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", ...batchSpecificPaths], {
+    cwd: repoRoot,
+    stdio: "ignore",
+  });
+  if (batchDiff.status === 0) {
+    throw new Error(`No batch-2 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
+  }
+  if (batchDiff.status !== 1) {
+    throw new Error(`Unable to inspect batch-2 diff between ${baselineSha} and ${headSha}`);
+  }
   run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
   worktreeAdded = true;
   symlinkSync(join(repoRoot, "cli", "node_modules"), join(mainWorktree, "cli", "node_modules"), "dir");
@@ -270,7 +296,7 @@ try {
     }
   }
   const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
-  console.log(`Whole-corpus replay passed: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the stacked parent.`);
+  console.log(`Whole-corpus replay passed against immutable stack base ${baselineSha}: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the stacked parent.`);
   console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
   console.log(`Fixture classes: ${classes.join(", ")}.`);
 } finally {
