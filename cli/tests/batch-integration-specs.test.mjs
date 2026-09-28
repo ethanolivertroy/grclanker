@@ -786,15 +786,16 @@ test("Zendesk executable rules ignore legacy status and preserve boundaries, pre
   const legacyStatus = "pass";
   const sessionFacts = {
     readable: true,
-    timeout_present: true,
-    severe: false,
-    issue_count: 0,
+    agent_session_timeout: 120,
+    mobile_app_access: true,
+    mobile_app_session_timeout: 120,
+    threshold_minutes: 120,
+    severe_threshold_minutes: 360,
   };
   assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-05", sessionFacts), "pass");
   assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-05", {
     ...sessionFacts,
-    severe: true,
-    issue_count: 1,
+    agent_session_timeout: 361,
   }), "fail", "mutating the timeout evidence changes the verdict while the legacy status is held constant");
   assert.equal(legacyStatus, "pass");
   assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-10", {

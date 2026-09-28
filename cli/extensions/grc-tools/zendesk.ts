@@ -2816,9 +2816,9 @@ function assessAgentTwoFactor(
     team_readable: teamSnap.status === "ok",
     team_count: teamMembers.length,
     security_readable: securitySnap.status === "ok",
-    enforcement_present: enforce !== undefined,
-    enforcement_enabled: enforce,
-    sso_enforced: enforceSso,
+    two_factor_enforce_present: enforce !== undefined,
+    two_factor_enforce_value: enforce,
+    enforce_sso_value: enforceSso,
     without_two_factor_count: withoutTwoFactor.length,
     unknown_two_factor_count: unknownTwoFactor.length,
     complete: !isTruncated(teamSnap),
@@ -2889,10 +2889,7 @@ function assessPasswordPolicy(securitySnap: ZendeskSnapshot<JsonRecord>, agentAu
   const customGaps = policyName === "custom" ? customPasswordGaps(agentPassword) : [];
   recordZendeskDecisionFacts(3, {
     readable: securitySnap.status === "ok",
-    policy_present: policyName !== undefined,
-    recommended: policyName === "recommended",
-    custom: policyName === "custom",
-    high: policyName === "high",
+    security_policy_name: policyName,
     custom_gap_count: customGaps.length,
   });
   if (securitySnap.status !== "ok") {
@@ -2975,13 +2972,13 @@ function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, securit
   const agentTimeout = asNumber(security.agent_session_timeout);
   const mobileAccess = asBoolean(security.mobile_app_access);
   const mobileTimeout = asNumber(security.mobile_app_session_timeout);
-  const issueCount = (agentTimeout !== undefined && (agentTimeout <= 0 || agentTimeout > thresholdMinutes) ? 1 : 0)
-    + (mobileAccess !== false && mobileTimeout !== undefined && (mobileTimeout <= 0 || mobileTimeout > thresholdMinutes) ? 1 : 0);
   recordZendeskDecisionFacts(5, {
     readable: securitySnap.status === "ok",
-    timeout_present: agentTimeout !== undefined,
-    severe: agentTimeout !== undefined && (agentTimeout <= 0 || agentTimeout > thresholdMinutes * 3),
-    issue_count: issueCount,
+    agent_session_timeout: agentTimeout,
+    mobile_app_access: mobileAccess,
+    mobile_app_session_timeout: mobileTimeout,
+    threshold_minutes: thresholdMinutes,
+    severe_threshold_minutes: thresholdMinutes * 3,
   });
   if (securitySnap.status !== "ok") {
     return manualFinding(5, title, "medium", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
@@ -3046,7 +3043,7 @@ function assessEndUserAuthentication(
     enforce_sso: enforceSso,
     zendesk_login: zendeskLogin,
     sso_method_count: methods.length,
-    strong_password_policy: policyName === "recommended" || policyName === "high",
+    security_policy_name: policyName,
     account_settings_complete: settingsSnap.status === "ok",
   });
   if (securitySnap.status !== "ok") {
@@ -3197,7 +3194,7 @@ function assessApiTokens(
   const summary = summarizeApiTokenEvents(events, staleDays, now);
   recordZendeskDecisionFacts(13, {
     settings_readable: settingsSnap.status === "ok",
-    token_access_disabled: apiTokenAccess === false,
+    api_token_access: apiTokenAccess,
     token_history_readable: tokenLogsSnap.status === "ok",
     token_history_complete: tokenLogsSnap.status === "ok" && !isTruncated(tokenLogsSnap),
     outstanding_token_count: summary.outstanding.length,
@@ -3406,7 +3403,11 @@ async function assessZendeskAccessControlWithDecisionContext(
     tokens_readable: tokensSnap.status === "ok",
     tokens_complete: tokensSnap.status === "ok" && !isTruncated(tokensSnap),
     token_count: tokens.length,
-    hygiene_warning_count: publicClients.length + privilegedTokens.length + nonExpiringTokens.length + usage.stale.length + usage.undated.length,
+    public_client_count: publicClients.length,
+    privileged_token_count: privilegedTokens.length,
+    non_expiring_token_count: nonExpiringTokens.length,
+    stale_token_count: usage.stale.length,
+    undated_token_count: usage.undated.length,
   });
   if (clientsSnap.status !== "ok") {
     findings.push(manualFinding(14, oauthTitle, "high", snapshotCause("OAuth clients (/oauth/clients, admin only)", clientsSnap), "capture Admin Center > Apps and integrations > APIs > OAuth clients with each client's scopes, kind, and redirect URLs."));
@@ -3627,7 +3628,8 @@ async function assessZendeskDataProtectionWithDecisionContext(
   recordZendeskDecisionFacts(9, {
     readable: auditSnap.status === "ok",
     entry_count: auditEntries.length,
-    sample_cut_short: sampleCutShort,
+    truncated: isTruncated(auditSnap),
+    sample_size: DEFAULT_AUDIT_LOG_SAMPLE,
   });
   if (auditSnap.status !== "ok") {
     findings.push(manualFinding(9, auditTitle, "high", `${snapshotCause("Audit logs (/audit_logs, Enterprise plan and admin role)", auditSnap)} This is a plan or permission limitation, not a pass.`, "capture Admin Center > Account > Audit log showing recent entries, or record that the plan does not include the audit log.", { audit_log_status: auditSnap.status }));
