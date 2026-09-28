@@ -464,7 +464,11 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     inputs: input("readable", "complete", "contact_count", "technical_contact_present", "technical_user_assigned", "technical_status_known", "technical_user_active", "technical_lookup_failed"),
     rules: ordered({
       manual: any(unavailable, eq("contact_count", 0)),
-      fail: any(eq("technical_contact_present", false), eq("technical_user_assigned", false), all(eq("technical_status_known", true), eq("technical_user_active", false))),
+      fail: any(
+        all(eq("technical_lookup_failed", false), eq("technical_contact_present", false)),
+        all(eq("technical_lookup_failed", false), eq("technical_user_assigned", false)),
+        all(eq("technical_status_known", true), eq("technical_user_active", false)),
+      ),
       warn: any(incomplete, eq("technical_lookup_failed", true), eq("technical_status_known", false)),
       pass: eq("technical_user_active", true),
     }),
