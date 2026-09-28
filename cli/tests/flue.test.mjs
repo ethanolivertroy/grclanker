@@ -1026,6 +1026,43 @@ test("tool error text loses Pi's echoed payload and any sensitive value from the
   );
 });
 
+test("sensitive value collection covers nested arrays and malformed Unicode without leaking or throwing", () => {
+  const malformed = "secret-\uD800-value";
+  const values = collectSensitiveValues(
+    {
+      credentials_json: {
+        keys: ["array-secret-value", { recovery: 4242 }],
+      },
+      accounts: [{ seed: "schema-array-secret", label: "safe" }],
+      api_token: malformed,
+    },
+    {
+      type: "object",
+      properties: {
+        accounts: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              seed: { type: "string", writeOnly: true },
+            },
+          },
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(values, ["schema-array-secret", "array-secret-value", malformed, "4242"]);
+  assert.doesNotThrow(() => scrubbedFormsOf(malformed), "a lone surrogate cannot make log redaction fail");
+  assert.equal(
+    scrubSensitiveValues(
+      `array array-secret-value; nested 4242; schema schema-array-secret; malformed ${malformed}`,
+      values,
+    ),
+    `array ${REDACTED_VALUE}; nested ${REDACTED_VALUE}; schema ${REDACTED_VALUE}; malformed ${REDACTED_VALUE}`,
+  );
+});
+
 test("scrubbing recognizes transformed echoes: encodings, reflowed PEM, case changes, short and numeric values", () => {
   const token = "tok_Live/AbC+dEf=9Q";
   const base64 = Buffer.from(token, "utf8").toString("base64");
