@@ -1678,6 +1678,16 @@ test("rule 10: SF-07, SF-09, and SF-10 demote when a secondary list is truncated
   assert.equal(findingById(cappedAssignments, "SF-09").status, "warn");
   assert.match(findingById(cappedAssignments, "SF-09").summary, /Only 0 of an unknown total of PermissionSetAssignment records were read/);
 
+  const emptyElevatedWithCappedAssignments = assessSalesforceIdentityData(goodIdentityData({
+    assignments: truncated("PermissionSetAssignment", [], 5001),
+  }), { now: NOW });
+  const emptyElevatedFinding = findingById(emptyElevatedWithCappedAssignments, "SF-09");
+  assert.equal(emptyElevatedFinding.status, "pass");
+  assert.equal(
+    emptyElevatedFinding.summary,
+    "None of the 1 permission sets grant Modify All Data, View All Data, Manage Users, Author Apex, or other elevated permissions.",
+  );
+
   assert.equal(findingById(assessSalesforceIdentityData(goodIdentityData(), { now: NOW }), "SF-10").status, "pass");
   const cappedProfiles = assessSalesforceIdentityData(goodIdentityData({ profiles: truncated("Profile", goodProfiles, 60) }), { now: NOW });
   const sf10 = findingById(cappedProfiles, "SF-10");

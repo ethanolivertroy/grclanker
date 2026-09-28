@@ -1185,6 +1185,22 @@ test("rule 1: forbidden or errored endpoints yield manual findings that name the
   }
 });
 
+test("OKTA-AUTH-002 keeps the legacy Partial finding when only MFA enrollment policies are truncated", () => {
+  const authentication = createSampleAuthenticationData();
+  authentication.mfaPolicies = {
+    ...authentication.mfaPolicies,
+    truncated: true,
+    truncationNote: "MFA_ENROLL pagination cursor repeated after 1 item; total unknown",
+  };
+  const finding = findingById(assessOktaAuthentication(authentication, createSampleConfig()), "OKTA-AUTH-002");
+  assert.equal(finding.status, "Partial");
+  assert.equal(
+    finding.summary,
+    "1 ACTIVE rules across 1 ACTIVE admin or dashboard policies require MFA, and strong authenticators are active. Inventory truncated: MFA_ENROLL pagination cursor repeated after 1 item; total unknown",
+  );
+  assert.ok(finding.evidence.includes("Partial data: MFA_ENROLL pagination cursor repeated after 1 item; total unknown"));
+});
+
 test("rule 2: empty inventories never pass by default and state fail or manual intent", () => {
   const config = createSampleConfig();
   const authentication = createSampleAuthenticationData();
