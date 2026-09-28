@@ -47,7 +47,7 @@ Each integration guide in this documentation describes its authentication, colle
 
 The current tool families share hardening for credential-aware error scrubbing, fixed-shape config errors, incomplete collection markers, and pagination status. Runtime adapters validate schemas at their boundaries. The Cursor Agent SDK marks 199 tools as read-only and approval-gates 42 writers. Flue redacts credential-shaped activity log arguments and documents its persistence risks.
 
-Evidence exporters allocate a new bundle path on every run instead of overwriting a prior export. Each integration guide documents its export layout and sensitive-data handling; review it before handling tenant data.
+Evidence exporters allocate a new bundle path on each rerun instead of overwriting a prior export. Each integration guide documents its export layout and sensitive-data handling; review it before handling tenant data.
 
 ## Specs
 

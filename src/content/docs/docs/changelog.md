@@ -56,7 +56,7 @@ node cli/bin/grclanker.js tools
 - Error text is scrubbed of credential-shaped values before it reaches the model, including quoted, lowercase, escaped, flag, cookie, and letters-only Bearer forms.
 - Pagination links on a different origin no longer receive credentials, and GitHub tokens go only to the configured GraphQL origin.
 - Evidence exports redact credentials, capped pagination is marked truncated instead of complete, and malformed success responses from CrowdStrike and Webex are rejected instead of read as empty data.
-- Evidence exporters allocate a new bundle path on every run, so reruns and concurrent runs no longer overwrite earlier bundles or ZIPs. Duo bundles are written owner-only.
+- Evidence exporters allocate a new bundle path on each rerun instead of overwriting an earlier bundle, and Vanta exports stay isolated even when runs overlap. Duo bundles are written owner-only.
 - Config files are read with a 1 MiB cap, FIFOs and devices are refused, and parse errors are built from fixed text so a malformed line cannot leak a credential.
 - RunPod staging uploads only git-tracked files and never the `.env` family.
 - Integration fixes: OCI Cloud Guard problems are parsed from the real response shape, Palo Alto honors `verify_tls` in config files, the Google Workspace operator bridge reports a partial bundle when `gws` lacks Alert Center, Zscaler reports explicitly configured files that are missing, and the default CMVP endpoint works again.
