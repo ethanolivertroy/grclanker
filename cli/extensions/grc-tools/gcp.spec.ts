@@ -251,6 +251,17 @@ function customDecision(id: string): Partial<Pick<Batch2CheckRow, "decisionInput
   return undefined;
 }
 
+function gcpCompletenessSemantics(id: string): string {
+  const shared = "true exactly when every named source avoids the lowering conditions in its structured source-state entry. A mode omitted from an entry can still affect evidence_readable or review facts but does not lower evidence_complete.";
+  if (["GCP-IAM-02", "GCP-IAM-03"].includes(id)) {
+    return `${shared} The service-account-key entry aggregates every attempted child key-list read under the project-scoped service-account inventory: mixed success and failure lowers completeness, every attempted key-list read failing leaves completeness unchanged while making evidence_readable false, zero attempts leave this source unchanged, and truncation lowers completeness.`;
+  }
+  if (id === "GCP-ORG-06") {
+    return `${shared} The effective-org-policy entry applies only to constraints/compute.requireOsLogin; failures of other constraint requests do not affect this check.`;
+  }
+  return shared;
+}
+
 const decisionPredicate: Readonly<Record<string, string>> = {
   "GCP-IAM-01": `Fail when a binding to any of ${GCP_PRIVILEGED_IAM_ROLES.join(", ")} contains allUsers, allAuthenticatedUsers, any user: principal, or a principal whose email suffix is outside the assessed organization's primary domain.`,
   "GCP-IAM-02": `Fail for a USER_MANAGED service-account key with missing creation time, expired validity, or age beyond stale_days. The option defaults to ${GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS} and is clamped to 1 through 3650 days; complete empty key inventories pass.`,
@@ -303,7 +314,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     completeness: batch2Completeness(
       decisionInputs,
       GCP_COMPLETENESS_SOURCES[id],
-      "project inventory and per-project scan failures lower evidence_complete except where the source-state table explicitly omits a mode. For service-account keys, the structured project-scoped aggregate distinguishes mixed successful and failed child reads from a full outage or zero attempts. Direct organization-scoped list errors generally make the finding manual without lowering this primitive; Security Command Center findings, OS Login effective-policy, and Access Context Manager failures are explicit exceptions.",
+      gcpCompletenessSemantics(id),
     ),
     decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
   };
