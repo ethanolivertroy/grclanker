@@ -19,6 +19,7 @@ import {
   type PermissionKind,
   type PortableValue,
   type RequestParameterContract,
+  renderVerdictCondition,
   type VerdictCondition,
   type VerdictOperand,
   type VerdictRule,
@@ -359,9 +360,9 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     if (!rendered) return `No ${status} branch exists for this check.`;
     if (rendered.condition.op === "eq" && rendered.condition.left.kind === "path") {
       const derivation = check.derivedFactRules?.[rendered.condition.left.path];
-      if (derivation) return JSON.stringify(derivation.condition);
+      if (derivation) return renderVerdictCondition(derivation.condition);
     }
-    return JSON.stringify(rendered.condition);
+    return renderVerdictCondition(rendered.condition);
   };
   const noncompliantStatus: EvaluatedFindingStatus = outcomes.fail
     ? "fail"
@@ -384,7 +385,7 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
         kind: "compliant",
         input: `${check.id} primitive assignment satisfies this exact first-match condition: ${sourceConditionFor(compliantStatus)}`,
         expected: compliantStatus,
-        reason: `${check.id} evaluates the rendered ordered rules directly; the assignment reaches ${compliantStatus} without a preselected label.`,
+        reason: `${check.id} evaluates the rendered ordered rules directly from the named primitive assignment and reaches ${compliantStatus}.`,
       },
       {
         kind: "noncompliant",
