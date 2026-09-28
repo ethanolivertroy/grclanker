@@ -800,16 +800,30 @@ export function evaluateBatchCheckVerdict(
   return evaluateCheckVerdict(checkContract(spec, checkId), rawFacts);
 }
 
+const STRICT_RUNTIME_FACT_SPECS = new Set([
+  "crowdstrike-sec-inspector",
+  "knowbe4-sec-inspector",
+  "qualys-sec-inspector",
+  "tenable-sec-inspector",
+  "veracode-sec-inspector",
+]);
+
 export function evaluateBatchRuntimeCheckVerdict(
   spec: IntegrationSpecContract,
   checkId: string,
   collectedFacts: Readonly<Record<string, unknown>>,
 ): EvaluatedFindingStatus {
+  const check = checkContract(spec, checkId);
+  const decisionFacts = STRICT_RUNTIME_FACT_SPECS.has(spec.identity.slug)
+    ? collectedFacts
+    : Object.fromEntries(
+        Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
+      );
   BATCH_DECISION_CAPTURE.getStore()?.push({
     integration: spec.identity.slug,
-    checks: new Map([[checkId, collectedFacts]]),
+    checks: new Map([[checkId, decisionFacts]]),
   });
-  return evaluateCheckVerdict(checkContract(spec, checkId), collectedFacts);
+  return evaluateCheckVerdict(check, decisionFacts);
 }
 
 export function assertBatchCheckVerdict<T extends string>(
