@@ -21,7 +21,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
-import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -2101,7 +2101,7 @@ function finding(
   const id = findingId(controlNumber);
   const facts = BOX_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(BOX_SPEC, id, facts, status);
+  status = evaluateBatchCheckVerdict(BOX_SPEC, id, facts) as BoxFindingStatus;
   return {
     id,
     control: controlNumber,
