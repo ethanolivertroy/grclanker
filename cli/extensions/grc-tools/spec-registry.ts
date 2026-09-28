@@ -18,6 +18,8 @@ import { registerOciTools } from "./oci.js";
 import { OCI_SPEC } from "./oci.spec.js";
 import { registerOktaTools } from "./okta.js";
 import { OKTA_SPEC } from "./okta.spec.js";
+import { registerPaloaltoTools } from "./paloalto.js";
+import { PALOALTO_SPEC } from "./paloalto.spec.js";
 import { registerSalesforceTools } from "./salesforce.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 import { registerServicenowTools } from "./servicenow.js";
@@ -30,6 +32,8 @@ import { registerZendeskTools } from "./zendesk.js";
 import { ZENDESK_SPEC } from "./zendesk.spec.js";
 import { registerZoomTools } from "./zoom.js";
 import { ZOOM_SPEC } from "./zoom.spec.js";
+import { registerZscalerTools } from "./zscaler.js";
+import { ZSCALER_SPEC } from "./zscaler.spec.js";
 
 export interface PublishedIntegrationSpec {
   contract: IntegrationSpecContract;
@@ -94,6 +98,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     registerTools: registerOktaTools,
   },
   {
+    contract: PALOALTO_SPEC,
+    narrativePath: "specs/narratives/paloalto.md",
+    outputPath: "specs/paloalto-sec-inspector.spec.md",
+    registerTools: registerPaloaltoTools,
+  },
+  {
     contract: SALESFORCE_SPEC,
     narrativePath: "specs/narratives/salesforce.md",
     outputPath: "specs/salesforce-sec-inspector.spec.md",
@@ -128,5 +138,11 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/zoom.md",
     outputPath: "specs/zoom-sec-inspector.spec.md",
     registerTools: registerZoomTools,
+  },
+  {
+    contract: ZSCALER_SPEC,
+    narrativePath: "specs/narratives/zscaler.md",
+    outputPath: "specs/zscaler-sec-inspector.spec.md",
+    registerTools: registerZscalerTools,
   },
 ];
