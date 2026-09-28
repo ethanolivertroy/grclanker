@@ -433,8 +433,8 @@ test("every batch tool definition carries adjacent non-enumerable metadata witho
   }
 });
 
-test("Okta, Duo, GWS, Box, Slack, and Zoom execute declared derived facts with ordered first-match precedence", () => {
-  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+test("all nine integrations execute declared derived facts with ordered first-match precedence", () => {
+  for (const [spec] of batch) {
     for (const check of spec.checks) {
       assert.ok(Object.keys(check.derivedFactRules ?? {}).length > 0, `${check.id}: executable derived facts`);
       assert.ok(check.criteria.rules.every((entry) => entry.condition.op === "eq"), `${check.id}: outcomes consume derived branches`);
@@ -467,9 +467,9 @@ test("Okta, Duo, GWS, Box, Slack, and Zoom execute declared derived facts with o
   }
 });
 
-test("Okta, Duo, GWS, Box, Slack, and Zoom decision inputs contain no preselected conclusion tokens", () => {
+test("all nine integration decision inputs contain no preselected conclusion tokens", () => {
   const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant|availability|available|enforcement|enforced)(?:_|$)/;
-  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+  for (const [spec] of batch) {
     for (const check of spec.checks) {
       for (const inputName of check.evidenceFields) {
         assert.doesNotMatch(inputName, forbidden, `${check.id}: ${inputName}`);

@@ -28,6 +28,9 @@ const testFiles = [
   "box.test.mjs",
   "slack.test.mjs",
   "zoom.test.mjs",
+  "zendesk.test.mjs",
+  "salesforce.test.mjs",
+  "servicenow.test.mjs",
 ];
 
 function run(command, args, options = {}) {
@@ -53,6 +56,9 @@ function instrumentedMainTest(source) {
     .replace(/^import \{ BOX_SPEC \} from .*box\.spec\.js";\n/m, "")
     .replace(/^import \{ SLACK_SPEC \} from .*slack\.spec\.js";\n/m, "")
     .replace(/^import \{ ZOOM_SPEC \} from .*zoom\.spec\.js";\n/m, "")
+    .replace(/^import \{ ZENDESK_SPEC \} from .*zendesk\.spec\.js";\n/m, "")
+    .replace(/^import \{ SALESFORCE_SPEC \} from .*salesforce\.spec\.js";\n/m, "")
+    .replace(/^import \{ SERVICENOW_SPEC \} from .*servicenow\.spec\.js";\n/m, "")
     .replace(
       'import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',
       'import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',

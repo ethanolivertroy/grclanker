@@ -43,6 +43,12 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
@@ -2955,4 +2961,21 @@ test("reviewer B round 4 verdict SNOW-02 (ruled code, not sentence): a positive 
   const healthy = findingsById(await assessServicenowAccessControl(createClient(fixtureFetch(healthyFixture()).fetchImpl))).get("SNOW-02");
   assert.equal(healthy.status, "pass", healthy.summary);
   assert.equal(healthy.evidence.public_page_count, 0, "a complete sys_public read beside visible ACLs states its zero");
+});
+
+test("byte differential fixtures: ServiceNow assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const clientFor = (fixture, options = {}) => createClient(fixtureFetch(fixture, options).fetchImpl);
+  writeByteDifferentialFixture("servicenow", "representative", {
+    access: await checkServicenowAccess(clientFor(healthyFixture())),
+    assessments: await runAllAssessments(clientFor(healthyFixture())),
+  });
+  writeByteDifferentialFixture("servicenow", "boundary", await runAllAssessments(clientFor(failingFixture())));
+  writeByteDifferentialFixture("servicenow", "denied", await runAllAssessments(clientFor(healthyFixture(), { forbidAll: true })));
+  writeByteDifferentialFixture("servicenow", "partial", await runAllAssessments(clientFor(healthyFixture(), { inflateTotal: 25 })));
+  writeByteDifferentialFixture("servicenow", "missing-null", await runAllAssessments(clientFor(emptyFixture())));
+  writeByteDifferentialFixture("servicenow", "compliant", await runAllAssessments(clientFor(healthyFixture())));
+
+  const outputRoot = prepareByteDifferentialExportRoot("servicenow");
+  const exported = await exportServicenowAuditBundle(clientFor(healthyFixture()), sampleConfig(), outputRoot);
+  writeByteDifferentialFixture("servicenow", "export", snapshotExportBundle(exported));
 });
