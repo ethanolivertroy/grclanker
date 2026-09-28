@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const SLACK_SURFACES = [
   ["auth-test", "POST", "/api/auth.test"], ["users", "GET", "/api/users.list"],
@@ -105,6 +106,147 @@ const decisions = [
   "always return manual because the pull-based Audit Logs API does not report SIEM streaming or export destinations.",
 ] as const;
 
+interface SlackExecutableDecision {
+  inputs: Readonly<Record<string, string>>;
+  rules: readonly VerdictRule[];
+}
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const compare = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry: PortableValue): VerdictCondition => ({
+  op,
+  left: path(name),
+  right: value(entry),
+});
+const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", name, entry);
+const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
+const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
+const ordered = (manual: VerdictCondition, fail: VerdictCondition | undefined, warn: VerdictCondition | undefined, pass: VerdictCondition | undefined): readonly VerdictRule[] => [
+  rule("manual", manual),
+  ...(fail ? [rule("fail", fail)] : []),
+  ...(warn ? [rule("warn", warn)] : []),
+  ...(pass ? [rule("pass", pass)] : []),
+  rule("manual", { op: "always" }),
+];
+const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete collector state before evidence samples are capped.`]),
+);
+const manual = (): SlackExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
+const inventory = (prefix: string, options: { empty?: "fail" | "warn" | "manual"; positive?: "pass" | "warn" } = {}): SlackExecutableDecision => {
+  const readable = `${prefix}_readable`;
+  const complete = `${prefix}_complete`;
+  const count = `${prefix}_count`;
+  const empty = options.empty ?? "warn";
+  const positive = options.positive ?? "pass";
+  return {
+    inputs: input(readable, complete, count),
+    rules: [
+      rule("manual", ne(readable, true)),
+      ...(empty === "manual" ? [rule("manual", eq(count, 0))] : [rule(empty, eq(count, 0))]),
+      rule("warn", ne(complete, true)),
+      rule(positive, gt(count, 0)),
+      rule("manual", { op: "always" }),
+    ],
+  };
+};
+
+const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecision>> = {
+  "SLACK-ID-01": {
+    inputs: input("users_readable", "users_complete", "active_user_count", "without_mfa_count", "unknown_mfa_count"),
+    rules: ordered(ne("users_readable", true), gt("without_mfa_count", 0), any(eq("active_user_count", 0), gt("unknown_mfa_count", 0), ne("users_complete", true)), gt("active_user_count", 0)),
+  },
+  "SLACK-ID-02": {
+    inputs: input("users_readable", "users_complete", "active_user_count", "guest_count"),
+    rules: ordered(ne("users_readable", true), undefined, any(gt("guest_count", 0), eq("active_user_count", 0), ne("users_complete", true)), all(gt("active_user_count", 0), eq("guest_count", 0))),
+  },
+  "SLACK-ID-03": inventory("scim", { empty: "fail" }),
+  "SLACK-ID-04": {
+    inputs: input("users_readable", "scim_readable", "complete", "scim_user_count", "mismatch_count"),
+    rules: ordered(any(ne("users_readable", true), ne("scim_readable", true)), gt("mismatch_count", 0), any(ne("complete", true), eq("scim_user_count", 0)), gt("scim_user_count", 0)),
+  },
+  "SLACK-ID-05": {
+    inputs: input("users_readable", "users_complete", "human_user_count"),
+    rules: ordered(ne("users_readable", true), undefined, any(ne("users_complete", true), eq("human_user_count", 0)), gt("human_user_count", 0)),
+  },
+  "SLACK-ADMIN-01": {
+    inputs: input("teams_readable", "admin_inventory_count", "complete", "excessive_admin_workspace_count"),
+    rules: ordered(any(ne("teams_readable", true), eq("admin_inventory_count", 0)), gt("excessive_admin_workspace_count", 0), ne("complete", true), gt("admin_inventory_count", 0)),
+  },
+  "SLACK-ADMIN-02": {
+    inputs: input("users_readable", "users_complete", "active_user_count", "without_sso_count", "unknown_sso_count"),
+    rules: ordered(ne("users_readable", true), gt("without_sso_count", 0), any(eq("active_user_count", 0), gt("unknown_sso_count", 0), ne("users_complete", true)), gt("active_user_count", 0)),
+  },
+  "SLACK-ADMIN-03": {
+    inputs: input("session_readable", "complete", "duration_count", "overlong_count"),
+    rules: ordered(any(ne("session_readable", true), eq("duration_count", 0)), gt("overlong_count", 0), ne("complete", true), gt("duration_count", 0)),
+  },
+  "SLACK-ADMIN-04": manual(),
+  "SLACK-ADMIN-05": {
+    inputs: input("teams_readable", "teams_complete", "workspace_count", "open_count", "unknown_count"),
+    rules: ordered(any(ne("teams_readable", true), eq("workspace_count", 0)), gt("open_count", 0), any(gt("unknown_count", 0), ne("teams_complete", true)), gt("workspace_count", 0)),
+  },
+  "SLACK-ADMIN-06": manual(),
+  "SLACK-ADMIN-07": {
+    inputs: input("teams_readable", "teams_complete", "domain_count", "unrestricted_count", "settings_error_count"),
+    rules: ordered(any(ne("teams_readable", true), eq("domain_count", 0)), gt("unrestricted_count", 0), any(gt("settings_error_count", 0), ne("teams_complete", true)), gt("domain_count", 0)),
+  },
+  "SLACK-ADMIN-08": {
+    inputs: input("emoji_readable", "emoji_complete", "emoji_count", "roster_available", "roster_complete", "non_admin_upload_count"),
+    rules: ordered(any(ne("emoji_readable", true), eq("emoji_count", 0), ne("roster_available", true)), gt("non_admin_upload_count", 0), any(ne("roster_complete", true), ne("emoji_complete", true)), gt("emoji_count", 0)),
+  },
+  "SLACK-ADMIN-09": manual(),
+  "SLACK-APP-01": inventory("approved"),
+  "SLACK-APP-02": inventory("restricted"),
+  "SLACK-APP-03": {
+    inputs: input("approved_readable", "approved_complete", "approved_count", "flagged_count"),
+    rules: ordered(ne("approved_readable", true), undefined, any(eq("approved_count", 0), gt("flagged_count", 0), ne("approved_complete", true)), all(gt("approved_count", 0), eq("flagged_count", 0))),
+  },
+  "SLACK-APP-04": inventory("barrier"),
+  "SLACK-APP-05": manual(),
+  "SLACK-APP-06": {
+    inputs: input("preferences_readable", "setting_present", "coverage_complete", "verdict"),
+    rules: ordered(any(ne("preferences_readable", true), ne("setting_present", true)), eq("verdict", "fail"), any(ne("verdict", "pass"), ne("coverage_complete", true)), eq("verdict", "pass")),
+  },
+  "SLACK-APP-07": manual(),
+  "SLACK-CHAN-01": {
+    inputs: input("external_readable", "external_complete", "external_count"),
+    rules: [
+      rule("manual", ne("external_readable", true)),
+      rule("warn", gt("external_count", 0)),
+      rule("warn", ne("external_complete", true)),
+      rule("pass", eq("external_count", 0)),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "SLACK-CHAN-02": {
+    inputs: input("channels_readable", "comparison_available", "complete", "unrestricted_count", "unknown_count"),
+    rules: ordered(any(ne("channels_readable", true), ne("comparison_available", true)), gt("unrestricted_count", 0), any(gt("unknown_count", 0), ne("complete", true)), eq("unrestricted_count", 0)),
+  },
+  "SLACK-CHAN-03": {
+    inputs: input("channels_readable", "retention_available", "complete", "short_retention_count"),
+    rules: ordered(any(ne("channels_readable", true), ne("retention_available", true)), gt("short_retention_count", 0), ne("complete", true), eq("short_retention_count", 0)),
+  },
+  "SLACK-CHAN-04": manual(),
+  "SLACK-CHAN-05": manual(),
+  "SLACK-MON-01": inventory("audit", { empty: "fail" }),
+  "SLACK-MON-02": {
+    inputs: input("audit_readable", "audit_complete", "latest_age_known", "latest_age_days"),
+    rules: ordered(ne("audit_readable", true), gt("latest_age_days", 1), any(ne("latest_age_known", true), ne("audit_complete", true)), compare("lte", "latest_age_days", 1)),
+  },
+  "SLACK-MON-03": {
+    inputs: input("audit_readable", "audit_complete", "security_event_count"),
+    rules: ordered(ne("audit_readable", true), undefined, any(eq("security_event_count", 0), ne("audit_complete", true)), gt("security_event_count", 0)),
+  },
+  "SLACK-MON-04": inventory("schema"),
+  "SLACK-MON-05": {
+    inputs: input("audit_readable", "audit_complete", "external_event_count"),
+    rules: ordered(ne("audit_readable", true), undefined, any(eq("external_event_count", 0), ne("audit_complete", true)), gt("external_event_count", 0)),
+  },
+  "SLACK-MON-06": manual(),
+};
+
 const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, severity, owner], index) => ({
   id,
   control,
@@ -113,6 +255,8 @@ const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, sever
   owner,
   surfaces: SLACK_CHECK_SURFACES[id],
   evidenceFields: [...SLACK_CHECK_SURFACES[id], "complete_source_counts"],
+  decisionInputs: SLACK_EXECUTABLE_DECISIONS[id].inputs,
+  decisionRules: SLACK_EXECUTABLE_DECISIONS[id].rules,
   decision: decisions[index],
 }));
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);

@@ -6,6 +6,7 @@
  * response field used here is listed in SLACK_METHODS with the public
  * documentation page it was verified against.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -19,7 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
-import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SLACK_SPEC } from "./slack.spec.js";
@@ -522,8 +523,18 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): SlackFinding {
-  status = preserveRuntimeFindingStatus(SLACK_SPEC, id, status);
+  const facts = SLACK_DECISION_CONTEXT.getStore()?.get(id);
+  if (!facts) throw new Error(`${id} has no runtime decision facts`);
+  status = evaluateBatchCheckVerdict(SLACK_SPEC, id, facts) as SlackFindingStatus;
   return { id, title, control, severity, status, summary, mappings: mappingsFor(control), evidence };
+}
+
+const SLACK_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordSlackDecisionFacts(id: string, facts: Readonly<Record<string, unknown>>): void {
+  const store = SLACK_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Slack assessment`);
+  store.set(id, facts);
 }
 
 function manualFinding(
@@ -1483,6 +1494,7 @@ export async function assessSlackIdentity(
   client: SlackApiClient,
   options: { userLimit?: number; skipScim?: boolean } = {},
 ): Promise<SlackAssessmentResult> {
+  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 20_000);
   const errors: string[] = [];
   const teamId = await resolveTeamId(client);
@@ -1523,6 +1535,12 @@ export async function assessSlackIdentity(
     return Boolean(email && deletedSlackEmails.has(email));
   });
   const usersView = usersResult.ok ? partialNote(users.length, usersResult.complete, usersResult.total, usersResult.truncation) : "unreadable";
+
+  recordSlackDecisionFacts("SLACK-ID-01", { users_readable: usersResult.ok, users_complete: usersComplete, active_user_count: activeHumans.length, without_mfa_count: withoutMfa.length, unknown_mfa_count: unknownMfa });
+  recordSlackDecisionFacts("SLACK-ID-02", { users_readable: usersResult.ok, users_complete: usersComplete, active_user_count: activeHumans.length, guest_count: guests.length });
+  recordSlackDecisionFacts("SLACK-ID-03", { scim_readable: scimConfig.ok && scimUsers.ok, scim_complete: scimUsers.ok && scimUsers.complete, scim_count: scimUsers.ok ? scimUsers.value.length : 0 });
+  recordSlackDecisionFacts("SLACK-ID-04", { users_readable: usersResult.ok, scim_readable: scimConfig.ok && scimUsers.ok, complete: usersComplete && scimUsers.ok && scimUsers.complete, scim_user_count: scimUsers.ok ? scimUsers.value.length : 0, mismatch_count: scimActiveDeletedInSlack.length });
+  recordSlackDecisionFacts("SLACK-ID-05", { users_readable: usersResult.ok, users_complete: usersComplete, human_user_count: humans.length });
 
   const findings: SlackFinding[] = [];
   if (!usersResult.ok) {
@@ -1676,6 +1694,7 @@ export async function assessSlackIdentity(
     findings,
     errors,
   };
+  });
 }
 
 interface WorkspaceRecord {
@@ -1704,6 +1723,7 @@ export async function assessSlackAdminAccess(
     sessionSample?: number;
   } = {},
 ): Promise<SlackAssessmentResult> {
+  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
   const workspaceLimit = clampNumber(options.workspaceLimit, DEFAULT_WORKSPACE_LIMIT, 1, 500);
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 20_000);
   const maxWorkspaceAdmins = clampNumber(options.maxWorkspaceAdmins, 5, 1, 100);
@@ -1825,6 +1845,28 @@ export async function assessSlackAdminAccess(
   const openWorkspaces = workspaces.filter((item) => item.discoverability === "open");
   const unknownDiscoverability = workspaces.filter((item) => !item.discoverability);
   const unrestrictedDomains = emailDomains.filter((item) => item.email_domain.length === 0);
+
+  recordSlackDecisionFacts("SLACK-ADMIN-01", { teams_readable: teamsResult.ok, admin_inventory_count: adminInventory.length, complete: adminsComplete, excessive_admin_workspace_count: excessiveAdmins.length });
+  recordSlackDecisionFacts("SLACK-ADMIN-02", { users_readable: orgUsers.ok, users_complete: orgUsersComplete, active_user_count: activeOrgUsers.length, without_sso_count: withoutSso.length, unknown_sso_count: ssoUnknown });
+  recordSlackDecisionFacts("SLACK-ADMIN-03", {
+    session_readable: sessionError === undefined && orgUsers.ok && sessionUserIds.length > 0,
+    complete: noSettingsApplied.length === 0 && sessionUserIds.length >= activeOrgUsers.length && orgUsersComplete,
+    duration_count: durations.length,
+    overlong_count: overlongSessions.length,
+  });
+  recordSlackDecisionFacts("SLACK-ADMIN-04", {});
+  recordSlackDecisionFacts("SLACK-ADMIN-05", { teams_readable: teamsResult.ok, teams_complete: workspacesComplete, workspace_count: workspaces.length, open_count: openWorkspaces.length, unknown_count: unknownDiscoverability.length });
+  recordSlackDecisionFacts("SLACK-ADMIN-06", {});
+  recordSlackDecisionFacts("SLACK-ADMIN-07", { teams_readable: teamsResult.ok, teams_complete: workspacesComplete, domain_count: emailDomains.length, unrestricted_count: unrestrictedDomains.length, settings_error_count: settingsErrors.length });
+  recordSlackDecisionFacts("SLACK-ADMIN-08", {
+    emoji_readable: emojiResult.ok,
+    emoji_complete: emojiComplete,
+    emoji_count: emojiEntries.length,
+    roster_available: adminUserIds.size > 0 && !everyAdminListUnreadable,
+    roster_complete: adminRosterComplete,
+    non_admin_upload_count: nonAdminUploads?.length ?? 0,
+  });
+  recordSlackDecisionFacts("SLACK-ADMIN-09", {});
 
   const findings: SlackFinding[] = [];
 
@@ -2065,6 +2107,7 @@ export async function assessSlackAdminAccess(
     findings,
     errors,
   };
+  });
 }
 
 interface AppRecord {
@@ -2093,6 +2136,7 @@ export async function assessSlackIntegrations(
   client: SlackApiClient,
   options: { appLimit?: number; workspaceLimit?: number } = {},
 ): Promise<SlackAssessmentResult> {
+  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
   const appLimit = clampNumber(options.appLimit, DEFAULT_APP_LIMIT, 1, 5000);
   const workspaceLimit = clampNumber(options.workspaceLimit, DEFAULT_WORKSPACE_LIMIT, 1, 500);
   const orgQuery = client.getOrgQuery();
@@ -2130,6 +2174,19 @@ export async function assessSlackIntegrations(
       : teamsResult.value.length > 1
         ? `the org has ${teamsResult.value.length} workspaces and only the token's workspace was read`
         : undefined;
+
+  recordSlackDecisionFacts("SLACK-APP-01", { approved_readable: approvedResult.ok, approved_complete: approvedResult.ok && approvedResult.complete, approved_count: approvedApps.length });
+  recordSlackDecisionFacts("SLACK-APP-02", { restricted_readable: restrictedResult.ok, restricted_complete: restrictedResult.ok && restrictedResult.complete, restricted_count: restrictedApps.length });
+  recordSlackDecisionFacts("SLACK-APP-03", { approved_readable: approvedResult.ok, approved_complete: approvedResult.ok && approvedResult.complete, approved_count: approvedApps.length, flagged_count: flaggedApps.size });
+  recordSlackDecisionFacts("SLACK-APP-04", { barrier_readable: barriersResult.ok, barrier_complete: barriersResult.ok && barriersResult.complete, barrier_count: barriersResult.ok ? barriersResult.value.length : 0 });
+  recordSlackDecisionFacts("SLACK-APP-05", {});
+  recordSlackDecisionFacts("SLACK-APP-06", {
+    preferences_readable: preferencesResult.ok,
+    setting_present: fileUploadSetting !== undefined,
+    coverage_complete: !workspaceScope && !identityGap,
+    verdict: fileUploadVerdict,
+  });
+  recordSlackDecisionFacts("SLACK-APP-07", {});
 
   const findings: SlackFinding[] = [];
   findings.push(
@@ -2268,6 +2325,7 @@ export async function assessSlackIntegrations(
     findings,
     errors,
   };
+  });
 }
 
 interface ChannelRecord {
@@ -2318,6 +2376,7 @@ export async function assessSlackChannelGovernance(
   client: SlackApiClient,
   options: { channelLimit?: number; minRetentionDays?: number } = {},
 ): Promise<SlackAssessmentResult> {
+  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
   const channelLimit = clampNumber(options.channelLimit, DEFAULT_CHANNEL_LIMIT, 1, 400);
   const minRetentionDays = clampNumber(options.minRetentionDays, DEFAULT_MIN_RETENTION_DAYS, 1, 36_500);
   const errors: string[] = [];
@@ -2382,6 +2441,23 @@ export async function assessSlackChannelGovernance(
   const shortRetention = retentionByChannel.filter((item) => item.is_policy_enabled === true && item.duration_days !== undefined && item.duration_days < minRetentionDays);
   const inheritingDefault = retentionByChannel.filter((item) => item.is_policy_enabled !== true);
   const channelsComplete = channelsResult.ok && channelsResult.complete;
+
+  recordSlackDecisionFacts("SLACK-CHAN-01", { external_readable: externalResult.ok, external_complete: externalResult.ok && externalResult.complete, external_count: externalChannels.length });
+  recordSlackDecisionFacts("SLACK-CHAN-02", {
+    channels_readable: channelsResult.ok,
+    comparison_available: channels.length > 0 && announcementChannels.length > 0 && announcementPrefs.length > 0,
+    complete: channelsComplete && unknownAnnouncements.length === 0 && prefsErrors.length === 0,
+    unrestricted_count: unrestrictedAnnouncements.length,
+    unknown_count: unknownAnnouncements.length + prefsErrors.length,
+  });
+  recordSlackDecisionFacts("SLACK-CHAN-03", {
+    channels_readable: channelsResult.ok,
+    retention_available: retentionByChannel.length > 0,
+    complete: channelsComplete && retentionErrors.length === 0,
+    short_retention_count: shortRetention.length,
+  });
+  recordSlackDecisionFacts("SLACK-CHAN-04", {});
+  recordSlackDecisionFacts("SLACK-CHAN-05", {});
 
   const findings: SlackFinding[] = [];
   findings.push(
@@ -2494,12 +2570,14 @@ export async function assessSlackChannelGovernance(
     findings,
     errors,
   };
+  });
 }
 
 export async function assessSlackMonitoring(
   client: SlackApiClient,
   options: { days?: number; auditLimit?: number } = {},
 ): Promise<SlackAssessmentResult> {
+  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
   const now = client.getNow();
   const days = clampNumber(options.days, DEFAULT_LOOKBACK_DAYS, 1, 365);
   const auditLimit = clampNumber(options.auditLimit, DEFAULT_AUDIT_LIMIT, 1, 9999);
@@ -2527,6 +2605,13 @@ export async function assessSlackMonitoring(
   const visibleSecurityEvents = entries.filter((entry) => securityActions.has(asString(entry.action) ?? ""));
   const visibleExternalEvents = entries.filter((entry) => externalActions.has(asString(entry.action) ?? ""));
   const logsView = logsResult.ok ? `${entries.length} entries in the last ${days} days${logsResult.complete ? "" : " (window truncated at the sample limit)"}` : "unreadable";
+
+  recordSlackDecisionFacts("SLACK-MON-01", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, audit_count: entries.length });
+  recordSlackDecisionFacts("SLACK-MON-02", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, latest_age_known: latestAge !== undefined, latest_age_days: latestAge });
+  recordSlackDecisionFacts("SLACK-MON-03", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, security_event_count: visibleSecurityEvents.length });
+  recordSlackDecisionFacts("SLACK-MON-04", { schema_readable: schemasResult.ok, schema_complete: schemasResult.ok && schemasResult.complete, schema_count: schemasResult.ok ? schemasResult.value.length : 0 });
+  recordSlackDecisionFacts("SLACK-MON-05", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, external_event_count: visibleExternalEvents.length });
+  recordSlackDecisionFacts("SLACK-MON-06", {});
 
   const findings: SlackFinding[] = [];
   if (!logsResult.ok) {
@@ -2628,6 +2713,7 @@ export async function assessSlackMonitoring(
     findings,
     errors,
   };
+  });
 }
 
 function formatAccessCheckText(result: SlackAccessCheckResult): string {
