@@ -178,6 +178,75 @@ test("resolveZscalerConfiguration prefers args over env over config file and map
   assert.equal(zpaOnly.zpa.cloud, "PRODUCTION");
 });
 
+test("config path precedence requires explicit argument and environment files but skips an absent default", async () => {
+  const base = createTempBase("grclanker-zscaler-config-discovery-");
+  const homeDir = join(base, "home");
+  const ziaArgs = { zia_cloud: "zscalerthree", zia_api_key: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123", zia_username: "auditor@example.com", zia_password: "s3cret-pass", max_retries: 0 };
+  mkdirSync(homeDir);
+
+  const withoutDefault = resolveZscalerConfiguration(ziaArgs, {}, homeDir);
+  assert.equal(withoutDefault.configFile, undefined, "an absent implicit default is optional");
+  assert.equal(withoutDefault.zia.cloud, "zscalerthree");
+
+  const defaultConfig = join(homeDir, ".zscaler", "zscaler.yaml");
+  mkdirSync(join(homeDir, ".zscaler"));
+  writeFileSync(defaultConfig, [
+    "zpa:",
+    "  client:",
+    "    clientId: default-client",
+    "    clientSecret: default-secret",
+    "    customerId: default-customer",
+  ].join("\n"));
+  const fromDefault = resolveZscalerConfiguration({}, {}, homeDir);
+  assert.equal(fromDefault.configFile, defaultConfig);
+  assert.equal(fromDefault.zpa.clientId, "default-client");
+
+  const explicitConfig = join(base, "explicit.yaml");
+  writeFileSync(explicitConfig, [
+    "zia:",
+    "  client:",
+    "    cloud: zscalerone",
+    "    apiKey: explicit-api-key",
+    "    username: explicit-user",
+    "    password: explicit-password",
+  ].join("\n"));
+  const fromEnvironmentFile = resolveZscalerConfiguration({}, { ZSCALER_CONFIG_FILE: explicitConfig }, homeDir);
+  assert.equal(fromEnvironmentFile.configFile, explicitConfig);
+  assert.equal(fromEnvironmentFile.zia.cloud, "zscalerone");
+
+  const argumentMissing = join(base, "ARGTOKCANARYqz8m2v4x7k1p3w5n9r.yaml");
+  assert.throws(
+    () => resolveZscalerConfiguration({ ...ziaArgs, config_file: argumentMissing }, { ZSCALER_CONFIG_FILE: explicitConfig }, homeDir),
+    (error) => {
+      assert.equal(error.message, `Unable to read Zscaler config file ${argumentMissing} (ENOENT)`);
+      return true;
+    },
+    "config_file takes precedence over ZSCALER_CONFIG_FILE and must exist",
+  );
+
+  const environmentMissing = join(base, "ENVTOKCANARYh6j2f8d4s0a1g3l5.yaml");
+  assert.throws(
+    () => resolveZscalerConfiguration(ziaArgs, { ZSCALER_CONFIG_FILE: environmentMissing }, homeDir),
+    (error) => {
+      assert.equal(error.message, `Unable to read Zscaler config file ${environmentMissing} (ENOENT)`);
+      return true;
+    },
+    "ZSCALER_CONFIG_FILE takes precedence over the implicit default and must exist",
+  );
+
+  const checkAccess = registeredZscalerTool("zscaler_check_access");
+  const argumentResult = await checkAccess({ ...ziaArgs, config_file: argumentMissing });
+  assert.match(argumentResult.text, /^Zscaler access check failed: Unable to read Zscaler config file .*\[REDACTED\]\.yaml \(ENOENT\)$/);
+  assert.ok(!argumentResult.serialized.includes("ARGTOKCANARY"), argumentResult.serialized);
+
+  const environmentResult = await withProcessEnv(
+    { ZSCALER_CONFIG_FILE: environmentMissing },
+    () => checkAccess(ziaArgs),
+  );
+  assert.match(environmentResult.text, /^Zscaler access check failed: Unable to read Zscaler config file .*\[REDACTED\]\.yaml \(ENOENT\)$/);
+  assert.ok(!environmentResult.serialized.includes("ENVTOKCANARY"), environmentResult.serialized);
+});
+
 /** Captures the tool definitions through a fake pi and returns a runner that renders one tool the way the agent sees it. */
 function registeredZscalerTool(name) {
   const definitions = new Map();

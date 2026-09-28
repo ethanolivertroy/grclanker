@@ -1,6 +1,6 @@
 ---
-title: Incident Evaluation and Communication — FedRAMP Process
-description: Official Consolidated Rules summary for the IEC FedRAMP process, including applicability and requirements.
+title: "Incident Evaluation and Communication: FedRAMP Process"
+description: "Official Consolidated Rules summary for the IEC FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,14 +30,14 @@ The Incident Evaluation and Communication rules explain how providers must commu
 
 ## Rule Subsets
 
-- `CSO` — General Provider Responsibilities: These rules apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
-- `FRP` — FedRAMP Responsibilities: These rules apply to FedRAMP. · types: 20x, Rev5 · classes: B, C, D
+- `CSO` · General Provider Responsibilities: These rules apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
+- `FRP` · FedRAMP Responsibilities: These rules apply to FedRAMP. · types: 20x, Rev5 · classes: B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `IEC-CSO-AIR` SHOULD — Automated Incident Reporting
+### `IEC-CSO-AIR` SHOULD: Automated Incident Reporting
 
 Providers SHOULD use automation to minimize human intervention in the process of reporting FedRAMP Reportable Incidents to all affected parties.
 
@@ -45,9 +45,9 @@ Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `IEC-CSO-DPR` MUST — Default PAIN Rating
+### `IEC-CSO-DPR` MUST: Default PAIN Rating
 
 Providers MUST treat FedRAMP Reportable Incidents as if they have a Potential Agency Impact N-rating (PAIN) of 5 UNLESS they promptly estimate the PAIN rating following the rule in IEC-CSO-EFI (Estimate Federal Impact).
 
@@ -55,9 +55,9 @@ Terms: `FedRAMP Reportable Incident`, `Incident`, `Potential Agency Impact`, `Pr
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `IEC-CSO-EFI` SHOULD — Estimate Federal Impact
+### `IEC-CSO-EFI` SHOULD: Estimate Federal Impact
 
 Providers SHOULD promptly estimate the likely adverse impact of an incident on agency customers to assign a Potential Agency Impact N-rating; this step is called Incident Rating.
 
@@ -74,9 +74,9 @@ Affects: Providers
 
 Note: All incidents must be assigned a default PAIN-5 as required by IEC-CSO-DPR (Default PAIN Rating) if this step is not completed.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `IEC-CSO-EFR` MUST — Evaluate FedRAMP Reportability
+### `IEC-CSO-EFR` MUST: Evaluate FedRAMP Reportability
 
 Providers MUST promptly evaluate incidents to determine if they affect confidentiality or integrity of federal customer data or are likely to affect confidentiality or integrity of federal customer data; such incidents are FedRAMP Reportable Incidents and must be reported following the FedRAMP Incident Evaluation and Communication rules.
 
@@ -84,9 +84,9 @@ Terms: `FedRAMP Reportable Incident`, `Federal Customer Data`, `Incident`, `Like
 
 Affects: Providers
 
-Recent update: 2026-07-02 — Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
+Recent update (2026-07-02): Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
 
-### `IEC-CSO-FIR` MUST — Final Incident Report
+### `IEC-CSO-FIR` MUST: Final Incident Report
 
 Varies by certification class:
 
@@ -99,9 +99,9 @@ Terms: `All Affected Parties`, `Final Incident Report (FIR)`, `Incident`, `Respo
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `IEC-CSO-IIR` VARIES BY CLASS — Initial Incident Report
+### `IEC-CSO-IIR` VARIES BY CLASS: Initial Incident Report
 
 Varies by certification class:
 
@@ -148,9 +148,9 @@ Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Initi
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `IEC-CSO-OIR` VARIES BY CLASS — Ongoing Incident Reports
+### `IEC-CSO-OIR` VARIES BY CLASS: Ongoing Incident Reports
 
 Varies by certification class:
 
@@ -185,9 +185,9 @@ Terms: `All Affected Parties`, `FedRAMP Reportable Incident`, `Incident`, `Respo
 
 Affects: Providers
 
-Recent update: 2026-09-13 — Removed the extra the in all statements.
+Recent update (2026-09-13): Removed the extra the in all statements.
 
-### `IEC-FRP-ORV` MUST — Ongoing Review
+### `IEC-FRP-ORV` MUST: Ongoing Review
 
 FedRAMP MUST periodically review FedRAMP Incident Evaluation and Communication implementation with providers based on lack of reporting or other information.
 
@@ -195,4 +195,4 @@ Terms: `Incident`
 
 Affects: FedRAMP
 
-Recent update: 2026-07-02 — Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.
+Recent update (2026-07-02): Update terminology from "Response" to "Communication" in FedRAMP Incident Evaluation rules.

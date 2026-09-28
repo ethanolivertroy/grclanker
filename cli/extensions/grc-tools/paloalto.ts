@@ -1715,6 +1715,16 @@ function ensurePrivateDir(pathname: string): void {
   }
 }
 
+function pathEntryExists(pathname: string): boolean {
+  try {
+    lstatSync(pathname);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
   ensurePrivateDir(baseDir);
   const realBase = realpathSync(baseDir);
@@ -1746,7 +1756,8 @@ async function nextAvailableAuditDir(root: string, preferredName: string): Promi
   ensurePrivateDir(root);
   for (const suffix of ["", "-2", "-3", "-4", "-5", "-6"]) {
     const candidate = resolveSecureOutputPath(root, `${preferredName}${suffix}`);
-    if (!existsSync(candidate)) {
+    const zipCandidate = resolveSecureOutputPath(root, `${preferredName}${suffix}.zip`);
+    if (!pathEntryExists(candidate) && !pathEntryExists(zipCandidate)) {
       mkdirSync(candidate, { recursive: true, mode: 0o700 });
       await chmod(candidate, 0o700);
       return candidate;
@@ -1770,7 +1781,7 @@ async function writeSecureJsonFile(rootDir: string, relativePathname: string, va
 
 async function createZipArchive(sourceDir: string, zipPath: string): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(zipPath, { mode: 0o600 });
+    const output = createWriteStream(zipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
     output.on("close", () => resolvePromise());
     output.on("error", rejectPromise);
@@ -2366,10 +2377,16 @@ export function resolvePaloaltoConfiguration(
     throw new Error("Configure Prisma Cloud (PRISMA_API_URL, PRISMA_ACCESS_KEY_ID, PRISMA_SECRET_KEY) and/or PAN-OS (PANOS_HOST plus PANOS_API_KEY or PANOS_USERNAME and PANOS_PASSWORD).");
   }
 
-  const verifyTlsRaw = typeof input.verify_tls === "boolean"
-    ? input.verify_tls
-    : asBoolean(env.PANOS_VERIFY_TLS) ?? asBoolean(configFile.PANOS_VERIFY_TLS);
-  const verifyTls = verifyTlsRaw !== false;
+  // Treat an invalid value at a higher-precedence source as the secure default
+  // instead of falling through to a lower-precedence opt-out. Config files accept
+  // both the environment-style key and the argument-style alias, as pick() does.
+  const configVerifyTls = configFile.PANOS_VERIFY_TLS ?? configFile.verify_tls;
+  const verifyTlsRaw = input.verify_tls !== undefined
+    ? asBoolean(input.verify_tls)
+    : env.PANOS_VERIFY_TLS !== undefined
+      ? asBoolean(env.PANOS_VERIFY_TLS)
+      : asBoolean(configVerifyTls);
+  const verifyTls = verifyTlsRaw ?? true;
   if (!verifyTls) sourceChain.push("tls-verification-disabled");
 
   return {
@@ -5540,6 +5557,11 @@ export async function exportPaloaltoAuditBundle(
   };
 }
 
+function normalizeVerifyTlsArgument(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  return asBoolean(value) ?? true;
+}
+
 function normalizeAuthArgs(args: unknown): AuthArgs {
   const value = asObject(args) ?? {};
   return {
@@ -5551,7 +5573,7 @@ function normalizeAuthArgs(args: unknown): AuthArgs {
     panos_username: asString(value.panos_username),
     panos_password: asString(value.panos_password),
     config_file: asString(value.config_file),
-    verify_tls: typeof value.verify_tls === "boolean" ? value.verify_tls : undefined,
+    verify_tls: normalizeVerifyTlsArgument(value.verify_tls),
     timeout_seconds: asNumber(value.timeout_seconds),
   };
 }

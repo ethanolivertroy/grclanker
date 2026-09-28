@@ -1,5 +1,7 @@
 # Vulnerability Investigation
 
+Subject: $ARGUMENTS
+
 Investigate the cryptographic and vulnerability posture of the specified vendor, product, or module.
 
 ## Phase 1: Cryptographic Module Validation

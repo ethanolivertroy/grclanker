@@ -9,9 +9,9 @@ Run the setup wizard any time you want to configure or reconfigure the companion
 grclanker setup
 ```
 
-On first launch, grclanker will run setup automatically if no model configuration exists yet.
+On first launch, grclanker runs setup automatically if no model configuration exists yet. That needs an interactive terminal; without one, grclanker exits and asks you to run `grclanker setup` first.
 
-Setup now covers three separate decisions:
+Setup covers three separate decisions:
 
 - model/provider selection
 - compute backend selection
@@ -40,7 +40,7 @@ Then run:
 grclanker setup
 ```
 
-Choose `local-first` when prompted.
+Choose `Local-first` when prompted, then confirm or change the local endpoint.
 
 ### What the wizard saves
 
@@ -54,7 +54,7 @@ For the local-first path, grclanker writes:
   - `defaultModel: "gemma4"`
 - `~/.grclanker/agent/models.json` with an Ollama-compatible `openai-completions` provider entry.
 
-Local-first is fail-closed during setup. If the endpoint is unreachable, or if `gemma4` is not installed there, setup stops and tells you exactly what to fix instead of silently falling back to a hosted model.
+Local-first is fail-closed during setup. If the endpoint is unreachable, setup stops and prints the `ollama serve` and `ollama pull` steps instead of silently falling back to a hosted model. If the endpoint answers but the model you picked is not installed there, setup offers one of the installed local models instead (Gemma tags first) or asks you to pull the model or enter another one. It never switches to a hosted provider.
 
 ## Hosted path
 
@@ -64,26 +64,36 @@ If you do not want the local-first path, run:
 grclanker setup
 ```
 
-Choose `hosted` and pick one of the current hosted providers:
+Choose `Hosted` and pick one of the current hosted providers:
 
-- `openai`
-- `anthropic`
-- `google`
+- `openai` (default model `gpt-5.2`)
+- `anthropic` (default model `claude-sonnet-4-20250514`)
+- `google` (default model `gemini-2.5-pro`)
 
-The wizard saves the provider and default model explicitly so the session is not ambiguous. grclanker then uses the provider credentials you already have configured for Pi-compatible usage.
+The wizard saves the provider and default model explicitly so the session is not ambiguous. grclanker then uses the credentials the embedded Pi runtime already knows how to read: the provider's environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`), or a key stored with `/login` inside a grclanker session, which lands in `~/.grclanker/agent/auth.json`.
 
 ## Compute backend selection
 
-The setup wizard also prompts for a preferred compute backend:
+After the model step, the wizard asks whether to configure advanced compute backend settings. Answer no to keep the current backend (`host` on a fresh install). Answer yes to pick a backend from the full list:
 
 - `host`
 - `sandbox-runtime`
 - `docker`
 - `parallels-vm`
+- `modal`
+- `runpod-pod`
+- `runpod-serverless`
+- `cloudflare-sandbox` and `vercel-sandbox` (listed, but not yet available)
 
-That part is separate from local-first versus hosted. You can pair either model path with any supported compute backend.
+Each entry shows whether the backend is detected on this machine. Picking one that is not detected asks before saving it anyway. That part is separate from local-first versus hosted. You can pair either model path with any supported compute backend.
 
-For Parallels specifically, setup now treats the sandbox source as either a dedicated template or a stopped base VM:
+To save a backend without the interactive wizard, pass it directly:
+
+```bash
+grclanker setup --compute docker
+```
+
+For Parallels specifically, setup treats the sandbox source as either a dedicated template or a stopped base VM:
 
 - it lists detected VMs
 - it lists detected templates when they exist
@@ -102,9 +112,11 @@ grclanker env smoke-test
 
 If you need the backend-specific details, use the dedicated [Compute Backends](/docs/getting-started/compute-backends/) guide.
 
+The `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`; its wizard offers `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. A source checkout (`npm --prefix cli ci && npm --prefix cli run build`, then `node cli/bin/grclanker.js setup`) has the full list.
+
 ## Skill visibility
 
-The setup wizard now also asks which skills grclanker should expose by default:
+The setup wizard also asks which skills grclanker should expose by default:
 
 - `Bundled grclanker skills only`
 - `Bundled + project/local Pi skills`
@@ -115,9 +127,10 @@ That mode keeps grclanker focused on its bundled GRC workflows and prevents repo
 
 If you opt into `Bundled + project/local Pi skills`, Pi-style discovery is re-enabled for:
 
-- `.agents/skills/` in the current repo and parent directories
-- `.pi/skills/` in the current repo
-- local Pi skill directories under your home directory
+- `.agents/skills/` in the current directory and its parents, up to the git repository root
+- `.grclanker/skills/` in the current directory
+- `~/.agents/skills/` in your home directory
+- `~/.grclanker/agent/skills/`, where grclanker also keeps its bundled skills
 
 ## Re-running setup
 

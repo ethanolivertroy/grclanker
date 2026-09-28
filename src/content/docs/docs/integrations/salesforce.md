@@ -1,6 +1,6 @@
 ---
 title: Salesforce
-description: Read-only Salesforce security inspector covering Health Check, session and password policy, MFA, permissions, sharing, connected apps, login forensics, audit trail, encryption, and certificates with FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
+description: Read-only Salesforce security inspector covering Health Check, session and password policy, MFA, permissions, sharing, connected apps, and audit trail.
 ---
 
 The Salesforce inspector audits one org through the REST API (SOQL), the Tooling API, and the Metadata API `listMetadata` and `readMetadata` calls. Every tool is read-only: nothing is created, updated, or deleted in the org.
@@ -46,23 +46,30 @@ export SF_CONSUMER_SECRET=...
 
 Other inputs:
 
-- `SF_CREDENTIALS_FILE`: JSON file with `grant_type` (`jwt-bearer`, `password`, or `authorization_code` with a `refresh_token`) plus the matching fields (`instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `refresh_token`, `access_token`, `api_version`)
+- `SF_CREDENTIALS_FILE` (or the `credentials_file` argument; there is no default path): JSON file with `grant_type` (`jwt-bearer`, `password`, `access-token`, or `authorization_code` / `refresh-token` with a `refresh_token`) plus the matching fields (`instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key` or `client_id`, `consumer_secret` or `client_secret`, `private_key_file`, `private_key`, `refresh_token`, `access_token`, `api_version`, `sandbox`); camelCase spellings such as `instanceUrl` and `consumerKey` are also accepted
 - `SF_ACCESS_TOKEN` with `SF_INSTANCE_URL`: reuse a token from `sf org display`
+- `SF_REFRESH_TOKEN` with `SF_CONSUMER_KEY` (plus `SF_CONSUMER_SECRET` unless the connected app skips the secret): refresh token flow
+- `SF_PRIVATE_KEY`: the PEM key inline, in place of `SF_PRIVATE_KEY_FILE`
+- `SF_CLIENT_ID` and `SF_CLIENT_SECRET`: aliases for `SF_CONSUMER_KEY` and `SF_CONSUMER_SECRET`
+- `SF_GRANT_TYPE`: forces a flow; otherwise the first complete set wins, in the order access token, JWT bearer, refresh token, username-password
 - `SF_LOGIN_URL`: explicit login host; otherwise `https://test.salesforce.com` is used when `SF_SANDBOX=true` or the instance URL is a sandbox host, and `https://login.salesforce.com` otherwise
 - `SF_API_VERSION`: defaults to `64.0`
+- `SF_TIMEOUT` (seconds, default 30, clamped to 1-300) and `SF_MAX_RETRIES` (default 3, clamped to 0-8)
 
-Precedence is explicit tool arguments, then environment variables, then the credentials file.
+`SF_SECURITY_TOKEN` is needed for the username-password flow only when the login IP is not trusted. Precedence is explicit tool arguments, then environment variables, then the credentials file.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `salesforce_check_access` | Probes the OAuth session, Organization, limits, Health Check, SecuritySettings, users, profiles, Profile metadata (`listMetadata`), permission sets, `TwoFactorMethodsInfo`, login history, audit trail, connected apps, `OauthToken`, event log files, and the caller's `UserPermissionAccess` flags; lists likely missing permissions, including any caller flag that is false |
+| `salesforce_check_access` | Probes the OAuth session, Organization, limits, Health Check and its per-setting risks, SecuritySettings, users, profiles, Profile metadata (`listMetadata`), permission sets, `TwoFactorMethodsInfo`, login history, audit trail, connected apps, `OauthToken`, event log files, and the caller's `UserPermissionAccess` flags; lists likely missing permissions, including any caller flag that is false |
 | `salesforce_assess_platform_security` | Controls 1, 2, 3, 5, 18, 19, 20 |
 | `salesforce_assess_identity_access` | Controls 4, 6, 7, 9, 10, 13 |
 | `salesforce_assess_data_protection` | Controls 8, 12, 16, 17 |
 | `salesforce_assess_monitoring_integrations` | Controls 11, 14, 15 |
 | `salesforce_export_audit_bundle` | Runs the access check and all four assessments, then writes `core_data/` (projected and redacted snapshots: `SecuritySettings`, `MyDomainSettings`, and `Profile` metadata reduced to the leaves the verdicts read, URL fields reduced to scheme, host, and path; each dataset wrapper carries `status`, `seen`, `total`, and `truncated`, and a dataset that was forbidden, unavailable, errored, or never requested is written as a `{ collected: false, dataset, status, http_status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, per-area results with an `inventories` map naming each dataset as `complete`, `partial (seen of total rows)`, or `unread (status: error)`, `summary.json`), `compliance/` (executive summary, unified matrix, eight framework reports), `QUICK_REFERENCE.md`, `_errors.log` when collection partially failed, and a zip named after the allocated output directory |
+
+All tools accept the connection arguments (`instance_url`, `login_url`, `username`, `password`, `security_token`, `consumer_key`, `consumer_secret`, `private_key_file`, `refresh_token`, `access_token`, `credentials_file`, `api_version`, `sandbox`, `timeout_seconds`, default 30). The assessment and export tools add `record_limit` (default 2000 rows per SOQL dataset); identity access adds `max_admins` (5) and `stale_login_days` (90); data protection adds `certificate_expiry_warning_days` (30); monitoring adds `login_history_days` (30) and `audit_trail_days` (90, both clamped to 1-180). `salesforce_export_audit_bundle` accepts all of these plus `output_dir` (default `./export/salesforce`). The bundle directory is `<org name>-audit-bundle`, lowercased with other characters replaced by `-` (falling back to the org Id or instance host), and a repeat run takes the suffixes `-2` through `-50`, skipping any name whose directory or zip already exists.
 
 ## Verdict semantics
 

@@ -85,11 +85,13 @@ export async function mountMonacoViewer({
   sizeContainer();
   window.addEventListener('resize', sizeContainer);
 
+  const fallbackHadFocus = fallbackPre.contains(document.activeElement);
   skeleton.hidden = true;
   fallbackPre.style.display = 'none';
   container.style.display = 'block';
   editor.setScrollTop(0);
   editor.setPosition({ lineNumber: 1, column: 1 });
+  if (fallbackHadFocus) editor.focus();
 
   return {
     setWrap(enabled: boolean) {

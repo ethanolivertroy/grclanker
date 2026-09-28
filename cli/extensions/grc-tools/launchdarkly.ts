@@ -271,7 +271,7 @@ type IdentityArgs = AuthArgs & {
   team_limit?: number;
   max_owners?: number;
   max_admins?: number;
-  allowed_domains?: string[];
+  allowed_domains?: string;
 };
 
 type AccessControlArgs = AuthArgs & {
@@ -283,7 +283,7 @@ type AccessControlArgs = AuthArgs & {
 type EnvironmentGovernanceArgs = AuthArgs & {
   project_limit?: number;
   environment_limit?: number;
-  project_keys?: string[];
+  project_keys?: string;
   production_pattern?: string;
   test_project_pattern?: string;
   sdk_key_max_age_days?: number;
@@ -292,14 +292,14 @@ type EnvironmentGovernanceArgs = AuthArgs & {
 type FlagHygieneArgs = AuthArgs & {
   project_limit?: number;
   flag_limit?: number;
-  project_keys?: string[];
+  project_keys?: string;
   production_pattern?: string;
   stale_flag_days?: number;
 };
 
 type MonitoringArgs = AuthArgs & {
   retention_days?: number;
-  integration_keys?: string[];
+  integration_keys?: string;
   relay_config_max_age_days?: number;
   production_pattern?: string;
 };
@@ -4899,7 +4899,7 @@ function normalizeIdentityArgs(args: unknown): IdentityArgs {
     team_limit: asNumber(value.team_limit),
     max_owners: asNumber(value.max_owners),
     max_admins: asNumber(value.max_admins),
-    allowed_domains: normalizeStringList(value.allowed_domains),
+    allowed_domains: asString(value.allowed_domains),
   };
 }
 
@@ -4919,7 +4919,7 @@ function normalizeEnvironmentGovernanceArgs(args: unknown): EnvironmentGovernanc
     ...normalizeAuthArgs(args),
     project_limit: asNumber(value.project_limit),
     environment_limit: asNumber(value.environment_limit),
-    project_keys: normalizeStringList(value.project_keys),
+    project_keys: asString(value.project_keys),
     production_pattern: asString(value.production_pattern),
     test_project_pattern: asString(value.test_project_pattern),
     sdk_key_max_age_days: asNumber(value.sdk_key_max_age_days),
@@ -4932,7 +4932,7 @@ function normalizeFlagHygieneArgs(args: unknown): FlagHygieneArgs {
     ...normalizeAuthArgs(args),
     project_limit: asNumber(value.project_limit),
     flag_limit: asNumber(value.flag_limit),
-    project_keys: normalizeStringList(value.project_keys),
+    project_keys: asString(value.project_keys),
     production_pattern: asString(value.production_pattern),
     stale_flag_days: asNumber(value.stale_flag_days),
   };
@@ -4943,7 +4943,7 @@ function normalizeMonitoringArgs(args: unknown): MonitoringArgs {
   return {
     ...normalizeAuthArgs(args),
     retention_days: asNumber(value.retention_days),
-    integration_keys: normalizeStringList(value.integration_keys),
+    integration_keys: asString(value.integration_keys),
     relay_config_max_age_days: asNumber(value.relay_config_max_age_days),
     production_pattern: asString(value.production_pattern),
   };
@@ -4967,20 +4967,20 @@ function toBundleOptions(args: ExportAuditBundleArgs): LaunchdarklyAuditBundleOp
     teamLimit: args.team_limit,
     maxOwners: args.max_owners,
     maxAdmins: args.max_admins,
-    allowedDomains: args.allowed_domains,
+    allowedDomains: normalizeStringList(args.allowed_domains),
     roleLimit: args.role_limit,
     tokenLimit: args.token_limit,
     staleTokenDays: args.stale_token_days,
     projectLimit: args.project_limit,
     environmentLimit: args.environment_limit,
-    projectKeys: args.project_keys,
+    projectKeys: normalizeStringList(args.project_keys),
     productionPattern: args.production_pattern,
     testProjectPattern: args.test_project_pattern,
     sdkKeyMaxAgeDays: args.sdk_key_max_age_days,
     flagLimit: args.flag_limit,
     staleFlagDays: args.stale_flag_days,
     retentionDays: args.retention_days,
-    integrationKeys: args.integration_keys,
+    integrationKeys: normalizeStringList(args.integration_keys),
     relayConfigMaxAgeDays: args.relay_config_max_age_days,
   };
 }
@@ -5047,7 +5047,7 @@ export function registerLaunchdarklyTools(pi: any): void {
           teamLimit: args.team_limit,
           maxOwners: args.max_owners,
           maxAdmins: args.max_admins,
-          allowedDomains: args.allowed_domains,
+          allowedDomains: normalizeStringList(args.allowed_domains),
         });
         return textResult(formatAssessmentText(result), assessmentPayload("launchdarkly_assess_identity", result));
       } catch (error) {
@@ -5108,7 +5108,7 @@ export function registerLaunchdarklyTools(pi: any): void {
         const result = await assessLaunchdarklyEnvironmentGovernance(createClient(args), {
           projectLimit: args.project_limit,
           environmentLimit: args.environment_limit,
-          projectKeys: args.project_keys,
+          projectKeys: normalizeStringList(args.project_keys),
           productionPattern: args.production_pattern,
           testProjectPattern: args.test_project_pattern,
           sdkKeyMaxAgeDays: args.sdk_key_max_age_days,
@@ -5142,7 +5142,7 @@ export function registerLaunchdarklyTools(pi: any): void {
         const result = await assessLaunchdarklyFlagHygiene(createClient(args), {
           projectLimit: args.project_limit,
           flagLimit: args.flag_limit,
-          projectKeys: args.project_keys,
+          projectKeys: normalizeStringList(args.project_keys),
           productionPattern: args.production_pattern,
           staleFlagDays: args.stale_flag_days,
         });
@@ -5173,7 +5173,7 @@ export function registerLaunchdarklyTools(pi: any): void {
       try {
         const result = await assessLaunchdarklyMonitoringIntegrations(createClient(args), {
           retentionDays: args.retention_days,
-          integrationKeys: args.integration_keys,
+          integrationKeys: normalizeStringList(args.integration_keys),
           relayConfigMaxAgeDays: args.relay_config_max_age_days,
           productionPattern: args.production_pattern,
         });

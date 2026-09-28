@@ -26,7 +26,7 @@ The Veracode tools inspect a Veracode Application Security Platform account thro
    - Tool arguments `api_key_id` and `api_key_secret`
    - Environment variables `VERACODE_API_KEY_ID` and `VERACODE_API_KEY_SECRET`
    - `~/.veracode/credentials` INI file with `veracode_api_key_id` and `veracode_api_key_secret` under a profile; `VERACODE_API_PROFILE` or the `profile` argument selects the profile (default `default`), and `credentials_file` or `VERACODE_API_CREDENTIALS_FILE` overrides the path. A missing file is skipped; one that cannot be read stops the tool with `Unable to read Veracode credentials file <path> (<errno code>)`. INI lines without `=` are ignored, and no message ever repeats a line from the file
-4. Pick the region with `region` or `VERACODE_REGION`: `us` (api.veracode.com, default), `eu` (api.veracode.eu), or `us-fed` (api.veracode.us). `base_url` or `VERACODE_API_BASE_URL` overrides the host explicitly.
+4. Pick the region with `region` or `VERACODE_REGION`: `us` (api.veracode.com, default), `eu` (api.veracode.eu), or `us-fed` (api.veracode.us). `base_url` or `VERACODE_API_BASE_URL` overrides the host explicitly. `timeout_seconds` or `VERACODE_TIMEOUT` sets the request timeout in seconds (default 30, clamped to 1 through 300).
 
 Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme: the data string `id=...&host=...&url=<path and query>&method=GET`, a 16-byte random nonce, a millisecond timestamp, the key chain `HMAC(key, nonce) -> HMAC(., timestamp) -> HMAC(., "vcode_request_version_1")`, and a final HMAC over the data string. The key ID and secret are removed from error messages as described under Export bundle and never written into bundles.
 
@@ -40,7 +40,7 @@ Requests are signed per the documented `VERACODE-HMAC-SHA-256` scheme: the data 
 | `veracode_assess_findings_hygiene` | Controls 3, 12, 16, 17 |
 | `veracode_assess_sca_posture` | Controls 5, 6, 18 |
 | `veracode_assess_access_controls` | Controls 7, 8, 9 |
-| `veracode_export_audit_bundle` | Runs everything and writes `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a paired zip |
+| `veracode_export_audit_bundle` | Runs everything into `<API host>-audit-bundle` under `output_dir` (default `./export/veracode`) and writes `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a paired zip |
 
 Every finding is `{ id, title, severity, status, summary, evidence, mappings }` where `status` is `pass`, `warn`, `fail`, or `manual`.
 

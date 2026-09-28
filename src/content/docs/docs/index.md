@@ -3,7 +3,7 @@ title: grclanker Docs
 description: Install grclanker, choose a runtime, and use 241 domain tools with 35 documented GRC integrations.
 ---
 
-`grclanker` is an experimental open source AI GRC companion with 241 domain tools. It ships 35 integrations, each with a repository spec that documents its design and intended behavior. The spec files are separate from the runtime tool registry.
+`grclanker` is an experimental open source AI GRC companion with 241 domain tools. It ships 35 vendor integrations, and every one except Vanta has a repository spec that documents its design and intended behavior. The spec files are separate from the runtime tool registry.
 
 The same workflow prompts, personas, and domain tools can run in three ways:
 
@@ -18,6 +18,8 @@ The same workflow prompts, personas, and domain tools can run in three ways:
 3. Choose local-first or hosted.
 4. Use a workflow, call a native integration tool, or hand the agent a repository spec.
 
+The one-line installer currently ships the `v0.0.1` release bundle, which registers 8 tools (the CMVP and KEV families). The other domain tools, `grclanker tools`, and `grclanker flue run` need a source checkout until the next release.
+
 The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. [Configuration](/docs/getting-started/configuration/) and [Compute Backends](/docs/getting-started/compute-backends/) cover runtime settings and execution environments.
 
 ## Runtime guides
@@ -28,7 +30,7 @@ The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. 
 ## Shipped surface
 
 - 241 domain tools and 7 compute backend tools, grouped in the [tool catalog](/docs/tools/catalog/).
-- 35 integrations, each with a repository spec, covering cloud, identity, collaboration, security, monitoring, vulnerability management, and enterprise platforms.
+- 35 vendor integrations covering cloud, identity, collaboration, security, monitoring, vulnerability management, and enterprise platforms.
 - Four structured workflows: `/investigate`, `/audit`, `/assess`, and `/validate`.
 - Official FedRAMP Consolidated Rules lookups and generated reference docs under [`/docs/fedramp/`](/docs/fedramp/).
 - FedRAMP readiness, artifact planning, ADS bundle generation, and portable trust-center site generation.
@@ -45,6 +47,6 @@ Export behavior differs by integration, including whether repeated runs reuse pa
 
 ## Specs
 
-Each of the 35 integrations has a raw spec that remains useful as a design record and build input. Browse them under [`/specs`](/specs) or read [Using Specs as Inputs](/docs/specs/using-specs-as-inputs/).
+The repository holds 35 raw specs: one for each vendor integration except Vanta, plus one for the compute backends. Each remains useful as a design record and build input. Browse them under [`/specs`](/specs) or read [Using Specs as Inputs](/docs/specs/using-specs-as-inputs/).
 
 `0.0.1` remains experimental. macOS and Linux are the recommended platforms. Windows support is best-effort.

@@ -1,6 +1,6 @@
 ---
-title: Collaborative Continuous Monitoring — FedRAMP Process
-description: Official Consolidated Rules summary for the CCM FedRAMP process, including applicability and requirements.
+title: "Collaborative Continuous Monitoring: FedRAMP Process"
+description: "Official Consolidated Rules summary for the CCM FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,15 +30,15 @@ The Collaborative Continuous Monitoring rules help agencies use shared, current 
 
 ## Rule Subsets
 
-- `AGM` — Agency Guidance: These rules for agencies apply to all agencies using a FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
-- `OCR` — Ongoing Certification Reports: These rules for Ongoing Certification Reports apply to providers with any type of FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
-- `QTR` — Quarterly Reviews: These rules for Quarterly Reviews apply to providers with any type of FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
+- `AGM` · Agency Guidance: These rules for agencies apply to all agencies using a FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
+- `OCR` · Ongoing Certification Reports: These rules for Ongoing Certification Reports apply to providers with any type of FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
+- `QTR` · Quarterly Reviews: These rules for Quarterly Reviews apply to providers with any type of FedRAMP Certification. · types: 20x, Rev5 · classes: B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `CCM-AGM-CSC` SHOULD — Consider Security Category
+### `CCM-AGM-CSC` SHOULD: Consider Security Category
 
 Agencies SHOULD consider the Security Category noted in their Authorization to Operate of the federal information system that includes the cloud service offering in its boundary and assign appropriate information security resources for reviewing Ongoing Certification Reports, attending Quarterly Reviews, and other ongoing FedRAMP Certification Data.
 
@@ -46,9 +46,9 @@ Terms: `Certification Data`, `Cloud Service Offering`, `Ongoing Certification`, 
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-AGM-ROR` MUST — Review Ongoing Reports
+### `CCM-AGM-ROR` MUST: Review Ongoing Reports
 
 Agencies MUST review each Ongoing Certification Report to understand how changes to the cloud service offering may impact the previously agreed-upon risk tolerance documented in the agency's Authorization to Operate of a federal information system that includes the cloud service offering in its boundary.
 
@@ -58,9 +58,9 @@ Affects: Agencies
 
 Note: This is required by 44 USC § 35, OMB A-130, FIPS-200, and M-24-15.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-OCR-AFS` MUST — Anonymized Feedback Summary
+### `CCM-OCR-AFS` MUST: Anonymized Feedback Summary
 
 Providers MUST supply an anonymized and desensitized summary of the feedback, questions, and answers about each Ongoing Certification Report as an addendum to the Ongoing Certification Report OR in the next Ongoing Certification Report.
 
@@ -70,9 +70,9 @@ Affects: Providers
 
 Note: This is intended to encourage sharing of information and decrease the burden on the cloud service provider - providing this summary will reduce duplicate questions from agencies and ensure FedRAMP has access to this information. It is generally in the provider's interest to update this addendum frequently throughout the quarter.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-OCR-AVL` MUST — Report Availability
+### `CCM-OCR-AVL` MUST: Report Availability
 
 Providers MUST supply an Ongoing Certification Report to all necessary parties every 3 months, covering the entire period since the previous summary, in a consistent format that is human readable; this report MUST include high-level summaries of at least the following information (if applicable):
 
@@ -92,9 +92,9 @@ Affects: Providers
 
 Structured timeframe: `3` months
 
-Recent update: 2026-09-13 — Added (if applicable) to clarify that some of these items are not always required depending on the FedRAMP Certification Type or Class.
+Recent update (2026-09-13): Added (if applicable) to clarify that some of these items are not always required depending on the FedRAMP Certification Type or Class.
 
-### `CCM-OCR-FBM` MUST — Feedback Mechanism
+### `CCM-OCR-FBM` MUST: Feedback Mechanism
 
 Providers MUST supply an asynchronous mechanism for all necessary parties to provide feedback or ask questions about each Ongoing Certification Report.
 
@@ -104,9 +104,9 @@ Affects: Providers
 
 Note: This could be email by default but providers are encouraged to consider something more interactive as appropriate.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-OCR-LSI` MUST NOT — Limit Sensitive Information
+### `CCM-OCR-LSI` MUST NOT: Limit Sensitive Information
 
 Providers MUST NOT irresponsibly disclose sensitive information in an Ongoing Certification Report that would likely have an adverse effect on the cloud service offering.
 
@@ -114,9 +114,9 @@ Terms: `Cloud Service Offering`, `FedRAMP Certification Report`, `Likely`, `Ongo
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-OCR-NRD` MUST — Next Report Date
+### `CCM-OCR-NRD` MUST: Next Report Date
 
 Providers MUST supply the target date for their next Ongoing Certification Report with other public FedRAMP Certification Data.
 
@@ -124,9 +124,9 @@ Terms: `Certification Data`, `FedRAMP Certification Report`, `Ongoing Certificat
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-OCR-RPS` MAY — Responsible Public Certification Report Sharing
+### `CCM-OCR-RPS` MAY: Responsible Public Certification Report Sharing
 
 Providers MAY responsibly supply some or all of the information an Ongoing Certification Report to the public or other parties if the provider determines doing so will NOT likely have an adverse effect on the cloud service offering.
 
@@ -134,9 +134,9 @@ Terms: `Cloud Service Offering`, `FedRAMP Certification Report`, `Likely`, `Ongo
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-OCR-SOR` SHOULD — Spread Out Reports
+### `CCM-OCR-SOR` SHOULD: Spread Out Reports
 
 Providers SHOULD establish a regular 3 month cycle for Ongoing Certification Reports that is spread out from the beginning, middle, or end of each quarter.
 
@@ -146,9 +146,9 @@ Affects: Providers
 
 Note: This recommendation is intended to discourage hundreds of cloud service providers from releasing their Ongoing Certification Reports during the first or last week of each quarter because that is the easiest way for a single provider to track this deliverable; the result would overwhelm agencies with many cloud services. Widely used cloud service providers are encouraged to work with their customers to identify ideal timeframes for this cycle.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-ACT` SHOULD — Additional Content
+### `CCM-QTR-ACT` SHOULD: Additional Content
 
 Providers SHOULD supply additional information in Quarterly Reviews that the provider determines is of interest, use, or otherwise relevant to agencies.
 
@@ -156,9 +156,9 @@ Terms: `Quarterly Review`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-MTG` VARIES BY CLASS — Quarterly Review Meeting
+### `CCM-QTR-MTG` VARIES BY CLASS: Quarterly Review Meeting
 
 Varies by certification class:
 
@@ -173,9 +173,9 @@ Affects: Providers
 
 Structured timeframe: `3` months
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-NID` MUST NOT — No Irresponsible Disclosure
+### `CCM-QTR-NID` MUST NOT: No Irresponsible Disclosure
 
 Providers MUST NOT irresponsibly disclose sensitive information in a Quarterly Review that would likely have an adverse effect on the cloud service offering.
 
@@ -183,9 +183,9 @@ Terms: `Cloud Service Offering`, `Likely`, `Quarterly Review`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-NRD` MUST — Next Review Date
+### `CCM-QTR-NRD` MUST: Next Review Date
 
 Providers MUST publicly supply the target date for their next Quarterly Review with other public FedRAMP Certification Data.
 
@@ -193,9 +193,9 @@ Terms: `Certification Data`, `Quarterly Review`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-REG` MUST — Meeting Registration Info
+### `CCM-QTR-REG` MUST: Meeting Registration Info
 
 Providers MUST supply either a registration link or a downloadable calendar file with meeting information for Quarterly Reviews to all necessary parties.
 
@@ -203,9 +203,9 @@ Terms: `All Necessary Parties`, `Quarterly Review`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-RTP` SHOULD NOT — Restrict Third Parties
+### `CCM-QTR-RTP` SHOULD NOT: Restrict Third Parties
 
 Providers SHOULD NOT invite third parties to attend Quarterly Reviews intended for agencies unless they have specific relevance.
 
@@ -215,9 +215,9 @@ Affects: Providers
 
 Note: This is because agencies are less likely to actively participate in meetings with third parties; the cloud service provider's independent assessor should be considered relevant by default.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-RTR` SHOULD — Record/Transcribe Reviews
+### `CCM-QTR-RTR` SHOULD: Record/Transcribe Reviews
 
 Providers SHOULD record or transcribe Quarterly Reviews and supply them to all necessary parties.
 
@@ -225,9 +225,9 @@ Terms: `All Necessary Parties`, `Quarterly Review`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-SAR` SHOULD — Schedule Around Reports
+### `CCM-QTR-SAR` SHOULD: Schedule Around Reports
 
 Providers SHOULD regularly schedule Quarterly Reviews to occur at least 3 business days after releasing an Ongoing Certification Report AND within 10 business days of such release.
 
@@ -235,9 +235,9 @@ Terms: `FedRAMP Certification Report`, `Ongoing Certification`, `Ongoing Certifi
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-SCR` MAY — Share Content Responsibly
+### `CCM-QTR-SCR` MAY: Share Content Responsibly
 
 Providers MAY responsibly supply content prepared for a Quarterly Review to the public or other parties if the provider determines doing so will NOT likely have an adverse effect on the cloud service offering.
 
@@ -245,9 +245,9 @@ Terms: `Cloud Service Offering`, `Likely`, `Quarterly Review`, `Responsibly`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CCM-QTR-SRR` MAY — Share Recordings Responsibly
+### `CCM-QTR-SRR` MAY: Share Recordings Responsibly
 
 Providers MAY responsibly supply recordings or transcriptions of Quarterly Reviews to the public or other parties ONLY if the provider removes all agency information (comments, questions, names, etc.) AND determines doing so will NOT likely have an adverse effect on the cloud service offering.
 
@@ -255,4 +255,4 @@ Terms: `Cloud Service Offering`, `Likely`, `Quarterly Review`, `Responsibly`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

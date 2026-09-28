@@ -13,6 +13,7 @@ import {
   checkContract,
   collectDefinedGrcTools,
   evaluateCheckVerdict,
+  evaluateCompletenessSource,
 } from "../dist/extensions/grc-tools/spec-model.js";
 import { AZURE_RUNTIME_BEHAVIOR, AZURE_SPEC } from "../dist/extensions/grc-tools/azure.spec.js";
 import { resolveAzureConfiguration } from "../dist/extensions/grc-tools/azure.js";
@@ -126,18 +127,29 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
           assert.ok(entry.sourceSurfaceIds.includes(source.surfaceId), `${entry.id}.${inputName}: ${source.surfaceId}`);
           assert.equal(new Set(source.falseWhen).size, source.falseWhen.length);
           assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected", "missing-required-field"].includes(mode)));
+          if (source.aggregate) {
+            assert.equal(source.aggregate.kind, "attempted-child-reads");
+            assert.ok(entry.sourceSurfaceIds.includes(source.aggregate.parentSurfaceId));
+            assert.ok(source.aggregate.attemptedUnit.length >= 40);
+            assert.deepEqual(source.aggregate.mixedFailureModes, ["error", "denied"]);
+            assert.equal(source.aggregate.mixedFailureEffect, "false");
+            assert.equal(source.aggregate.allAttemptsFailedEffect, "unchanged");
+            assert.equal(source.aggregate.zeroAttemptsEffect, "unchanged");
+            assert.equal(source.aggregate.allAttemptsFailedReadability, "false");
+          }
         }
         const rendered = entry.evidenceFieldDefinitions[inputName];
         assert.match(rendered, new RegExp(`For ${entry.id},`));
         assert.match(rendered, /Exact source-state effects:/);
         assert.match(rendered, new RegExp(contract.semantics.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
         assert.doesNotMatch(rendered, /all check-specific pages|check-specific source and precedence semantics|capForUnreadableAll|currently designated|preserved current behavior/);
+        assert.doesNotMatch(rendered, /\.;/, `${entry.id}.${inputName}: scoped source entries use clean semicolon punctuation`);
       }
     }
   }
   assert.equal(checksWithCompleteness, 156);
   assert.equal(completenessFields, 156);
-  assert.equal(sourceEntries, 315);
+  assert.equal(sourceEntries, 316);
 
   assert.deepEqual(check(AZURE_SPEC, "AZURE-MON-06").completeness.complete.sources, [
     { surfaceId: "diagnostic-settings", falseWhen: [] },
@@ -146,6 +158,11 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   assert.deepEqual(check(AZURE_SPEC, "AZURE-DP-01").completeness.complete.sources.map((source) => source.surfaceId), [
     "compliance-policies", "managed-devices", "conditional-access",
   ]);
+  assert.deepEqual(check(OCI_SPEC, "OCI-LOG-02").completeness.evidence_complete.sources, [
+    { surfaceId: "cloud-guard-configuration", falseWhen: [] },
+    { surfaceId: "cloud-guard-targets", falseWhen: [] },
+    { surfaceId: "cloud-guard-problems", falseWhen: [] },
+  ]);
   assert.deepEqual(check(CLOUDFLARE_SPEC, "CF-IAM-02").completeness.evidence_complete.sources, [
     { surfaceId: "token-verification", falseWhen: [] },
     { surfaceId: "current-token-detail", falseWhen: [] },
@@ -153,6 +170,61 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   assert.deepEqual(check(GCP_SPEC, "GCP-IAM-02").completeness.evidence_complete.sources[0].falseWhen, [
     "truncated", "error", "denied", "not-collected",
   ]);
+  const keySource = check(GCP_SPEC, "GCP-IAM-02").completeness.evidence_complete.sources
+    .find((source) => source.surfaceId === "service-account-keys");
+  assert.ok(keySource);
+  assert.match(keySource.scope, /project-scoped child aggregate/i);
+  assert.match(keySource.scope, /without a nonempty email.*no key-list request/i);
+  assert.match(keySource.aggregate.attemptedUnit, /with a nonempty email/);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 2,
+    successfulCount: 1,
+    failedCount: 1,
+    failureModes: ["denied"],
+    truncated: false,
+  }), false);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 2,
+    successfulCount: 0,
+    failedCount: 2,
+    failureModes: ["denied"],
+    truncated: false,
+  }), true);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 0,
+    successfulCount: 0,
+    failedCount: 0,
+    failureModes: [],
+    truncated: false,
+  }), true);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 1,
+    successfulCount: 1,
+    failedCount: 0,
+    failureModes: [],
+    truncated: true,
+  }), false);
+  assert.match(
+    check(GCP_SPEC, "GCP-ORG-06").completeness.evidence_complete.sources
+      .find((source) => source.surfaceId === "effective-org-policy").scope,
+    /constraints\/compute\.requireOsLogin/,
+  );
+  const keyRotation = check(GCP_SPEC, "GCP-IAM-02");
+  assert.match(keyRotation.evidenceFieldDefinitions.evidence_readable, /successful empty service-account response sets this false/);
+  assert.equal(evaluateCheckVerdict(keyRotation, {
+    evidence_readable: false,
+    evidence_complete: true,
+    inventory_count: 0,
+    violation_count: 0,
+    review_count: 0,
+  }), "manual");
+  assert.equal(evaluateCheckVerdict(keyRotation, {
+    evidence_readable: true,
+    evidence_complete: true,
+    inventory_count: 0,
+    violation_count: 0,
+    review_count: 0,
+  }), "pass", "a listed service account with a complete empty key inventory remains compliant");
   assert.equal(check(OCI_SPEC, "OCI-IAM-01").completeness, undefined);
   assert.deepEqual(check(PALOALTO_SPEC, "PA-21").completeness.evidence_complete.sources.map((source) => source.surfaceId), [
     "prisma-policies", "panos-system-info", "panos-policy-config",
@@ -160,6 +232,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   assert.match(check(PALOALTO_SPEC, "PA-19").completeness.evidence_complete.semantics, /unconfigured product is omitted/);
   assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /zia-ssl-inspection-rules: truncation leaves evidence_complete true/);
   assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /zia-security-allowlist: truncation leaves evidence_complete true; an error, 403 denial, or not-collected read makes evidence_complete false/);
+  assert.match(check(ZSCALER_SPEC, "ZS-07").criteria.pass, /Remain manual when the administrator or role inventory is empty/);
 });
 
 test("batch 2 threshold metadata is exhaustive and renders immutable defaults", () => {

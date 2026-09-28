@@ -1,6 +1,6 @@
 ---
 title: KnowBe4
-description: Read-only inspection of KnowBe4 KMSAT phishing simulations, training campaigns, user risk, and account governance through the Reporting API, with optional PhishER GraphQL enrichment.
+description: Read-only KnowBe4 KMSAT inspector covering phishing simulations, training campaigns, user risk, and account governance, with optional PhishER enrichment.
 ---
 
 The KnowBe4 integration audits a KnowBe4 Security Awareness Training (KMSAT) account against the twenty controls in `specs/knowbe4-sec-inspector.spec.md`. It reads phishing security tests and recipients, training campaigns and enrollments, users, groups, and account settings through the KnowBe4 Reporting API, and optionally reads PhishER messages through the PhishER GraphQL API. Every tool is read-only; nothing in this integration creates, changes, or deletes KnowBe4 data.
@@ -60,10 +60,10 @@ curl -s -X POST 'https://training.knowbe4.com/graphql?scope=phisher' \
 | Tool | Purpose | Notable parameters |
 | --- | --- | --- |
 | `knowbe4_check_access` | Probes `/v1/account`, users, groups, phishing campaigns, security tests, training campaigns, enrollments, store purchases, and policies, plus PhishER when a key is configured. Reports `healthy` or `limited`. | auth parameters only |
-| `knowbe4_assess_phishing_program` | Controls 1, 2, 6, 7, 9, 19, 20. | `lookback_days` (90), `max_campaign_gap_days` (30), `min_coverage_pct` (90), `max_phish_prone_pct` (15), `min_report_rate_pct` (50), `max_schedule_gap_days` (45), `require_full_targeting` (true), `security_test_sample_limit` (12), `phisher_message_limit` (1000) |
-| `knowbe4_assess_training_program` | Controls 3, 4, 10, 11, 17. | `training_lookback_days` (365), `min_completion_pct` (90), `fail_completion_pct` (80), `enrollment_grace_days` (30), `remedial_window_days` (14), `max_content_age_days` (365), `required_compliance_topics`, `enrollment_limit` (20000) |
-| `knowbe4_assess_user_risk` | Controls 5, 8, 18. | `max_mean_risk_score` (50), `max_risk_score_stddev` (25), `inactive_days` (180), `lookback_days` (90), `user_limit` (5000) |
-| `knowbe4_assess_account_governance` | Controls 12, 13, 14, 15, 16. | `max_admin_count` (3), `require_usb_tests` (true), `require_vishing_tests` (true), `lookback_days` (90) |
+| `knowbe4_assess_phishing_program` | Controls 1, 2, 6, 7, 9, 19, 20. | `lookback_days` (90), `user_limit` (5000), `max_campaign_gap_days` (30), `min_coverage_pct` (90), `max_phish_prone_pct` (15), `min_report_rate_pct` (50), `max_schedule_gap_days` (45), `require_full_targeting` (true), `security_test_sample_limit` (12), `phisher_message_limit` (1000) |
+| `knowbe4_assess_training_program` | Controls 3, 4, 10, 11, 17. | `training_lookback_days` (365), `min_completion_pct` (90), `fail_completion_pct` (80), `enrollment_grace_days` (30), `remedial_window_days` (14), `max_content_age_days` (365), `required_compliance_topics`, `enrollment_limit` (20000), `lookback_days` (90), `user_limit` (5000), `security_test_sample_limit` (12) |
+| `knowbe4_assess_user_risk` | Controls 5, 8, 18. | `max_mean_risk_score` (50), `max_risk_score_stddev` (25), `inactive_days` (180), `lookback_days` (90), `user_limit` (5000), `enrollment_limit` (20000), `security_test_sample_limit` (12) |
+| `knowbe4_assess_account_governance` | Controls 12, 13, 14, 15, 16. | `max_admin_count` (3), `require_usb_tests` (true), `require_vishing_tests` (true), `lookback_days` (90), `user_limit` (5000) |
 | `knowbe4_export_audit_bundle` | Runs every assessment and writes an evidence bundle plus a `.zip`. | all of the above plus `output_dir` (default `./export/knowbe4`) |
 
 Every assessment returns findings shaped as `{ id, control, title, severity, status, summary, evidence, mappings, manualEvidence }` with severity `critical`, `high`, `medium`, `low`, or `info` and status `pass`, `warn`, `fail`, or `manual`. Finding ids are `KNOWBE4-01` through `KNOWBE4-20` and match the spec control numbers.

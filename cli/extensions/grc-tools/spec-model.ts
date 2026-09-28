@@ -172,6 +172,27 @@ export type CompletenessFailureMode =
 export interface CompletenessSourceContract {
   surfaceId: string;
   falseWhen: readonly CompletenessFailureMode[];
+  scope?: string;
+  aggregate?: CompletenessAggregateContract;
+}
+
+export interface CompletenessAggregateContract {
+  kind: "attempted-child-reads";
+  parentSurfaceId: string;
+  attemptedUnit: string;
+  mixedFailureModes: readonly CompletenessFailureMode[];
+  mixedFailureEffect: "false";
+  allAttemptsFailedEffect: "unchanged";
+  zeroAttemptsEffect: "unchanged";
+  allAttemptsFailedReadability: "false";
+}
+
+export interface CompletenessSourceObservation {
+  attemptedCount: number;
+  successfulCount: number;
+  failedCount: number;
+  failureModes: readonly CompletenessFailureMode[];
+  truncated: boolean;
 }
 
 export interface CompletenessContract {
@@ -323,6 +344,28 @@ export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFact
     facts[name] = evaluateVerdictCondition(derivation.condition, facts);
   }
   return evaluateVerdictCriteria(check.criteria, facts);
+}
+
+export function evaluateCompletenessSource(
+  source: CompletenessSourceContract,
+  observation: CompletenessSourceObservation,
+): boolean {
+  const counts = [observation.attemptedCount, observation.successfulCount, observation.failedCount];
+  if (counts.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new Error(`${source.surfaceId} completeness observation counts must be non-negative safe integers`);
+  }
+  if (observation.successfulCount + observation.failedCount !== observation.attemptedCount) {
+    throw new Error(`${source.surfaceId} completeness observation successes and failures must equal attempts`);
+  }
+  const modes = new Set(observation.failureModes);
+  if (observation.truncated) modes.add("truncated");
+  if (source.falseWhen.some((mode) => modes.has(mode))) return false;
+  if (!source.aggregate) return true;
+  return !(
+    observation.successfulCount > 0
+    && observation.failedCount > 0
+    && source.aggregate.mixedFailureModes.some((mode) => modes.has(mode))
+  );
 }
 
 function pathValue(root: unknown, path: string, item: unknown): unknown {

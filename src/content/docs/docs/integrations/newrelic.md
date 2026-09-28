@@ -1,6 +1,6 @@
 ---
 title: New Relic
-description: Read-only New Relic organization security inspection covering identity, API keys, access grants, alerting, and data governance, mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
+description: Read-only New Relic security inspector covering identity, API keys, access grants, alerting, and data governance, mapped to eight frameworks including FedRAMP.
 ---
 
 The New Relic integration implements the [New Relic Security Inspector spec](https://github.com/ethanolivertroy/grclanker/blob/main/specs/newrelic-sec-inspector.spec.md) as native grclanker tools. It reads organization, user, role, API key, alerting, and data governance configuration through NerdGraph (GraphQL) and the REST API v2, evaluates the 20 numbered controls from the spec, and emits normalized findings that carry the spec's compliance mappings. Every tool is read-only: no mutation is ever sent to New Relic.
@@ -84,7 +84,7 @@ Spec controls 11, 12, 13, 14, 15, 16. Extra arguments: `entity_limit`, `min_rete
 
 ### `newrelic_export_audit_bundle`
 
-Runs all four assessments and writes an evidence bundle under `output_dir` (default `./export/newrelic`). The bundle directory is named `newrelic-<account ids>-audit-bundle` (suffixed `-2` through `-6` on repeat runs, skipping any name whose directory or zip already exists), the zip takes the same name as the directory, and the directory contains:
+Runs all four assessments and writes an evidence bundle under `output_dir` (default `./export/newrelic`). The bundle directory is named `newrelic-<account ids>-audit-bundle`, with the account ids joined by `-` (or `newrelic-<region>-audit-bundle`, such as `newrelic-us-audit-bundle`, when no account resolved). Repeat runs take the suffixes `-2` through `-6`, skipping any name whose directory or zip already exists; the zip takes the same name as the directory, and the directory contains:
 
 - `metadata.json`: region, endpoint, accounts, audit window, and configuration source chain.
 - `core_data/*.json`: NerdGraph and REST records projected to the fields each query selects (accounts, organization, authentication domains, users, group role grants, roles, API keys, audit events, alert policies and conditions, destinations, channels, workflows, alertable entities, workloads, retention rules and namespaces, obfuscation rules and expressions, pipeline cloud rules, drop rules, dashboards, live URL metadata, synthetic monitors, secure credentials, script scan results, log scan counts, infrastructure host and agent version rows). A file whose query failed, was never issued, or lost a scope is written as `{ status, records }` (the readable rows for a partial listing, `null` when nothing was read) rather than as an empty list. See "Bundle secret hygiene" below for what is deliberately not stored.

@@ -1,8 +1,10 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { runComputeDoctor } from "./pi/doctor.js";
-import { extractComputeFlag, runComputeExec, runComputeList, runComputeSmokeTest } from "./pi/env.js";
+import { runComputeExec, runComputeList, runComputeSmokeTest } from "./pi/env.js";
+import { CLI_HELP } from "./pi/cli-help.js";
 import { launchCli, runCliSetup } from "./pi/launch.js";
+import { routeCliInvocation } from "./pi/cli-routing.js";
 import { GrclankerUserError } from "./pi/setup.js";
 import type { ComputeBackendKind } from "./pi/compute.js";
 import {
@@ -29,49 +31,22 @@ function resolveAppRoot(currentDir: string): string {
 
 const appRoot = resolveAppRoot(import.meta.dirname);
 
-const commands: Record<string, (compute?: ComputeBackendKind) => Promise<void>> = {
+const commands: Record<string, (compute?: ComputeBackendKind, prompt?: string) => Promise<void>> = {
   setup: (compute) => runCliSetup(appRoot, compute),
-  investigate: (compute) => launchCli(appRoot, "investigate", compute),
-  audit: (compute) => launchCli(appRoot, "audit", compute),
-  assess: (compute) => launchCli(appRoot, "assess", compute),
-  validate: (compute) => launchCli(appRoot, "validate", compute),
+  investigate: (compute, prompt) => launchCli(appRoot, "investigate", compute, prompt),
+  audit: (compute, prompt) => launchCli(appRoot, "audit", compute, prompt),
+  assess: (compute, prompt) => launchCli(appRoot, "assess", compute, prompt),
+  validate: (compute, prompt) => launchCli(appRoot, "validate", compute, prompt),
 };
 
 function printHelp() {
-  console.log(`
-grclanker
-
-Usage:
-  grclanker                     Interactive GRC CLI
-  grclanker setup               Configure local-first or hosted model access
-  grclanker setup --compute <k> Save <kind> as the preferred compute backend
-  grclanker env list            List every compute backend, bucket, and readiness
-  grclanker env doctor          Check compute backend availability
-  grclanker env smoke-test      Validate the selected backend end-to-end
-  grclanker env exec -- <cmd>   Run a shell command on the selected backend
-  grclanker tools               List bundled GRC and compute tools
-  grclanker flue run -m <text>  Run the same GRC agent under the Flue Framework runtime
-  grclanker investigate         Trace crypto status, KEVs, and exploitability
-  grclanker audit               Map evidence against a requested framework
-  ... --compute <kind>          Run investigate/audit on a specific backend
-  grclanker assess              Produce a posture readout and remediation order
-  grclanker validate            Answer a narrow FIPS validation question
-
-Install:
-  curl -fsSL https://grclanker.com/install | bash
-  powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
-
-Recommended next step after install:
-  grclanker setup
-
-Options:
-  --help, -h                    Show this help
-`);
+  console.log(CLI_HELP);
 }
 
 async function main() {
-  const command = process.argv[2];
-  const subcommand = process.argv[3];
+  const args = process.argv.slice(2);
+  const command = args[0];
+  const subcommand = args[1];
 
   if (command === "--help" || command === "-h") {
     printHelp();
@@ -84,33 +59,33 @@ async function main() {
   }
 
   if (command === "env" && subcommand === "list") {
-    await runComputeList(process.argv.slice(4));
+    await runComputeList(args.slice(2));
     return;
   }
 
   if (command === "env" && subcommand === "smoke-test") {
-    await runComputeSmokeTest(process.argv.slice(4));
+    await runComputeSmokeTest(args.slice(2));
     return;
   }
 
   if (command === "env" && subcommand === "exec") {
-    await runComputeExec(process.argv.slice(4));
+    await runComputeExec(args.slice(2));
     return;
   }
 
   if (command === "flue") {
     // Loaded lazily so the Pi-based CLI path never pays for the Flue runtime.
     const { runFlueCommand } = await import("./flue/cli.js");
-    const exitCode = await runFlueCommand(process.argv.slice(3));
+    const exitCode = await runFlueCommand(args.slice(1));
     if (exitCode !== 0) process.exit(exitCode);
     return;
   }
 
   if (command === "tools") {
     const tools = getRegisteredToolSummaries();
-    const args = process.argv.slice(3);
-    const asJson = args.includes("--json");
-    const toolName = args.find((arg) => arg !== "--json");
+    const toolArgs = args.slice(1);
+    const asJson = toolArgs.includes("--json");
+    const toolName = toolArgs.find((arg) => arg !== "--json");
 
     if (toolName) {
       const tool = findRegisteredTool(tools, toolName);
@@ -128,15 +103,19 @@ async function main() {
     return;
   }
 
-  const handler = command ? commands[command] : undefined;
-  if (command && !handler) {
-    console.error(`Unknown command: ${command}`);
+  const invocation = routeCliInvocation(args, Object.keys(commands));
+  if (invocation.kind === "unknown-option" || invocation.kind === "unknown-command") {
+    console.error(`Unknown command: ${invocation.command}`);
     console.error("Run 'grclanker --help' for usage.");
     process.exit(1);
   }
 
-  const { compute } = extractComputeFlag(process.argv.slice(3));
-  await (handler ?? ((kind?: ComputeBackendKind) => launchCli(appRoot, undefined, kind)))(compute);
+  if (invocation.kind === "command") {
+    await commands[invocation.command]!(invocation.compute, invocation.prompt);
+    return;
+  }
+
+  await launchCli(appRoot, undefined, invocation.compute, invocation.prompt);
 }
 
 main().catch((error) => {

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { syncBundledAssets } from "../bootstrap/sync.js";
 import {
   ensureGrclankerHome,
@@ -16,7 +16,9 @@ import {
   resolveSkillDiscoveryMode,
 } from "./settings.js";
 import { resolveComputeBackend, type ComputeBackendKind } from "./compute.js";
+import { serializeInitialPrompt, type InitialPromptPayload } from "./prompt-envelope.js";
 import { ensureCliConfigured, runComputeSetup, runSetupWizard } from "./setup.js";
+import { readWorkflowPrompt } from "./workflow-prompt.js";
 
 function resolveExtensionEntrypoint(appRoot: string): string {
   const compiledPath = resolve(appRoot, "dist", "extensions", "grc-tools.js");
@@ -55,7 +57,7 @@ export function buildCliLaunchArgs(
   appRoot: string,
   agentDir: string,
   settings: GrclankerSettings,
-  workflow?: string,
+  initialPrompt?: InitialPromptPayload,
 ): string[] {
   const args: string[] = [];
   if (
@@ -73,13 +75,8 @@ export function buildCliLaunchArgs(
   args.push("--prompt-template", resolve(appRoot, "prompts"));
   args.push("--system-prompt", readFileSync(resolve(appRoot, ".grclanker", "SYSTEM.md"), "utf8"));
 
-  if (workflow) {
-    const promptPath = join(appRoot, "prompts", `${workflow}.md`);
-    if (!existsSync(promptPath)) {
-      console.error(`Workflow prompt not found: ${promptPath}`);
-      process.exit(1);
-    }
-    args.push(readFileSync(promptPath, "utf8"));
+  if (initialPrompt) {
+    args.push(serializeInitialPrompt(initialPrompt));
   }
 
   return args;
@@ -89,6 +86,7 @@ export async function launchCli(
   appRoot: string,
   workflow?: string,
   compute?: ComputeBackendKind,
+  prompt?: string,
 ): Promise<void> {
   const workingDir = process.cwd();
   const { agentDir, settingsPath } = prepareCliRuntime(appRoot);
@@ -97,7 +95,12 @@ export async function launchCli(
     process.env[COMPUTE_BACKEND_OVERRIDE_ENV] = compute;
   }
   const settings = applyComputeBackendOverride(readGrclankerSettings(settingsPath), compute);
-  const args = buildCliLaunchArgs(appRoot, agentDir, settings, workflow);
+  const initialPrompt = workflow
+    ? { kind: "workflow" as const, content: readWorkflowPrompt(appRoot, workflow, prompt) }
+    : prompt
+      ? { kind: "prompt" as const, content: prompt }
+      : undefined;
+  const args = buildCliLaunchArgs(appRoot, agentDir, settings, initialPrompt);
 
   process.env.GRCLANKER_CODING_AGENT_DIR = agentDir;
   process.env.GRCLANKER_COMPUTE_BACKEND = resolveComputeBackend(settings);

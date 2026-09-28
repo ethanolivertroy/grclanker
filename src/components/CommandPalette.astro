@@ -12,13 +12,24 @@
         placeholder="Search the site..."
         autocomplete="off"
         spellcheck="false"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded="false"
+        aria-controls="search-results"
         aria-label="Search the site"
       />
       <button id="search-close" type="button" class="overlay-close" aria-label="Close search">
         Close
       </button>
     </div>
-    <ul id="search-results" class="max-h-72 overflow-y-auto py-1" aria-live="polite" aria-label="Search results"></ul>
+    <ul id="search-results" class="max-h-72 overflow-y-auto py-1" role="listbox" aria-label="Search results"></ul>
+    <div id="search-empty" class="py-1" hidden>
+      <div class="px-4 py-6 text-center">
+        <img src="/empty-state.webp" alt="" class="w-24 h-24 mx-auto mb-3 rounded-lg object-cover" loading="lazy" />
+        <span class="text-subtext0 text-sm block">No pages found</span>
+      </div>
+    </div>
+    <div id="search-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
     <div class="px-3 py-2 border-t border-surface0 flex items-center gap-4 text-xs text-subtext0">
       <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
       <span><kbd>Enter</kbd> open</span>
@@ -28,6 +39,6 @@
 </div>
 
 <!-- Toast for copy feedback -->
-<div id="copy-toast" class="toast">URL copied to clipboard</div>
+<div id="copy-toast" class="toast" role="status" aria-live="polite"></div>
 
 <!-- JS is in Base.astro to ensure execution in dev mode -->

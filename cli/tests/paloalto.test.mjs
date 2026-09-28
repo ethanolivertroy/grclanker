@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createServer } from "node:http";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 
 import {
   PaloaltoApiError,
@@ -568,6 +569,75 @@ test("resolvePaloaltoConfiguration prefers args over env over config file and su
   assert.equal(fromArgs.timeoutMs, 5000);
   assert.equal(fromArgs.verifyTls, true);
   assert.ok(fromArgs.sourceChain.includes("arguments-prisma-access-key"));
+});
+
+test("resolvePaloaltoConfiguration honors config-file TLS settings with secure precedence and defaults", () => {
+  const base = createTempBase("grclanker-paloalto-tls-config-");
+  const configFile = join(base, "paloalto.json");
+  const resolveWith = (fileSetting, envSetting, argSetting) => {
+    writeFileSync(configFile, JSON.stringify({
+      PANOS_HOST: "fw.example.com",
+      PANOS_API_KEY: "key",
+      ...fileSetting,
+    }));
+    return resolvePaloaltoConfiguration(
+      argSetting === undefined ? { config_file: configFile } : { config_file: configFile, verify_tls: argSetting },
+      envSetting === undefined ? {} : { PANOS_VERIFY_TLS: envSetting },
+    ).verifyTls;
+  };
+
+  assert.equal(resolveWith({ verify_tls: false }), false, "argument-style config key accepts a JSON boolean");
+  assert.equal(resolveWith({ verify_tls: true }), true, "argument-style config key enables verification");
+  assert.equal(resolveWith({ PANOS_VERIFY_TLS: "off" }), false, "environment-style config key accepts documented false aliases");
+  assert.equal(resolveWith({ PANOS_VERIFY_TLS: "yes" }), true, "environment-style config key accepts documented true aliases");
+
+  assert.equal(resolveWith({ verify_tls: false }, "true"), true, "environment overrides config");
+  assert.equal(resolveWith({ verify_tls: true }, "false"), false, "environment can explicitly opt out over config");
+  assert.equal(resolveWith({ verify_tls: true }, "true", false), false, "argument overrides environment and config");
+  assert.equal(resolveWith({ verify_tls: false }, "false", true), true, "argument can restore verification");
+
+  assert.equal(resolveWith({ verify_tls: "invalid" }), true, "invalid config values fail closed");
+  assert.equal(resolveWith({ verify_tls: false }, "invalid"), true, "invalid environment values do not expose a config opt-out");
+  assert.equal(resolveWith({ verify_tls: false }, "false", "invalid"), true, "invalid argument values do not expose lower-precedence opt-outs");
+  assert.equal(resolveWith({}), true, "the default keeps TLS verification enabled");
+});
+
+test("every Palo Alto tool prepares, validates, and resolves TLS arguments without insecure fallback", () => {
+  const configFile = join(createTempBase("grclanker-paloalto-tls-tool-"), "paloalto.json");
+  writeFileSync(configFile, JSON.stringify({
+    PANOS_HOST: "fw.example.com",
+    PANOS_API_KEY: "key",
+    verify_tls: false,
+  }));
+  const tools = new Map();
+  registerPaloaltoTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const cases = [
+    { value: true, expected: true, label: "boolean true" },
+    { value: "true", expected: true, label: "string true" },
+    { value: "enabled", expected: true, label: "recognized true alias" },
+    { value: "invalid", expected: true, label: "invalid string fails closed" },
+    { value: false, expected: false, label: "boolean false" },
+    { value: "false", expected: false, label: "string false" },
+  ];
+
+  for (const tool of tools.values()) {
+    for (const entry of cases) {
+      const prepared = tool.prepareArguments({ config_file: configFile, verify_tls: entry.value });
+      assert.equal(typeof prepared.verify_tls, "boolean", `${tool.name}: ${entry.label} prepares a schema-shaped boolean`);
+      const validated = validateToolArguments(tool, {
+        type: "toolCall",
+        id: `tls-${tool.name}`,
+        name: tool.name,
+        arguments: prepared,
+      });
+      assert.equal(validated.verify_tls, entry.expected, `${tool.name}: ${entry.label} survives validation`);
+      assert.equal(
+        resolvePaloaltoConfiguration(validated, {}).verifyTls,
+        entry.expected,
+        `${tool.name}: ${entry.label} has argument precedence over config false`,
+      );
+    }
+  }
 });
 
 test("resolvePaloaltoConfiguration allows a single product and rejects incomplete credentials", () => {
@@ -1271,6 +1341,36 @@ test("exportPaloaltoAuditBundle writes core_data, analysis, compliance reports, 
   assert.equal(basename(clean.zipPath), `${basename(clean.outputDir)}.zip`);
   assert.notEqual(clean.zipPath, result.zipPath);
   assert.ok(existsSync(result.zipPath) && existsSync(clean.zipPath));
+});
+
+test("exportPaloaltoAuditBundle preserves an orphaned zip and allocates a distinct rerun path", async () => {
+  const base = createTempBase("grclanker-paloalto-orphaned-zip-");
+  const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch());
+  const first = await exportPaloaltoAuditBundle(clients, base);
+  const originalZip = readFileSync(first.zipPath);
+
+  rmSync(first.outputDir, { recursive: true });
+  const rerun = await exportPaloaltoAuditBundle(clients, base);
+
+  assert.deepEqual(readFileSync(first.zipPath), originalZip, "the retained archive must not be overwritten");
+  assert.notEqual(rerun.outputDir, first.outputDir);
+  assert.notEqual(rerun.zipPath, first.zipPath);
+  assert.equal(basename(rerun.zipPath), `${basename(rerun.outputDir)}.zip`);
+});
+
+test("exportPaloaltoAuditBundle treats a dangling zip symlink as an occupied bundle name", async () => {
+  const base = createTempBase("grclanker-paloalto-dangling-zip-");
+  const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch());
+  const first = await exportPaloaltoAuditBundle(clients, base);
+
+  rmSync(first.outputDir, { recursive: true });
+  rmSync(first.zipPath);
+  symlinkSync(join(base, "missing-archive-target.zip"), first.zipPath);
+  const rerun = await exportPaloaltoAuditBundle(clients, base);
+
+  assert.notEqual(rerun.outputDir, first.outputDir);
+  assert.notEqual(rerun.zipPath, first.zipPath);
+  assert.equal(basename(rerun.zipPath), `${basename(rerun.outputDir)}.zip`);
 });
 
 test("redactXmlCredentials collapses credential-bearing PAN-OS nodes and leaves settings and the source tree intact", () => {

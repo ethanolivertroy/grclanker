@@ -1,6 +1,6 @@
 ---
-title: Secure Configuration Guide — FedRAMP Process
-description: Official Consolidated Rules summary for the SCG FedRAMP process, including applicability and requirements.
+title: "Secure Configuration Guide: FedRAMP Process"
+description: "Official Consolidated Rules summary for the SCG FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,14 +30,14 @@ The Secure Configuration Guide rules help agencies and other customers understan
 
 ## Rule Subsets
 
-- `CSO` — General Provider Responsibilities: These rules apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
-- `ENH` — Enhanced Capabilities: These recommendations apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
+- `CSO` · General Provider Responsibilities: These rules apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
+- `ENH` · Enhanced Capabilities: These recommendations apply to providers with FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `SCG-CSO-AUP` MUST — Use Instructions
+### `SCG-CSO-AUP` MUST: Use Instructions
 
 Providers MUST include instructions in the FedRAMP Certification Package that explain how to obtain and use the Secure Configuration Guide.
 
@@ -47,17 +47,17 @@ Affects: Providers
 
 Note: These instructions may appear in a variety of ways; it is up to the provider to do so in the most appropriate and effective ways for their specific customer needs.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-CSO-PUB` SHOULD — Public Secure Configuration Guidance
+### `SCG-CSO-PUB` SHOULD: Public Secure Configuration Guidance
 
 Providers SHOULD make the Secure Configuration Guide available publicly.
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-CSO-RSC` MUST — Recommended Secure Configuration
+### `SCG-CSO-RSC` MUST: Recommended Secure Configuration
 
 Providers MUST create, maintain, and make available recommendations for securely configuring their cloud services (the Secure Configuration Guide) that includes at least the following information:
 
@@ -73,9 +73,9 @@ Affects: Providers
 Note: These rules refer to this guidance as a Secure Configuration Guide but cloud service providers may make this guidance available in various appropriate forms that provide the best customer experience.
 This guidance should explain how top-level administrative accounts and privileged accounts are named and referred to in the cloud service offering.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-CSO-SDF` SHOULD — Secure Defaults
+### `SCG-CSO-SDF` SHOULD: Secure Defaults
 
 Providers SHOULD set all settings to their recommended secure defaults for top-level administrative accounts and privileged accounts when initially provisioned.
 
@@ -83,17 +83,17 @@ Terms: `Privileged Account`, `Top-Level Administrative Account`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-ENH-API` SHOULD — API Capability
+### `SCG-ENH-API` SHOULD: API Capability
 
 Providers SHOULD offer the capability to view and adjust security settings via an API or similar capability.
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-ENH-CMP` SHOULD — Comparison Capability
+### `SCG-ENH-CMP` SHOULD: Comparison Capability
 
 Providers SHOULD offer the capability to compare all current settings for top-level administrative accounts and privileged accounts to the recommended secure defaults.
 
@@ -101,9 +101,9 @@ Terms: `Privileged Account`, `Top-Level Administrative Account`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-ENH-EXP` SHOULD — Export Capability
+### `SCG-ENH-EXP` SHOULD: Export Capability
 
 Providers SHOULD offer the capability to export all security settings in a machine-readable format.
 
@@ -111,9 +111,9 @@ Terms: `Machine-Readable`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-ENH-MRG` SHOULD — Machine-Readable Guidance
+### `SCG-ENH-MRG` SHOULD: Machine-Readable Guidance
 
 Providers SHOULD also provide the Secure Configuration Guide in a machine-readable format that can be used by customers or third-party tools to compare against current settings.
 
@@ -121,9 +121,9 @@ Terms: `Machine-Readable`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SCG-ENH-VRH` SHOULD — Versioning and Release History
+### `SCG-ENH-VRH` SHOULD: Versioning and Release History
 
 Providers SHOULD provide versioning and a release history for recommended secure default settings for top-level administrative accounts and privileged accounts as they are adjusted over time.
 
@@ -131,4 +131,4 @@ Terms: `Privileged Account`, `Top-Level Administrative Account`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

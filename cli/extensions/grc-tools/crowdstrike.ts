@@ -1329,6 +1329,23 @@ function parseJsonBody(rawText: string): JsonRecord | undefined {
   }
 }
 
+/**
+ * Successful Falcon REST responses are JSON objects. Keep malformed body contents out of errors:
+ * only their documented shape, content type, and byte length are safe to retain.
+ */
+function describeMalformedSuccessBody(response: Response, rawText: string): string {
+  if (rawText.trim().length === 0) return "empty body";
+  try {
+    const parsed = JSON.parse(rawText);
+    if (Array.isArray(parsed)) return "JSON array";
+    if (parsed === null) return "JSON null";
+    return `JSON ${typeof parsed}`;
+  } catch {
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "unknown content type";
+    return `non-JSON body (${contentType}, ${Buffer.byteLength(rawText, "utf8")} bytes)`;
+  }
+}
+
 function pageOf<T>(items: T[], total: number | undefined, moreAvailable: boolean): CrowdstrikePage<T> {
   const truncated = moreAvailable || (total !== undefined && items.length < total);
   return { items, total, truncated };
@@ -1500,16 +1517,39 @@ export class CrowdstrikeApiClient {
           path,
         );
       }
-      return payload ?? {};
+      if (!payload) {
+        throw new Error(
+          this.redact(
+            `CrowdStrike response for ${path} (${response.status}) was malformed: expected a JSON object, received ${describeMalformedSuccessBody(response, rawText)}.`,
+          ),
+        );
+      }
+      return payload;
     }
   }
 
+  /**
+   * Falcon's generated OpenAPI models for query, entity, and combined list responses require a
+   * top-level resources array. In particular, msa.QueryResponse and each exclusions response model
+   * use this envelope, including for a valid empty inventory.
+   */
+  private requireResourcesEnvelope(path: string, payload: JsonRecord): JsonRecord {
+    if (!Array.isArray(payload.resources)) {
+      throw new Error(
+        this.redact(
+          `CrowdStrike response for ${path} was malformed: expected a Falcon response envelope with a resources array.`,
+        ),
+      );
+    }
+    return payload;
+  }
+
   async getJson(path: string, query: JsonRecord = {}): Promise<JsonRecord> {
-    return this.request("GET", path, { query });
+    return this.requireResourcesEnvelope(path, await this.request("GET", path, { query }));
   }
 
   async postJson(path: string, body: unknown, query: JsonRecord = {}): Promise<JsonRecord> {
-    return this.request("POST", path, { query, body });
+    return this.requireResourcesEnvelope(path, await this.request("POST", path, { query, body }));
   }
 
   async getResources(path: string, query: JsonRecord = {}): Promise<unknown[]> {

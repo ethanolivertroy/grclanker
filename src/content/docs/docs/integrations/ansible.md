@@ -124,8 +124,8 @@ The script exits 0 with a skip message when `AAP_URL` plus credentials are absen
 
 ## Official documentation
 
-- [Automation Controller API Guide](https://docs.ansible.com/automation-controller/latest/html/controllerapi/index.html)
-- [Automation Controller API Reference](https://docs.ansible.com/automation-controller/latest/html/controllerapi/api_ref.html)
-- [Automation Controller User Guide](https://docs.ansible.com/automation-controller/latest/html/userguide/index.html)
+- [Automation execution API overview (AAP 2.5)](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html/automation_execution_api_overview/index)
+- [AWX API Reference](https://docs.ansible.com/projects/awx/en/latest/rest_api/index.html)
+- [Using automation execution (AAP 2.5)](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.5/html/using_automation_execution/index)
 - [Red Hat Ansible Automation Platform documentation](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/)
 - [AWX API serializers](https://github.com/ansible/awx/blob/devel/awx/api/serializers.py) (the upstream source of every field name used by these tools)

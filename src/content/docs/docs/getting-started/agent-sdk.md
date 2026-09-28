@@ -3,7 +3,7 @@ title: Cursor Agent SDK
 description: Run all 241 grclanker domain tools as a Cursor Agent SDK agent built on @cursor/july.
 ---
 
-grclanker ships a Cursor Agent SDK project next to the Pi terminal CLI. It is built on [`@cursor/july`](https://www.npmjs.com/package/@cursor/july), the early-alpha package behind the `agent-sdk` CLI. It lives in `cli/agent-sdk/` and adapts the bundled 241-tool domain registry instead of duplicating it. Separately, each of the 35 integrations has a repository spec under `/specs`; those files document the integrations and are not runtime registry entries.
+grclanker ships a Cursor Agent SDK project next to the Pi terminal CLI. It is built on [`@cursor/july`](https://www.npmjs.com/package/@cursor/july), the early-alpha package behind the `agent-sdk` CLI. It lives in `cli/agent-sdk/` and adapts the bundled 241-tool domain registry instead of duplicating it.
 
 ## What the agent exposes
 
@@ -33,10 +33,10 @@ The Agent SDK project runs from a source checkout. `@cursor/july` is a devDepend
 npm --prefix cli install
 npm --prefix cli run agent-sdk:validate
 npm --prefix cli run agent-sdk:info
-npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2024-3094"}'
+npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
 ```
 
-`validate`, `info`, and `call` need no Cursor credential. `call` runs a server tool deterministically with no model turn, which is the fastest way to confirm a tool works before blaming a prompt.
+`validate`, `info`, and `call` need no Cursor credential. `call` runs a server tool deterministically with no model turn, which is the fastest way to confirm a tool works before blaming a prompt. The `kevs_search` call above needs network access to the CISA KEV feed and prints a JSON envelope with `"ok": true` and the matching Log4j entries. Every `agent-sdk` command also prints an "outdated" warning because `@cursor/july` is pinned (see [Limitations](#limitations)); that warning is expected.
 
 Model turns need a Cursor credential. Sign in once with `npx agent-sdk login` inside `cli/`, or export `CURSOR_API_KEY`, then serve the agent with the playground:
 
@@ -68,7 +68,7 @@ npm --prefix cli run sync:agent-sdk-tools
 
 ## Limitations
 
-- Source checkout only: the published `@grclanker/cli` package and the release bundles do not include the Agent SDK project or `@cursor/july`.
-- `@cursor/july` is early alpha and pinned to an exact version in `cli/package.json`; expect to bump it deliberately.
+- Source checkout only: the release bundles do not include the Agent SDK project or `@cursor/july`, and `@grclanker/cli` is not published to npm.
+- `@cursor/july` is early alpha and pinned to an exact version (`0.2.1`) in `cli/package.json`; expect to bump it deliberately.
 - Turns run on the local Cursor harness (`runtime: "local"`). The cloud runtime is not configured because in-process server tools only run on local turns.
 - Node 22.19 or newer, the CLI package's `engines` floor, and never Bun. `@cursor/july` itself accepts 22.13, but the grclanker tools it loads require 22.19.

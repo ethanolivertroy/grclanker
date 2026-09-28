@@ -23,8 +23,8 @@ Account settings are collected once per run from `GET /accounts/{accountId}/sett
 | Source | Keys |
 |--------|------|
 | Tool arguments | `account_id`, `client_id`, `client_secret` (or `token`), `base_url`, `oauth_base_url`, `timeout_seconds`, `config_file` |
-| Environment | `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` (or `ZOOM_TOKEN`), `ZOOM_BASE_URL`, `ZOOM_OAUTH_BASE_URL`, `ZOOM_TIMEOUT`, `ZOOM_CONFIG_FILE` |
-| Config file | `ZOOM_CONFIG_FILE` or `config_file`, then `./.zoom.json`, `./.grclanker-zoom.json`, `~/.zoom.json`, `~/.grclanker-zoom.json`, `~/.config/grclanker/zoom.json` |
+| Environment | `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET` (or `ZOOM_TOKEN` / `ZOOM_ACCESS_TOKEN`), `ZOOM_BASE_URL` (or `ZOOM_API_BASE_URL`), `ZOOM_OAUTH_BASE_URL`, `ZOOM_TIMEOUT`, `ZOOM_CONFIG_FILE` |
+| Config file | `ZOOM_CONFIG_FILE` or `config_file` (must exist when named), then `./.zoom.json`, `./.grclanker-zoom.json`, `~/.zoom.json`, `~/.grclanker-zoom.json`, `~/.config/grclanker/zoom.json`. Keys: `account_id`, `client_id`, `client_secret` (or `token` / `access_token`), `base_url`, `oauth_base_url` (the camelCase `accountId`, `clientId`, `clientSecret`, `baseUrl`, and `oauthBaseUrl` also work). The timeout is read only from `timeout_seconds` or `ZOOM_TIMEOUT`. |
 
 Config file example (`~/.zoom.json`):
 
@@ -99,7 +99,7 @@ Status semantics for every finding: `pass` means the documented setting is compl
 | 21 | Meeting password locked at account level | meeting_security | ZOOM-MTG-01 | `lock_settings.schedule_meeting.require_password_for_scheduling_new_meetings` true |
 | 22 | Embed password in join link disabled | meeting_security | ZOOM-MTG-06 | `meeting_security.embed_password_in_join_link` false (settings `option=meeting_security`) and the `meeting_security.embed_password_in_join_link` lock true; the settings response documents the key only under `meeting_security` |
 | 23 | Only authenticated users can join | meeting_security | ZOOM-MTG-08 | `meeting_authentication` true (option view) and locked |
-| 24 | Admin operation log retention verified | collaboration_governance | ZOOM-COLLAB-05 | entries with a parseable `time` inside the `operation_log_days` window; undated entries cap at warn |
+| 24 | Admin operation log retention verified | collaboration_governance | ZOOM-COLLAB-05 | entries with a parseable `time` inside the fixed 30-day window; undated entries cap at warn |
 | 25 | PMI usage restricted | meeting_security | ZOOM-MTG-07 | `schedule_meeting.personal_meeting` false, or `use_pmi_for_scheduled_meetings` and `use_pmi_for_instant_meetings` false and locked |
 
 Coverage: 25 of 25 spec controls have a finding; 23 are automatable and 2 (controls 8 and 13) are manual by design with the reference page proving the absence cited in the finding summary.

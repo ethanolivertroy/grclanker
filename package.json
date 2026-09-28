@@ -2,16 +2,26 @@
   "name": "grclanker",
   "type": "module",
   "version": "0.0.1",
+  "license": "Apache-2.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build",
+    "build": "astro build && node scripts/check-links.mjs",
+    "check:links": "node scripts/check-links.mjs",
+    "test:links": "node --test scripts/check-links.test.mjs",
     "preview": "npm run build && wrangler dev",
     "sync:fedramp": "npm --prefix cli run sync:fedramp",
     "sync:tool-catalog": "npm --prefix cli run sync:tool-catalog",
     "generate-types": "wrangler types",
+    "check": "astro check",
+    "prebuild": "npm run check",
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
+    "@astrojs/sitemap": "^3.7.4",
     "@monaco-editor/loader": "^1.7.0",
     "@tailwindcss/vite": "^4.3.1",
     "astro": "^7.2.8",
@@ -22,6 +32,9 @@
     "vite": "8.1.0"
   },
   "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "@types/node": "^22.20.4",
+    "typescript": "^6.0.3",
     "wrangler": "^4.135.0"
   }
 }

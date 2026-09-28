@@ -52,12 +52,12 @@ function sourceBanner(
 }
 
 function frontmatter(title: string, description: string): string {
-  return `---\ntitle: ${title}\ndescription: ${description}\n---`;
+  return `---\ntitle: ${JSON.stringify(title)}\ndescription: ${JSON.stringify(description)}\n---`;
 }
 
 function requirementBadge(requirement: FedrampRequirementRecord): string {
   const keyword = requirement.primaryKeyWord ? ` ${requirement.primaryKeyWord}` : "";
-  const name = requirement.name ? ` — ${requirement.name}` : "";
+  const name = requirement.name ? `: ${requirement.name}` : "";
   const fka = requirement.fka ? ` (formerly \`${requirement.fka}\`)` : "";
   return `### \`${requirement.id}\`${fka}${keyword}${name}`;
 }
@@ -101,7 +101,7 @@ function requirementMarkdown(requirement: FedrampRequirementRecord): string {
   if (requirement.updated.length > 0) {
     lines.push(
       "",
-      `Recent update: ${requirement.updated[0]!.date} — ${requirement.updated[0]!.comment}`,
+      `Recent update (${requirement.updated[0]!.date}): ${requirement.updated[0]!.comment}`,
     );
   }
 
@@ -123,7 +123,7 @@ function processPage(
   const counts = requirementCountsByApplicability(catalog, process.id);
   const lines = [
     frontmatter(
-      `${process.name} — FedRAMP Process`,
+      `${process.name}: FedRAMP Process`,
       `Official Consolidated Rules summary for the ${process.shortName} FedRAMP process, including applicability and requirements.`,
     ),
     "",
@@ -167,7 +167,7 @@ function processPage(
     for (const label of process.labels) {
       const types = label.types.length > 0 ? ` · types: ${label.types.join(", ")}` : "";
       const classes = label.classes.length > 0 ? ` · classes: ${label.classes.join(", ")}` : "";
-      lines.push(`- \`${label.code}\` — ${label.name}: ${label.description}${types}${classes}`);
+      lines.push(`- \`${label.code}\` · ${label.name}: ${label.description}${types}${classes}`);
     }
     lines.push("");
   }
@@ -178,7 +178,7 @@ function processPage(
       const reference = authority.referenceUrl
         ? `[${authority.reference ?? authority.referenceUrl}](${authority.referenceUrl})`
         : authority.reference ?? "Authority";
-      const suffix = authority.description ? ` — ${authority.description}` : "";
+      const suffix = authority.description ? `: ${authority.description}` : "";
       lines.push(`- ${reference}${suffix}`);
     }
     lines.push("");
@@ -209,7 +209,7 @@ function ksiDomainPage(
   const indicators = domainIndicators(catalog, domain.id);
   const lines = [
     frontmatter(
-      `${domain.name} — FedRAMP KSI Domain`,
+      `${domain.name}: FedRAMP KSI Domain`,
       `Official Consolidated Rules summary for the ${domain.shortName} FedRAMP key security indicator domain.`,
     ),
     "",
@@ -229,7 +229,7 @@ function ksiDomainPage(
 
   for (const indicator of indicators) {
     const former = indicator.fka ? ` (formerly \`${indicator.fka}\`)` : "";
-    lines.push(`### \`${indicator.id}\`${former} — ${indicator.name}`, "");
+    lines.push(`### \`${indicator.id}\`${former}: ${indicator.name}`, "");
     if (indicator.classVariants.length > 0) {
       lines.push("Varies by certification class:", "");
       for (const variant of indicator.classVariants) {
@@ -252,7 +252,7 @@ function ksiDomainPage(
     }
     if (indicator.updated.length > 0) {
       lines.push(
-        `Recent update: ${indicator.updated[0]!.date} — ${indicator.updated[0]!.comment}`,
+        `Recent update (${indicator.updated[0]!.date}): ${indicator.updated[0]!.comment}`,
         "",
       );
     }
@@ -275,13 +275,13 @@ export function buildFedrampDocsSnapshot(
   const processRows = catalog.processes
     .map((process) => {
       const counts = requirementCountsByApplicability(catalog, process.id);
-      return `- [${process.name}](/docs/fedramp/processes/${process.webName}/) — \`${process.shortName}\` · applies to ${process.applicability.map((value) => `\`${value}\``).join(", ")} · requirements: \`both ${counts.both}\`, \`20x ${counts["20x"]}\`, \`rev5 ${counts.rev5}\``;
+      return `- [${process.name}](/docs/fedramp/processes/${process.webName}/) · \`${process.shortName}\` · applies to ${process.applicability.map((value) => `\`${value}\``).join(", ")} · requirements: \`both ${counts.both}\`, \`20x ${counts["20x"]}\`, \`rev5 ${counts.rev5}\``;
     })
     .join("\n");
   const ksiRows = catalog.ksiDomains
     .map((domain) => {
       const indicatorCount = domainIndicators(catalog, domain.id).length;
-      return `- [${domain.name}](/docs/fedramp/ksi/${domain.webName}/) — \`${domain.shortName}\` · ${indicatorCount} indicator${indicatorCount === 1 ? "" : "s"}`;
+      return `- [${domain.name}](/docs/fedramp/ksi/${domain.webName}/) · \`${domain.shortName}\` · ${indicatorCount} indicator${indicatorCount === 1 ? "" : "s"}`;
     })
     .join("\n");
 

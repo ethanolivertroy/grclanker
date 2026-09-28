@@ -1,6 +1,6 @@
 ---
 title: Sumo Logic
-description: Read-only Sumo Logic organization security inspector covering SSO, MFA, RBAC, access keys, audit index, retention, collectors, content sharing, and alert routing.
+description: Read-only Sumo Logic security inspector covering SSO, MFA, RBAC, access keys, audit index, retention, collectors, content sharing, and alert routing.
 ---
 
 The Sumo Logic tools inspect an organization's Management API configuration and map the results to the 20 controls in `specs/sumologic-sec-inspector.spec.md`. Every tool is read-only: no PUT, POST, or DELETE requests are ever issued.
@@ -24,7 +24,7 @@ export SUMOLOGIC_ACCESS_KEY="..."
 export SUMOLOGIC_ENDPOINT="us2"   # deployment code or full API URL
 ```
 
-Configuration precedence is explicit tool arguments, then environment variables (`SUMOLOGIC_ACCESS_ID`, `SUMOLOGIC_ACCESS_KEY`, `SUMOLOGIC_ENDPOINT` or `SUMOLOGIC_DEPLOYMENT`, `SUMOLOGIC_TIMEOUT`), then a YAML config file at `SUMOLOGIC_CONFIG_FILE` or `~/.sumologic-sec-inspector/config.yaml` with `access_id`, `access_key`, and `endpoint` keys. A missing config file is skipped. One that cannot be read stops the tool with `Unable to read Sumo Logic config file <path> (<errno code>)`, and one that cannot be parsed stops it with `Unable to parse Sumo Logic config file: invalid YAML in <path> at line N, column M (<code>)`, where the code is the yaml package's own (`DUPLICATE_KEY`, `MISSING_CHAR`, `BAD_INDENT`, and so on) or `INVALID_YAML` when the parser threw something else, such as the unresolved alias `key: *value`; the position is omitted when the parser reports none. The message never repeats a line, key, or value from the file.
+Configuration precedence is explicit tool arguments, then environment variables (`SUMOLOGIC_ACCESS_ID`, `SUMOLOGIC_ACCESS_KEY`, `SUMOLOGIC_ENDPOINT` or `SUMOLOGIC_DEPLOYMENT`, `SUMOLOGIC_TIMEOUT`), then a YAML config file at `SUMOLOGIC_CONFIG_FILE` or `~/.sumologic-sec-inspector/config.yaml` with `access_id`, `access_key`, and `endpoint` keys. The endpoint defaults to `us1` when none of these set it. A missing config file is skipped. One that cannot be read stops the tool with `Unable to read Sumo Logic config file <path> (<errno code>)`, and one that cannot be parsed stops it with `Unable to parse Sumo Logic config file: invalid YAML in <path> at line N, column M (<code>)`, where the code is the yaml package's own (`DUPLICATE_KEY`, `MISSING_CHAR`, `BAD_INDENT`, and so on) or `INVALID_YAML` when the parser threw something else, such as the unresolved alias `key: *value`; the position is omitted when the parser reports none. The message never repeats a line, key, or value from the file.
 
 Requests use HTTP Basic authentication (`Authorization: Basic base64(accessId:accessKey)`). The client follows `token` continuation cursors on paginated endpoints (page size 1000 where the OpenAPI allows it, 100 for `/v2/dashboards` whose `limit` maximum is 100); the `next` value is sent back only as the `token` query value of the same path on the configured base URL and is never requested as a URL, so a URL-shaped cursor cannot send the Basic credential to another origin. The client uses `limit`/`offset` for the Collector Management and monitor search APIs, retries 429 and 5xx responses with backoff (honoring `Retry-After` when present), enforces a request timeout, and scrubs error messages as described under Export bundle.
 
@@ -56,7 +56,7 @@ A full URL such as `https://api.eu.sumologic.com` is normalized to end in `/api`
 | `sumologic_assess_access_control` | Controls 6, 7, 8, 13, 14: RBAC, key rotation, inactive keys, service allowlist, session timeout. |
 | `sumologic_assess_data_governance` | Controls 9, 10, 12, 16, 17: audit index, data forwarding, collectors, ingest budgets, retention. |
 | `sumologic_assess_content_sharing` | Controls 11, 15, 18, 19, 20: content sharing, scheduled search permissions, lookup tables, dashboard sharing, alert routing. |
-| `sumologic_export_audit_bundle` | Run everything and write `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` (on partial collection), and a zip. |
+| `sumologic_export_audit_bundle` | Run everything into `<deployment or API host>-sumologic-audit-bundle` under `output_dir` (default `./export/sumologic`) and write `core_data/`, `analysis/`, `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` (on partial collection), and a zip. |
 
 Every run allocates a fresh output directory and a zip with the same base name, so re-running never overwrites a prior bundle.
 

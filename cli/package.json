@@ -3,10 +3,10 @@
   "version": "0.0.1",
   "type": "module",
   "description": "Experimental local-first GRC CLI for CMVP, KEV, EPSS, and framework-mapped posture work",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hackIDLE/grclanker.git"
+    "url": "git+https://github.com/ethanolivertroy/grclanker.git"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -81,9 +81,11 @@
     "extensions",
     "flue",
     "prompts",
-    "scripts",
+    "scripts/patch-embedded-pi.mjs",
     "skills",
-    ".grclanker"
+    ".grclanker",
+    "LICENSE",
+    "NOTICE"
   ],
   "pi": {
     "extensions": [
@@ -135,7 +137,7 @@
     "@modelcontextprotocol/sdk": "1.30.1",
     "basic-ftp": "6.0.1",
     "js-yaml": "4.3.2",
-    "protobufjs": "7.6.4",
+    "protobufjs": "7.6.6",
     "undici": "7.29.0"
   }
 }

@@ -451,6 +451,16 @@ test("resolveSalesforceConfiguration selects JWT bearer, sandbox flag, access to
   assert.throws(() => resolveSalesforceConfiguration({}, { SF_ACCESS_TOKEN: "x" }), /requires SF_ACCESS_TOKEN and SF_INSTANCE_URL/);
 });
 
+test("Salesforce auth tool schema exposes optional inline PEM private key input", () => {
+  const registered = [];
+  registerSalesforceTools({ registerTool: (tool) => registered.push(tool) });
+
+  const checkAccess = registered.find((tool) => tool.name === "salesforce_check_access");
+  assert.ok(checkAccess, "salesforce_check_access is registered");
+  assert.ok(checkAccess.parameters.properties.private_key, "the registered auth schema exposes private_key");
+  assert.ok(!checkAccess.parameters.required?.includes("private_key"), "private_key is optional");
+});
+
 test("buildJwtAssertion signs RS256 claims for the login host and exchanges them for a session", async () => {
   const config = sampleConfig({
     authMode: "jwt-bearer",

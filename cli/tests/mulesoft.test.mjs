@@ -26,6 +26,7 @@ import {
   defaultCertificateProbe,
   exportMulesoftAuditBundle,
   getMulesoftControlCatalog,
+  mulesoftAssessmentToolDetails,
   parseSimpleToml,
   redactSecretText,
   redactSnapshot,
@@ -811,7 +812,7 @@ test("checkMulesoftAccess reports a healthy organization when every surface is r
   assert.equal(result.organizationId, ORG_ID);
   assert.equal(result.controlPlane, "us");
   assert.equal(result.authMode, "token");
-  assert.ok(result.surfaces.length >= 18);
+  assert.equal(result.surfaces.length, 20);
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
   assert.deepEqual(result.missingPermissions, []);
   assert.ok(result.notes.some((note) => note.includes("alice")));
@@ -819,6 +820,56 @@ test("checkMulesoftAccess reports a healthy organization when every surface is r
   assert.match(result.recommendedNextStep, /mulesoft_assess_identity_access/);
   for (const name of ["organization", "identity_providers", "members", "role_groups", "environments", "api_manager_apis", "exchange_assets", "cloudhub_applications", "vpcs", "load_balancers", "audit_query", "mq_regions", "secret_groups"]) {
     assert.ok(result.surfaces.some((surface) => surface.name === name), `expected surface ${name}`);
+  }
+});
+
+test("checkMulesoftAccess maps every access surface to externally documented connected-app scope guidance", async () => {
+  const result = await checkMulesoftAccess(healthyBundleClient());
+
+  // The live discovery document is authoritative for scope IDs. Public product docs verify the
+  // display names used below. IDs without a publicly documented display-name mapping stay as IDs.
+  // https://anypoint.mulesoft.com/accounts/api/v2/oauth2/.well-known/openid-configuration
+  // https://docs.mulesoft.com/anypoint-cli/latest/auth
+  // https://docs.mulesoft.com/access-management/creating-connected-apps-dev
+  // https://docs.mulesoft.com/access-management/permissions-by-product
+  // https://docs.mulesoft.com/mq/mq-connected-apps
+  // https://docs.mulesoft.com/anypoint-security/asm-permission-concept
+  const expectedPermissionsBySurface = {
+    current_user: "Connected Apps: profile (implicit for client_credentials)",
+    organization: "Access Management: View Organization (`read:organization`)",
+    identity_providers: "Access Management connected-app scope `view:identityproviders`",
+    members: "Access Management connected-app scope `read:orgusers`",
+    mfa_exempt_users: "Access Management connected-app scope `read:orgusers`",
+    role_groups: "Connected Apps: Read-only full access (`read:full`; no narrower public role-group scope is documented)",
+    environments: "Access Management: View Environment (`read:orgenvironments`; `view:environment`)",
+    connected_applications: "Access Management connected-app scope `read:orgconnapps`",
+    organization_hierarchy: "Access Management: View Organization (`read:organization`)",
+    api_manager_apis: "API Manager: View APIs Configuration (`read:api_configuration`)",
+    exchange_assets: "Exchange: Exchange Viewer (`read:exchange`)",
+    cloudhub_applications: "Runtime Manager: Read Applications (`read:applications`)",
+    cloudhub_alerts: "Runtime Manager: Read Alerts (`read:application_alerts`)",
+    vpcs: "Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`)",
+    load_balancers: "Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`)",
+    hybrid_servers: "Runtime Manager: Read Servers (`read:servers`)",
+    audit_platforms: "Access Management: Audit Log Viewer (`read:audit_logs`)",
+    audit_query: "Access Management: Audit Log Viewer (`read:audit_logs`)",
+    mq_regions: "Anypoint MQ: View destinations (`view:destinations`)",
+    secret_groups: "Secrets Manager: Read secrets metadata (`read:secrets_metadata`)",
+  };
+  assert.deepEqual(
+    Object.fromEntries(result.surfaces.map((surface) => [surface.name, surface.permission])),
+    expectedPermissionsBySurface,
+  );
+
+  const invalidPermissionHints = [
+    "CloudHub Network: CloudHub Network Viewer",
+    "Audit Log: Audit Log Viewer",
+    "Anypoint MQ: MQ Viewer",
+    "Secrets Manager: Read Secret Groups",
+  ];
+  const accessOutput = JSON.stringify(result);
+  for (const invalidPermissionHint of invalidPermissionHints) {
+    assert.ok(!accessOutput.includes(invalidPermissionHint), `invalid permission hint returned: ${invalidPermissionHint}`);
   }
 });
 
@@ -849,8 +900,8 @@ test("checkMulesoftAccess reports limited access and missing permissions when su
   assert.ok(result.surfaces.some((surface) => surface.name === "cloudhub_applications" && surface.status === "skipped"));
   assert.ok(result.missingPermissions.some((permission) => /Audit Log Viewer/.test(permission)));
   assert.ok(result.missingPermissions.some((permission) => /CloudHub Network Viewer/.test(permission)));
-  assert.ok(result.missingPermissions.some((permission) => /View Connected Applications/.test(permission)));
-  assert.match(result.recommendedNextStep, /Grant the connected app or user these read permissions/);
+  assert.ok(result.missingPermissions.some((permission) => /`read:orgconnapps`/.test(permission)));
+  assert.match(result.recommendedNextStep, /Add these documented connected-app scopes or permissions/);
   assert.ok(result.notes.some((note) => note.includes("No environment was readable")));
 });
 
@@ -4076,4 +4127,165 @@ test("reviewer B round 4 verdict N3: MULESOFT-IAM-01 is manual, not fail, on an 
   const disabledFinding = findingById(disabled, "MULESOFT-IAM-01");
   assert.equal(disabledFinding.status, "fail", disabledFinding.summary);
   assert.match(disabledFinding.summary, /Partial view: identity provider list truncated at 1 of 3 total/);
+});
+
+// ---------------------------------------------------------------------------
+// Native assessment tool details: Pi persists and renders details, so they carry a bounded
+// projection of the result and never the raw snapshots (those belong in core_data/).
+// ---------------------------------------------------------------------------
+
+const MULESOFT_ASSESSMENT_DETAIL_KEYS = ["tool", "category", "title", "summary", "findings", "errors", "snapshot_keys"];
+const MULESOFT_BULK_MARKER = "bulk-inventory-item";
+
+function bulkItems(count, make) {
+  return Array.from({ length: count }, (_, index) => make(index));
+}
+
+// Each assessment under five fixture shapes. The bulk shape fills the inventories the category
+// snapshots carry up to the default user and application limits, so the snapshots grow with it
+// while the details must not.
+const MULESOFT_DETAIL_TOOLS = [
+  {
+    tool: "mulesoft_assess_identity_access",
+    run: assessMulesoftIdentityAccess,
+    fixtures: {
+      healthy: () => healthyIdentityClient(),
+      forbidden: () => forbidAll(healthyIdentityClient()),
+      empty: () => emptyIdentityClient(),
+      partial: () => partialIdentityClient(),
+      bulk: () => healthyIdentityClient({
+        async listMembers() {
+          return bulkItems(1000, (index) => ({ id: `u-${index}`, username: `${MULESOFT_BULK_MARKER}-${index}`, email: `${MULESOFT_BULK_MARKER}-${index}@example.com` }));
+        },
+      }),
+    },
+  },
+  {
+    tool: "mulesoft_assess_api_gateway",
+    run: assessMulesoftApiGateway,
+    fixtures: {
+      healthy: () => healthyApiGatewayClient(),
+      forbidden: () => forbidAll(healthyApiGatewayClient()),
+      empty: () => emptyApiGatewayClient(),
+      partial: () => partialApiGatewayClient(),
+      bulk: () => healthyApiGatewayClient({
+        async listExchangeAssets() {
+          return bulkItems(500, (index) => ({ organizationId: ORG_ID, assetId: `${MULESOFT_BULK_MARKER}-${index}`, name: `${MULESOFT_BULK_MARKER} ${index}`, status: "published", isPublic: false, type: "rest-api" }));
+        },
+      }),
+    },
+  },
+  {
+    tool: "mulesoft_assess_runtime_infrastructure",
+    run: assessMulesoftRuntimeInfrastructure,
+    fixtures: {
+      healthy: () => healthyRuntimeClient(),
+      forbidden: () => forbidAll(healthyRuntimeClient()),
+      empty: () => emptyRuntimeClient(),
+      partial: () => partialRuntimeClient(),
+      bulk: () => healthyRuntimeClient({
+        async listCloudhubApplications(environmentId) {
+          return bulkItems(100, (index) => ({
+            domain: `${MULESOFT_BULK_MARKER}-${environmentId}-${index}`,
+            muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) },
+            workers: { amount: 2, type: { name: "Small", weight: 0.2 }, recentStatistics: { cpu: 45 } },
+            persistentQueues: true,
+            persistentQueuesEncrypted: true,
+            properties: {},
+          }));
+        },
+      }),
+    },
+  },
+  {
+    tool: "mulesoft_assess_audit_monitoring",
+    run: assessMulesoftAuditMonitoring,
+    fixtures: {
+      healthy: () => healthyAuditClient(),
+      forbidden: () => forbidAll(healthyAuditClient()),
+      empty: () => emptyAuditClient(),
+      partial: () => partialAuditClient(),
+      bulk: () => healthyAuditClient({
+        async listCloudhubAlerts(environmentId) {
+          return bulkItems(500, (index) => ({ id: `alert-${environmentId}-${index}`, name: `${MULESOFT_BULK_MARKER} ${index}`, enabled: true, condition: { resources: ["*"] } }));
+        },
+      }),
+    },
+  },
+];
+
+// Serialized-size ceilings, in characters, at roughly twice the largest value these fixtures produce.
+// Measured maxima across the four tools: healthy 7.3k, forbidden 14.0k, empty 9.9k, partial 12.5k, bulk 8.9k.
+const MULESOFT_DETAILS_CEILING = { healthy: 16000, forbidden: 28000, empty: 20000, partial: 26000, bulk: 18000 };
+
+function assertMulesoftDetailsShape(details, tool, label) {
+  assert.deepEqual(Object.keys(details), MULESOFT_ASSESSMENT_DETAIL_KEYS, `${label}: details carry exactly the projected fields`);
+  assert.equal("snapshots" in details, false, `${label}: raw snapshots are not carried in details`);
+  assert.equal(details.tool, tool, `${label}: tool name`);
+  assert.ok(details.snapshot_keys.length > 0, `${label}: the snapshot dataset names are kept`);
+  assert.ok(details.snapshot_keys.every((key) => typeof key === "string"), `${label}: snapshot_keys lists names only`);
+}
+
+test("assessment tool details are a bounded projection: raw snapshots are dropped while the snapshot names, summary, findings, and errors are kept", async () => {
+  for (const { tool, run, fixtures } of MULESOFT_DETAIL_TOOLS) {
+    const sizes = {};
+    const snapshotSizes = {};
+    for (const [fixture, makeClient] of Object.entries(fixtures)) {
+      const label = `${tool} (${fixture})`;
+      const result = await run(makeClient());
+      const details = mulesoftAssessmentToolDetails(tool, result);
+      assertMulesoftDetailsShape(details, tool, label);
+      for (const key of ["category", "title", "summary", "findings", "errors"]) {
+        assert.deepEqual(details[key], result[key], `${label}: ${key} is preserved`);
+      }
+      assert.deepEqual(details.snapshot_keys, Object.keys(result.snapshots), `${label}: snapshot_keys names every snapshot`);
+      sizes[fixture] = JSON.stringify(details).length;
+      snapshotSizes[fixture] = JSON.stringify(result.snapshots).length;
+      assert.ok(sizes[fixture] <= MULESOFT_DETAILS_CEILING[fixture], `${label}: details serialize to ${sizes[fixture]} characters, over the ${MULESOFT_DETAILS_CEILING[fixture]} ceiling`);
+    }
+    assert.ok(snapshotSizes.bulk > 10 * snapshotSizes.healthy, `${tool}: the bulk fixture grows the snapshots (${snapshotSizes.healthy} -> ${snapshotSizes.bulk})`);
+    assert.ok(sizes.bulk <= 2 * sizes.healthy, `${tool}: the details do not grow with the snapshots (${sizes.healthy} -> ${sizes.bulk})`);
+  }
+});
+
+test("the registered assessment tools return the bounded details over HTTP and still render every finding and error in the text", async () => {
+  const registered = new Map();
+  registerMulesoftTools({ registerTool: (tool) => registered.set(tool.name, tool) });
+  const upstream = msCanaryFetch({});
+  // No dedicated load balancer, so the runtime assessment never opens a live TLS probe.
+  const fetchImpl = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (msSurfaceOf(url) === "loadBalancers") return jsonResponse({ data: [], total: 0 });
+    return upstream(input, init);
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  try {
+    for (const { tool, run } of MULESOFT_DETAIL_TOOLS) {
+      const registeredTool = registered.get(tool);
+      const output = await registeredTool.execute("call-details", registeredTool.prepareArguments({ organization_id: ORG_ID, token: SAMPLE_TOKEN, control_plane: "us" }));
+      assert.notEqual(output.isError, true, output.content[0].text);
+      const { details } = output;
+      assertMulesoftDetailsShape(details, tool, tool);
+
+      const direct = await run(new MulesoftApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 }));
+      assert.equal(details.category, direct.category, `${tool}: category`);
+      assert.equal(details.title, direct.title, `${tool}: title`);
+      assert.deepEqual(Object.keys(details.summary), Object.keys(direct.summary), `${tool}: summary fields`);
+      assert.deepEqual(details.findings.map((item) => [item.id, item.status]), direct.findings.map((item) => [item.id, item.status]), `${tool}: findings`);
+      assert.deepEqual(details.errors, direct.errors, `${tool}: errors`);
+      assert.deepEqual(details.snapshot_keys, Object.keys(direct.snapshots), `${tool}: snapshot_keys names every snapshot the assessment collected`);
+
+      const text = output.content.map((part) => part.text ?? "").join("\n");
+      assert.ok(text.startsWith(`${details.title}\n`), `${tool}: the text leads with the title`);
+      for (const key of Object.keys(details.summary)) assert.ok(text.includes(`- ${key}: `), `${tool}: the text renders summary.${key}`);
+      for (const item of details.findings) assert.ok(text.includes(item.id), `${tool}: the text renders ${item.id}`);
+      for (const error of details.errors) assert.ok(text.includes(`- ${error}`), `${tool}: the text renders the collection error`);
+
+      const size = JSON.stringify(details).length;
+      assert.ok(size <= MULESOFT_DETAILS_CEILING.healthy, `${tool}: details serialize to ${size} characters, over the ${MULESOFT_DETAILS_CEILING.healthy} ceiling`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

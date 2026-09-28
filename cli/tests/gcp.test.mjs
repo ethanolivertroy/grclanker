@@ -46,6 +46,7 @@ import {
 } from "./helpers/byte-differential-fixtures.mjs";
 import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { GCP_COMPLETENESS_SOURCES, GCP_SPEC } from "../dist/extensions/grc-tools/gcp.spec.js";
+import * as specModel from "../dist/extensions/grc-tools/spec-model.js";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 
@@ -365,6 +366,10 @@ test("self-check (a): every endpoint forbidden yields only manual verdicts", asy
   const access = await checkGcpAccess(client);
   assert.equal(access.status, "limited");
   assert.ok(access.surfaces.every((surface) => surface.status === "not_readable"));
+  assert.match(access.recommendedNextStep, /roles\/iam\.securityReviewer already includes storage\.buckets\.list for project bucket inventory/);
+  assert.match(access.recommendedNextStep, /custom role containing only storage\.buckets\.list at the organization or each audited project/);
+  assert.doesNotMatch(access.recommendedNextStep, /roles\/storage\.admin/);
+  assert.doesNotMatch(access.recommendedNextStep, /roles\/storage\.bucketViewer/);
 });
 
 test("self-check (b): empty inventories never pass except where emptiness is compliant by intent", async () => {
@@ -1218,17 +1223,164 @@ function assertGcpCompletenessMutation(row, mode, facts, scope) {
       assert.ok(source, `${row.id}/${checkId}: runtime dependency has a spec source`);
     }
     const actual = facts.get(checkId)?.evidence_complete;
-    const mixedKeyReadFailure = scope === "partial-project"
-      && row.key === "serviceAccountKeys"
-      && ["GCP-IAM-02", "GCP-IAM-03"].includes(checkId)
-      && ["error", "denied"].includes(mode);
-    if ((row.dependents.includes(checkId) && source?.falseWhen.includes(mode)) || mixedKeyReadFailure) {
+    const scopedAggregateFailure = scope === "partial-project"
+      && source?.aggregate?.mixedFailureModes.includes(mode);
+    if ((row.dependents.includes(checkId) && source?.falseWhen.includes(mode)) || scopedAggregateFailure) {
       assert.equal(actual, false, `${row.id}/${mode}/${scope}/${checkId}: lowering failure mode`);
     } else {
       assert.notEqual(actual, false, `${row.id}/${mode}/${scope}/${checkId}: non-lowering failure mode`);
     }
   }
 }
+
+test("GCP-IAM-02 and GCP-IAM-03 service-account-key scope aggregate matches all 20 success, empty, failure, and truncation scenarios", { skip: Boolean(process.env.GRC_CORPUS_FIXTURE_DIR) }, async () => {
+  const checkIds = ["GCP-IAM-02", "GCP-IAM-03"];
+  const statusMode = (status) => [401, 403].includes(status) ? "denied" : "error";
+  const truncatedData = structuredClone(TWO_PROJECTS);
+  truncatedData.keys = {
+    keys: [{
+      name: "projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/current",
+      keyType: "USER_MANAGED",
+      validAfterTime: "2026-09-20T00:00:00Z",
+      validBeforeTime: "2027-09-21T00:00:00Z",
+    }],
+  };
+  const zeroProjectData = structuredClone(COMPLIANT);
+  zeroProjectData.projects = { results: [] };
+  const zeroServiceAccountData = structuredClone(TWO_PROJECTS);
+  zeroServiceAccountData.serviceAccounts = { accounts: [] };
+  const fourAccountData = structuredClone(COMPLIANT);
+  fourAccountData.serviceAccounts = {
+    accounts: Array.from({ length: 4 }, (_, index) => ({
+      name: `projects/prod-audit/serviceAccounts/svc-${index + 1}@prod-audit.iam.gserviceaccount.com`,
+      email: `svc-${index + 1}@prod-audit.iam.gserviceaccount.com`,
+    })),
+  };
+  const cases = [
+    ...[401, 403, 404, 429, 500].flatMap((status) => [
+      { label: `mixed-${status}`, status, failureScope: "mixed", expectedFailures: 1, expectedStatus: "warn", expectedComplete: false, wording: /Partial view: service account keys unreadable for 1 of 2 service accounts \(second-project\)/ },
+      { label: `all-failed-${status}`, status, failureScope: "all", expectedFailures: 2, expectedStatus: "manual", expectedComplete: true, wording: /Manual: service account keys unreadable for 2 of 2 service accounts \(prod-audit, second-project\)/ },
+    ]),
+    { label: "all-success", expectedStatus: "pass", expectedComplete: true, wording: /(?:No user-managed service account keys exist across 2 service accounts|2 service accounts carry no user-managed keys)/ },
+    { label: "zero-projects", data: zeroProjectData, config: sampleConfig({ projectId: undefined }), expectedStatus: "manual", expectedComplete: false, wording: /Manual: no projects were inventoried in the scope/ },
+    { label: "truncated", data: truncatedData, maxKeys: 1, expectedStatus: "warn", expectedComplete: false, wording: /inventory incomplete/ },
+    {
+      label: "zero-service-accounts",
+      data: zeroServiceAccountData,
+      expectedStatus: "manual",
+      expectedComplete: true,
+      wordingByCheck: {
+        "GCP-IAM-02": /Manual: no service accounts were listed in the sampled projects; every project with Compute or App Engine enabled has default service accounts, so an empty list usually means iam\.serviceAccounts\.list was not permitted\./,
+        "GCP-IAM-03": /Manual: No service accounts were listed\. Emptiness is treated as manual\./,
+      },
+    },
+    ...[403, 500].flatMap((status) => [
+      { label: `mixed-first-${status}`, status, failureScope: "first", expectedFailures: 1, expectedStatus: "warn", expectedComplete: false, wording: /Partial view: service account keys unreadable for 1 of 2 service accounts \(prod-audit\)/ },
+      { label: `one-of-four-${status}`, status, data: fourAccountData, failedKeyOrdinals: [2], expectedFailures: 1, expectedStatus: "warn", expectedComplete: false, wording: /Partial view: service account keys unreadable for 1 of 4 service accounts \(prod-audit\)/ },
+      { label: `all-four-${status}`, status, data: fourAccountData, failureScope: "all", expectedFailures: 4, expectedStatus: "manual", expectedComplete: true, wording: /Manual: service account keys unreadable for 4 of 4 service accounts \(prod-audit\)/ },
+    ]),
+  ];
+  assert.equal(cases.length, 20);
+
+  let findingCases = 0;
+  for (const scenario of cases) {
+    let attemptedAccounts = 0;
+    let attemptedKeys = 0;
+    let failedKeys = 0;
+    const requests = [];
+    const data = scenario.data ?? TWO_PROJECTS;
+    const client = createClient(async (url, init) => {
+      const request = requestFacts(url, init);
+      if (request.host === "iam.googleapis.com" && request.path.endsWith("/serviceAccounts")) {
+        attemptedAccounts += 1;
+      }
+      const keyRequest = request.host === "iam.googleapis.com" && request.path.endsWith("/keys");
+      if (keyRequest) {
+        attemptedKeys += 1;
+        const fails = scenario.status !== undefined
+          && (
+            scenario.failureScope === "all"
+            || (scenario.failureScope === "mixed" && requestProject(url, init) === SECOND_PROJECT)
+            || (scenario.failureScope === "first" && requestProject(url, init) === "prod-audit")
+            || scenario.failedKeyOrdinals?.includes(attemptedKeys)
+          );
+        if (fails) {
+          failedKeys += 1;
+          requests.push({ project: requestProject(url, init), status: scenario.status });
+          return denied(scenario.status);
+        }
+      }
+      return jsonResponse(routeForProject(url, init, data));
+    }, scenario.config ?? sampleConfig());
+    const captured = await captureBatchDecisionFacts(() =>
+      assessGcpIdentity(client, { maxProjects: 5, ...(scenario.maxKeys ? { maxKeys: scenario.maxKeys } : {}) }));
+    const runtimeFacts = gcpFactsByCheck(captured.captures);
+    const findings = findingsById([captured.result]);
+    const failureModes = scenario.status === undefined ? [] : [statusMode(scenario.status)];
+    const observations = {
+      projects: {
+        attemptedCount: 1,
+        successfulCount: 1,
+        failedCount: 0,
+        failureModes: [],
+        truncated: false,
+      },
+      "service-accounts": scenario.label === "zero-projects"
+        ? { attemptedCount: 0, successfulCount: 0, failedCount: 0, failureModes: ["not-collected"], truncated: false }
+        : { attemptedCount: attemptedAccounts, successfulCount: attemptedAccounts, failedCount: 0, failureModes: [], truncated: false },
+      "service-account-keys": {
+        attemptedCount: attemptedKeys,
+        successfulCount: attemptedKeys - failedKeys,
+        failedCount: failedKeys,
+        failureModes,
+        truncated: scenario.label === "truncated",
+      },
+    };
+
+    for (const checkId of checkIds) {
+      const contract = GCP_SPEC.checks.find((entry) => entry.id === checkId);
+      assert.ok(contract, `${scenario.label}/${checkId}: check contract`);
+      const completeness = contract.completeness.evidence_complete.sources.every((source) =>
+        specModel.evaluateCompletenessSource(source, observations[source.surfaceId]));
+      assert.equal(completeness, scenario.expectedComplete, `${scenario.label}/${checkId}: portable completeness`);
+      const facts = runtimeFacts.get(checkId);
+      assert.ok(facts, `${scenario.label}/${checkId}: runtime facts`);
+      if (scenario.label === "zero-service-accounts" && checkId === "GCP-IAM-02") {
+        assert.deepEqual(facts, {}, "GCP-IAM-02 uses the runtime's successful-empty manual branch without key decision facts");
+        const portableFacts = {
+          evidence_readable: false,
+          evidence_complete: completeness,
+          inventory_count: 0,
+          violation_count: 0,
+          review_count: 0,
+        };
+        assert.equal(specModel.evaluateCheckVerdict(contract, {}), "manual", "missing runtime facts remain manual");
+        assert.equal(specModel.evaluateCheckVerdict(contract, portableFacts), "manual", "the portable empty-service-account witness remains manual");
+        assert.equal(findings[checkId].status, scenario.expectedStatus, `${scenario.label}/${checkId}: runtime status`);
+        assert.match(findings[checkId].summary, scenario.wordingByCheck[checkId], `${scenario.label}/${checkId}: runtime wording`);
+        findingCases += 1;
+        continue;
+      }
+      assert.equal(facts.evidence_complete, completeness, `${scenario.label}/${checkId}: runtime and portable completeness`);
+      const portableFacts = { ...facts, evidence_complete: completeness };
+      assert.deepEqual(portableFacts, facts, `${scenario.label}/${checkId}: portable fact projection`);
+      assert.equal(specModel.evaluateCheckVerdict(contract, portableFacts), scenario.expectedStatus, `${scenario.label}/${checkId}: portable status`);
+      assert.equal(findings[checkId].status, scenario.expectedStatus, `${scenario.label}/${checkId}: runtime status`);
+      assert.match(findings[checkId].summary, scenario.wordingByCheck?.[checkId] ?? scenario.wording, `${scenario.label}/${checkId}: runtime wording`);
+      findingCases += 1;
+    }
+
+    if (scenario.status !== undefined) {
+      assert.equal(requests.length, scenario.expectedFailures, `${scenario.label}: injected key failures`);
+      assert.ok(requests.every((request) => request.status === scenario.status), `${scenario.label}: exact injected status`);
+    }
+    if (scenario.label === "zero-service-accounts") {
+      assert.equal(attemptedAccounts, 2, "both readable projects returned a successful empty service-account list");
+      assert.equal(attemptedKeys, 0, "no key request exists without a service account");
+    }
+  }
+  assert.equal(findingCases, 40);
+});
 
 /** The one evidence field that grows, rather than nulls, when a read fails: the list of unreadable inventories itself. */
 const ENGINE_EVIDENCE = new Set(["unreadable_inventories"]);

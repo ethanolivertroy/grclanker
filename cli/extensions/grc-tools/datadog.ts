@@ -348,7 +348,7 @@ const INVENTORIES: Record<string, InventoryDescriptor> = {
   application_keys: { label: "application_keys", endpoint: "GET /api/v2/application_keys", permission: "org_app_keys_read", limitArgument: "key_limit", collectManually: "Organization Settings > Application Keys with owner, scopes, created, and last used dates" },
   org_configs: { label: "org_configs", endpoint: "GET /api/v2/org_configs", permission: "none", collectManually: "Organization Settings > Preferences" },
   api_keys: { label: "api_keys", endpoint: "GET /api/v2/api_keys", permission: "api_keys_read", limitArgument: "key_limit", collectManually: "Organization Settings > API Keys with created and last used dates" },
-  shared_dashboards: { label: "shared_dashboards", endpoint: "GET /api/v1/dashboard?filter[shared]=true", permission: "dashboards_read", limitArgument: "the dashboard limit", collectManually: "Dashboards > Shared Dashboards with each share type" },
+  shared_dashboards: { label: "shared_dashboards", endpoint: "GET /api/v1/dashboard?filter[shared]=true", permission: "dashboards_read", collectManually: "Dashboards > Shared Dashboards with each share type" },
   ip_allowlist: { label: "ip_allowlist", endpoint: "GET /api/v2/ip_allowlist", permission: "org_management", collectManually: "Organization Settings > Security > IP Allowlist" },
   aws_integrations: { label: "aws_integrations", endpoint: "GET /api/v1/integration/aws", permission: "aws_configuration_read", collectManually: "Integrations > AWS showing each account, its authentication method, and resource collection" },
   gcp_integrations: { label: "gcp_integrations", endpoint: "GET /api/v1/integration/gcp", permission: "gcp_configuration_read", collectManually: "Integrations > Google Cloud Platform showing each project and resource collection" },
@@ -364,11 +364,19 @@ const INVENTORIES: Record<string, InventoryDescriptor> = {
   log_indexes: { label: "log_indexes", endpoint: "GET /api/v1/logs/config/indexes", permission: "logs_read_config", collectManually: "Logs > Configuration > Indexes with retention and exclusion filters" },
   log_archives: { label: "log_archives", endpoint: "GET /api/v2/logs/config/archives", permission: "logs_read_archives", collectManually: "Logs > Configuration > Archives with each destination and state" },
   sensitive_data_scanner: { label: "sensitive_data_scanner", endpoint: "GET /api/v2/sensitive-data-scanner/config", permission: "data_scanner_read", collectManually: "Organization Settings > Sensitive Data Scanner" },
-  org_connections: { label: "org_connections", endpoint: "GET /api/v2/org_connections", permission: "org_connections_read", limitArgument: "the org connection limit", collectManually: "Organization Settings > Org Connections" },
+  org_connections: { label: "org_connections", endpoint: "GET /api/v2/org_connections", permission: "org_connections_read", collectManually: "Organization Settings > Org Connections" },
 };
 
 function inventoryDescriptor(inventory: string): InventoryDescriptor {
   return INVENTORIES[inventory] ?? { label: inventory, endpoint: inventory, permission: "unknown", collectManually: `the ${inventory} inventory from the Datadog console` };
+}
+
+function truncationRemediation(inventory: string, includePurpose = false): string {
+  const descriptor = inventoryDescriptor(inventory);
+  if (descriptor.limitArgument) {
+    return `raise ${descriptor.limitArgument}${includePurpose ? " to inspect the full list" : ""}`;
+  }
+  return `inspect the full inventory manually in ${descriptor.collectManually}`;
 }
 
 export interface DatadogRolePermissionFailure {
@@ -1801,7 +1809,7 @@ async function loadInventory(
   const total = listing.total ?? (truncated ? undefined : items.length);
   if (truncated) {
     const reason = listing.items.length > limit ? `more than ${limit} items exist` : listing.truncationReason ?? "the listing stopped early";
-    errors.push(`${inventory}: inventory truncated at ${limit} items (${describeTruncation(items.length, total)}; ${reason}); raise ${inventoryDescriptor(inventory).limitArgument ?? "the matching limit argument"} to inspect the full list`);
+    errors.push(`${inventory}: inventory truncated at ${limit} items (${describeTruncation(items.length, total)}; ${reason}); ${truncationRemediation(inventory, true)}`);
     return { value: items, truncated: true, limit, seen: items.length, total, truncationReason: reason };
   }
   return { value: items, truncated: false, limit, seen: items.length, total };
@@ -1907,10 +1915,10 @@ function withInventoryGaps(
   return { ...item, status: "warn", summary: `${item.summary} ${caveat}`, evidence };
 }
 
-function truncationCaveat(inventory: string, surface: SurfaceResult<unknown>, limitArgument: string): string | undefined {
+function truncationCaveat(inventory: string, surface: SurfaceResult<unknown>): string | undefined {
   if (!surface.truncated) return undefined;
   const seen = surface.seen ?? (Array.isArray(surface.value) ? surface.value.length : 0);
-  return `${inventory} inventory is truncated at ${surface.limit ?? "the configured limit of"} items (${describeTruncation(seen, surface.total)}; raise ${limitArgument}), so the verdict covers a partial view and violators from it are neither counted nor named.`;
+  return `${inventory} inventory is truncated at ${surface.limit ?? "the configured limit of"} items (${describeTruncation(seen, surface.total)}; ${truncationRemediation(inventory)}), so the verdict covers a partial view and violators from it are neither counted nor named.`;
 }
 
 /**
@@ -2289,7 +2297,7 @@ function evaluateMfaControl(snapshot: DatadogIdentitySnapshot, strictSaml: boole
       "Export Organization Settings > Users and confirm every active human user has MFA enabled or authenticates only through a SAML IdP that enforces MFA.",
     ], evidence);
   }
-  const caveats = [truncationCaveat("users", snapshot.users, "user_limit")];
+  const caveats = [truncationCaveat("users", snapshot.users)];
   if (activeHumans.length === 0) {
     return withInventoryGaps(
       withVerdictCaveats(
@@ -2429,7 +2437,7 @@ function evaluateRbacControl(snapshot: DatadogIdentitySnapshot, maxAdmins: numbe
       "Export Organization Settings > Roles with each custom role's permission list and the Datadog Admin Role membership count.",
     ], evidence);
   }
-  const caveats = [truncationCaveat("roles", snapshot.roles, "role_limit")];
+  const caveats = [truncationCaveat("roles", snapshot.roles)];
   if (overPrivileged.length > 0) {
     return withVerdictCaveats(
       finding(
@@ -2520,7 +2528,7 @@ function evaluateUserAccessControl(snapshot: DatadogIdentitySnapshot, now: Date,
     ], evidence);
   }
   const caveats = [
-    truncationCaveat("users", snapshot.users, "user_limit"),
+    truncationCaveat("users", snapshot.users),
     undated.length > 0 ? `${undated.length} active users have neither last_login_time nor created_at and were not counted as recently active.` : undefined,
     undatedPending.length > 0 ? `${undatedPending.length} pending invitations have no created_at and could not be aged.` : undefined,
   ];
@@ -2626,8 +2634,8 @@ function evaluateServiceAccountControl(snapshot: DatadogIdentitySnapshot, now: D
     ], evidence);
   }
   const caveats = [
-    truncationCaveat("users", snapshot.users, "user_limit"),
-    truncationCaveat("application_keys", snapshot.applicationKeys, "key_limit"),
+    truncationCaveat("users", snapshot.users),
+    truncationCaveat("application_keys", snapshot.applicationKeys),
     undatedKeys.length > 0 ? `${undatedKeys.length} service account application keys have no created_at and were not counted as rotated.` : undefined,
   ];
   const read = readSuffix(usersComplete);
@@ -2789,7 +2797,7 @@ function evaluateApiKeyControl(snapshot: DatadogAccessControlSnapshot, now: Date
     ], evidence);
   }
   const caveats = [
-    truncationCaveat("api_keys", snapshot.apiKeys, "key_limit"),
+    truncationCaveat("api_keys", snapshot.apiKeys),
     undated.length > 0 ? `${undated.length} API keys have no created_at and were not counted as rotated within the window.` : undefined,
   ];
   const read = readSuffix(snapshot.apiKeys);
@@ -2875,7 +2883,7 @@ function evaluateApplicationKeyControl(snapshot: DatadogAccessControlSnapshot, n
     ], evidence);
   }
   const caveats = [
-    truncationCaveat("application_keys", surface, "key_limit"),
+    truncationCaveat("application_keys", surface),
     ownerUnresolved.length > 0
       ? `${ownerUnresolved.length} application keys have no owner record in the response (include=owned_by), so ownership by an active user could not be confirmed for them.`
       : undefined,
@@ -2949,7 +2957,7 @@ function evaluateDashboardSharingControl(snapshot: DatadogAccessControlSnapshot)
       publicSharingEvidence,
     ], evidence);
   }
-  const caveats = [truncationCaveat("shared_dashboards", snapshot.sharedDashboards, "the dashboard limit")];
+  const caveats = [truncationCaveat("shared_dashboards", snapshot.sharedDashboards)];
   if (shared.length > 0) {
     return withVerdictCaveats(
       finding(
@@ -3147,7 +3155,7 @@ function evaluateOrgSettingsControl(snapshot: DatadogDataProtectionSnapshot, min
   if (indexes.length === 0) {
     return manualFinding(20, "medium", "The log indexes endpoint returned no indexes, so log retention could not be evaluated; the empty inventory is treated as unverifiable rather than compliant.", [consoleEvidence[1]], evidence);
   }
-  const connectionCaveats = [truncationCaveat("org_connections", snapshot.orgConnections, "the org connection limit")];
+  const connectionCaveats = [truncationCaveat("org_connections", snapshot.orgConnections)];
   if (shortRetention.length > 0 || unknownRetention.length > 0 || connections.length > 0 || (autocreateEnabled && autocreateDomains.length === 0)) {
     return withVerdictCaveats(
       finding(
@@ -3294,7 +3302,7 @@ function evaluateDetectionRulesControl(snapshot: DatadogSecurityMonitoringSnapsh
     rules_inventory_truncated: truncatedFlag(surface),
     inventory: inventoryState("security_rules", surface),
   };
-  const caveats = [truncationCaveat("security_rules", surface, "rule_limit")];
+  const caveats = [truncationCaveat("security_rules", surface)];
   // An empty inventory proves that no detection is active only when the listing was read completely. A listing that
   // returned no rows before it stopped (an empty first page under a next-page cursor, a repeated cursor) leaves whether
   // any rule exists unknown, so it is reported with the collection's own stop reason rather than as a fail.
@@ -3543,7 +3551,7 @@ function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPas
     return withInventoryGaps(
       withVerdictCaveats(
         finding(12, "high", "fail", `Cloud Security Posture Management is not active: ${cspm.total} cloud integrations are configured but none has CSPM resource collection enabled and none of the ${cloudRules.length} cloud_configuration rules${rulesRead} is enabled.`, evidence),
-        [truncationCaveat("security_rules", snapshot.rules, "rule_limit")],
+        [truncationCaveat("security_rules", snapshot.rules)],
       ),
       unreadablePosture,
       { essential: true },
@@ -3552,7 +3560,7 @@ function evaluateCspmControl(snapshot: DatadogSecurityMonitoringSnapshot, minPas
   if (unreadablePosture.length > 0) {
     return manualFinding(12, "high", `CSPM appears active (${enabledCloudRules.length} enabled cloud_configuration rules${rulesRead}, ${cspm.enabled} integrations with resource collection), but the posture passing rate could not be measured. ${unreadableSurfacesReason(unreadablePosture)}`, [consoleEvidence], evidence);
   }
-  const ruleCaveats = [truncationCaveat("security_rules", snapshot.rules, "rule_limit")];
+  const ruleCaveats = [truncationCaveat("security_rules", snapshot.rules)];
   if (countsTruncated) {
     const { clause, remedy } = postureTruncation(failing, passing);
     return withVerdictCaveats(finding(12, "high", "warn", `CSPM is active with ${enabledCloudRules.length} enabled compliance rules${rulesRead}, but the passing rate could not be measured reliably: the posture findings response carried no total_filtered_count and ${clause}. ${remedy}`, evidence), ruleCaveats);
@@ -3611,7 +3619,7 @@ function evaluateComplianceCoverageControl(snapshot: DatadogSecurityMonitoringSn
     rules_inventory_truncated: truncatedFlag(surface),
     inventory: inventoryState("security_rules", surface),
   };
-  const caveats = [truncationCaveat("security_rules", surface, "rule_limit")];
+  const caveats = [truncationCaveat("security_rules", surface)];
   if (complianceRules.length === 0) {
     return withVerdictCaveats(
       finding(13, "medium", complete ? "fail" : "warn", complete
@@ -3696,7 +3704,7 @@ function evaluateMonitorNotificationControl(snapshot: DatadogSecurityMonitoringS
       "Confirm in Monitors > Manage Monitors whether security-related monitors exist; if alerting is handled entirely by Cloud SIEM notification rules, capture Security > Cloud SIEM > Notification Rules instead.",
     ], evidence);
   }
-  const caveats = [truncationCaveat("monitors", surface, "monitor_limit")];
+  const caveats = [truncationCaveat("monitors", surface)];
   if (securityMonitors.length === 0) {
     return withVerdictCaveats(
       finding(17, "medium", "warn", `${monitors.length} monitors${read} were inventoried but none of them is tagged or named as a security monitor; tag security-critical monitors so notification routing can be verified.`, evidence),

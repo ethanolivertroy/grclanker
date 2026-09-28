@@ -3,7 +3,7 @@ import Base from '../layouts/Base.astro';
 
 ---
 
-<Base title="About: grclanker">
+<Base title="About: grclanker" description="What grclanker ships today: an open source compliance agent with 241 domain tools, 35 vendor integrations, and Pi, Cursor Agent SDK, and Flue runtime paths.">
   <!-- Hero illustration -->
   <section class="relative overflow-hidden">
     <div class="absolute inset-0 w-full h-full">
@@ -36,7 +36,7 @@ import Base from '../layouts/Base.astro';
             <div class="hud-divider !my-7"></div>
 
             <p>
-              <strong class="text-text">grclanker</strong> is an open source compliance agent with 241 domain tools. It ships 35 integrations, each with a repository spec and native checks, assessments, or evidence exports. CMVP, KEV, EPSS, FedRAMP, Vanta, SCF, and OSCAL tools round out the current surface.
+              <strong class="text-text">grclanker</strong> is an open source compliance agent with 241 domain tools. It ships 35 vendor integrations with native checks, assessments, or evidence exports, and every one except Vanta has a repository spec. CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools round out the current surface. The v0.0.1 release bundle carries only the CMVP and KEV tools, so the full set runs from a source checkout until the next release.
             </p>
 
             <p>
@@ -48,11 +48,11 @@ import Base from '../layouts/Base.astro';
             </p>
 
             <p>
-              Shared hardening scrubs credential-shaped error text, marks incomplete collections, reports pagination stops, and avoids overwriting prior exports. Runtime adapters validate tool schemas, classify read effects, and put approval gates around writer tools where the host supports them.
+              Shared hardening scrubs credential-shaped error text, marks incomplete collections, and reports pagination stops. Most exporters allocate a new bundle path on rerun instead of overwriting a prior export; Vanta reuses its audit directory. Runtime adapters validate tool schemas, classify read effects, and put approval gates around writer tools where the host supports them.
             </p>
 
             <p>
-              Every raw spec remains an agent-agnostic build plan with APIs, authentication, control mappings, architecture, and test guidance. Browse them at <a href="/specs" class="text-blue hover:underline">/specs</a>.
+              Every raw spec remains an agent-agnostic build plan with APIs, authentication, control mappings, architecture, and test guidance. Browse them at <a href="/specs" class="text-blue underline! underline-offset-2">/specs</a>.
             </p>
           </div>
         </div>

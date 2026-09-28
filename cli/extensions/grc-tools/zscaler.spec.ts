@@ -147,7 +147,7 @@ function zscalerCompletenessSemantics(id: string): string {
         : "an error or 403 denial does not change evidence_complete";
     return `${entry.surfaceId}: ${truncated}; ${failed}`;
   });
-  return `Product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
+  return `product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
 }
 
 const rows: ReadonlyArray<readonly [string, Batch2CheckRow["severity"], "zia_policy" | "zia_access_control" | "zpa"]> = [
@@ -215,7 +215,7 @@ const decisionPredicate: readonly string[] = [
   `Fail when no enabled DECRYPT rule exists or an unscoped DO_NOT_DECRYPT rule exists. Warn when the exemption list is unreadable, its count exceeds max_ssl_exemptions (default ${ZSCALER_DEFAULT_MAX_SSL_EXEMPTIONS}, clamped to 0 through 100000), or a location has sslScanEnabled=false.`,
   "Remain manual when no sandbox rule exists; fail when all rules are disabled; warn when enabled rules do not use BLOCK.",
   "Fail when any enabled ZIA administrator permits password login without readable SAML authentication evidence; warn for incomplete administrators.",
-  `Fail when enabled administrator coverage is absent or enabled Super Admin membership exceeds max_super_admins. That option defaults to ${ZSCALER_DEFAULT_MAX_SUPER_ADMINS} and is clamped to 0 through 500; warn for missing role resolution, local-password access, or unreadable password-expiry settings.`,
+  `Remain manual when the administrator or role inventory is empty. Otherwise fail when enabled administrator coverage is absent or enabled Super Admin membership exceeds max_super_admins. That option defaults to ${ZSCALER_DEFAULT_MAX_SUPER_ADMINS} and is clamped to 0 through 500; warn when a nonempty role inventory cannot resolve an administrator's role, local-password access exists, or password-expiry settings are unreadable.`,
   "Fail when no enabled application segment exists or a segment is wildcard-domain plus full-port-range or bypassType=ALWAYS; warn for wildcard domains, full ranges, bypass, ungrouped segments, or partial segment/group data.",
   "Fail when no enabled access ALLOW rule exists or an unconditional ALLOW rule exists; warn for ALLOW rules without identity criteria.",
   "Fail when no posture profile exists or no ALLOW access rule uses posture; warn when only a subset of ALLOW rules uses posture.",
@@ -419,6 +419,7 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
   runtimeBehavior: ZSCALER_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Across the 41 ZIA-policy and ZPA single-dataset truncation replays, 16 affected finding cases currently remain pass for ZS-03, ZS-04, ZS-05, ZS-16, ZS-17, ZS-20, and ZS-25. Secondary inventories cap pass when unreadable, but those truncations and several primary ZIA truncations are not completeness-gating; a collector follow-up must close these paths.",
+    "Three access-area truncation cases also remain pass: ZS-07 when zia-admin-roles or zia-password-expiry is truncated, and ZS-14 when zia-audit-log-report is truncated. These access-area inventories require collector completeness gating.",
     "ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only.",
   ],
   sensitiveFields: ["apiKey", "password", "clientSecret", "authorization", "cookie", "token"],

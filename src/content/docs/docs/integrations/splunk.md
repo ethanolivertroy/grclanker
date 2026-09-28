@@ -1,6 +1,6 @@
 ---
 title: Splunk
-description: Read-only Splunk Enterprise and Splunk Cloud Platform security inspection covering authentication, RBAC, TLS, HEC, audit logging, and platform hardening with compliance mappings.
+description: Read-only Splunk Enterprise and Splunk Cloud Platform security inspector covering authentication, RBAC, TLS, HEC, audit logging, and platform hardening.
 ---
 
 The Splunk integration inspects a Splunk Enterprise or Splunk Cloud Platform deployment through the splunkd management REST API and, when configured, the Splunk Cloud Admin Config Service (ACS). It is read-only: the only POST requests it issues are the session-key login (`/services/auth/login`, when you supply a username and password) and a single read-only oneshot search against `index=_audit` that confirms audit events are flowing.
