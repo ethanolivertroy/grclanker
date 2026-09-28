@@ -315,6 +315,9 @@ const searchData = searchEnabled
       var searchModal = document.getElementById('search-modal');
       var searchInput = document.getElementById('search-input');
       var searchResults = document.getElementById('search-results');
+      var searchEmpty = document.getElementById('search-empty');
+      var searchStatus = document.getElementById('search-status');
+      var searchStatusTimer = null;
       var searchClose = document.getElementById('search-close');
       var helpBackdrop = document.getElementById('help-backdrop');
       var helpModal = document.getElementById('help-modal');
@@ -338,7 +341,7 @@ const searchData = searchEnabled
         return Array.prototype.slice.call(
           container.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])')
         ).filter(function(el) {
-          return !el.hasAttribute('hidden') && el.offsetParent !== null;
+          return !el.hasAttribute('hidden') && el.offsetParent !== null && el.tabIndex >= 0;
         });
       }
 
@@ -409,19 +412,36 @@ const searchData = searchEnabled
         var html = '';
         for (var i = 0; i < items.length; i++) {
           var item = items[i];
-          html += '<li><a href="' + item.href + '" class="search-result' + (i===0?' active':'') + '" data-index="' + i + '">'
+          html += '<li role="none"><a href="' + item.href + '" id="search-option-' + i + '" role="option" tabindex="-1" aria-selected="' + (i===0) + '" class="search-result' + (i===0?' active':'') + '" data-index="' + i + '">'
             + '<div class="result-name">' + esc(item.title) + '</div>'
             + '<div class="result-meta">' + esc(item.kind) + ' &middot; ' + esc(item.meta) + '</div>'
             + '</a></li>';
         }
-        if (!items.length) html = '<li class="px-4 py-6 text-center"><img src="/empty-state.webp" alt="" class="w-24 h-24 mx-auto mb-3 rounded-lg object-cover"><span class="text-subtext0 text-sm block">No pages found</span></li>';
         searchResults.innerHTML = html;
+        searchResults.hidden = !items.length;
+        searchEmpty.hidden = !!items.length;
+        searchInput.setAttribute('aria-expanded', items.length ? 'true' : 'false');
+        searchInput.removeAttribute('aria-activedescendant');
+        announceResultCount(items.length);
+      }
+
+      function announceResultCount(count) {
+        clearTimeout(searchStatusTimer);
+        searchStatusTimer = setTimeout(function() {
+          searchStatus.textContent = count === 0 ? 'No results' : count === 1 ? '1 result' : count + ' results';
+        }, 400);
       }
 
       function updateActive() {
         var els = searchResults.querySelectorAll('.search-result');
-        for (var i = 0; i < els.length; i++) els[i].classList.toggle('active', i === selectedIndex);
-        if (els[selectedIndex]) els[selectedIndex].scrollIntoView({ block: 'nearest' });
+        for (var i = 0; i < els.length; i++) {
+          els[i].classList.toggle('active', i === selectedIndex);
+          els[i].setAttribute('aria-selected', i === selectedIndex ? 'true' : 'false');
+        }
+        if (els[selectedIndex]) {
+          searchInput.setAttribute('aria-activedescendant', els[selectedIndex].id);
+          els[selectedIndex].scrollIntoView({ block: 'nearest' });
+        }
       }
 
       function openSearch() {
@@ -433,12 +453,17 @@ const searchData = searchEnabled
         setShellInert(true);
         document.body.style.overflow = 'hidden';
         searchInput.value = '';
+        searchStatus.textContent = '';
         renderResults(searchSite(''));
         setTimeout(function() { searchInput.focus(); }, 50);
       }
 
       function closeSearch() {
         searchOpen = false;
+        clearTimeout(searchStatusTimer);
+        searchStatus.textContent = '';
+        searchInput.setAttribute('aria-expanded', 'false');
+        searchInput.removeAttribute('aria-activedescendant');
         searchBackdrop.classList.remove('open');
         searchModal.classList.remove('open');
         setShellInert(false);
