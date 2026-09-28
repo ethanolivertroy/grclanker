@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_OWNER="${GRCLANKER_REPO_OWNER:-hackIDLE}"
+REPO_OWNER="${GRCLANKER_REPO_OWNER:-ethanolivertroy}"
 REPO_NAME="${GRCLANKER_REPO_NAME:-grclanker}"
 VERSION="${GRCLANKER_VERSION:-latest}"
 INSTALL_DIR="${GRCLANKER_INSTALL_DIR:-$HOME/.local/share/grclanker}"
@@ -209,7 +209,11 @@ detect_target() {
       if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
         :
       elif ldd --version 2>&1 | grep -qi 'musl'; then
-        fail "Linux musl hosts are not supported by release bundles yet. Use npm install -g @grclanker/cli or bun install -g @grclanker/cli instead."
+        printf "\n" >&2
+        warn "Linux musl hosts are not supported by release bundles yet."
+        source_instructions
+        printf "\n" >&2
+        fail "Install aborted."
       fi
       ;;
     *) fail "unsupported operating system: $os" ;;
@@ -231,12 +235,23 @@ asset_extension_for_target() {
   esac
 }
 
+# Writes to stderr because detect_target runs inside a command substitution.
+source_instructions() {
+  {
+    printf "  ${DIM}Build from source instead (Node.js 22.19+):${R}\n"
+    printf "    git clone https://github.com/%s/%s.git\n" "$REPO_OWNER" "$REPO_NAME"
+    printf "    cd %s\n" "$REPO_NAME"
+    printf "    npm --prefix cli ci\n"
+    printf "    npm --prefix cli run build\n"
+    printf "    node cli/bin/grclanker.js\n"
+    printf "  ${DIM}Guide: https://grclanker.com/docs/getting-started/installation/${R}\n"
+  } >&2
+}
+
 fallback_instructions() {
   printf "\n"
   warn "Release bundle unavailable for ${1}."
-  printf "  ${DIM}Fallbacks:${R}\n"
-  printf "    npm install -g @grclanker/cli\n"
-  printf "    bun install -g @grclanker/cli\n"
+  source_instructions
   printf "\n"
   fail "Install aborted."
 }

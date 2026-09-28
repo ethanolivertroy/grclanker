@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "hackIDLE" }
+$RepoOwner = if ($env:GRCLANKER_REPO_OWNER) { $env:GRCLANKER_REPO_OWNER } else { "ethanolivertroy" }
 $RepoName = if ($env:GRCLANKER_REPO_NAME) { $env:GRCLANKER_REPO_NAME } else { "grclanker" }
 $Version = if ($Version) { $Version } elseif ($env:GRCLANKER_VERSION) { $env:GRCLANKER_VERSION } else { "latest" }
 $InstallDir = if ($env:GRCLANKER_INSTALL_DIR) { $env:GRCLANKER_INSTALL_DIR } else { Join-Path $HOME ".local\share\grclanker" }
@@ -149,9 +149,13 @@ function Get-Target {
 function Fallback-And-Fail([string]$Target) {
   Write-Host ""
   Write-Warn "Release bundle unavailable for $Target."
-  Write-Host "  Fallbacks:"
-  Write-Host "    npm install -g @grclanker/cli"
-  Write-Host "    bun install -g @grclanker/cli"
+  Write-Host "  Build from source instead (Node.js 22.19+):"
+  Write-Host "    git clone https://github.com/$RepoOwner/$RepoName.git"
+  Write-Host "    cd $RepoName"
+  Write-Host "    npm --prefix cli ci"
+  Write-Host "    npm --prefix cli run build"
+  Write-Host "    node cli/bin/grclanker.js"
+  Write-Host "  Guide: https://grclanker.com/docs/getting-started/installation/"
   throw "Install aborted."
 }
 
