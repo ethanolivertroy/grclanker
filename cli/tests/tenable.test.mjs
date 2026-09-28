@@ -864,6 +864,20 @@ test("control 1 warns when policy details are readable but the policy-name inven
   assert.match(finding.summary, /policy names are unknown/);
 });
 
+test("control 1 preserves manual review for a truncated policy-detail inventory unless a failure is proved", async () => {
+  const healthyData = await collectTenableScanProgramData(clientsFor(healthyRoutes()), { now: NOW });
+  healthyData.policyDetails.truncated = true;
+  healthyData.policyDetails.total = healthyData.policyDetails.data.length + 1;
+  assert.equal(byId(assessTenableScanProgram(healthyData, { now: NOW }), "TENABLE-01").status, "manual");
+
+  const unsafeRoutes = healthyRoutes();
+  unsafeRoutes["GET /policies/2"] = healthyPolicyDetails({ settings: { safe_checks: "no" } });
+  const unsafeData = await collectTenableScanProgramData(clientsFor(unsafeRoutes), { now: NOW });
+  unsafeData.policyDetails.truncated = true;
+  unsafeData.policyDetails.total = unsafeData.policyDetails.data.length + 1;
+  assert.equal(byId(assessTenableScanProgram(unsafeData, { now: NOW }), "TENABLE-01").status, "fail");
+});
+
 test("control 11 treats the tenant-wide All Users group as broad, alongside AllUsers and AllTags", async () => {
   const allUsersGroup = healthyRoutes();
   allUsersGroup["GET /api/v3/access-control/permissions"] = {

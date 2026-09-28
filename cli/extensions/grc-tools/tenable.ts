@@ -2896,10 +2896,15 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const scans = value("scan_count") ?? 0;
       const policies = asRecords(evidence.policies_evaluated);
       const unreadable = policies.filter((item) => ["unreadable", "unverified"].includes(asString(item.verdict) ?? "")).length;
-      if (asString(evidence.policy_details_status) !== "ok" || unreadable > 0 || (policies.length === 0 && count("scans_without_policy_id") === scans && scans > 0)) return {};
       const violations = (value("discovery_only_scans") ?? 0) === scans && scans > 0
         ? 1
         : policies.filter((item) => asString(item.verdict) === "fail").length;
+      if (
+        asString(evidence.policy_details_status) !== "ok"
+        || unreadable > 0
+        || (policies.length === 0 && count("scans_without_policy_id") === scans && scans > 0)
+        || (evidence.policy_details_truncated === true && violations === 0)
+      ) return {};
       const reviews = policies.filter((item) => asString(item.verdict) === "warn").length
         + count("scans_without_policy_id")
         + (evidence.caller_is_administrator === true ? 0 : 1)
@@ -3572,7 +3577,10 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       policy_details_http_status: data.policyDetails.httpStatus,
       policy_details_requested: data.policyDetails.data.length,
       caller_is_administrator: callerIsAdministrator,
-    }, "", { policies_status: data.policies.status }));
+    }, "", {
+      policies_status: data.policies.status,
+      policy_details_truncated: data.policyDetails.truncated,
+    }));
 
     const recurring = scans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
     const disabledRecurring = scans.filter((scan) => !scanIsEnabled(scan) && scanIsRecurring(scan));
