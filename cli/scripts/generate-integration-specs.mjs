@@ -200,6 +200,8 @@ function renderChecks(spec) {
         : derivation;
       return `| \`${check.id}\` | \`${name}\` | ${escapeCell(rendered)} |`;
     }));
+  const inputRows = spec.checks.flatMap((check) => check.evidenceFields.map((name) =>
+    `| \`${check.id}\` | \`${name}\` | ${escapeCell(check.evidenceFieldDescriptions?.[name] ?? "No portable input description was published.")} |`));
   return [
     "## Checks",
     "",
@@ -222,6 +224,14 @@ function renderChecks(spec) {
     "| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |",
     "|---|---|---|---|---|---|---|---|---|",
     ...spec.checks.map((check) => `| \`${check.id}\` | ${check.severity} | \`${check.owningTool}\` | ${listCell(check.sourceSurfaceIds)} | ${listCell(check.evidenceFields)} | ${escapeCell(check.criteria.pass)} | ${escapeCell(check.criteria.warn)} | ${escapeCell(check.criteria.fail)} | ${escapeCell(check.criteria.manual)} |`),
+    "",
+    "### Raw decision inputs",
+    "",
+    "These are primitive vendor fields, complete collector cardinalities, and operator parameters. Null means the source was missing, unreadable, denied, malformed, or not requested; it never means zero, false, or compliant.",
+    "",
+    "| Finding | Input | Primitive type, source, completeness, and null meaning |",
+    "|---|---|---|",
+    ...inputRows,
     "",
     "### Ordered decision rules",
     "",

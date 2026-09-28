@@ -2450,15 +2450,22 @@ export async function assessCloudflareIdentity(
   if (config.authMethod !== "token") {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
       "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.", 12,
-      { auth_method: config.authMethod }, cloudflareDecisionFacts(false, false, 0, 0)));
+      { auth_method: config.authMethod }, {}));
   } else if (!verify.ok) {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
       manualReason("/user/tokens/verify", "any valid API token (verify needs no extra permission)", "the token status and permission groups from the dashboard", verify.error), 12,
-      { error: verify.error }, cloudflareDecisionFacts(false, false, 0, 0)));
+      { error: verify.error }, {}));
   } else if (verifiedStatus !== "active") {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "fail",
       `The active API token reported status ${verifiedStatus ?? "unknown"} instead of active.`, 12,
-      { verified_status: verifiedStatus ?? null }, cloudflareDecisionFacts(true, true, 1, 1)));
+      { verified_status: verifiedStatus ?? null }, {
+        evidence_readable: true,
+        evidence_complete: true,
+        verified_status: verifiedStatus ?? null,
+        token_policy_count: 0,
+        write_capable_permission_group_count: 0,
+        broad_resource_policy_count: 0,
+      }));
   } else if (!tokenDetails || !tokenDetails.ok) {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
       manualReason(
@@ -2467,7 +2474,7 @@ export async function assessCloudflareIdentity(
         "the token permission groups and resource scope",
         tokenDetails && !tokenDetails.ok ? tokenDetails.error : notAttempted("getUserToken").error,
       ), 12,
-      { verified_status: verifiedStatus, token_id: verifiedId ?? null, ...(tokenDetails && !tokenDetails.ok ? { http_status: tokenDetails.status ?? null } : {}) }, cloudflareDecisionFacts(false, false, 0, 0)));
+      { verified_status: verifiedStatus, token_id: verifiedId ?? null, ...(tokenDetails && !tokenDetails.ok ? { http_status: tokenDetails.status ?? null } : {}) }, {}));
   } else {
     const broadPolicies = policies.filter((policy) => {
       const resources = asObject(policy.resources) ?? {};
@@ -2484,7 +2491,14 @@ export async function assessCloudflareIdentity(
           : `The active token is active with ${permissionGroups.length} read-only permission groups across ${policies.length} policies.`,
       12,
       { verified_status: verifiedStatus, policies: policies.length, permission_groups: permissionGroups.slice(0, 50), write_capable_groups: writeGroups.slice(0, 50), broad_resource_policies: broadPolicies.length, expires_on: asString(verified?.expires_on) ?? null },
-      cloudflareDecisionFacts(true, true, policies.length, policies.length === 0 ? 1 : 0, writeGroups.length)));
+      {
+        evidence_readable: true,
+        evidence_complete: true,
+        verified_status: verifiedStatus,
+        token_policy_count: policies.length,
+        write_capable_permission_group_count: writeGroups.length,
+        broad_resource_policy_count: broadPolicies.length,
+      }));
   }
 
   const tokenSources: Array<{ label: string; outcome: ReadOutcome<CloudflarePagedList> | undefined }> = [
@@ -3140,15 +3154,39 @@ export async function assessCloudflareTrafficControls(
     if (gatewayRules!.items.length === 0) {
       const gatewayTag = gatewayAccountOutcome!.ok ? asString(gatewayAccountOutcome!.value?.gateway_tag) : undefined;
       if (gatewayTag) {
-        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `Zero Trust Gateway is provisioned for this account (gateway_tag ${gatewayTag} from /accounts/{account_id}/gateway) but no Gateway DNS or HTTP policies exist.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: gatewayTag }, cloudflareDecisionFacts(true, true, 0, 1)));
+        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `Zero Trust Gateway is provisioned for this account (gateway_tag ${gatewayTag} from /accounts/{account_id}/gateway) but no Gateway DNS or HTTP policies exist.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: gatewayTag }, {
+          evidence_readable: true,
+          evidence_complete: true,
+          gateway_provisioned: true,
+          gateway_rule_count: 0,
+          enabled_rule_count: 0,
+          blocking_or_isolating_rule_count: 0,
+          dns_or_http_filter_present: false,
+        }));
       } else {
-        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `No Gateway rules exist and ${gatewayAccountOutcome!.ok ? "/accounts/{account_id}/gateway returned no gateway_tag" : `/accounts/{account_id}/gateway could not be read (${gatewayAccountOutcome!.error})`}. Zero Trust Gateway requires a Zero Trust subscription with the Gateway product; confirm whether Gateway is licensed and, if so, define DNS and HTTP filtering policies.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: null }));
+        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `No Gateway rules exist and ${gatewayAccountOutcome!.ok ? "/accounts/{account_id}/gateway returned no gateway_tag" : `/accounts/{account_id}/gateway could not be read (${gatewayAccountOutcome!.error})`}. Zero Trust Gateway requires a Zero Trust subscription with the Gateway product; confirm whether Gateway is licensed and, if so, define DNS and HTTP filtering policies.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: null }, {}));
       }
     } else if (blocking.length === 0 || !(filters.has("dns") || filters.has("http"))) {
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }, cloudflareDecisionFacts(true, !gatewayRules!.truncated, gatewayRules!.items.length, 1)));
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }, {
+        evidence_readable: true,
+        evidence_complete: !gatewayRules!.truncated,
+        gateway_provisioned: true,
+        gateway_rule_count: gatewayRules!.items.length,
+        enabled_rule_count: enabled.length,
+        blocking_or_isolating_rule_count: blocking.length,
+        dns_or_http_filter_present: filters.has("dns") || filters.has("http"),
+      }));
     } else {
       const partial = partialInventoryNote("Gateway rule", gatewayRules!);
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", partial ? "warn" : "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }, cloudflareDecisionFacts(true, !gatewayRules!.truncated, gatewayRules!.items.length, 0)));
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", partial ? "warn" : "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }, {
+        evidence_readable: true,
+        evidence_complete: !gatewayRules!.truncated,
+        gateway_provisioned: true,
+        gateway_rule_count: gatewayRules!.items.length,
+        enabled_rule_count: enabled.length,
+        blocking_or_isolating_rule_count: blocking.length,
+        dns_or_http_filter_present: filters.has("dns") || filters.has("http"),
+      }));
     }
   }
 

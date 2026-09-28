@@ -21,6 +21,25 @@ import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.
 
 const DOCS = "https://learn.microsoft.com/en-us/graph/api/overview";
 const ARM_DOCS = "https://learn.microsoft.com/en-us/rest/api/azure/";
+export const AZURE_GUEST_ROLE_SAME_AS_MEMBER = "a0b1b346-4d3e-4e8b-98f8-753987be4970";
+export const AZURE_GUEST_ROLE_LIMITED = "10dae51f-b6af-4016-8d66-8c2a99b929b3";
+export const AZURE_GUEST_ROLE_RESTRICTED = "2af84b1e-32c8-42b7-82bc-daa82404023b";
+export const AZURE_HIGH_PRIVILEGE_DELEGATED_SCOPES = [
+  "directory.readwrite.all",
+  "directory.accessasuser.all",
+  "rolemanagement.readwrite.directory",
+  "application.readwrite.all",
+  "mail.readwrite",
+  "mail.read",
+  "mail.send",
+  "files.readwrite.all",
+  "user.readwrite.all",
+  "group.readwrite.all",
+] as const;
+export const AZURE_ADMIN_PORTS = [22, 3389, 3306, 1433] as const;
+export const AZURE_SECURE_SCORE_PASS_RATIO = 0.75;
+export const AZURE_SECURE_SCORE_WARN_RATIO = 0.5;
+export const AZURE_MIN_RETENTION_DAYS = 90;
 const surfaces = [
   restSurface("conditional-access", "/v1.0/identity/conditionalAccess/policies", "Microsoft Graph", DOCS, ["id", "displayName", "state", "conditions", "grantControls"]),
   restSurface("security-defaults", "/v1.0/policies/identitySecurityDefaultsEnforcementPolicy", "Microsoft Graph", DOCS, ["isEnabled"]),
@@ -416,7 +435,10 @@ export const AZURE_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Honor bounded Retry-After and use bounded exponential retry; exhausted reads remain unreadable.",
   },
   runtimeBehavior: AZURE_RUNTIME_BEHAVIOR,
-  knownGaps: ["Certificate authentication, managed identity, several mailbox and device surfaces, alternate reporters, and standalone binaries are not shipped."],
+  knownGaps: [
+    "Current-runtime limitation preserved for parity: AZURE-MON-06 caps pass only when the Log Analytics workspace inventory is truncated; truncation of diagnostic settings alone does not cap the finding. A runtime follow-up must make both dependencies completeness-gating.",
+    "Certificate authentication, managed identity, several mailbox and device surfaces, alternate reporters, and standalone binaries are not shipped.",
+  ],
   sensitiveFields: ["client_secret", "graph_token", "management_token", "access_token", "authorization", "cookie"],
   credentialFormats: ["Microsoft OAuth bearer tokens", "OAuth client secrets", "Azure CLI token output"],
   output: buildBatchOutputContract({

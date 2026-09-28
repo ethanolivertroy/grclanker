@@ -28,7 +28,17 @@ import {
   AZURE_AUTH_RESOLVER,
   readResolverEnvironment,
 } from "./auth-resolver-contracts.js";
-import { AZURE_SPEC } from "./azure.spec.js";
+import {
+  AZURE_ADMIN_PORTS as ADMIN_PORTS,
+  AZURE_GUEST_ROLE_LIMITED as GUEST_ROLE_LIMITED,
+  AZURE_GUEST_ROLE_RESTRICTED as GUEST_ROLE_RESTRICTED,
+  AZURE_GUEST_ROLE_SAME_AS_MEMBER as GUEST_ROLE_SAME_AS_MEMBER,
+  AZURE_HIGH_PRIVILEGE_DELEGATED_SCOPES as HIGH_PRIVILEGE_DELEGATED_SCOPES,
+  AZURE_MIN_RETENTION_DAYS as MIN_RETENTION_DAYS,
+  AZURE_SECURE_SCORE_PASS_RATIO,
+  AZURE_SECURE_SCORE_WARN_RATIO,
+  AZURE_SPEC,
+} from "./azure.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -41,7 +51,6 @@ const DEFAULT_MAX_MAILBOXES = 100;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const STALE_GUEST_DAYS = 90;
-const MIN_RETENTION_DAYS = 90;
 const LONG_LIVED_CREDENTIAL_DAYS = 730;
 const SECURITY_DEFAULTS_ENDPOINT = "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy";
 const MESSAGE_RULES_ENDPOINT = "GET /v1.0/users/{id}/mailFolders/inbox/messageRules";
@@ -200,32 +209,12 @@ const PRIVILEGED_ROLE_TEMPLATE_IDS = new Map<string, string>([
   ["b1be1c3e-b65d-4f19-8427-f6fa0d97feb9", "conditional access administrator"],
 ]);
 
-/** guestUserRoleId values, https://learn.microsoft.com/en-us/graph/api/resources/authorizationpolicy?view=graph-rest-1.0 */
-const GUEST_ROLE_SAME_AS_MEMBER = "a0b1b346-4d3e-4e8b-98f8-753987be4970";
-const GUEST_ROLE_LIMITED = "10dae51f-b6af-4016-8d66-8c2a99b929b3";
-const GUEST_ROLE_RESTRICTED = "2af84b1e-32c8-42b7-82bc-daa82404023b";
-
 /** Built-in policy definition IDs, https://learn.microsoft.com/en-us/azure/governance/policy/samples/built-in-policies */
 const MANDATORY_POLICY_DEFINITIONS: Array<{ id: string; name: string }> = [
   { id: "e56962a6-4747-49cd-b67b-bf8b01975c4c", name: "Allowed locations" },
   { id: "871b6d14-10aa-478d-b590-94f262ecfa99", name: "Require a tag on resources" },
   { id: "cccc23c7-8427-4f53-ad12-b6a63eb452b3", name: "Allowed virtual machine size SKUs" },
 ];
-
-const HIGH_PRIVILEGE_DELEGATED_SCOPES = [
-  "directory.readwrite.all",
-  "directory.accessasuser.all",
-  "rolemanagement.readwrite.directory",
-  "application.readwrite.all",
-  "mail.readwrite",
-  "mail.read",
-  "mail.send",
-  "files.readwrite.all",
-  "user.readwrite.all",
-  "group.readwrite.all",
-];
-
-const ADMIN_PORTS = [22, 3389, 3306, 1433];
 
 export interface AzureResolvedConfig {
   tenantId: string;
@@ -2823,7 +2812,7 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
     findings.push(manualForError("AZURE-MON-01", 3, "Secure Score posture", "medium", "GET /v1.0/security/secureScores", "SecurityEvents.Read.All", "the Microsoft Secure Score dashboard export", secureScores, AZURE_ENDPOINT_DOCS.secureScores, errors));
   } else {
     findings.push(finding("AZURE-MON-01", 3, "Secure Score posture", "medium",
-      maxScoreValue <= 0 ? "manual" : secureScoreRatio >= 0.75 ? "pass" : secureScoreRatio >= 0.5 ? "warn" : "fail",
+      maxScoreValue <= 0 ? "manual" : secureScoreRatio >= AZURE_SECURE_SCORE_PASS_RATIO ? "pass" : secureScoreRatio >= AZURE_SECURE_SCORE_WARN_RATIO ? "warn" : "fail",
       maxScoreValue > 0
         ? `Current Secure Score is ${currentScoreValue}/${maxScoreValue} (${Math.round(secureScoreRatio * 100)}%).`
         : "Secure Score returned no scored records; collect the Secure Score dashboard manually.",
@@ -2893,7 +2882,7 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
           ? "The diagnostic settings reference workspaces outside this subscription; collect their retentionInDays manually."
           : `${compliant.length}/${retention.length} linked Log Analytics workspaces retain data for ${MIN_RETENTION_DAYS}+ days.${partialNote(workspaces.value, "workspaces")}`,
       { workspaces: retention, minimum_days: MIN_RETENTION_DAYS },
-      { readable: true, complete: !diagnosticSettings.value.truncated && !workspaces.value.truncated, inventory_count: retention.length, destination_workspace_count: workspaceIds.size, linked_workspace_count: linked.length, workspace_retention_at_least_minimum_count: compliant.length }));
+      { readable: true, complete: !workspaces.value.truncated, inventory_count: retention.length, destination_workspace_count: workspaceIds.size, linked_workspace_count: linked.length, workspace_retention_at_least_minimum_count: compliant.length }));
   }
 
   findings.push(finding("AZURE-MON-07", 19, "Entra ID audit log export", "medium", "manual",
@@ -3340,7 +3329,13 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
         : exposed.length > 0
           ? `${exposed.length} inbound Allow rules expose ports ${ADMIN_PORTS.join("/")} to any source across ${nsgs.value.items.length} NSGs.`
           : `No inbound Allow rule exposes ports ${ADMIN_PORTS.join("/")} to any source across ${nsgs.value.items.length} NSGs.${partialNote(nsgs.value, "NSGs")}`,
-      { network_security_groups: nsgs.value.items.length, exposed_rules: exposed.slice(0, 25), admin_ports: ADMIN_PORTS, ...pageEvidence(nsgs.value) }));
+      { network_security_groups: nsgs.value.items.length, exposed_rules: exposed.slice(0, 25), admin_ports: ADMIN_PORTS, ...pageEvidence(nsgs.value) },
+      {
+        readable: true,
+        complete: !nsgs.value.truncated,
+        inventory_count: nsgs.value.items.length,
+        exposed_rule_count: exposed.length,
+      }));
   }
 
   const flowLogPages: AzurePage[] = [];

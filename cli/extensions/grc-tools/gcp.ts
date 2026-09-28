@@ -1929,13 +1929,7 @@ function manualFinding(
   manualEvidence: string,
   evidence: JsonRecord = {},
 ): GcpFinding {
-  const status = gcpVerdictStatus(id, {
-    evidence_readable: false,
-    evidence_complete: false,
-    inventory_count: 0,
-    violation_count: 0,
-    review_count: 0,
-  });
+  const status = gcpVerdictStatus(id, {});
   return {
     id,
     title,
@@ -2958,9 +2952,7 @@ function orgPolicyFinding(
     status: gcpVerdictStatus(id, {
       evidence_readable: true,
       evidence_complete: !view.partial,
-      inventory_count: 1,
-      violation_count: enabled ? 0 : 1,
-      review_count: 0,
+      policy_enabled: enabled,
     }),
     summary: enabled ? `${passSummary}${view.note}` : `${failSummary}${view.note}`,
     evidence: { policy: snapshotOrgPolicy(read.policy.data), partial: view.partial, unreadable_inventories: view.unreadable },
@@ -3137,12 +3129,8 @@ export async function assessGcpOrgGuardrails(
           status: gcpVerdictStatus("GCP-ORG-05", {
             evidence_readable: true,
             evidence_complete: !policyView.partial,
-            inventory_count: 2,
-            violation_count: interpretOrgPolicyEnabled(serialPortPolicy.policy.data)
-              || interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data) ? 0 : 1,
-            review_count: computeGuardrailsEnforced
-              || (!interpretOrgPolicyEnabled(serialPortPolicy.policy.data)
-                && !interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data)) ? 0 : 1,
+            serial_port_access_disabled: interpretOrgPolicyEnabled(serialPortPolicy.policy.data),
+            shielded_vm_required: interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data),
           }),
           summary: computeGuardrailsEnforced
             ? `constraints/compute.disableSerialPortAccess and constraints/compute.requireShieldedVm are both enforced in the effective policy of the sampled project.${policyView.note}`

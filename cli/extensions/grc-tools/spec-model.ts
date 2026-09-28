@@ -118,7 +118,8 @@ export interface DerivedFactRule {
 export type VerdictOperand =
   | { kind: "value"; value: PortableValue }
   | { kind: "path"; path: string; fallback?: PortableValue }
-  | { kind: "length"; path: string };
+  | { kind: "length"; path: string }
+  | { kind: "subtract"; left: VerdictOperand; right: VerdictOperand };
 
 export type VerdictCondition =
   | { op: "always" }
@@ -153,6 +154,7 @@ export interface CheckContract {
   owningTool: string;
   sourceSurfaceIds: readonly string[];
   evidenceFields: readonly string[];
+  evidenceFieldDescriptions?: Readonly<Record<string, string>>;
   derivedFacts: Readonly<Record<string, string>>;
   derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   criteria: VerdictCriteria;
@@ -327,6 +329,13 @@ function operandValue(operand: VerdictOperand, facts: VerdictFacts, item: unknow
       const value = pathValue(facts, operand.path, item);
       return Array.isArray(value) || typeof value === "string" ? value.length : undefined;
     }
+    case "subtract": {
+      const left = operandValue(operand.left, facts, item);
+      const right = operandValue(operand.right, facts, item);
+      if (left === null || left === undefined || right === null || right === undefined) return undefined;
+      const result = Number(left) - Number(right);
+      return Number.isFinite(result) ? result : undefined;
+    }
     default: {
       const unhandled: never = operand;
       return unhandled;
@@ -422,6 +431,8 @@ function renderOperand(operand: VerdictOperand): string {
       return `\`${operand.path}\`${"fallback" in operand ? ` (default ${JSON.stringify(operand.fallback)})` : ""}`;
     case "length":
       return `length of \`${operand.path}\``;
+    case "subtract":
+      return `(${renderOperand(operand.left)} minus ${renderOperand(operand.right)})`;
     default: {
       const unhandled: never = operand;
       return String(unhandled);
@@ -483,7 +494,19 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
 }
 
 function operandPaths(operand: VerdictOperand): string[] {
-  return operand.kind === "path" || operand.kind === "length" ? [operand.path] : [];
+  switch (operand.kind) {
+    case "path":
+    case "length":
+      return [operand.path];
+    case "subtract":
+      return [...operandPaths(operand.left), ...operandPaths(operand.right)];
+    case "value":
+      return [];
+    default: {
+      const unhandled: never = operand;
+      return [String(unhandled)];
+    }
+  }
 }
 
 export function verdictConditionPaths(condition: VerdictCondition): string[] {

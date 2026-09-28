@@ -397,6 +397,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       ? Object.keys(check.decisionInputs)
       : [...new Set(check.evidenceFields.flatMap((field) =>
         definition.surfaces.find((surface) => surface.id === field)?.fields ?? [field]))],
+    ...(check.decisionInputs ? { evidenceFieldDescriptions: check.decisionInputs } : {}),
     derivedFacts: check.decisionInputs
       ? Object.fromEntries(Object.entries(check.derivedFactRules ?? {}).map(([name, rule]) => [name, rule.description]))
       : {

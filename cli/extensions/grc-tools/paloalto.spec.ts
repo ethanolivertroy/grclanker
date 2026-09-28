@@ -6,10 +6,14 @@ import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2Defined,
   batch2Eq,
   batch2Gt,
   batch2Ne,
+  batch2Not,
+  batch2Path,
   batch2Rule,
+  batch2Value,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
@@ -86,6 +90,143 @@ const completePassRules = [
   batch2Rule("manual", { op: "always" }),
 ] as const;
 
+function paloaltoDecision(control: number): Partial<Pick<Batch2CheckRow, "decisionInputs" | "decisionRules" | "constants">> | undefined {
+  if (control === 1) {
+    return {
+      constants: { warning_margin_percentage_points: 20 },
+      decisionInputs: {
+        evidence_readable: "Boolean. True only when the Prisma compliance posture summary was readable.",
+        evidence_complete: "Boolean. True only when the posture inventory was complete; false means the result is partial.",
+        passed_resource_count: "Non-negative integer from summary.passedResources; null means the field was unavailable.",
+        total_resource_count: "Non-negative integer from summary.totalResources, or the complete sum of passedResources and failedResources when totalResources is absent; zero means no evaluated resources.",
+        minimum_pass_rate_percent: "Number from the minCompliancePassRate operator option after clamping to 1 through 100; the default is 90.",
+      },
+      decisionRules: [
+        batch2Rule("manual", batch2Any(
+          batch2Ne("evidence_readable", true),
+          batch2Not(batch2Defined("passed_resource_count")),
+          batch2Not(batch2Defined("total_resource_count")),
+          batch2Eq("total_resource_count", 0),
+        )),
+        batch2Rule("fail", {
+          op: "ratio",
+          numerator: batch2Path("passed_resource_count"),
+          denominator: batch2Path("total_resource_count"),
+          comparator: "lt",
+          threshold: {
+            kind: "subtract",
+            left: batch2Path("minimum_pass_rate_percent"),
+            right: batch2Path("warning_margin_percentage_points"),
+          },
+          scale: 100,
+          roundDigits: 1,
+        }),
+        batch2Rule("warn", batch2Any(
+          batch2Ne("evidence_complete", true),
+          {
+            op: "ratio",
+            numerator: batch2Path("passed_resource_count"),
+            denominator: batch2Path("total_resource_count"),
+            comparator: "lt",
+            threshold: batch2Path("minimum_pass_rate_percent"),
+            scale: 100,
+            roundDigits: 1,
+          },
+        )),
+        batch2Rule("pass", batch2All(
+          batch2Eq("evidence_readable", true),
+          batch2Eq("evidence_complete", true),
+          {
+            op: "ratio",
+            numerator: batch2Path("passed_resource_count"),
+            denominator: batch2Path("total_resource_count"),
+            comparator: "gte",
+            threshold: batch2Path("minimum_pass_rate_percent"),
+            scale: 100,
+            roundDigits: 1,
+          },
+        )),
+        batch2Rule("manual", { op: "always" }),
+      ],
+    };
+  }
+  if (control === 19) {
+    return {
+      decisionInputs: {
+        evidence_readable: "Boolean. True only when every configured Prisma role and PAN-OS administrator/password-complexity surface used here was readable.",
+        evidence_complete: "Boolean. False when a configured product inventory was truncated or contained unevaluable records.",
+        panos_configured: "Boolean derived only from whether at least one PAN-OS device snapshot was configured.",
+        prisma_configured: "Boolean derived only from whether a Prisma Cloud snapshot was configured.",
+        panos_administrator_count: "Complete count of PAN-OS administrator entries before presentation slicing.",
+        panos_superuser_count: "Complete count of administrator entries whose role resolves to superuser.",
+        maximum_superuser_count: "Integer operator threshold maxSuperusers after clamping to 0 through 1000; default 3.",
+        password_complexity_disabled_device_count: "Count of configured PAN-OS devices where password-complexity enabled is not exactly yes.",
+        local_password_only_administrator_count: "Count of administrators with a local password and neither authentication profile nor public key.",
+        prisma_system_admin_role_count: "Count of Prisma roles whose roleType or name matches System Admin.",
+        prisma_role_count: "Complete count of Prisma user roles before presentation slicing.",
+      },
+      decisionRules: [
+        batch2Rule("manual", batch2Any(
+          batch2Ne("evidence_readable", true),
+          batch2All(batch2Eq("panos_configured", true), batch2Eq("panos_administrator_count", 0)),
+        )),
+        batch2Rule("fail", batch2All(
+          batch2Eq("panos_configured", true),
+          batch2Any(
+            { op: "gt", left: batch2Path("panos_superuser_count"), right: batch2Path("maximum_superuser_count") },
+            batch2Gt("password_complexity_disabled_device_count", 0),
+          ),
+        )),
+        batch2Rule("warn", batch2Any(
+          batch2Ne("evidence_complete", true),
+          batch2Gt("local_password_only_administrator_count", 0),
+          batch2Ne("panos_configured", true),
+          batch2Ne("prisma_configured", true),
+          batch2All(batch2Eq("prisma_configured", true), batch2Any(
+            { op: "gt", left: batch2Path("prisma_system_admin_role_count"), right: batch2Path("maximum_superuser_count") },
+            batch2Eq("prisma_role_count", 0),
+          )),
+        )),
+        batch2Rule("pass", { op: "always" }),
+      ],
+    };
+  }
+  if (control === 20) {
+    return {
+      decisionInputs: {
+        evidence_readable: "Boolean. True only when every configured Prisma integration and PAN-OS security-rule/log-forwarding surface was readable.",
+        evidence_complete: "Boolean. False when a configured product inventory was truncated or contained unevaluable records.",
+        panos_configured: "Boolean derived only from whether at least one PAN-OS device snapshot was configured.",
+        prisma_configured: "Boolean derived only from whether a Prisma Cloud snapshot was configured.",
+        enabled_security_rule_count: "Complete count of PAN-OS security rules not explicitly disabled.",
+        log_end_disabled_rule_count: "Count of enabled rules whose log-end value is exactly no.",
+        implicit_log_end_rule_count: "Count of enabled rules with no explicit log-end value.",
+        rule_without_forwarding_profile_count: "Count of enabled rules with no log forwarding profile.",
+        external_forwarding_configured: "Boolean: true when at least one syslog server profile or Panorama forwarding setting exists.",
+        prisma_siem_integration_count: "Count of Prisma integrations whose documented type or name identifies Splunk, SIEM, syslog, QRadar, Sentinel, webhook, SQS, Pub/Sub, ServiceNow, or SNOW.",
+      },
+      decisionRules: [
+        batch2Rule("manual", batch2Ne("evidence_readable", true)),
+        batch2Rule("fail", batch2All(batch2Eq("panos_configured", true), batch2Any(
+          batch2Gt("log_end_disabled_rule_count", 0),
+          batch2Eq("external_forwarding_configured", false),
+        ))),
+        batch2Rule("warn", batch2Any(
+          batch2Ne("evidence_complete", true),
+          batch2Ne("panos_configured", true),
+          batch2Ne("prisma_configured", true),
+          batch2Eq("enabled_security_rule_count", 0),
+          batch2Gt("implicit_log_end_rule_count", 0),
+          batch2Gt("rule_without_forwarding_profile_count", 0),
+          batch2All(batch2Eq("prisma_configured", true), batch2Eq("prisma_siem_integration_count", 0)),
+        )),
+        batch2Rule("pass", { op: "always" }),
+      ],
+    };
+  }
+  return undefined;
+}
+
 const checks = batch2Checks(titles.map((title, index) => {
   const control = index + 1;
   const decisionRules = control === 10 || control === 25
@@ -94,16 +235,7 @@ const checks = batch2Checks(titles.map((title, index) => {
         batch2Rule("fail", batch2Gt("violation_count", 0)),
         ...completePassRules,
       ]
-    : control === 19
-      ? [
-          batch2Rule("manual", batch2Any(
-            batch2Ne("evidence_readable", true),
-            batch2Eq("inventory_count", 0),
-          )),
-          batch2Rule("fail", batch2Gt("violation_count", 0)),
-          ...completePassRules,
-        ]
-      : undefined;
+    : undefined;
   return {
     id: `PA-${String(control).padStart(2, "0")}`,
     control,
@@ -113,6 +245,7 @@ const checks = batch2Checks(titles.map((title, index) => {
     surfaces: sourceSurfaces(control),
     emptyOutcome: "manual" as const,
     decisionRules,
+    ...paloaltoDecision(control),
     decision: `Evaluate ${title} from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation.`,
   };
 }));
