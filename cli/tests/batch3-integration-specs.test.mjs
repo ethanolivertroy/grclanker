@@ -276,14 +276,22 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
         if (typeof value === "number") {
           const node = nodes.find((candidate) =>
             ["gt", "gte", "lt", "lte"].includes(candidate.op)
-            && (path(candidate.left) === constant || path(candidate.right) === constant));
+              ? path(candidate.left) === constant || path(candidate.right) === constant
+              : candidate.op === "ratio" && path(candidate.threshold) === constant);
           assert.ok(node, `${check.id}.${constant}: executable comparison`);
-          const observed = path(node.left) === constant ? path(node.right) : path(node.left);
+          const observed = node.op === "ratio"
+            ? path(node.numerator)
+            : path(node.left) === constant ? path(node.right) : path(node.left);
           assert.ok(observed && check.evidenceFields.includes(observed), `${check.id}.${constant}: raw observed fact`);
           const delta = Number.isInteger(value) ? 1 : 0.01;
-          const outcomes = [value - delta, value, value + delta].map((observedValue) =>
+          const denominator = node.op === "ratio" ? 100 : 1;
+          const scale = node.op === "ratio" ? node.scale ?? 1 : 1;
+          if (node.op === "ratio") baseline[path(node.denominator)] = denominator;
+          const observedValues = [value - delta, value, value + delta]
+            .map((boundaryValue) => boundaryValue * denominator / scale);
+          const outcomes = observedValues.map((observedValue) =>
             evaluateBatchRuntimeCheckVerdict(spec, check.id, { ...baseline, [observed]: observedValue }));
-          const matches = [value - delta, value, value + delta].map((observedValue) =>
+          const matches = observedValues.map((observedValue) =>
             evaluateVerdictCondition(node, { ...check.criteria.constants, ...baseline, [observed]: observedValue }));
           assert.ok(new Set(matches).size > 1, `${check.id}.${constant}: below/equal/above branch transition`);
           assert.ok(new Set(outcomes).size > 1, `${check.id}.${constant}: below/equal/above outcome transition`);
