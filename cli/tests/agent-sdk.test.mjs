@@ -28,7 +28,6 @@ import {
   buildSdkToolConfig,
   executeGrcTool,
   grclankerToolConfig,
-  prepareGrcToolArguments,
 } from "../dist/agent-sdk/lib/tools.js";
 import { clearFedrampCachesForTests } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/extensions/grc-tools/shared.js";
@@ -204,7 +203,7 @@ test("every registered tool converts to a plain object input schema without cons
   }
 });
 
-test("LaunchDarkly list arguments stay schema-shaped through prepareArguments", () => {
+test("LaunchDarkly list arguments stay schema-shaped through the Agent SDK adapter", async () => {
   const cases = [
     ["launchdarkly_assess_identity", { allowed_domains: "example.com, example.org" }],
     ["launchdarkly_assess_environment_governance", { project_keys: "web, mobile" }],
@@ -219,14 +218,24 @@ test("LaunchDarkly list arguments stay schema-shaped through prepareArguments", 
 
   for (const [name, listInput] of cases) {
     const tool = getRegisteredGrcTool(name);
-    assert.doesNotThrow(
-      () => prepareGrcToolArguments(tool, `${name}-omitted`, {}),
-      `${name} must accept omitted optional list arguments`,
-    );
+    const executed = [];
+    const config = buildSdkToolConfig({
+      ...tool,
+      async execute(_toolCallId, args) {
+        executed.push(args);
+        return { content: [{ type: "text", text: "accepted" }] };
+      },
+    });
 
-    const prepared = prepareGrcToolArguments(tool, `${name}-comma-separated`, listInput);
+    for (const [label, input] of [["omitted", {}], ["comma-separated", listInput]]) {
+      const result = await config.execute(input, { toolCallId: `${name}-${label}` });
+      assert.equal(result.isError, undefined, `${name} must accept ${label} optional list arguments`);
+      assert.equal(result.content[0].text, "accepted");
+    }
+
+    assert.equal(executed.length, 2);
     for (const [key, value] of Object.entries(listInput)) {
-      assert.equal(prepared[key], value, `${name}.${key} must remain a schema-valid string until execute`);
+      assert.equal(executed[1][key], value, `${name}.${key} must remain a schema-valid string until execute`);
     }
   }
 });
