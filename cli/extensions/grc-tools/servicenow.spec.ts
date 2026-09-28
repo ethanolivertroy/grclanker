@@ -362,7 +362,9 @@ const SERVICENOW_EXECUTABLE_DECISIONS: Readonly<Record<string, ServicenowExecuta
   },
   "SNOW-13": propertyDecision(),
   "SNOW-14": {
-    inputs: input("readable", "complete", "integration_user_count", "admin_integration_count", "privileged_assignment_count"),
+    inputs: inputWith({
+      privileged_assignment_count: "Non-negative cardinality of privileged role assignments held by integration users whose projected `user.web_service_access_only` or `user.internal_integration_user` field is true.",
+    }, "readable", "complete", "integration_user_count", "admin_integration_count", "privileged_assignment_count"),
     rules: [rule("manual", ne("readable", true)), rule("fail", gt("admin_integration_count", 0)), rule("manual", eq("integration_user_count", 0)), rule("warn", any(gt("privileged_assignment_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
   },
   "SNOW-15": {

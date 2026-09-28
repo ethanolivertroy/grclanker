@@ -440,7 +440,10 @@ export const SLACK_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Honor Retry-After up to the runtime bound and retry 429 responses twice; exhausted reads stay explicit.",
   },
   runtimeBehavior: SLACK_RUNTIME_BEHAVIOR,
-  knownGaps: ["Discovery DLP details, guest expiry, several workspace restrictions, and standalone reporters remain unavailable."],
+  knownGaps: [
+    "Discovery DLP details, guest expiry, several workspace restrictions, and standalone reporters remain unavailable.",
+    "SLACK-ID-04 preserves the runtime's username-first SCIM matcher: when SCIM userName is a Slack handle, the primary email is not consulted, so a lifecycle mismatch may remain unmatched.",
+  ],
   sensitiveFields: ["token", "scimToken", "authorization", "cookie", "webhook_url"],
   credentialFormats: ["xoxb, xoxp, xoxe, and xapp token families", "SCIM bearer tokens", "webhook path secrets"],
   output: buildBatchOutputContract({

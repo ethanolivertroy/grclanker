@@ -19,7 +19,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "f129d63dda795997e3263499ae2e42b455d36bd6";
+const baselineRef = "ec0a666c9bd0f3b9a37eecb051e960c8437dde50";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
