@@ -309,6 +309,51 @@ test("executeGrcTool returns error envelopes for invalid arguments and thrown er
   });
 });
 
+test("executeGrcTool withholds echoed arguments and credentials from every error envelope", async () => {
+  const credentialSentinel = "agent-sdk-credential-sentinel-6228";
+  const argumentSentinel = "agent-sdk-argument-sentinel-6228";
+  const parameters = Type.Object({
+    api_token: Type.String(),
+    query: Type.String(),
+    limit: Type.Optional(Type.Number()),
+  });
+  const { tool: validating } = fakeTool({ parameters });
+
+  const invalid = await executeGrcTool(
+    validating,
+    { api_token: credentialSentinel, query: argumentSentinel, limit: "not-a-number" },
+    { toolCallId: "call_validation_redaction" },
+  );
+  const invalidEnvelope = JSON.stringify(invalid);
+
+  assert.equal(invalid.isError, true);
+  assert.match(invalid.content[0].text, /limit: must be number/);
+  assert.doesNotMatch(invalidEnvelope, /Received arguments:/);
+  assert.ok(!invalidEnvelope.includes(credentialSentinel));
+  assert.ok(!invalidEnvelope.includes(argumentSentinel));
+
+  const { tool: throwing } = fakeTool({
+    parameters,
+    async execute(_toolCallId, args) {
+      throw new Error(
+        `credential rejected: ${args.api_token}\n\nReceived arguments:\n${JSON.stringify(args)}`,
+      );
+    },
+  });
+  const thrown = await executeGrcTool(
+    throwing,
+    { api_token: credentialSentinel, query: argumentSentinel },
+    { toolCallId: "call_execution_redaction" },
+  );
+  const thrownEnvelope = JSON.stringify(thrown);
+
+  assert.equal(thrown.isError, true);
+  assert.match(thrown.content[0].text, /credential rejected: \[redacted\]/);
+  assert.doesNotMatch(thrownEnvelope, /Received arguments:/);
+  assert.ok(!thrownEnvelope.includes(credentialSentinel));
+  assert.ok(!thrownEnvelope.includes(argumentSentinel));
+});
+
 test("executeGrcTool disables persistent caches only for dry-run sessions", async () => {
   const observed = [];
   const { tool } = fakeTool({
