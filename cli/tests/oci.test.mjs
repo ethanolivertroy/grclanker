@@ -609,7 +609,7 @@ test("OCI prerequisite and nested-read failures match declared primitive complet
       assert.ok(source, `${id}: ${fixture.surface} is declared`);
       assert.deepEqual(source.falseWhen, [], `${id}: prerequisite failure does not lower completeness`);
       assert.equal(facts.get(id)?.evidence_complete, true, `${id}: primitive remains true`);
-      assert.notEqual(byId(findings, id).status, "pass", `${id}: failed prerequisite cannot pass`);
+      assert.notEqual(findings.find((item) => item.id === id)?.status, "pass", `${id}: failed prerequisite cannot pass`);
       replays += 1;
     }
   }

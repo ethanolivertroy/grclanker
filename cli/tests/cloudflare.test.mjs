@@ -1128,14 +1128,16 @@ test("CF-IAM-06 treats token-list 404 as complete safe-empty evidence and other 
     async listUserTokens() { return userTokens; },
     async listAccountTokens() { return accountTokens; },
   })));
-  const safeFacts = safeEmpty.captures.find((capture) => capture.integration === CLOUDFLARE_SPEC.identity.slug)?.checks.get("CF-IAM-06");
+  const safeFacts = safeEmpty.captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
   assert.equal(safeFacts?.evidence_complete, true);
   assert.equal(byId(safeEmpty.result, "CF-IAM-06").status, "pass");
 
   const failed = await captureBatchDecisionFacts(() => assessCloudflareIdentity(fixtureClient("compliant", {
     async listUserTokens() { throw forbidden("/user/tokens"); },
   })));
-  const failedFacts = failed.captures.find((capture) => capture.integration === CLOUDFLARE_SPEC.identity.slug)?.checks.get("CF-IAM-06");
+  const failedFacts = failed.captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
   assert.equal(failedFacts?.evidence_complete, false);
   assert.equal(byId(failed.result, "CF-IAM-06").status, "warn");
 });
@@ -1145,17 +1147,28 @@ test("CF-TRF-06 preserves the unpaginated Gateway-rules limitation in facts and 
     CLOUDFLARE_COMPLETENESS_SOURCES["CF-TRF-06"].find((entry) => entry.surfaceId === "gateway-rules")?.falseWhen,
     [],
   );
+  const gatewayClient = new CloudflareApiClient(sampleConfig(), {
+    fetchImpl: fakeFetch(() => ({
+      payload: {
+        success: true,
+        result: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
+        result_info: { page: 1, per_page: 1, total_pages: 2, total_count: 2 },
+      },
+    })).fetchImpl,
+  });
+  const firstPage = await gatewayClient.listGatewayRules();
+  assert.deepEqual(firstPage, {
+    items: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
+    truncated: false,
+    totalCount: 1,
+  });
   const { result, captures } = await captureBatchDecisionFacts(() => assessCloudflareTrafficControls(fixtureClient("compliant", {
     async listGatewayRules() {
-      return {
-        items: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
-        truncated: true,
-        seen: 1,
-        totalCount: 2,
-      };
+      return firstPage;
     },
   })));
-  const facts = captures.find((capture) => capture.integration === CLOUDFLARE_SPEC.identity.slug)?.checks.get("CF-TRF-06");
+  const facts = captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-TRF-06"))?.checks.get("CF-TRF-06");
   assert.equal(facts?.evidence_complete, true);
   assert.equal(byId(result, "CF-TRF-06").status, "pass");
 });

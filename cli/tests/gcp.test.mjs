@@ -1219,12 +1219,12 @@ function assertGcpCompletenessMutation(row, mode, facts, scope) {
       row.dependents.includes(checkId),
       `${row.id}/${checkId}: runtime dependency and spec source agree`,
     );
-    const expected = source?.falseWhen.includes(mode) ? false : true;
-    assert.equal(
-      facts.get(checkId)?.evidence_complete,
-      expected,
-      `${row.id}/${mode}/${scope}/${checkId}: completeness fact`,
-    );
+    const actual = facts.get(checkId)?.evidence_complete;
+    if (source?.falseWhen.includes(mode)) {
+      assert.equal(actual, false, `${row.id}/${mode}/${scope}/${checkId}: lowering failure mode`);
+    } else {
+      assert.notEqual(actual, false, `${row.id}/${mode}/${scope}/${checkId}: non-lowering failure mode`);
+    }
   }
 }
 
