@@ -100,9 +100,38 @@ test("kevs_search output is unchanged when the cap does not remove results", asy
   assert.deepEqual(fewMatches.result.details, { query: "acme", count: 3 });
 });
 
-test("kevs_search advertises the result cap in its limit schema", async () => {
+test("kevs_search treats zero, negative, and sub-1 limits as the default of 10", async () => {
+  for (const limit of [0, -1, -10000, 0.5, "0", "-1"]) {
+    const { result, text } = await runSearch({ query: "acme", limit }, 120);
+    const label = `limit ${JSON.stringify(limit)}`;
+    assert.ok(text.startsWith('Found 10 KEV entries matching "acme" (catalog size: 120):\n\n'), label);
+    assert.equal(text.split("\n\n").length, 11, label);
+    assert.equal(text.split("\n\n").at(-1), expectedBlock(10), label);
+    assert.deepEqual(result.details, { query: "acme", count: 10 }, label);
+  }
+});
+
+test("kevs_search honors the smallest positive limit and truncates fractional limits", async () => {
+  const one = await runSearch({ query: "acme", limit: 1 }, 120);
+  assert.equal(one.text, `Found 1 KEV entry matching "acme" (catalog size: 120):\n\n${expectedBlock(1)}`);
+
+  const fractionalAtBound = await runSearch({ query: "acme", limit: 50.9 }, 120);
+  assert.ok(fractionalAtBound.text.startsWith('Found 50 KEV entries matching "acme" (catalog size: 120):\n\n'));
+  assert.deepEqual(fractionalAtBound.result.details, { query: "acme", count: 50 });
+
+  const justOver = await runSearch({ query: "acme", limit: 51 }, 120);
+  assert.ok(justOver.text.startsWith("Showing 50 of 120 KEV entries"));
+  assert.deepEqual(justOver.result.details, { query: "acme", count: 50, total_matches: 120, capped: true });
+});
+
+test("kevs_search advertises both limit bounds in its schema", async () => {
   const { tool } = await runSearch({ query: "acme" }, 1);
   const limit = tool.parameters.properties.limit;
   assert.equal(limit.default, 10);
-  assert.match(limit.description, /Values above 50 are capped at 50/);
+  assert.equal(
+    limit.description,
+    "Maximum results to show (default: 10). Values below 1 use the default; values above 50 are capped at 50, so narrow the query instead of raising it.",
+  );
+  assert.equal(limit.minimum, undefined, "out-of-range limits are normalized, not rejected by schema validation");
+  assert.equal(limit.maximum, undefined, "out-of-range limits are normalized, not rejected by schema validation");
 });
