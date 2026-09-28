@@ -102,7 +102,7 @@ export const CLOUDFLARE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly B
   "CF-TRF-03": zoneCompleteness(),
   "CF-TRF-04": [cfSource("account-audit-logs", CT)],
   "CF-TRF-05": [cfSource("account-ip-access-rules", CT)],
-  "CF-TRF-06": [cfSource("gateway-rules", CT), cfSource("gateway-account", CN)],
+  "CF-TRF-06": [cfSource("gateway-rules", CN), cfSource("gateway-account", CN)],
 };
 
 function owner(id: string): string {
@@ -127,7 +127,7 @@ const decisionPredicate: Readonly<Record<string, string>> = {
   "CF-IAM-03": `Fail when the complete active-member inventory contains more Super Administrator roles than max_super_admins. The operator option defaults to ${CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS} and is clamped to the inclusive range 0 through 100; warn for members whose two-factor authentication field is not true.`,
   "CF-IAM-04": "Fail when an Access application has no attached or reusable policy or any policy decision is bypass; pass only after both complete application and policy inventories establish coverage without bypass.",
   "CF-IAM-05": `Fail when the complete identity-provider inventory is empty or every lowercased provider type is ${CLOUDFLARE_WEAK_IDENTITY_PROVIDER_TYPES.join(" or ")}; warn when one of those weak types coexists with any other provider type.`,
-  "CF-IAM-06": "Fail for active API tokens with no expires_on or an expires_on in the past; warn for undocumented token status or active tokens with no last_used_on.",
+  "CF-IAM-06": "Fail for active API tokens with no expires_on or an expires_on in the past; warn for undocumented token status or active tokens with no last_used_on. HTTP 404 from either token-list endpoint is normalized by the collector to a readable, complete empty list and is safe-empty evidence that may pass; other request failures remain unreadable.",
   "CF-ZONE-01": "For every zone, fail when the managed-firewall entry point is absent, has no enabled execute rule, or an execute rule has overrides.enabled=false.",
   "CF-ZONE-02": "For every zone, pass only for ssl=strict, warn for full or origin_pull, fail for flexible or off, and treat every other or absent value as unreadable.",
   "CF-ZONE-03": "For every zone, pass only for min_tls_version 1.2 or 1.3, fail for 1.0 or 1.1, and treat every other or absent value as unreadable.",
@@ -201,7 +201,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
       ? {
           decisionInputs: {
             evidence_readable: "Boolean. True only when Gateway rules and, for an empty rule list, the Gateway account provisioning object were readable.",
-            evidence_complete: "Boolean. True only when Gateway rule pagination proved exhaustion.",
+            evidence_complete: "Boolean. True after the single unpaginated Gateway-rules response is readable. The runtime does not follow result_info pagination for this endpoint and therefore cannot detect omitted later pages.",
             gateway_provisioned: "Boolean. True when /accounts/{account_id}/gateway returns a non-empty gateway_tag.",
             gateway_rule_count: "Complete count of Gateway rules before presentation slicing.",
             blocking_or_isolating_rule_count: "Count of enabled rules whose action is block, isolate, or override.",
@@ -241,10 +241,10 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
       decisionInputs,
       CLOUDFLARE_COMPLETENESS_SOURCES[id],
       id.startsWith("CF-ZONE-") || ["CF-TRF-01", "CF-TRF-02", "CF-TRF-03"].includes(id)
-        ? `For ${id}, the zone inventory governs evidence_complete: truncation, error, denial, or absence makes it false. Per-zone endpoint failures instead increase manual or review counts and leave evidence_complete unchanged.`
+        ? "The zone inventory governs evidence_complete: truncation, error, denial, or absence makes it false. Per-zone endpoint failures instead increase manual or review counts and leave evidence_complete unchanged."
         : id === "CF-IAM-06"
-          ? "For CF-IAM-06, each token inventory participates only when attempted. Any attempted list that truncates or fails makes evidence_complete false; an account-token read omitted because no account context exists is not a failed source."
-          : `For ${id}, each named source changes evidence_complete only for its declared source-state failures. A primary single-object error instead makes the finding manual and omits the primitive; a source with no failure modes does not lower it.`,
+          ? "Each token inventory participates only when attempted. HTTP 404 is normalized to a readable, complete empty list and does not lower evidence_complete; truncation or any other attempted-list failure makes it false. An account-token read omitted because no account context exists is not a failed source."
+          : "Each named source changes evidence_complete only for its declared source-state failures. A primary single-object error instead makes the finding manual and omits the primitive; a source with no failure modes does not lower it.",
     ),
     decision: `${decisionPredicate[id]} ${aggregationSemantics} A proved violation has first-match precedence and incomplete or unreadable evidence cannot pass.`,
   };
@@ -280,7 +280,7 @@ export const CLOUDFLARE_SPEC = buildBatchIntegrationSpec({
     cloudflare_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [{
-    surfaceIds: surfaces.map((surface) => surface.id),
+    surfaceIds: surfaces.filter((surface) => surface.id !== "gateway-rules").map((surface) => surface.id),
     cursorFields: ["result_info.page", "result_info.total_pages", "result_info.total_count"],
     pageSize: null,
     itemCap: null,
@@ -298,6 +298,7 @@ export const CLOUDFLARE_SPEC = buildBatchIntegrationSpec({
   knownGaps: [
     "Feature and plan ambiguity is preserved as manual evidence where the API cannot distinguish an unlicensed feature from an empty configuration.",
     "The shipped runtime has no framework mapping for CF-ZONE-15 (DNS record origin exposure); this migration preserves that gap rather than inventing a control mapping.",
+    "CF-TRF-06 reads Gateway rules with one unpaginated request. The runtime does not follow result_info pagination on that endpoint, so a first page can pass without proving that all rules were evaluated.",
   ],
   sensitiveFields: ["api_token", "api_key", "authorization", "x-auth-key", "x-auth-email", "cookie"],
   credentialFormats: ["Cloudflare API tokens", "Cloudflare Global API keys", "session cookies"],

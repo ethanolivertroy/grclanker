@@ -147,7 +147,7 @@ function zscalerCompletenessSemantics(id: string): string {
         : "an error or 403 denial does not change evidence_complete";
     return `${entry.surfaceId}: ${truncated}; ${failed}`;
   });
-  return `For ${id}, product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
+  return `Product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
 }
 
 const rows: ReadonlyArray<readonly [string, Batch2CheckRow["severity"], "zia_policy" | "zia_access_control" | "zpa"]> = [

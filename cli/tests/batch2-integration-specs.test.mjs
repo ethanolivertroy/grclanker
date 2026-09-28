@@ -137,7 +137,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   }
   assert.equal(checksWithCompleteness, 156);
   assert.equal(completenessFields, 156);
-  assert.equal(sourceEntries, 272);
+  assert.equal(sourceEntries, 317);
 
   assert.deepEqual(check(AZURE_SPEC, "AZURE-MON-06").completeness.complete.sources, [
     { surfaceId: "diagnostic-settings", falseWhen: [] },
@@ -155,7 +155,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   ]);
   assert.equal(check(OCI_SPEC, "OCI-IAM-01").completeness, undefined);
   assert.deepEqual(check(PALOALTO_SPEC, "PA-21").completeness.evidence_complete.sources.map((source) => source.surfaceId), [
-    "prisma-policies", "panos-policy-config",
+    "prisma-policies", "panos-system-info", "panos-policy-config",
   ]);
   assert.match(check(PALOALTO_SPEC, "PA-19").completeness.evidence_complete.semantics, /unconfigured product is omitted/);
   assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /zia-ssl-inspection-rules: truncation leaves evidence_complete true/);
