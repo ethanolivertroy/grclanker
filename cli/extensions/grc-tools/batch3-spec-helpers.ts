@@ -441,7 +441,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
         decisionInputs,
         completenessSources,
         row.completenessSemantics
-          ? `${names.complete}: ${row.completenessSemantics}`
+          ? `${names.complete}: ${row.completenessSemantics} ${exactCompletenessSemantics}`
           : exactCompletenessSemantics,
       ),
       specificCriteria: true,
