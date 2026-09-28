@@ -25,6 +25,12 @@ export const GCP_ADMIN_PORTS = [22, 3389] as const;
 export const GCP_FLOW_LOG_UNSUPPORTED_PURPOSES = ["REGIONAL_MANAGED_PROXY", "GLOBAL_MANAGED_PROXY", "INTERNAL_HTTPS_LOAD_BALANCER", "PRIVATE_SERVICE_CONNECT", "PRIVATE_NAT"] as const;
 export const GCP_HTTP_BACKEND_PROTOCOLS = ["HTTP", "HTTPS", "HTTP2", "H2C"] as const;
 export const GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS = 90;
+export const GCP_PRIVILEGED_IAM_ROLES = [
+  "roles/owner",
+  "roles/editor",
+  "roles/resourcemanager.organizationAdmin",
+  "roles/resourcemanager.folderAdmin",
+] as const;
 const surfaces = [
   restSurface("organization", "cloudresourcemanager.googleapis.com/v1/organizations/{organization}", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/organizations/get", ["name", "displayName", "state"]),
   restSurface("projects", "cloudasset.googleapis.com/v1/{scope}:searchAllResources", "Cloud Asset Inventory", ASSET_DOCS, ["name", "displayName", "state", "project"]),
@@ -182,7 +188,7 @@ function customDecision(id: string): Partial<Pick<Batch2CheckRow, "decisionInput
 }
 
 const decisionPredicate: Readonly<Record<string, string>> = {
-  "GCP-IAM-01": "Fail for IAM bindings to owner, editor, or the runtime privileged-role set when a member is allUsers, allAuthenticatedUsers, a user, or an external principal outside the assessed organization.",
+  "GCP-IAM-01": `Fail when a binding to any of ${GCP_PRIVILEGED_IAM_ROLES.join(", ")} contains allUsers, allAuthenticatedUsers, any user: principal, or a principal whose email suffix is outside the assessed organization's primary domain.`,
   "GCP-IAM-02": `Fail for a USER_MANAGED service-account key with missing creation time, expired validity, or age beyond stale_days. The option defaults to ${GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS} and is clamped to 1 through 3650 days; complete empty key inventories pass.`,
   "GCP-IAM-03": "Warn when any enabled service account has a USER_MANAGED key; pass only after complete service-account and key inventories prove none.",
   "GCP-IAM-04": "Warn when an IAM member serviceAccount principal belongs to a project different from the resource project.",
