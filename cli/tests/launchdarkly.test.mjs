@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import {
   chmodSync,
   existsSync,
@@ -2830,19 +2831,125 @@ function httpLaunchdarkly(fixture, options = {}) {
   return { client, config, log, routes, fetchImpl };
 }
 
-/** Runs a registered LaunchDarkly tool against the router by standing in for global fetch for the duration of the call. */
-async function runLaunchdarklyTool(toolName, fetchImpl, args) {
+function registeredLaunchdarklyTools() {
   const registered = [];
   registerLaunchdarklyTools({ registerTool: (tool) => registered.push(tool) });
-  const tool = registered.find((candidate) => candidate.name === toolName);
+  return new Map(registered.map((tool) => [tool.name, tool]));
+}
+
+/** Mirrors Pi's tool loop: prepare first, then validate the prepared value against the advertised schema. */
+function prepareAndValidateLaunchdarklyTool(tool, rawArgs, toolCallId) {
+  const prepared = tool.prepareArguments ? tool.prepareArguments(structuredClone(rawArgs)) : rawArgs;
+  const validated = validateToolArguments(
+    { name: tool.name, description: tool.description, parameters: tool.parameters },
+    { type: "toolCall", id: toolCallId, name: tool.name, arguments: prepared },
+  );
+  return { prepared, validated };
+}
+
+/** Runs a registered LaunchDarkly tool through Pi-equivalent preparation and validation against the mocked router. */
+async function runLaunchdarklyTool(toolName, fetchImpl, args) {
+  const tool = registeredLaunchdarklyTools().get(toolName);
+  const toolCallId = `call-${toolName}`;
+  const { validated } = prepareAndValidateLaunchdarklyTool(tool, args, toolCallId);
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fetchImpl;
   try {
-    return await tool.execute(`call-${toolName}`, tool.prepareArguments(args));
+    return await tool.execute(toolCallId, validated);
   } finally {
     globalThis.fetch = originalFetch;
   }
 }
+
+test("affected registered tools pass Pi validation before normalizing comma-separated lists at execution", async () => {
+  const registered = registeredLaunchdarklyTools();
+  const schemaCases = [
+    ["launchdarkly_assess_identity", { allowed_domains: "example.com, example.org" }],
+    ["launchdarkly_assess_environment_governance", { project_keys: "web, missing" }],
+    ["launchdarkly_assess_flag_hygiene", { project_keys: "web, missing" }],
+    ["launchdarkly_assess_monitoring_integrations", { integration_keys: "datadog, splunk" }],
+    ["launchdarkly_export_audit_bundle", {
+      allowed_domains: "example.com, example.org",
+      project_keys: "web, missing",
+      integration_keys: "datadog, splunk",
+    }],
+  ];
+  for (const [name, commaArgs] of schemaCases) {
+    const tool = registered.get(name);
+    const omitted = prepareAndValidateLaunchdarklyTool(tool, {}, `${name}-omitted`);
+    for (const key of Object.keys(commaArgs)) {
+      assert.equal(omitted.prepared[key], undefined, `${name}.${key} must stay omitted through prepareArguments`);
+    }
+
+    const comma = prepareAndValidateLaunchdarklyTool(tool, commaArgs, `${name}-comma`);
+    for (const [key, value] of Object.entries(commaArgs)) {
+      assert.equal(comma.prepared[key], value, `${name}.${key} must stay schema-shaped through prepareArguments`);
+      assert.equal(comma.validated[key], value, `${name}.${key} must pass Pi validation as the advertised string`);
+    }
+  }
+
+  const fixture = ldFixture();
+  const run = httpLaunchdarkly(fixture);
+  const baseArgs = { token: TEST_TOKEN };
+
+  const identity = await runLaunchdarklyTool(
+    "launchdarkly_assess_identity",
+    run.fetchImpl,
+    { ...baseArgs, allowed_domains: "example.com, example.org" },
+  );
+  assert.notEqual(identity.isError, true, identity.content[0].text);
+  assert.deepEqual(finding(identity.details, "LD-24").evidence.allowed_domains, ["example.com", "example.org"]);
+
+  for (const name of [
+    "launchdarkly_assess_environment_governance",
+    "launchdarkly_assess_flag_hygiene",
+  ]) {
+    const result = await runLaunchdarklyTool(
+      name,
+      run.fetchImpl,
+      { ...baseArgs, project_keys: "web, missing" },
+    );
+    assert.notEqual(result.isError, true, result.content[0].text);
+  }
+  const projectFilters = run.log
+    .filter((entry) => entry.path === "/api/v2/projects")
+    .map((entry) => new URL(entry.url).searchParams.get("filter"));
+  assert.ok(projectFilters.length >= 2);
+  assert.ok(projectFilters.every((filter) => filter === "keys:web|missing"));
+
+  const monitoring = await runLaunchdarklyTool(
+    "launchdarkly_assess_monitoring_integrations",
+    run.fetchImpl,
+    { ...baseArgs, integration_keys: "datadog, splunk" },
+  );
+  assert.notEqual(monitoring.isError, true, monitoring.content[0].text);
+  assert.deepEqual(
+    finding(monitoring.details, "LD-20").evidence.probed_integration_keys,
+    ["datadog", "splunk"],
+  );
+
+  const exportRoot = createTempBase("grclanker-ld-list-args-");
+  const exported = await runLaunchdarklyTool(
+    "launchdarkly_export_audit_bundle",
+    run.fetchImpl,
+    {
+      ...baseArgs,
+      output_dir: exportRoot,
+      allowed_domains: "example.com, example.org",
+      project_keys: "web, missing",
+      integration_keys: "datadog, splunk",
+    },
+  );
+  assert.notEqual(exported.isError, true, exported.content[0].text);
+  const files = readBundleFiles(exported.details.output_dir);
+  const exportedIdentity = JSON.parse(files.get("analysis/identity.json"));
+  const exportedMonitoring = JSON.parse(files.get("analysis/monitoring_integrations.json"));
+  assert.deepEqual(finding(exportedIdentity, "LD-24").evidence.allowed_domains, ["example.com", "example.org"]);
+  assert.deepEqual(
+    finding(exportedMonitoring, "LD-20").evidence.probed_integration_keys,
+    ["datadog", "splunk"],
+  );
+});
 
 const LD_AREAS = [
   ["identity", assessLaunchdarklyIdentity],
