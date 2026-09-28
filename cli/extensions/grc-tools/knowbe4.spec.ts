@@ -157,7 +157,7 @@ const rows: readonly Batch3CheckRow[] = [
       knowbe4_10_recipient_and_enrollment_reads_complete: "Boolean true when every selected security test recipient list was read and no sampled failed user lacks a completed enrollment lookup; the inherited no-failure snapshot exception is rendered separately.",
       knowbe4_10_failed_user_count: "Non-negative count of distinct failed users in sampled security tests for whom remediation is due.",
       knowbe4_10_remediated_percent: "Percentage of failed sampled users enrolled in remedial training inside default_remedial_window_days; null means the sampled denominator or follow-up join was unavailable.",
-      knowbe4_10_no_remediation_due: "Boolean true only when the sampled tests contain zero failed users and there are no unsampled tests.",
+      knowbe4_10_no_remediation_due: "Boolean true only when at least one security test was sampled, those sampled tests contain zero failed users, and there are no unsampled tests; an empty test window is false and warns.",
     },
     decisionRules: [
       batch2Rule("manual", batch2Ne("knowbe4_10_remediation_reads_succeeded", true)),

@@ -2358,10 +2358,13 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "KNOWBE4-10": {
       const evaluated = value("failed_users_evaluated") ?? 0;
-      const inventory = evaluated > 0 ? evaluated : count("sampled_security_tests");
+      const sampledTests = count("sampled_security_tests");
+      const inventory = evaluated > 0 ? evaluated : sampledTests;
       const pct = value("remediated_pct");
       const unsampled = value("unsampled_security_tests") ?? 0;
-      const noRemediationDue = value("failed_users_in_sampled_tests") === 0 && unsampled === 0;
+      const noRemediationDue = sampledTests > 0
+        && value("failed_users_in_sampled_tests") === 0
+        && unsampled === 0;
       const complete = noRemediationDue || (pct !== undefined && unsampled === 0);
       return {
         knowbe4_10_remediation_reads_succeeded: true,
