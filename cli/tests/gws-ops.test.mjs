@@ -271,6 +271,31 @@ function createRunner(options = {}) {
   };
 }
 
+/**
+ * Mirrors the exact v0.22.5 unknown-service response while allowing the two
+ * supported admin-reports commands to succeed afterward.
+ */
+function createV0225MissingAlertcenterBinary(base) {
+  const knownServices = "drive, sheets, gmail, calendar, admin-reports, reports, docs, slides, tasks, people, chat, classroom, forms, keep, meet, events, modelarmor, workflow, wf, script";
+  const message = `Unknown service 'alertcenter'. Known services: ${knownServices}. Use '<api>:<version>' syntax for unlisted APIs.`;
+  return createScriptedBinary(base, [
+    `if [ "$1" = "alertcenter:v1beta1" ]; then`,
+    heredoc({ error: { code: 400, message, reason: "validationError" } }),
+    `  echo "error[validation]: ${message}" 1>&2`,
+    "  exit 3",
+    "fi",
+    'case "$*" in',
+    "  *'\"applicationName\":\"admin\"'*)",
+    heredoc(adminPayload()),
+    "    ;;",
+    "  *'\"applicationName\":\"token\"'*)",
+    heredoc(tokenPayload()),
+    "    ;;",
+    '  *) echo "unexpected command: $*" 1>&2; exit 3 ;;',
+    "esac",
+  ].join("\n"));
+}
+
 test("resolveGwsCliExecutable prefers explicit binary path", () => {
   const base = createTempBase("grclanker-gws-ops-bin-");
   const fake = createFakeBinary(base);
@@ -638,6 +663,9 @@ test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, completen
   assert.equal(result.zipPath, `${result.outputDir}.zip`);
   assert.equal(result.commandCount, 3);
   assert.equal(result.recordCount, 4);
+  assert.equal(result.complete, false);
+  assert.match(result.status, /^partial: one or more commands returned a nextPageToken/);
+  assert.deepEqual(result.unavailableCategories, []);
   assert.deepEqual(result.categories, { alerts: 2, admin_activity: 1, token_activity: 1 });
   assert.equal(existsSync(join(result.outputDir, "README.md")), true);
   assert.equal(existsSync(join(result.outputDir, "summary.md")), true);
@@ -656,10 +684,108 @@ test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, completen
   assert.match(adminAnalysis.status, /^complete: the CLI response carried no nextPageToken/);
   assert.equal(adminAnalysis.records.length, 1);
   const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
-  assert.match(summary, /Complete page: no \(nextPageToken present\)/);
-  assert.match(summary, /Complete page: yes/);
+  assert.match(summary, /Bundle completeness: partial: one or more commands returned a nextPageToken/);
+  assert.doesNotMatch(summary, /Bundle completeness: complete:/);
+  assert.match(summary, /Complete evidence: no \(nextPageToken present\)/);
+  assert.match(summary, /Complete evidence: yes/);
   assert.match(summary, /^- Status: complete: the CLI response carried no nextPageToken/m);
   assert.match(summary, /^- Status: partial: at least 1; /m);
+});
+
+test("collectGwsOperatorEvidenceBundle degrades the exact v0.22.5 missing-alertcenter response to honest partial evidence", async () => {
+  const base = createTempBase("grclanker-gws-ops-v0225-missing-alertcenter-");
+  const fake = createV0225MissingAlertcenterBinary(base);
+  const outputRoot = join(base, "export");
+
+  const result = await collectGwsOperatorEvidenceBundle(
+    { gwsBin: fake, output_dir: outputRoot },
+    defaultGwsCliRunner,
+  );
+
+  assert.equal(result.commandCount, 3);
+  assert.equal(result.recordCount, 2);
+  assert.equal(result.complete, false);
+  assert.match(result.status, /^partial: one or more optional evidence categories were unsupported\/unavailable/);
+  assert.deepEqual(result.unavailableCategories, ["alerts"]);
+  assert.deepEqual(result.categories, { alerts: null, admin_activity: 1, token_activity: 1 });
+
+  const alertsAnalysis = JSON.parse(readFileSync(join(result.outputDir, "analysis", "alerts.json"), "utf8"));
+  assert.equal(alertsAnalysis.mode, "unavailable");
+  assert.equal(alertsAnalysis.count, null);
+  assert.equal(alertsAnalysis.complete, false);
+  assert.equal(alertsAnalysis.records, null);
+  assert.equal(alertsAnalysis.nextPageToken, null);
+  assert.match(alertsAnalysis.status, /^unsupported\/unavailable:/);
+  assert.ok(alertsAnalysis.notes.some((note) => /zero alert count is not asserted/.test(note)));
+
+  const alertsRaw = JSON.parse(readFileSync(join(result.outputDir, "raw", "alerts.json"), "utf8"));
+  assert.equal(alertsRaw.raw, null);
+  assert.match(alertsRaw.command.command, /alertcenter:v1beta1 alerts list/);
+
+  const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
+  assert.match(summary, /Bundle completeness: partial: one or more optional evidence categories were unsupported\/unavailable/);
+  assert.match(summary, /Records: not collected \(unavailable\)/);
+  assert.match(summary, /Complete evidence: no \(unsupported\/unavailable\)/);
+  const alertsSection = summary.split("## Google Workspace admin activity trace")[0];
+  assert.doesNotMatch(alertsSection, /Complete evidence: yes/);
+});
+
+test("collectGwsOperatorEvidenceBundle keeps available alertcenter success and unrelated failures strict", async () => {
+  const base = createTempBase("grclanker-gws-ops-bundle-strict-");
+  const fake = createFakeBinary(base);
+  const available = await collectGwsOperatorEvidenceBundle(
+    { gwsBin: fake, output_dir: join(base, "available") },
+    createRunner(),
+  );
+  assert.equal(available.complete, true);
+  assert.deepEqual(available.unavailableCategories, []);
+  assert.equal(available.categories.alerts, 2);
+
+  const pagedAvailable = await collectGwsOperatorEvidenceBundle(
+    { gwsBin: fake, output_dir: join(base, "paged-available") },
+    createRunner({ alerts: alertsPayload({ nextPageToken: "more-alerts" }) }),
+  );
+  assert.equal(pagedAvailable.complete, false);
+  assert.match(pagedAvailable.status, /^partial: one or more commands returned a nextPageToken/);
+  assert.deepEqual(pagedAvailable.unavailableCategories, []);
+  const pagedSummary = readFileSync(join(pagedAvailable.outputDir, "summary.md"), "utf8");
+  assert.match(pagedSummary, /Bundle completeness: partial: one or more commands returned a nextPageToken/);
+  assert.doesNotMatch(pagedSummary, /Bundle completeness: complete:/);
+
+  const successRunner = createRunner();
+  const unexpectedAlertFailure = async (request) => {
+    if (request.args[0] === "alertcenter:v1beta1") {
+      const command = [request.executable.displayExecutable, ...request.args].join(" ");
+      throw new GwsCliCommandError("validation", "error[validation]: unexpected argument '--bogus'", command, 3);
+    }
+    return successRunner(request);
+  };
+  await assert.rejects(
+    () => collectGwsOperatorEvidenceBundle(
+      { gwsBin: fake, output_dir: join(base, "unexpected-alert") },
+      unexpectedAlertFailure,
+    ),
+    (error) => error instanceof GwsCliCommandError
+      && error.kind === "validation"
+      && /unexpected argument/.test(error.message),
+  );
+
+  const coreFailure = async (request) => {
+    if (request.args[0] === "admin-reports" && parseParams(request.args).applicationName === "admin") {
+      const command = [request.executable.displayExecutable, ...request.args].join(" ");
+      throw new GwsCliCommandError("api", "Google Reports API returned 503", command, 1);
+    }
+    return createRunner()(request);
+  };
+  await assert.rejects(
+    () => collectGwsOperatorEvidenceBundle(
+      { gwsBin: fake, output_dir: join(base, "core-failure") },
+      coreFailure,
+    ),
+    (error) => error instanceof GwsCliCommandError
+      && error.kind === "api"
+      && /Reports API returned 503/.test(error.message),
+  );
 });
 
 test("rule 9 (end to end): the evidence bundle and tool results never carry a planted secret or the echoed CLI token", async () => {
@@ -760,12 +886,13 @@ test("rule 9: CLI stderr is scrubbed where the error is built, so no thrown mess
       assert.match(result.content[0].text, /Bearer \[REDACTED\] or access_token=\[REDACTED\]/, name);
     }
 
-    // The validation branch re-wraps the message for the missing alertcenter alias; the rewrapped text stays scrubbed.
+    // A noncanonical validation failure mentioning alertcenter stays strict and un-rewritten; its credential is still scrubbed.
     const rejected = createScriptedBinary(createTempBase("grclanker-gws-ops-stderr-exit3-"), `echo "Unknown service 'alertcenter' (${pair})" 1>&2\nexit 3`);
     const alias = await tools.run("gws_ops_investigate_alerts", { gws_bin: rejected });
     assert.equal(alias.details.kind, "validation");
     assert.doesNotMatch(JSON.stringify(alias), leak);
-    assert.match(alias.content[0].text, /registers no alertcenter alias/);
+    assert.match(alias.content[0].text, /Unknown service 'alertcenter' \(access_token=\[REDACTED\]\)/);
+    assert.doesNotMatch(alias.content[0].text, /registers no alertcenter alias/);
 
     // A parse failure never repeats the CLI's stdout, even its first characters.
     const garbage = createScriptedBinary(createTempBase("grclanker-gws-ops-stderr-parse-"), `echo "$GOOGLE_WORKSPACE_CLI_TOKEN ${bearer} is not json"`);

@@ -17,6 +17,10 @@ const EPSS_URL = "https://api.first.org/data/v1/epss";
 // 4-hour cache for KEV (updates about weekly), 1-hour for EPSS.
 const KEV_TTL = 4 * 60 * 60 * 1000;
 
+const DEFAULT_SEARCH_LIMIT = 10;
+// Each rendered entry is about 11 lines and 1.1 KB with EPSS, so 50 keeps a broad search near 60 KB.
+const MAX_SEARCH_LIMIT = 50;
+
 interface KevVulnerability {
   cveID: string;
   vendorProject: string;
@@ -196,7 +200,11 @@ function formatKev(vulnerability: KevVulnerability, epss?: EpssEntry): string {
   if (epss) {
     const score = (parseFloat(epss.epss) * 100).toFixed(1);
     const percentile = (parseFloat(epss.percentile) * 100).toFixed(1);
-    lines.push(`  EPSS:        ${score}% probability (${percentile}th percentile)`);
+    const scoreDate = asString(epss.date);
+    lines.push(
+      `  EPSS:        ${score}% probability (${percentile}th percentile)` +
+        (scoreDate ? `, scored ${scoreDate}` : ""),
+    );
   }
 
   if (vulnerability.notes) {
@@ -229,6 +237,20 @@ async function fetchEpss(cveIds: string[]): Promise<Map<string, EpssEntry>> {
   return scores;
 }
 
+function epssScoreDates(
+  scores: Map<string, EpssEntry>,
+  cveIds: string[],
+): Record<string, string> {
+  const dates: Record<string, string> = {};
+  for (const cveId of cveIds) {
+    const scoreDate = asString(scores.get(cveId)?.date);
+    if (scoreDate) {
+      dates[cveId] = scoreDate;
+    }
+  }
+  return dates;
+}
+
 export function registerKevsTools(pi: any): void {
   pi.registerTool({
     name: "kevs_search",
@@ -240,7 +262,12 @@ export function registerKevsTools(pi: any): void {
         description:
           "Search term: CVE ID (for example: 'CVE-2024-1234'), vendor, product name, or keyword.",
       }),
-      limit: Type.Optional(Type.Number({ default: 10 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: `Maximum results to show (default: ${DEFAULT_SEARCH_LIMIT}). Values below 1 use the default; values above ${MAX_SEARCH_LIMIT} are capped at ${MAX_SEARCH_LIMIT}, so narrow the query instead of raising it.`,
+          default: DEFAULT_SEARCH_LIMIT,
+        }),
+      ),
     }),
     prepareArguments: normalizeSearchArgs,
     async execute(_toolCallId: string, args: SearchArgs) {
@@ -254,18 +281,19 @@ export function registerKevsTools(pi: any): void {
       try {
         const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL);
         const normalizedQuery = args.query.toLowerCase();
-        const limit = args.limit ?? 10;
+        const requestedLimit = Math.trunc(args.limit ?? DEFAULT_SEARCH_LIMIT);
+        const limit = requestedLimit < 1 ? DEFAULT_SEARCH_LIMIT : Math.min(requestedLimit, MAX_SEARCH_LIMIT);
 
-        const matches = catalog.vulnerabilities
-          .filter(
-            (vulnerability) =>
-              vulnerability.cveID.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.vendorProject.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.product.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.vulnerabilityName.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.shortDescription.toLowerCase().includes(normalizedQuery),
-          )
-          .slice(0, limit);
+        const allMatches = catalog.vulnerabilities.filter(
+          (vulnerability) =>
+            vulnerability.cveID.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.vendorProject.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.product.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.vulnerabilityName.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.shortDescription.toLowerCase().includes(normalizedQuery),
+        );
+        const matches = allMatches.slice(0, limit);
+        const capped = requestedLimit > MAX_SEARCH_LIMIT && allMatches.length > MAX_SEARCH_LIMIT;
 
         if (matches.length === 0) {
           return textResult(
@@ -274,16 +302,25 @@ export function registerKevsTools(pi: any): void {
           );
         }
 
-        const epssScores = await fetchEpss(matches.map((vulnerability) => vulnerability.cveID));
+        const matchedCveIds = matches.map((vulnerability) => vulnerability.cveID);
+        const epssScores = await fetchEpss(matchedCveIds);
+        const scoreDates = epssScoreDates(epssScores, matchedCveIds);
+        const heading = capped
+          ? `Showing ${matches.length} of ${allMatches.length} KEV entries matching "${args.query}" ` +
+            `(catalog size: ${catalog.count}). Results are capped at ${MAX_SEARCH_LIMIT}; ` +
+            `narrow the query to a CVE ID, vendor, or product to see the rest.`
+          : `Found ${matches.length} KEV entr${matches.length === 1 ? "y" : "ies"} matching "${args.query}" ` +
+            `(catalog size: ${catalog.count}):`;
         return textResult(
-          `Found ${matches.length} KEV entr${matches.length === 1 ? "y" : "ies"} matching "${args.query}" ` +
-            `(catalog size: ${catalog.count}):\n\n` +
+          `${heading}\n\n` +
             matches
               .map((vulnerability) => formatKev(vulnerability, epssScores.get(vulnerability.cveID)))
               .join("\n\n"),
           {
             query: args.query,
             count: matches.length,
+            ...(capped ? { total_matches: allMatches.length, capped: true } : {}),
+            ...(Object.keys(scoreDates).length > 0 ? { epss_score_dates: scoreDates } : {}),
           },
         );
       } catch (error) {
@@ -325,24 +362,29 @@ export function registerKevsTools(pi: any): void {
           );
         }
 
+        const scoreDates = epssScoreDates(epssScores, args.cve_ids);
+        const hasScoreDates = Object.keys(scoreDates).length > 0;
         const rows = args.cve_ids.map((cveId) => {
           const entry = epssScores.get(cveId);
+          const dateColumn = hasScoreDates ? [scoreDates[cveId] ?? "N/A"] : [];
           if (!entry) {
-            return [cveId, "Not scored", "N/A"];
+            return [cveId, "Not scored", "N/A", ...dateColumn];
           }
 
           const score = (parseFloat(entry.epss) * 100).toFixed(2);
           const percentile = (parseFloat(entry.percentile) * 100).toFixed(1);
-          return [cveId, `${score}%`, `${percentile}th`];
+          return [cveId, `${score}%`, `${percentile}th`, ...dateColumn];
         });
+        const headers = ["CVE ID", "EPSS Score", "Percentile", ...(hasScoreDates ? ["Score Date"] : [])];
 
         return textResult(
           "EPSS Exploit Probability Scores:\n\n" +
-            formatTable(["CVE ID", "EPSS Score", "Percentile"], rows) +
+            formatTable(headers, rows) +
             "\n\nEPSS estimates exploitation likelihood in the next 30 days. Scores above 10% are usually worth fast triage.",
           {
             cve_ids: args.cve_ids,
             count: rows.length,
+            ...(hasScoreDates ? { epss_score_dates: scoreDates } : {}),
           },
         );
       } catch (error) {
@@ -366,7 +408,12 @@ export function registerKevsTools(pi: any): void {
           default: 30,
         }),
       ),
-      limit: Type.Optional(Type.Number({ default: 10 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: "Max results to return (default: 10).",
+          default: 10,
+        }),
+      ),
     }),
     prepareArguments: normalizeRecentArgs,
     async execute(_toolCallId: string, args: RecentArgs) {
@@ -417,7 +464,12 @@ export function registerKevsTools(pi: any): void {
       "Find KEV entries with known ransomware campaign use. Critical for prioritizing patches against ransomware threats.",
     parameters: Type.Object({
       vendor: Type.Optional(Type.String({ description: "Filter by vendor or product name." })),
-      limit: Type.Optional(Type.Number({ default: 20 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: "Max results to return (default: 20).",
+          default: 20,
+        }),
+      ),
     }),
     prepareArguments: normalizeRansomwareArgs,
     async execute(_toolCallId: string, args: RansomwareArgs) {

@@ -20,6 +20,7 @@ import {
   escapeCsvCell,
   sanitizeFilename,
 } from "../dist/extensions/grc-tools/vanta.js";
+import { readZipEntries } from "./helpers/bundle-contents.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -443,6 +444,116 @@ test("exportVantaAuditPackage records partial download failures in _errors.log",
     readFileSync(join(result.outputDir, "_errors.log"), "utf8"),
     /Failed to download broken\.pdf/,
   );
+});
+
+test("exportVantaAuditPackage allocates fresh bundles on sequential reruns", async () => {
+  const audit = {
+    id: "audit-rerun-123456",
+    customerDisplayName: "Collision Test",
+    customerOrganizationName: "Collision Test LLC",
+    framework: "SOC 2",
+    auditStartDate: "2026-01-01T00:00:00.000Z",
+    auditEndDate: "2026-12-31T00:00:00.000Z",
+  };
+  const evidence = [{
+    id: "ae-rerun",
+    evidenceId: "ev-rerun",
+    name: "Rerun evidence",
+    status: "SUBMITTED",
+    description: null,
+    evidenceType: "UPLOADED_DOCUMENT",
+    testStatus: null,
+    relatedControls: [{ name: "IAM" }],
+    creationDate: "2026-01-02T00:00:00.000Z",
+    statusUpdatedDate: "2026-01-03T00:00:00.000Z",
+  }];
+  const client = {
+    async listEvidence() {
+      return evidence;
+    },
+    async listEvidenceUrls() {
+      return [
+        {
+          id: "url-rerun-stale",
+          url: "https://downloads.example.com/stale.txt",
+          filename: "stale.txt",
+          isDownloadable: true,
+        },
+        {
+          id: "url-rerun-flaky",
+          url: "https://downloads.example.com/flaky.txt",
+          filename: "flaky.txt",
+          isDownloadable: true,
+        },
+      ];
+    },
+  };
+  let failDownload = true;
+  const fetchImpl = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (failDownload && url.endsWith("/flaky.txt")) {
+      return new Response("failed", { status: 500, statusText: "Internal Server Error" });
+    }
+    const body = failDownload ? "stale-run" : "fresh-run";
+    return new Response(body, {
+      status: 200,
+      headers: { "content-length": String(body.length) },
+    });
+  };
+  const base = createTempBase("grclanker-vanta-rerun-");
+  const outputRoot = resolve(base, "exports");
+
+  const first = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl });
+  const firstZipBytes = readFileSync(first.zipPath);
+  assert.equal(first.errorCount, 1);
+  assert.ok(existsSync(join(first.outputDir, "_errors.log")));
+  assert.ok([...readZipEntries(first.zipPath).values()].includes("stale-run"));
+
+  failDownload = false;
+  const second = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl });
+
+  assert.notEqual(second.outputDir, first.outputDir);
+  assert.notEqual(second.zipPath, first.zipPath);
+  assert.deepEqual(readFileSync(first.zipPath), firstZipBytes);
+  assert.equal(second.errorCount, 0);
+  assert.equal(existsSync(join(second.outputDir, "_errors.log")), false);
+  const secondZipEntries = readZipEntries(second.zipPath);
+  assert.ok([...secondZipEntries.keys()].every((name) => !name.endsWith("/_errors.log")));
+  assert.ok([...secondZipEntries.values()].includes("fresh-run"));
+  assert.ok([...secondZipEntries.values()].every((content) => content !== "stale-run"));
+});
+
+test("exportVantaAuditPackage allocates distinct bundles for concurrent exports", async () => {
+  const audit = {
+    id: "audit-concurrent-123456",
+    customerDisplayName: "Concurrent Test",
+    customerOrganizationName: "Concurrent Test LLC",
+    framework: "ISO 27001",
+    auditStartDate: "2026-01-01T00:00:00.000Z",
+    auditEndDate: "2026-12-31T00:00:00.000Z",
+  };
+  const client = {
+    async listEvidence() {
+      return [];
+    },
+    async listEvidenceUrls() {
+      return [];
+    },
+  };
+  const base = createTempBase("grclanker-vanta-concurrent-");
+  const outputRoot = resolve(base, "exports");
+
+  const [first, second] = await Promise.all([
+    exportVantaAuditPackage(client, audit, outputRoot),
+    exportVantaAuditPackage(client, audit, outputRoot),
+  ]);
+
+  assert.notEqual(first.outputDir, second.outputDir);
+  assert.notEqual(first.zipPath, second.zipPath);
+  assert.ok(existsSync(first.outputDir));
+  assert.ok(existsSync(second.outputDir));
+  assert.ok(existsSync(first.zipPath));
+  assert.ok(existsSync(second.zipPath));
 });
 
 test("secure output helpers reject symlink escapes and filename helpers stay safe", () => {

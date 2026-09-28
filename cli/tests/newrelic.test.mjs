@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   symlinkSync,
@@ -623,13 +624,13 @@ test("resolveNewrelicConfiguration treats the config path as caller text: a conf
   const checkAccess = tools.get("newrelic_check_access");
   let failure = "non-standard object";
   const [objectError, objectResult, subclassError, subclassResult] = await withFsStub(
-    "readFileSync",
+    "openSync",
     (original, pathname, ...rest) => {
       if (pathname !== validPath) return original(pathname, ...rest);
       throw failure === "non-standard object" ? nonStandard : new ReadFailure();
     },
     async () => {
-      assert.equal(thrownBy(() => readFileSync(validPath, "utf8")), nonStandard, "control: the stub is in place");
+      assert.equal(thrownBy(() => openSync(validPath, "r")), nonStandard, "control: the stub is in place");
       const direct = thrownBy(() => resolveNewrelicConfiguration({ config_file: validPath }, {}, home));
       const viaTool = await checkAccess.execute("call-1", checkAccess.prepareArguments({ config_file: validPath }));
       failure = "Error subclass";

@@ -2,9 +2,10 @@ import type { JsonObject, JsonSchemaObject } from "@cursor/july";
 import type { ToolContext, ToolExecuteResult } from "@cursor/july/tools";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { runWithoutPersistentCaches } from "../../extensions/grc-tools/shared.js";
+import { collectSensitiveValues, scrubSensitiveValues, withholdEchoedArguments } from "../../flue/redact.js";
 import { classifyGrcToolEffect, type GrcToolEffect, isGrcWriteTool } from "./effects.js";
 import { getRegisteredGrcTool, type RegisteredGrcTool } from "./registry.js";
-import { errorEnvelope, toSdkToolResult } from "./results.js";
+import { errorEnvelope, type SdkToolEnvelope, toSdkToolResult } from "./results.js";
 import { toJsonSchema } from "./schema.js";
 
 export interface GrcToolExecutionContext {
@@ -35,6 +36,30 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function sanitizeErrorText(tool: RegisteredGrcTool, input: JsonObject, errorText: string): string {
+  const withoutArguments = withholdEchoedArguments(errorText);
+  const sensitiveValues = collectSensitiveValues(input, tool.parameters);
+  return scrubSensitiveValues(withoutArguments, sensitiveValues);
+}
+
+function safeErrorEnvelope(tool: RegisteredGrcTool, input: JsonObject, errorText: string): ToolExecuteResult {
+  return errorEnvelope(sanitizeErrorText(tool, input, errorText));
+}
+
+function sanitizeErrorResult(
+  tool: RegisteredGrcTool,
+  input: JsonObject,
+  result: SdkToolEnvelope,
+): SdkToolEnvelope {
+  if (result.isError !== true) return result;
+  return {
+    ...result,
+    content: result.content.map((entry) =>
+      entry.type === "text" ? { ...entry, text: sanitizeErrorText(tool, input, entry.text) } : entry,
+    ),
+  };
+}
+
 /**
  * Mirror the Pi runtime: run the tool's `prepareArguments` shim, then coerce
  * and validate against the TypeBox schema with Pi's own validator.
@@ -61,15 +86,15 @@ export async function executeGrcTool(
   try {
     args = prepareGrcToolArguments(tool, toolCallId, input);
   } catch (error) {
-    return errorEnvelope(describeError(error));
+    return safeErrorEnvelope(tool, input, describeError(error));
   }
 
   const run = () => tool.execute(toolCallId, args);
   try {
     const result = options.dryRun === true ? await runWithoutPersistentCaches(run) : await run();
-    return toSdkToolResult(result);
+    return sanitizeErrorResult(tool, input, toSdkToolResult(result));
   } catch (error) {
-    return errorEnvelope(`${tool.name} failed: ${describeError(error)}`);
+    return safeErrorEnvelope(tool, input, `${tool.name} failed: ${describeError(error)}`);
   }
 }
 

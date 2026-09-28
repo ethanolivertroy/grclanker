@@ -223,10 +223,12 @@ const ASSIGNMENT_CARRIERS = Object.freeze([
 
 /** Realistic summary sentences that place a value where a corollary summary or an error line would. */
 const SENTENCES = Object.freeze([
-  (value) => `Inventory ${value} was not readable, so the finding is manual and names it.`,
-  (value) => `GET ${value} failed with 403 Forbidden: non-JSON body (text/html, 512 bytes)`,
-  (value) => `Unread inventory: ${value} (429 Too Many Requests, seen 40 of 120).`,
-  (value) => `Finding withheld for ${value} because the read of ${value} stopped after 500 of 1200 items with more pages available.`,
+  (value) => `Inventory (${value}) was not readable, so the finding is manual and names it.`,
+  // Delimit the inserted value so a setting such as `token_type=Bearer` cannot become the
+  // indistinguishable credential carrier `Bearer failed` through fixture concatenation.
+  (value) => `GET (${value}) failed with 403 Forbidden: non-JSON body (text/html, 512 bytes)`,
+  (value) => `Unread inventory: (${value}) (429 Too Many Requests, seen 40 of 120).`,
+  (value) => `Finding withheld for (${value}) because the read of (${value}) stopped after 500 of 1200 items with more pages available.`,
 ]);
 
 /** Every scrub the library exposes for error text and data text, each returning the text it produces. */

@@ -3427,6 +3427,7 @@ const authParams = {
   consumer_key: Type.Optional(Type.String({ description: "Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY." })),
   consumer_secret: Type.Optional(Type.String({ description: "Connected app consumer secret. Defaults to SF_CONSUMER_SECRET." })),
   private_key_file: Type.Optional(Type.String({ description: "PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE." })),
+  private_key: Type.Optional(Type.String({ description: "PEM private key for the JWT bearer flow. Prefer private_key_file or SF_PRIVATE_KEY to avoid providing key material inline." })),
   refresh_token: Type.Optional(Type.String({ description: "OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN." })),
   access_token: Type.Optional(Type.String({ description: "Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN." })),
   credentials_file: Type.Optional(Type.String({ description: "JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE." })),

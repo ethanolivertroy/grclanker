@@ -57,18 +57,24 @@ timeout = 30
 
 ### Connected app permissions
 
-Create a connected app that acts on its own behalf (client credentials) and grant it read-only permissions in the organization and each environment you want inspected. `mulesoft_check_access` probes every surface and names the permission for any `401` or `403`.
+Create a connected app that acts on its own behalf (client credentials) and grant it read-only scopes in the organization and each environment you want inspected. `mulesoft_check_access` probes every surface and names the connected-app scope for any `401` or `403`. Scope IDs come from the Anypoint OpenID discovery document. When MuleSoft publicly documents a scope display name, both the display name and API ID are shown.
 
-| Surface | Read permission |
+| Surface | Read scope or permission |
 | --- | --- |
-| Organization, members, role groups, environments, connected apps, identity providers, hierarchy | Access Management: Organization Administrator is required for identity provider settings and MFA exemptions; the remaining reads work with any principal that can view the organization |
-| API Manager APIs and policies | API Manager: View APIs Configuration, View Policies, View Contracts |
-| Exchange assets | Exchange: Exchange Viewer |
-| CloudHub applications and alerts, hybrid servers | Runtime Manager: Read Applications, Read Alerts, Read Servers |
-| Anypoint VPCs and dedicated load balancers | Runtime Manager: CloudHub Network Viewer |
-| Audit log platforms, queries, and retention settings | Access Management: Audit Log Viewer. The retention settings read (`GET /audit/v2/organizations/{orgId}/retentionSettings`) is evidence only for control 17; a `403` on it is recorded in the finding and `_errors.log` without changing the verdict |
-| Anypoint MQ regions, queues, clients | MQ: View destinations, View clients |
-| Secrets Manager secret groups | Secrets Manager: Manage secret groups (includes read) or Read secrets metadata |
+| Current connected-app profile | `profile`, assigned implicitly to client-credentials apps |
+| Organization and hierarchy | Access Management: View Organization (`read:organization`) |
+| Organization members and MFA-exempt users | Access Management connected-app scope `read:orgusers` |
+| Role groups | Connected Apps: Read-only full access (`read:full`). MuleSoft does not publicly document a narrower role-group scope. |
+| Environments | Access Management: View Environment (`read:orgenvironments`; `view:environment`) |
+| Connected applications | Access Management connected-app scope `read:orgconnapps` |
+| Identity providers | Access Management connected-app scope `view:identityproviders` |
+| API Manager APIs and policies | API Manager: View APIs Configuration (`read:api_configuration`), View Policies (`read:api_policies`), View Contracts (`read:api_contracts`) |
+| Exchange assets | Exchange: Exchange Viewer (`read:exchange`) |
+| CloudHub applications and alerts, hybrid servers | Runtime Manager: Read Applications (`read:applications`), Read Alerts (`read:application_alerts`), Read Servers (`read:servers`) |
+| Anypoint VPCs and dedicated load balancers | Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`) |
+| Audit log platforms, queries, and retention settings | Access Management: Audit Log Viewer (`read:audit_logs`). The retention settings read (`GET /audit/v2/organizations/{orgId}/retentionSettings`) is evidence only for control 17; a `403` on it is recorded in the finding and `_errors.log` without changing the verdict. |
+| Anypoint MQ regions, queues, clients | Anypoint MQ: View destinations (`view:destinations`) and View clients (`view:clients`). View clients exposes client IDs and client secrets. |
+| Secrets Manager secret groups | Secrets Manager: Read secrets metadata (`read:secrets_metadata`) |
 
 Because Anypoint scopes are environment-specific for most products, grant them for each environment the assessment should sample.
 
@@ -195,7 +201,8 @@ Endpoint paths, pagination, and response fields were verified against the Anypoi
 
 Product documentation used for control semantics and permissions:
 
-- [Connected Apps for Developers](https://docs.mulesoft.com/access-management/connected-apps-developers) and [Configuring Identity Management](https://docs.mulesoft.com/access-management/external-identity)
+- [Connected Apps for Developers](https://docs.mulesoft.com/access-management/connected-apps-developers), [Creating Connected Apps](https://docs.mulesoft.com/access-management/creating-connected-apps-dev), [Anypoint CLI Authentication](https://docs.mulesoft.com/anypoint-cli/latest/auth), and the [OpenID discovery document](https://anypoint.mulesoft.com/accounts/api/v2/oauth2/.well-known/openid-configuration)
+- [Permissions by Product](https://docs.mulesoft.com/access-management/permissions-by-product) and [Configuring Identity Management](https://docs.mulesoft.com/access-management/external-identity)
 - [Multi-Factor Authentication](https://docs.mulesoft.com/access-management/multi-factor-authentication)
 - [Roles](https://docs.mulesoft.com/access-management/roles), [Environments](https://docs.mulesoft.com/access-management/environments), and [Business Groups](https://docs.mulesoft.com/access-management/business-groups)
 - [Audit Logging](https://docs.mulesoft.com/access-management/audit-logging)
@@ -206,5 +213,5 @@ Product documentation used for control semantics and permissions:
 - [VPC Firewall Rules](https://docs.mulesoft.com/cloudhub/vpc-firewall-rules-concept), [Dedicated Load Balancers](https://docs.mulesoft.com/cloudhub/cloudhub-dedicated-load-balancer), [SSL Endpoints and Certificates](https://docs.mulesoft.com/cloudhub/lb-ssl-endpoints), and [Certificate Validation and Cipher Suites](https://docs.mulesoft.com/cloudhub/lb-cert-validation) (`defaultCipherSuite`, `/loadbalancers/ciphersuites`)
 - [Servers, Server Groups, and Clusters](https://docs.mulesoft.com/runtime-manager/managing-servers) and [Runtime Manager Alerts](https://docs.mulesoft.com/runtime-manager/alerts-on-runtime-manager)
 - [Anypoint Monitoring Alerts](https://docs.mulesoft.com/monitoring/alerts-hf)
-- [Anypoint MQ Access Management](https://docs.mulesoft.com/mq/mq-access-management)
-- [Secret Groups](https://docs.mulesoft.com/anypoint-security/asm-secret-group-concept)
+- [Anypoint MQ Access Management](https://docs.mulesoft.com/mq/mq-access-management) and [Anypoint MQ Connected Apps](https://docs.mulesoft.com/mq/mq-connected-apps)
+- [Secrets Manager Permissions](https://docs.mulesoft.com/anypoint-security/asm-permission-concept) and [Secret Groups](https://docs.mulesoft.com/anypoint-security/asm-secret-group-concept)
