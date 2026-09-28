@@ -1246,14 +1246,14 @@ test("registered AWS region and port list arguments stay schema-shaped through p
   }
 });
 
-test("registered AWS port schemas enforce integer ports from 0 through 65535", () => {
+test("registered AWS tools enforce integer ports from 0 through 65535 without changing the schema-shaped string", () => {
   for (const name of ["aws_assess_network_security", "aws_export_audit_bundle"]) {
     const tool = registeredAwsTool(name);
     assert.doesNotThrow(() => prepareAndValidateAwsTool(tool, { sensitive_ports: "0,22,443,65535" }), `${name} accepts both valid boundaries`);
     for (const sensitive_ports of ["-1", "65536", "22.5", "22,invalid", "22 443"]) {
       assert.throws(
         () => prepareAndValidateAwsTool(tool, { sensitive_ports }),
-        /Validation failed/,
+        /sensitive_ports must contain only comma-separated integer ports from 0 through 65535/,
         `${name} rejects ${sensitive_ports}`,
       );
     }

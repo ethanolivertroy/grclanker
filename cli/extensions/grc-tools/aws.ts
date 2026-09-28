@@ -159,6 +159,7 @@ const MIN_NETWORK_PORT = 0;
 const MAX_NETWORK_PORT = 65535;
 const NETWORK_PORT_TOKEN_PATTERN = String.raw`(?:0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])`;
 const NETWORK_PORT_LIST_PATTERN = String.raw`^\s*${NETWORK_PORT_TOKEN_PATTERN}(?:\s*,\s*${NETWORK_PORT_TOKEN_PATTERN})*\s*$`;
+const NETWORK_PORT_LIST_REGEX = new RegExp(NETWORK_PORT_LIST_PATTERN);
 const ANY_IPV4 = AWS_VERDICT_VALUES.publicIpv4Cidr;
 const ANY_IPV6 = AWS_VERDICT_VALUES.publicIpv6Cidr;
 const REQUIRED_PUBLIC_ACCESS_FLAGS = AWS_REQUIRED_PUBLIC_ACCESS_FLAGS;
@@ -4431,6 +4432,13 @@ function parsePortList(value: unknown): number[] | undefined {
   return [...new Set(ports)];
 }
 
+function preservePortList(value: unknown): string | undefined {
+  if (typeof value === "string" && !NETWORK_PORT_LIST_REGEX.test(value)) {
+    throw new Error(`sensitive_ports must contain only comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT}`);
+  }
+  return value as string | undefined;
+}
+
 function protocolCoversPorts(protocol: string | undefined): "all" | "ports" | "none" {
   if (protocol === undefined) return "none";
   if (protocol === "-1" || protocol.toLowerCase() === "all") return "all";
@@ -5129,7 +5137,7 @@ function normalizeNetworkSecurityArgs(args: unknown): NetworkSecurityArgs {
   return {
     ...normalizeScopeArgs(args),
     resource_limit: asNumber(value.resource_limit),
-    sensitive_ports: value.sensitive_ports as string | undefined,
+    sensitive_ports: preservePortList(value.sensitive_ports),
   };
 }
 
@@ -5163,7 +5171,7 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleToolArg
     key_limit: asNumber(value.key_limit),
     instance_limit: asNumber(value.instance_limit),
     resource_limit: asNumber(value.resource_limit),
-    sensitive_ports: value.sensitive_ports as string | undefined,
+    sensitive_ports: preservePortList(value.sensitive_ports),
   };
 }
 
@@ -5316,11 +5324,7 @@ export function registerAwsTools(pi: any): void {
       ...authParams,
       ...scopeParams,
       resource_limit: Type.Optional(Type.Number({ description: `Maximum VPCs, flow logs, NACLs, or security groups per region before flagging truncation. Defaults to ${DEFAULT_RESOURCE_LIMIT}.`, default: DEFAULT_RESOURCE_LIMIT })),
-      sensitive_ports: Type.Optional(Type.String({
-        description: `Comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT} treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`,
-        default: DEFAULT_SENSITIVE_PORTS.join(","),
-        pattern: NETWORK_PORT_LIST_PATTERN,
-      })),
+      sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
     }),
     prepareArguments: normalizeNetworkSecurityArgs,
     async execute(_toolCallId: string, args: NetworkSecurityArgs) {
@@ -5358,11 +5362,7 @@ export function registerAwsTools(pi: any): void {
       max_findings: Type.Optional(Type.Number({ description: "Maximum Access Analyzer findings to sample. Defaults to 200.", default: 200 })),
       ...dataProtectionParams,
       resource_limit: Type.Optional(Type.Number({ description: `Maximum VPCs, flow logs, NACLs, or security groups per region before flagging truncation. Defaults to ${DEFAULT_RESOURCE_LIMIT}.`, default: DEFAULT_RESOURCE_LIMIT })),
-      sensitive_ports: Type.Optional(Type.String({
-        description: `Comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT} treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`,
-        default: DEFAULT_SENSITIVE_PORTS.join(","),
-        pattern: NETWORK_PORT_LIST_PATTERN,
-      })),
+      sensitive_ports: Type.Optional(Type.String({ description: `Comma-separated ports treated as sensitive. Defaults to ${DEFAULT_SENSITIVE_PORTS.join(",")}.`, default: DEFAULT_SENSITIVE_PORTS.join(",") })),
     }),
     prepareArguments: normalizeExportAuditBundleArgs,
     async execute(_toolCallId: string, args: ExportAuditBundleToolArgs) {
