@@ -1,14 +1,14 @@
 /**
  * NIST Cryptographic Module Validation Program (CMVP) tools.
  *
- * Wraps the static JSON API at hackidle.github.io/nist-cmvp-api
+ * Wraps the static JSON API at ethanolivertroy.github.io/nist-cmvp-api
  * (same data source as cmvp-tui). Enables searching validated, historical,
  * and in-process cryptographic modules for FIPS 140-2/140-3 compliance.
  */
 import { Type } from "@sinclair/typebox";
 import { cachedFetch, errorResult, formatTable, textResult } from "./shared.js";
 
-const DEFAULT_BASE = "https://hackidle.github.io/nist-cmvp-api/api";
+const DEFAULT_BASE = "https://ethanolivertroy.github.io/nist-cmvp-api/api";
 const BASE = process.env.CMVP_API_BASE_URL?.trim().replace(/\/+$/, "") || DEFAULT_BASE;
 
 // 24-hour cache. CMVP data updates weekly via GitHub Actions.

@@ -404,7 +404,7 @@ test("toSdkToolResult keeps text and image content, drops details, and carries i
   });
 });
 
-test("grclankerToolConfig runs a registered tool end to end with stubbed network access", async () => {
+test("grclankerToolConfig uses the current CMVP API default end to end", async () => {
   const originalFetch = globalThis.fetch;
   const urls = [];
   globalThis.fetch = async (input) => {
@@ -437,7 +437,9 @@ test("grclankerToolConfig runs a registered tool end to end with stubbed network
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /Found 1 active FIPS module\(s\) matching "boringcrypto"/);
     assert.match(result.content[0].text, /Certificate #4407 - BoringCrypto/);
-    assert.equal(urls.length, 1);
+    assert.deepEqual(urls, [
+      "https://ethanolivertroy.github.io/nist-cmvp-api/api/modules.json",
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
     clearGrcSharedCachesForTests();
