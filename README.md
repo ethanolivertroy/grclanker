@@ -127,7 +127,7 @@ Run it from a source checkout (`@cursor/july` is a CLI devDependency, so `npm --
 ```bash
 npm --prefix cli run agent-sdk:validate
 npm --prefix cli run agent-sdk:info
-npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2024-3094"}'
+npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
 npm --prefix cli run agent-sdk:dev
 ```
 
@@ -135,13 +135,15 @@ npm --prefix cli run agent-sdk:dev
 
 ## What You Can Do With It
 
-`grclanker` with no arguments opens an interactive session; ask in plain language:
+`grclanker` with no arguments opens an interactive session; ask in plain language, for example:
 
 ```text
-what is the CMVP certificate for BoringCrypto?
-investigate CVE-2024-3094
+is CVE-2021-44228 in the CISA KEV catalog, and what is its EPSS score?
+investigate CVE-2021-44228
 map our vuln evidence to FedRAMP RA-5
 ```
+
+CMVP questions (for example "is BoringCrypto FIPS validated?") are in scope, but the `cmvp_*` lookups currently fail on both the `0.0.1` bundle and `main`: the CMVP data API they read returns 404.
 
 On `main`, the native cloud and SaaS tools answer directly in the same session, for example:
 
@@ -162,7 +164,7 @@ Built-in workflow rails, as slash commands inside a session or as `grclanker inv
 
 In the `0.0.1` release bundle:
 
-- 8 domain tools: `cmvp_search_modules`, `cmvp_search_historical`, `cmvp_search_in_process`, `cmvp_get_module`, `kevs_search`, `kevs_recent`, `kevs_check_ransomware`, and `kevs_get_epss`
+- 8 domain tools: `cmvp_search_modules`, `cmvp_search_historical`, `cmvp_search_in_process`, `cmvp_get_module`, `kevs_search`, `kevs_recent`, `kevs_check_ransomware`, and `kevs_get_epss` (the `cmvp_*` lookups currently return a 404 from their data API)
 - 7 compute backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) routed through the selected compute backend
 - 2 bundled agent personas: `auditor` and `verifier`
 - 4 workflow commands
@@ -184,14 +186,14 @@ Bundled runner (built on Flue's `start()` API, no extra install; `main` only, so
 
 ```bash
 export ANTHROPIC_API_KEY=...
-grclanker flue run --message "Is BoringCrypto FIPS validated?"
-grclanker flue run --message "Now check KEV exposure" --id fips-review --json
+grclanker flue run --message "Is CVE-2021-44228 in the CISA KEV catalog?"
+grclanker flue run --message "Now get its EPSS score" --id log4shell-review --json
 ```
 
 Official Flue CLI (from a repo checkout, in the `cli/` directory after `npm install`, Node 22.19 or newer):
 
 ```bash
-npx flue run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
+npx flue run flue/agent.ts --message "Is CVE-2021-44228 in the CISA KEV catalog?"
 ```
 
 `@flue/cli` is a devDependency of the CLI package on purpose: the CLI must share the project's `@flue/runtime` install. Running a separately downloaded copy (for example `npx @flue/cli run ...` without the local install) loads a second runtime and fails with an internal hook error.
@@ -264,7 +266,7 @@ The release installers look for GitHub Release assets named like:
 - `grclanker-<version>-win32-arm64.zip`
 - `grclanker-<version>-win32-x64.zip`
 
-plus a `SHA256SUMS.txt` the installers use to verify the download.
+plus a `SHA256SUMS.txt`. When that file has an entry for the downloaded archive, the installers check the archive's SHA-256 against it and abort on a mismatch. When the file cannot be fetched, has no entry for the archive, no `sha256sum` or `shasum` is available (`install` only), or a custom `GRCLANKER_ASSET_URL` is set, they print a warning and install without verifying.
 
 Build them locally:
 
