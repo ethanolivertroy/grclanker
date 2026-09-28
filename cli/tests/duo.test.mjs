@@ -35,6 +35,12 @@ import {
 import { DUO_SPEC } from "../dist/extensions/grc-tools/duo.spec.js";
 import { assertBundlePathsMatchSpec, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
   CANARY,
   CANARY_VALUES,
   ENCODED_FORM_SECRET,
@@ -2854,4 +2860,117 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
   for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
   assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
   assert.ok(log.some((entry) => entry.path === surface && entry.status === 200), "the 200 answer named in the note was observed");
+});
+
+test("byte differential fixtures: Duo assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const config = createSampleConfig();
+  const assess = (authentication, admin, integrations, monitoring) => ({
+    authentication: assessDuoAuthentication(authentication, config),
+    admin: assessDuoAdminAccess(admin, config),
+    integrations: assessDuoIntegrations(integrations, config),
+    monitoring: assessDuoMonitoring(monitoring, config),
+  });
+
+  writeByteDifferentialFixture("duo", "representative", assess(
+    createSampleAuthenticationData(),
+    createSampleAdminData(),
+    createSampleIntegrationData(),
+    createSampleMonitoringData(),
+  ));
+  writeByteDifferentialFixture("duo", "denied", assess(
+    forbiddenAuthenticationData(),
+    forbiddenAdminData(),
+    forbiddenIntegrationData(),
+    forbiddenMonitoringData(),
+  ));
+
+  const missingAuthentication = emptyAuthenticationData();
+  missingAuthentication.settings = dataset(null);
+  missingAuthentication.globalPolicy = dataset(null);
+  const missingAdmin = {
+    settings: dataset(null),
+    admins: dataset([]),
+    allowedAdminAuthMethods: dataset(null),
+    activityLogs: dataset([]),
+  };
+  const missingIntegrations = {
+    settings: dataset(null),
+    policies: dataset([]),
+    globalPolicy: dataset(null),
+    infoSummary: dataset(null),
+    integrations: dataset([]),
+  };
+  const missingMonitoring = {
+    settings: dataset(null),
+    infoSummary: dataset(null),
+    authenticationAttempts: undefined,
+    authenticationLogs: dataset([]),
+    activityLogs: dataset([]),
+    telephonyLogs: dataset([]),
+    trustMonitorEvents: dataset([]),
+  };
+  writeByteDifferentialFixture("duo", "missing-null", assess(
+    missingAuthentication,
+    missingAdmin,
+    missingIntegrations,
+    missingMonitoring,
+  ));
+
+  const partialAuthentication = compliantAuthenticationData();
+  partialAuthentication.users = { ...partialAuthentication.users, complete: false, total: 40 };
+  partialAuthentication.bypassCodes = { ...partialAuthentication.bypassCodes, complete: false, total: 12 };
+  partialAuthentication.webauthnCredentials = { ...partialAuthentication.webauthnCredentials, complete: false, total: 30 };
+  const partialAdmin = compliantAdminData();
+  partialAdmin.admins = { ...partialAdmin.admins, complete: false, total: 9 };
+  partialAdmin.activityLogs = { ...partialAdmin.activityLogs, complete: false };
+  const partialIntegrations = compliantIntegrationData();
+  partialIntegrations.integrations = { ...partialIntegrations.integrations, complete: false, total: 20 };
+  const partialMonitoring = compliantMonitoringData();
+  partialMonitoring.authenticationLogs = { ...partialMonitoring.authenticationLogs, complete: false };
+  partialMonitoring.activityLogs = { ...partialMonitoring.activityLogs, complete: false };
+  partialMonitoring.telephonyLogs = { ...partialMonitoring.telephonyLogs, complete: false };
+  partialMonitoring.trustMonitorEvents = { ...partialMonitoring.trustMonitorEvents, complete: false };
+  writeByteDifferentialFixture("duo", "partial", assess(
+    partialAuthentication,
+    partialAdmin,
+    partialIntegrations,
+    partialMonitoring,
+  ));
+
+  writeByteDifferentialFixture("duo", "compliant", assess(
+    compliantAuthenticationData(),
+    compliantAdminData(),
+    compliantIntegrationData(),
+    compliantMonitoringData(),
+  ));
+
+  const remembered = (days) => {
+    const data = compliantAuthenticationData();
+    data.globalPolicy.data.sections.remembered_devices = {
+      browser_apps: { enabled: true, user_based: { max_time_value: days, max_time_units: "days" } },
+    };
+    data.policies.data[0].sections.remembered_devices = data.globalPolicy.data.sections.remembered_devices;
+    return assessDuoAuthentication(data, config);
+  };
+  const lockout = (threshold) => {
+    const data = compliantAdminData();
+    data.settings.data.lockout_threshold = threshold;
+    return assessDuoAdminAccess(data, config);
+  };
+  const telephony = (credits) => {
+    const data = compliantMonitoringData();
+    data.infoSummary.data.telephony_credits_remaining = credits;
+    data.telephonyLogs.data = [{ txid: `credit-${credits}` }];
+    return assessDuoMonitoring(data, config);
+  };
+  writeByteDifferentialFixture("duo", "boundary", {
+    rememberedDays: [14, 15, 30, 31].map(remembered),
+    lockoutAttempts: [0, 1, 10, 11].map(lockout),
+    telephonyCredits: [24, 25, 99, 100].map(telephony),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("duo");
+  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
+  const exported = await exportDuoAuditBundle(client, config, exportRoot);
+  writeByteDifferentialFixture("duo", "export", snapshotExportBundle(exported));
 });

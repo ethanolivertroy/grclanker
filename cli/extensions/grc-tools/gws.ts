@@ -3880,7 +3880,7 @@ export function assessGwsMonitoring(
     complete: completeGwsDatasets(data.alerts),
     alert_count: data.alerts.data.length,
     open_alert_count: alerts.open,
-    unknown_status_count: alerts.unknownStatus,
+    alert_without_known_state_count: alerts.unknownStatus,
   });
 
   const findings: GwsFinding[] = [];

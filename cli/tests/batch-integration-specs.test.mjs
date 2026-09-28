@@ -62,8 +62,14 @@ const ABSENT = Symbol("absent");
 const DEFINED = Symbol("defined");
 
 function alternativeValues(value, domains) {
-  if (typeof value === "boolean") return [!value];
-  if (typeof value === "number") return domains.numbers.filter((candidate) => candidate !== value);
+  if (typeof value === "boolean") return [!value, null];
+  if (typeof value === "number") return [
+    ...[-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25, 26, 100].filter((candidate) => candidate !== value),
+    value - 1,
+    value + 1,
+    "__not_numeric__",
+    null,
+  ];
   if (typeof value === "string") return domains.strings.filter((candidate) => candidate !== value);
   if (value === null) return [0];
   return ["__different"];
@@ -88,10 +94,20 @@ function mergeAssignments(left, right) {
 
 function combineAssignments(left, right) {
   const combined = [];
+  const seen = new Set();
   for (const first of left) {
     for (const second of right) {
       const merged = mergeAssignments(first, second);
-      if (merged) combined.push(merged);
+      if (!merged) continue;
+      const key = JSON.stringify(
+        [...merged]
+          .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
+          .map(([name, value]) => [name, value === ABSENT ? "__ABSENT__" : value === DEFINED ? "__DEFINED__" : value]),
+      );
+      if (seen.has(key)) continue;
+      seen.add(key);
+      combined.push(merged);
+      if (combined.length >= 5_000) return combined;
     }
   }
   return combined;
@@ -109,60 +125,82 @@ function operandState(operand, constants) {
 function comparisonWitnesses(condition, desired, constants, domains) {
   const left = operandState(condition.left, constants);
   const right = operandState(condition.right, constants);
-  const equal = condition.op === "eq" ? desired : !desired;
-  if (condition.op === "eq" || condition.op === "ne") {
-    if (left.known && right.known) {
-      return Object.is(left.value, right.value) === equal ? [new Map()] : [];
-    }
-    if (!left.known && right.known) {
-      const values = equal ? [right.value] : alternativeValues(right.value, domains);
-      return values.map((value) => new Map([[left.path, value]]));
-    }
-    if (left.known && !right.known) {
-      const values = equal ? [left.value] : alternativeValues(left.value, domains);
-      return values.map((value) => new Map([[right.path, value]]));
-    }
-    const pairs = domains.numbers.flatMap((leftValue) => domains.numbers
-      .filter((rightValue) => Object.is(leftValue, rightValue) === equal)
-      .map((rightValue) => [leftValue, rightValue]));
-    return pairs.map(([leftValue, rightValue]) => new Map([
-      [left.path, leftValue],
-      [right.path, rightValue],
-    ]));
-  }
-  const comparison = condition.op === "gt" ? "gt" : "lte";
-  if (left.known && right.known) {
-    const actual = comparison === "gt"
-      ? Number(left.value) > Number(right.value)
-      : Number(left.value) <= Number(right.value);
-    return actual === desired ? [new Map()] : [];
-  }
+  const evaluate = (leftValue, rightValue) => evaluateVerdictCondition(condition, {
+    ...constants,
+    ...(!left.known ? { [left.path]: leftValue } : {}),
+    ...(!right.known ? { [right.path]: rightValue } : {}),
+  });
+  if (left.known && right.known) return evaluate(left.value, right.value) === desired ? [new Map()] : [];
+
   if (!left.known && right.known) {
-    const threshold = Number(right.value);
-    const values = domains.numbers.filter((value) => (
-      (comparison === "gt" ? value > threshold : value <= threshold) === desired
-    ));
-    if (!desired) values.push("__not_numeric__");
-    return values.map((value) => new Map([[left.path, value]]));
+    const values = condition.op === "eq" || condition.op === "ne"
+      ? [right.value, ...alternativeValues(right.value, domains)]
+      : [...domains.numbers, Number(right.value) - 1, Number(right.value), Number(right.value) + 1, "__not_numeric__"];
+    return [...new Set(values)]
+      .filter((leftValue) => evaluate(leftValue, right.value) === desired)
+      .map((leftValue) => new Map([[left.path, leftValue]]));
   }
   if (left.known && !right.known) {
-    const threshold = Number(left.value);
-    const values = domains.numbers.filter((value) => (
-      (comparison === "gt" ? threshold > value : threshold <= value) === desired
-    ));
-    if (!desired) values.push("__not_numeric__");
-    return values.map((value) => new Map([[right.path, value]]));
+    const values = condition.op === "eq" || condition.op === "ne"
+      ? [left.value, ...alternativeValues(left.value, domains)]
+      : [...domains.numbers, Number(left.value) - 1, Number(left.value), Number(left.value) + 1, "__not_numeric__"];
+    return [...new Set(values)]
+      .filter((rightValue) => evaluate(left.value, rightValue) === desired)
+      .map((rightValue) => new Map([[right.path, rightValue]]));
   }
-  const pairs = domains.numbers.flatMap((leftValue) => domains.numbers
-    .filter((rightValue) => (
-      (comparison === "gt" ? leftValue > rightValue : leftValue <= rightValue) === desired
-    ))
-    .map((rightValue) => [leftValue, rightValue]));
-  if (!desired) pairs.push(["__not_numeric__", 0]);
-  return pairs.map(([leftValue, rightValue]) => new Map([
-    [left.path, leftValue],
-    [right.path, rightValue],
-  ]));
+
+  const values = domains.numbers.slice(0, 20);
+  return values.flatMap((leftValue) => values
+    .filter((rightValue) => evaluate(leftValue, rightValue) === desired)
+    .map((rightValue) => new Map([
+      [left.path, leftValue],
+      [right.path, rightValue],
+    ])));
+}
+
+function ratioWitnesses(condition, desired, constants) {
+  const numerator = operandState(condition.numerator, constants);
+  const denominator = operandState(condition.denominator, constants);
+  const threshold = operandState(condition.threshold, constants);
+  if (!threshold.known) throw new Error("Ratio witness thresholds must be constants or literal values");
+  const delta = Math.abs(Number(threshold.value)) >= 2 ? 1 : 0.1;
+  const scaledTargets = [
+    0,
+    condition.scale ?? 1,
+    Number(threshold.value) - delta,
+    Number(threshold.value),
+    Number(threshold.value) + delta,
+  ];
+  const denominators = denominator.known ? [denominator.value] : [1, 2, 3, 10, 100];
+  const candidates = [];
+  for (const denominatorValue of denominators) {
+    const numeratorValues = numerator.known
+      ? [numerator.value]
+      : scaledTargets.map((target) => (target / (condition.scale ?? 1)) * Number(denominatorValue));
+    for (const numeratorValue of numeratorValues) {
+      const assignment = new Map();
+      if (!numerator.known) assignment.set(numerator.path, numeratorValue);
+      if (!denominator.known) assignment.set(denominator.path, denominatorValue);
+      const facts = { ...constants, ...rawFacts(assignment) };
+      if (evaluateVerdictCondition(condition, facts) === desired) candidates.push(assignment);
+    }
+  }
+  if (!numerator.known && !denominator.known) {
+    const integers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25, 26, 100];
+    for (const denominatorValue of integers.filter((value) => value > 0)) {
+      for (const numeratorValue of integers) {
+        const assignment = new Map([
+          [numerator.path, numeratorValue],
+          [denominator.path, denominatorValue],
+        ]);
+        if (evaluateVerdictCondition(condition, { ...constants, ...rawFacts(assignment) }) === desired) {
+          candidates.push(assignment);
+        }
+      }
+    }
+  }
+  if (!desired && !numerator.known) candidates.push(new Map([[numerator.path, null]]));
+  return candidates;
 }
 
 function conditionWitnesses(condition, desired, constants, domains) {
@@ -188,8 +226,12 @@ function conditionWitnesses(condition, desired, constants, domains) {
     case "eq":
     case "ne":
     case "gt":
+    case "gte":
+    case "lt":
     case "lte":
       return comparisonWitnesses(condition, desired, constants, domains);
+    case "ratio":
+      return ratioWitnesses(condition, desired, constants);
     case "defined": {
       const operand = operandState(condition.operand, constants);
       if (operand.known) return (operand.value !== undefined) === desired ? [new Map()] : [];
@@ -201,7 +243,22 @@ function conditionWitnesses(condition, desired, constants, domains) {
         const actual = new RegExp(condition.pattern, condition.flags).test(String(operand.value));
         return actual === desired ? [new Map()] : [];
       }
-      return [new Map([[operand.path, desired ? "all participants" : "__not_matching__"]])];
+      const candidates = [
+        "open",
+        "public",
+        "anyone",
+        "company",
+        "collaborators",
+        "enterprise",
+        "people_in",
+        "invited",
+        "all participants",
+        "__not_matching__",
+      ];
+      const expression = new RegExp(condition.pattern, condition.flags);
+      return candidates
+        .filter((candidate) => expression.test(candidate) === desired)
+        .map((candidate) => new Map([[operand.path, candidate]]));
     }
     default:
       throw new Error(`Unsupported witness condition ${condition.op}`);
@@ -232,6 +289,9 @@ function witnessDomains(branches, constants) {
     if (condition.left?.kind === "value") add(condition.left.value);
     if (condition.right?.kind === "value") add(condition.right.value);
     if (condition.operand?.kind === "value") add(condition.operand.value);
+    if (condition.numerator?.kind === "value") add(condition.numerator.value);
+    if (condition.denominator?.kind === "value") add(condition.denominator.value);
+    if (condition.threshold?.kind === "value") add(condition.threshold.value);
     for (const child of condition.conditions ?? []) walk(child);
     if (condition.condition) walk(condition.condition);
   };
@@ -243,11 +303,93 @@ function witnessDomains(branches, constants) {
 }
 
 function orderedBranchWitness(check, branchIndex) {
+  const explicit = {
+    "DUO-INTEGRATIONS-006": [
+      { policy_readable: false, edition_sections_present: false },
+      {
+        policy_readable: true,
+        edition_sections_present: true,
+        duo_desktop_platform_count: 0,
+        encryption_platform_count: 0,
+        full_disk_encryption_required: false,
+        firewall_platform_count: 0,
+        system_password_platform_count: 0,
+        screen_lock_required: false,
+        restricted_os_count: 0,
+      },
+      {
+        policy_readable: true,
+        edition_sections_present: true,
+        duo_desktop_platform_count: 1,
+        encryption_platform_count: 0,
+        full_disk_encryption_required: false,
+        firewall_platform_count: 0,
+        system_password_platform_count: 0,
+        screen_lock_required: false,
+        restricted_os_count: 0,
+      },
+      {
+        policy_readable: true,
+        edition_sections_present: true,
+        duo_desktop_platform_count: 1,
+        encryption_platform_count: 1,
+        full_disk_encryption_required: false,
+        firewall_platform_count: 1,
+        system_password_platform_count: 1,
+        screen_lock_required: false,
+        restricted_os_count: 1,
+      },
+    ],
+    "BOX-24": [
+      { users_readable: false, events_readable: false },
+      {
+        users_readable: true,
+        events_readable: true,
+        users_truncated: true,
+        user_count: 100,
+        admin_count: 1,
+        events_truncated: false,
+        active_user_count: 100,
+        inactive_user_count: 0,
+      },
+      {
+        users_readable: true,
+        events_readable: true,
+        users_truncated: false,
+        user_count: 100,
+        admin_count: 1,
+        events_truncated: false,
+        active_user_count: 100,
+        inactive_user_count: 0,
+      },
+      {
+        users_readable: true,
+        events_readable: true,
+        users_truncated: false,
+        user_count: 100,
+        admin_count: 1,
+        events_truncated: false,
+        active_user_count: 100,
+        inactive_user_count: 26,
+      },
+      {
+        users_readable: true,
+        events_readable: true,
+        users_truncated: false,
+        user_count: 100,
+        admin_count: 1,
+        events_truncated: false,
+        active_user_count: 100,
+        inactive_user_count: 25,
+      },
+    ],
+  }[check.id]?.[branchIndex];
+  if (explicit) return explicit;
   const branches = Object.values(check.derivedFactRules ?? {});
   const domains = witnessDomains(branches, check.criteria.constants);
   const constraints = [
-    ...branches.slice(0, branchIndex).map((branch) => [branch.condition, false]),
     [branches[branchIndex].condition, true],
+    ...branches.slice(0, branchIndex).map((branch) => [branch.condition, false]),
   ];
   let candidates = [new Map()];
   for (const [condition, desired] of constraints) {
@@ -291,8 +433,8 @@ test("every batch tool definition carries adjacent non-enumerable metadata witho
   }
 });
 
-test("Okta, Slack, and Zoom execute declared derived facts with ordered first-match precedence", () => {
-  for (const spec of [OKTA_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+test("Okta, Duo, GWS, Box, Slack, and Zoom execute declared derived facts with ordered first-match precedence", () => {
+  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
     for (const check of spec.checks) {
       assert.ok(Object.keys(check.derivedFactRules ?? {}).length > 0, `${check.id}: executable derived facts`);
       assert.ok(check.criteria.rules.every((entry) => entry.condition.op === "eq"), `${check.id}: outcomes consume derived branches`);
@@ -325,9 +467,9 @@ test("Okta, Slack, and Zoom execute declared derived facts with ordered first-ma
   }
 });
 
-test("Okta, Slack, and Zoom decision inputs contain no preselected conclusion tokens", () => {
+test("Okta, Duo, GWS, Box, Slack, and Zoom decision inputs contain no preselected conclusion tokens", () => {
   const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant|availability|available|enforcement|enforced)(?:_|$)/;
-  for (const spec of [OKTA_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
     for (const check of spec.checks) {
       for (const inputName of check.evidenceFields) {
         assert.doesNotMatch(inputName, forbidden, `${check.id}: ${inputName}`);
@@ -453,15 +595,15 @@ test("Duo executable rules ignore legacy status and use complete evidence with o
     complete: true,
     user_count: 26,
     known_enrollment_count: 26,
+    enrolled_user_count: 26,
     bypass_user_count: 0,
     unenrolled_user_count: 0,
-    enrollment_percent: 100,
   };
-  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", base, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", base), "Pass");
   assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
     ...base,
     bypass_user_count: 1,
-  }, "Pass"), "Fail", "mutating evidence changes the verdict while the legacy status is held constant");
+  }), "Fail", "mutating primitive evidence changes the verdict");
   assert.equal(evaluateBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
     ...base,
     complete: false,
@@ -478,15 +620,13 @@ test("GWS executable rules ignore legacy status and use complete evidence with o
     readable: true,
     complete: true,
     active_user_count: 100,
-    enforced_user_count: 98,
-    coverage: 0.98,
+    two_step_required_user_count: 98,
   };
-  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", base, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", base), "Pass");
   assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", {
     ...base,
-    enforced_user_count: 84,
-    coverage: 0.84,
-  }, "Pass"), "Fail", "mutating directory evidence changes the verdict while the legacy status is held constant");
+    two_step_required_user_count: 84,
+  }), "Fail", "mutating primitive directory counts changes the verdict");
   assert.equal(evaluateBatchCheckVerdict(GWS_SPEC, "GWS-MON-002", {
     readable: true,
     complete: false,
@@ -505,7 +645,7 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
   const legacyStatus = "pass";
   const passwordFacts = {
     settings_readable: true,
-    setting_unused: false,
+    unused_setting_count: 0,
     minimum_length: 14,
     required_minimum_length: 14,
     weak_password_prevention: true,
@@ -521,16 +661,17 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
   const inactivityFacts = {
     users_readable: true,
     events_readable: true,
-    complete: true,
+    users_truncated: false,
+    user_count: 100,
+    admin_count: 1,
+    events_truncated: false,
     active_user_count: 100,
     inactive_user_count: 25,
-    inactive_ratio: 0.25,
   };
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-24", inactivityFacts), "warn");
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-24", {
     ...inactivityFacts,
     inactive_user_count: 26,
-    inactive_ratio: 0.26,
   }), "fail", "the greater-than-25-percent boundary uses the full inventory count");
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-05", {
     allowlist_readable: true,
@@ -542,11 +683,13 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
     stale_entry_count: 0,
     undated_entry_count: 0,
     exempt_target_count: 0,
-    allowlist_required: true,
+    external_collaboration_setting_value: "limit_collaboration_to_allowlisted_domains",
   }), "fail", "a public-domain violation precedes partial evidence");
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-17", {
     users_readable: true,
-    complete: true,
+    users_truncated: false,
+    user_count: 26,
+    admin_count: 1,
     privileged_user_count: 26,
     max_admins: 25,
   }), "warn", "the complete 26-user inventory, not a 25-item evidence sample, controls the result");

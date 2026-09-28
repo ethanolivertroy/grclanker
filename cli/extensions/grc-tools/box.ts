@@ -2937,7 +2937,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     settings_readable: configReadable,
     allowlist_readable: allowlistReadable,
     unused_setting_count: Object.keys(externalUnused).length,
-    external_status: externalStatus,
+    external_collaboration_setting_value: externalStatus,
     allowlist_entry_count: entries.length,
   });
   findings.push(capForUnreadableInventories(
@@ -3013,7 +3013,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     stale_entry_count: staleEntries.length,
     undated_entry_count: undatedEntries.length,
     exempt_target_count: exemptTargets.length,
-    external_status: externalStatus,
+    external_collaboration_setting_value: externalStatus,
   });
   findings.push(capForUnreadableInventories(
     !allowlistReadable
