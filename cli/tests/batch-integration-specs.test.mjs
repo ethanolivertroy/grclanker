@@ -64,7 +64,7 @@ const DEFINED = Symbol("defined");
 function alternativeValues(value, numericDomain) {
   if (typeof value === "boolean") return [!value];
   if (typeof value === "number") return numericDomain.filter((candidate) => candidate !== value);
-  if (typeof value === "string") return [`${value}__different`];
+  if (typeof value === "string") return ["__other__", `${value}__different`];
   if (value === null) return [0];
   return ["__different"];
 }
