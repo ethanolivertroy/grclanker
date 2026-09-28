@@ -48,6 +48,10 @@ jobs:
         working-directory: cli
         run: npm run test:cli
 
+      - name: Validate Agent SDK registry
+        working-directory: cli
+        run: npm run test:agent-sdk:validate
+
       - name: Run leak probe
         working-directory: cli
         run: node --test tests/hardening-leak-probe.test.mjs
