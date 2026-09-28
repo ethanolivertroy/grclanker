@@ -20,6 +20,16 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  evaluateBatchCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
+import {
+  GCP_AUTH_RESOLVER,
+  readResolverEnvironment,
+} from "./auth-resolver-contracts.js";
+import { GCP_SPEC } from "./gcp.spec.js";
 import { REDACTED, seenVersusTotal, systemErrorCode } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -177,6 +187,23 @@ export const GCP_FRAMEWORKS: Array<{ slug: string; title: string; prefix: string
   { slug: "irap", title: "IRAP / ISM", prefix: "IRAP " },
   { slug: "ismap", title: "ISMAP", prefix: "ISMAP " },
 ];
+
+hydrateBatchFrameworkMappings(GCP_SPEC, Object.fromEntries(GCP_SPEC.checks.map((check) => {
+  const mappings = [...new Set(check.controlNumbers.flatMap((control) => GCP_CONTROL_MAPPINGS[control]?.mappings ?? []))];
+  const values = (prefix: string): string[] => mappings
+    .filter((mapping) => mapping.startsWith(prefix))
+    .map((mapping) => mapping.slice(prefix.length));
+  return [check.id, {
+    fedramp: values("FedRAMP "),
+    cmmc: values("CMMC "),
+    soc2: values("SOC 2 "),
+    cis: values("CIS GCP "),
+    pci_dss: values("PCI-DSS "),
+    disa_stig: values("DISA STIG "),
+    irap: values("IRAP "),
+    ismap: values("ISMAP "),
+  }];
+})));
 
 function controlMappings(...controls: number[]): string[] {
   return [...new Set(controls.flatMap((control) => GCP_CONTROL_MAPPINGS[control]?.mappings ?? []))];
@@ -943,6 +970,7 @@ export function resolveGcpConfiguration(
   commandRunner: GcpCommandRunner = defaultCommandRunner,
   fileReader: GcpFileReader = defaultFileReader,
 ): GcpResolvedConfig {
+  env = readResolverEnvironment(GCP_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const organizationId = asString(input.organization_id) ?? asString(env.GCP_ORGANIZATION_ID) ?? asString(env.GCP_ORG_ID);
   if (organizationId) {
@@ -1778,6 +1806,23 @@ interface VerdictInput {
 
 type PartialViewInput = Pick<VerdictInput, "total" | "deniedProjects" | "scannedProjects" | "apiDisabledProjects" | "truncated" | "unreachableScopes" | "unreadable">;
 
+function gcpVerdictStatus(checkId: string, facts: Readonly<Record<string, unknown>>): GcpFindingStatus {
+  const status = evaluateBatchCheckVerdict(GCP_SPEC, checkId, facts);
+  switch (status) {
+    case "pass":
+    case "warn":
+    case "fail":
+    case "manual":
+      return status;
+    case "info":
+      throw new Error(`${checkId} produced unsupported GCP info status`);
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`Unhandled GCP verdict ${String(exhaustive)}`);
+    }
+  }
+}
+
 function partialNote(input: PartialViewInput): string {
   const notes: string[] = [];
   const unreachable = input.unreachableScopes ?? [];
@@ -1799,6 +1844,15 @@ function verdict(input: VerdictInput): GcpFinding {
   const allDenied = (input.deniedProjects ?? 0) > 0 && input.deniedProjects === input.scannedProjects;
   const allDisabled = (input.apiDisabledProjects ?? 0) > 0 && input.apiDisabledProjects === input.scannedProjects;
   const unreadable = [...(input.inventoryError ? [input.inventoryError] : []), ...(input.unreadable ?? [])];
+  const evaluatedStatus = gcpVerdictStatus(input.id, {
+    evidence_readable: !input.inventoryError
+      && input.scannedProjects !== 0
+      && !(input.total === 0 && (allDenied || allDisabled)),
+    evidence_complete: !isPartial,
+    inventory_count: input.total,
+    violation_count: input.violations,
+    review_count: input.unknown ?? 0,
+  });
   /** Per-project scan status is a value only when at least one project was attempted; a scan of nothing reports null. */
   const perProjectStatus = input.scannedProjects === undefined
     ? {}
@@ -1819,14 +1873,14 @@ function verdict(input: VerdictInput): GcpFinding {
   if (input.inventoryError) {
     return {
       ...unseen,
-      status: "manual",
+      status: evaluatedStatus,
       summary: `Manual: ${input.inventoryError.dataset} unreadable for ${input.inventoryError.scope} via ${input.inventoryError.endpoint} (${input.inventoryError.error}). Collect manually: ${input.manualEvidence}`,
     };
   }
   if (input.scannedProjects === 0) {
     return {
       ...unseen,
-      status: "manual",
+      status: evaluatedStatus,
       summary: `Manual: no projects were inventoried in the scope, so per-project evidence could not be collected. Collect manually: ${input.manualEvidence}`,
     };
   }
@@ -1834,7 +1888,7 @@ function verdict(input: VerdictInput): GcpFinding {
     const dataset = input.inventory?.dataset ?? "the inventory";
     return {
       ...unseen,
-      status: "manual",
+      status: evaluatedStatus,
       summary: `Manual: ${allDenied ? `every sampled project denied the read of ${dataset}${input.inventory ? ` (${input.inventory.endpoint})` : ""}` : `the API serving ${dataset} is not enabled in any sampled project`}.${partial} Collect manually: ${input.manualEvidence}`,
     };
   }
@@ -1842,12 +1896,12 @@ function verdict(input: VerdictInput): GcpFinding {
     switch (input.emptyVerdict) {
       case "pass":
         return isPartial
-          ? { ...base, status: "warn", summary: `${input.emptySummary}${partial}` }
-          : { ...base, status: "pass", summary: `${input.emptySummary} Emptiness is compliant by intent.` };
+          ? { ...base, status: evaluatedStatus, summary: `${input.emptySummary}${partial}` }
+          : { ...base, status: evaluatedStatus, summary: `${input.emptySummary} Emptiness is compliant by intent.` };
       case "fail":
-        return { ...base, status: "fail", summary: `${input.emptySummary} Emptiness is treated as fail.${partial}` };
+        return { ...base, status: evaluatedStatus, summary: `${input.emptySummary} Emptiness is treated as fail.${partial}` };
       case "manual":
-        return { ...base, status: "manual", summary: `Manual: ${input.emptySummary} Emptiness is treated as manual.${partial} Collect manually: ${input.manualEvidence}` };
+        return { ...base, status: evaluatedStatus, summary: `Manual: ${input.emptySummary} Emptiness is treated as manual.${partial} Collect manually: ${input.manualEvidence}` };
       default: {
         const exhaustive: never = input.emptyVerdict;
         throw new Error(`Unhandled empty verdict ${String(exhaustive)}`);
@@ -1855,15 +1909,15 @@ function verdict(input: VerdictInput): GcpFinding {
     }
   }
   if (input.violations > 0) {
-    return { ...base, status: input.violationStatus ?? "fail", summary: `${input.failSummary}${partial}` };
+    return { ...base, status: evaluatedStatus, summary: `${input.failSummary}${partial}` };
   }
   if ((input.unknown ?? 0) > 0) {
-    return { ...base, status: "warn", summary: `${input.unknownSummary ?? `${input.unknown} of ${input.total} items lacked the documented flag needed to confirm compliance.`}${partial}` };
+    return { ...base, status: evaluatedStatus, summary: `${input.unknownSummary ?? `${input.unknown} of ${input.total} items lacked the documented flag needed to confirm compliance.`}${partial}` };
   }
   if (isPartial) {
-    return { ...base, status: "warn", summary: `${input.passSummary}${partial} A partial view cannot pass.` };
+    return { ...base, status: evaluatedStatus, summary: `${input.passSummary}${partial} A partial view cannot pass.` };
   }
-  return { ...base, status: "pass", summary: input.passSummary };
+  return { ...base, status: evaluatedStatus, summary: input.passSummary };
 }
 
 function manualFinding(
@@ -1875,11 +1929,18 @@ function manualFinding(
   manualEvidence: string,
   evidence: JsonRecord = {},
 ): GcpFinding {
+  const status = gcpVerdictStatus(id, {
+    evidence_readable: false,
+    evidence_complete: false,
+    inventory_count: 0,
+    violation_count: 0,
+    review_count: 0,
+  });
   return {
     id,
     title,
     severity,
-    status: "manual",
+    status,
     summary: `Manual: ${reason} Collect manually: ${manualEvidence}`,
     evidence,
     mappings: controlMappings(...controls),
@@ -2735,7 +2796,13 @@ export async function assessGcpLoggingDetection(
           id: "GCP-LOG-05",
           title: "Security Command Center visibility",
           severity: "info",
-          status: sccSources.data.items.length > 0 && sccPartialNotes.length === 0 ? "pass" : "warn",
+          status: gcpVerdictStatus("GCP-LOG-05", {
+            evidence_readable: true,
+            evidence_complete: sccPartialNotes.length === 0,
+            inventory_count: sccSources.data.items.length,
+            violation_count: 0,
+            review_count: sccSources.data.items.length === 0 ? 1 : 0,
+          }),
           summary: sccSources.data.items.length > 0
             ? `Security Command Center returned ${sccSources.data.items.length}${sccSources.truncated ? "+" : ""} sources and ${sccFindingCount === null ? "an unreadable findings list" : `${sccFindingCount}${sccFindings.truncated ? "+" : ""} findings`}. Visibility only; findings are not scored as controls.${sccPartialNote}${sccPartialNotes.length > 0 ? " A partial view cannot pass." : ""}`
             : `Security Command Center returned no sources for the scope; verify the tier or organization scope. Visibility only.${sccPartialNote}`,
@@ -2888,7 +2955,13 @@ function orgPolicyFinding(
     id,
     title,
     severity,
-    status: enabled ? (view.partial ? "warn" : "pass") : failStatus,
+    status: gcpVerdictStatus(id, {
+      evidence_readable: true,
+      evidence_complete: !view.partial,
+      inventory_count: 1,
+      violation_count: enabled ? 0 : 1,
+      review_count: 0,
+    }),
     summary: enabled ? `${passSummary}${view.note}` : `${failSummary}${view.note}`,
     evidence: { policy: snapshotOrgPolicy(read.policy.data), partial: view.partial, unreadable_inventories: view.unreadable },
     mappings: controlMappings(...controls),
@@ -3011,11 +3084,13 @@ export async function assessGcpOrgGuardrails(
           id: "GCP-ORG-01",
           title: "Organization visibility",
           severity: "medium",
-          status: context.error
-            ? "manual"
-            : context.truncated || context.projectIds.length === 0 || !asString(organization.data?.name)
-              ? "warn"
-              : "pass",
+          status: gcpVerdictStatus("GCP-ORG-01", {
+            evidence_readable: !context.error,
+            evidence_complete: !context.truncated,
+            inventory_count: context.projectIds.length,
+            violation_count: 0,
+            review_count: asString(organization.data?.name) ? 0 : 1,
+          }),
           summary: context.unreadable[0]
             ? `Manual: organization ${config.organizationId} was readable but the ${describeUnreadable(context.unreadable[0])}: ${context.error}. Collect manually: list projects under the organization.`
             : !asString(organization.data?.name)
@@ -3059,11 +3134,16 @@ export async function assessGcpOrgGuardrails(
           id: "GCP-ORG-05",
           title: "Serial port and Shielded VM guardrails",
           severity: "medium",
-          status: computeGuardrailsEnforced
-            ? (policyView.partial ? "warn" : "pass")
-            : interpretOrgPolicyEnabled(serialPortPolicy.policy.data) || interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data)
-              ? "warn"
-              : "fail",
+          status: gcpVerdictStatus("GCP-ORG-05", {
+            evidence_readable: true,
+            evidence_complete: !policyView.partial,
+            inventory_count: 2,
+            violation_count: interpretOrgPolicyEnabled(serialPortPolicy.policy.data)
+              || interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data) ? 0 : 1,
+            review_count: computeGuardrailsEnforced
+              || (!interpretOrgPolicyEnabled(serialPortPolicy.policy.data)
+                && !interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data)) ? 0 : 1,
+          }),
           summary: computeGuardrailsEnforced
             ? `constraints/compute.disableSerialPortAccess and constraints/compute.requireShieldedVm are both enforced in the effective policy of the sampled project.${policyView.note}`
             : `Compute hardening guardrails missing: ${[!interpretOrgPolicyEnabled(serialPortPolicy.policy.data) && "compute.disableSerialPortAccess", !interpretOrgPolicyEnabled(shieldedVmPolicy.policy.data) && "compute.requireShieldedVm"].filter(Boolean).join(", ")}.${policyView.note}`,
@@ -4246,6 +4326,7 @@ function runTool<TArgs>(
 }
 
 export function registerGcpTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, GCP_SPEC);
   pi.registerTool({
     name: "gcp_check_access",
     label: "Check GCP audit access",
