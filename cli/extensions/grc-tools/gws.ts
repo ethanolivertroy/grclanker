@@ -1098,6 +1098,7 @@ function countByStatus(findings: GwsFinding[]): Record<GwsFindingStatus, number>
 }
 
 const GWS_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+const GWS_METADATA_DEMOTED_PASSES = new WeakSet<GwsFinding>();
 
 function recordGwsDecisionFacts(definitionId: string, facts: Readonly<Record<string, unknown>>): void {
   const store = GWS_DECISION_CONTEXT.getStore();
@@ -1126,8 +1127,9 @@ function buildFinding(
   if (!definition) throw new Error(`Unknown GWS check definition: ${definitionId}`);
   const facts = GWS_DECISION_CONTEXT.getStore()?.get(definitionId);
   if (!facts) throw new Error(`${definitionId} has no runtime decision facts`);
+  const legacyStatus = status;
   status = materializeBatchCheckVerdict(GWS_SPEC, definitionId, facts, status);
-  return {
+  const finding: GwsFinding = {
     id: definition.id,
     title: definition.title,
     category: definition.category,
@@ -1139,6 +1141,8 @@ function buildFinding(
     manualNote,
     frameworks: definition.frameworks,
   };
+  if (legacyStatus === "Pass" && status === "Partial") GWS_METADATA_DEMOTED_PASSES.add(finding);
+  return finding;
 }
 
 function isActiveUser(user: JsonRecord): boolean {
@@ -1201,11 +1205,12 @@ function withPartialCap(
   reason = "the credential only saw a partial inventory",
 ): GwsFinding {
   if (notes.length === 0) return finding;
-  const status: GwsFindingStatus = finding.status === "Pass" ? "Partial" : finding.status;
+  const passBeforeCap = finding.status === "Pass" || GWS_METADATA_DEMOTED_PASSES.has(finding);
+  const status: GwsFindingStatus = passBeforeCap ? "Partial" : finding.status;
   return {
     ...finding,
     status,
-    summary: finding.status === "Pass"
+    summary: passBeforeCap
       ? `${finding.summary} The verdict is capped at Partial because ${reason}.`
       : finding.summary,
     evidence: [...finding.evidence, ...notes],
