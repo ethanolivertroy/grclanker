@@ -63,7 +63,7 @@ function owner(id: string): string {
 }
 
 const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces]) => {
-  const custom = id === "CF-IAM-02"
+  const custom: Partial<Batch2CheckRow> = id === "CF-IAM-02"
     ? {
         decisionInputs: {
           evidence_readable: "Boolean. True only when token verification and the current-token detail response were readable; Global API Key authentication has no token and is false.",
