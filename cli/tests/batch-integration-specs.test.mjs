@@ -33,6 +33,7 @@ const batch = [
   [ZENDESK_SPEC, ZENDESK_RUNTIME_BEHAVIOR],
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
+const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS)-/.test(check.id);
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -67,7 +68,7 @@ test("every batch tool definition carries adjacent non-enumerable metadata witho
 test("ordered rules preserve runtime statuses byte-for-byte and enforce first-match precedence", () => {
   for (const [spec] of batch) {
     for (const check of spec.checks) {
-      if (check.id.startsWith("OKTA-")) continue;
+      if (usesExecutableEvidenceRules(check)) continue;
       const emitted = new Set(check.criteria.rules.map((rule) => rule.status));
       for (const status of emitted) {
         const payload = { id: check.id, status, values: [null, 0, 25, 26] };
@@ -97,12 +98,12 @@ test("every rule has boundary coverage and null, missing, denied, or unreadable 
   for (const [spec] of batch) {
     validateDecisionInputs(spec);
     for (const check of spec.checks) {
-      if (check.id.startsWith("OKTA-")) {
+      if (usesExecutableEvidenceRules(check)) {
         const nullFacts = Object.fromEntries(check.evidenceFields.map((name) => [name, null]));
         assert.equal(evaluateCheckVerdict(check, {}), "manual", `${check.id}: missing`);
         assert.notEqual(evaluateCheckVerdict(check, nullFacts), "pass", `${check.id}: null cannot pass`);
         assert.throws(
-          () => evaluateCheckVerdict(check, { ...nullFacts, undeclared_okta_input: true }),
+          () => evaluateCheckVerdict(check, { ...nullFacts, undeclared_evidence_input: true }),
           new RegExp(`${check.id} received undeclared decision input`),
         );
         continue;
@@ -184,6 +185,60 @@ test("Okta executable rules ignore legacy status and use complete counts with or
     compliant_policy_count: 25,
     all_policies_compliant: true,
   }), "pass");
+});
+
+test("Duo executable rules ignore legacy status and use complete evidence with ordered precedence", () => {
+  const base = {
+    readable: true,
+    complete: true,
+    user_count: 26,
+    known_enrollment_count: 26,
+    bypass_user_count: 0,
+    unenrolled_user_count: 0,
+    enrollment_percent: 100,
+  };
+  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", base, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
+    ...base,
+    bypass_user_count: 1,
+  }, "Pass"), "Fail", "mutating evidence changes the verdict while the legacy status is held constant");
+  assert.equal(evaluateBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
+    ...base,
+    complete: false,
+    bypass_user_count: 1,
+  }), "fail", "a proven bypass violation precedes partial inventory evidence");
+  assert.equal(evaluateBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
+    ...base,
+    complete: false,
+  }), "warn", "a 26-user incomplete inventory cannot pass based on a 25-item rendering sample");
+});
+
+test("GWS executable rules ignore legacy status and use complete evidence with ordered precedence", () => {
+  const base = {
+    readable: true,
+    complete: true,
+    active_user_count: 100,
+    enforced_user_count: 98,
+    coverage: 0.98,
+  };
+  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", base, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", {
+    ...base,
+    enforced_user_count: 84,
+    coverage: 0.84,
+  }, "Pass"), "Fail", "mutating directory evidence changes the verdict while the legacy status is held constant");
+  assert.equal(evaluateBatchCheckVerdict(GWS_SPEC, "GWS-MON-002", {
+    readable: true,
+    complete: false,
+    event_count: 26,
+    suspicious_login_count: 6,
+  }), "fail", "a proven suspicious-login violation precedes partial audit evidence");
+  assert.equal(evaluateBatchCheckVerdict(GWS_SPEC, "GWS-MON-002", {
+    readable: true,
+    complete: false,
+    event_count: 26,
+    suspicious_login_count: 0,
+  }), "warn", "complete source cardinality, not a capped 25-item sample, controls pass");
 });
 
 test("runtime behavior statements are explicit and generator-visible", () => {
