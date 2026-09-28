@@ -49,13 +49,15 @@ export function materializeInitialPrompt(
   payload: InitialPromptPayload,
   pipedInput: string,
 ): string {
-  if (!pipedInput) return payload.content;
-
   if (payload.kind === "workflow") {
+    if (!pipedInput) return payload.content;
     return `${payload.content}\n\n## Piped input\n\n${pipedInput}`;
   }
 
-  return `${pipedInput}\n\n${payload.content}`;
+  const literalPrompt = payload.content.startsWith("/")
+    ? `## CLI prompt\n\n${payload.content}`
+    : payload.content;
+  return pipedInput ? `${pipedInput}\n\n${literalPrompt}` : literalPrompt;
 }
 
 export function resolveSerializedInitialPrompt(

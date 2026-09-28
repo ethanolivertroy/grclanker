@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "@earendil-works/pi-coding-agent";
 import { runPrintMode } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/print-mode.js";
 import { CLI_HELP } from "../dist/pi/cli-help.js";
-import { registerInitialPromptInputHandler } from "../dist/extensions/grc-tools.js";
+import grcTools from "../dist/extensions/grc-tools.js";
 import { routeCliInvocation } from "../dist/pi/cli-routing.js";
 import { buildCliLaunchArgs } from "../dist/pi/launch.js";
 import {
@@ -29,12 +29,12 @@ function renderWorkflow(workflow, subject) {
 
 function registeredInitialPromptHandler() {
   let handler;
-  registerInitialPromptInputHandler({
+  grcTools({
     on(event, candidate) {
-      assert.equal(event, "input");
-      handler = candidate;
+      if (event === "input") handler = candidate;
       return () => {};
     },
+    registerTool() {},
   });
   assert.equal(typeof handler, "function");
   return handler;
@@ -92,7 +92,7 @@ test("non-option invocations route as one free-form Pi prompt", () => {
   assert.equal(parsed.fileArgs.length, 0);
   assert.deepEqual(parsed.messages, [args.at(-1)]);
   assert.equal(args.at(-1).startsWith("-"), false);
-  assert.equal(args.includes("--no-prompt-templates"), true);
+  assert.equal(args.includes("--no-prompt-templates"), false);
 });
 
 test("workflow subjects survive both --compute forms and positions", () => {
@@ -181,6 +181,34 @@ test("initial prompt envelopes preserve literal user text and workflow precedenc
   assert.ok(materialized.startsWith(workflow));
   assert.match(materialized, /## Piped input\n\ntenant evidence$/);
   assert.equal(materialized.includes("$ARGUMENTS"), false);
+});
+
+test("slash-leading free-form prompts stay literal without disabling later templates", async () => {
+  const literal = "/audit x";
+  const handler = registeredInitialPromptHandler();
+  const result = await handler({
+    type: "input",
+    text: serializeInitialPrompt({ kind: "prompt", content: literal }),
+    source: "interactive",
+  });
+  assert.deepEqual(result, { action: "transform", text: `## CLI prompt\n\n${literal}` });
+
+  assert.deepEqual(
+    await handler({
+      type: "input",
+      text: serializeInitialPrompt({ kind: "prompt", content: literal }),
+      source: "rpc",
+    }),
+    { action: "continue" },
+  );
+  assert.deepEqual(
+    await handler({
+      type: "input",
+      text: serializeInitialPrompt({ kind: "prompt", content: literal }),
+      source: "extension",
+    }),
+    { action: "continue" },
+  );
 });
 
 test("serialized prompts complete in print mode before runtime disposal", async () => {
