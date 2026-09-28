@@ -1,4 +1,9 @@
-import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  deriveDecisionRules,
+  type BatchCheckDefinition,
+} from "./batch-spec-builder.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const ZOOM_SURFACES = [
@@ -89,20 +94,47 @@ const decisions = [
   "return pass when every participant sees the recording disclaimer, warn for guest-only, unknown, or group-relaxed settings, fail when the legacy disclaimer is explicitly false, and manual when no documented setting is exposed.",
 ] as const;
 
-interface ZoomExecutableDecision { inputs: Readonly<Record<string, string>>; rules: readonly VerdictRule[] }
+interface ZoomExecutableDecision {
+  inputs: Readonly<Record<string, string>>;
+  constants?: Readonly<Record<string, PortableValue>>;
+  rules: readonly VerdictRule[];
+}
 const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
 const path = (name: string) => ({ kind: "path" as const, path: name });
 const cmp = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry: PortableValue): VerdictCondition => ({ op, left: path(name), right: value(entry) });
 const eq = (name: string, entry: PortableValue) => cmp("eq", name, entry);
 const ne = (name: string, entry: PortableValue) => cmp("ne", name, entry);
 const gt = (name: string, entry: PortableValue) => cmp("gt", name, entry);
+const ltePaths = (left: string, right: string): VerdictCondition => ({ op: "lte", left: path(left), right: path(right) });
+const defined = (name: string): VerdictCondition => ({ op: "defined", operand: path(name) });
+const matches = (name: string, pattern: string, flags?: string): VerdictCondition => ({ op: "matches", operand: path(name), pattern, ...(flags ? { flags } : {}) });
+const not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", condition });
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
 const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from complete collector state before evidence samples are capped.`]));
-const standard = (): ZoomExecutableDecision => ({
-  inputs: input("available", "compliant", "enforced"),
-  rules: [rule("manual", ne("available", true)), rule("fail", ne("compliant", true)), rule("warn", ne("enforced", true)), rule("pass", eq("enforced", true)), rule("manual", { op: "always" })],
+const groupInputs = ["relaxing_group_count", "group_list_state", "unreadable_group_setting_count", "group_list_truncated"] as const;
+const groupEvidenceIncomplete = any(
+  gt("relaxing_group_count", 0),
+  eq("group_list_state", "denied"),
+  eq("group_list_state", "error"),
+  gt("unreadable_group_setting_count", 0),
+  eq("group_list_truncated", true),
+);
+const booleanSetting = (requiredValue: boolean): ZoomExecutableDecision => ({
+  inputs: input("settings_readable", "setting_present", "setting_value", "lock_value", ...groupInputs),
+  constants: { required_setting_value: requiredValue },
+  rules: [
+    rule("manual", any(ne("settings_readable", true), ne("setting_present", true))),
+    rule("fail", { op: "ne", left: path("setting_value"), right: path("required_setting_value") }),
+    rule("warn", any(ne("lock_value", true), groupEvidenceIncomplete)),
+    rule("pass", all(
+      { op: "eq", left: path("setting_value"), right: path("required_setting_value") },
+      eq("lock_value", true),
+      not(groupEvidenceIncomplete),
+    )),
+    rule("manual", { op: "always" }),
+  ],
 });
 const manual = (): ZoomExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
 const inventory = (empty: "manual" | "warn", bad: "fail" | "warn"): ZoomExecutableDecision => ({
@@ -114,38 +146,200 @@ const ZOOM_EXECUTABLE_DECISIONS: Readonly<Record<string, ZoomExecutableDecision>
     inputs: input("readable", "complete", "count", "bad_count", "unknown_count"),
     rules: [rule("manual", any(ne("readable", true), eq("count", 0))), rule("fail", gt("bad_count", 0)), rule("warn", any(gt("unknown_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
   },
-  "ZOOM-ID-02": standard(),
+  "ZOOM-ID-02": {
+    inputs: input("settings_readable", "setting_present", "setting_value", "roles_readable", "roles_complete", "admin_role_count", "uncovered_admin_role_count"),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), ne("setting_present", true))),
+      rule("manual", all(eq("setting_value", "role"), any(ne("roles_readable", true), eq("admin_role_count", 0)))),
+      rule("fail", any(eq("setting_value", "none"), all(eq("setting_value", "role"), gt("uncovered_admin_role_count", 0)))),
+      rule("warn", any(eq("setting_value", "group"), all(any(eq("setting_value", "all"), eq("setting_value", "role")), ne("roles_complete", true)))),
+      rule("pass", all(
+        any(eq("setting_value", "all"), eq("setting_value", "role")),
+        eq("roles_readable", true),
+        eq("roles_complete", true),
+        any(eq("setting_value", "all"), gt("admin_role_count", 0)),
+        eq("uncovered_admin_role_count", 0),
+      )),
+      rule("manual", { op: "always" }),
+    ],
+  },
   "ZOOM-ID-03": inventory("manual", "fail"),
-  "ZOOM-ID-04": { inputs: input("available", "complete", "admin_count", "max_admins"), rules: [rule("manual", ne("available", true)), rule("warn", any(ne("complete", true), { op: "gt", left: path("admin_count"), right: path("max_admins") })), rule("pass", { op: "always" })] },
+  "ZOOM-ID-04": {
+    inputs: input("roles_readable", "admin_role_count", "member_read_denied", "complete", "admin_count", "max_admins"),
+    rules: [
+      rule("manual", any(ne("roles_readable", true), eq("admin_role_count", 0), eq("member_read_denied", true))),
+      rule("warn", any(ne("complete", true), { op: "gt", left: path("admin_count"), right: path("max_admins") })),
+      rule("pass", ltePaths("admin_count", "max_admins")),
+      rule("manual", { op: "always" }),
+    ],
+  },
   "ZOOM-ID-05": { inputs: input("readable", "complete", "count", "bad_count", "unknown_count"), rules: [rule("manual", any(ne("readable", true), eq("count", 0))), rule("fail", gt("bad_count", 0)), rule("warn", any(gt("unknown_count", 0), ne("complete", true))), rule("pass", { op: "always" })] },
-  "ZOOM-ID-06": standard(),
+  "ZOOM-ID-06": {
+    inputs: input("settings_readable", "client_setting_present", "web_setting_present", "client_minutes", "web_minutes", "max_minutes"),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), all(ne("client_setting_present", true), ne("web_setting_present", true)))),
+      rule("fail", any(not(defined("client_minutes")), not(defined("web_minutes")), cmp("lte", "client_minutes", 0), cmp("lte", "web_minutes", 0))),
+      rule("warn", any({ op: "gt", left: path("client_minutes"), right: path("max_minutes") }, { op: "gt", left: path("web_minutes"), right: path("max_minutes") })),
+      rule("pass", { op: "always" }),
+    ],
+  },
   "ZOOM-ID-07": manual(),
   "ZOOM-COLLAB-01": inventory("manual", "fail"),
-  "ZOOM-COLLAB-02": standard(),
-  "ZOOM-COLLAB-03": standard(),
-  "ZOOM-COLLAB-04": standard(),
+  "ZOOM-COLLAB-02": booleanSetting(false),
+  "ZOOM-COLLAB-03": {
+    inputs: input("settings_readable", "cloud_recording_present", "cloud_recording_value", "auto_delete_present", "auto_delete_value", "retention_days", "max_retention_days", "lock_value", ...groupInputs),
+    rules: [
+      rule("manual", any(
+        ne("settings_readable", true),
+        all(ne("cloud_recording_present", true), ne("auto_delete_present", true)),
+        eq("cloud_recording_value", false),
+      )),
+      rule("fail", ne("auto_delete_value", true)),
+      rule("warn", any(
+        not(defined("retention_days")),
+        { op: "gt", left: path("retention_days"), right: path("max_retention_days") },
+        ne("lock_value", true),
+        groupEvidenceIncomplete,
+      )),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZOOM-COLLAB-04": {
+    inputs: input("phone_readable", "auto_call_present", "ad_hoc_present", "auto_call_enable", "ad_hoc_enable", "auto_call_lock", "ad_hoc_lock"),
+    rules: [
+      rule("manual", any(
+        ne("phone_readable", true),
+        ne("auto_call_present", true),
+        ne("ad_hoc_present", true),
+        not(defined("auto_call_enable")),
+        not(defined("ad_hoc_enable")),
+      )),
+      rule("warn", any(ne("auto_call_lock", true), ne("ad_hoc_lock", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
   "ZOOM-COLLAB-05": inventory("warn", "warn"),
   "ZOOM-COLLAB-06": inventory("manual", "warn"),
-  "ZOOM-COLLAB-07": standard(),
+  "ZOOM-COLLAB-07": {
+    inputs: input(
+      "settings_readable",
+      "add_policy_present",
+      "add_policy_enabled",
+      "add_policy_selected_option",
+      "chat_policy_present",
+      "chat_policy_enabled",
+      "chat_policy_selected_option",
+      "add_policy_lock",
+      "chat_policy_lock",
+      ...groupInputs,
+    ),
+    rules: [
+      rule("manual", any(
+        ne("settings_readable", true),
+        ne("add_policy_present", true),
+        ne("chat_policy_present", true),
+        not(defined("add_policy_enabled")),
+        not(defined("chat_policy_enabled")),
+        all(eq("add_policy_enabled", true), not(defined("add_policy_selected_option"))),
+        all(eq("chat_policy_enabled", true), not(defined("chat_policy_selected_option"))),
+      )),
+      rule("fail", any(
+        all(eq("add_policy_enabled", true), eq("add_policy_selected_option", 1)),
+        all(eq("chat_policy_enabled", true), eq("chat_policy_selected_option", 1)),
+      )),
+      rule("warn", any(ne("add_policy_lock", true), ne("chat_policy_lock", true), groupEvidenceIncomplete)),
+      rule("pass", { op: "always" }),
+    ],
+  },
   "ZOOM-COLLAB-08": manual(),
-  "ZOOM-MTG-01": standard(), "ZOOM-MTG-02": standard(), "ZOOM-MTG-03": standard(),
-  "ZOOM-MTG-04": standard(), "ZOOM-MTG-05": standard(), "ZOOM-MTG-06": standard(),
-  "ZOOM-MTG-07": standard(), "ZOOM-MTG-08": standard(), "ZOOM-MTG-09": standard(),
-  "ZOOM-MTG-10": standard(),
+  "ZOOM-MTG-01": booleanSetting(true),
+  "ZOOM-MTG-02": booleanSetting(true),
+  "ZOOM-MTG-03": {
+    inputs: input("settings_readable", "screen_setting_present", "screen_setting_value", "share_setting_present", "share_setting_value", "lock_value", ...groupInputs),
+    rules: [
+      rule("manual", any(
+        ne("settings_readable", true),
+        ne("screen_setting_present", true),
+        all(ne("screen_setting_value", false), ne("share_setting_present", true)),
+        all(ne("screen_setting_value", false), ne("share_setting_value", "host"), ne("share_setting_value", "all")),
+      )),
+      rule("fail", all(ne("screen_setting_value", false), eq("share_setting_value", "all"))),
+      rule("warn", any(ne("lock_value", true), groupEvidenceIncomplete)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZOOM-MTG-04": booleanSetting(false),
+  "ZOOM-MTG-05": {
+    inputs: input("settings_readable", "e2ee_setting_present", "e2ee_setting_value", "encryption_type_value", "lock_value", ...groupInputs),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), ne("e2ee_setting_present", true))),
+      rule("fail", ne("e2ee_setting_value", true)),
+      rule("warn", any(ne("encryption_type_value", "e2ee"), ne("lock_value", true), groupEvidenceIncomplete)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZOOM-MTG-06": booleanSetting(false),
+  "ZOOM-MTG-07": {
+    inputs: input("settings_readable", "personal_meeting_value", "scheduled_setting_present", "scheduled_setting_value", "instant_setting_present", "instant_setting_value", "scheduled_lock_value", "instant_lock_value", ...groupInputs),
+    rules: [
+      rule("manual", any(
+        ne("settings_readable", true),
+        all(ne("personal_meeting_value", false), any(ne("scheduled_setting_present", true), ne("instant_setting_present", true))),
+      )),
+      rule("fail", all(
+        ne("personal_meeting_value", false),
+        any(ne("scheduled_setting_value", false), ne("instant_setting_value", false)),
+      )),
+      rule("warn", any(ne("scheduled_lock_value", true), ne("instant_lock_value", true), groupEvidenceIncomplete)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZOOM-MTG-08": booleanSetting(true),
+  "ZOOM-MTG-09": {
+    inputs: input("settings_readable", "setting_present", "setting_value", "region_count", "lock_value", ...groupInputs),
+    rules: [
+      rule("manual", any(ne("settings_readable", true), ne("setting_present", true))),
+      rule("fail", ne("setting_value", true)),
+      rule("warn", any(eq("region_count", 0), ne("lock_value", true), groupEvidenceIncomplete)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZOOM-MTG-10": {
+    inputs: input("settings_readable", "disclaimer_option", "legacy_setting_present", "legacy_setting_value", ...groupInputs),
+    rules: [
+      rule("manual", any(
+        ne("settings_readable", true),
+        all(not(defined("disclaimer_option")), ne("legacy_setting_present", true)),
+      )),
+      rule("fail", all(not(defined("disclaimer_option")), eq("legacy_setting_present", true), ne("legacy_setting_value", true))),
+      rule("warn", any(
+        all(defined("disclaimer_option"), not(matches("disclaimer_option", "all participants", "i"))),
+        groupEvidenceIncomplete,
+      )),
+      rule("pass", any(matches("disclaimer_option", "all participants", "i"), eq("legacy_setting_value", true))),
+      rule("manual", { op: "always" }),
+    ],
+  },
 };
 
-const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, owner], index) => ({
-  id,
-  control,
-  title,
-  severity,
-  owner,
-  surfaces: ZOOM_CHECK_SURFACES[id],
-  evidenceFields: [...ZOOM_CHECK_SURFACES[id], "complete_source_counts"],
-  decisionInputs: ZOOM_EXECUTABLE_DECISIONS[id].inputs,
-  decisionRules: ZOOM_EXECUTABLE_DECISIONS[id].rules,
-  decision: decisions[index],
-}));
+const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, owner], index) => {
+  const decision = ZOOM_EXECUTABLE_DECISIONS[id];
+  const executable = deriveDecisionRules(id, decision.rules);
+  return {
+    id,
+    control,
+    title,
+    severity,
+    owner,
+    surfaces: ZOOM_CHECK_SURFACES[id],
+    evidenceFields: [...ZOOM_CHECK_SURFACES[id], "complete_source_counts"],
+    decisionInputs: decision.inputs,
+    decisionConstants: decision.constants,
+    decisionRules: executable.rules,
+    derivedFactRules: executable.derivedFactRules,
+    decision: decisions[index],
+  };
+});
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 export const ZOOM_RUNTIME_BEHAVIOR = [

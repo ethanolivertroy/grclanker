@@ -1729,14 +1729,15 @@ export function assessZoomIdentityFromSnapshot(
   const rolesUnreadable = snapshot.roles.status !== "ok";
   const uncoveredAdminRoles = adminRoles.filter((role) => !twoFactorRoles.includes(asString(role.id) ?? ""));
   const twoFactorMode = asString(twoFactor.value);
-  const twoFactorRecognized = ["all", "role", "group", "none"].includes(twoFactorMode ?? "");
-  const twoFactorAvailable = !securitySurface && twoFactor.present && twoFactorRecognized
-    && (twoFactorMode !== "role" || (!rolesUnreadable && adminRoles.length > 0));
-  const twoFactorCompliant = twoFactorMode === "all" || twoFactorMode === "group"
-    || (twoFactorMode === "role" && uncoveredAdminRoles.length === 0);
-  const twoFactorEnforced = (twoFactorMode === "all" || twoFactorMode === "role")
-    && twoFactorCompliant && !rolesUnreadable && !roles.truncated;
-  recordZoomDecisionFacts("ZOOM-ID-02", { available: twoFactorAvailable, compliant: twoFactorCompliant, enforced: twoFactorEnforced });
+  recordZoomDecisionFacts("ZOOM-ID-02", {
+    settings_readable: !securitySurface,
+    setting_present: twoFactor.present,
+    setting_value: twoFactorMode,
+    roles_readable: !rolesUnreadable,
+    roles_complete: !rolesUnreadable && !roles.truncated,
+    admin_role_count: adminRoles.length,
+    uncovered_admin_role_count: uncoveredAdminRoles.length,
+  });
   // The admin role inventory is evidence for every 2FA mode, so an unreadable
   // GET /roles is named here instead of rendering as an empty admin_roles list.
   const twoFactorEvidence = {
@@ -1868,7 +1869,14 @@ export function assessZoomIdentityFromSnapshot(
     member_lists_truncated: memberTruncated,
     member_lists_denied: memberDenied,
   };
-  recordZoomDecisionFacts("ZOOM-ID-04", { available: snapshot.roles.status === "ok" && adminRoles.length > 0 && !memberDenied, complete: !memberTruncated && !roles.truncated, admin_count: adminIds.size, max_admins: maxAdmins });
+  recordZoomDecisionFacts("ZOOM-ID-04", {
+    roles_readable: snapshot.roles.status === "ok",
+    admin_role_count: adminRoles.length,
+    member_read_denied: memberDenied,
+    complete: !memberTruncated && !roles.truncated,
+    admin_count: adminIds.size,
+    max_admins: maxAdmins,
+  });
   findings.push(finding(
     "ZOOM-ID-04",
     "Administrative privilege concentration",
@@ -1913,9 +1921,12 @@ export function assessZoomIdentityFromSnapshot(
   };
   const timeoutDisabled = (minutes: number | undefined) => minutes === undefined || minutes <= 0;
   recordZoomDecisionFacts("ZOOM-ID-06", {
-    available: !securitySurface && (clientTimeout.present || webTimeout.present),
-    compliant: !timeoutDisabled(clientMinutes) && !timeoutDisabled(webMinutes),
-    enforced: !timeoutDisabled(clientMinutes) && !timeoutDisabled(webMinutes) && (clientMinutes ?? 0) <= maxInactivity && (webMinutes ?? 0) <= maxInactivity,
+    settings_readable: !securitySurface,
+    client_setting_present: clientTimeout.present,
+    web_setting_present: webTimeout.present,
+    client_minutes: clientMinutes,
+    web_minutes: webMinutes,
+    max_minutes: maxInactivity,
   });
   recordZoomDecisionFacts("ZOOM-ID-07", {});
   findings.push(finding(
@@ -2051,7 +2062,13 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const fileTransfer = readSetting(bundle, "in_meeting.file_transfer");
   const fileTransferLocked = readLock(bundle, "in_meeting.file_transfer");
   const fileTransferGroups = groupOverrideState(snapshot, groupsRelaxing(snapshot, "in_meeting.file_transfer", false));
-  recordZoomDecisionFacts("ZOOM-COLLAB-02", { available: !settingsSurface && fileTransfer.present, compliant: fileTransfer.value === false, enforced: fileTransfer.value === false && fileTransferLocked === true && !fileTransferGroups.demote });
+  recordZoomDecisionFacts("ZOOM-COLLAB-02", {
+    settings_readable: !settingsSurface,
+    setting_present: fileTransfer.present,
+    setting_value: fileTransfer.value,
+    lock_value: fileTransferLocked,
+    ...fileTransferGroups.decisionFacts,
+  });
   findings.push(finding(
     "ZOOM-COLLAB-02",
     "In-meeting file transfer restricted",
@@ -2091,9 +2108,15 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
     ...retentionGroups.evidence,
   };
   recordZoomDecisionFacts("ZOOM-COLLAB-03", {
-    available: !settingsSurface && (cloudRecording.present || autoDelete.present) && cloudRecording.value !== false,
-    compliant: autoDelete.value === true,
-    enforced: autoDelete.value === true && retentionDays !== undefined && retentionDays <= maxRetention && autoDeleteLocked === true && !retentionGroups.demote,
+    settings_readable: !settingsSurface,
+    cloud_recording_present: cloudRecording.present,
+    cloud_recording_value: cloudRecording.value,
+    auto_delete_present: autoDelete.present,
+    auto_delete_value: autoDelete.value,
+    retention_days: retentionDays,
+    max_retention_days: maxRetention,
+    lock_value: autoDeleteLocked,
+    ...retentionGroups.decisionFacts,
   });
   findings.push(finding(
     "ZOOM-COLLAB-03",
@@ -2141,7 +2164,15 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   const phonePolicies = [autoCall, adHoc];
   const phoneUnlocked = phonePolicies.filter((policy) => policy && asBoolean(policy.locked) !== true);
   const phoneMissingEnable = phonePolicies.filter((policy) => policy && asBoolean(policy.enable) === undefined);
-  recordZoomDecisionFacts("ZOOM-COLLAB-04", { available: phone.status === "ok" && Boolean(autoCall) && Boolean(adHoc) && phoneMissingEnable.length === 0, compliant: true, enforced: phoneUnlocked.length === 0 });
+  recordZoomDecisionFacts("ZOOM-COLLAB-04", {
+    phone_readable: phone.status === "ok",
+    auto_call_present: Boolean(autoCall),
+    ad_hoc_present: Boolean(adHoc),
+    auto_call_enable: autoCall ? asBoolean(autoCall.enable) : undefined,
+    ad_hoc_enable: adHoc ? asBoolean(adHoc.enable) : undefined,
+    auto_call_lock: autoCall ? asBoolean(autoCall.locked) : undefined,
+    ad_hoc_lock: adHoc ? asBoolean(adHoc.locked) : undefined,
+  });
   findings.push(finding(
     "ZOOM-COLLAB-04",
     "Zoom Phone recording policies enforced",
@@ -2276,9 +2307,16 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
       || restricted(asObject(getNestedValue(policy.settings.data, ["chat", "allow_users_to_chat_with_others"]))) === false)
     .map((policy) => policy.name));
   recordZoomDecisionFacts("ZOOM-COLLAB-07", {
-    available: !settingsSurface && Boolean(addContacts) && Boolean(chatWithOthers) && addRestricted !== undefined && chatRestricted !== undefined,
-    compliant: addRestricted === true && chatRestricted === true,
-    enforced: addRestricted === true && chatRestricted === true && contactsLocked && !contactsGroups.demote,
+    settings_readable: !settingsSurface,
+    add_policy_present: Boolean(addContacts),
+    add_policy_enabled: addContacts ? asBoolean(addContacts.enable) : undefined,
+    add_policy_selected_option: addContacts ? asNumber(addContacts.selected_option) : undefined,
+    chat_policy_present: Boolean(chatWithOthers),
+    chat_policy_enabled: chatWithOthers ? asBoolean(chatWithOthers.enable) : undefined,
+    chat_policy_selected_option: chatWithOthers ? asNumber(chatWithOthers.selected_option) : undefined,
+    add_policy_lock: addLocked,
+    chat_policy_lock: chatLocked,
+    ...contactsGroups.decisionFacts,
   });
   recordZoomDecisionFacts("ZOOM-COLLAB-08", {});
   findings.push(finding(
@@ -2394,9 +2432,11 @@ function booleanControl(
     ...extraEvidence,
   };
   recordZoomDecisionFacts(id, {
-    available: !surface && setting.present,
-    compliant: setting.value === compliantValue,
-    enforced: setting.value === compliantValue && locked === true && !groups.demote,
+    settings_readable: !surface,
+    setting_present: setting.present,
+    setting_value: setting.value,
+    lock_value: locked,
+    ...groups.decisionFacts,
   });
   if (surface) {
     return finding(id, title, severity, controls, "manual", manualForSurface(surface, labels.evidenceToCollect), evidence);
@@ -2422,7 +2462,15 @@ function groupInventoryTruncated(snapshot: ZoomSnapshot): boolean {
  * truncated group inventory all block pass. A skipped group list (the
  * collaboration tool run alone) leaves the verdict to the account lock.
  */
-function groupOverrideState(snapshot: ZoomSnapshot, relaxed: string[]): { demote: boolean; note: string; evidence: JsonRecord } {
+function groupOverrideState(
+  snapshot: ZoomSnapshot,
+  relaxed: string[],
+): {
+  demote: boolean;
+  note: string;
+  evidence: JsonRecord;
+  decisionFacts: Readonly<Record<string, unknown>>;
+} {
   const unreadable = groupsUnreadable(snapshot);
   const truncated = groupInventoryTruncated(snapshot);
   const listUnreadable = snapshot.groups.status === "denied" || snapshot.groups.status === "error";
@@ -2442,6 +2490,12 @@ function groupOverrideState(snapshot: ZoomSnapshot, relaxed: string[]): { demote
       groups_relaxing: relaxed.slice(0, 25),
       groups_unreadable: unreadable.slice(0, 25).map(unreadableGroupLabel),
       groups_truncated: truncated,
+    },
+    decisionFacts: {
+      relaxing_group_count: relaxed.length,
+      group_list_state: snapshot.groups.status,
+      unreadable_group_setting_count: unreadable.length,
+      group_list_truncated: truncated,
     },
   };
 }
@@ -2510,9 +2564,13 @@ export function assessZoomMeetingSecurityFromSnapshot(
   };
   const sharingValue = asString(whoCanShare.value);
   recordZoomDecisionFacts("ZOOM-MTG-03", {
-    available: !screenSurface && screenSharing.present && (screenSharing.value === false || (whoCanShare.present && ["host", "all"].includes(sharingValue ?? ""))),
-    compliant: screenSharing.value === false || sharingValue === "host",
-    enforced: (screenSharing.value === false || sharingValue === "host") && sharingLocked === true && !shareGroups.demote,
+    settings_readable: !screenSurface,
+    screen_setting_present: screenSharing.present,
+    screen_setting_value: screenSharing.value,
+    share_setting_present: whoCanShare.present,
+    share_setting_value: sharingValue,
+    lock_value: sharingLocked,
+    ...shareGroups.decisionFacts,
   });
   findings.push(finding(
     "ZOOM-MTG-03",
@@ -2573,9 +2631,12 @@ export function assessZoomMeetingSecurityFromSnapshot(
     ...groupsRelaxing(snapshot, "meeting_security.encryption_type", "e2ee"),
   ])]);
   recordZoomDecisionFacts("ZOOM-MTG-05", {
-    available: !e2eeSurface && e2ee.present,
-    compliant: e2ee.value === true,
-    enforced: e2ee.value === true && asString(encryptionType.value) === "e2ee" && e2eeLocked === true && !e2eeGroups.demote,
+    settings_readable: !e2eeSurface,
+    e2ee_setting_present: e2ee.present,
+    e2ee_setting_value: e2ee.value,
+    encryption_type_value: asString(encryptionType.value),
+    lock_value: e2eeLocked,
+    ...e2eeGroups.decisionFacts,
   });
   findings.push(finding(
     "ZOOM-MTG-05",
@@ -2642,9 +2703,15 @@ export function assessZoomMeetingSecurityFromSnapshot(
   };
   const pmiCompliant = personalMeeting.value === false || (pmiScheduled.value === false && pmiInstant.value === false);
   recordZoomDecisionFacts("ZOOM-MTG-07", {
-    available: !pmiSurface && (personalMeeting.value === false || (pmiScheduled.present && pmiInstant.present)),
-    compliant: pmiCompliant,
-    enforced: pmiCompliant && pmiLocked && !pmiGroups.demote,
+    settings_readable: !pmiSurface,
+    personal_meeting_value: personalMeeting.value,
+    scheduled_setting_present: pmiScheduled.present,
+    scheduled_setting_value: pmiScheduled.value,
+    instant_setting_present: pmiInstant.present,
+    instant_setting_value: pmiInstant.value,
+    scheduled_lock_value: pmiScheduledLocked,
+    instant_lock_value: pmiInstantLocked,
+    ...pmiGroups.decisionFacts,
   });
   findings.push(finding(
     "ZOOM-MTG-07",
@@ -2701,9 +2768,12 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const regionsLocked = readLock(bundle, "in_meeting.custom_data_center_regions");
   const regionGroups = groupOverrideState(snapshot, groupsRelaxing(snapshot, "in_meeting.custom_data_center_regions", true));
   recordZoomDecisionFacts("ZOOM-MTG-09", {
-    available: !regionSurface && customRegions.present,
-    compliant: customRegions.value === true,
-    enforced: customRegions.value === true && regionList.length > 0 && regionsLocked === true && !regionGroups.demote,
+    settings_readable: !regionSurface,
+    setting_present: customRegions.present,
+    setting_value: customRegions.value,
+    region_count: regionList.length,
+    lock_value: regionsLocked,
+    ...regionGroups.decisionFacts,
   });
   findings.push(finding(
     "ZOOM-MTG-09",
@@ -2748,12 +2818,13 @@ export function assessZoomMeetingSecurityFromSnapshot(
   const disclaimerStatus: ZoomFindingStatus = disclaimer.status === "pass" && disclaimerGroups.demote ? "warn" : disclaimer.status;
   const disclaimerOption = asString(readSetting(bundle, "recording.recording_notification_for_zoom_client.disclaimer_to_participants").value);
   const disclaimerLegacy = readSetting(bundle, "recording.recording_disclaimer");
-  const disclaimerAvailable = !disclaimerSurface && (disclaimerOption !== undefined || disclaimerLegacy.present);
-  const disclaimerCompliant = disclaimerOption !== undefined ? true : disclaimerLegacy.value === true;
-  const disclaimerEnforced = disclaimerCompliant
-    && (disclaimerOption ? /all participants/i.test(disclaimerOption) : disclaimerLegacy.value === true)
-    && !disclaimerGroups.demote;
-  recordZoomDecisionFacts("ZOOM-MTG-10", { available: disclaimerAvailable, compliant: disclaimerCompliant, enforced: disclaimerEnforced });
+  recordZoomDecisionFacts("ZOOM-MTG-10", {
+    settings_readable: !disclaimerSurface,
+    disclaimer_option: disclaimerOption,
+    legacy_setting_present: disclaimerLegacy.present,
+    legacy_setting_value: disclaimerLegacy.value,
+    ...disclaimerGroups.decisionFacts,
+  });
   findings.push(finding(
     "ZOOM-MTG-10",
     "Recording consent disclaimer shown to participants",

@@ -125,6 +125,7 @@ export type VerdictCondition =
   | { op: "and" | "or"; conditions: readonly VerdictCondition[] }
   | { op: "not"; condition: VerdictCondition }
   | { op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte"; left: VerdictOperand; right: VerdictOperand }
+  | { op: "matches"; operand: VerdictOperand; pattern: string; flags?: string }
   | { op: "defined" | "null"; operand: VerdictOperand }
   | { op: "some" | "every"; path: string; condition: VerdictCondition };
 
@@ -343,6 +344,10 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
       return operandValue(condition.left, facts, item) === operandValue(condition.right, facts, item);
     case "ne":
       return operandValue(condition.left, facts, item) !== operandValue(condition.right, facts, item);
+    case "matches": {
+      const candidate = operandValue(condition.operand, facts, item);
+      return typeof candidate === "string" && new RegExp(condition.pattern, condition.flags).test(candidate);
+    }
     case "gt":
     case "gte":
     case "lt":
@@ -407,6 +412,8 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
       return `${renderOperand(condition.left)} equals ${renderOperand(condition.right)}`;
     case "ne":
       return `${renderOperand(condition.left)} does not equal ${renderOperand(condition.right)}`;
+    case "matches":
+      return `${renderOperand(condition.operand)} matches portable regular expression \`${condition.pattern}\`${condition.flags ? ` with flags \`${condition.flags}\`` : ""}`;
     case "gt":
       return `${renderOperand(condition.left)} is greater than ${renderOperand(condition.right)}`;
     case "gte":
@@ -441,6 +448,8 @@ export function verdictConditionPaths(condition: VerdictCondition): string[] {
       return verdictConditionPaths(condition.condition);
     case "defined":
     case "null":
+      return operandPaths(condition.operand);
+    case "matches":
       return operandPaths(condition.operand);
     case "eq":
     case "ne":
