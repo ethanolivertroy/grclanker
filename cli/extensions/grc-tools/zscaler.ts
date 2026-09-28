@@ -19,8 +19,17 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
+import {
+  readResolverEnvironment,
+  ZSCALER_AUTH_RESOLVER,
+} from "./auth-resolver-contracts.js";
 import { ConfigFileError, readYamlConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { ZSCALER_SPEC } from "./zscaler.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -208,6 +217,20 @@ const ZSCALER_CONTROLS: Record<number, ControlDefinition> = {
   24: control("Certificate Management", "high", "zpa", ["SC-12, SC-17", "C.3.8, C.3.10", "CC6.1, CC6.7", "CIS CSC 3", "4.1", "V-XXXXX", "ISM-0490", "7.2.3"]),
   25: control("Security Policy Baseline", "high", "zia_policy", ["SI-3, SI-4", "C.5.2, C.5.3", "CC6.8, CC7.1", "CIS CSC 8, 10", "5.2, 5.3", "V-XXXXX", "ISM-1288", "8.2.3"]),
 };
+
+hydrateBatchFrameworkMappings(ZSCALER_SPEC, Object.fromEntries(Object.entries(ZSCALER_CONTROLS).map(([controlNumber, definition]) => [
+  `ZS-${controlNumber.padStart(2, "0")}`,
+  {
+    fedramp: [definition.mappings.FedRAMP],
+    cmmc: [definition.mappings["CMMC 2.0"]],
+    soc2: [definition.mappings["SOC 2"]],
+    cis: [definition.mappings.CIS],
+    pci_dss: [definition.mappings["PCI-DSS 4.0"]],
+    disa_stig: [definition.mappings["DISA STIG"]],
+    irap: [definition.mappings.IRAP],
+    ismap: [definition.mappings.ISMAP],
+  },
+])));
 
 const FRAMEWORK_REPORTS: Array<{ framework: ZscalerFramework; path: string; title: string }> = [
   { framework: "FedRAMP", path: "compliance/fedramp/fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },
@@ -601,6 +624,7 @@ export function resolveZscalerConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): ZscalerResolvedConfig {
+  env = readResolverEnvironment(ZSCALER_AUTH_RESOLVER, env);
   const configFile = asString(input.config_file)
     ?? asString(env.ZSCALER_CONFIG_FILE)
     ?? (existsSync(join(homedir(), ".zscaler", "zscaler.yaml")) ? join(homedir(), ".zscaler", "zscaler.yaml") : undefined);
@@ -3516,6 +3540,7 @@ const authParams = {
 };
 
 export function registerZscalerTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, ZSCALER_SPEC);
   pi.registerTool({
     name: "zscaler_check_access",
     label: "Check Zscaler audit access",

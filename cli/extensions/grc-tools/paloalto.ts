@@ -22,6 +22,15 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import {
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
+import {
+  PALOALTO_AUTH_RESOLVER,
+  readResolverEnvironment,
+} from "./auth-resolver-contracts.js";
+import { PALOALTO_SPEC } from "./paloalto.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -327,6 +336,20 @@ export const PALOALTO_CONTROLS: ControlDefinition[] = [
   { control: 24, id: "PA-24", title: "Cloud discovery and shadow IT", mappings: mappingRow("CM-8, RA-5", "C.2.2, C.2.4", "CC6.1, CC7.1", "CIS CSC 1", "11.2", "V-XXXXX", "ISM-1034", "4.1.2") },
   { control: 25, id: "PA-25", title: "CI/CD pipeline security", mappings: mappingRow("SA-11, CM-3", "C.3.4, C.5.2", "CC8.1", "CIS CSC 7", "6.3, 6.5", "V-XXXXX", "ISM-1143", "9.1.1") },
 ];
+
+hydrateBatchFrameworkMappings(PALOALTO_SPEC, Object.fromEntries(PALOALTO_CONTROLS.map((control) => [
+  control.id,
+  {
+    fedramp: control.mappings.FedRAMP,
+    cmmc: control.mappings["CMMC 2.0"],
+    soc2: control.mappings["SOC 2"],
+    cis: control.mappings.CIS,
+    pci_dss: control.mappings["PCI-DSS 4.0"],
+    disa_stig: control.mappings["DISA STIG"],
+    irap: control.mappings.IRAP,
+    ismap: control.mappings.ISMAP,
+  },
+])));
 
 const CONTROLS_BY_NUMBER = new Map(PALOALTO_CONTROLS.map((item) => [item.control, item]));
 
@@ -2279,6 +2302,7 @@ export function resolvePaloaltoConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): PaloaltoResolvedConfig {
+  env = readResolverEnvironment(PALOALTO_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const configFile = readConfigFile(asString(input.config_file) ?? asString(env.PALOALTO_CONFIG_FILE));
 
@@ -5476,6 +5500,7 @@ async function runSealed(tool: string, label: string, args: AuthArgs, run: (clie
 }
 
 export function registerPaloaltoTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, PALOALTO_SPEC);
   pi.registerTool({
     name: "paloalto_check_access",
     label: "Check Palo Alto audit access",
