@@ -260,7 +260,7 @@ const rows: readonly Batch3CheckRow[] = [
       batch3Source("vuln-export-jobs", NON_TRUNCATION_FAILURES),
       batch3Source("asset-export-jobs", NON_TRUNCATION_FAILURES),
     ],
-    completenessSemantics: "The TENABLE-19 check-owned population-complete fact becomes false when either export-job source errors, is denied, is not collected, is not configured, or lacks a required field. Truncation leaves it unchanged when observed external jobs span at least two days, matching the documented compatibility behavior. Finding previews and exported samples never establish source cardinality.",
+    completenessSemantics: "The TENABLE-19 check-owned population-complete fact becomes false when either export-job source errors, is denied, is not collected, is not configured, or lacks a required field. A truncated listing leaves it unchanged when observed external jobs span at least two days, matching the documented compatibility behavior. Finding previews and exported samples never establish source cardinality.",
   },
   { id: "TENABLE-20", control: 20, title: "Target group management", severity: "medium", owner: "tenable_assess_scan_program", surfaces: ["target-groups"], predicate: "Count target groups with empty, broad, overlapping, or unparseable member definitions.", emptyOutcome: "pass" },
 ] as const;
