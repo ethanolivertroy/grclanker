@@ -33,7 +33,7 @@ const batch = [
   [ZENDESK_SPEC, ZENDESK_RUNTIME_BEHAVIOR],
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
-const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS)-/.test(check.id);
+const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX)-/.test(check.id);
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -239,6 +239,57 @@ test("GWS executable rules ignore legacy status and use complete evidence with o
     event_count: 26,
     suspicious_login_count: 0,
   }), "warn", "complete source cardinality, not a capped 25-item sample, controls pass");
+});
+
+test("Box executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+  const legacyStatus = "pass";
+  const passwordFacts = {
+    settings_readable: true,
+    setting_unused: false,
+    minimum_length: 14,
+    required_minimum_length: 14,
+    weak_password_prevention: true,
+    complexity_rule_count: 2,
+  };
+  assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-21", passwordFacts), "pass");
+  assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-21", {
+    ...passwordFacts,
+    minimum_length: 7,
+  }), "fail", "mutating password evidence changes the verdict while the legacy status is held constant");
+  assert.equal(legacyStatus, "pass");
+
+  const inactivityFacts = {
+    users_readable: true,
+    events_readable: true,
+    complete: true,
+    active_user_count: 100,
+    inactive_user_count: 25,
+    inactive_ratio: 0.25,
+  };
+  assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-24", inactivityFacts), "warn");
+  assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-24", {
+    ...inactivityFacts,
+    inactive_user_count: 26,
+    inactive_ratio: 0.26,
+  }), "fail", "the greater-than-25-percent boundary uses the full inventory count");
+  assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-05", {
+    allowlist_readable: true,
+    config_readable: true,
+    exempt_targets_readable: true,
+    complete: false,
+    allowlist_entry_count: 26,
+    public_domain_count: 1,
+    stale_entry_count: 0,
+    undated_entry_count: 0,
+    exempt_target_count: 0,
+    allowlist_required: true,
+  }), "fail", "a public-domain violation precedes partial evidence");
+  assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-17", {
+    users_readable: true,
+    complete: true,
+    privileged_user_count: 26,
+    max_admins: 25,
+  }), "warn", "the complete 26-user inventory, not a 25-item evidence sample, controls the result");
 });
 
 test("runtime behavior statements are explicit and generator-visible", () => {
