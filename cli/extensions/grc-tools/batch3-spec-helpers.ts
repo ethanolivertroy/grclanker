@@ -8,7 +8,12 @@ import type {
   BatchCheckDefinition,
   BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
-import type { FindingSeverity, PortableValue, VerdictRule } from "./spec-model.js";
+import type {
+  FindingSeverity,
+  FrameworkKey,
+  PortableValue,
+  VerdictRule,
+} from "./spec-model.js";
 
 export interface Batch3CheckRow {
   id: string;
@@ -21,6 +26,7 @@ export interface Batch3CheckRow {
   emptyOutcome?: "pass" | "warn" | "fail" | "manual" | "info";
   violationOutcome?: "fail" | "warn";
   manualOnly?: boolean;
+  frameworks?: Partial<Record<FrameworkKey, readonly string[]>>;
   constants?: Readonly<Record<string, PortableValue>>;
   decisionInputs?: Readonly<Record<string, string>>;
   decisionRules?: readonly VerdictRule[];
@@ -63,6 +69,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       emptyOutcome: row.emptyOutcome,
       violationOutcome: row.violationOutcome,
       manualOnly: row.manualOnly,
+      frameworks: row.frameworks,
       constants: row.constants,
       decisionInputs,
       decisionRules: row.decisionRules,

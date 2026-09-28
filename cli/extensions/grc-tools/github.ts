@@ -373,7 +373,7 @@ const GITHUB_ACCESS_PROBES = [
   { key: "code_security_defaults", path: (org: string) => `/orgs/${org}/code-security/configurations/defaults` },
 ] as const;
 
-const GITHUB_CHECKS: Record<string, CheckDefinition> = {
+export const GITHUB_CHECKS: Record<string, CheckDefinition> = {
   "GITHUB-ORG-001": {
     id: "GITHUB-ORG-001",
     title: "Organization requires 2FA",

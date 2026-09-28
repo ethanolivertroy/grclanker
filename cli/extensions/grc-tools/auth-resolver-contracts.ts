@@ -424,3 +424,149 @@ export const KNOWBE4_AUTH_RESOLVER = {
   variants: ["us", "eu", "ca", "uk", "de", "Optional region-specific PhishER GraphQL endpoint"],
   configFields: ["api_token", "region", "base_url", "phisher_api_token", "phisher_graphql_url", "timeout", "redact_pii"],
 } as const satisfies ResolverAuthenticationContract;
+
+export const DATADOG_AUTH_RESOLVER = {
+  modes: ["Datadog API key plus application key"],
+  precedence: ["Explicit tool arguments", "DD_* then DATADOG_* environment aliases", "dogshelI-compatible INI configuration"],
+  environment: [
+    "DD_API_KEY", "DATADOG_API_KEY", "DD_APP_KEY", "DD_APPLICATION_KEY", "DATADOG_APP_KEY",
+    "DD_SITE", "DATADOG_SITE", "DD_HOST", "DATADOG_HOST", "DD_CONFIG_FILE", "DATADOG_CONFIG_FILE",
+    "DD_TIMEOUT", "DD_MAX_RETRIES",
+  ],
+  configLocations: ["~/.dogrc", "Explicit path from config_file, DD_CONFIG_FILE, or DATADOG_CONFIG_FILE"],
+  variants: ["US1", "US3", "US5", "EU1", "AP1", "AP2", "US government", "Explicit same-origin API base URL"],
+  configFields: ["apikey", "appkey", "api_host"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const ELASTIC_AUTH_RESOLVER = {
+  modes: ["Elasticsearch API key", "HTTP Basic username/password", "Bearer token", "Elastic Cloud API key for deployment metadata"],
+  precedence: ["Explicit tool arguments", "ELASTIC_* and KIBANA_* environment variables", "Explicit or default Elastic YAML configuration"],
+  environment: [
+    "ELASTIC_SEC_INSPECTOR_CONFIG", "ELASTICSEARCH_URL", "ELASTIC_URL", "KIBANA_URL", "KIBANA_SPACE_ID",
+    "ELASTIC_API_KEY", "ELASTIC_USERNAME", "ELASTIC_PASSWORD", "ELASTIC_BEARER_TOKEN",
+    "ELASTIC_CLOUD_API_KEY", "ELASTIC_CLOUD_API_URL", "ELASTIC_TIMEOUT",
+  ],
+  configLocations: ["~/.elastic-sec-inspector/config.yaml", "Explicit path from config_file or ELASTIC_SEC_INSPECTOR_CONFIG"],
+  variants: ["Self-managed Elasticsearch and Kibana", "Elastic Cloud deployment metadata", "Optional Kibana space"],
+  configFields: ["elasticsearch_url", "kibana_url", "kibana_space_id", "api_key", "username", "password", "bearer_token", "cloud_api_key", "cloud_api_url", "timeout_seconds", "max_retries"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const NEWRELIC_AUTH_RESOLVER = {
+  modes: ["New Relic user API key"],
+  precedence: ["Explicit tool arguments", "NEW_RELIC_* environment variables", "Explicit or default New Relic YAML configuration"],
+  environment: [
+    "NEW_RELIC_SEC_INSPECTOR_CONFIG", "NEW_RELIC_API_KEY", "NEW_RELIC_ACCOUNT_ID",
+    "NEW_RELIC_REGION", "NEW_RELIC_TIMEOUT", "NEW_RELIC_AUDIT_WINDOW_DAYS",
+  ],
+  configLocations: ["~/.newrelic-sec-inspector/config.yaml", "Explicit path from config_file or NEW_RELIC_SEC_INSPECTOR_CONFIG"],
+  variants: ["US NerdGraph and REST origins", "EU NerdGraph and REST origins", "One or more account IDs"],
+  configFields: ["api_key", "account_ids", "region", "timeout_seconds", "audit_window_days"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const SPLUNK_AUTH_RESOLVER = {
+  modes: ["Splunk bearer token", "Splunk username/password Basic authentication", "Independent Splunk Cloud ACS token"],
+  precedence: ["Explicit tool arguments", "SPLUNK_* environment variables", "Explicit or default Splunk YAML configuration"],
+  environment: [
+    "SPLUNK_CONFIG_FILE", "SPLUNK_URL", "SPLUNK_TOKEN", "SPLUNK_USERNAME", "SPLUNK_PASSWORD",
+    "SPLUNK_STACK", "SPLUNK_ACS_TOKEN", "SPLUNK_ACS_BASE_URL", "SPLUNK_VERIFY_SSL", "SPLUNK_TIMEOUT",
+  ],
+  configLocations: ["~/.splunk-sec-inspector/config.yaml", "Explicit path from config_file or SPLUNK_CONFIG_FILE"],
+  variants: ["Splunk Enterprise management API", "Splunk Cloud management API", "Splunk Cloud ACS"],
+  configFields: ["url", "token", "username", "password", "stack", "acs_token", "acs_base_url", "verify_ssl", "timeout_seconds"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const SUMOLOGIC_AUTH_RESOLVER = {
+  modes: ["Sumo Logic access ID and access key using HTTP Basic authentication"],
+  precedence: ["Explicit tool arguments", "SUMOLOGIC_* environment variables", "Explicit or default Sumo Logic YAML configuration"],
+  environment: [
+    "SUMOLOGIC_CONFIG_FILE", "SUMOLOGIC_ACCESS_ID", "SUMOLOGIC_ACCESS_KEY",
+    "SUMOLOGIC_DEPLOYMENT", "SUMOLOGIC_ENDPOINT", "SUMOLOGIC_TIMEOUT",
+  ],
+  configLocations: ["~/.sumologic-sec-inspector/config.yaml", "Explicit path from config_file or SUMOLOGIC_CONFIG_FILE"],
+  variants: ["au", "ca", "ch", "de", "esc", "eu", "fed", "in", "jp", "kr", "us1", "us2", "Explicit regional endpoint"],
+  configFields: ["access_id", "access_key", "deployment", "endpoint", "timeout_seconds"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const LAUNCHDARKLY_AUTH_RESOLVER = {
+  modes: ["LaunchDarkly REST API access token"],
+  precedence: ["Explicit tool arguments", "LAUNCHDARKLY_* then LD_* environment aliases", "Explicit or default LaunchDarkly YAML configuration"],
+  environment: [
+    "LAUNCHDARKLY_CONFIG", "LAUNCHDARKLY_API_TOKEN", "LD_ACCESS_TOKEN", "LAUNCHDARKLY_BASE_URL",
+    "LD_BASE_URI", "LAUNCHDARKLY_API_VERSION", "LAUNCHDARKLY_TIMEOUT", "LAUNCHDARKLY_PROJECTS",
+    "LAUNCHDARKLY_ALLOWED_DOMAINS",
+  ],
+  configLocations: ["~/.launchdarkly-sec-inspector/config.yaml", "Explicit path from config_file or LAUNCHDARKLY_CONFIG"],
+  variants: ["LaunchDarkly SaaS", "Federal instance", "Explicit same-origin REST API base URL"],
+  configFields: ["api_token", "base_url", "api_version", "timeout_seconds", "project_keys", "allowed_domains"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const MULESOFT_AUTH_RESOLVER = {
+  modes: ["Explicit Anypoint access token", "OAuth client credentials", "Username/password token exchange"],
+  precedence: ["Explicit tool arguments", "ANYPOINT_* environment variables", "Explicit or default MuleSoft YAML configuration"],
+  environment: [
+    "MULESOFT_SEC_INSPECTOR_CONFIG", "ANYPOINT_CONFIG_FILE", "ANYPOINT_ACCESS_TOKEN", "ANYPOINT_TOKEN",
+    "ANYPOINT_CLIENT_ID", "ANYPOINT_CLIENT_SECRET", "ANYPOINT_USERNAME", "ANYPOINT_PASSWORD",
+    "ANYPOINT_ORGANIZATION_ID", "ANYPOINT_ORG_ID", "ANYPOINT_CONTROL_PLANE", "ANYPOINT_BASE_URL",
+    "ANYPOINT_ENVIRONMENTS", "ANYPOINT_ENVIRONMENT_IDS", "ANYPOINT_TIMEOUT",
+  ],
+  configLocations: ["~/.mulesoft-sec-inspector/config.yaml", "Explicit path from config_file, ANYPOINT_CONFIG_FILE, or MULESOFT_SEC_INSPECTOR_CONFIG"],
+  variants: ["US", "EU", "US government", "Explicit Anypoint control-plane URL", "Optional environment allowlist"],
+  configFields: ["access_token", "client_id", "client_secret", "username", "password", "organization_id", "control_plane", "base_url", "environment_ids", "timeout_seconds"],
+  refreshRequest: "POST /accounts/api/v2/oauth2/token with client_credentials, or POST /accounts/login with username and password.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const GITHUB_AUTH_RESOLVER = {
+  modes: ["Fine-grained or classic personal access token", "GitHub App installation token minted from an RS256 JWT"],
+  precedence: ["Explicit tool arguments", "GITHUB_TOKEN then GH_TOKEN", "GitHub App environment or explicit arguments"],
+  environment: [
+    "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_ORG", "GH_ORG", "GITHUB_API_URL", "GITHUB_API_BASE_URL",
+    "GITHUB_GRAPHQL_URL", "GITHUB_ENTERPRISE", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_APP_PRIVATE_KEY_PATH", "GITHUB_APP_INSTALLATION_ID", "GITHUB_LOOKBACK_DAYS",
+  ],
+  configLocations: ["GitHub App private key path supplied explicitly or through GITHUB_APP_PRIVATE_KEY_PATH"],
+  variants: ["GitHub.com", "GitHub Enterprise Server REST /api/v3 and GraphQL /api/graphql origins"],
+  configFields: [],
+  refreshRequest: "POST /app/installations/{installation_id}/access_tokens using a ten-minute GitHub App JWT signed with RS256.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const SNOWFLAKE_AUTH_RESOLVER = {
+  modes: ["Key-pair JWT authentication", "OAuth bearer token", "Programmatic access token"],
+  precedence: ["Explicit tool arguments", "SNOWFLAKE_* environment variables", "Selected connection in Snowflake connections.toml or config.toml"],
+  environment: [
+    "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PRIVATE_KEY_PATH", "SNOWFLAKE_PRIVATE_KEY_FILE",
+    "SNOWFLAKE_PRIVATE_KEY", "SNOWFLAKE_PRIVATE_KEY_RAW", "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+    "PRIVATE_KEY_PASSPHRASE", "SNOWFLAKE_TOKEN", "SNOWFLAKE_OAUTH_TOKEN", "SNOWFLAKE_ACCESS_TOKEN",
+    "SNOWFLAKE_TOKEN_TYPE", "SNOWFLAKE_AUTHENTICATOR", "SNOWFLAKE_ROLE", "SNOWFLAKE_WAREHOUSE",
+    "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA", "SNOWFLAKE_BASE_URL", "SNOWFLAKE_HOST",
+    "SNOWFLAKE_CONNECTION_NAME", "SNOWFLAKE_DEFAULT_CONNECTION_NAME", "SNOWFLAKE_HOME",
+    "SNOWFLAKE_TIMEOUT", "SNOWFLAKE_STATEMENT_TIMEOUT", "SNOWFLAKE_POLL_INTERVAL_MS",
+  ],
+  configLocations: ["~/.snowflake/connections.toml", "~/.snowflake/config.toml", "SNOWFLAKE_HOME equivalents"],
+  variants: ["Account identifier host derivation", "Explicit Snowflake SQL API host", "Optional role, warehouse, database, and schema"],
+  configFields: ["account", "user", "private_key_path", "private_key", "private_key_passphrase", "token", "authenticator", "role", "warehouse", "database", "schema", "host"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const PAGERDUTY_AUTH_RESOLVER = {
+  modes: ["PagerDuty API token", "OAuth access token", "Scoped OAuth client-credentials token"],
+  precedence: ["Explicit tool arguments", "PAGERDUTY_* then PD_API_KEY environment aliases", "Explicit or default PagerDuty JSON configuration"],
+  environment: [
+    "PAGERDUTY_CONFIG_FILE", "PAGERDUTY_API_TOKEN", "PAGERDUTY_API_KEY", "PAGERDUTY_TOKEN", "PD_API_KEY",
+    "PAGERDUTY_ACCESS_TOKEN", "PAGERDUTY_OAUTH_TOKEN", "PAGERDUTY_CLIENT_ID", "PAGERDUTY_CLIENT_SECRET",
+    "PAGERDUTY_SUBDOMAIN", "PAGERDUTY_ACCOUNT_SUBDOMAIN", "PAGERDUTY_USER_EMAIL", "PAGERDUTY_FROM_EMAIL",
+    "PAGERDUTY_REGION", "PAGERDUTY_SERVICE_REGION", "PAGERDUTY_BASE_URL", "PAGERDUTY_API_BASE_URL",
+    "PAGERDUTY_IDENTITY_TOKEN_URL", "PAGERDUTY_TIMEOUT",
+  ],
+  configLocations: ["~/.config/grclanker/pagerduty.json", "Explicit path from config_file or PAGERDUTY_CONFIG_FILE"],
+  variants: ["US service region", "EU service region", "Scoped credential requiring account subdomain and From header"],
+  configFields: ["api_token", "access_token", "client_id", "client_secret", "subdomain", "from_email", "region", "base_url", "timeout_seconds"],
+  refreshRequest: "POST the PagerDuty identity token endpoint with the client_credentials grant for scoped OAuth credentials.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const ANSIBLE_AUTH_RESOLVER = {
+  modes: ["AAP OAuth2 bearer token", "AAP username/password Basic authentication"],
+  precedence: ["Explicit tool arguments", "AAP_* environment variables"],
+  environment: ["AAP_URL", "AAP_TOKEN", "AAP_USERNAME", "AAP_PASSWORD", "AAP_VERIFY_SSL", "AAP_TIMEOUT"],
+  configLocations: [],
+  variants: ["Automation Controller and Ansible Automation Platform Gateway API v2", "Per-client TLS verification setting"],
+  configFields: [],
+} as const satisfies ResolverAuthenticationContract;
