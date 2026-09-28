@@ -2995,7 +2995,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   ];
   recordBoxDecisionFacts(5, {
     allowlist_readable: allowlistReadable,
-    config_readable: configReadable,
+    config_readable: !data.configuration.error,
     exempt_targets_readable: !data.exemptTargets.error,
     complete: completeBoxDatasets(data.allowlistEntries, data.exemptTargets),
     allowlist_entry_count: entries.length,
