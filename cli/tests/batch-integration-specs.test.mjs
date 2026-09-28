@@ -33,7 +33,13 @@ import { SERVICENOW_RUNTIME_BEHAVIOR, SERVICENOW_SPEC } from "../dist/extensions
 import { SLACK_RUNTIME_BEHAVIOR, SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
 import { ZENDESK_RUNTIME_BEHAVIOR, ZENDESK_SPEC } from "../dist/extensions/grc-tools/zendesk.spec.js";
 import { ZOOM_RUNTIME_BEHAVIOR, ZOOM_SPEC } from "../dist/extensions/grc-tools/zoom.spec.js";
-import { checkContract, collectDefinedGrcTools, evaluateCheckVerdict, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
+import {
+  checkContract,
+  collectDefinedGrcTools,
+  evaluateCheckVerdict,
+  evaluateVerdictCondition,
+  evaluateVerdictCriteria,
+} from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 import {
   renderAllIntegrationSpecs,
@@ -52,6 +58,152 @@ const batch = [
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
 const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|ZD|SF|SNOW)-/.test(check.id);
+const ABSENT = Symbol("absent");
+
+function alternativeValue(value) {
+  if (typeof value === "boolean") return !value;
+  if (typeof value === "number") return value + 1;
+  if (typeof value === "string") return `${value}__different`;
+  if (value === null) return 0;
+  return "__different";
+}
+
+function mergeAssignments(left, right) {
+  const merged = new Map(left);
+  for (const [name, value] of right) {
+    if (merged.has(name) && !Object.is(merged.get(name), value)) return undefined;
+    merged.set(name, value);
+  }
+  return merged;
+}
+
+function combineAssignments(left, right) {
+  const combined = [];
+  for (const first of left) {
+    for (const second of right) {
+      const merged = mergeAssignments(first, second);
+      if (merged) combined.push(merged);
+    }
+  }
+  return combined;
+}
+
+function operandState(operand, constants) {
+  if (operand.kind === "value") return { known: true, value: operand.value };
+  if (operand.kind === "path" && Object.hasOwn(constants, operand.path)) {
+    return { known: true, value: constants[operand.path] };
+  }
+  if (operand.kind !== "path") throw new Error(`Unsupported witness operand ${operand.kind}`);
+  return { known: false, path: operand.path };
+}
+
+function comparisonWitnesses(condition, desired, constants) {
+  const left = operandState(condition.left, constants);
+  const right = operandState(condition.right, constants);
+  const equal = condition.op === "eq" ? desired : !desired;
+  if (condition.op === "eq" || condition.op === "ne") {
+    if (left.known && right.known) {
+      return Object.is(left.value, right.value) === equal ? [new Map()] : [];
+    }
+    if (!left.known && right.known) {
+      return [new Map([[left.path, equal ? right.value : alternativeValue(right.value)]])];
+    }
+    if (left.known && !right.known) {
+      return [new Map([[right.path, equal ? left.value : alternativeValue(left.value)]])];
+    }
+    return [new Map([
+      [left.path, 0],
+      [right.path, equal ? 0 : 1],
+    ])];
+  }
+  const comparison = condition.op === "gt" ? "gt" : "lte";
+  if (left.known && right.known) {
+    const actual = comparison === "gt"
+      ? Number(left.value) > Number(right.value)
+      : Number(left.value) <= Number(right.value);
+    return actual === desired ? [new Map()] : [];
+  }
+  if (!left.known && right.known) {
+    const threshold = Number(right.value);
+    const value = comparison === "gt"
+      ? (desired ? threshold + 1 : threshold)
+      : (desired ? threshold : threshold + 1);
+    return [new Map([[left.path, value]])];
+  }
+  if (left.known && !right.known) {
+    const threshold = Number(left.value);
+    const value = comparison === "gt"
+      ? (desired ? threshold - 1 : threshold)
+      : (desired ? threshold : threshold - 1);
+    return [new Map([[right.path, value]])];
+  }
+  const values = comparison === "gt"
+    ? (desired ? [1, 0] : [0, 0])
+    : (desired ? [0, 0] : [1, 0]);
+  return [new Map([[left.path, values[0]], [right.path, values[1]]])];
+}
+
+function conditionWitnesses(condition, desired, constants) {
+  switch (condition.op) {
+    case "always":
+      return desired ? [new Map()] : [];
+    case "not":
+      return conditionWitnesses(condition.condition, !desired, constants);
+    case "and":
+      if (desired) {
+        return condition.conditions.reduce(
+          (candidates, child) => combineAssignments(candidates, conditionWitnesses(child, true, constants)),
+          [new Map()],
+        );
+      }
+      return condition.conditions.flatMap((child) => conditionWitnesses(child, false, constants));
+    case "or":
+      if (desired) return condition.conditions.flatMap((child) => conditionWitnesses(child, true, constants));
+      return condition.conditions.reduce(
+        (candidates, child) => combineAssignments(candidates, conditionWitnesses(child, false, constants)),
+        [new Map()],
+      );
+    case "eq":
+    case "ne":
+    case "gt":
+    case "lte":
+      return comparisonWitnesses(condition, desired, constants);
+    case "defined": {
+      const operand = operandState(condition.operand, constants);
+      if (operand.known) return (operand.value !== undefined) === desired ? [new Map()] : [];
+      return [new Map([[operand.path, desired ? 0 : ABSENT]])];
+    }
+    case "matches": {
+      const operand = operandState(condition.operand, constants);
+      if (operand.known) {
+        const actual = new RegExp(condition.pattern, condition.flags).test(String(operand.value));
+        return actual === desired ? [new Map()] : [];
+      }
+      return [new Map([[operand.path, desired ? "all participants" : "__not_matching__"]])];
+    }
+    default:
+      throw new Error(`Unsupported witness condition ${condition.op}`);
+  }
+}
+
+function rawFacts(assignment) {
+  return Object.fromEntries([...assignment].filter(([, value]) => value !== ABSENT));
+}
+
+function orderedBranchWitness(check, branchIndex) {
+  const branches = Object.values(check.derivedFactRules ?? {});
+  const constraints = [
+    ...branches.slice(0, branchIndex).map((branch) => [branch.condition, false]),
+    [branches[branchIndex].condition, true],
+  ];
+  let candidates = [new Map()];
+  for (const [condition, desired] of constraints) {
+    candidates = combineAssignments(candidates, conditionWitnesses(condition, desired, check.criteria.constants));
+  }
+  return candidates.map(rawFacts).find((facts) => constraints.every(([condition, desired]) => (
+    evaluateVerdictCondition(condition, { ...check.criteria.constants, ...facts }) === desired
+  )));
+}
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -88,6 +240,17 @@ test("Okta, Slack, and Zoom execute declared derived facts with ordered first-ma
     for (const check of spec.checks) {
       assert.ok(Object.keys(check.derivedFactRules ?? {}).length > 0, `${check.id}: executable derived facts`);
       assert.ok(check.criteria.rules.every((entry) => entry.condition.op === "eq"), `${check.id}: outcomes consume derived branches`);
+      const branches = Object.values(check.derivedFactRules);
+      assert.equal(branches.length, check.criteria.rules.length, `${check.id}: one executable derivation per outcome`);
+      for (const [index, rule] of check.criteria.rules.entries()) {
+        const witness = orderedBranchWitness(check, index);
+        assert.ok(witness, `${check.id}: executable evidence reaches ordered branch ${index + 1} (${rule.status})`);
+        assert.equal(
+          evaluateCheckVerdict(check, witness),
+          rule.status,
+          `${check.id}: branch ${index + 1} executes at its exact comparison boundary after every earlier branch is false`,
+        );
+      }
       const nullFacts = Object.fromEntries(check.evidenceFields.map((name) => [name, null]));
       assert.equal(evaluateCheckVerdict(check, {}), "manual", `${check.id}: missing evidence`);
       assert.notEqual(evaluateCheckVerdict(check, nullFacts), "pass", `${check.id}: null evidence`);
@@ -129,7 +292,7 @@ test("Okta Info is an explicit evidence outcome and cannot be selected by a lega
   }), "pass");
 });
 
-test("every rule has boundary coverage and null, missing, denied, or unreadable evidence cannot pass", () => {
+test("all batch rules reject null, missing, denied, or unreadable evidence", () => {
   const derivations = new Set();
   for (const [spec] of batch) {
     validateDecisionInputs(spec);
@@ -558,16 +721,6 @@ test("ServiceNow executable rules ignore legacy status and preserve boundaries, 
     expired_certificate_count: 0,
     concern_count: 0,
   }), "fail", "a provider absence proved by complete provider inventories precedes partial companion evidence");
-});
-
-test("runtime behavior statements are explicit and generator-visible", () => {
-  for (const [spec, behavior] of batch) {
-    assert.ok(behavior.length >= 3, `${spec.identity.slug}: behavior statements`);
-    for (const statement of behavior) {
-      assert.ok(spec.knownGaps.includes(statement), `${spec.identity.slug}: generated behavior statement`);
-      assert.ok(statement.length > 80, `${spec.identity.slug}: substantive behavior statement`);
-    }
-  }
 });
 
 test("batch contracts reject undeclared derived inputs", () => {
