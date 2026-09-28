@@ -18,7 +18,7 @@ The OCI tool family inspects a tenancy read-only through the official OCI CLI an
 
 1. Install the OCI CLI (`oci`) and confirm `oci --version` works. Installation guide: https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm
 2. Configure an API-key profile in `~/.oci/config` (`tenancy`, `user`, `fingerprint`, `key_file`, `region`). Config file reference: https://docs.oracle.com/en-us/iaas/Content/API/Concepts/sdkconfig.htm
-3. Optionally set `OCI_CONFIG_FILE`, `OCI_CLI_PROFILE`, `OCI_REGION`, `OCI_TENANCY_OCID`, or `OCI_COMPARTMENT_OCID`; tool arguments override environment, which overrides the config profile.
+3. Optionally set `OCI_CONFIG_FILE`, `OCI_CLI_PROFILE`, `OCI_REGION`, `OCI_TENANCY_OCID`, or `OCI_COMPARTMENT_OCID`; tool arguments (`config_file`, `profile`, `region`, `tenancy_ocid`, `compartment_ocid`) override environment, which overrides the config profile. Without any of them the tools read `~/.oci/config` profile `DEFAULT`, take `region` and `tenancy` from that profile (region falls back to `us-ashburn-1`), and use the tenancy as the starting compartment. A tenancy OCID is required from one of the three sources.
 
 Only API-key profiles are supported in this release. Session token (`security_token_file`), instance principal, resource principal, and delegation token modes are deferred (see Limitations).
 
@@ -92,7 +92,7 @@ Every finding carries the spec mapping table values for FedRAMP, CMMC L2, SOC 2,
 
 ## Evidence bundle
 
-`oci_export_audit_bundle` writes `<tenancy>-<region>-audit/` under the output root (reruns allocate `-2`, `-3`, never overwrite) and a zip named after that directory:
+`oci_export_audit_bundle` writes `<tenancy>-<region>-audit/` under the output root (reruns allocate `-2` through `-9`, never overwrite, and fail once all nine names are taken) and a zip named after that directory:
 
 - `QUICK_REFERENCE.md`, `README.md`, `metadata.json`
 - `core_data/`: `access.json`, `compartments.json` (no credentials)

@@ -30,7 +30,7 @@ Configuration precedence is explicit tool arguments, then environment variables,
 
 | Setting | Environment variable | Config file key | Notes |
 |---------|---------------------|-----------------|-------|
-| Username | `QUALYS_USERNAME` (or `QUALYS_USER`) | `username` | Required for basic and OAuth modes |
+| Username | `QUALYS_USERNAME` (or `QUALYS_USER`) | `username` or `user` | Required for basic and OAuth modes |
 | Password | `QUALYS_PASSWORD` | `password` | Required for basic and OAuth modes |
 | Pre-issued bearer token | `QUALYS_TOKEN` (or `QUALYS_ACCESS_TOKEN`) | `token` | Bearer mode, skips username and password |
 | OAuth mode | `QUALYS_USE_OAUTH=true` | `use_oauth` | Requests a JWT from the platform gateway `/auth` endpoint with `username`, `password`, and `token=true`, then sends `Authorization: Bearer` |
@@ -38,9 +38,11 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | Base URL override | `QUALYS_BASE_URL` (or `QUALYS_API_URL`) | `base_url` | Bypasses the platform mapping |
 | Gateway URL override | `QUALYS_GATEWAY_URL` | `gateway_url` | Only used for OAuth token requests |
 | Config file path | `QUALYS_CONFIG_FILE` | n/a | Defaults to `~/.qcrc`, key=value or INI style |
-| Timeout | `QUALYS_TIMEOUT` (seconds) | `timeout` | Defaults to 60 |
-| Retries | `QUALYS_MAX_RETRIES` | n/a | Defaults to 3 |
-| Lookback window | `QUALYS_LOOKBACK_DAYS` | n/a | Defaults to 30 |
+| Timeout | `QUALYS_TIMEOUT` (seconds) | `timeout` | Defaults to 60, clamped to 1-600 |
+| Retries | `QUALYS_MAX_RETRIES` | n/a | Defaults to 3, clamped to 0-10 |
+| Lookback window | `QUALYS_LOOKBACK_DAYS` | n/a | Defaults to 30, clamped to 1-365 |
+
+A pre-issued token wins over OAuth and basic modes whenever one resolves. `base_url` (from any source) takes precedence over `platform`. Config file keys are case-insensitive; `#`, `;`, and `[section]` lines are skipped.
 
 Example:
 
@@ -83,7 +85,7 @@ A failed request is reported with its HTTP status and endpoint path, never with 
 
 ## Tools
 
-All tools accept the same connection arguments (`username`, `password`, `token`, `platform`, `base_url`, `gateway_url`, `use_oauth`, `config_file`, `timeout_seconds`, `lookback_days`). Assessment tools add `host_limit`, `detection_limit`, `min_auth_scan_percent`, `min_agent_coverage_percent`, `max_managers`, `sla_critical_days`, `sla_high_days`, and `sla_medium_days`.
+All tools accept the same connection arguments (`username`, `password`, `token`, `platform`, `base_url`, `gateway_url`, `use_oauth`, `config_file`, `timeout_seconds`, `lookback_days`). Assessment tools add `host_limit` (default 5000), `detection_limit` (5000), `min_auth_scan_percent` (80), `min_agent_coverage_percent` (50), `max_managers` (5), `sla_critical_days` (15), `sla_high_days` (30), and `sla_medium_days` (90); `qualys_export_audit_bundle` also takes `output_dir` (default `./export/qualys`).
 
 ### `qualys_check_access`
 
@@ -127,7 +129,7 @@ Controls 12, 13, 15, 19: active scheduled reports and recent report output, user
 
 ### `qualys_export_audit_bundle`
 
-Runs the access check and all four assessments, then writes `export/qualys/qualys-<platform>-audit-bundle/` (a numeric suffix is appended when the directory exists) containing:
+Runs the access check and all four assessments, then writes `qualys-<platform>-audit-bundle/` under `output_dir`, with the platform lowercased (for example `./export/qualys/qualys-us1-audit-bundle/`). A repeat run takes the suffixes `-2` through `-99`, skipping any name whose directory or zip already exists. The directory contains:
 
 - `QUICK_REFERENCE.md` and `metadata.json`
 - `core_data/access.json` and `core_data/<category>/<dataset>.json`, one status wrapper per collected surface carrying `name`, `endpoint`, `status` (`readable`, `truncated`, `unreadable`, or `not_collected`), `count` with a `count_status` of `complete` or `partial`, and `records`, a per-record projection (identifiers, names, statuses, dates, counts, and the documented fields the verdicts read). A denied or never-issued read carries `count: null` and `records: null` with a `reason`, never `[]`. Option profile configuration, authentication record values, connector ARNs and external IDs, agent activation IDs, report distribution settings, and notification recipients are never written
@@ -136,7 +138,7 @@ Runs the access check and all four assessments, then writes `export/qualys/qualy
 - `_errors.log` when any collection step failed
 - a sibling `.zip` archive of the whole directory
 
-Output paths are resolved with traversal and symlink-parent protection; `output_dir` values that escape the working directory or pass through a symlinked parent are rejected.
+`output_dir` is resolved against the working directory and may be any path. Every file inside the bundle is resolved with traversal and symlink-parent protection: a path that escapes the output root or passes through a symlinked parent is rejected.
 
 ## Control coverage
 

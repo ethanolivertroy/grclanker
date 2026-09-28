@@ -25,14 +25,16 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | Variable | Purpose |
 | --- | --- |
 | `SERVICENOW_INSTANCE` | Instance name, expanded to `https://<instance>.service-now.com` |
-| `SERVICENOW_URL` | Full instance URL (overrides the instance name) |
-| `SERVICENOW_AUTH_METHOD` | `basic`, `oauth`, or `mtls` (inferred from the credentials when omitted) |
+| `SERVICENOW_URL` (or `SERVICENOW_INSTANCE_URL`) | Full instance URL (overrides the instance name) |
+| `SERVICENOW_AUTH_METHOD` | `basic`, `oauth` (also spelled `oauth2`, `client_credentials`, `oauth_client_credentials`, or `password`), or `mtls`; when omitted it is inferred as `oauth` for an access token or a client ID and secret, else `basic` for a username and password |
 | `SERVICENOW_USERNAME` / `SERVICENOW_PASSWORD` | Basic auth, or the OAuth password grant when client credentials are also set |
 | `SERVICENOW_CLIENT_ID` / `SERVICENOW_CLIENT_SECRET` | OAuth application registry client (client credentials grant, or password grant with a user) |
-| `SERVICENOW_ACCESS_TOKEN` | Pre-issued bearer token |
+| `SERVICENOW_ACCESS_TOKEN` (or `SERVICENOW_TOKEN`) | Pre-issued bearer token |
 | `SERVICENOW_REFRESH_TOKEN` | Refresh token issued earlier to the OAuth client; with the client ID and secret, the first exchange uses the `refresh_token` grant |
 | `SERVICENOW_CONFIG_FILE` | YAML config file path |
-| `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30), retries for 429 and 5xx (default 3), Table API page size (default 500) |
+| `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30, clamped to 1-300), retries for 429 and 5xx (default 3, clamped to 0-10), Table API page size (default 500, clamped to 1-10000) |
+
+Only the first config file found is read: `SERVICENOW_CONFIG_FILE` (or `config_file`) when set, which must exist, otherwise `./.servicenow.yaml`, otherwise `~/.servicenow-sec-inspector/config.yaml`. Its keys are `instance`, `instance_url` (or `url`, `base_url`), `auth_method`, `username` (or `user`), `password`, `client_id`, `client_secret`, `access_token` (or `token`), `refresh_token`, `timeout_seconds` (or `timeout`), `max_retries`, and `page_size`; camelCase spellings such as `instanceUrl` and `clientSecret` are also accepted.
 
 ### Basic authentication
 
@@ -60,7 +62,7 @@ Tokens are exchanged at `POST https://<instance>.service-now.com/oauth_token.do`
 | `servicenow_assess_platform_hardening` | Controls 1, 5, 12, 13, 16, 17, 18. Options: `max_session_timeout_minutes` (60), `record_limit`. |
 | `servicenow_assess_access_control` | Controls 2 and 11. Option: `record_limit`. |
 | `servicenow_assess_operations_governance` | Controls 9, 10, 15, 19, 20. Option: `record_limit`. |
-| `servicenow_export_audit_bundle` | Runs the access check and all four assessments, then writes `core_data/` (Table API and Aggregate API snapshots projected to the requested `sysparm_fields`, with `truncated`, `total_unknown`, and `partial` flags per table; a table or aggregate that was forbidden, errored, or never requested is written as a `{ collected: false, table, query, status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, per-area results with an `inventories` map that reports each table as read, `unread (...)`, or `not requested (...)`, `summary.json`), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, one report per framework), `QUICK_REFERENCE.md`, `metadata.json`, `_errors.log` when collection partially failed, and a zip archive named after the allocated output directory. Reruns allocate `-2`, `-3`, ... instead of overwriting. Default output root: `./export/servicenow`. |
+| `servicenow_export_audit_bundle` | Runs the access check and all four assessments, then writes `core_data/` (Table API and Aggregate API snapshots projected to the requested `sysparm_fields`, with `truncated`, `total_unknown`, and `partial` flags per table; a table or aggregate that was forbidden, errored, or never requested is written as a `{ collected: false, table, query, status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, per-area results with an `inventories` map that reports each table as read, `unread (...)`, or `not requested (...)`, `summary.json`), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, one report per framework), `QUICK_REFERENCE.md`, `metadata.json`, `_errors.log` when collection partially failed, and a zip archive named after the allocated output directory. The directory is `<instance>-audit-bundle`, where the instance is the configured instance name or the first label of the instance host. Reruns allocate `-2` through `-9` instead of overwriting, skipping any name whose directory or zip already exists, and fail once all nine are taken. Default output root: `./export/servicenow`. |
 
 All tools accept the authentication arguments (`instance`, `instance_url`, `auth_method`, `username`, `password`, `client_id`, `client_secret`, `access_token`, `refresh_token`, `config_file`, `timeout_seconds`, `max_retries`, `page_size`).
 

@@ -18,15 +18,15 @@ Set the organization ID and one credential source. Explicit tool arguments win o
 
 | Setting | Argument | Environment variable | `config.toml` key |
 | --- | --- | --- | --- |
-| Organization (business group) ID | `organization_id` | `ANYPOINT_ORG_ID` (or `ANYPOINT_ORGANIZATION_ID`) | `org_id` |
+| Organization (business group) ID | `organization_id` | `ANYPOINT_ORG_ID` (or `ANYPOINT_ORGANIZATION_ID`) | `org_id` (or `organization_id`) |
 | Connected app client credentials | `client_id`, `client_secret` | `ANYPOINT_CLIENT_ID`, `ANYPOINT_CLIENT_SECRET` | `client_id`, `client_secret` |
 | Username and password | `username`, `password` | `ANYPOINT_USERNAME`, `ANYPOINT_PASSWORD` | `username`, `password` |
-| Pre-issued bearer token | `token` | `ANYPOINT_TOKEN` (or `ANYPOINT_ACCESS_TOKEN`) | `token` |
-| Control plane | `control_plane` (`us`, `eu`, `gov`) | `ANYPOINT_CONTROL_PLANE` | `control_plane` |
+| Pre-issued bearer token | `token` | `ANYPOINT_TOKEN` (or `ANYPOINT_ACCESS_TOKEN`) | `token` (or `access_token`) |
+| Control plane | `control_plane` (`us`, `eu`, `gov`) | `ANYPOINT_CONTROL_PLANE` | `control_plane` (or `region`) |
 | Custom base URL | `base_url` | `ANYPOINT_BASE_URL` | `base_url` |
-| Environment filter | `environments` (comma-separated names or IDs) | `ANYPOINT_ENVIRONMENTS` | `environments` (array) |
-| Request timeout (seconds) | `timeout_seconds` | `ANYPOINT_TIMEOUT` | `timeout` |
-| Config file path | `config_file` | `MULESOFT_SEC_INSPECTOR_CONFIG` | default `~/.config/mulesoft-sec-inspector/config.toml` |
+| Environment filter | `environments` (comma-separated names or IDs) | `ANYPOINT_ENVIRONMENTS` (or `ANYPOINT_ENVIRONMENT_IDS`) | `environments` (array) |
+| Request timeout (seconds, default 30) | `timeout_seconds` | `ANYPOINT_TIMEOUT` | `timeout` (or `timeout_seconds`) |
+| Config file path | `config_file` | `MULESOFT_SEC_INSPECTOR_CONFIG` (or `ANYPOINT_CONFIG_FILE`) | default `~/.config/mulesoft-sec-inspector/config.toml` |
 
 Auth mode is chosen in this order: pre-issued token, connected app client credentials, then username and password.
 
@@ -89,7 +89,7 @@ Because Anypoint scopes are environment-specific for most products, grant them f
 | `mulesoft_assess_audit_monitoring` | Controls 17, 24: audit log entries in the lookback window and alert coverage for production applications. |
 | `mulesoft_export_audit_bundle` | Runs the access check and all four assessments and writes a bundle plus `.zip` under `output_dir` (default `./export/mulesoft`): `core_data/` holds projected and redacted snapshots (a denied, errored, or never-requested dataset is written as a `{ collected: false, dataset, status, endpoint, error }` marker, and a dataset assembled from several reads of which some failed as `{ collected: "partial", failed_reads, items }`), `analysis/` holds the findings and per-category summaries with an `inventories` map naming each source as complete, partial, unread, or not requested, and `compliance/` holds the executive summary, unified matrix, and eight framework reports. |
 
-All tools accept the authentication arguments above. Assessment tools also accept thresholds such as `max_admins`, `max_roles_per_group`, `max_connected_app_scopes`, `stale_connected_app_days`, `environment_limit`, `api_limit`, `application_limit`, `runtime_support_warning_days`, `certificate_warning_days`, and `audit_lookback_hours`. Environments are sampled production first, so a low `environment_limit` still covers production.
+All tools accept the authentication arguments above. Assessment tools also accept limits and thresholds (defaults in parentheses): `mulesoft_assess_identity_access` takes `user_limit` (1000), `max_admins` (5), `max_roles_per_group` (15), `max_connected_app_scopes` (10), and `stale_connected_app_days` (90); `mulesoft_assess_api_gateway` takes `environment_limit` (10) and `api_limit` (100); `mulesoft_assess_runtime_infrastructure` takes `environment_limit`, `application_limit` (200), `runtime_support_warning_days` (90), and `certificate_warning_days` (60); `mulesoft_assess_audit_monitoring` takes `environment_limit` and `audit_lookback_hours` (24). The export accepts all of them. Environments are sampled production first, so a low `environment_limit` still covers production.
 
 Each finding has the shape `{ id, control, title, severity, status, summary, evidence, mappings }` where `severity` is `critical`, `high`, `medium`, `low`, or `info` and `status` is `pass`, `warn`, `fail`, or `manual`. A `manual` finding states exactly what evidence a human must collect from Anypoint Platform. When a read failed or the credential saw only part of the inventory, `evidence.unreadable_sources` and `evidence.partial_view` list the causes.
 
@@ -106,7 +106,7 @@ Every finding follows the same rules so that missing or partial evidence never p
 - Pagination runs to the requested limit and every list reports whether it was truncated; a first page is never treated as the whole population.
 - A read that depends on a list which was not read (role group roles and members, connected app scopes, API instances and policies, applications, servers, MQ regions, queues, and clients, secret groups, VPC and load balancer details, the load balancer certificate probes, alerts) is never requested; it is recorded as `not requested` naming the parent read, and the finding reports the parent failure once instead of an empty child read. When some parents were read and others were not, the children of the unread parents are reported as a partial failure.
 - Evidence and summaries derived from an unread or unrequested source render `null` rather than `0` or `[]`: `evidence.partial_view` is `null` (not `[]`) when a source was never read, and every category summary carries an `inventories` map naming each source as `complete (N items)`, `partial (N of M)`, `unread (<error>)`, or `not requested (<reason>)`.
-- Re-running the export allocates a new directory and derives the `.zip` name from it, so no prior bundle or archive is overwritten.
+- Re-running the export allocates a new directory (`-2` up to `-50`, then it fails) and derives the `.zip` name from it, so no prior bundle or archive is overwritten.
 
 ### Bundle layout
 

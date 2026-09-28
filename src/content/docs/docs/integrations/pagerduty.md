@@ -23,7 +23,7 @@ Credentials resolve in this order: explicit tool arguments, then environment var
 |-----------|----------------------|-------------|
 | REST API key (recommended) | `PAGERDUTY_API_TOKEN`, or `PAGERDUTY_API_KEY`, `PAGERDUTY_TOKEN`, `PD_API_KEY` | `Authorization: Token token=<key>` |
 | OAuth bearer token | `PAGERDUTY_ACCESS_TOKEN` (or `PAGERDUTY_OAUTH_TOKEN`) | `Authorization: Bearer <token>` |
-| Scoped OAuth client credentials | `PAGERDUTY_CLIENT_ID`, `PAGERDUTY_CLIENT_SECRET`, `PAGERDUTY_SUBDOMAIN` | Token exchanged at `https://identity.pagerduty.com/oauth/token` with the `as_account-<region>.<subdomain>` scope plus the `*.read` scopes, then `Authorization: Bearer <token>` |
+| Scoped OAuth client credentials | `PAGERDUTY_CLIENT_ID`, `PAGERDUTY_CLIENT_SECRET`, `PAGERDUTY_SUBDOMAIN` (or `PAGERDUTY_ACCOUNT_SUBDOMAIN`) | Token exchanged at `https://identity.pagerduty.com/oauth/token` with the `as_account-<region>.<subdomain>` scope plus the `*.read` scopes, then `Authorization: Bearer <token>` |
 
 Optional settings:
 
@@ -33,7 +33,10 @@ Optional settings:
 | `PAGERDUTY_BASE_URL` (or `PAGERDUTY_API_BASE_URL`) | Explicit REST base URL; overrides the region |
 | `PAGERDUTY_USER_EMAIL` (or `PAGERDUTY_FROM_EMAIL`) | Sent as the `From` header |
 | `PAGERDUTY_TIMEOUT` | HTTP timeout in seconds (default 30) |
-| `PAGERDUTY_CONFIG_FILE` | JSON file with `api_token`, `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email`, `timeout_seconds` |
+| `PAGERDUTY_IDENTITY_TOKEN_URL` | Overrides the OAuth token endpoint (default `https://identity.pagerduty.com/oauth/token`) |
+| `PAGERDUTY_CONFIG_FILE` | JSON file with `api_token` (or `api_key`, `token`), `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email` (or `email`), `timeout_seconds` |
+
+The `api_key` and `token` aliases for `api_token`, and `email` for `from_email`, are also accepted as tool arguments. When more than one credential resolves, the REST API key wins, then the OAuth bearer token, then client credentials.
 
 Every request carries `Accept: application/vnd.pagerduty+json;version=2`. The client follows classic `limit`/`offset` pagination using the `more` flag (100 per page, capped at the documented 10,000 record ceiling) and cursor pagination (`cursor`, `next_cursor`) on audit records and incident workflow triggers. `GET /change_events` declares no `more` or `total` field, so the client keeps reading offset pages until a page comes back shorter than requested; a full final page at the requested limit is recorded as incomplete. It retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present, and redacts tokens from error messages.
 
@@ -49,7 +52,15 @@ Every request carries `Accept: application/vnd.pagerduty+json;version=2`. The cl
 | `pagerduty_assess_integration_security` | Controls 14, 15, 16, 21, 25: HTTPS webhook endpoints, legacy versus signed v3 webhooks, legacy and unfiltered service integrations, business service dependencies, change events |
 | `pagerduty_export_audit_bundle` | Runs the access check and all five assessments, then writes `core_data/` (projected and redacted API snapshots, each carrying `complete`, `total`, and `truncation`; a dataset that was denied, errored, or never requested is written as a `{ collected: false, status, endpoint, error }` marker instead of an empty list), `analysis/` (`findings.json`, one result per category whose summary carries an `inventories` map naming each source as complete, partial, unread, or not requested, `metadata.json`), `compliance/`, `QUICK_REFERENCE.md`, `_errors.log` when part of the collection failed, and a `.zip` under `output_dir` (default `./export/pagerduty`) |
 
-All tools accept the auth parameters (`api_token`, `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email`, `config_file`, `timeout_seconds`). Assessment tools also accept sampling limits (`user_limit`, `team_limit`, `service_limit`, `schedule_limit`, `business_service_limit`) and thresholds (`max_admins`, `coverage_days`, `audit_window_days`, `audit_limit`, `min_retention_days`, `api_key_max_age_days`, `change_event_days`).
+All tools accept the auth parameters (`api_token`, `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email`, `config_file`, `timeout_seconds`, default 30). Each assessment tool adds its own sampling limits and thresholds, all optional numbers; `pagerduty_export_audit_bundle` accepts every one of them plus `output_dir`:
+
+| Tool | Parameters (default) |
+|------|----------------------|
+| `pagerduty_assess_access_control` | `user_limit` (1000), `team_limit` (50), `max_admins` (5) |
+| `pagerduty_assess_incident_response` | `service_limit` (1000) |
+| `pagerduty_assess_oncall_coverage` | `schedule_limit` (50), `coverage_days` (30), `user_limit` (1000) |
+| `pagerduty_assess_audit_logging` | `audit_window_days` (30), `audit_limit` (2000), `min_retention_days` (365), `api_key_max_age_days` (90) |
+| `pagerduty_assess_integration_security` | `service_limit` (1000), `business_service_limit` (50), `change_event_days` (30) |
 
 ### Audit bundle layout
 
@@ -72,7 +83,7 @@ pagerduty-<region>-audit-bundle/
 pagerduty-<region>-audit-bundle.zip
 ```
 
-Output paths are resolved inside `output_dir`; traversal outside it and symlinked parent directories are rejected. Files are written with mode `0600` and directories with `0700`.
+A repeat run takes the suffixes `-2` through `-10`, skipping any name whose directory or zip already exists, and fails once all ten names are taken. Output paths are resolved inside `output_dir`; traversal outside it and symlinked parent directories are rejected. Files are written with mode `0600` and directories with `0700`.
 
 ## Control coverage
 
