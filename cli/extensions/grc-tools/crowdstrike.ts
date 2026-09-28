@@ -22,6 +22,12 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
+import { CROWDSTRIKE_SPEC } from "./crowdstrike.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -345,6 +351,10 @@ export const CROWDSTRIKE_CONTROLS: ReadonlyArray<ControlDefinition> = [
 ];
 
 const CONTROL_BY_ID = new Map(CROWDSTRIKE_CONTROLS.map((definition) => [definition.id, definition]));
+hydrateBatchFrameworkMappings(
+  CROWDSTRIKE_SPEC,
+  Object.fromEntries(CROWDSTRIKE_CONTROLS.map((definition) => [definition.id, definition.frameworks])),
+);
 
 export interface CrowdstrikeResolvedConfig {
   clientId: string;
@@ -741,11 +751,18 @@ function finding(
   if (!definition) {
     throw new Error(`Unknown CrowdStrike control ${id}`);
   }
+  const facts = {
+    evidence_readable: status !== "manual",
+    evidence_complete: status !== "manual",
+    inventory_count: 1,
+    violation_count: status === "fail" ? 1 : 0,
+    review_count: status === "warn" ? 1 : 0,
+  };
   return {
     id,
     title: definition.title,
     severity: definition.severity,
-    status,
+    status: evaluateBatchRuntimeCheckVerdict(CROWDSTRIKE_SPEC, id, facts) as CrowdstrikeFinding["status"],
     summary,
     evidence,
     mappings: mappingStrings(definition),
@@ -4127,6 +4144,7 @@ const hostParams = {
 };
 
 export function registerCrowdstrikeTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, CROWDSTRIKE_SPEC);
   pi.registerTool({
     name: "crowdstrike_check_access",
     label: "Check CrowdStrike Falcon audit access",
