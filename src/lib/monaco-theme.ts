@@ -3,6 +3,8 @@
  * Maps all editor chrome and markdown token colors to the Frappé palette.
  * Text colors keep 4.5:1 against editor.background and the current-line
  * highlight (WCAG 1.4.3); sliders, guides, and borders keep 3:1 (WCAG 1.4.11).
+ * Selection fills stay dark so every token keeps 4.5:1 on them; the selection
+ * outline in global.css carries the 3:1 visibility against the editor.
  */
 export const catppuccinFrappe = {
   base: 'vs-dark' as const,
@@ -64,7 +66,8 @@ export const catppuccinFrappe = {
     'editor.background': '#292c3c',
     'editor.foreground': '#c6d0f5',
     'editorCursor.foreground': '#f2d5cf',
-    'editor.selectionBackground': '#414559',
+    'editor.selectionBackground': '#232634',
+    'editor.inactiveSelectionBackground': '#232634',
     'editor.selectionHighlightBackground': '#41455980',
     'editor.lineHighlightBackground': '#30344660',
     'editor.lineHighlightBorder': '#30344600',
