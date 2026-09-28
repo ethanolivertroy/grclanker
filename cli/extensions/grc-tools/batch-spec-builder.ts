@@ -370,7 +370,21 @@ function recordOperandUsage(
   expectedType?: PortableInputType,
   comparedValue?: PortableValue,
 ): void {
-  if (operand.kind === "value") return;
+  switch (operand.kind) {
+    case "value":
+      return;
+    case "subtract":
+      recordOperandUsage(usage, operand.left, derivedFact, "number");
+      recordOperandUsage(usage, operand.right, derivedFact, "number");
+      return;
+    case "path":
+    case "length":
+      break;
+    default: {
+      const exhaustive: never = operand;
+      return exhaustive;
+    }
+  }
   const name = operand.path;
   const entry = usage.get(name) ?? { types: new Set<PortableInputType>(), values: new Set<string>(), derivedFacts: new Set<string>() };
   if (operand.kind === "length") entry.types.add("array");
@@ -510,8 +524,23 @@ function renderCompletenessSemantics(
     return `For ${check.id}, this fact has no vendor dataset dependency. ${contract.semantics}`;
   }
   const sourceText = contract.sources.map((source) => {
-    const falseModes = source.falseWhen.length > 0 ? source.falseWhen.join(", ") : "none";
-    return `\`${source.surfaceId}\`: false on ${falseModes}; other failure modes do not change this fact`;
+    if (!source.scope && !source.aggregate) {
+      if (source.falseWhen.length === 0) {
+        return `\`${source.surfaceId}\`: does not lower this fact for any declared failure mode`;
+      }
+      return `\`${source.surfaceId}\`: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact`;
+    }
+    const scope = source.scope ? ` (${source.scope})` : "";
+    const aggregate = source.aggregate
+      ? `; aggregate rule: count ${source.aggregate.attemptedUnit} under \`${source.aggregate.parentSurfaceId}\`; `
+        + `${source.aggregate.mixedFailureModes.join(" or ")} makes this fact false only when at least one attempted child read succeeds and at least one fails; `
+        + "if every attempted child read fails, this fact is unchanged and evidence_readable is false; "
+        + "zero attempted child reads leave this fact unchanged"
+      : "";
+    if (source.falseWhen.length === 0) {
+      return `\`${source.surfaceId}\`${scope}: does not lower this fact for any declared failure mode${aggregate}`;
+    }
+    return `\`${source.surfaceId}\`${scope}: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact${aggregate}`;
   }).join("; ");
   return `For ${check.id}, ${contract.semantics} Exact source-state effects: ${sourceText}`;
 }
@@ -539,6 +568,23 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
         seen.add(source.surfaceId);
         if (new Set(source.falseWhen).size !== source.falseWhen.length) {
           throw new Error(`${check.id} completeness input ${inputName} repeats a failure mode for ${source.surfaceId}`);
+        }
+        if (source.scope !== undefined && !source.scope.trim()) {
+          throw new Error(`${check.id} completeness input ${inputName} has an empty scope qualifier for ${source.surfaceId}`);
+        }
+        if (source.aggregate) {
+          if (!check.surfaces.includes(source.aggregate.parentSurfaceId)) {
+            throw new Error(`${check.id} completeness input ${inputName} aggregate for ${source.surfaceId} references undeclared parent ${source.aggregate.parentSurfaceId}`);
+          }
+          if (!source.aggregate.attemptedUnit.trim()) {
+            throw new Error(`${check.id} completeness input ${inputName} aggregate for ${source.surfaceId} has no attempted unit`);
+          }
+          if (source.aggregate.mixedFailureModes.length === 0) {
+            throw new Error(`${check.id} completeness input ${inputName} aggregate for ${source.surfaceId} has no mixed-failure modes`);
+          }
+          if (new Set(source.aggregate.mixedFailureModes).size !== source.aggregate.mixedFailureModes.length) {
+            throw new Error(`${check.id} completeness input ${inputName} aggregate for ${source.surfaceId} repeats a mixed-failure mode`);
+          }
         }
       }
     }
@@ -688,6 +734,22 @@ export function evaluateBatchCheckVerdict(
   rawFacts: Readonly<Record<string, unknown>>,
 ): EvaluatedFindingStatus {
   return evaluateCheckVerdict(checkContract(spec, checkId), rawFacts);
+}
+
+export function evaluateBatchRuntimeCheckVerdict(
+  spec: IntegrationSpecContract,
+  checkId: string,
+  collectedFacts: Readonly<Record<string, unknown>>,
+): EvaluatedFindingStatus {
+  const check = checkContract(spec, checkId);
+  const declaredFacts = Object.fromEntries(
+    Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
+  );
+  BATCH_DECISION_CAPTURE.getStore()?.push({
+    integration: spec.identity.slug,
+    checks: new Map([[checkId, declaredFacts]]),
+  });
+  return evaluateCheckVerdict(check, declaredFacts);
 }
 
 export function assertBatchCheckVerdict<T extends string>(

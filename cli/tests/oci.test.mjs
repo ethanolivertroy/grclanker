@@ -41,6 +41,14 @@ import {
   scopedStatus,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/oci.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { OCI_COMPLETENESS_SOURCES, OCI_SPEC } from "../dist/extensions/grc-tools/oci.spec.js";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const TENANCY = "ocid1.tenancy.oc1..aaaaexample";
@@ -390,6 +398,15 @@ async function runAllAssessments(client, options = {}) {
   ];
 }
 
+function ociFactsByCheck(captures) {
+  const facts = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, OCI_SPEC.identity.slug);
+    for (const [id, values] of capture.checks) facts.set(id, values);
+  }
+  return facts;
+}
+
 test("resolveOciConfiguration prefers explicit arguments over environment and config", () => {
   const resolved = resolveOciConfiguration(
     {
@@ -725,6 +742,48 @@ test("self-check fixture (c): partial inventories never pass and report seen ver
     assert.match(inventory.status, /^partial: .*denied or unreadable in 1 compartment\(s\): prod/, `${id}: ${inventory.status}`);
     assert.deepEqual(inventory.denied_compartments, ["prod"]);
   }
+});
+
+test("OCI prerequisite and nested-read failures match declared primitive completeness without changing parent verdicts", async () => {
+  const cases = [
+    {
+      surface: "identity-compartments",
+      ids: ["OCI-IAM-04", "OCI-LOG-05", "OCI-GRD-01", "OCI-GRD-02", "OCI-GRD-03", "OCI-GRD-04", "OCI-GRD-05", "OCI-GRD-06", "OCI-CMP-01", "OCI-CMP-02", "OCI-CMP-03"],
+      mutate(client) { client.listCompartments = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+    {
+      surface: "identity-availability-domains",
+      ids: ["OCI-CMP-03"],
+      mutate(client) { client.listAvailabilityDomains = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+    {
+      surface: "object-storage-namespace",
+      ids: ["OCI-GRD-06"],
+      mutate(client) { client.getObjectStorageNamespace = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+    {
+      surface: "network-security-group-rules",
+      ids: ["OCI-GRD-02"],
+      mutate(client) { client.listNetworkSecurityGroupRules = async () => { throw FORBIDDEN_ERROR; }; },
+    },
+  ];
+  let replays = 0;
+  for (const fixture of cases) {
+    const client = compliantClient();
+    fixture.mutate(client);
+    const { result, captures } = await captureBatchDecisionFacts(() => runAllAssessments(client));
+    const facts = ociFactsByCheck(captures);
+    const findings = result.flatMap((assessment) => assessment.findings);
+    for (const id of fixture.ids) {
+      const source = OCI_COMPLETENESS_SOURCES[id].find((entry) => entry.surfaceId === fixture.surface);
+      assert.ok(source, `${id}: ${fixture.surface} is declared`);
+      assert.deepEqual(source.falseWhen, [], `${id}: prerequisite failure does not lower completeness`);
+      assert.equal(facts.get(id)?.evidence_complete, true, `${id}: primitive remains true`);
+      assert.notEqual(findings.find((item) => item.id === id)?.status, "pass", `${id}: failed prerequisite cannot pass`);
+      replays += 1;
+    }
+  }
+  assert.equal(replays, 14);
 });
 
 test("compartment cap withholds pass and records truncation", async () => {
@@ -2170,6 +2229,116 @@ test("silent success: empty, whitespace-only, and foreign-JSON stdout on exit 0 
   } finally {
     fake.restore();
   }
+});
+
+test("byte differential fixtures: OCI assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const representativeClient = compliantClient();
+  representativeClient.listUsers = async () => [
+    { id: "ocid1.user.oc1..alice", name: "alice", lifecycleState: "ACTIVE", isMfaActivated: false, capabilities: { canUseConsolePassword: true, canUseApiKeys: true } },
+  ];
+  writeByteDifferentialFixture("oci", "representative", await runAllAssessments(representativeClient));
+  writeByteDifferentialFixture("oci", "denied", await runAllAssessments(deniedClient()));
+  writeByteDifferentialFixture("oci", "missing-null", await runAllAssessments(emptyClient()));
+  writeByteDifferentialFixture("oci", "partial", await runAllAssessments(partialClient()));
+  writeByteDifferentialFixture("oci", "compliant", await runAllAssessments(compliantClient()));
+  const passwordLengthAt = async (minimumPasswordLength) => {
+    const client = compliantClient();
+    client.getAuthenticationPolicy = async () => ({
+      compartmentId: TENANCY,
+      passwordPolicy: {
+        minimumPasswordLength,
+        isLowercaseCharactersRequired: true,
+        isUppercaseCharactersRequired: true,
+        isNumericCharactersRequired: true,
+        isSpecialCharactersRequired: true,
+      },
+    });
+    return assessOciIdentity(client);
+  };
+  const passwordLengths = await Promise.all([13, 14, 15].map(passwordLengthAt));
+  const credentialAgeAt = async (days, staleDays = 90) => {
+    const client = compliantClient();
+    client.listApiKeys = async () => [{
+      fingerprint: `boundary-${days}`,
+      lifecycleState: "ACTIVE",
+      timeCreated: new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString(),
+    }];
+    return assessOciIdentity(client, { staleDays });
+  };
+  const auditRetentionAt = async (days) => {
+    const client = compliantClient();
+    client.getAuditConfiguration = async () => ({ retentionPeriodDays: days });
+    return assessOciLoggingDetection(client);
+  };
+  const bastionTtlAt = async (seconds) => {
+    const client = compliantClient();
+    client.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: seconds, clientCidrBlockAllowList: ["203.0.113.0/24"] });
+    return assessOciTenancyGuardrails(client);
+  };
+  const sessionTtlHoursAt = async (hours) => {
+    const client = compliantClient();
+    client.listBastionSessions = async () => [{ id: "session-1", lifecycleState: "ACTIVE", sessionTtlInSeconds: hours * 60 * 60 }];
+    return assessOciTenancyGuardrails(client);
+  };
+  const keyAgeAt = async (days) => {
+    const client = compliantClient();
+    client.listKeyVersions = async () => [{
+      id: "boundary-key-version",
+      lifecycleState: "ENABLED",
+      timeCreated: new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString(),
+    }];
+    return assessOciTenancyGuardrails(client);
+  };
+  const keySizeAt = async (algorithm, length) => {
+    const client = compliantClient();
+    client.listKeys = async () => [{ id: "key-1", displayName: "data", algorithm, lifecycleState: "ENABLED", protectionMode: "HSM" }];
+    client.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: { algorithm, length } });
+    return assessOciTenancyGuardrails(client);
+  };
+  const preauthenticatedRequestDaysAt = async (days) => {
+    const client = compliantClient();
+    client.listPreauthenticatedRequests = async () => [{
+      id: `par-${days}`,
+      name: "boundary",
+      accessType: "ObjectRead",
+      timeExpires: new Date(NOW.getTime() + days * 24 * 60 * 60 * 1000).toISOString(),
+    }];
+    return assessOciTenancyGuardrails(client);
+  };
+  const credentialAges = await Promise.all([89, 90, 91].map(credentialAgeAt));
+  const credentialAgeOverride = await Promise.all([29, 30, 31].map((days) => credentialAgeAt(days, 30)));
+  const auditRetention = await Promise.all([364, 365, 366].map(auditRetentionAt));
+  const bastionTtl = await Promise.all([10_799, 10_800, 10_801].map(bastionTtlAt));
+  const sessionTtlHours = await Promise.all([7, 8, 9].map(sessionTtlHoursAt));
+  const keyAges = await Promise.all([364, 365, 366].map(keyAgeAt));
+  const aesKeyBytes = await Promise.all([31, 32, 33].map((length) => keySizeAt("AES", length)));
+  const rsaKeyBytes = await Promise.all([511, 512, 513].map((length) => keySizeAt("RSA", length)));
+  const preauthenticatedRequestDays = await Promise.all([29, 30, 31].map(preauthenticatedRequestDaysAt));
+  const keyThresholds = await Promise.all([5, 6, 7].map((maxKeys) => assessOciIdentity(compliantClient(), { maxKeys })));
+  assert.equal(
+    keyThresholds.length + passwordLengths.length + credentialAges.length + credentialAgeOverride.length
+      + auditRetention.length + bastionTtl.length
+      + sessionTtlHours.length + keyAges.length + aesKeyBytes.length + rsaKeyBytes.length
+      + preauthenticatedRequestDays.length,
+    33,
+  );
+  writeByteDifferentialFixture("oci", "boundary", {
+    keyThresholds,
+    passwordMinimumLength: passwordLengths,
+    credentialAgeDays: credentialAges,
+    credentialAgeOverrideThirtyDays: credentialAgeOverride,
+    auditRetentionDays: auditRetention,
+    bastionTtlSeconds: bastionTtl,
+    bastionSessionTtlHours: sessionTtlHours,
+    keyRotationAgeDays: keyAges,
+    aesKeyBytes,
+    rsaKeyBytes,
+    preauthenticatedRequestDays,
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("oci");
+  const exported = await exportOciAuditBundle(compliantClient(), sampleConfig(), exportRoot);
+  writeByteDifferentialFixture("oci", "export", snapshotExportBundle(exported));
 });
 
 test("silent success per surface: each shape on each surface the #68 review names renders the dependent finding manual or warn, never pass or fail, with a marker naming the command and the stdout state", { skip: POSIX_ONLY }, async () => {

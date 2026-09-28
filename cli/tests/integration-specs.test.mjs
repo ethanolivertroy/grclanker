@@ -116,16 +116,22 @@ test("generated integration specs are current", async () => {
 test("published registry entries have complete, internally linked contracts", () => {
   assert.deepEqual(PUBLISHED_INTEGRATION_SPECS.map((entry) => entry.contract.identity.slug), [
     "aws-sec-inspector",
+    "azure-sec-inspector",
     "box-sec-inspector",
+    "cloudflare-sec-inspector",
     "duo-sec-inspector",
+    "gcp-sec-inspector",
     "gws-inspector-go",
+    "oci-sec-inspector",
     "okta-sec-inspector",
+    "paloalto-sec-inspector",
     "salesforce-sec-inspector",
     "servicenow-sec-inspector",
     "slack-sec-inspector",
     "webex-sec-inspector",
     "zendesk-sec-inspector",
     "zoom-sec-inspector",
+    "zscaler-sec-inspector",
   ]);
 
   for (const entry of PUBLISHED_INTEGRATION_SPECS) {

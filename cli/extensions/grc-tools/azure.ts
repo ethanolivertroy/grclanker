@@ -19,6 +19,36 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
+import {
+  AZURE_AUTH_RESOLVER,
+  readResolverEnvironment,
+} from "./auth-resolver-contracts.js";
+import {
+  AZURE_ADMIN_PORTS as ADMIN_PORTS,
+  AZURE_CREDENTIAL_EXPIRY_WARNING_DAYS as CREDENTIAL_EXPIRY_WARNING_DAYS,
+  AZURE_CREDENTIAL_LONG_LIVED_DAYS as LONG_LIVED_CREDENTIAL_DAYS,
+  AZURE_GUEST_ROLE_LIMITED as GUEST_ROLE_LIMITED,
+  AZURE_GUEST_ROLE_RESTRICTED as GUEST_ROLE_RESTRICTED,
+  AZURE_GUEST_ROLE_SAME_AS_MEMBER as GUEST_ROLE_SAME_AS_MEMBER,
+  AZURE_HIGH_PRIVILEGE_DELEGATED_SCOPES as HIGH_PRIVILEGE_DELEGATED_SCOPES,
+  AZURE_MAX_CONTRIBUTOR_ASSIGNMENTS as MAX_CONTRIBUTOR_ASSIGNMENTS,
+  AZURE_MAX_GLOBAL_ADMINS as MAX_GLOBAL_ADMINS,
+  AZURE_MAX_OWNER_ASSIGNMENTS as MAX_OWNER_ASSIGNMENTS,
+  AZURE_MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS as MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS,
+  AZURE_MFA_UNREGISTERED_WARN_RATIO as MFA_UNREGISTERED_WARN_RATIO,
+  AZURE_MIN_RETENTION_DAYS as MIN_RETENTION_DAYS,
+  AZURE_PRIVILEGED_ASSIGNMENT_FAIL_ABOVE as PRIVILEGED_ASSIGNMENT_FAIL_ABOVE,
+  AZURE_PRIVILEGED_ASSIGNMENT_PASS_MAX as PRIVILEGED_ASSIGNMENT_PASS_MAX,
+  AZURE_SECURE_SCORE_PASS_RATIO,
+  AZURE_SECURE_SCORE_WARN_RATIO,
+  AZURE_SPEC,
+  AZURE_STALE_GUEST_DAYS as STALE_GUEST_DAYS,
+} from "./azure.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -30,9 +60,7 @@ const DEFAULT_MAX_ASSIGNMENTS = 500;
 const DEFAULT_MAX_MAILBOXES = 100;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const STALE_GUEST_DAYS = 90;
-const MIN_RETENTION_DAYS = 90;
-const LONG_LIVED_CREDENTIAL_DAYS = 730;
+const HIGH_PRIVILEGE_DELEGATED_SCOPE_SET = new Set<string>(HIGH_PRIVILEGE_DELEGATED_SCOPES);
 const SECURITY_DEFAULTS_ENDPOINT = "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy";
 const MESSAGE_RULES_ENDPOINT = "GET /v1.0/users/{id}/mailFolders/inbox/messageRules";
 const MAILBOX_RULES_PERMISSION = "MailboxSettings.Read (application)";
@@ -190,32 +218,12 @@ const PRIVILEGED_ROLE_TEMPLATE_IDS = new Map<string, string>([
   ["b1be1c3e-b65d-4f19-8427-f6fa0d97feb9", "conditional access administrator"],
 ]);
 
-/** guestUserRoleId values, https://learn.microsoft.com/en-us/graph/api/resources/authorizationpolicy?view=graph-rest-1.0 */
-const GUEST_ROLE_SAME_AS_MEMBER = "a0b1b346-4d3e-4e8b-98f8-753987be4970";
-const GUEST_ROLE_LIMITED = "10dae51f-b6af-4016-8d66-8c2a99b929b3";
-const GUEST_ROLE_RESTRICTED = "2af84b1e-32c8-42b7-82bc-daa82404023b";
-
 /** Built-in policy definition IDs, https://learn.microsoft.com/en-us/azure/governance/policy/samples/built-in-policies */
 const MANDATORY_POLICY_DEFINITIONS: Array<{ id: string; name: string }> = [
   { id: "e56962a6-4747-49cd-b67b-bf8b01975c4c", name: "Allowed locations" },
   { id: "871b6d14-10aa-478d-b590-94f262ecfa99", name: "Require a tag on resources" },
   { id: "cccc23c7-8427-4f53-ad12-b6a63eb452b3", name: "Allowed virtual machine size SKUs" },
 ];
-
-const HIGH_PRIVILEGE_DELEGATED_SCOPES = [
-  "directory.readwrite.all",
-  "directory.accessasuser.all",
-  "rolemanagement.readwrite.directory",
-  "application.readwrite.all",
-  "mail.readwrite",
-  "mail.read",
-  "mail.send",
-  "files.readwrite.all",
-  "user.readwrite.all",
-  "group.readwrite.all",
-];
-
-const ADMIN_PORTS = [22, 3389, 3306, 1433];
 
 export interface AzureResolvedConfig {
   tenantId: string;
@@ -355,6 +363,24 @@ export const AZURE_CONTROL_MAPPINGS: Record<number, ControlMapping> = {
   24: { name: "Network Watcher", fedramp: "AU-12, SI-4", cmmc: "AU.L2-3.3.1", soc2: "CC7.2", cis_azure: "6.4, 6.5", pci_dss: "10.2.1", disa_stig: "SRG-APP-000089", irap: "ISM-0580", ismap: "8.1.3" },
   25: { name: "Azure Policy", fedramp: "CM-2, CM-6", cmmc: "CM.L2-3.4.2", soc2: "CC6.1, CC8.1", cis_azure: "n/a", pci_dss: "6.3.1", disa_stig: "SRG-APP-000383", irap: "ISM-1490", ismap: "6.3.2" },
 };
+
+hydrateBatchFrameworkMappings(AZURE_SPEC, Object.fromEntries(AZURE_SPEC.checks.map((check) => {
+  const mapping = AZURE_CONTROL_MAPPINGS[check.controlNumbers[0]];
+  const values = (key: AzureFramework): string[] => {
+    const entry = mapping?.[key];
+    return !entry || entry === "n/a" ? [] : entry.split(",").map((value) => value.trim());
+  };
+  return [check.id, {
+    fedramp: values("fedramp"),
+    cmmc: values("cmmc"),
+    soc2: values("soc2"),
+    cis: values("cis_azure"),
+    pci_dss: values("pci_dss"),
+    disa_stig: values("disa_stig"),
+    irap: values("irap"),
+    ismap: values("ismap"),
+  }];
+})));
 
 function frameworkMappings(control: number): string[] {
   const mapping = AZURE_CONTROL_MAPPINGS[control];
@@ -1294,11 +1320,124 @@ function finding(
   control: number,
   title: string,
   severity: AzureFinding["severity"],
-  status: AzureFindingStatus,
+  _status: AzureFindingStatus,
   summary: string,
   evidence?: JsonRecord,
+  decisionFacts?: Readonly<Record<string, unknown>>,
 ): AzureFinding {
+  const status = evaluateBatchRuntimeCheckVerdict(AZURE_SPEC, id, decisionFacts ?? azureDecisionFacts(id, evidence)) as AzureFindingStatus;
   return { id, title, severity, status, summary, control, evidence, mappings: frameworkMappings(control) };
+}
+
+const AZURE_MANUAL_ONLY_CHECKS = new Set(["AZURE-MON-07", "AZURE-DP-02", "AZURE-DP-07"]);
+
+function evidenceCount(evidence: JsonRecord, key: string): number | null {
+  const entry = evidence[key];
+  return Array.isArray(entry) ? entry.length : asNumber(entry) ?? null;
+}
+
+function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<string, unknown>> {
+  if (AZURE_MANUAL_ONLY_CHECKS.has(id)) return {};
+  const item = evidence ?? {};
+  const readable = item.required_access === undefined;
+  const complete = item.truncated !== true;
+  const inventoryCount = asNumber(item.seen)
+    ?? asNumber(item.users)
+    ?? asNumber(item.guests)
+    ?? asNumber(item.applications)
+    ?? asNumber(item.grants)
+    ?? asNumber(item.total_plans)
+    ?? asNumber(item.diagnostic_settings)
+    ?? asNumber(item.assignments)
+    ?? asNumber(item.network_security_groups)
+    ?? asNumber(item.labels)
+    ?? asNumber(item.vaults)
+    ?? asNumber(item.storage_accounts)
+    ?? null;
+  switch (id) {
+    case "AZURE-ID-01":
+      return { policy_readable: readable, complete, policy_count: asNumber(item.total_policies) ?? null, mfa_policy_count: asNumber(item.mfa_policies) ?? null, security_defaults_readable: item.security_defaults_readable, security_defaults_enabled: item.security_defaults_enabled };
+    case "AZURE-ID-02":
+      return { policy_readable: readable, complete, legacy_block_policy_count: asNumber(item.legacy_auth_block_policies) ?? null, security_defaults_readable: item.security_defaults_readable, security_defaults_enabled: item.security_defaults_enabled };
+    case "AZURE-ID-03": {
+      const users = asNumber(item.users);
+      const withoutMfa = asNumber(item.users_without_mfa);
+      return { readable, complete, inventory_count: users ?? null, without_mfa_count: withoutMfa ?? null, without_mfa_ratio: users !== undefined && users > 0 && withoutMfa !== undefined ? withoutMfa / users : null };
+    }
+    case "AZURE-ID-04":
+      return { readable, complete: item.members_truncated !== true, inventory_count: asNumber(item.activated_roles) ?? null, global_admin_count: asNumber(item.global_administrators) ?? null, privileged_assignment_count: asNumber(item.privileged_role_assignments) ?? null };
+    case "AZURE-ID-05":
+      return { readable, complete, inventory_count: inventoryCount, expired_credential_count: evidenceCount(item, "expired"), expiring_credential_count: evidenceCount(item, "expiring"), missing_expiry_count: asNumber(item.missing_expiry) ?? null, long_lived_credential_count: asNumber(item.long_lived) ?? null };
+    case "AZURE-ID-06": {
+      const eligible = asNumber(item.eligible_assignments);
+      const permanent = asNumber(item.permanent_privileged_assignments);
+      return { readable, complete: true, inventory_count: eligible !== undefined && permanent !== undefined ? eligible + permanent : null, eligible_assignment_count: eligible ?? null, permanent_privileged_count: permanent ?? null };
+    }
+    case "AZURE-ID-07": {
+      const guestRole = asLower(item.guestUserRoleId);
+      const invites = asLower(item.allowInvitesFrom);
+      return { readable, guest_role_id: guestRole ?? null, allow_invites_from: invites ?? null };
+    }
+    case "AZURE-ID-08":
+      return { readable, complete, inventory_count: asNumber(item.guests) ?? null, stale_guest_count: evidenceCount(item, "stale_guests"), unknown_activity_count: asNumber(item.unknown_activity) ?? null };
+    case "AZURE-ID-09":
+    case "AZURE-ID-10":
+      return { readable, complete, inventory_count: evidenceCount(item, "enforcing_policies"), license_present: item.entra_id_p2, enforcing_policy_count: evidenceCount(item, "enforcing_policies") };
+    case "AZURE-ID-11":
+      return { readable, complete, inventory_count: asNumber(item.risky_users) ?? null, high_risk_user_count: asNumber(item.high_risk_users) ?? null };
+    case "AZURE-ID-12":
+      return { readable, complete, inventory_count: asNumber(item.applications) ?? null, expired_credential_count: evidenceCount(item, "expired"), expiring_credential_count: evidenceCount(item, "expiring"), missing_expiry_count: asNumber(item.missing_expiry) ?? null, long_lived_credential_count: asNumber(item.long_lived) ?? null, ownerless_application_count: evidenceCount(item, "ownerless") };
+    case "AZURE-ID-13":
+      return { readable, complete, inventory_count: asNumber(item.grants) ?? null, risky_grant_count: evidenceCount(item, "risky_grants") };
+    case "AZURE-MON-01":
+      return { readable, maximum_score: asNumber(item.max_score) ?? null, score_ratio: asNumber(item.ratio) ?? null };
+    case "AZURE-MON-02":
+      return { readable, complete: true, inventory_count: asNumber(item.directory_audits) ?? null };
+    case "AZURE-MON-03":
+      return { readable, complete: true, inventory_count: asNumber(item.sign_ins) ?? null };
+    case "AZURE-MON-04":
+      return { readable, complete, inventory_count: asNumber(item.total_plans) ?? null, standard_plan_count: asNumber(item.standard_plans) ?? null };
+    case "AZURE-MON-05":
+      return { readable, complete, inventory_count: inventoryCount, effective_setting_count: asNumber(item.effective_settings) ?? null };
+    case "AZURE-MON-06": {
+      const workspaces = asRecords(item.workspaces);
+      return { readable, complete: true, inventory_count: workspaces.length, destination_workspace_count: workspaces.length, linked_workspace_count: workspaces.length, workspace_retention_at_least_minimum_count: workspaces.filter((workspace) => (asNumber(workspace.retentionInDays) ?? 0) >= MIN_RETENTION_DAYS).length };
+    }
+    case "AZURE-SUB-01":
+      return { readable, complete, inventory_count: inventoryCount, matching_assignment_count: evidenceCount(item, "owner_assignments"), warn_maximum: 2 };
+    case "AZURE-SUB-02":
+      return { readable, complete, inventory_count: inventoryCount, matching_assignment_count: evidenceCount(item, "contributor_assignments"), warn_maximum: 5 };
+    case "AZURE-SUB-03":
+      return { readable, complete: true, inventory_count: asNumber(item.security_contacts) ?? null, configured_contact_count: asNumber(item.security_contacts) ?? null };
+    case "AZURE-SUB-04":
+      return { readable, complete: true, inventory_count: asNumber(item.network_watchers) ?? null };
+    case "AZURE-SUB-05":
+      return { readable, complete, inventory_count: inventoryCount, privileged_service_principal_count: evidenceCount(item, "privileged_service_principals") };
+    case "AZURE-DP-01":
+      return { readable, complete, inventory_count: asNumber(item.compliance_policies) ?? null, license_present: item.intune_license ?? null, device_count: asNumber(item.devices) ?? null, device_policy_with_required_settings_count: asNumber(item.compliant_device_ca_policies) ?? null, noncompliant_device_count: asNumber(item.noncompliant_devices) ?? null, unknown_device_count: asNumber(item.unknown_state_devices) ?? null };
+    case "AZURE-DP-03":
+      return { readable, complete, inventory_count: asNumber(item.labels) ?? null, active_sensitivity_record_count: asNumber(item.active_labels) ?? null };
+    case "AZURE-DP-04":
+      return { readable, complete, inventory_count: asNumber(item.vaults) ?? null, missing_protection_count: evidenceCount(item, "missing_protection"), access_policy_vault_count: evidenceCount(item, "access_policy_vaults"), open_network_count: evidenceCount(item, "open_network") };
+    case "AZURE-DP-05":
+      return { readable, complete, inventory_count: asNumber(item.storage_accounts) ?? null, http_allowed_count: evidenceCount(item, "http_allowed"), public_blob_count: evidenceCount(item, "public_blob_access"), public_blob_unset_count: evidenceCount(item, "public_blob_unset"), weak_tls_count: evidenceCount(item, "weak_tls") };
+    case "AZURE-DP-06":
+      return { readable, complete, inventory_count: asNumber(item.seen) ?? null, mailbox_read_count: asNumber(item.mailboxes_read) ?? null, mailbox_unreadable_count: asNumber(item.mailboxes_unreadable) ?? null, forwarding_rule_count: evidenceCount(item, "forwarding_rules") };
+    case "AZURE-DP-08": {
+      const capability = asLower(item.sharingCapability);
+      return { readable, capability_present: capability !== undefined, capability, domain_allowlist: asLower(item.sharingDomainRestrictionMode) === "allowlist", external_resharing: item.isResharingByExternalUsersEnabled === true };
+    }
+    case "AZURE-NP-01":
+      return { readable, complete, inventory_count: asNumber(item.network_security_groups) ?? null, exposed_rule_count: evidenceCount(item, "exposed_rules") };
+    case "AZURE-NP-02":
+      return { readable, complete, inventory_count: asNumber(item.assignments) ?? null, assignment_not_do_not_enforce_count: asNumber(item.enforced) ?? null };
+    case "AZURE-NP-03":
+      return { readable, resource_count_present: item.non_compliant_resources !== null && item.non_compliant_resources !== undefined, policy_count_present: item.non_compliant_policies !== null && item.non_compliant_policies !== undefined, noncompliant_policy_count: asNumber(item.non_compliant_policies) ?? null };
+    case "AZURE-NP-04":
+      return { readable, complete, inventory_count: asNumber(item.network_security_groups) ?? null, covered_nsg_count: asNumber(item.covered_nsgs) ?? null, uncovered_nsg_count: evidenceCount(item, "uncovered_nsgs") };
+    default:
+      throw new Error(`${id} has no Azure decision-fact projection`);
+  }
 }
 
 function describeFailure(result: { error: string; status?: number }): string {
@@ -1597,6 +1736,7 @@ export function resolveAzureConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   commandRunner: AzureCommandRunner = defaultCommandRunner,
 ): AzureResolvedConfig {
+  env = readResolverEnvironment(AZURE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const cloud = resolveAzureCloud(asString(input.authority_host) ?? asString(env.AZURE_AUTHORITY_HOST), {
     graphHost: asString(env.AZURE_GRAPH_HOST),
@@ -2346,7 +2486,7 @@ function credentialSummary(now: Date, records: JsonRecord[], label: (record: Jso
         const entry = { owner: name, credentialType, endDateTime: asString(credential.endDateTime) ?? null, daysRemaining: remaining === undefined ? null : round(remaining) };
         if (remaining === undefined) missingExpiry.push(entry);
         else if (remaining < 0) expired.push(entry);
-        else if (remaining <= 30) expiring.push(entry);
+        else if (remaining <= CREDENTIAL_EXPIRY_WARNING_DAYS) expiring.push(entry);
         const start = parseIsoDate(credential.startDateTime);
         const end = parseIsoDate(credential.endDateTime);
         if (start && end && (end.getTime() - start.getTime()) / DAY_MS > LONG_LIVED_CREDENTIAL_DAYS) longLived.push(entry);
@@ -2441,7 +2581,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
   } else {
     const usersWithoutMfa = registrations.value.items.filter((item) => item.isMfaRegistered !== true);
     const ratio = registrations.value.items.length > 0 ? usersWithoutMfa.length / registrations.value.items.length : 1;
-    const status: AzureFindingStatus = registrations.value.items.length === 0 ? "manual" : usersWithoutMfa.length === 0 ? capForPartial("pass", registrations.value) : ratio <= 0.1 ? "warn" : "fail";
+    const status: AzureFindingStatus = registrations.value.items.length === 0 ? "manual" : usersWithoutMfa.length === 0 ? capForPartial("pass", registrations.value) : ratio <= MFA_UNREGISTERED_WARN_RATIO ? "warn" : "fail";
     findings.push(finding("AZURE-ID-03", 2, "MFA registration coverage", "high", status,
       registrations.value.items.length === 0
         ? "The registration report returned zero users; an empty inventory cannot demonstrate MFA coverage, so this control needs manual confirmation."
@@ -2477,12 +2617,13 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
   } else {
     const status: AzureFindingStatus = privilegedAssignments === 0
       ? "manual"
-      : globalAdmins > 4 || privilegedAssignments > 10 ? "fail" : membersTruncated || roles.value.truncated ? "warn" : privilegedAssignments <= 5 ? "pass" : "warn";
+      : globalAdmins > MAX_GLOBAL_ADMINS || privilegedAssignments > PRIVILEGED_ASSIGNMENT_FAIL_ABOVE ? "fail" : membersTruncated || roles.value.truncated ? "warn" : privilegedAssignments <= PRIVILEGED_ASSIGNMENT_PASS_MAX ? "pass" : "warn";
     findings.push(finding("AZURE-ID-04", 5, "Privileged directory role sprawl", "high", status,
       privilegedAssignments === 0
         ? "Zero privileged role members were returned; every tenant has at least one Global Administrator, so this needs manual confirmation of read access."
         : `The tenant exposes ${globalAdmins} Global Administrators and ${privilegedAssignments} privileged role assignments (CIS recommends 2 to 4 Global Administrators).${membersTruncated ? " Member inventory is partial; verdict capped at warn." : ""}`,
-      { global_administrators: globalAdmins, privileged_role_assignments: privilegedAssignments, activated_roles: roles.value.items.length, members_truncated: membersTruncated }));
+      { global_administrators: globalAdmins, privileged_role_assignments: privilegedAssignments, activated_roles: roles.value.items.length, members_truncated: membersTruncated },
+      { readable: true, complete: !membersTruncated && !roles.value.truncated, inventory_count: roles.value.items.length, global_admin_count: globalAdmins, privileged_assignment_count: privilegedAssignments }));
   }
 
   if (!servicePrincipals.ok) {
@@ -2511,12 +2652,13 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     });
     const status: AzureFindingStatus = eligibilities.value.items.length === 0 && permanentPrivileged.length === 0
       ? "manual"
-      : permanentPrivileged.length > 2 ? "fail" : permanentPrivileged.length > 0 || eligibilities.value.items.length === 0 ? "warn" : capForPartial("pass", eligibilities.value, assignmentSchedules.value);
+      : permanentPrivileged.length > MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS ? "fail" : permanentPrivileged.length > 0 || eligibilities.value.items.length === 0 ? "warn" : capForPartial("pass", eligibilities.value, assignmentSchedules.value);
     findings.push(finding("AZURE-ID-06", 5, "Privileged Identity Management eligibility", "high", status,
       status === "manual"
         ? "Zero eligible and zero permanent privileged schedules were returned; confirm PIM is onboarded before treating this as compliant."
         : `${eligibilities.value.items.length} PIM eligible assignments and ${permanentPrivileged.length} permanent (Assigned, noExpiration) privileged role assignments were found.${partialNote(eligibilities.value, "eligibility schedules")}${partialNote(assignmentSchedules.value, "assignment schedules")}`,
-      { eligible_assignments: eligibilities.value.items.length, permanent_privileged_assignments: permanentPrivileged.length, permanent_examples: permanentPrivileged.slice(0, 10).map((item) => ({ principalId: item.principalId, roleDefinitionId: item.roleDefinitionId })) }));
+      { eligible_assignments: eligibilities.value.items.length, permanent_privileged_assignments: permanentPrivileged.length, permanent_examples: permanentPrivileged.slice(0, 10).map((item) => ({ principalId: item.principalId, roleDefinitionId: item.roleDefinitionId })) },
+      { readable: true, complete: !eligibilities.value.truncated && !assignmentSchedules.value.truncated, inventory_count: eligibilities.value.items.length + permanentPrivileged.length, eligible_assignment_count: eligibilities.value.items.length, permanent_privileged_count: permanentPrivileged.length }));
   }
 
   if (!authorizationPolicy.ok) {
@@ -2574,7 +2716,8 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
       matching.length > 0
         ? `${matching.length} enabled Conditional Access policies act on medium or high ${key} with ${remediationLabel}.${partialNote(policies.value, "Conditional Access policies")}`
         : `No enabled Conditional Access policy enforces ${remediationLabel} at medium or high ${key}${reportOnlyMatching.length > 0 ? ` (${reportOnlyMatching.length} matching policies are report-only)` : ""}.`,
-      { enforcing_policies: matching.map((policy) => policy.displayName), report_only_policies: reportOnlyMatching.length, entra_id_p2: true });
+      { enforcing_policies: matching.map((policy) => policy.displayName), report_only_policies: reportOnlyMatching.length, entra_id_p2: true },
+      { readable: true, complete: !policies.value.truncated, inventory_count: policies.value.items.length, license_present: true, enforcing_policy_count: matching.length });
   };
   findings.push(riskFinding("AZURE-ID-09", 7, "Sign-in risk policy", "signInRiskLevels", ["mfa", "block"], "MFA or block"));
   findings.push(riskFinding("AZURE-ID-10", 8, "User risk policy", "userRiskLevels", ["passwordchange", "block"], "password change or block"));
@@ -2590,7 +2733,8 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
       riskyUsers.value.items.length === 0
         ? `No users are currently atRisk or confirmedCompromised (${riskDetections.value.seen} recent risk detections); an empty risky-user list is compliant by intent.${partialNote(riskDetections.value, "risk detections")}`
         : `${riskyUsers.value.items.length} users are atRisk or confirmedCompromised, ${highRisk.length} at high risk, with ${riskDetections.value.seen} recent risk detections.`,
-      { risky_users: riskyUsers.value.items.length, high_risk_users: highRisk.length, risk_detections: riskDetections.value.seen, ...pageEvidence(riskyUsers.value) }));
+      { risky_users: riskyUsers.value.items.length, high_risk_users: highRisk.length, risk_detections: riskDetections.value.seen, ...pageEvidence(riskyUsers.value) },
+      { readable: true, complete: !riskyUsers.value.truncated && !riskDetections.value.truncated, inventory_count: riskyUsers.value.items.length, high_risk_user_count: highRisk.length }));
   }
 
   if (!applications.ok) {
@@ -2614,7 +2758,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     const risky = grants.value.items.filter((grant) => {
       if (asLower(grant.consentType) !== "allprincipals") return false;
       const scopes = (asString(grant.scope) ?? "").toLowerCase().split(/\s+/);
-      return scopes.some((scope) => HIGH_PRIVILEGE_DELEGATED_SCOPES.includes(scope));
+      return scopes.some((scope) => HIGH_PRIVILEGE_DELEGATED_SCOPE_SET.has(scope));
     });
     const status: AzureFindingStatus = grants.value.items.length === 0 ? "manual" : risky.length > 0 ? "fail" : capForPartial("pass", grants.value);
     findings.push(finding("AZURE-ID-13", 22, "Tenant-wide delegated permission grants", "high", status,
@@ -2680,7 +2824,7 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
     findings.push(manualForError("AZURE-MON-01", 3, "Secure Score posture", "medium", "GET /v1.0/security/secureScores", "SecurityEvents.Read.All", "the Microsoft Secure Score dashboard export", secureScores, AZURE_ENDPOINT_DOCS.secureScores, errors));
   } else {
     findings.push(finding("AZURE-MON-01", 3, "Secure Score posture", "medium",
-      maxScoreValue <= 0 ? "manual" : secureScoreRatio >= 0.75 ? "pass" : secureScoreRatio >= 0.5 ? "warn" : "fail",
+      maxScoreValue <= 0 ? "manual" : secureScoreRatio >= AZURE_SECURE_SCORE_PASS_RATIO ? "pass" : secureScoreRatio >= AZURE_SECURE_SCORE_WARN_RATIO ? "warn" : "fail",
       maxScoreValue > 0
         ? `Current Secure Score is ${currentScoreValue}/${maxScoreValue} (${Math.round(secureScoreRatio * 100)}%).`
         : "Secure Score returned no scored records; collect the Secure Score dashboard manually.",
@@ -2749,7 +2893,8 @@ export async function assessAzureMonitoring(client: MonitoringClient): Promise<A
         : linked.length === 0
           ? "The diagnostic settings reference workspaces outside this subscription; collect their retentionInDays manually."
           : `${compliant.length}/${retention.length} linked Log Analytics workspaces retain data for ${MIN_RETENTION_DAYS}+ days.${partialNote(workspaces.value, "workspaces")}`,
-      { workspaces: retention, minimum_days: MIN_RETENTION_DAYS }));
+      { workspaces: retention, minimum_days: MIN_RETENTION_DAYS },
+      { readable: true, complete: !workspaces.value.truncated, inventory_count: retention.length, destination_workspace_count: workspaceIds.size, linked_workspace_count: linked.length, workspace_retention_at_least_minimum_count: compliant.length }));
   }
 
   findings.push(finding("AZURE-MON-07", 19, "Entra ID audit log export", "medium", "manual",
@@ -2826,10 +2971,11 @@ export async function assessAzureSubscriptionGuardrails(
       noAssignments
         ? "Zero role assignments were returned at subscription scope; every subscription has at least one, so confirm read access manually."
         : `${matches.length} ${label} were visible at subscription scope (${roleAssignments.ok ? roleAssignments.value.seen : 0} assignments inspected).${roleAssignments.ok ? partialNote(roleAssignments.value, "role assignments") : ""}`,
-      { [evidenceKey]: matches.slice(0, 25), ...(roleAssignments.ok ? pageEvidence(roleAssignments.value) : {}) });
+      { [evidenceKey]: matches.slice(0, 25), ...(roleAssignments.ok ? pageEvidence(roleAssignments.value) : {}) },
+      { readable: true, complete: rbacPages.every((page) => !page.truncated), inventory_count: roleAssignments.ok ? roleAssignments.value.items.length : 0, matching_assignment_count: matches.length, warn_maximum: warnMax });
   };
-  findings.push(rbacFinding("AZURE-SUB-01", 17, "Owner assignments at subscription scope", "high", ownerAssignments, 2, "Owner assignments", "owner_assignments"));
-  findings.push(rbacFinding("AZURE-SUB-02", 17, "Contributor assignments at subscription scope", "medium", contributorAssignments, 5, "Contributor assignments", "contributor_assignments"));
+  findings.push(rbacFinding("AZURE-SUB-01", 17, "Owner assignments at subscription scope", "high", ownerAssignments, MAX_OWNER_ASSIGNMENTS, "Owner assignments", "owner_assignments"));
+  findings.push(rbacFinding("AZURE-SUB-02", 17, "Contributor assignments at subscription scope", "medium", contributorAssignments, MAX_CONTRIBUTOR_ASSIGNMENTS, "Contributor assignments", "contributor_assignments"));
 
   if (!securityContacts.ok) {
     findings.push(manualForError("AZURE-SUB-03", 18, "Security contacts configured", "medium", "GET Microsoft.Security/securityContacts", "Security Reader on the subscription", "the Defender for Cloud email notifications page", securityContacts, AZURE_ENDPOINT_DOCS.securityContacts, errors));
@@ -2847,7 +2993,8 @@ export async function assessAzureSubscriptionGuardrails(
       networkWatchers.value.items.length > 0
         ? `${networkWatchers.value.items.length} Network Watcher resources exist across the subscription; NSG flow log coverage is assessed by AZURE-NP-04.${partialNote(networkWatchers.value, "network watchers")}`
         : "No Network Watcher resources exist for the subscription.",
-      { network_watchers: networkWatchers.value.items.length, regions: networkWatchers.value.items.map((item) => item.location).slice(0, 50) }));
+      { network_watchers: networkWatchers.value.items.length, regions: networkWatchers.value.items.map((item) => item.location).slice(0, 50) },
+      { readable: true, complete: !networkWatchers.value.truncated, inventory_count: networkWatchers.value.items.length }));
   }
 
   if (rbacManual) {
@@ -2860,7 +3007,8 @@ export async function assessAzureSubscriptionGuardrails(
         : privilegedServicePrincipals.length > 0
           ? `${privilegedServicePrincipals.length} service principals hold Owner or Contributor at subscription scope.`
           : `No service principal holds Owner or Contributor across ${roleAssignments.ok ? roleAssignments.value.seen : 0} inspected assignments.${roleAssignments.ok ? partialNote(roleAssignments.value, "role assignments") : ""}`,
-      { privileged_service_principals: privilegedServicePrincipals.slice(0, 25) }));
+      { privileged_service_principals: privilegedServicePrincipals.slice(0, 25) },
+      { readable: true, complete: rbacPages.every((page) => !page.truncated), inventory_count: roleAssignments.ok ? roleAssignments.value.items.length : 0, privileged_service_principal_count: privilegedServicePrincipals.length }));
   }
 
   return {
@@ -2924,7 +3072,8 @@ export async function assessAzureDataProtection(
         : devices.value.items.length === 0
           ? "Compliance policies exist but zero managed devices were returned; confirm enrollment before treating this as compliant."
           : `${compliancePolicies.value.items.length} compliance policies, ${nonCompliant.length}/${devices.value.items.length} devices noncompliant/conflict/error, ${unknown.length} with unknown complianceState, ${compliantDevicePolicies.length} enabled Conditional Access policies require a compliant device.${partialNote(devices.value, "managed devices")}`,
-      { compliance_policies: compliancePolicies.value.items.length, devices: devices.value.items.length, noncompliant_devices: nonCompliant.length, unknown_state_devices: unknown.length, compliant_device_ca_policies: compliantDevicePolicies.length, ...pageEvidence(devices.value) }));
+      { compliance_policies: compliancePolicies.value.items.length, devices: devices.value.items.length, noncompliant_devices: nonCompliant.length, unknown_state_devices: unknown.length, compliant_device_ca_policies: compliantDevicePolicies.length, ...pageEvidence(devices.value) },
+      { readable: true, complete: !compliancePolicies.value.truncated && !devices.value.truncated && !policies.value.truncated, inventory_count: compliancePolicies.value.items.length, license_present: true, device_count: devices.value.items.length, device_policy_with_required_settings_count: compliantDevicePolicies.length, noncompliant_device_count: nonCompliant.length, unknown_device_count: unknown.length }));
   }
 
   findings.push(finding("AZURE-DP-02", 10, "Data Loss Prevention policies", "medium", "manual",
@@ -3192,7 +3341,13 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
         : exposed.length > 0
           ? `${exposed.length} inbound Allow rules expose ports ${ADMIN_PORTS.join("/")} to any source across ${nsgs.value.items.length} NSGs.`
           : `No inbound Allow rule exposes ports ${ADMIN_PORTS.join("/")} to any source across ${nsgs.value.items.length} NSGs.${partialNote(nsgs.value, "NSGs")}`,
-      { network_security_groups: nsgs.value.items.length, exposed_rules: exposed.slice(0, 25), admin_ports: ADMIN_PORTS, ...pageEvidence(nsgs.value) }));
+      { network_security_groups: nsgs.value.items.length, exposed_rules: exposed.slice(0, 25), admin_ports: ADMIN_PORTS, ...pageEvidence(nsgs.value) },
+      {
+        readable: true,
+        complete: !nsgs.value.truncated,
+        inventory_count: nsgs.value.items.length,
+        exposed_rule_count: exposed.length,
+      }));
   }
 
   const flowLogPages: AzurePage[] = [];
@@ -3251,7 +3406,8 @@ export async function assessAzureNetworkAndPolicy(client: NetworkPolicyClient): 
         : watchers.value.items.length === 0
           ? `${nsgs.value.items.length} NSGs exist but no Network Watcher resource exists, so no flow log can be enabled.`
           : `${covered}/${nsgs.value.items.length} NSGs have an enabled flow log (${flowLogs.length} flow logs across ${watchers.value.items.length} Network Watchers, ${disabledFlowLogs} disabled or without a target, ${nonNsgTargets} enabled flow logs target other resource types and are not credited to an NSG). Retention policy values are reported as evidence, not judged.${partialNote(nsgs.value, "NSGs")}${partialNote(watchers.value, "network watchers")}${partialNote(flowLogPage, "flow logs")}`,
-      { network_security_groups: nsgs.value.items.length, covered_nsgs: covered, uncovered_nsgs: uncovered.slice(0, 25).map((nsg) => nsg.name ?? nsg.id), network_watchers: watchers.value.items.length, flow_logs: flowLogs.length, disabled_flow_logs: disabledFlowLogs, non_nsg_targets: nonNsgTargets, flow_log_details: details.slice(0, 25), ...pageEvidence(flowLogPage) }));
+      { network_security_groups: nsgs.value.items.length, covered_nsgs: covered, uncovered_nsgs: uncovered.slice(0, 25).map((nsg) => nsg.name ?? nsg.id), network_watchers: watchers.value.items.length, flow_logs: flowLogs.length, disabled_flow_logs: disabledFlowLogs, non_nsg_targets: nonNsgTargets, flow_log_details: details.slice(0, 25), ...pageEvidence(flowLogPage) },
+      { readable: true, complete: pages.every((page) => !page.truncated), inventory_count: nsgs.value.items.length, covered_nsg_count: covered, uncovered_nsg_count: uncovered.length }));
   }
 
   if (!assignments.ok) {
@@ -3608,6 +3764,7 @@ const maxMailboxesParam = Type.Optional(Type.Number({ description: `Maximum memb
 const maxAssignmentsParam = Type.Optional(Type.Number({ description: "Maximum ARM role assignments to sample. Defaults to 500.", default: 500 }));
 
 export function registerAzureTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, AZURE_SPEC);
   pi.registerTool({
     name: "azure_check_access",
     label: "Check Azure audit access",

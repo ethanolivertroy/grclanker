@@ -235,3 +235,128 @@ export const SERVICENOW_AUTH_RESOLVER = {
   ],
   refreshRequest: "POST /oauth_token.do with client_credentials or refresh_token form fields.",
 } as const satisfies ResolverAuthenticationContract;
+
+export const AZURE_AUTH_RESOLVER = {
+  modes: ["Explicit Microsoft Graph and Azure Resource Manager bearer tokens", "Azure CLI token discovery", "OAuth client credentials"],
+  precedence: ["Explicit tool arguments", "AZURE_* environment variables", "Azure CLI", "OAuth client credentials when a token is absent"],
+  environment: [
+    "AZURE_AUTHORITY_HOST",
+    "AZURE_GRAPH_HOST",
+    "AZURE_MANAGEMENT_HOST",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_TENANT_ID",
+    "AZURE_SUBSCRIPTION_ID",
+    "AZURE_GRAPH_TOKEN",
+    "AZURE_MANAGEMENT_TOKEN",
+    "AZURE_ACCESS_TOKEN",
+  ],
+  configLocations: ["Azure CLI account context"],
+  variants: ["Azure public cloud", "Azure US Government", "Azure China"],
+  configFields: [],
+  refreshRequest: "POST /{tenant}/oauth2/v2.0/token using client_credentials independently for Microsoft Graph and Azure Resource Manager scopes.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const GCP_AUTH_RESOLVER = {
+  modes: ["Explicit OAuth access token", "Service-account application default credentials", "Authorized-user application default credentials", "gcloud access token"],
+  precedence: ["Explicit tool arguments", "GCP and GOOGLE_* environment variables", "Application Default Credentials file", "gcloud auth print-access-token"],
+  environment: [
+    "APPDATA",
+    "CLOUDSDK_CONFIG",
+    "GCP_ORGANIZATION_ID",
+    "GCP_ORG_ID",
+    "GCP_ACCESS_TOKEN",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+    "GOOGLE_ACCESS_TOKEN",
+    "GCP_CREDENTIALS_FILE",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GCP_PROJECT_ID",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+  ],
+  configLocations: ["Explicit credentials_file", "GCP_CREDENTIALS_FILE", "GOOGLE_APPLICATION_CREDENTIALS", "Application Default Credentials well-known path"],
+  variants: ["Organization scope", "Project scope", "Service-account JWT bearer exchange", "Authorized-user refresh-token exchange"],
+  configFields: ["type", "client_email", "private_key", "token_uri", "project_id", "client_id", "client_secret", "refresh_token"],
+  refreshRequest: "POST the credential token_uri with a JWT bearer assertion or refresh_token grant.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const OCI_AUTH_RESOLVER = {
+  modes: ["OCI CLI configuration profile"],
+  precedence: ["Explicit tool arguments", "OCI_* environment variables", "Selected OCI CLI profile", "Runtime defaults"],
+  environment: ["HOME", "USERPROFILE", "OCI_CONFIG_FILE", "OCI_CLI_PROFILE", "OCI_REGION", "OCI_TENANCY_OCID", "OCI_COMPARTMENT_OCID"],
+  configLocations: ["~/.oci/config", "Explicit path from config_file or OCI_CONFIG_FILE"],
+  variants: ["Named OCI CLI profile", "Explicit tenancy or compartment scope", "OCI region"],
+  configFields: ["tenancy", "region", "user", "fingerprint", "key_file", "pass_phrase", "security_token_file"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const CLOUDFLARE_AUTH_RESOLVER = {
+  modes: ["Cloudflare API token", "Global API key with account email"],
+  precedence: ["Explicit tool arguments", "CLOUDFLARE_* environment variables"],
+  environment: [
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_API_KEY",
+    "CLOUDFLARE_EMAIL",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_BASE_URL",
+    "CLOUDFLARE_TIMEOUT",
+  ],
+  configLocations: [],
+  variants: ["Explicit account ID", "Single visible account discovery", "Custom same-origin API base URL"],
+  configFields: [],
+} as const satisfies ResolverAuthenticationContract;
+
+export const PALOALTO_AUTH_RESOLVER = {
+  modes: ["Prisma Cloud access key and secret key", "Prisma Cloud Compute token exchange", "PAN-OS API key", "PAN-OS username and password key generation"],
+  precedence: ["Explicit tool arguments", "Palo Alto environment variables", "Palo Alto JSON config file"],
+  environment: [
+    "PALOALTO_CONFIG_FILE",
+    "PRISMA_ACCESS_KEY_ID",
+    "PRISMA_SECRET_KEY",
+    "PRISMA_API_URL",
+    "PRISMA_COMPUTE_URL",
+    "PANOS_HOST",
+    "PANOS_API_KEY",
+    "PANOS_USERNAME",
+    "PANOS_PASSWORD",
+    "PANOS_VERIFY_TLS",
+    "PALOALTO_TIMEOUT",
+  ],
+  configLocations: ["~/.config/grclanker/paloalto.json", "Explicit path from config_file or PALOALTO_CONFIG_FILE"],
+  variants: ["Prisma Cloud CSPM", "Prisma Cloud Compute", "One or more PAN-OS devices", "Per-client PAN-OS TLS verification override"],
+  configFields: [
+    "PRISMA_ACCESS_KEY_ID", "prisma_access_key_id", "PRISMA_SECRET_KEY", "prisma_secret_key",
+    "PRISMA_API_URL", "prisma_api_url", "PRISMA_COMPUTE_URL", "prisma_compute_url",
+    "PANOS_HOST", "panos_hosts", "PANOS_API_KEY", "panos_api_key", "PANOS_USERNAME",
+    "panos_username", "PANOS_PASSWORD", "panos_password", "PANOS_VERIFY_TLS",
+  ],
+  refreshRequest: "POST /login for Prisma Cloud or Prisma Compute; POST /api/?type=keygen for PAN-OS username/password authentication.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const ZSCALER_AUTH_RESOLVER = {
+  modes: ["ZIA legacy API-key obfuscation and session cookie", "ZPA OAuth client credentials"],
+  precedence: ["Explicit tool arguments", "Zscaler environment variables", "Zscaler YAML config file"],
+  environment: [
+    "ZSCALER_CONFIG_FILE",
+    "ZIA_CLOUD",
+    "ZIA_BASE_URL",
+    "ZIA_API_KEY",
+    "ZIA_USERNAME",
+    "ZIA_PASSWORD",
+    "ZPA_CLOUD",
+    "ZPA_BASE_URL",
+    "ZPA_CLIENT_ID",
+    "ZPA_CLIENT_SECRET",
+    "ZPA_CUSTOMER_ID",
+    "ZSCALER_CLIENT_ID",
+    "ZSCALER_CLIENT_SECRET",
+    "ZDX_CLIENT_ID",
+    "ZDX_CLIENT_SECRET",
+    "ZSCALER_TIMEOUT",
+    "ZSCALER_MAX_RETRIES",
+  ],
+  configLocations: ["~/.zscaler/zscaler.yaml", "Explicit path from config_file or ZSCALER_CONFIG_FILE"],
+  variants: ["ZIA commercial, beta, government, and tenant clouds", "ZPA production, beta, government, and government-US clouds"],
+  configFields: ["zia.client", "zpa.client", "zscaler.client"],
+  refreshRequest: "POST /authenticatedSession for ZIA; POST /signin for ZPA OAuth client credentials.",
+} as const satisfies ResolverAuthenticationContract;

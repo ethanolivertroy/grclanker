@@ -54,8 +54,16 @@ import {
   xmlText,
   xmlToJson,
 } from "../dist/extensions/grc-tools/paloalto.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC } from "../dist/extensions/grc-tools/paloalto.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const noSleep = async () => {};
 
@@ -334,8 +342,8 @@ function computeSnapshot(overrides = {}) {
     images: good
       ? [{ id: "sha256:2", scanTime: "2026-09-01T00:00:00Z", repoTag: { repo: "app" }, vulnerabilityDistribution: { critical: 0, high: 2, medium: 4, low: 1, total: 7 } }]
       : [],
-    vulnerabilityStats: good ? documentedVulnerabilityStats({ critical: 0, high: 3 }) : documentedVulnerabilityStats({ critical: 12, high: 30 }),
-    complianceStats: good ? documentedComplianceStats({ failed: 3, total: 100 }) : documentedComplianceStats({ failed: 0, total: 0 }),
+    vulnerabilityStats: overrides.vulnerabilityStats ?? (good ? documentedVulnerabilityStats({ critical: 0, high: 3 }) : documentedVulnerabilityStats({ critical: 12, high: 30 })),
+    complianceStats: overrides.complianceStats ?? (good ? documentedComplianceStats({ failed: 3, total: 100 }) : documentedComplianceStats({ failed: 0, total: 0 })),
     cloudDiscovery: good ? [{ provider: "aws", serviceType: "eks", total: 3, defended: 3 }] : [],
     ciScans: good ? [{ time: "2026-09-01T00:00:00Z", pass: true }] : [],
     failed: overrides.failed ?? [],
@@ -402,6 +410,112 @@ function prismaSnapshot(overrides = {}) {
     errors: overrides.errors ?? [],
   };
 }
+
+const PALOALTO_SOURCE_INPUTS = {
+  "prisma-compliance-posture": ["cspm", "compliance posture"],
+  "prisma-alert-rules": ["cspm", "alert rules"],
+  "prisma-open-alerts": ["cspm", "open alerts"],
+  "prisma-policies": ["cspm", "policies"],
+  "prisma-cloud-accounts": ["cspm", "cloud accounts"],
+  "prisma-account-groups": ["cspm", "account groups"],
+  "prisma-user-roles": ["cspm", "user roles"],
+  "prisma-integrations": ["cspm", "integrations"],
+  "compute-vulnerability-image-policy": ["compute", "vulnerability image policy"],
+  "compute-images": ["compute", "images"],
+  "compute-vulnerability-stats": ["compute", "vulnerability stats"],
+  "compute-compliance-host-policy": ["compute", "compliance host policy"],
+  "compute-compliance-container-policy": ["compute", "compliance container policy"],
+  "compute-compliance-stats": ["compute", "compliance stats"],
+  "compute-defenders": ["compute", "defenders"],
+  "compute-runtime-container-policy": ["compute", "runtime container policy"],
+  "compute-registry-settings": ["compute", "registry settings"],
+  "compute-registry-scans": ["compute", "registry scans"],
+  "compute-cloud-discovery": ["compute", "cloud discovery"],
+  "compute-ci-scans": ["compute", "ci scans"],
+  "panos-policy-config": ["panos", "/vsys"],
+  "panos-zone-config": ["panos", "/network"],
+  "panos-device-config": ["panos", "/deviceconfig"],
+  "panos-globalprotect-config": ["panos", "/vsys"],
+  "panos-system-info": ["panos-system", "show system info"],
+  "panos-ha-state": ["panos-ha", "ha"],
+};
+
+function assessPaloaltoSnapshots(prisma, panos) {
+  if (prisma) assessPrismaCloudPosture(prisma);
+  assessPrismaCompute(prisma ?? undefined);
+  assessPanosFirewallPolicy(panos);
+  assessPanosThreatPrevention(panos);
+  assessDataLossPrevention(prisma ?? undefined, panos);
+  assessAdminAccess(prisma ?? undefined, panos);
+  assessLogging(prisma ?? undefined, panos);
+  assessPanosDeviceHardening(panos);
+}
+
+function paloaltoFactsByCheck(captures) {
+  const facts = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, PALOALTO_SPEC.identity.slug);
+    for (const [id, values] of capture.checks) facts.set(id, values);
+  }
+  return facts;
+}
+
+async function capturePaloaltoCompleteness(prisma = prismaSnapshot(), panos = [panosSnapshot()]) {
+  const { captures } = await captureBatchDecisionFacts(() => assessPaloaltoSnapshots(prisma, panos));
+  return paloaltoFactsByCheck(captures);
+}
+
+test("all 25 Palo Alto checks replay every declared configured-source failure mode and product absence", async () => {
+  const baseline = await capturePaloaltoCompleteness();
+  assert.equal(baseline.size, 25);
+  for (const check of PALOALTO_SPEC.checks) {
+    assert.equal(baseline.get(check.id)?.evidence_complete, true, `${check.id}: baseline complete`);
+  }
+
+  const modes = ["truncated", "error", "denied", "not-collected", "missing-required-field"];
+  let replays = 0;
+  for (const [checkId, sources] of Object.entries(PALOALTO_COMPLETENESS_SOURCES)) {
+    for (const source of sources) {
+      const [kind, runtimeName] = PALOALTO_SOURCE_INPUTS[source.surfaceId] ?? [];
+      assert.ok(kind && runtimeName, `${checkId}: fixture mapping for ${source.surfaceId}`);
+      for (const mode of modes) {
+        const prisma = prismaSnapshot();
+        const panos = [panosSnapshot()];
+        if (kind === "cspm") {
+          if (mode === "truncated" && runtimeName === "open alerts") prisma.alertsTruncated = true;
+          if (["error", "denied", "not-collected", "missing-required-field"].includes(mode)) prisma.failed = [runtimeName];
+        } else if (kind === "compute") {
+          if (mode === "truncated") prisma.compute.truncated = [runtimeName];
+          if (["error", "denied", "not-collected", "missing-required-field"].includes(mode)) prisma.compute.failed = [runtimeName];
+        } else if (kind === "panos-ha") {
+          if (["error", "denied", "not-collected"].includes(mode)) panos[0].haStateFailed = true;
+        } else if (kind === "panos-system") {
+          if (["error", "denied", "not-collected"].includes(mode)) {
+            panos[0].reachable = false;
+            panos[0].systemInfo = {};
+          }
+        } else if (["error", "denied", "not-collected"].includes(mode)) {
+          panos[0].failedXpaths = [runtimeName];
+        }
+        const facts = await capturePaloaltoCompleteness(prisma, panos);
+        assert.equal(
+          facts.get(checkId)?.evidence_complete,
+          source.falseWhen.includes(mode) ? false : true,
+          `${checkId}/${source.surfaceId}/${mode}`,
+        );
+        replays += 1;
+      }
+    }
+  }
+  assert.equal(replays, 280);
+
+  const panosOnly = await capturePaloaltoCompleteness(null, [panosSnapshot()]);
+  const prismaOnly = await capturePaloaltoCompleteness(prismaSnapshot(), []);
+  for (const id of ["PA-19", "PA-20", "PA-21"]) {
+    assert.equal(panosOnly.get(id)?.evidence_complete, true, `${id}: CSPM unconfigured is omitted`);
+    assert.equal(prismaOnly.get(id)?.evidence_complete, true, `${id}: PAN-OS unconfigured is omitted`);
+  }
+});
 
 function byId(findings, id) {
   return findings.find((item) => item.id === id);
@@ -4549,4 +4663,81 @@ test("review fix 5: PA-SW-01 maps to control 23 and the unified matrix has exact
   const supplementaryRows = controlColumn(supplementarySection);
   assert.deepEqual(supplementaryRows.map((cells) => cells[1]).sort(), ["PA-HA-01", "PA-SW-01"]);
   assert.ok(supplementaryRows.every((cells) => cells[2] === "23"));
+});
+
+test("byte differential fixtures: Palo Alto assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture(
+    "paloalto",
+    "representative",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ partial: true }))),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "denied",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ denyAll: true }))),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "missing-null",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ emptyAll: true }))),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "partial",
+    await runAllAssessments(createPaloaltoClients(twoDeviceConfig(), mockedFetch({ partial: true }))),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "compliant",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch())),
+  );
+
+  const complianceAt = (passedResources, minCompliancePassRate = 90) => {
+    const boundarySnapshot = prismaSnapshot();
+    boundarySnapshot.posture = {
+      summary: { passedResources, failedResources: 100 - passedResources, totalResources: 100 },
+      complianceDetails: [{ name: "CIS v1.4", passedResources, failedResources: 100 - passedResources }],
+    };
+    return assessPrismaCloudPosture(boundarySnapshot, { minCompliancePassRate });
+  };
+  const administratorCountAt = (count, maxSuperusers = 3) => {
+    const snapshot = panosSnapshot();
+    snapshot.config[snapshot.config.length - 1] = parseXml(
+      `<mgt-config><users>${Array.from({ length: count }, (_, index) => (
+        `<entry name="admin-${index}"><permissions><role-based><superuser>yes</superuser></role-based></permissions><authentication-profile>mfa-radius</authentication-profile></entry>`
+      )).join("")}</users><password-complexity><enabled>yes</enabled></password-complexity></mgt-config>`,
+    );
+    return assessAdminAccess(prismaSnapshot(), [snapshot], { maxSuperusers });
+  };
+  const superuserBoundaries = [2, 3, 4].map((count) => administratorCountAt(count));
+  const superuserOverrideBoundaries = [4, 5, 6].map((count) => administratorCountAt(count, 5));
+  const criticalCveBoundaries = [0, 1].map((critical) => assessPrismaCompute(computeSnapshot({
+    vulnerabilityStats: documentedVulnerabilityStats({ critical, high: 0 }),
+  })));
+  const hostComplianceBoundaries = [89, 90, 91].map((passRate) => assessPrismaCompute(computeSnapshot({
+    complianceStats: documentedComplianceStats({ failed: 100 - passRate, total: 100 }),
+  })));
+  const complianceRateBoundaries = [69, 70, 89, 90, 91].map(complianceAt);
+  const complianceRateOverrideEighty = [59, 60, 79, 80, 81].map((passRate) => complianceAt(passRate, 80));
+  assert.equal(
+    complianceRateBoundaries.length + complianceRateOverrideEighty.length
+      + superuserBoundaries.length + superuserOverrideBoundaries.length
+      + criticalCveBoundaries.length + hostComplianceBoundaries.length,
+    21,
+  );
+  writeByteDifferentialFixture("paloalto", "boundary", {
+    complianceRate: complianceRateBoundaries,
+    complianceRateOverrideEighty,
+    criticalCves: criticalCveBoundaries,
+    hostComplianceRate: hostComplianceBoundaries,
+    superusers: superuserBoundaries,
+    superusersOverrideFive: superuserOverrideBoundaries,
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("paloalto");
+  const exported = await exportPaloaltoAuditBundle(
+    createPaloaltoClients(bothProductsConfig(), mockedFetch()),
+    exportRoot,
+  );
+  writeByteDifferentialFixture("paloalto", "export", snapshotExportBundle(exported));
 });

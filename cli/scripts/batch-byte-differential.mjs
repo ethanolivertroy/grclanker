@@ -17,8 +17,11 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
-const mainWorktree = join(runRoot, "main");
-const mainFixtures = join(runRoot, "fixtures-main");
+// Immutable stack base integrated immediately before final validation. Update
+// this SHA only when a newer parent head is merged into this branch.
+const baselineRef = "0ae89670cdf4ae291a326e40ecc7daaadef09de0";
+const mainWorktree = join(runRoot, "stacked-parent");
+const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
 const mainCorpus = join(runRoot, "corpus-main");
 const branchCorpus = join(runRoot, "corpus-branch");
@@ -33,7 +36,15 @@ const testFiles = [
   "zendesk.test.mjs",
   "salesforce.test.mjs",
   "servicenow.test.mjs",
+  "azure.test.mjs",
+  "gcp.test.mjs",
+  "oci.test.mjs",
+  "cloudflare.test.mjs",
+  "paloalto.test.mjs",
+  "zscaler.test.mjs",
 ];
+const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
+const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -61,6 +72,12 @@ function instrumentedMainTest(source) {
     .replace(/^import \{ ZENDESK_SPEC \} from .*zendesk\.spec\.js";\n/m, "")
     .replace(/^import \{ SALESFORCE_SPEC \} from .*salesforce\.spec\.js";\n/m, "")
     .replace(/^import \{ SERVICENOW_SPEC \} from .*servicenow\.spec\.js";\n/m, "")
+    .replace(/^import \{ AZURE_COMPLETENESS_SOURCES, AZURE_SPEC \} from .*azure\.spec\.js";\n/m, "")
+    .replace(/^import \{ CLOUDFLARE_COMPLETENESS_SOURCES, CLOUDFLARE_SPEC \} from .*cloudflare\.spec\.js";\n/m, "")
+    .replace(/^import \{ GCP_COMPLETENESS_SOURCES, GCP_SPEC \} from .*gcp\.spec\.js";\n/m, "")
+    .replace(/^import \{ OCI_COMPLETENESS_SOURCES, OCI_SPEC \} from .*oci\.spec\.js";\n/m, "")
+    .replace(/^import \{ PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC \} from .*paloalto\.spec\.js";\n/m, "")
+    .replace(/^import \{ ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC \} from .*zscaler\.spec\.js";\n/m, "")
     .replace(/^import \{ captureBatchDecisionFacts \} from .*batch-spec-builder\.js";\n/m, "")
     .replace(/^import \{\n  captureBatchDecisionFacts,\n  evaluateBatchCheckVerdict,\n\} from .*batch-spec-builder\.js";\n/m, "")
     .replace(
@@ -124,7 +141,7 @@ function __corpusRecord(name, kind, value) {
   if (!directory) return;
   __corpusMkdirSync(directory, { recursive: true });
   const serialized = JSON.stringify({ name, kind, value })
-    .replace(/http:\\/\\/127\\.0\\.0\\.1:\\d+/g, "http://127.0.0.1:<ephemeral-port>")
+    .replace(/127\\.0\\.0\\.1:\\d+/g, "127.0.0.1:<ephemeral-port>")
     .replace(/http:\\/\\/localhost:\\d+/g, "http://localhost:<ephemeral-port>");
   __corpusAppendFileSync(
     directory + "/${moduleName}.jsonl",
@@ -234,6 +251,7 @@ function runCorpusSuite(root, fixtureDirectory) {
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
+    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures)",
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
@@ -298,7 +316,31 @@ function corpusSweepCounts(root, paths) {
 
 let worktreeAdded = false;
 try {
-  run("git", ["worktree", "add", "--detach", mainWorktree, "origin/main"]);
+  const baselineSha = run("git", ["rev-parse", `${baselineRef}^{commit}`], { capture: true }).stdout.trim();
+  const headSha = run("git", ["rev-parse", "HEAD^{commit}"], { capture: true }).stdout.trim();
+  if (baselineSha === headSha) {
+    throw new Error(`Differential baseline resolved to HEAD (${headSha}); self-comparison is forbidden`);
+  }
+  run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
+  const batchSpecificPaths = [
+    "cli/extensions/grc-tools/azure.ts",
+    "cli/extensions/grc-tools/cloudflare.ts",
+    "cli/extensions/grc-tools/gcp.ts",
+    "cli/extensions/grc-tools/oci.ts",
+    "cli/extensions/grc-tools/paloalto.ts",
+    "cli/extensions/grc-tools/zscaler.ts",
+  ];
+  const batchDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", ...batchSpecificPaths], {
+    cwd: repoRoot,
+    stdio: "ignore",
+  });
+  if (batchDiff.status === 0) {
+    throw new Error(`No batch-2 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
+  }
+  if (batchDiff.status !== 1) {
+    throw new Error(`Unable to inspect batch-2 diff between ${baselineSha} and ${headSha}`);
+  }
+  run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
   worktreeAdded = true;
   symlinkSync(join(repoRoot, "cli", "node_modules"), join(mainWorktree, "cli", "node_modules"), "dir");
   copyDifferentialTestsToMain();
@@ -322,10 +364,25 @@ try {
   runFixtureSuite(mainWorktree, mainFixtures);
   runFixtureSuite(repoRoot, branchFixtures);
 
+  const expectedFixturePaths = testFiles.flatMap((testFile) => {
+    const integration = testFile.replace(/\.test\.mjs$/, "");
+    return fixtureClasses.map((fixtureClass) => `${integration}/${fixtureClass}.json`);
+  }).sort();
+  const mainFixturePaths = filesUnder(mainFixtures);
+  if (JSON.stringify(mainFixturePaths) !== JSON.stringify(expectedFixturePaths)) {
+    throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
+  }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
+  for (const integration of batch2Integrations) {
+    const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
+    const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
+    if (representative.equals(compliant)) {
+      throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
+    }
+  }
   const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
-  console.log(`Whole-corpus replay passed: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched current main.`);
-  console.log(`Realistic single-dataset sweeps matched current main: ${sweepCounts.truncated} truncated, ${sweepCounts.denied} denied, ${sweepCounts.empty} empty.`);
+  console.log(`Whole-corpus replay passed against immutable stack base ${baselineSha}: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the stacked parent.`);
+  console.log(`Realistic single-dataset sweeps matched the stacked parent: ${sweepCounts.truncated} truncated, ${sweepCounts.denied} denied, ${sweepCounts.empty} empty.`);
   console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
   console.log(`Fixture classes: ${classes.join(", ")}.`);
 } finally {

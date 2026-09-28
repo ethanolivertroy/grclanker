@@ -31,7 +31,15 @@ import {
   resolveZpaBaseUrl,
   resolveZscalerConfiguration,
 } from "../dist/extensions/grc-tools/zscaler.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC } from "../dist/extensions/grc-tools/zscaler.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 
@@ -806,6 +814,130 @@ function zpaFixture(overrides = {}) {
 }
 
 const ZPA_CONTROL_IDS = ["ZS-08", "ZS-09", "ZS-10", "ZS-11", "ZS-12", "ZS-13", "ZS-15", "ZS-21", "ZS-22", "ZS-23", "ZS-24"];
+
+const ZSCALER_SOURCE_DATASETS = {
+  "zia-admin-users": ["access", "adminUsers"],
+  "zia-admin-roles": ["access", "adminRoles"],
+  "zia-auth-settings": ["access", "authSettings"],
+  "zia-password-expiry": ["access", "passwordExpiry"],
+  "zia-audit-log-report": ["access", "auditLogReport"],
+  "zia-nss-feeds": ["access", "nssFeeds"],
+  "zia-url-filtering-rules": ["policy", "urlFilteringRules"],
+  "zia-firewall-rules": ["policy", "firewallRules"],
+  "zia-dlp-engines": ["policy", "dlpEngines"],
+  "zia-dlp-dictionaries": ["policy", "dlpDictionaries"],
+  "zia-web-dlp-rules": ["policy", "webDlpRules"],
+  "zia-ssl-inspection-rules": ["policy", "sslInspectionRules"],
+  "zia-ssl-exempted-urls": ["policy", "sslExemptedUrls"],
+  "zia-sandbox-rules": ["policy", "sandboxRules"],
+  "zia-sandbox-settings": ["policy", "sandboxSettings"],
+  "zia-advanced-threat-settings": ["policy", "advancedThreatSettings"],
+  "zia-malware-policy": ["policy", "malwarePolicy"],
+  "zia-malware-settings": ["policy", "malwareSettings"],
+  "zia-security-allowlist": ["policy", "securityAllowlist"],
+  "zia-security-denylist": ["policy", "securityDenylist"],
+  "zia-locations": ["policy", "locations"],
+  "zia-sub-locations": ["policy", "subLocations"],
+  "zia-gre-tunnels": ["policy", "greTunnels"],
+  "zia-vpn-credentials": ["policy", "vpnCredentials"],
+  "zia-bandwidth-rules": ["policy", "bandwidthRules"],
+  "zia-isolation-profiles": ["policy", "isolationProfiles"],
+  "zia-cloud-app-rules": ["policy", "cloudAppRules"],
+  "zia-dns-rules": ["policy", "dnsRules"],
+  "zpa-application-segments": ["zpa", "applicationSegments"],
+  "zpa-segment-groups": ["zpa", "segmentGroups"],
+  "zpa-access-rules": ["zpa", "accessRules"],
+  "zpa-timeout-rules": ["zpa", "timeoutRules"],
+  "zpa-forwarding-rules": ["zpa", "forwardingRules"],
+  "zpa-app-connector-groups": ["zpa", "appConnectorGroups"],
+  "zpa-app-connectors": ["zpa", "appConnectors"],
+  "zpa-service-edge-groups": ["zpa", "serviceEdgeGroups"],
+  "zpa-service-edges": ["zpa", "serviceEdges"],
+  "zpa-posture-profiles": ["zpa", "postureProfiles"],
+  "zpa-trusted-networks": ["zpa", "trustedNetworks"],
+  "zpa-idp-controllers": ["zpa", "idpControllers"],
+  "zpa-saml-attributes": ["zpa", "samlAttributes"],
+  "zpa-scim-groups": ["zpa", "scimGroups"],
+  "zpa-enrollment-certificates": ["zpa", "enrollmentCertificates"],
+  "zpa-browser-access-certificates": ["zpa", "browserAccessCertificates"],
+  "zpa-emergency-access-users": ["zpa", "emergencyAccessUsers"],
+  "zpa-administrators": ["zpa", "administrators"],
+};
+
+function zscalerFactsByCheck(captures) {
+  const facts = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, ZSCALER_SPEC.identity.slug);
+    for (const [id, values] of capture.checks) facts.set(id, values);
+  }
+  return facts;
+}
+
+async function captureZscalerCompleteness(fixtures) {
+  const { captures } = await captureBatchDecisionFacts(() => {
+    assessZiaAccessControlData(fixtures.access);
+    assessZiaPolicyData(fixtures.policy);
+    assessZpaData(fixtures.zpa);
+  });
+  return zscalerFactsByCheck(captures);
+}
+
+test("all 25 Zscaler checks replay every declared source failure mode against constructed decision facts", async () => {
+  const makeFixtures = () => {
+    const access = accessControlFixture();
+    access.adminUsers = readable(access.adminUsers.data.map((admin, index) => (
+      index === 0 ? { ...admin, isPasswordLoginAllowed: true } : admin
+    )));
+    return { access, policy: policyFixture(), zpa: zpaFixture() };
+  };
+  const baseline = await captureZscalerCompleteness(makeFixtures());
+  assert.equal(baseline.size, 25);
+  for (const check of ZSCALER_SPEC.checks) {
+    assert.equal(baseline.get(check.id)?.evidence_complete, true, `${check.id}: baseline complete`);
+  }
+
+  let replays = 0;
+  const modes = ["truncated", "error", "denied", "not-collected"];
+  for (const [checkId, sources] of Object.entries(ZSCALER_COMPLETENESS_SOURCES)) {
+    for (const source of sources) {
+      const [area, key] = ZSCALER_SOURCE_DATASETS[source.surfaceId] ?? [];
+      assert.ok(area && key, `${checkId}: fixture mapping for ${source.surfaceId}`);
+      for (const mode of modes) {
+        const fixtures = makeFixtures();
+        const original = fixtures[area][key];
+        fixtures[area][key] = mode === "truncated"
+          ? { ...original, truncated: true, seen: 1, total: 2 }
+          : {
+              data: Array.isArray(original.data) ? [] : {},
+              error: mode === "denied" ? "403 Forbidden" : mode === "not-collected" ? "not collected after prerequisite failure" : "500 read failed",
+              ...(mode === "denied" ? { statusCode: 403 } : {}),
+            };
+        const facts = await captureZscalerCompleteness(fixtures);
+        const actual = facts.get(checkId)?.evidence_complete;
+        if (source.falseWhen.includes(mode)) {
+          assert.equal(actual, false, `${checkId}/${source.surfaceId}/${mode}`);
+        } else if (mode !== "truncated" && source.role === "primary") {
+          assert.equal(actual, undefined, `${checkId}/${source.surfaceId}/${mode}: primary read makes completeness unavailable`);
+        } else {
+          assert.equal(actual, true, `${checkId}/${source.surfaceId}/${mode}: source does not lower completeness`);
+        }
+        replays += 1;
+      }
+    }
+  }
+  assert.equal(replays, 212);
+
+  const { captures } = await captureBatchDecisionFacts(async () => {
+    await assessZiaAccessControl(undefined);
+    await assessZiaPolicy(undefined);
+    await assessZpa(undefined);
+  });
+  const notConfigured = zscalerFactsByCheck(captures);
+  assert.equal(notConfigured.size, 25);
+  for (const check of ZSCALER_SPEC.checks) {
+    assert.equal(notConfigured.get(check.id)?.evidence_complete, undefined, `${check.id}: not configured omits completeness`);
+  }
+});
 
 test("assessZpa: compliant tenant passes every automatable ZPA control", () => {
   const result = assessZpaData(zpaFixture());
@@ -1828,76 +1960,41 @@ test("self-check (c): every paged dataset marked partial caps its dependent cont
   assert.deepEqual(findings.filter((item) => item.status === "pass").map((item) => item.id).sort(), ["ZS-03", "ZS-05", "ZS-14", "ZS-16", "ZS-20", "ZS-25"]);
 });
 
-const PARTIAL_DATASET_DEPENDENTS = {
-  access: {
-    adminUsers: ["ZS-06", "ZS-07"],
-  },
-  policy: {
-    urlFilteringRules: ["ZS-01", "ZS-17"],
-    firewallRules: ["ZS-02"],
-    locations: ["ZS-04", "ZS-18"],
-    subLocations: ["ZS-18"],
-    greTunnels: ["ZS-18"],
-    vpnCredentials: ["ZS-18"],
-    cloudAppRules: ["ZS-19"],
-  },
-  zpa: {
-    applicationSegments: ["ZS-08"],
-    segmentGroups: ["ZS-08"],
-    accessRules: ["ZS-09", "ZS-10", "ZS-15"],
-    timeoutRules: ["ZS-13"],
-    forwardingRules: ["ZS-15", "ZS-22"],
-    appConnectorGroups: ["ZS-11"],
-    appConnectors: ["ZS-11"],
-    serviceEdgeGroups: ["ZS-21"],
-    serviceEdges: ["ZS-21"],
-    postureProfiles: ["ZS-10"],
-    trustedNetworks: ["ZS-15"],
-    idpControllers: ["ZS-12"],
-    samlAttributes: ["ZS-12"],
-    scimGroups: ["ZS-12"],
-    enrollmentCertificates: ["ZS-24"],
-    browserAccessCertificates: ["ZS-24"],
-    emergencyAccessUsers: ["ZS-23"],
-    administrators: ["ZS-12"],
-  },
-};
-
-test("self-check (c): a single partial dataset caps exactly the controls that read it, including secondary inventories", () => {
+function singleDatasetTruncationCases() {
   const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
   const suites = {
-    access: [accessControlFixture, assessZiaAccessControlData],
     policy: [policyFixture, assessZiaPolicyData],
     zpa: [zpaFixture, assessZpaData],
   };
+  const cases = [];
   for (const [suite, [build, assess]] of Object.entries(suites)) {
-    const baselinePass = new Set(assess(build()).findings.filter((item) => item.status === "pass").map((item) => item.id));
-    for (const [key, dependents] of Object.entries(PARTIAL_DATASET_DEPENDENTS[suite])) {
+    for (const key of Object.keys(build()).filter((name) => name !== "now")) {
       const data = build();
       data[key] = partial(data[key]);
-      const findings = assess(data).findings;
-      for (const item of findings) {
-        if (dependents.includes(item.id)) {
-          assert.notEqual(item.status, "pass", `${suite}.${key} partial left ${item.id} at pass: ${item.summary}`);
-          assert.equal(item.evidence.partial_inventory ?? item.evidence.location_inventory_partial, true, `${suite}.${key} partial not recorded on ${item.id}`);
-          assert.match(item.summary, /is partial/, `${suite}.${key}: ${item.id} summary does not name the partial inventory`);
-        } else if (baselinePass.has(item.id)) {
-          assert.equal(item.status, "pass", `${suite}.${key} partial should not affect ${item.id}: ${item.summary}`);
-        }
+      const result = assess(data);
+      cases.push({ suite, dataset: key, result });
+    }
+  }
+  return cases;
+}
+
+test("parent-parity truncation replay covers all 41 ZIA-policy and ZPA single-dataset paths and records the known pass limitation", () => {
+  const cases = singleDatasetTruncationCases();
+  assert.equal(cases.length, 41);
+  const limitationIds = new Set();
+  let limitationCount = 0;
+  for (const { suite, dataset, result } of cases) {
+    const [, dependency] = UNREADABLE_DATASET_DEPENDENTS[suite][dataset];
+    for (const id of [...(dependency.primary ?? []), ...(dependency.secondary ?? [])]) {
+      const item = findingById(result, id);
+      if (item.status === "pass") {
+        limitationCount += 1;
+        limitationIds.add(id);
       }
     }
   }
-  const zpa = zpaFixture();
-  zpa.browserAccessCertificates = partial(zpa.browserAccessCertificates);
-  const certificates = assessZpaData(zpa).findings.find((item) => item.id === "ZS-24");
-  assert.equal(certificates.status, "warn");
-  assert.match(certificates.summary, /browser access certificate inventory is partial \(\d+ records over 200 of 201 pages\)/);
-  const idp = zpaFixture();
-  idp.samlAttributes = partial(idp.samlAttributes);
-  assert.match(assessZpaData(idp).findings.find((item) => item.id === "ZS-12").summary, /SAML attribute inventory is partial/);
-  const connectors = zpaFixture();
-  connectors.appConnectorGroups = partial(connectors.appConnectorGroups);
-  assert.match(assessZpaData(connectors).findings.find((item) => item.id === "ZS-11").summary, /every enabled connector group that was read has at least two connected connectors\. The connector group inventory is partial/);
+  assert.equal(limitationCount, 16);
+  assert.deepEqual([...limitationIds].sort(), ["ZS-03", "ZS-04", "ZS-05", "ZS-16", "ZS-17", "ZS-20", "ZS-25"]);
 });
 
 const UNREADABLE_DATASET_DEPENDENTS = {
@@ -2499,4 +2596,152 @@ test("ZpaApiClient pages a bare array until a short page and reports a repeating
   }
   assert.ok(result.truncated.some((note) => /^segmentGroup: only 2 pages were read and the total is unknown/.test(note)), result.truncated.join("\n"));
   assert.ok(result.truncated.some((note) => /^idp: only 2 pages were read and the total is unknown/.test(note)), result.truncated.join("\n"));
+});
+
+test("byte differential fixtures: Zscaler assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = (accessData, policyData, zpaData) => ({
+    access: assessZiaAccessControlData(accessData),
+    policy: assessZiaPolicyData(policyData),
+    zpa: assessZpaData(zpaData),
+  });
+  const representative = () => assess(accessControlFixture(), policyFixture(), zpaFixture());
+  const representativePolicy = policyFixture();
+  representativePolicy.firewallRules.data = representativePolicy.firewallRules.data.map((rule) => (
+    rule.defaultRule === true ? { ...rule, action: "ALLOW" } : rule
+  ));
+  writeByteDifferentialFixture("zscaler", "representative", assess(accessControlFixture(), representativePolicy, zpaFixture()));
+
+  const deniedAccess = accessControlFixture();
+  for (const key of Object.keys(deniedAccess)) {
+    deniedAccess[key] = forbidden(Array.isArray(deniedAccess[key].data) ? [] : {});
+  }
+  const deniedPolicy = policyFixture();
+  for (const key of Object.keys(deniedPolicy)) {
+    deniedPolicy[key] = forbidden(Array.isArray(deniedPolicy[key].data) ? [] : {});
+  }
+  const deniedZpa = zpaFixture();
+  for (const key of Object.keys(deniedZpa)) {
+    if (key !== "now") deniedZpa[key] = forbidden([]);
+  }
+  writeByteDifferentialFixture("zscaler", "denied", assess(deniedAccess, deniedPolicy, deniedZpa));
+
+  writeByteDifferentialFixture("zscaler", "missing-null", {
+    access: await assessZiaAccessControl(undefined),
+    policy: await assessZiaPolicy(undefined),
+    zpa: await assessZpa(undefined),
+  });
+
+  const partialAccess = accessControlFixture();
+  partialAccess.adminUsers = { ...partialAccess.adminUsers, truncated: true, seen: 3, total: 4 };
+  const partialPolicy = policyFixture();
+  partialPolicy.locations = { ...partialPolicy.locations, truncated: true, seen: 1, total: 2 };
+  const partialZpa = zpaFixture();
+  partialZpa.applicationSegments = { ...partialZpa.applicationSegments, truncated: true, seen: 1, total: 2 };
+  const truncationReplay = singleDatasetTruncationCases();
+  assert.equal(truncationReplay.length, 41);
+  writeByteDifferentialFixture("zscaler", "partial", {
+    combined: assess(partialAccess, partialPolicy, partialZpa),
+    singleDatasetTruncations: truncationReplay,
+  });
+  writeByteDifferentialFixture("zscaler", "compliant", representative());
+  const sslExemptionsAt = (count, maxSslExemptions) => {
+    const fixture = policyFixture();
+    fixture.sslExemptedUrls = readable({ urls: Array.from({ length: count }, (_, index) => `boundary-${index}.example`) });
+    return assessZiaPolicyData(fixture, maxSslExemptions === undefined ? {} : { maxSslExemptions });
+  };
+  const securityAllowlistAt = (count) => {
+    const fixture = policyFixture();
+    fixture.securityAllowlist = readable({ whitelistUrls: Array.from({ length: count }, (_, index) => `allow-${index}.example`) });
+    return assessZiaPolicyData(fixture);
+  };
+  const superAdministratorsAt = (count, maxSuperAdmins = 5) => assessZiaAccessControlData(accessControlFixture({
+    adminUsers: readable(Array.from({ length: count }, (_, index) => ({
+      id: index + 1,
+      loginName: `boundary-admin-${index}@example.com`,
+      disabled: false,
+      isPasswordLoginAllowed: false,
+      adminScopeType: "ORGANIZATION",
+      role: { id: 10, name: "Super Admin" },
+    }))),
+  }), { maxSuperAdmins });
+  const sslDefaultBoundaries = [49, 50, 51].map((count) => sslExemptionsAt(count));
+  const sslOverrideBoundaries = [9, 10, 11].map((count) => sslExemptionsAt(count, 10));
+  const allowlistBoundaries = [99, 100, 101].map(securityAllowlistAt);
+  const connectorAgeAt = (days, staleConnectorDays = 30) => assessZpaData(zpaFixture({
+    appConnectors: readable([
+      { id: "c-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
+      { id: "c-2", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
+    ]),
+  }), { staleConnectorDays });
+  const serviceEdgeAgeAt = (days, staleConnectorDays = 30) => assessZpaData(zpaFixture({
+    serviceEdges: readable([
+      { id: "se-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
+    ]),
+  }), { staleConnectorDays });
+  const timeoutAt = (hours, maxTimeoutHours = 24) => assessZpaData(zpaFixture({
+    timeoutRules: readable([{ id: "t-1", name: "Boundary timeout", disabled: false, reauthTimeout: String(hours * 60 * 60), reauthIdleTimeout: "3600" }]),
+  }), { maxTimeoutHours });
+  const certificateAt = (days, certExpiryWarnDays = 30) => assessZpaData(zpaFixture({
+    enrollmentCertificates: readable([{ id: "ec-1", name: "Boundary certificate", validToInEpochSec: Math.floor((NOW.getTime() + days * 24 * 60 * 60 * 1000) / 1000) }]),
+    browserAccessCertificates: readable([]),
+  }), { certExpiryWarnDays });
+  const connectorDefaultBoundaries = [29, 30, 31].map((days) => connectorAgeAt(days));
+  const connectorOverrideBoundaries = [9, 10, 11].map((days) => connectorAgeAt(days, 10));
+  const serviceEdgeDefaultBoundaries = [29, 30, 31].map((days) => serviceEdgeAgeAt(days));
+  const serviceEdgeOverrideBoundaries = [9, 10, 11].map((days) => serviceEdgeAgeAt(days, 10));
+  const timeoutDefaultBoundaries = [23, 24, 25].map((hours) => timeoutAt(hours));
+  const timeoutOverrideBoundaries = [9, 10, 11].map((hours) => timeoutAt(hours, 10));
+  const certificateDefaultBoundaries = [29, 30, 31].map((days) => certificateAt(days));
+  const certificateOverrideBoundaries = [9, 10, 11].map((days) => certificateAt(days, 10));
+  const configuredSuperAdministratorThresholds = [0, 1, 2].map((maxSuperAdmins) => (
+    assessZiaAccessControlData(accessControlFixture(), { maxSuperAdmins })
+  ));
+  const superAdministratorDefaultBoundaries = [4, 5, 6].map((count) => superAdministratorsAt(count));
+  const superAdministratorOverrideBoundaries = [9, 10, 11].map((count) => superAdministratorsAt(count, 10));
+  assert.equal(
+    configuredSuperAdministratorThresholds.length
+      + superAdministratorDefaultBoundaries.length + superAdministratorOverrideBoundaries.length
+      + sslDefaultBoundaries.length + sslOverrideBoundaries.length + allowlistBoundaries.length
+      + connectorDefaultBoundaries.length + connectorOverrideBoundaries.length
+      + serviceEdgeDefaultBoundaries.length + serviceEdgeOverrideBoundaries.length
+      + timeoutDefaultBoundaries.length + timeoutOverrideBoundaries.length
+      + certificateDefaultBoundaries.length + certificateOverrideBoundaries.length,
+    42,
+  );
+  writeByteDifferentialFixture("zscaler", "boundary", {
+    superAdministrators: configuredSuperAdministratorThresholds,
+    superAdministratorDefaultThreshold: superAdministratorDefaultBoundaries,
+    superAdministratorOverrideTen: superAdministratorOverrideBoundaries,
+    sslExemptions: sslDefaultBoundaries,
+    sslExemptionsOverrideTen: sslOverrideBoundaries,
+    securityAllowlist: allowlistBoundaries,
+    connectorAgeDays: connectorDefaultBoundaries,
+    connectorAgeOverrideTenDays: connectorOverrideBoundaries,
+    serviceEdgeAgeDays: serviceEdgeDefaultBoundaries,
+    serviceEdgeAgeOverrideTenDays: serviceEdgeOverrideBoundaries,
+    timeoutHours: timeoutDefaultBoundaries,
+    timeoutOverrideTenHours: timeoutOverrideBoundaries,
+    certificateExpiryDays: certificateDefaultBoundaries,
+    certificateExpiryOverrideTenDays: certificateOverrideBoundaries,
+  });
+
+  const ziaStub = ziaTenantFetch(ziaCompliantTenant());
+  const zpaStub = zpaTenantFetch(zpaCompliantTenant());
+  const config = {
+    zia: ziaConfig(),
+    zpa: zpaConfig(),
+    oneApiDetected: false,
+    zdxDetected: false,
+    timeoutMs: 30000,
+    maxRetries: 0,
+    sourceChain: [],
+  };
+  const clients = {
+    config,
+    zia: new ZiaApiClient(config.zia, { fetchImpl: ziaStub.fetchImpl, maxRetries: 0, now: () => NOW }),
+    zpa: new ZpaApiClient(config.zpa, { fetchImpl: zpaStub.fetchImpl, maxRetries: 0, now: () => NOW }),
+  };
+  const exportRoot = prepareByteDifferentialExportRoot("zscaler");
+  const exported = await exportZscalerAuditBundle(clients, { outputDir: exportRoot });
+  writeByteDifferentialFixture("zscaler", "export", snapshotExportBundle(exported));
 });

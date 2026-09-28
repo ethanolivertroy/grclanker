@@ -28,6 +28,8 @@ import {
   resolveSecureOutputPath,
   scrubSnapshotValue,
 } from "../dist/extensions/grc-tools/cloudflare.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { CLOUDFLARE_COMPLETENESS_SOURCES, CLOUDFLARE_SPEC } from "../dist/extensions/grc-tools/cloudflare.spec.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   CANARY_VALUES,
@@ -78,6 +80,12 @@ import {
   assertMustRedactRowsBesideMustKeep,
   withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1104,6 +1112,71 @@ test("verdict rule 10: listCursorPaginated reports an empty page with a cursor, 
   assert.deepEqual(firstPageNotFound, { items: [], truncated: false, totalCount: 0 }, "a 404 on the first page still means the product is not provisioned");
 });
 
+test("CF-IAM-06 treats token-list 404 as complete safe-empty evidence and other failures as incomplete", async () => {
+  const notFoundClient = new CloudflareApiClient(sampleConfig(), {
+    fetchImpl: fakeFetch(() => ({
+      status: 404,
+      payload: { success: false, errors: [{ code: 10000, message: "not found" }] },
+    })).fetchImpl,
+  });
+  const userTokens = await notFoundClient.listUserTokens();
+  const accountTokens = await notFoundClient.listAccountTokens();
+  assert.deepEqual(userTokens, { items: [], truncated: false, totalCount: 0 });
+  assert.deepEqual(accountTokens, { items: [], truncated: false, totalCount: 0 });
+
+  const safeEmptyCases = [
+    { async listUserTokens() { return userTokens; } },
+    { async listAccountTokens() { return accountTokens; } },
+  ];
+  for (const overrides of safeEmptyCases) {
+    const safeEmpty = await captureBatchDecisionFacts(() =>
+      assessCloudflareIdentity(fixtureClient("compliant", overrides)));
+    const safeFacts = safeEmpty.captures.find((capture) =>
+      capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
+    assert.equal(safeFacts?.evidence_complete, true);
+    assert.equal(byId(safeEmpty.result, "CF-IAM-06").status, "pass");
+  }
+
+  const failed = await captureBatchDecisionFacts(() => assessCloudflareIdentity(fixtureClient("compliant", {
+    async listUserTokens() { throw forbidden("/user/tokens"); },
+  })));
+  const failedFacts = failed.captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
+  assert.equal(failedFacts?.evidence_complete, false);
+  assert.equal(byId(failed.result, "CF-IAM-06").status, "warn");
+});
+
+test("CF-TRF-06 preserves the unpaginated Gateway-rules limitation in facts and metadata", async () => {
+  assert.deepEqual(
+    CLOUDFLARE_COMPLETENESS_SOURCES["CF-TRF-06"].find((entry) => entry.surfaceId === "gateway-rules")?.falseWhen,
+    [],
+  );
+  const gatewayClient = new CloudflareApiClient(sampleConfig(), {
+    fetchImpl: fakeFetch(() => ({
+      payload: {
+        success: true,
+        result: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
+        result_info: { page: 1, per_page: 1, total_pages: 2, total_count: 2 },
+      },
+    })).fetchImpl,
+  });
+  const firstPage = await gatewayClient.listGatewayRules();
+  assert.deepEqual(firstPage, {
+    items: [{ id: "gw-1", name: "Block malware", action: "block", enabled: true, filters: ["dns"] }],
+    truncated: false,
+    totalCount: 1,
+  });
+  const { result, captures } = await captureBatchDecisionFacts(() => assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listGatewayRules() {
+      return firstPage;
+    },
+  })));
+  const facts = captures.find((capture) =>
+    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-TRF-06"))?.checks.get("CF-TRF-06");
+  assert.equal(facts?.evidence_complete, true);
+  assert.equal(byId(result, "CF-TRF-06").status, "pass");
+});
+
 test("verdict rule 10: CF-IAM-04 caps at warn when the reusable Access policy list is truncated and names seen versus total", async () => {
   const client = fixtureClient("compliant", {
     async listAccessPolicies() {
@@ -2093,4 +2166,113 @@ test("rule 9 server-assigned 32-hex ids (round 4 open ruling): a real Cloudflare
     }
   }
   assert.ok(files.get("compliance/executive_summary.md").includes(`Account: ${account.id}`), "the executive summary's account line is a field rendering and keeps the id whole");
+});
+
+test("byte differential fixtures: Cloudflare assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = async (client) => ({
+    identity: await assessCloudflareIdentity(client),
+    zones: await assessCloudflareZoneSecurity(client),
+    traffic: await assessCloudflareTrafficControls(client),
+  });
+  const representativeClient = fixtureClient("compliant", {
+    async getDnssec() {
+      return { status: "pending", algorithm: "13" };
+    },
+  });
+  writeByteDifferentialFixture("cloudflare", "representative", await assess(representativeClient));
+  writeByteDifferentialFixture("cloudflare", "denied", await assess(fixtureClient("forbidden")));
+  writeByteDifferentialFixture("cloudflare", "missing-null", await assess(fixtureClient("empty")));
+  writeByteDifferentialFixture("cloudflare", "partial", await assess(fixtureClient("partial")));
+  writeByteDifferentialFixture("cloudflare", "compliant", await assess(fixtureClient("compliant")));
+  const superAdministratorsAt = (count, maxSuperAdmins = 2) => assessCloudflareIdentity(fixtureClient("compliant", {
+    async listMembers() {
+      return {
+        items: Array.from({ length: count }, (_, index) => ({
+          id: `boundary-member-${index}`,
+          status: "accepted",
+          user: { email: `admin-${index}@example.com`, two_factor_authentication_enabled: true },
+          roles: [{ id: `boundary-role-${index}`, name: "Super Administrator - All Privileges" }],
+        })),
+        truncated: false,
+        totalCount: count,
+      };
+    },
+  }), { maxSuperAdmins });
+  const defaultBoundaries = await Promise.all([1, 2, 3].map((count) => superAdministratorsAt(count)));
+  const overrideBoundaries = await Promise.all([4, 5, 6].map((count) => superAdministratorsAt(count, 5)));
+  const configuredThresholdBoundaries = await Promise.all([0, 1, 2].map((maxSuperAdmins) => (
+    assessCloudflareIdentity(fixtureClient("compliant"), { maxSuperAdmins })
+  )));
+  const hstsAt = (maxAge) => assessCloudflareZoneSecurity(fixtureClient("compliant", {
+    async getZoneSettings() {
+      return compliantSettings().map((setting) => setting.id === "security_header"
+        ? { ...setting, value: { strict_transport_security: { enabled: true, max_age: maxAge, include_subdomains: true, preload: true, nosniff: true } } }
+        : setting);
+    },
+  }));
+  const certificateAt = (days) => assessCloudflareZoneSecurity(fixtureClient("compliant", {
+    async listCertificatePacks() {
+      return {
+        items: [{
+          id: "boundary-pack",
+          type: "universal",
+          status: "active",
+          certificates: [{
+            id: "boundary-certificate",
+            status: "active",
+            expires_on: new Date(Date.now() + days * 86_400_000).toISOString(),
+          }],
+        }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  }));
+  const auditEventAt = (days) => assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listAuditLogs(_accountId, lookbackDays) {
+      assert.equal(lookbackDays, 30);
+      return {
+        items: [{ id: "boundary-event", when: new Date(Date.now() - days * 86_400_000).toISOString(), action: { type: "change_setting", result: true } }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  }));
+  const ipAccessRuleAt = (days) => assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listIpAccessRules() {
+      return {
+        items: [{
+          id: "boundary-ip-rule",
+          mode: "block",
+          notes: "Boundary rule",
+          modified_on: new Date(Date.now() - days * 86_400_000).toISOString(),
+          configuration: { target: "ip", value: "198.51.100.1" },
+        }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  }));
+  const hstsMaxAgeSeconds = await Promise.all([15_551_999, 15_552_000, 15_552_001].map(hstsAt));
+  const certificateExpiryDays = await Promise.all([29, 30, 31].map(certificateAt));
+  const auditEventAgeDays = await Promise.all([29, 30, 31].map(auditEventAt));
+  const ipAccessRuleAgeDays = await Promise.all([364, 365, 366].map(ipAccessRuleAt));
+  assert.equal(
+    defaultBoundaries.length + overrideBoundaries.length + configuredThresholdBoundaries.length
+      + hstsMaxAgeSeconds.length + certificateExpiryDays.length + auditEventAgeDays.length + ipAccessRuleAgeDays.length,
+    21,
+  );
+  writeByteDifferentialFixture("cloudflare", "boundary", {
+    superAdministrators: configuredThresholdBoundaries,
+    superAdministratorDefaultThreshold: defaultBoundaries,
+    superAdministratorOverrideFive: overrideBoundaries,
+    hstsMaxAgeSeconds,
+    certificateExpiryDays,
+    auditEventAgeDays,
+    ipAccessRuleAgeDays,
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("cloudflare");
+  const exported = await exportCloudflareAuditBundle(fixtureClient("compliant"), sampleConfig(), exportRoot);
+  writeByteDifferentialFixture("cloudflare", "export", snapshotExportBundle(exported));
 });

@@ -36,6 +36,8 @@ import {
   scrubSnapshotValue,
   toPage,
 } from "../dist/extensions/grc-tools/azure.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { AZURE_COMPLETENESS_SOURCES, AZURE_SPEC } from "../dist/extensions/grc-tools/azure.spec.js";
 import {
   CANARY,
   CANARY_URL,
@@ -86,6 +88,12 @@ import {
 } from "./helpers/redaction-table.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-04-16T00:00:00.000Z");
 const ASSESSORS = [
@@ -1116,6 +1124,9 @@ test("rule 10: AZURE-MON-04 and AZURE-MON-05 cap at warn on a truncated pricing 
   assert.equal(diagnostics.status, "warn");
   assert.match(diagnostics.summary, /Inventory of diagnostic settings is partial \(1 seen of 3 total\); verdict capped at warn\./);
   assert.deepEqual({ seen: diagnostics.evidence.seen, total: diagnostics.evidence.total, truncated: diagnostics.evidence.truncated }, { seen: 1, total: 3, truncated: true });
+  const retention = result.findings.find((item) => item.id === "AZURE-MON-06");
+  assert.equal(retention.status, "pass", "parent-parity limitation: diagnostic-settings truncation does not cap AZURE-MON-06");
+  assert.equal(retention.summary, "1/1 linked Log Analytics workspaces retain data for 90+ days.");
   // A non-compliant page is still fail or warn on its own merits, never masked by the cap.
   const mixed = clientWith({ ...compliantClient(), async listDefenderPricings() { return { items: [{ properties: { pricingTier: "Standard" } }, { properties: { pricingTier: "Free" } }], truncated: true, seen: 2 }; } });
   assert.equal((await assessAzureMonitoring(mixed)).findings.find((item) => item.id === "AZURE-MON-04").status, "warn");
@@ -1203,6 +1214,27 @@ test("assessAzureSubscriptionGuardrails flags RBAC and missing contacts", async 
   assert.equal(statuses["AZURE-SUB-03"], "fail");
   assert.equal(statuses["AZURE-SUB-04"], "warn");
   assert.equal(statuses["AZURE-SUB-05"], "fail");
+});
+
+test("AZURE-SUB-04 network-watcher truncation matches its executable completeness contract", async () => {
+  const source = AZURE_COMPLETENESS_SOURCES["AZURE-SUB-04"].find((entry) => entry.surfaceId === "network-watchers");
+  assert.deepEqual(source?.falseWhen, ["truncated"]);
+  const client = clientWith({
+    ...compliantClient(),
+    async listNetworkWatchers() {
+      return {
+        items: [{ id: WATCHER_ID, name: "NetworkWatcher_eastus", location: "eastus" }],
+        truncated: true,
+        seen: 1,
+        total: 2,
+      };
+    },
+  });
+  const { result, captures } = await captureBatchDecisionFacts(() => assessAzureSubscriptionGuardrails(client));
+  const facts = captures.find((capture) =>
+    capture.integration === AZURE_SPEC.identity.slug && capture.checks.has("AZURE-SUB-04"))?.checks.get("AZURE-SUB-04");
+  assert.equal(facts?.complete, false);
+  assert.equal(result.findings.find((item) => item.id === "AZURE-SUB-04")?.status, "warn");
 });
 
 test("assessAzureDataProtection and assessAzureNetworkAndPolicy detect misconfigurations", async () => {
@@ -2335,4 +2367,140 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
   for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
   assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
   assert.ok(seen.has(surface), "the surface named in the note was requested");
+});
+
+test("byte differential fixtures: Azure assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = async (client) => Promise.all(ASSESSORS.map(([, run]) => run(client)));
+  const representative = clientWith({
+    async listSecureScores() {
+      return [{ currentScore: 60, maxScore: 100 }];
+    },
+  }, compliantClient());
+  writeByteDifferentialFixture("azure", "representative", await assess(representative));
+  writeByteDifferentialFixture("azure", "denied", await assess(forbiddenClient()));
+
+  const missing = clientWith(
+    Object.fromEntries(CLIENT_METHODS.map((method) => [method, async () => null])),
+    compliantClient(),
+  );
+  writeByteDifferentialFixture("azure", "missing-null", await assess(missing));
+
+  const partial = clientWith({
+    async listSecurityAlerts() {
+      throw forbidden();
+    },
+  }, compliantClient());
+  const diagnosticTruncation = clientWith({
+    async listDiagnosticSettings() {
+      return {
+        items: [{ id: "diag-1", properties: { workspaceId: "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law", logs: [{ category: "Administrative", enabled: true }] } }],
+        truncated: true,
+        seen: 1,
+        total: 3,
+      };
+    },
+  }, compliantClient());
+  writeByteDifferentialFixture("azure", "partial", {
+    deniedSecurityAlerts: await assess(partial),
+    diagnosticSettingsTruncated: await assess(diagnosticTruncation),
+  });
+  writeByteDifferentialFixture("azure", "compliant", await assess(compliantClient()));
+
+  const scoreAt = async (score) => assessAzureMonitoring(clientWith({
+    async listSecureScores() {
+      return [{ currentScore: score, maxScore: 100 }];
+    },
+  }, compliantClient()));
+  const identityWithRoleMembers = async (roleName, count) => assessAzureIdentity(clientWith({
+    async listDirectoryRoles() {
+      return [{ id: "boundary-role", displayName: roleName }];
+    },
+    async listDirectoryRoleMembers() {
+      return Array.from({ length: count }, (_, index) => ({ id: `boundary-member-${index}` }));
+    },
+  }, compliantClient()));
+  const identityWithUnregisteredMfaUsers = async (count) => assessAzureIdentity(clientWith({
+    async listUserRegistrationDetails() {
+      return Array.from({ length: 100 }, (_, index) => ({
+        userPrincipalName: `boundary-user-${index}@example.com`,
+        isMfaRegistered: index >= count,
+      }));
+    },
+  }, compliantClient()));
+  const identityWithCredential = async (remainingDays, lifetimeDays) => {
+    const end = new Date(NOW.getTime() + remainingDays * 24 * 60 * 60 * 1000).toISOString();
+    const start = new Date(new Date(end).getTime() - lifetimeDays * 24 * 60 * 60 * 1000).toISOString();
+    const credential = { startDateTime: start, endDateTime: end };
+    return assessAzureIdentity(clientWith({
+      async listServicePrincipals() {
+        return [{ displayName: "Boundary SP", passwordCredentials: [credential], keyCredentials: [] }];
+      },
+      async listApplications() {
+        return [{ id: "boundary-app", displayName: "Boundary App", owners: [{ id: "owner" }], passwordCredentials: [credential], keyCredentials: [] }];
+      },
+    }, compliantClient()));
+  };
+  const identityWithPermanentAssignments = async (count) => assessAzureIdentity(clientWith({
+    async listRoleEligibilitySchedules() {
+      return [{ id: "eligible" }];
+    },
+    async listRoleAssignmentSchedules() {
+      return Array.from({ length: count }, (_, index) => ({
+        id: `permanent-${index}`,
+        assignmentType: "Assigned",
+        roleDefinitionId: "62e90394-69f5-4237-9190-012177145e10",
+        scheduleInfo: { expiration: { type: "noExpiration" } },
+      }));
+    },
+  }, compliantClient()));
+  const identityWithGuestAge = async (days) => assessAzureIdentity(clientWith({
+    async listGuestUsers() {
+      return [{
+        id: "boundary-guest",
+        userType: "Guest",
+        accountEnabled: true,
+        signInActivity: { lastSignInDateTime: new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString() },
+      }];
+    },
+  }, compliantClient()));
+  const subscriptionAssignments = async (roleName, count) => {
+    const roleId = `/${roleName.toLowerCase()}`;
+    return assessAzureSubscriptionGuardrails(clientWith({
+      async listRoleDefinitions() {
+        return [{ id: roleId, properties: { roleName } }];
+      },
+      async listRoleAssignments() {
+        return Array.from({ length: count }, (_, index) => ({
+          id: `assignment-${index}`,
+          properties: { roleDefinitionId: roleId, principalType: "User" },
+        }));
+      },
+    }, compliantClient()));
+  };
+  const retentionAt = async (days) => assessAzureMonitoring(clientWith({
+    async listLogAnalyticsWorkspaces() {
+      return [{ id: "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law", properties: { retentionInDays: days } }];
+    },
+  }, compliantClient()));
+  const boundary = {
+    secureScore: await Promise.all([0, 49, 50, 74, 75, 76].map(scoreAt)),
+    mfaUnregisteredPercent: await Promise.all([9, 10, 11].map(identityWithUnregisteredMfaUsers)),
+    globalAdministrators: await Promise.all([3, 4, 5].map((count) => identityWithRoleMembers("Global Administrator", count))),
+    privilegedAssignments: await Promise.all([5, 6, 10, 11].map((count) => identityWithRoleMembers("Privileged Role Administrator", count))),
+    credentialExpiryDays: await Promise.all([29, 30, 31].map((days) => identityWithCredential(days, 365))),
+    credentialLifetimeDays: await Promise.all([729, 730, 731].map((days) => identityWithCredential(365, days))),
+    permanentPrivilegedAssignments: await Promise.all([1, 2, 3].map(identityWithPermanentAssignments)),
+    guestInactivityDays: await Promise.all([89, 90, 91].map(identityWithGuestAge)),
+    ownerAssignments: await Promise.all([1, 2, 3].map((count) => subscriptionAssignments("Owner", count))),
+    contributorAssignments: await Promise.all([4, 5, 6].map((count) => subscriptionAssignments("Contributor", count))),
+    workspaceRetentionDays: await Promise.all([89, 90, 91].map(retentionAt)),
+  };
+  assert.equal(Object.values(boundary).reduce((total, values) => total + values.length, 0), 37);
+  writeByteDifferentialFixture("azure", "boundary", {
+    ...boundary,
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("azure");
+  const exported = await exportAzureAuditBundle(compliantClient(), sampleConfig(), exportRoot, { max_assignments: 25 });
+  writeByteDifferentialFixture("azure", "export", snapshotExportBundle(exported));
 });

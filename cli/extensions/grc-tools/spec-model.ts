@@ -118,7 +118,8 @@ export interface DerivedFactRule {
 export type VerdictOperand =
   | { kind: "value"; value: PortableValue }
   | { kind: "path"; path: string; fallback?: PortableValue }
-  | { kind: "length"; path: string };
+  | { kind: "length"; path: string }
+  | { kind: "subtract"; left: VerdictOperand; right: VerdictOperand };
 
 export type VerdictCondition =
   | { op: "always" }
@@ -170,6 +171,27 @@ export type CompletenessFailureMode =
 export interface CompletenessSourceContract {
   surfaceId: string;
   falseWhen: readonly CompletenessFailureMode[];
+  scope?: string;
+  aggregate?: CompletenessAggregateContract;
+}
+
+export interface CompletenessAggregateContract {
+  kind: "attempted-child-reads";
+  parentSurfaceId: string;
+  attemptedUnit: string;
+  mixedFailureModes: readonly CompletenessFailureMode[];
+  mixedFailureEffect: "false";
+  allAttemptsFailedEffect: "unchanged";
+  zeroAttemptsEffect: "unchanged";
+  allAttemptsFailedReadability: "false";
+}
+
+export interface CompletenessSourceObservation {
+  attemptedCount: number;
+  successfulCount: number;
+  failedCount: number;
+  failureModes: readonly CompletenessFailureMode[];
+  truncated: boolean;
 }
 
 export interface CompletenessContract {
@@ -323,6 +345,28 @@ export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFact
   return evaluateVerdictCriteria(check.criteria, facts);
 }
 
+export function evaluateCompletenessSource(
+  source: CompletenessSourceContract,
+  observation: CompletenessSourceObservation,
+): boolean {
+  const counts = [observation.attemptedCount, observation.successfulCount, observation.failedCount];
+  if (counts.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new Error(`${source.surfaceId} completeness observation counts must be non-negative safe integers`);
+  }
+  if (observation.successfulCount + observation.failedCount !== observation.attemptedCount) {
+    throw new Error(`${source.surfaceId} completeness observation successes and failures must equal attempts`);
+  }
+  const modes = new Set(observation.failureModes);
+  if (observation.truncated) modes.add("truncated");
+  if (source.falseWhen.some((mode) => modes.has(mode))) return false;
+  if (!source.aggregate) return true;
+  return !(
+    observation.successfulCount > 0
+    && observation.failedCount > 0
+    && source.aggregate.mixedFailureModes.some((mode) => modes.has(mode))
+  );
+}
+
 function pathValue(root: unknown, path: string, item: unknown): unknown {
   const fromItem = path === "$" || path.startsWith("$.");
   const segments = (fromItem ? path.slice(1).replace(/^\./, "") : path).split(".").filter(Boolean);
@@ -345,6 +389,13 @@ function operandValue(operand: VerdictOperand, facts: VerdictFacts, item: unknow
     case "length": {
       const value = pathValue(facts, operand.path, item);
       return Array.isArray(value) || typeof value === "string" ? value.length : undefined;
+    }
+    case "subtract": {
+      const left = operandValue(operand.left, facts, item);
+      const right = operandValue(operand.right, facts, item);
+      if (typeof left !== "number" || typeof right !== "number") return undefined;
+      const result = left - right;
+      return Number.isFinite(result) ? result : undefined;
     }
     default: {
       const unhandled: never = operand;
@@ -441,6 +492,8 @@ function renderOperand(operand: VerdictOperand): string {
       return `\`${operand.path}\`${"fallback" in operand ? ` (default ${JSON.stringify(operand.fallback)})` : ""}`;
     case "length":
       return `length of \`${operand.path}\``;
+    case "subtract":
+      return `(${renderOperand(operand.left)} minus ${renderOperand(operand.right)})`;
     default: {
       const unhandled: never = operand;
       return String(unhandled);
@@ -502,7 +555,19 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
 }
 
 function operandPaths(operand: VerdictOperand): string[] {
-  return operand.kind === "path" || operand.kind === "length" ? [operand.path] : [];
+  switch (operand.kind) {
+    case "path":
+    case "length":
+      return [operand.path];
+    case "subtract":
+      return [...operandPaths(operand.left), ...operandPaths(operand.right)];
+    case "value":
+      return [];
+    default: {
+      const unhandled: never = operand;
+      return [String(unhandled)];
+    }
+  }
 }
 
 export function verdictConditionPaths(condition: VerdictCondition): string[] {
