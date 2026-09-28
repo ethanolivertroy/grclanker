@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSyn
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createServer } from "node:http";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 
 import {
   PaloaltoApiError,
@@ -485,6 +486,44 @@ test("resolvePaloaltoConfiguration honors config-file TLS settings with secure p
   assert.equal(resolveWith({ verify_tls: false }, "invalid"), true, "invalid environment values do not expose a config opt-out");
   assert.equal(resolveWith({ verify_tls: false }, "false", "invalid"), true, "invalid argument values do not expose lower-precedence opt-outs");
   assert.equal(resolveWith({}), true, "the default keeps TLS verification enabled");
+});
+
+test("every Palo Alto tool prepares, validates, and resolves TLS arguments without insecure fallback", () => {
+  const configFile = join(createTempBase("grclanker-paloalto-tls-tool-"), "paloalto.json");
+  writeFileSync(configFile, JSON.stringify({
+    PANOS_HOST: "fw.example.com",
+    PANOS_API_KEY: "key",
+    verify_tls: false,
+  }));
+  const tools = new Map();
+  registerPaloaltoTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const cases = [
+    { value: true, expected: true, label: "boolean true" },
+    { value: "true", expected: true, label: "string true" },
+    { value: "enabled", expected: true, label: "recognized true alias" },
+    { value: "invalid", expected: true, label: "invalid string fails closed" },
+    { value: false, expected: false, label: "boolean false" },
+    { value: "false", expected: false, label: "string false" },
+  ];
+
+  for (const tool of tools.values()) {
+    for (const entry of cases) {
+      const prepared = tool.prepareArguments({ config_file: configFile, verify_tls: entry.value });
+      assert.equal(typeof prepared.verify_tls, "boolean", `${tool.name}: ${entry.label} prepares a schema-shaped boolean`);
+      const validated = validateToolArguments(tool, {
+        type: "toolCall",
+        id: `tls-${tool.name}`,
+        name: tool.name,
+        arguments: prepared,
+      });
+      assert.equal(validated.verify_tls, entry.expected, `${tool.name}: ${entry.label} survives validation`);
+      assert.equal(
+        resolvePaloaltoConfiguration(validated, {}).verifyTls,
+        entry.expected,
+        `${tool.name}: ${entry.label} has argument precedence over config false`,
+      );
+    }
+  }
 });
 
 test("resolvePaloaltoConfiguration allows a single product and rejects incomplete credentials", () => {

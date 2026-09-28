@@ -5385,6 +5385,11 @@ export async function exportPaloaltoAuditBundle(
   };
 }
 
+function normalizeVerifyTlsArgument(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  return asBoolean(value) ?? true;
+}
+
 function normalizeAuthArgs(args: unknown): AuthArgs {
   const value = asObject(args) ?? {};
   return {
@@ -5396,7 +5401,7 @@ function normalizeAuthArgs(args: unknown): AuthArgs {
     panos_username: asString(value.panos_username),
     panos_password: asString(value.panos_password),
     config_file: asString(value.config_file),
-    verify_tls: typeof value.verify_tls === "boolean" ? value.verify_tls : undefined,
+    verify_tls: normalizeVerifyTlsArgument(value.verify_tls),
     timeout_seconds: asNumber(value.timeout_seconds),
   };
 }
