@@ -149,12 +149,9 @@ function Get-Target {
 function Fallback-And-Fail([string]$Target) {
   Write-Host ""
   Write-Warn "Release bundle unavailable for $Target."
-  Write-Host "  Source fallback (Node.js 22.19 or newer):"
-  Write-Host "    git clone https://github.com/ethanolivertroy/grclanker.git"
-  Write-Host "    cd grclanker"
-  Write-Host "    npm install --prefix cli"
-  Write-Host "    npm --prefix cli run build"
-  Write-Host "    npm install --global ./cli"
+  Write-Host "  Fallbacks:"
+  Write-Host "    npm install -g @grclanker/cli"
+  Write-Host "    bun install -g @grclanker/cli"
   throw "Install aborted."
 }
 
@@ -319,7 +316,7 @@ try {
   }
 
   Write-Host ""
-  Write-Host "  Ready. Run grclanker setup to start." -ForegroundColor Green
+  Write-Host "  Ready. Run grclanker to start." -ForegroundColor Green
   Write-Host ""
 } finally {
   if (Test-Path $TempRoot) {

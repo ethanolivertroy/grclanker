@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Install grclanker with the bundled runtime, source-checkout fallback, or skills-only path.
+description: Install grclanker with the bundled runtime, package-manager fallback, or skills-only path.
 ---
 
 The recommended path is the one-line bundle installer. It downloads a prebuilt runtime bundle, unpacks it under `~/.local/share/grclanker`, and links the launcher into `~/.local/bin`.
@@ -101,19 +101,16 @@ Windows PowerShell (best effort):
 powershell -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm https://grclanker.com/install.ps1))) -Version 0.0.1"
 ```
 
-## Source-checkout fallback
+## Package-manager fallback
 
-Use this path only when you already manage Node.js 22.19 or newer and do not need the bundled installer:
+Use this path only when you already manage your own Node runtime and do not need the bundled installer:
 
 ```bash
-git clone https://github.com/ethanolivertroy/grclanker.git
-cd grclanker
-npm install --prefix cli
-npm --prefix cli run build
-npm install --global ./cli
+npm install -g @grclanker/cli
+bun install -g @grclanker/cli
 ```
 
-`@grclanker/cli` is not currently published to the npm registry, so the previously documented `npm install -g @grclanker/cli` and `bun install -g @grclanker/cli` commands do not work. The source install above does not solve runtime Node requirements for you; the bundle installer does.
+The package-manager installs do not solve runtime Node requirements for you. The bundle installer does.
 
 ## Verify the install
 

@@ -3,7 +3,7 @@ title: Quick Start
 description: The shortest path from install to a useful local grclanker session.
 ---
 
-If you want the fast path, do this in order. If you need Windows notes, pinned versions, a source-checkout fallback, or skills-only installs, use the [Installation](/docs/getting-started/installation) page.
+If you want the fast path, do this in order. If you need Windows notes, pinned versions, package-manager fallback, or skills-only installs, use the [Installation](/docs/getting-started/installation) page.
 
 ## 1. Install the bundle
 

@@ -26,7 +26,7 @@ test("launcher minimum matches the package Node engine", () => {
   assert.match(launcher, /requires Node\.js 22\.19\.0 or newer/);
 });
 
-test("bundle installer handles a symlinked TMPDIR and directs first run to setup", () => {
+test("bundle installer resolves its launcher target through a symlinked TMPDIR", () => {
   const backingRoot = mkdtempSync(join(realpathSync(tmpdir()), "grclanker-install-backing-"));
   const realTempDir = resolve(backingRoot, "real-tmp");
   const linkedTempDir = resolve(backingRoot, "linked-tmp");
@@ -68,7 +68,6 @@ test("bundle installer handles a symlinked TMPDIR and directs first run to setup
     );
 
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stdout, /Ready\. Run grclanker setup to start\./);
     assert.notEqual(tempRoot, realpathSync(tempRoot));
     assert.equal(
       realpathSync(resolve(binDir, "grclanker")),
@@ -77,35 +76,4 @@ test("bundle installer handles a symlinked TMPDIR and directs first run to setup
   } finally {
     rmSync(backingRoot, { recursive: true, force: true });
   }
-});
-
-test("install surfaces use the canonical source fallback and PowerShell directs setup", () => {
-  const sourceInstallCommands = [
-    "npm install --prefix cli",
-    "npm --prefix cli run build",
-    "npm install --global ./cli",
-  ];
-  const surfaces = [
-    resolve(REPO_ROOT, "README.md"),
-    resolve(REPO_ROOT, "public", "install"),
-    resolve(REPO_ROOT, "public", "install.ps1"),
-    resolve(REPO_ROOT, "src", "content", "docs", "docs", "getting-started", "installation.md"),
-  ];
-
-  for (const surface of surfaces) {
-    const contents = readFileSync(surface, "utf8");
-    let previousIndex = -1;
-    for (const command of sourceInstallCommands) {
-      const commandIndex = contents.indexOf(command);
-      assert.ok(commandIndex > previousIndex, `${surface} must include ${command} in order`);
-      previousIndex = commandIndex;
-    }
-  }
-
-  const powershellInstaller = readFileSync(resolve(REPO_ROOT, "public", "install.ps1"), "utf8");
-  assert.doesNotMatch(
-    powershellInstaller,
-    /Write-Host "    (?:npm|bun) install -g @grclanker\/cli"/,
-  );
-  assert.match(powershellInstaller, /Ready\. Run grclanker setup to start\./);
 });

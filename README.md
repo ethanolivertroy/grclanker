@@ -22,17 +22,12 @@ Windows PowerShell (best effort):
 powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
 ```
 
-Source-checkout fallback (requires Node.js 22.19 or newer):
+Package-manager fallback:
 
 ```bash
-git clone https://github.com/ethanolivertroy/grclanker.git
-cd grclanker
-npm install --prefix cli
-npm --prefix cli run build
-npm install --global ./cli
+npm install -g @grclanker/cli
+bun install -g @grclanker/cli
 ```
-
-`@grclanker/cli` is not currently published to the npm registry, so `npm install -g @grclanker/cli` does not work yet.
 
 Installation docs:
 
