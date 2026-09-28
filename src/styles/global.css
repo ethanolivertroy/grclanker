@@ -341,7 +341,7 @@ code {
   border-radius: 4px;
   background: transparent;
   border: 1px solid transparent;
-  color: var(--color-surface2);
+  color: var(--color-overlay2);
   cursor: pointer;
   transition: all 0.15s ease;
   font-family: inherit;
@@ -900,8 +900,8 @@ details[open] > .agent-group-toggle::before {
 .hero-install-toggle {
   flex: 0 0 auto;
   border: none;
-  background: rgba(35, 38, 52, 0.28);
-  color: var(--color-overlay1);
+  background: var(--color-crust);
+  color: var(--color-overlay2);
   padding: 0.78rem 1.18rem;
   font-size: var(--text-sm);
   font-weight: 600;
@@ -918,12 +918,12 @@ details[open] > .agent-group-toggle::before {
 }
 
 .hero-install-toggle.is-active {
-  background: rgba(65, 69, 89, 0.94);
+  background: var(--color-surface0);
   color: var(--ui-text);
 }
 
 .hero-install-toggle:not(.is-active):hover {
-  background: rgba(65, 69, 89, 0.55);
+  background: color-mix(in srgb, var(--color-surface0) 55%, var(--color-crust));
   color: var(--ui-text);
 }
 
@@ -1478,6 +1478,8 @@ details[open] > .agent-group-toggle::before {
 
 .docs-prose a {
   color: var(--docs-accent);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
 }
 
 .docs-prose a:hover {
@@ -1964,12 +1966,15 @@ details[open] > .agent-group-toggle::before {
   max-width: 32rem;
   z-index: 101;
   opacity: 0;
-  transition: opacity 0.15s ease, transform 0.15s ease;
+  visibility: hidden;
+  transition: opacity 0.15s ease, transform 0.15s ease, visibility 0s linear 0.15s;
   pointer-events: none;
 }
 .overlay-modal.open {
   opacity: 1;
+  visibility: visible;
   transform: translateX(-50%) translateY(0);
+  transition-delay: 0s;
   pointer-events: auto;
 }
 
@@ -2050,7 +2055,7 @@ kbd {
   padding: 0.1em 0.4em;
   font-size: var(--text-xs);
   font-family: inherit;
-  color: var(--color-subtext0);
+  color: var(--color-subtext1);
   line-height: 1.4;
 }
 
@@ -2098,13 +2103,18 @@ input:focus-visible {
 
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
   .overlay-backdrop,
   .overlay-modal,
   .search-result,
   .toast {
     transition: none;
   }
-  #cursor {
+  #cursor,
+  .skeleton-line,
+  .copy-btn.copied {
     animation: none;
   }
 }
