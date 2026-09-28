@@ -3679,7 +3679,8 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const shieldConfigUnreadable = unreadableInventory("enterprise_configuration (shield)", data.configuration, "the configured Shield anomaly detection rules were not checked");
   const monitoringEventsUnreadable = unreadableInventory("enterprise_events", data.events, "Shield alert and block events were not checked");
   recordBoxDecisionFacts(25, {
-    shield_readable: shieldReadable,
+    shield_settings_readable: shieldReadable,
+    shield_source_readable: !data.configuration.error,
     events_readable: eventsReadable,
     events_complete: completeBoxDatasets(data.events),
     anomaly_rule_count: anomalyRules.length,

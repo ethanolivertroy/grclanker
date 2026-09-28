@@ -369,12 +369,12 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     ],
   },
   "BOX-25": {
-    inputs: input("shield_readable", "events_readable", "events_complete", "anomaly_rule_count", "anomaly_event_count", "access_event_count"),
+    inputs: input("shield_settings_readable", "shield_source_readable", "events_readable", "events_complete", "anomaly_rule_count", "anomaly_event_count", "access_event_count"),
     rules: [
-      rule("manual", all(ne("shield_readable", true), ne("events_readable", true))),
-      rule("warn", any(ne("shield_readable", true), ne("events_readable", true))),
+      rule("manual", all(ne("shield_settings_readable", true), ne("events_readable", true))),
+      rule("warn", any(ne("shield_source_readable", true), ne("events_readable", true))),
       rule("pass", any(gt("anomaly_rule_count", 0), gt("anomaly_event_count", 0))),
-      rule("warn", any(gt("access_event_count", 0), ne("events_complete", true))),
+      rule("warn", any(ne("shield_settings_readable", true), gt("access_event_count", 0), ne("events_complete", true))),
       rule("fail", { op: "always" }),
     ],
   },
