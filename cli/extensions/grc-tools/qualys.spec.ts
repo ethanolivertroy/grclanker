@@ -2,7 +2,16 @@ import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
 } from "./batch-spec-builder.js";
-import { restSurface } from "./batch2-spec-helpers.js";
+import {
+  batch2All,
+  batch2Any,
+  batch2Eq,
+  batch2Gt,
+  batch2Ne,
+  batch2Path,
+  batch2Rule,
+  restSurface,
+} from "./batch2-spec-helpers.js";
 import { QUALYS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { BATCH3_FRAMEWORK_FILES, batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
@@ -74,7 +83,51 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "QUALYS-C07", control: 7, title: "Agent deployment coverage", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["hosts", "cloud-agents"], predicate: "Compute unique Cloud Agent host coverage over the complete host inventory; percentages below min_agent_coverage_percent violate.", constants: { default_min_agent_coverage_percent: 50 } },
   { id: "QUALYS-C08", control: 8, title: "Authentication record completeness", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["auth-records", "hosts"], predicate: "Count missing Windows, Unix/Linux, or network-device authentication record types and records whose latest status is failed or expired." },
   { id: "QUALYS-C09", control: 9, title: "Policy compliance profile assignment", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["compliance-policies", "asset-groups"], predicate: "Count draft or disabled compliance policies and policies with no readable asset-group assignment; no policy is a violation." },
-  { id: "QUALYS-C10", control: 10, title: "Vulnerability SLA adherence", severity: "critical", owner: "qualys_assess_vulnerability_management", surfaces: ["detections", "knowledge-base"], predicate: "Count open detections older than the configurable critical, high, or medium SLA for their normalized severity.", emptyOutcome: "pass", constants: { default_sla_critical_days: 15, default_sla_high_days: 30, default_sla_medium_days: 90 } },
+  {
+    id: "QUALYS-C10",
+    control: 10,
+    title: "Vulnerability SLA adherence",
+    severity: "critical",
+    owner: "qualys_assess_vulnerability_management",
+    surfaces: ["hosts", "detections"],
+    predicate: "For open severity 3 through 5 detections, apply the configured 90-day medium, 30-day high, or 15-day critical first-found SLA. Fail when dated on-SLA percentage is below 80, warn from 80 through below 95 or for undated rows, and pass at 95 or above.",
+    emptyOutcome: "pass",
+    constants: {
+      default_sla_critical_days: 15,
+      default_sla_high_days: 30,
+      default_sla_medium_days: 90,
+      pass_sla_percent: 95,
+      fail_below_sla_percent: 80,
+    },
+    runtimeFactNames: {
+      readable: "qualys_c10_host_and_detection_reads_succeeded",
+      complete: "qualys_c10_host_and_detection_lists_complete",
+      population: "qualys_c10_sla_scoped_detection_count",
+      failureMatches: "qualys_c10_sla_breach_count",
+      reviewMatches: "qualys_c10_undated_detection_count",
+    },
+    decisionInputs: {
+      qualys_c10_host_and_detection_reads_succeeded: "Boolean true only when a non-empty host inventory and the VM detection listing returned parseable status, severity, and first-found fields.",
+      qualys_c10_host_and_detection_lists_complete: "Boolean true only when host and detection VM XML continuation chains exhausted before item and page caps.",
+      qualys_c10_sla_scoped_detection_count: "Non-negative complete count of open normalized severity 3, 4, or 5 detections after fixed, closed, and informational records are excluded.",
+      qualys_c10_dated_detection_count: "Non-negative count of SLA-scoped detections carrying a parseable FIRST_FOUND_DATETIME.",
+      qualys_c10_on_sla_detection_count: "Non-negative count of dated detections whose first-found age is at most the configured 90-day medium, 30-day high, or 15-day critical SLA.",
+      qualys_c10_undated_detection_count: "Non-negative count of SLA-scoped detections without a parseable FIRST_FOUND_DATETIME; these rows are excluded from the ratio and require review.",
+    },
+    decisionRules: [
+      batch2Rule("manual", batch2Ne("qualys_c10_host_and_detection_reads_succeeded", true)),
+      batch2Rule("manual", batch2All(batch2Eq("qualys_c10_sla_scoped_detection_count", 0), batch2Ne("qualys_c10_host_and_detection_lists_complete", true))),
+      batch2Rule("pass", batch2All(batch2Eq("qualys_c10_sla_scoped_detection_count", 0), batch2Eq("qualys_c10_host_and_detection_lists_complete", true))),
+      batch2Rule("warn", batch2Eq("qualys_c10_dated_detection_count", 0)),
+      batch2Rule("fail", { op: "ratio", numerator: batch2Path("qualys_c10_on_sla_detection_count"), denominator: batch2Path("qualys_c10_dated_detection_count"), comparator: "lt", threshold: batch2Path("fail_below_sla_percent"), scale: 100 }),
+      batch2Rule("warn", batch2Any(
+        batch2Ne("qualys_c10_host_and_detection_lists_complete", true),
+        batch2Gt("qualys_c10_undated_detection_count", 0),
+        { op: "ratio", numerator: batch2Path("qualys_c10_on_sla_detection_count"), denominator: batch2Path("qualys_c10_dated_detection_count"), comparator: "lt", threshold: batch2Path("pass_sla_percent"), scale: 100 },
+      )),
+      batch2Rule("pass", { op: "always" }),
+    ],
+  },
   { id: "QUALYS-C11", control: 11, title: "Patch management tracking", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["detections", "knowledge-base"], predicate: "Count open patchable detections with no solution metadata or whose first-found age exceeds the applicable remediation SLA.", emptyOutcome: "pass" },
   { id: "QUALYS-C12", control: 12, title: "Report template and distribution", severity: "medium", owner: "qualys_assess_administration", surfaces: ["scheduled-reports", "reports"], predicate: "Count the absence of an active scheduled report and scheduled reports without a readable distribution target." },
   { id: "QUALYS-C13", control: 13, title: "User role and permission audit", severity: "high", owner: "qualys_assess_administration", surfaces: ["users", "user-list"], predicate: "Count active Manager or Unit Manager accounts above max_managers plus inactive or shared accounts.", constants: { default_max_managers: 5 } },

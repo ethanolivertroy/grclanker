@@ -26,6 +26,7 @@ import {
 } from "./batch-spec-builder.js";
 import {
   batch3RuntimeFacts,
+  batch3SetCompleteness,
   batch3UnavailableFacts,
   type Batch3RuntimeFactValues,
 } from "./batch3-spec-helpers.js";
@@ -1970,7 +1971,9 @@ function finding(
   const id = `QUALYS-C${String(control).padStart(2, "0")}`;
   const decisionFacts = isQualysDecisionValues(decisionValues)
     ? batch3RuntimeFacts(id, decisionValues)
-    : batch3UnavailableFacts(id);
+    : decisionValues && Object.keys(decisionValues).length > 0
+      ? decisionValues
+      : batch3UnavailableFacts(id);
   return {
     id,
     control,
@@ -2013,16 +2016,21 @@ function guardedFinding(input: VerdictInput): QualysFinding {
   const unknownTotal = buckets.reduce((total, [, count]) => total + count, 0);
   const notes: string[] = [];
   let status = input.status;
-  let decisionFacts = isQualysDecisionValues(input.decisionFacts)
+  let decisionFacts = input.decisionFacts && Object.keys(input.decisionFacts).length > 0
     ? input.decisionFacts
     : undefined;
+  const markIncomplete = (): void => {
+    if (!decisionFacts) return;
+    decisionFacts = isQualysDecisionValues(decisionFacts)
+      ? { ...decisionFacts, complete: false }
+      : batch3SetCompleteness(`QUALYS-C${String(input.control).padStart(2, "0")}`, decisionFacts, false);
+  };
 
   if (unreadable.length > 0) {
     const causes = unreadable.map((source) => `${source.name}${source.moduleUnavailable ? " (module unlicensed or role not permitted)" : ""}: ${shortenMessage(source.error ?? "", 120)}`);
     if (status !== "fail") status = "manual";
-    decisionFacts = status === "fail" && decisionFacts
-      ? { ...decisionFacts, complete: false }
-      : undefined;
+    if (status === "fail") markIncomplete();
+    else decisionFacts = undefined;
     notes.push(`${status === "fail" ? "Additional evidence was not readable" : "Required evidence was not readable"}: ${causes.join("; ")}.`);
   }
   // A call blocked by an unreadable upstream is disclosed with the read it would have made; a call skipped because
@@ -2033,17 +2041,17 @@ function guardedFinding(input: VerdictInput): QualysFinding {
   }
   if (truncated.length > 0) {
     if (status === "pass") status = "warn";
-    if (decisionFacts) decisionFacts = { ...decisionFacts, complete: false };
+    markIncomplete();
     notes.push(`Partial view: ${truncated.map((source) => `${source.name} ${source.truncationReason} (${source.data.length} seen${source.cap ? ` of cap ${source.cap}` : ""})`).join("; ")}.`);
   }
   if (unknownTotal > 0) {
     if (status === "pass") status = "warn";
-    if (decisionFacts) decisionFacts = { ...decisionFacts, complete: false };
+    markIncomplete();
     notes.push(`${unknownTotal} records lack the date or flag needed to count as compliant (${buckets.map(([name, count]) => `${name}: ${count}`).join(", ")}) and were not counted as compliant.`);
   }
   if (input.scope.partial) {
     if (status === "pass") status = "warn";
-    if (decisionFacts) decisionFacts = { ...decisionFacts, complete: false };
+    markIncomplete();
     notes.push(`Partial view: ${input.scope.note}`);
   }
 
@@ -3685,11 +3693,14 @@ export async function assessQualysVulnerabilityManagement(
     },
     decisionFacts: detections.error || hosts.error || !hostPopulationKnown || !detectionsFullyRead && slaScoped.length === 0
       ? {}
-      : qualysDecisionFacts(
-        slaScoped.length,
-        slaDated.length > 0 && (slaPercent ?? 0) < 80 ? slaBreaches.length : 0,
-        slaDated.length === 0 || (slaPercent ?? 0) >= 80 && (slaPercent ?? 0) < 95 ? Math.max(1, slaBreaches.length) : 0,
-      ),
+      : {
+          qualys_c10_host_and_detection_reads_succeeded: true,
+          qualys_c10_host_and_detection_lists_complete: detectionsFullyRead && !hosts.truncated,
+          qualys_c10_sla_scoped_detection_count: slaScoped.length,
+          qualys_c10_dated_detection_count: slaDated.length,
+          qualys_c10_on_sla_detection_count: Math.max(0, slaDated.length - slaBreaches.length),
+          qualys_c10_undated_detection_count: slaUndated.length,
+        },
   }));
 
   const knowledgeBaseUnusable = openQids.length > 0 && !knowledgeBase.error && kbQids.size === 0;
