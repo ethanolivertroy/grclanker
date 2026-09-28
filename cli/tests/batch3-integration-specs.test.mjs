@@ -14,6 +14,9 @@ import { KNOWBE4_RUNTIME_BEHAVIOR, KNOWBE4_SPEC } from "../dist/extensions/grc-t
 import { QUALYS_RUNTIME_BEHAVIOR, QUALYS_SPEC } from "../dist/extensions/grc-tools/qualys.spec.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 import {
+  evaluateBatchRuntimeCheckVerdict,
+} from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import {
   collectDefinedGrcTools,
   evaluateCheckVerdict,
   evaluateVerdictCondition,
@@ -223,6 +226,94 @@ test("hidden threshold bands execute below, equal, and above against primitive f
   assert.deepEqual([49, 50, 51, 89, 90, 91].map((percent) => verdict("KNOWBE4-10", { ...kb10, knowbe4_10_remediated_percent: percent })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
   const kb19 = { knowbe4_19_security_test_reads_succeeded: true, knowbe4_19_security_test_and_recipient_lists_complete: true, knowbe4_19_delivered_recipient_count: 100, knowbe4_19_configured_minimum_percent: 50, knowbe4_19_configured_fail_percent: 25 };
   assert.deepEqual([24, 25, 26, 49, 50, 51].map((percent) => verdict("KNOWBE4-19", { ...kb19, knowbe4_19_report_rate_percent: percent })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
+});
+
+test("all 86 numeric constants and 13 set or pattern branches transition through runtime metadata", () => {
+  const conditionNodes = (condition) => {
+    const nodes = [condition];
+    if (condition.op === "and" || condition.op === "or") {
+      for (const child of condition.conditions) nodes.push(...conditionNodes(child));
+    } else if (condition.op === "not") {
+      nodes.push(...conditionNodes(condition.condition));
+    }
+    return nodes;
+  };
+  const path = (operand) => operand?.kind === "path" ? operand.path : undefined;
+  const baseFacts = (check) => {
+    const facts = {};
+    for (const name of check.evidenceFields) {
+      const definition = check.evidenceFieldDefinitions[name];
+      if (/Type\/domain: [^.]*boolean/.test(definition)) facts[name] = true;
+      else if (/Type\/domain: [^.]*array/.test(definition)) facts[name] = [];
+      else if (/Type\/domain: [^.]*number/.test(definition)) {
+        facts[name] = /(?:failure|violation|review|undated|missing|without|unreadable|external)/.test(name) ? 0 : 100;
+      } else {
+        facts[name] = "observed";
+      }
+    }
+    for (const rule of Object.values(check.derivedFactRules)) {
+      for (const node of conditionNodes(rule.condition)) {
+        if (!["gt", "gte", "lt", "lte"].includes(node.op)) continue;
+        const left = path(node.left);
+        const right = path(node.right);
+        if (!left || !right || typeof check.criteria.constants[right] !== "number") continue;
+        const boundary = check.criteria.constants[right];
+        facts[left] = node.op === "gt" || node.op === "lt" ? boundary : node.op === "gte" ? boundary - 1 : boundary + 1;
+      }
+    }
+    return facts;
+  };
+  let numericBranches = 0;
+  let runtimeTransitions = 0;
+  let collectionBranches = 0;
+  for (const [spec] of batch) {
+    for (const check of spec.checks) {
+      const derived = Object.values(check.derivedFactRules);
+      const baseline = baseFacts(check);
+      for (const [constant, value] of Object.entries(check.criteria.constants)) {
+        const nodes = derived.flatMap((rule) => conditionNodes(rule.condition));
+        if (typeof value === "number") {
+          const node = nodes.find((candidate) =>
+            ["gt", "gte", "lt", "lte"].includes(candidate.op)
+            && (path(candidate.left) === constant || path(candidate.right) === constant));
+          assert.ok(node, `${check.id}.${constant}: executable comparison`);
+          const observed = path(node.left) === constant ? path(node.right) : path(node.left);
+          assert.ok(observed && check.evidenceFields.includes(observed), `${check.id}.${constant}: raw observed fact`);
+          const delta = Number.isInteger(value) ? 1 : 0.01;
+          const outcomes = [value - delta, value, value + delta].map((observedValue) =>
+            evaluateBatchRuntimeCheckVerdict(spec, check.id, { ...baseline, [observed]: observedValue }));
+          const matches = [value - delta, value, value + delta].map((observedValue) =>
+            evaluateVerdictCondition(node, { ...check.criteria.constants, ...baseline, [observed]: observedValue }));
+          assert.ok(new Set(matches).size > 1, `${check.id}.${constant}: below/equal/above branch transition`);
+          assert.ok(new Set(outcomes).size > 1, `${check.id}.${constant}: below/equal/above outcome transition`);
+          numericBranches += 1;
+          runtimeTransitions += 1;
+          continue;
+        }
+        if (!["string", "object"].includes(typeof value)) continue;
+        const node = nodes.find((candidate) =>
+          ["intersects", "matchesAny"].includes(candidate.op)
+          && [path(candidate.left), path(candidate.right), path(candidate.patterns)].includes(constant));
+        if (!node) continue;
+        const observed = node.op === "intersects"
+          ? path(path(node.left) === constant ? node.right : node.left)
+          : path(node.candidates);
+        assert.ok(observed && check.evidenceFields.includes(observed), `${check.id}.${constant}: raw collection fact`);
+        const match = Array.isArray(value) ? value[0] : value;
+        const missFacts = { ...baseline, [observed]: ["definitely-not-a-match"] };
+        const matchFacts = { ...baseline, [observed]: [match] };
+        assert.notEqual(
+          evaluateBatchRuntimeCheckVerdict(spec, check.id, missFacts),
+          evaluateBatchRuntimeCheckVerdict(spec, check.id, matchFacts),
+          `${check.id}.${constant}: set/pattern outcome transition`,
+        );
+        collectionBranches += 1;
+      }
+    }
+  }
+  assert.equal(numericBranches, 86);
+  assert.equal(runtimeTransitions, 86);
+  assert.equal(collectionBranches, 13);
 });
 
 test("batch 3 runtimes consume spec verdicts without legacy status bridges", async () => {
