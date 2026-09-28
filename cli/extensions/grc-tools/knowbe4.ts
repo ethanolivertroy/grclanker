@@ -2301,18 +2301,24 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
   if (evidence.user_list_empty === true) return fact(1, 0, 1);
   const observedViolation = evidence.violation_observed === true ? 1 : value("violation_observed") ?? 0;
   switch (id) {
-    case "KNOWBE4-01":
-      return fact(value("security_tests_read") ?? 0, (value("days_since_last_test") ?? Number.POSITIVE_INFINITY) > (value("max_campaign_gap_days") ?? 0) ? 1 : 0);
+    case "KNOWBE4-01": {
+      const maximumGap = value("max_campaign_gap_days");
+      if (maximumGap === undefined) return batch3UnavailableFacts(id);
+      return fact(value("security_tests_read") ?? 0, (value("days_since_last_test") ?? Number.POSITIVE_INFINITY) > maximumGap ? 1 : 0);
+    }
     case "KNOWBE4-02": {
       const tests = value("security_tests_in_window");
       const coverage = value("coverage_pct");
+      const minimumCoverage = value("min_coverage_pct");
+      if (minimumCoverage === undefined) return batch3UnavailableFacts(id);
       const complete = evidence.recipient_reads_complete === true && coverage !== undefined;
-      return fact(value("active_users") ?? value("users_read") ?? 0, tests === 0 || complete && coverage < (value("min_coverage_pct") ?? 0) ? 1 : 0, tests !== 0 && !complete ? 1 : 0, complete);
+      return fact(value("active_users") ?? value("users_read") ?? 0, tests === 0 || complete && coverage < minimumCoverage ? 1 : 0, tests !== 0 && !complete ? 1 : 0, complete);
     }
     case "KNOWBE4-03": {
       const campaigns = asRecordArray(evidence.campaigns_evaluated);
-      const failThreshold = value("fail_completion_pct") ?? 0;
-      const minimum = value("min_completion_pct") ?? 0;
+      const failThreshold = value("fail_completion_pct");
+      const minimum = value("min_completion_pct");
+      if (failThreshold === undefined || minimum === undefined) return batch3UnavailableFacts(id);
       return fact(campaigns.length, campaigns.filter((item) => (asNumber(item.completion_pct) ?? 100) < failThreshold).length, campaigns.filter((item) => {
         const completion = asNumber(item.completion_pct) ?? 100;
         return completion >= failThreshold && completion < minimum;
@@ -2331,12 +2337,23 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
         knowbe4_04_late_enrollment_percent: complete ? latePct : null,
       };
     }
-    case "KNOWBE4-05":
-      return fact(value("users_scored") ?? value("users_scored_read") ?? 0, (value("mean_risk_score") ?? 0) > (value("max_mean_risk_score") ?? 0) ? 1 : 0, value("mean_risk_score") === undefined || (value("stddev_risk_score") ?? 0) > (value("max_risk_score_stddev") ?? 0) ? 1 : 0);
+    case "KNOWBE4-05": {
+      const maximumMean = value("max_mean_risk_score");
+      const maximumDeviation = value("max_risk_score_stddev");
+      if (maximumMean === undefined || maximumDeviation === undefined) return batch3UnavailableFacts(id);
+      return fact(value("users_scored") ?? value("users_scored_read") ?? 0, (value("mean_risk_score") ?? 0) > maximumMean ? 1 : 0, value("mean_risk_score") === undefined || (value("stddev_risk_score") ?? 0) > maximumDeviation ? 1 : 0);
+    }
     case "KNOWBE4-06": {
       const current = value("current_phish_prone_pct");
       const baseline = value("baseline_phish_prone_pct");
-      return fact(value("security_tests_read") ?? 0, current !== undefined && current > (value("max_phish_prone_pct") ?? 0) ? 1 : 0, current === undefined || baseline !== undefined && current > baseline ? 1 : 0);
+      return {
+        knowbe4_06_security_test_sources_readable: true,
+        knowbe4_06_recipient_population_complete: true,
+        knowbe4_06_security_test_count: value("security_tests_read") ?? 0,
+        knowbe4_06_current_phish_prone_percent: current ?? null,
+        knowbe4_06_baseline_phish_prone_percent: baseline ?? null,
+        knowbe4_06_configured_max_phish_prone_percent: value("max_phish_prone_pct") ?? null,
+      };
     }
     case "KNOWBE4-07": {
       const delta = value("delta_points");
@@ -2353,8 +2370,10 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const campaigns = value("active_campaigns")
         ?? count("full_targeting_campaigns", "partial_targeting_campaigns");
       const coverage = value("estimated_coverage_pct");
+      const minimumCoverage = value("min_coverage_pct");
+      if (minimumCoverage === undefined) return batch3UnavailableFacts(id);
       const requireFull = evidence.require_full_targeting !== false;
-      return fact(campaigns, campaigns === 0 || requireFull && coverage !== undefined && coverage < (value("min_coverage_pct") ?? 0) ? 1 : 0, coverage === undefined && campaigns > 0 ? 1 : 0);
+      return fact(campaigns, campaigns === 0 || requireFull && coverage !== undefined && coverage < minimumCoverage ? 1 : 0, coverage === undefined && campaigns > 0 ? 1 : 0);
     }
     case "KNOWBE4-10": {
       const evaluated = value("failed_users_evaluated") ?? 0;
@@ -2377,8 +2396,14 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "KNOWBE4-11":
       return fact(value("modules_reviewed") ?? 0, count("retired_modules"), count("stale_modules", "undated_module_count"));
     case "KNOWBE4-12": {
-      const admins = value("admin_count") ?? 0;
-      return fact(admins, admins > (value("max_admin_count") ?? 0) ? admins - (value("max_admin_count") ?? 0) : 0, admins === 0 ? 1 : count("external_domain_admins"));
+      const admins = value("admin_count");
+      return {
+        knowbe4_12_account_and_user_sources_readable: admins !== undefined,
+        knowbe4_12_account_and_user_population_complete: admins !== undefined,
+        knowbe4_12_administrator_count: admins ?? null,
+        knowbe4_12_external_administrator_count: count("external_domain_admins"),
+        knowbe4_12_configured_max_admin_count: value("max_admin_count") ?? null,
+      };
     }
     case "KNOWBE4-16":
       return fact(value("callback_tests_all_time") ?? value("callback_tests_read") ?? 0, (value("callback_tests_in_window") ?? 0) === 0 ? 1 : 0, evidence.callback_tests_in_window === null ? 1 : 0, evidence.callback_tests_in_window !== null);
@@ -2388,7 +2413,9 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const missing = topics.filter((topic) => !Array.isArray(topic.assigned_modules) || topic.assigned_modules.length === 0).length;
       const unenrolled = knowbe4EvidenceCount(evidence, "topics_without_enrollments");
       const incomplete = evidence.completion_data_partial === true;
-      const low = topics.filter((topic) => (asNumber(topic.completion_pct) ?? 100) < (value("min_completion_pct") ?? 0)).length;
+      const minimumCompletion = value("min_completion_pct");
+      if (minimumCompletion === undefined) return batch3UnavailableFacts(id);
+      const low = topics.filter((topic) => (asNumber(topic.completion_pct) ?? 100) < minimumCompletion).length;
       return fact(topics.length, required.length > 0 ? missing + unenrolled : 0, (required.length === 0 ? missing + unenrolled : 0) + low + (incomplete ? 1 : 0), !incomplete);
     }
     case "KNOWBE4-18": {
@@ -2406,7 +2433,8 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "KNOWBE4-19": {
       const rate = value("report_rate_pct");
-      const minimum = value("min_report_rate_pct") ?? 0;
+      const minimum = value("min_report_rate_pct");
+      if (minimum === undefined) return batch3UnavailableFacts(id);
       return {
         knowbe4_19_security_test_reads_succeeded: true,
         knowbe4_19_security_test_and_recipient_lists_complete: true,

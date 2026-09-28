@@ -28,6 +28,7 @@ export interface Batch3CheckRow {
   predicate: string;
   emptyOutcome?: "pass" | "warn" | "fail" | "manual" | "info";
   violationOutcome?: "fail" | "warn";
+  incompleteOutcome?: "warn" | "manual";
   manualOnly?: boolean;
   constants?: Readonly<Record<string, PortableValue>>;
   decisionInputs?: Readonly<Record<string, string>>;
@@ -60,17 +61,29 @@ function checkPrefix(id: string): string {
   return id.toLowerCase().replaceAll("-", "_");
 }
 
+function semanticStem(title: string): string {
+  return title
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]+/g, "_")
+    .replaceAll(/^_+|_+$/g, "");
+}
+
+function checkOwnedFactNames(row: Pick<Batch3CheckRow, "id" | "title">): Batch3FactNames {
+  const prefix = checkPrefix(row.id);
+  const stem = semanticStem(row.title);
+  return {
+    readable: `${prefix}_${stem}_sources_readable`,
+    complete: `${prefix}_${stem}_population_complete`,
+    population: `${prefix}_${stem}_population_count`,
+    failureMatches: `${prefix}_${stem}_violation_count`,
+    reviewMatches: `${prefix}_${stem}_review_count`,
+  };
+}
+
 export function batch3FactNames(id: string): Batch3FactNames {
   const registered = REGISTERED_FACT_NAMES.get(id);
-  if (registered) return registered;
-  const prefix = checkPrefix(id);
-  return {
-    readable: `${prefix}_required_source_reads_succeeded`,
-    complete: `${prefix}_required_source_lists_complete`,
-    population: `${prefix}_records_evaluated`,
-    failureMatches: `${prefix}_records_matching_failure_predicate`,
-    reviewMatches: `${prefix}_records_requiring_review`,
-  };
+  if (!registered) throw new Error(`${id}: check-owned runtime fact names were not registered by its adjacent specification`);
+  return registered;
 }
 
 export function batch3RuntimeFacts(
@@ -144,7 +157,7 @@ export function batch3Source(
 
 export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinition[] {
   return batch2Checks(rows.map((row): Batch2CheckRow => {
-    if (row.runtimeFactNames) REGISTERED_FACT_NAMES.set(row.id, row.runtimeFactNames);
+    REGISTERED_FACT_NAMES.set(row.id, row.runtimeFactNames ?? checkOwnedFactNames(row));
     const names = batch3FactNames(row.id);
     const decisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : {
       [names.readable]: `Boolean set from the named source read results before any finding is created. True only when every response and required field used by ${row.id} is readable.`,
@@ -157,6 +170,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       batch2Rule("manual", batch2Any(
         batch2Ne(names.readable, true),
         batch2Not(batch2Defined(names.readable)),
+        ...(row.incompleteOutcome === "manual" ? [batch2Ne(names.complete, true)] : []),
       )),
       batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0)),
       ...(row.emptyOutcome === undefined || row.emptyOutcome === "manual"
@@ -190,25 +204,12 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
             : [batch2Rule("manual", { op: "always" }, "Missing, null, malformed, or contradictory primitives require manual review.")]),
         ]
       : undefined;
-    const numericConstants = Object.entries(row.constants ?? {})
-      .filter(([, value]) => typeof value === "number")
-      .map(([name]) => name);
-    const decisionRules = coreDecisionRules && numericConstants.length > 0
-      ? [
-          ...coreDecisionRules.slice(0, 1),
-          batch2Rule(
-            "manual",
-            batch2Any(...numericConstants.map((name) => batch2Not(batch2Defined(name)))),
-            `The numeric decision constants for ${row.id} must be present before the check can execute.`,
-          ),
-          ...coreDecisionRules.slice(1),
-        ]
-      : coreDecisionRules;
+    const decisionRules = coreDecisionRules;
     const completenessSources = row.completenessSources
       ?? row.surfaces.map((surfaceId) => batch3Source(surfaceId));
     const exactCompletenessSemantics = completenessSources.length === 0
       ? `${row.id} has no automated source dataset; no collection state can establish completeness.`
-      : `For ${row.id}, evidence_complete is true only after ${completenessSources.map((source) => source.surfaceId).join(", ")} each completed and returned every field required by this check. Exact source-state effects: ${completenessSources.map((source) => `${source.surfaceId} sets evidence_complete false on ${source.falseWhen.join(", ") || "no collection state"}`).join("; ")}. Finding previews and exported samples never establish source cardinality.`;
+      : `${names.complete} is true only after ${completenessSources.map((source) => source.surfaceId).join(", ")} each completed and returned every field required by this check. Exact source-state effects: ${completenessSources.map((source) => `${source.surfaceId} sets ${names.complete} false on ${source.falseWhen.join(", ") || "no collection state"}`).join("; ")}. Finding previews and exported samples never establish source cardinality.`;
     return {
       id: row.id,
       control: row.control,

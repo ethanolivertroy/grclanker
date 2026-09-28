@@ -255,6 +255,107 @@ function factEquals(check: BatchCheckDefinition, suffix: string, value: Portable
   };
 }
 
+function exampleOperandValue(
+  operand: VerdictOperand,
+  constants: Readonly<Record<string, PortableValue>>,
+  fallback: PortableValue,
+): PortableValue {
+  if (operand.kind === "value") return operand.value;
+  if (operand.kind === "subtract") return fallback;
+  return constants[operand.path] ?? fallback;
+}
+
+function renderExampleAssignment(
+  condition: VerdictCondition,
+  constants: Readonly<Record<string, PortableValue>>,
+): string {
+  const operandName = (operand: VerdictOperand): string => {
+    switch (operand.kind) {
+      case "path":
+      case "length":
+        return operand.path;
+      case "value":
+        return JSON.stringify(operand.value);
+      case "subtract":
+        return `(${operandName(operand.left)} - ${operandName(operand.right)})`;
+      default: {
+        const exhaustive: never = operand;
+        return String(exhaustive);
+      }
+    }
+  };
+  const compared = (
+    left: VerdictOperand,
+    right: VerdictOperand,
+    relation: "eq" | "ne" | "gt" | "gte" | "lt" | "lte",
+  ): string => {
+    const rightValue = exampleOperandValue(right, constants, 1);
+    const leftName = operandName(left);
+    const rightName = operandName(right);
+    if (left.kind !== "path" && left.kind !== "length") return `${leftName} ${relation} ${rightName}`;
+    if (relation === "eq") return `${leftName}=${JSON.stringify(rightValue)}`;
+    if (relation === "ne") {
+      const unequal = typeof rightValue === "boolean"
+        ? !rightValue
+        : typeof rightValue === "number"
+          ? rightValue + 1
+          : `${String(rightValue)}-different`;
+      return `${leftName}=${JSON.stringify(unequal)} (not ${JSON.stringify(rightValue)})`;
+    }
+    if (typeof rightValue === "number") {
+      const value = relation === "gt" ? rightValue + 1
+        : relation === "gte" ? rightValue
+          : relation === "lt" ? rightValue - 1
+            : rightValue;
+      return `${leftName}=${value}; ${rightName}=${rightValue}`;
+    }
+    return `${leftName} ${relation} ${rightName}`;
+  };
+  switch (condition.op) {
+    case "always":
+      return "all earlier ordered branch conditions are false";
+    case "and":
+      return condition.conditions.map((child) => renderExampleAssignment(child, constants)).join("; ");
+    case "or":
+      return renderExampleAssignment(condition.conditions[0] ?? { op: "always" }, constants);
+    case "not":
+      return `the following condition is false: ${renderExampleAssignment(condition.condition, constants)}`;
+    case "eq":
+    case "ne":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte":
+      return compared(condition.left, condition.right, condition.op);
+    case "ratio": {
+      const threshold = exampleOperandValue(condition.threshold, constants, 1);
+      const thresholdNumber = typeof threshold === "number" ? threshold : 1;
+      const scale = condition.scale ?? 1;
+      const denominator = 100;
+      const boundary = thresholdNumber * denominator / scale;
+      const numerator = condition.comparator === "gt" ? boundary + 1
+        : condition.comparator === "gte" ? boundary
+          : condition.comparator === "lt" ? Math.max(0, boundary - 1)
+            : boundary;
+      return `${operandName(condition.numerator)}=${numerator}; ${operandName(condition.denominator)}=${denominator}; ${operandName(condition.threshold)}=${thresholdNumber}`;
+    }
+    case "matches":
+      return `${operandName(condition.operand)}="matching-value" matching /${condition.pattern}/${condition.flags ?? ""}`;
+    case "defined":
+      return `${operandName(condition.operand)}=0 (defined)`;
+    case "null":
+      return `${operandName(condition.operand)}=null`;
+    case "some":
+      return `${condition.path}=[one record satisfying ${renderExampleAssignment(condition.condition, constants)}]`;
+    case "every":
+      return `${condition.path}=[records each satisfying ${renderExampleAssignment(condition.condition, constants)}]`;
+    default: {
+      const exhaustive: never = condition;
+      return String(exhaustive);
+    }
+  }
+}
+
 function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
   const manualOnly = /^always return manual\b/i.test(check.decision)
     && !/\b(?:pass|warn|fail)\b/i.test(check.decision.replace(/^always return manual\b/i, ""));
@@ -371,40 +472,38 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
       : "manual";
   const partialStatus: EvaluatedFindingStatus = outcomes.warn ? "warn" : "manual";
   const compliantStatus: EvaluatedFindingStatus = outcomes.pass ? "pass" : "manual";
+  const constants = check.decisionConstants ?? {};
+  const conditionFor = (status: EvaluatedFindingStatus): VerdictCondition => {
+    const rendered = renderedRules.find((entry) => entry.status === status);
+    if (!rendered) return { op: "always" };
+    if (rendered.condition.op === "eq" && rendered.condition.left.kind === "path") {
+      return check.derivedFactRules?.[rendered.condition.left.path]?.condition ?? rendered.condition;
+    }
+    return rendered.condition;
+  };
+  const exampleFor = (
+    kind: "compliant" | "noncompliant" | "partial" | "unreadable",
+    status: EvaluatedFindingStatus,
+  ) => ({
+    kind,
+    input: `${check.id} concrete primitive assignment: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`,
+    expected: status,
+    reason: `${check.id} reaches the first ${status} rule under this named primitive assignment.`,
+  });
   return {
-    pass: `${check.id} returns pass at the first ordered pass condition ${sourceConditionFor("pass")}. Portable derivation: ${check.decision}`,
-    warn: `${check.id} returns warn at the first ordered warn condition ${sourceConditionFor("warn")}. Portable derivation: ${check.decision}`,
-    fail: `${check.id} returns fail at the first ordered fail condition ${sourceConditionFor("fail")}. Portable derivation: ${check.decision}`,
+    pass: `${check.id} returns pass at the first ordered pass condition ${sourceConditionFor("pass")}. Decision predicate: ${check.decision}`,
+    warn: `${check.id} returns warn at the first ordered warn condition ${sourceConditionFor("warn")}. Decision predicate: ${check.decision}`,
+    fail: `${check.id} returns fail at the first ordered fail condition ${sourceConditionFor("fail")}. Decision predicate: ${check.decision}`,
     manual: `${check.id} returns manual at the first ordered manual condition ${sourceConditionFor("manual")}; absent, null, denied, unreadable, not-requested, and malformed primitives cannot pass.`,
     constants: check.decisionConstants ?? {
       requiredEvidenceReadable: true,
       requiredEvidenceComplete: true,
     },
     examples: [
-      {
-        kind: "compliant",
-        input: `${check.id} primitive assignment satisfies this exact first-match condition: ${sourceConditionFor(compliantStatus)}`,
-        expected: compliantStatus,
-        reason: `${check.id} evaluates the rendered ordered rules directly from the named primitive assignment and reaches ${compliantStatus}.`,
-      },
-      {
-        kind: "noncompliant",
-        input: `${check.id} primitive assignment satisfies this exact first-match condition: ${sourceConditionFor(noncompliantStatus)}`,
-        expected: noncompliantStatus,
-        reason: `${check.id} reaches the first executable ${noncompliantStatus} branch from the named primitive fields and constants.`,
-      },
-      {
-        kind: "partial",
-        input: `${check.id} has no earlier proved violation and satisfies this exact partial/review condition: ${sourceConditionFor(partialStatus)}`,
-        expected: partialStatus,
-        reason: `${check.id} applies the rendered ${partialStatus} branch to its explicitly named source-completeness primitives.`,
-      },
-      {
-        kind: "unreadable",
-        input: `${check.id} satisfies this exact unreadable or fallback condition: ${sourceConditionFor("manual")}`,
-        expected: "manual",
-        reason: `${check.id} does not coerce unavailable vendor evidence to an empty collection, zero, false, or passing fact.`,
-      },
+      exampleFor("compliant", compliantStatus),
+      exampleFor("noncompliant", noncompliantStatus),
+      exampleFor("partial", partialStatus),
+      exampleFor("unreadable", "manual"),
     ],
     rules: renderedRules,
   };
@@ -606,7 +705,7 @@ function renderCompletenessSemantics(
     }
     return `\`${source.surfaceId}\`${scope}: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact${aggregate}`;
   }).join("; ");
-  return `For ${check.id}, ${contract.semantics} Exact source-state effects: ${sourceText}`;
+  return `${contract.semantics} Exact source-state effects: ${sourceText}`;
 }
 
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {

@@ -1905,29 +1905,80 @@ function controlId(number: number): string {
   return `VERACODE-${String(number).padStart(2, "0")}`;
 }
 
+const VERACODE_UNCAPPED_COUNT = Symbol("veracode-uncapped-decision-count");
+
+type DecisionSample<T> = T[] & { [VERACODE_UNCAPPED_COUNT]?: number };
+
+function decisionSample<T>(items: readonly T[], limit: number): DecisionSample<T> {
+  const sampled = items.slice(0, limit) as DecisionSample<T>;
+  Object.defineProperty(sampled, VERACODE_UNCAPPED_COUNT, { value: items.length });
+  return sampled;
+}
+
 function veracodeEvidenceCount(evidence: JsonRecord, name: string): number {
   const value = evidence[name];
-  if (Array.isArray(value)) return value.length;
+  if (Array.isArray(value)) return (value as DecisionSample<unknown>)[VERACODE_UNCAPPED_COUNT] ?? value.length;
   return asNumber(value) ?? 0;
+}
+
+function veracodeEvidenceComplete(id: string, evidence: JsonRecord): boolean {
+  const count = (...names: string[]) => names.reduce((total, name) => total + veracodeEvidenceCount(evidence, name), 0);
+  const inventory = (...names: string[]) => names.map((name) => asNumber(evidence[name])).find((value) => value !== undefined) ?? 0;
+  const applicationsComplete = (): boolean =>
+    count("unreadable_applications", "unchecked_applications") === 0
+    && (asNumber(evidence.applications_total) ?? inventory("applications_seen", "applications_sampled"))
+      <= inventory("applications_seen", "applications_sampled");
+  const childListsComplete = (): boolean =>
+    !asRecords(evidence.per_application).some((entry) => entry.list_complete === false);
+  switch (id) {
+    case "VERACODE-01":
+    case "VERACODE-02":
+    case "VERACODE-04":
+    case "VERACODE-10":
+    case "VERACODE-15":
+    case "VERACODE-19":
+      return applicationsComplete();
+    case "VERACODE-03":
+    case "VERACODE-12":
+    case "VERACODE-16":
+    case "VERACODE-17":
+      return applicationsComplete() && childListsComplete();
+    case "VERACODE-05":
+    case "VERACODE-06":
+      return count("unreadable_workspaces") === 0
+        && (asNumber(evidence.workspaces_seen) ?? inventory("workspaces_sampled")) <= inventory("workspaces_sampled")
+        && childListsComplete();
+    case "VERACODE-07":
+      return applicationsComplete() && evidence.teams_scope !== "member_only";
+    case "VERACODE-08":
+      return evidence.roles_complete !== false
+        && evidence.teams_scope !== "member_only"
+        && count("users_without_last_login_count") === 0;
+    case "VERACODE-09":
+      return evidence.api_accounts !== null
+        && count("unreadable_users", "credentials_unreadable") === 0;
+    case "VERACODE-13":
+      return count("unreadable", "unchecked_analyses") === 0;
+    case "VERACODE-18":
+      return applicationsComplete()
+        && count("unreadable_linked_project_lists", "unchecked_applications") === 0;
+    case "VERACODE-11":
+    case "VERACODE-14":
+    case "VERACODE-20":
+      return false;
+    default:
+      return false;
+  }
 }
 
 function veracodeDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
   const counts = (...names: string[]) => names.reduce((total, name) => total + veracodeEvidenceCount(evidence, name), 0);
   const inventory = (...names: string[]) => names.map((name) => asNumber(evidence[name])).find((value) => value !== undefined) ?? 0;
-  const partial = (
-    counts("unreadable_applications", "unchecked_applications", "users_without_last_login_count") > 0
-    || (asNumber(evidence.applications_total) ?? 0) > inventory("applications_seen", "applications_sampled")
-    || (asNumber(evidence.workspaces_seen) ?? 0) > inventory("workspaces_sampled")
-    || evidence.roles_complete === false
-    || evidence.teams_scope === "member_only"
-    || ["applications_on_default_policies", "applications_without_team", "api_accounts"]
-      .some((name) => Object.hasOwn(evidence, name) && evidence[name] === null)
-    || asRecords(evidence.per_application).some((entry) => entry.list_complete === false)
-  );
+  const complete = veracodeEvidenceComplete(id, evidence);
   const fact = (population: number, violations: number, reviews: number) =>
     batch3RuntimeFacts(id, {
       readable: true,
-      complete: !partial,
+      complete,
       population,
       failureMatches: violations,
       reviewMatches: reviews,
@@ -2225,10 +2276,10 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
     applications_seen: list.items.length,
     applications_total: list.totalElements ?? null,
     fresh_applications: fresh,
-    stale_applications: stale.slice(0, 50),
-    applications_without_static_scan: noStaticScan.slice(0, 50),
-    applications_with_unpublished_latest_static_scan: notPublished.slice(0, 50),
-    applications_without_static_scan_date: missingDate.slice(0, 50),
+    stale_applications: decisionSample(stale, 50),
+    applications_without_static_scan: decisionSample(noStaticScan, 50),
+    applications_with_unpublished_latest_static_scan: decisionSample(notPublished, 50),
+    applications_without_static_scan_date: decisionSample(missingDate, 50),
     max_scan_age_days: maxScanAgeDays,
     date_source: "scans[].modified_date of the latest STATIC scan in a published status",
   };
@@ -2363,9 +2414,9 @@ function evaluateScanFrequency(snapshot: ApplicationSnapshot, policies: Surface<
   const evidence = {
     applications_seen: list.items.length,
     compliant_applications: compliant,
-    overdue_applications: overdue.slice(0, 50),
-    unconfirmed_applications: unconfirmed.slice(0, 50),
-    applications_without_frequency_requirement: noRequirement.slice(0, 50),
+    overdue_applications: decisionSample(overdue, 50),
+    unconfirmed_applications: decisionSample(unconfirmed, 50),
+    applications_without_frequency_requirement: decisionSample(noRequirement, 50),
     critical_scan_interval_days: intervals.criticalDays,
     standard_scan_interval_days: intervals.standardDays,
     requirement_basis: "strictest scan_frequency_rules across every assigned policy per scan type plus the business criticality tier against last_completed_scan_date",
@@ -2402,7 +2453,7 @@ function evaluateScanCompletion(snapshot: ApplicationSnapshot): VeracodeFinding 
     else healthy += 1;
   }
   const partial = partialInventoryNote(list, "applications");
-  const evidence = { applications_seen: list.items.length, healthy_applications: healthy, failed_scan_applications: failed.slice(0, 50), applications_without_scans: noScans.slice(0, 50) };
+  const evidence = { applications_seen: list.items.length, healthy_applications: healthy, failed_scan_applications: decisionSample(failed, 50), applications_without_scans: decisionSample(noScans, 50) };
   if (failed.length > 0) {
     return finding(19, "medium", joinNotes(`${failed.length}/${list.items.length} applications expose a latest scan in a failed, canceled, or incomplete status.`, partial), evidence);
   }
@@ -2433,7 +2484,7 @@ async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSna
   const caveats = [partialInventoryNote(list, "applications"), scopeNote(sampled.length, list.items.length, "applications")];
   // With no sandbox list readable the counts are unknown, not 0.
   const anyReadable = results.some((item) => item.sandboxes.status === "ok");
-  const evidence = { applications_sampled: sampled.length, applications_total: knownTotal(list), applications_with_sandboxes: anyReadable ? withSandboxes : null, applications_without_sandboxes: anyReadable ? withoutSandboxes.slice(0, 50) : null, unreadable_applications: unreadable.length };
+  const evidence = { applications_sampled: sampled.length, applications_total: knownTotal(list), applications_with_sandboxes: anyReadable ? withSandboxes : null, applications_without_sandboxes: anyReadable ? decisionSample(withoutSandboxes, 50) : null, unreadable_applications: unreadable.length };
   if (unreadable.length === results.length) {
     return { finding: manualFinding(10, "medium", unreadableReason("sandboxes", unreadable[0].sandboxes), ["Confirm sandbox usage per application in the Platform."], evidence), raw, errors };
   }
@@ -2534,11 +2585,11 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
   const evidence = {
     analyses_seen: analyses.value.items.length,
     analyses_sampled: sampled.length,
-    scan_coverage: scanListsUnreadable ? null : scanCoverage.slice(0, 50),
+    scan_coverage: scanListsUnreadable ? null : decisionSample(scanCoverage, 50),
     configured_scans: configurationsUnknown ? null : configured,
-    unauthenticated_scans: configurationsUnknown ? null : unauthenticated.slice(0, 50),
-    crawl_disabled_scans: configurationsUnknown ? null : crawlDisabled.slice(0, 50),
-    unreadable: unreadable.slice(0, 50),
+    unauthenticated_scans: configurationsUnknown ? null : decisionSample(unauthenticated, 50),
+    crawl_disabled_scans: configurationsUnknown ? null : decisionSample(crawlDisabled, 50),
+    unreadable: decisionSample(unreadable, 50),
   };
   const raw = { analyses: analyses.value.items, scans_by_analysis: rawScansByAnalysis, scan_configurations: scanListsUnreadable ? notAttempted("no scan list was readable, so no scan configuration was requested.") : rawScans };
   if (configurationsRead === 0) {
@@ -2645,7 +2696,7 @@ function evaluatePolicyCompliance(snapshot: ApplicationSnapshot): VeracodeFindin
     else unassessed.push(applicationName(app));
   }
   const partial = partialInventoryNote(list, "applications");
-  const evidence = { applications_seen: list.items.length, passing_applications: passing, failing_applications: failing.slice(0, 50), conditional_pass_applications: conditional.slice(0, 50), unassessed_applications: unassessed.slice(0, 50), applications_without_policy: unassigned.slice(0, 50) };
+  const evidence = { applications_seen: list.items.length, passing_applications: passing, failing_applications: decisionSample(failing, 50), conditional_pass_applications: decisionSample(conditional, 50), unassessed_applications: decisionSample(unassessed, 50), applications_without_policy: decisionSample(unassigned, 50) };
   if (failing.length > 0 || unassigned.length > 0) {
     return finding(2, "critical", joinNotes(`${failing.length}/${list.items.length} applications did not pass their assigned policy and ${unassigned.length} have no policy assigned.`, partial), evidence);
   }
@@ -2682,7 +2733,7 @@ function evaluateCustomPolicies(snapshot: ApplicationSnapshot, policies: Surface
   const applicationsRead = snapshot.applications.status === "ok";
   const caveats = [partialInventoryNote(policies.value, "policies"), snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so policy assignment per application was not verified."];
   // Per-application assignment counts come from the application inventory: null, never 0 or [], when it was not read.
-  const evidence = { policies_seen: policies.value.items.length, custom_policies: customPolicies.length, custom_policies_without_finding_rules: customWithoutRules, custom_policies_without_grace_periods: customWithoutGrace, applications_on_default_policies: applicationsRead ? appsOnDefaultPolicies.slice(0, 50) : null, applications_on_custom_policies: applicationsRead ? appsOnCustom : null };
+  const evidence = { policies_seen: policies.value.items.length, custom_policies: customPolicies.length, custom_policies_without_finding_rules: customWithoutRules, custom_policies_without_grace_periods: customWithoutGrace, applications_on_default_policies: applicationsRead ? decisionSample(appsOnDefaultPolicies, 50) : null, applications_on_custom_policies: applicationsRead ? appsOnCustom : null };
   if (customPolicies.length === 0) {
     return finding(15, "high", joinNotes(`None of the ${policies.value.items.length} policies is a customer-defined (CUSTOMER type) policy, so applications rely on Veracode default policies.`, ...caveats), evidence);
   }
@@ -2852,7 +2903,7 @@ function evaluateMitigationWorkflow(samples: ApplicationFindingsSample[], invent
     }
   }
   const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} application finding lists were unreadable.` : undefined, incomplete > 0 ? `${incomplete} finding lists were truncated.` : undefined];
-  const evidence = { applications_sampled: samples.length, findings_seen: findingsSeen, mitigation_annotations_seen: mitigationsSeen, proposed_not_reviewed: pendingReview.slice(0, 100), proposed_not_reviewed_count: pendingReview.length, mitigations_without_justification: unjustified.slice(0, 100) };
+  const evidence = { applications_sampled: samples.length, findings_seen: findingsSeen, mitigation_annotations_seen: mitigationsSeen, proposed_not_reviewed: decisionSample(pendingReview, 100), proposed_not_reviewed_count: pendingReview.length, mitigations_without_justification: decisionSample(unjustified, 100) };
   if (findingsSeen === 0) {
     return manualFinding(12, "high", "The sampled applications returned zero findings, so there are no mitigations to audit; the empty population is treated as unverifiable rather than compliant.", manualEvidence, evidence);
   }
@@ -2906,10 +2957,10 @@ function evaluateFalsePositiveRate(samples: ApplicationFindingsSample[], invento
   const evidence = {
     applications_sampled: samples.length,
     applications_with_findings: evaluated,
-    applications_exceeding: exceeding.slice(0, 50),
+    applications_exceeding: decisionSample(exceeding, 50),
     max_rate_percent: maxRatePercent,
     signal: "annotations[].action FP (include_annot=TRUE); finding_status.resolution is recorded as evidence only",
-    per_application: perApplication.slice(0, 50),
+    per_application: decisionSample(perApplication, 50),
   };
   if (evaluated === 0) {
     return manualFinding(16, "medium", "No sampled application returned findings, so a false positive rate cannot be computed; the empty population is treated as unverifiable rather than compliant.", manualEvidence, evidence);
@@ -2944,7 +2995,7 @@ function evaluateFlawDensity(samples: ApplicationFindingsSample[], inventory: Ha
     if (density > maxDensity) exceeding.push({ application: sample.application, density: Number(density.toFixed(3)), kloc: Number((loc / 1000).toFixed(1)), high_flaws: highFlaws });
   }
   const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} summary reports were unreadable.` : undefined];
-  const evidence = { applications_sampled: samples.length, applications_evaluated: evaluated, applications_exceeding: exceeding.slice(0, 50), applications_without_loc: missingLoc.slice(0, 50), max_density_per_kloc: maxDensity };
+  const evidence = { applications_sampled: samples.length, applications_evaluated: evaluated, applications_exceeding: decisionSample(exceeding, 50), applications_without_loc: decisionSample(missingLoc, 50), max_density_per_kloc: maxDensity };
   if (exceeding.length > 0) {
     return finding(17, "medium", joinNotes(`${exceeding.length}/${evaluated} applications exceed ${maxDensity} Very High/High flaws per KLOC.`, ...caveats), evidence);
   }
@@ -3177,11 +3228,11 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   const evidence = {
     applications_sampled: sampled.length,
     covered_applications: covered.length,
-    uncovered_applications: scaBlocker ? null : uncovered.slice(0, 50),
-    unreadable_applications: unreadable.slice(0, 50),
-    unreadable_linked_project_lists: unreadableLists.slice(0, 50),
+    uncovered_applications: scaBlocker ? null : decisionSample(uncovered, 50),
+    unreadable_applications: decisionSample(unreadable, 50),
+    unreadable_linked_project_lists: decisionSample(unreadableLists, 50),
     linked_project_lists_requested: listsRequested,
-    unchecked_applications: unchecked.slice(0, 50),
+    unchecked_applications: decisionSample(unchecked, 50),
     linked_projects_by_application: linkedProjectListsRead > 0 ? linkedProjectsByApplication : null,
     sca_agent_api_available: !scaBlocker,
     sca_agent_api_status: workspaces.status === "error" ? workspaces.statusCode ?? null : null,
@@ -3316,7 +3367,7 @@ function evaluateTeamAccess(snapshot: IdentitySnapshot, maxUnrestricted: number)
   const teamScopeNotes = snapshot.teams.value.notes ?? [];
   const caveats = [partialInventoryNote(snapshot.users.value, "users"), partialInventoryNote(snapshot.roles.value, "roles"), partialInventoryNote(snapshot.teams.value, "teams"), ...teamScopeNotes, snapshot.applications.status === "ok" ? partialInventoryNote(snapshot.applications.value, "applications") : "The application inventory was unreadable, so application team assignment was not verified."];
   // The team assignment list comes from the application inventory: null, never [], when it was not read.
-  const evidence = { users_seen: snapshot.users.value.items.length, roles_seen: snapshot.roles.value.items.length, roles_complete: snapshot.roles.value.complete, teams_seen: snapshot.teams.value.items.length, teams_scope: teamScopeNotes.length > 0 ? "member_only" : "organization", team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: unrestrictedUsers.slice(0, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: applicationsRead ? appsWithoutTeams.slice(0, 50) : null, max_unrestricted_users: maxUnrestricted };
+  const evidence = { users_seen: snapshot.users.value.items.length, roles_seen: snapshot.roles.value.items.length, roles_complete: snapshot.roles.value.complete, teams_seen: snapshot.teams.value.items.length, teams_scope: teamScopeNotes.length > 0 ? "member_only" : "organization", team_unrestricted_roles: [...unrestrictedRoles].filter(Boolean), users_with_all_application_access: decisionSample(unrestrictedUsers, 100), users_with_all_application_access_count: unrestrictedUsers.length, applications_without_team: applicationsRead ? decisionSample(appsWithoutTeams, 50) : null, max_unrestricted_users: maxUnrestricted };
   if (snapshot.teams.value.items.length === 0 && teamScopeNotes.length > 0) {
     return manualFinding(7, "high", joinNotes("The organization-wide team list was refused and the API user is a member of no teams, so team scoping could not be verified.", ...teamScopeNotes), manualEvidence, evidence);
   }
@@ -3349,7 +3400,7 @@ function evaluateUserRoles(snapshot: IdentitySnapshot, maxAdmins: number, inacti
   const serviceWithoutTeam = active.filter((user) => isApiAccount(user) && asRecords(user.teams).length === 0 && asBoolean(user.no_teams_required) !== true).map(userLabel);
   const nonSaml = active.filter(isActiveHuman).filter((user) => asBoolean(user.saml_user) !== true).map(userLabel);
   const partial = partialInventoryNote(snapshot.users.value, "users");
-  const evidence = { users_seen: users.length, active_users: active.length, administrators: admins.slice(0, 50), administrator_count: admins.length, max_admins: maxAdmins, inactive_users: inactive.slice(0, 100), inactive_count: inactive.length, users_without_last_login: neverLoggedIn.slice(0, 100), users_without_last_login_count: neverLoggedIn.length, api_accounts_without_team: serviceWithoutTeam.slice(0, 50), non_saml_human_users: nonSaml.length, inactive_days: inactiveDays };
+  const evidence = { users_seen: users.length, active_users: active.length, administrators: decisionSample(admins, 50), administrator_count: admins.length, max_admins: maxAdmins, inactive_users: decisionSample(inactive, 100), inactive_count: inactive.length, users_without_last_login: decisionSample(neverLoggedIn, 100), users_without_last_login_count: neverLoggedIn.length, api_accounts_without_team: decisionSample(serviceWithoutTeam, 50), non_saml_human_users: nonSaml.length, inactive_days: inactiveDays };
   if (inactive.length > 0 || serviceWithoutTeam.length > 0 || admins.length > maxAdmins) {
     return finding(8, "high", joinNotes(`${admins.length} Administrator accounts (threshold ${maxAdmins}), ${inactive.length} active human users with no login in ${inactiveDays} days, and ${serviceWithoutTeam.length} API accounts without a team assignment.`, partial), evidence);
   }
@@ -3398,7 +3449,7 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
   const caveats = [partialInventoryNote(snapshot.users.value, "users"), scopeNote(sampled.length, apiUsers.length, "API accounts"), unreadable.length > 0 ? `${unreadable.length} credential records were unreadable.` : undefined];
   // With no credential record readable the age classification is unknown, not 0 or []; credentials_readable stays the honest count of records read.
   const anyReadable = readable.length > 0;
-  const evidence = { api_accounts: snapshot.users.value.complete ? apiUsers.length : null, api_accounts_sampled: sampled.length, credentials_readable: readable.length, credentials_current: anyReadable ? current : null, credentials_over_max_age: anyReadable ? aged.slice(0, 100) : null, credentials_over_max_age_count: anyReadable ? aged.length : null, credentials_expired: anyReadable ? expired.slice(0, 50) : null, credentials_missing_dates: anyReadable ? missingDates.slice(0, 50) : null, max_credential_age_days: maxAgeDays };
+  const evidence = { api_accounts: snapshot.users.value.complete ? apiUsers.length : null, api_accounts_sampled: sampled.length, credentials_readable: readable.length, credentials_current: anyReadable ? current : null, credentials_over_max_age: anyReadable ? decisionSample(aged, 100) : null, credentials_over_max_age_count: anyReadable ? aged.length : null, credentials_expired: anyReadable ? decisionSample(expired, 50) : null, credentials_missing_dates: anyReadable ? decisionSample(missingDates, 50) : null, max_credential_age_days: maxAgeDays };
   if (readable.length === 0) {
     return { finding: manualFinding(9, "high", unreadableReason("api_credentials (Administrator role)", unreadable[0].credentials), manualEvidence, evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
   }

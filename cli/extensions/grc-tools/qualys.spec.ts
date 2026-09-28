@@ -5,17 +5,68 @@ import {
 import {
   batch2All,
   batch2Any,
+  batch2Defined,
   batch2Eq,
   batch2Gt,
   batch2Ne,
+  batch2Not,
   batch2Path,
   batch2Rule,
   restSurface,
 } from "./batch2-spec-helpers.js";
 import { QUALYS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import type { RequestParameterContract } from "./spec-model.js";
 
 const DOCS = "https://docs.qualys.com/en/vm/api/";
+const parameter = (
+  name: string,
+  value: string,
+  required = true,
+  location: RequestParameterContract["location"] = "query",
+): RequestParameterContract => ({ name, location, required, value });
+const VM_PARAMETERS: Readonly<Record<string, readonly RequestParameterContract[]>> = {
+  "scheduled-scans": [parameter("action", "list"), parameter("show_notifications", "0")],
+  scans: [parameter("action", "list"), parameter("launched_after_datetime", "ISO-8601 UTC now minus the resolved lookbackDays"), parameter("show_ags", "1"), parameter("show_op", "1")],
+  hosts: [parameter("action", "list"), parameter("details", "All"), parameter("show_tags", "1"), parameter("truncation_limit", "min(resolved hostLimit, 1000)")],
+  "option-profiles": [parameter("action", "list")],
+  "excluded-ips": [parameter("action", "list")],
+  "asset-groups": [parameter("action", "list"), parameter("show_attributes", "ALL"), parameter("truncation_limit", "500")],
+  appliances: [parameter("action", "list"), parameter("output_mode", "full")],
+  "auth-records": [parameter("action", "list")],
+  "compliance-policies": [parameter("action", "list"), parameter("details", "Basic")],
+  detections: [
+    parameter("action", "list"),
+    parameter("status", "Active,New,Re-Opened"),
+    parameter("severities", "3,4,5"),
+    parameter("show_qds", "1"),
+    parameter("truncation_limit", "min(resolved detectionLimit, 1000)"),
+    parameter("output_format", "XML"),
+  ],
+  "knowledge-base": [parameter("action", "list"), parameter("details", "Basic"), parameter("ids", "Comma-separated batch of at most 100 QIDs returned by the detection inventory")],
+  "scheduled-reports": [parameter("action", "list"), parameter("is_active", "1")],
+  reports: [parameter("action", "list")],
+  "activity-log": [parameter("action", "list"), parameter("since_datetime", "ISO-8601 UTC now minus the resolved lookbackDays"), parameter("truncation_limit", "5000")],
+  "user-list": [],
+};
+const QPS_FILTERS: Readonly<Record<string, readonly RequestParameterContract[]>> = {
+  connectors: [],
+  "cloud-agents": [parameter("ServiceRequest.filters.Criteria[tagName,EQUALS]", "Cloud Agent", true, "form-body")],
+  tags: [],
+  users: [],
+  "was-webapps": [parameter("ServiceRequest.preferences.verbose", "true", true, "form-body")],
+  "was-scans": [
+    parameter("ServiceRequest.filters.Criteria[launchedDate,GREATER]", "ISO-8601 UTC now minus the resolved lookbackDays", true, "form-body"),
+    parameter("ServiceRequest.filters.Criteria[type,EQUALS]", "VULNERABILITY", true, "form-body"),
+  ],
+  "was-scan-history": [
+    parameter("ServiceRequest.filters.Criteria[webApp.id,IN]", "Comma-separated batch of at most 50 web-application IDs", true, "form-body"),
+    parameter("ServiceRequest.filters.Criteria[type,EQUALS]", "VULNERABILITY", true, "form-body"),
+    parameter("ServiceRequest.filters.Criteria[status,EQUALS]", "FINISHED", true, "form-body"),
+  ],
+  "was-auth-records": [],
+  "was-schedules": [],
+};
 const vm = (id: string, path: string, fields: readonly string[]) => {
   const qps = path.startsWith("/qps/");
   const administration = path.startsWith("/msp/");
@@ -32,15 +83,15 @@ const vm = (id: string, path: string, fields: readonly string[]) => {
           parameters: [
             { name: "ServiceRequest.preferences.limitResults", location: "form-body", required: true, value: "100, 500, or the remaining configured cap selected by the concrete collector." },
             { name: "ServiceRequest.preferences.startFromId", location: "form-body", required: false, value: "Last returned object ID when hasMoreRecords is true." },
-            { name: "ServiceRequest.filters.Criteria", location: "form-body", required: false, value: "Exact check-specific field/operator/value criteria; omitted only for unfiltered searches." },
+            ...(QPS_FILTERS[id] ?? []),
           ],
           responseShape: `JSON ServiceResponse containing data, hasMoreRecords, lastId, and projected ${fields.join(", ")} members.`,
         }
       : {
           headers: ["Authorization: Basic or Bearer according to the resolved mode", "X-Requested-With: grclanker", "Accept: application/xml"],
           parameters: administration
-            ? [{ name: "request", location: "query", required: false, value: "The Administration user-list endpoint accepts no action selector in the shipped collector." }]
-            : [{ name: "action", location: "query", required: true, value: "list" }],
+            ? VM_PARAMETERS[id] ?? []
+            : VM_PARAMETERS[id] ?? [],
           responseShape: `Qualys VM/PC API v2 XML response parsed from the documented DTD; projected ${fields.join(", ")} members.`,
         },
   );
@@ -75,7 +126,49 @@ const surfaces = [
 
 const rows: readonly Batch3CheckRow[] = [
   { id: "QUALYS-C01", control: 1, title: "Scan schedule coverage", severity: "high", owner: "qualys_assess_scan_coverage", surfaces: ["scheduled-scans", "scans", "asset-groups"], predicate: "Count asset groups with no active recurring vulnerability scan and schedules whose most recent completed scan is older than lookback_days.", constants: { default_lookback_days: 30 } },
-  { id: "QUALYS-C02", control: 2, title: "Authenticated scan ratio", severity: "high", owner: "qualys_assess_scan_coverage", surfaces: ["hosts", "auth-records"], predicate: "Compute hosts with successful authenticated-scan evidence divided by the complete host population; percentages below min_auth_scan_percent violate.", constants: { default_min_auth_scan_percent: 80 } },
+  {
+    id: "QUALYS-C02",
+    control: 2,
+    title: "Authenticated scan ratio",
+    severity: "high",
+    owner: "qualys_assess_scan_coverage",
+    surfaces: ["hosts"],
+    predicate: "Compute hosts carrying LAST_VM_AUTH_SCANNED_DATE inside the resolved lookback divided by hosts carrying a vulnerability scan date; fail when the percentage is below configured_min_auth_scan_percent.",
+    constants: { default_min_auth_scan_percent: 80 },
+    runtimeFactNames: {
+      readable: "qualys_c02_host_list_readable",
+      complete: "qualys_c02_host_list_complete",
+      population: "qualys_c02_scanned_host_count",
+      failureMatches: "qualys_c02_authenticated_host_count",
+      reviewMatches: "qualys_c02_hosts_without_scan_date_count",
+    },
+    decisionInputs: {
+      qualys_c02_host_list_readable: "Boolean true only when the host XML list returns parseable LAST_VULN_SCAN_DATETIME and LAST_VM_AUTH_SCANNED_DATE fields.",
+      qualys_c02_host_list_complete: "Boolean true only when host XML pagination exhausts without a cap, repeated continuation, request error, denial, or missing required fields.",
+      qualys_c02_scanned_host_count: "Uncapped count of hosts carrying a parseable vulnerability scan date; this is the ratio denominator.",
+      qualys_c02_authenticated_host_count: "Uncapped count of scanned hosts whose LAST_VM_AUTH_SCANNED_DATE falls inside max(configured lookbackDays, 30 days).",
+      qualys_c02_hosts_without_scan_date_count: "Uncapped count of returned hosts without a parseable vulnerability scan date; these hosts never enter the denominator and require review only after the ratio branch.",
+      qualys_c02_configured_min_auth_scan_percent: "Resolved minAuthScanPercent after clamping to the inclusive 0 through 100 configuration domain; null means configuration was not established and requires manual review.",
+    },
+    decisionRules: [
+      batch2Rule("manual", batch2Ne("qualys_c02_host_list_readable", true)),
+      batch2Rule("manual", batch2Not(batch2Defined("qualys_c02_configured_min_auth_scan_percent"))),
+      batch2Rule("fail", batch2Eq("qualys_c02_scanned_host_count", 0)),
+      batch2Rule("fail", {
+        op: "ratio",
+        numerator: batch2Path("qualys_c02_authenticated_host_count"),
+        denominator: batch2Path("qualys_c02_scanned_host_count"),
+        comparator: "lt",
+        threshold: batch2Path("qualys_c02_configured_min_auth_scan_percent"),
+        scale: 100,
+      }),
+      batch2Rule("warn", batch2Any(
+        batch2Ne("qualys_c02_host_list_complete", true),
+        batch2Gt("qualys_c02_hosts_without_scan_date_count", 0),
+      )),
+      batch2Rule("pass", { op: "always" }),
+    ],
+  },
   { id: "QUALYS-C03", control: 3, title: "Scan option profile review", severity: "medium", owner: "qualys_assess_scan_coverage", surfaces: ["option-profiles", "scheduled-scans"], predicate: "Count option profiles referenced by active schedules that omit safe checks, authenticated scanning, or documented port and performance settings." },
   { id: "QUALYS-C04", control: 4, title: "Asset group completeness", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["hosts", "asset-groups"], predicate: "Count host assets assigned to no asset group, empty group IP sets, and group members absent from the complete host inventory." },
   { id: "QUALYS-C05", control: 5, title: "Cloud connector status", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["connectors"], predicate: "Count cloud connectors not in an active or successful synchronization state or with no readable last-sync timestamp." },
@@ -142,7 +235,48 @@ const rows: readonly Batch3CheckRow[] = [
   },
   { id: "QUALYS-C11", control: 11, title: "Patch management tracking", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["detections", "knowledge-base"], predicate: "Count open patchable detections with no solution metadata or whose first-found age exceeds the applicable remediation SLA.", emptyOutcome: "pass" },
   { id: "QUALYS-C12", control: 12, title: "Report template and distribution", severity: "medium", owner: "qualys_assess_administration", surfaces: ["scheduled-reports", "reports"], predicate: "Count the absence of an active scheduled report and scheduled reports without a readable distribution target." },
-  { id: "QUALYS-C13", control: 13, title: "User role and permission audit", severity: "high", owner: "qualys_assess_administration", surfaces: ["users", "user-list"], predicate: "Count active Manager or Unit Manager accounts above max_managers plus inactive or shared accounts.", constants: { default_max_managers: 5 } },
+  {
+    id: "QUALYS-C13",
+    control: 13,
+    title: "User role and permission audit",
+    severity: "high",
+    owner: "qualys_assess_administration",
+    surfaces: ["users", "user-list"],
+    predicate: "Fail when the uncapped active Manager or super-user count exceeds configured_max_managers or any email address is shared by multiple accounts; otherwise review stale, generic, pending, or source-incomplete accounts.",
+    constants: { default_max_managers: 5 },
+    runtimeFactNames: {
+      readable: "qualys_c13_user_sources_readable",
+      complete: "qualys_c13_user_population_complete",
+      population: "qualys_c13_active_user_count",
+      failureMatches: "qualys_c13_manager_count",
+      reviewMatches: "qualys_c13_review_account_count",
+    },
+    decisionInputs: {
+      qualys_c13_user_sources_readable: "Boolean true only when both Administration user search and VM/PC User List return their required role, status, login, email, and last-login fields.",
+      qualys_c13_user_population_complete: "Boolean true only when both user sources exhaust and no Restricted-view hidden login, source truncation, error, denial, or missing required field leaves the joined population incomplete.",
+      qualys_c13_active_user_count: "Uncapped count of joined users whose VM/PC USER_STATUS is Active, or the lower-bound Administration population when that source alone proves a violation.",
+      qualys_c13_manager_count: "Uncapped count of joined active users carrying Manager, Unit Manager, or super-user role evidence.",
+      qualys_c13_shared_email_count: "Uncapped count of normalized email addresses used by more than one returned account.",
+      qualys_c13_review_account_count: "Uncapped sum of stale-login, generic-identifier, Pending Activation, and required-field review records.",
+      qualys_c13_configured_max_managers: "Resolved maxManagers after clamping to 0 through 10000; null means configuration was not established and requires manual review.",
+    },
+    decisionRules: [
+      batch2Rule("manual", batch2Not(batch2Defined("qualys_c13_configured_max_managers"))),
+      batch2Rule("fail", batch2Any(
+        { op: "gt", left: batch2Path("qualys_c13_manager_count"), right: batch2Path("qualys_c13_configured_max_managers") },
+        batch2Gt("qualys_c13_shared_email_count", 0),
+      )),
+      batch2Rule("manual", batch2Any(
+        batch2Ne("qualys_c13_user_sources_readable", true),
+        batch2Eq("qualys_c13_active_user_count", 0),
+      )),
+      batch2Rule("warn", batch2Any(
+        batch2Ne("qualys_c13_user_population_complete", true),
+        batch2Gt("qualys_c13_review_account_count", 0),
+      )),
+      batch2Rule("pass", { op: "always" }),
+    ],
+  },
   { id: "QUALYS-C14", control: 14, title: "External scanner configuration", severity: "high", owner: "qualys_assess_scan_coverage", surfaces: ["scheduled-scans", "appliances"], predicate: "Count the absence of an active external scan schedule and schedules referencing no external scanner appliance." },
   { id: "QUALYS-C15", control: 15, title: "Web application inventory", severity: "high", owner: "qualys_assess_administration", surfaces: ["was-webapps", "was-scans", "was-scan-history", "was-auth-records", "was-schedules"], predicate: "Count web applications without an active schedule, a recent completed scan, or required authentication records." },
   {

@@ -2890,9 +2890,14 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "run an Authentication Report in Qualys and record the percentage of hosts with successful authenticated scans.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length },
-    decisionFacts: hosts.error || hosts.data.length === 0
-      ? {}
-      : qualysDecisionFacts(scannedHosts.length, scannedHosts.length === 0 || (authPercent ?? 0) < settings.minAuthScanPercent ? 1 : 0),
+    decisionFacts: {
+      qualys_c02_host_list_readable: !hosts.error,
+      qualys_c02_host_list_complete: !hosts.error && !hosts.truncated,
+      qualys_c02_scanned_host_count: hosts.error ? null : scannedHosts.length,
+      qualys_c02_authenticated_host_count: hosts.error ? null : authScannedHosts.length,
+      qualys_c02_hosts_without_scan_date_count: hosts.error ? null : hostsWithoutScanDate.length,
+      qualys_c02_configured_min_auth_scan_percent: settings.minAuthScanPercent,
+    },
   }));
 
   findings.push(guardedFinding({
@@ -4127,13 +4132,21 @@ export async function assessQualysAdministration(
       users_without_last_login: usersWithoutLastLogin.length,
       users_without_login_in_restricted_view: restrictedViewUsers.length,
     },
-    decisionFacts: bothUserSourcesUnreadable || activeUsers.length === 0 && !excessiveManagers && sharedEmails.length === 0
-      ? {}
-      : qualysDecisionFacts(
-        activeUsers.length,
-        excessiveManagers || sharedEmails.length > 0 ? Math.max(1, managers.length - settings.maxManagers, sharedEmails.length) : 0,
-        staleLoginUsers.length + genericAccounts.length + pendingUsers.length,
-      ),
+    decisionFacts: {
+      qualys_c13_user_sources_readable: !userList.error && !users.error,
+      qualys_c13_user_population_complete: !userList.error
+        && !users.error
+        && !userList.truncated
+        && !users.truncated
+        && restrictedViewUsers.length === 0,
+      qualys_c13_active_user_count: bothUserSourcesUnreadable ? null : activeUsers.length,
+      qualys_c13_manager_count: bothUserSourcesUnreadable ? null : managers.length,
+      qualys_c13_shared_email_count: bothUserSourcesUnreadable ? null : sharedEmails.length,
+      qualys_c13_review_account_count: bothUserSourcesUnreadable
+        ? null
+        : staleLoginUsers.length + genericAccounts.length + pendingUsers.length + usersWithoutLastLogin.length,
+      qualys_c13_configured_max_managers: settings.maxManagers,
+    },
   }));
 
   const wasStatus: QualysFindingStatus = webApps.error || wasScans.error || wasAuth.error
