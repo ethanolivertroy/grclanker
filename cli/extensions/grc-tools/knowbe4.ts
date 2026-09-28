@@ -2240,36 +2240,135 @@ function findingId(number: number): string {
   return `KNOWBE4-${String(number).padStart(2, "0")}`;
 }
 
+const KNOWBE4_DECISION_FACTS = Symbol("knowbe4-decision-facts");
+
+type Knowbe4FindingWithFacts = Knowbe4Finding & {
+  [KNOWBE4_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
+};
+
+function knowbe4EvidenceCount(evidence: JsonRecord, name: string): number {
+  const value = evidence[name];
+  if (Array.isArray(value)) return value.length;
+  return asNumber(value) ?? 0;
+}
+
+function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
+  const count = (...names: string[]) => names.reduce((total, name) => total + knowbe4EvidenceCount(evidence, name), 0);
+  const value = (name: string) => asNumber(evidence[name]);
+  const fact = (inventoryCount: number, violationCount = 0, reviewCount = 0, complete = true) => ({
+    evidence_readable: true,
+    evidence_complete: complete,
+    inventory_count: inventoryCount,
+    violation_count: violationCount,
+    review_count: reviewCount,
+  });
+  const observedViolation = evidence.violation_observed === true ? 1 : value("violation_observed") ?? 0;
+  switch (id) {
+    case "KNOWBE4-01":
+      return fact(value("security_tests_read") ?? 0, (value("days_since_last_test") ?? Number.POSITIVE_INFINITY) > (value("max_campaign_gap_days") ?? 0) ? 1 : 0);
+    case "KNOWBE4-02": {
+      const tests = value("security_tests_in_window");
+      const coverage = value("coverage_pct");
+      const complete = evidence.recipient_reads_complete === true && coverage !== undefined;
+      return fact(value("active_users") ?? value("users_read") ?? 0, tests === 0 || complete && coverage < (value("min_coverage_pct") ?? 0) ? 1 : 0, tests !== 0 && !complete ? 1 : 0, complete);
+    }
+    case "KNOWBE4-03": {
+      const campaigns = asRecordArray(evidence.campaigns_evaluated);
+      const failThreshold = value("fail_completion_pct") ?? 0;
+      const minimum = value("min_completion_pct") ?? 0;
+      return fact(campaigns.length, campaigns.filter((item) => (asNumber(item.completion_pct) ?? 100) < failThreshold).length, campaigns.filter((item) => {
+        const completion = asNumber(item.completion_pct) ?? 100;
+        return completion >= failThreshold && completion < minimum;
+      }).length + count("campaigns_with_truncated_enrollments", "campaigns_without_measurable_completion"));
+    }
+    case "KNOWBE4-04": {
+      const inventory = value("new_users_evaluated") ?? value("new_users_read") ?? 0;
+      const late = value("late_or_missing_enrollments") ?? value("late_or_missing_enrollments_among_read_users");
+      const complete = late !== undefined;
+      return fact(inventory, complete && (value("late_pct") ?? 0) > 5 ? late : 0, !complete || (late ?? 0) > 0 ? Math.max(1, late ?? 0) : 0, complete);
+    }
+    case "KNOWBE4-05":
+      return fact(value("users_scored") ?? value("users_scored_read") ?? 0, (value("mean_risk_score") ?? 0) > (value("max_mean_risk_score") ?? 0) ? 1 : 0, value("mean_risk_score") === undefined || (value("stddev_risk_score") ?? 0) > (value("max_risk_score_stddev") ?? 0) ? 1 : 0);
+    case "KNOWBE4-06": {
+      const current = value("current_phish_prone_pct");
+      const baseline = value("baseline_phish_prone_pct");
+      return fact(value("security_tests_read") ?? 0, current !== undefined && current > (value("max_phish_prone_pct") ?? 0) ? 1 : 0, current === undefined || baseline !== undefined && current > baseline ? 1 : 0);
+    }
+    case "KNOWBE4-07": {
+      const delta = value("delta_points");
+      return fact(value("security_tests_considered") ?? 0, delta !== undefined && delta > 5 ? 1 : 0, delta === undefined || delta > 0 ? 1 : 0);
+    }
+    case "KNOWBE4-08":
+      return fact(value("active_groups") ?? value("active_groups_read") ?? 0, observedViolation, (value("active_groups") ?? value("active_groups_read") ?? 0) === 0 || evidence.groups_missing_phishing === null || evidence.groups_missing_training === null ? 1 : 0);
+    case "KNOWBE4-09": {
+      const campaigns = value("active_campaigns") ?? 0;
+      const coverage = value("estimated_coverage_pct");
+      const requireFull = evidence.require_full_targeting !== false;
+      return fact(campaigns, campaigns === 0 || requireFull && coverage !== undefined && coverage < (value("min_coverage_pct") ?? 0) ? 1 : 0, coverage === undefined && campaigns > 0 ? 1 : 0);
+    }
+    case "KNOWBE4-10": {
+      const evaluated = value("failed_users_evaluated") ?? 0;
+      const pct = value("remediated_pct");
+      return fact(evaluated, observedViolation > 0 && pct !== undefined && pct < 50 ? observedViolation : 0, pct === undefined || pct < 90 ? Math.max(1, observedViolation) : 0, evidence.recipient_reads_complete === true && pct !== undefined);
+    }
+    case "KNOWBE4-11":
+      return fact(value("modules_reviewed") ?? 0, count("retired_modules"), count("stale_modules", "undated_module_count"));
+    case "KNOWBE4-12": {
+      const admins = value("admin_count") ?? 0;
+      return fact(admins, admins > (value("max_admin_count") ?? 0) ? admins - (value("max_admin_count") ?? 0) : 0, admins === 0 ? 1 : count("external_domain_admins"));
+    }
+    case "KNOWBE4-16":
+      return fact(value("callback_tests_all_time") ?? value("callback_tests_read") ?? 0, (value("callback_tests_in_window") ?? 0) === 0 ? 1 : 0, evidence.callback_tests_in_window === null ? 1 : 0, evidence.callback_tests_in_window !== null);
+    case "KNOWBE4-17": {
+      const topics = asRecordArray(evidence.topics);
+      const required = asStringArray(evidence.required_compliance_topics);
+      const missing = topics.filter((topic) => asArray(topic.assigned_modules).length === 0).length;
+      const incomplete = evidence.completion_data_partial === true;
+      const low = topics.filter((topic) => (asNumber(topic.completion_pct) ?? 100) < (value("min_completion_pct") ?? 0)).length;
+      return fact(topics.length, required.length > 0 ? missing : 0, (required.length === 0 ? missing : 0) + low + (incomplete ? 1 : 0), !incomplete);
+    }
+    case "KNOWBE4-18": {
+      const inventory = value("users_evaluated") ?? value("users_evaluated_read") ?? 0;
+      const inactive = value("inactive_users");
+      const partial = evidence.partial_activity_data === true || inactive === undefined;
+      return fact(inventory, !partial && (value("inactive_pct") ?? 0) > 5 ? inactive ?? 0 : 0, partial || (inactive ?? 0) > 0 ? Math.max(1, inactive ?? 0) : 0, !partial);
+    }
+    case "KNOWBE4-19": {
+      const rate = value("report_rate_pct");
+      const minimum = value("min_report_rate_pct") ?? 0;
+      return fact(value("delivered_count") ?? 0, rate !== undefined && rate < minimum / 2 ? 1 : 0, rate === undefined || rate < minimum ? 1 : 0);
+    }
+    case "KNOWBE4-20":
+      return fact(value("security_tests_all_time") ?? value("security_tests_read") ?? 0, count("gaps_over_threshold"), 0);
+    default:
+      return {};
+  }
+}
+
 function finding(
   number: number,
   severity: Knowbe4Finding["severity"],
-  status: Knowbe4Finding["status"],
+  _legacyStatus: Knowbe4Finding["status"],
   summary: string,
   evidence?: JsonRecord,
   manualEvidence?: string,
 ): Knowbe4Finding {
   const definition = controlById(number);
   const id = findingId(number);
-  const facts = {
-    evidence_readable: status !== "manual",
-    evidence_complete: status !== "manual",
-    inventory_count: 1,
-    violation_count: status === "fail" ? 1 : 0,
-    review_count: status === "warn" ? 1 : 0,
-  };
-  return {
+  const facts = knowbe4DecisionFacts(id, evidence ?? {});
+  const result: Knowbe4FindingWithFacts = {
     id,
     control: number,
     title: definition.title,
     severity,
-    status: number === 15
-      ? "manual"
-      : evaluateBatchRuntimeCheckVerdict(KNOWBE4_SPEC, id, facts) as Knowbe4Finding["status"],
+    status: evaluateBatchRuntimeCheckVerdict(KNOWBE4_SPEC, id, facts) as Knowbe4Finding["status"],
     summary,
     evidence,
     mappings: knowbe4ControlMappings(number),
     manualEvidence,
   };
+  Object.defineProperty(result, KNOWBE4_DECISION_FACTS, { value: facts });
+  return result;
 }
 
 function inventoryGap(inventory: Knowbe4InventoryName, collection: Knowbe4Collected<unknown>, notChecked: string): Knowbe4InventoryGap {
@@ -2367,13 +2466,19 @@ function withInventoryCaveats(item: Knowbe4Finding, snapshot: Knowbe4Snapshot, r
     ...(gaps.length > 0 || existingGaps.length > 0 ? { unreadable_inventories: [...existingGaps, ...gaps] } : {}),
     ...(truncated.length > 0 ? { truncated_inventories: truncated } : {}),
   };
-  if (gaps.length === 0 && truncated.length === 0) return { ...item, evidence };
-
-  let status = item.status;
-  if (status === "pass") {
-    if (gaps.length > 0) status = essentialGap ? "manual" : "warn";
-    else if (verdictTruncated) status = "warn";
+  const previousFacts = (item as Knowbe4FindingWithFacts)[KNOWBE4_DECISION_FACTS] ?? {};
+  if (gaps.length === 0 && truncated.length === 0) {
+    const unchanged: Knowbe4FindingWithFacts = { ...item, evidence };
+    Object.defineProperty(unchanged, KNOWBE4_DECISION_FACTS, { value: previousFacts });
+    return unchanged;
   }
+
+  const facts = essentialGap
+    ? {}
+    : gaps.length > 0 || verdictTruncated
+      ? { ...previousFacts, evidence_complete: false }
+      : previousFacts;
+  const status = evaluateBatchRuntimeCheckVerdict(KNOWBE4_SPEC, item.id, facts) as Knowbe4Finding["status"];
   // A truncated verdict inventory is always stated with seen versus total and the cap, whatever the verdict: a warn the
   // finding reached on its own from the partial read still has to say how much was read.
   const parts = [item.summary, ...gaps.map(inventoryGapCaveat)];
@@ -2381,7 +2486,9 @@ function withInventoryCaveats(item: Knowbe4Finding, snapshot: Knowbe4Snapshot, r
   const manualEvidence = status === "manual"
     ? item.manualEvidence ?? `Collect ${gaps.map((gap) => gap.collect_manually).join("; ")}.`
     : item.manualEvidence;
-  return { ...item, status, summary: parts.join(" "), evidence, manualEvidence };
+  const result: Knowbe4FindingWithFacts = { ...item, status, summary: parts.join(" "), evidence, manualEvidence };
+  Object.defineProperty(result, KNOWBE4_DECISION_FACTS, { value: facts });
+  return result;
 }
 
 // An empty user list is a data-access condition, not a clean population: anonymized KnowBe4 accounts cannot
