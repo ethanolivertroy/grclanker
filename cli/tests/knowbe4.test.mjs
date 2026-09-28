@@ -41,6 +41,12 @@ import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -1210,6 +1216,17 @@ test("assessKnowbe4UserRisk passes balanced risk, full group coverage, and activ
   assert.equal(findingFor(result, 18).evidence.inactive_users, 0);
 });
 
+test("inactive-user cleanup preserves the parent pass for an empty test list with stale activity metadata", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["risk"], now: NOW });
+  snapshot.securityTests.data = [];
+  snapshot.unsampledSecurityTestIds = ["stale-test"];
+
+  const inactive = findingFor(assessKnowbe4UserRisk(snapshot, { now: NOW }), 18);
+  assert.equal(inactive.status, "pass");
+  assert.equal(inactive.evidence.partial_activity_data, true);
+  assert.equal(inactive.evidence.inactive_users, null);
+});
+
 test("assessKnowbe4UserRisk fails high risk, uncovered groups, and inactive users", async () => {
   const client = mockClient(failingFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["risk"], now: NOW });
@@ -1314,6 +1331,110 @@ test("collectKnowbe4Snapshot flags user_limit truncation and user-set controls d
   assert.equal(findingFor(risk, 18).evidence.inactive_user_sample, null);
   assert.equal(findingFor(risk, 5).evidence.users_scored, null);
   assert.equal(findingFor(risk, 5).evidence.users_scored_read, 5);
+});
+
+test("campaign targeting retains the observed All Users proof when the campaign inventory is truncated", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["phishing"], now: NOW });
+  snapshot.phishingCampaigns.truncated = true;
+  snapshot.phishingCampaigns.total = snapshot.phishingCampaigns.data.length + 1;
+  snapshot.phishingCampaigns.limit = 20_000;
+
+  const targeting = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 9);
+  assert.equal(targeting.status, "warn");
+  assert.match(targeting.summary, /target All Users.*Truncated listing: phishing_campaigns/);
+
+  const lowCoverage = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["phishing"], now: NOW });
+  lowCoverage.activeUsers.truncated = true;
+  lowCoverage.activeUsers.total = lowCoverage.activeUsers.data.length + 1;
+  lowCoverage.activeUsers.limit = 5_000;
+  const failingTargeting = findingFor(assessKnowbe4PhishingProgram(lowCoverage, { now: NOW }), 9);
+  assert.equal(failingTargeting.status, "fail");
+  assert.match(failingTargeting.summary, /estimated 50%.*Truncated listing: users/);
+});
+
+test("report-rate failures remain proved when the security-test inventory is truncated", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["phishing"], now: NOW });
+  snapshot.securityTests.truncated = true;
+  snapshot.securityTests.total = snapshot.securityTests.data.length + 1;
+  snapshot.securityTests.limit = 20_000;
+
+  const reportRate = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 19);
+  assert.equal(reportRate.status, "fail");
+  assert.match(reportRate.summary, /Only 10%.*Truncated listing: security_tests/);
+});
+
+test("an empty truncated security-test read still proves the no-test coverage failure", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["phishing"], now: NOW });
+  snapshot.securityTests.data = [];
+  snapshot.securityTests.truncated = true;
+  snapshot.securityTests.total = undefined;
+  snapshot.securityTests.limit = 20_000;
+
+  const coverage = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 2);
+  assert.equal(coverage.status, "fail");
+  assert.match(coverage.summary, /No phishing security tests ran.*Truncated listing: security_tests/);
+  const cadence = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 20);
+  assert.equal(cadence.status, "fail");
+  assert.match(cadence.summary, /No phishing security tests have ever run.*Truncated listing: security_tests/);
+});
+
+test("remedial training preserves the parent pass for an empty test list with retained recipient samples", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["training"], now: NOW });
+  snapshot.securityTests.data = [];
+  snapshot.securityTests.truncated = false;
+  snapshot.securityTests.total = 0;
+
+  const remediation = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 10);
+  assert.equal(remediation.status, "pass");
+  assert.equal(remediation.evidence.recipient_reads_complete, false);
+  assert.match(remediation.summary, /100%.*across all 3 tests in the window/);
+
+  snapshot.securityTestRecipients.data = [{
+    ...snapshot.securityTestRecipients.data[0],
+    recipients: [],
+  }];
+  const nothingDue = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 10);
+  assert.equal(nothingDue.status, "pass");
+  assert.equal(nothingDue.evidence.recipient_reads_complete, false);
+  assert.match(nothingDue.summary, /No users failed the 1 sampled phishing security tests/);
+});
+
+test("late enrollment failures remain proved against the users read from a truncated inventory", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["training"], now: NOW });
+  snapshot.activeUsers.truncated = true;
+  snapshot.activeUsers.total = snapshot.activeUsers.data.length + 1;
+  snapshot.activeUsers.limit = 5_000;
+
+  const timeliness = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 4);
+  assert.equal(timeliness.status, "fail");
+  assert.match(timeliness.summary, /2 of 2 recently joined users.*Truncated listing: users/);
+});
+
+test("inactive-user failures remain proved against the users read from a truncated inventory", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["risk"], now: NOW });
+  snapshot.activeUsers.truncated = true;
+  snapshot.activeUsers.total = snapshot.activeUsers.data.length + 1;
+  snapshot.activeUsers.limit = 5_000;
+
+  const inactive = findingFor(assessKnowbe4UserRisk(snapshot, { now: NOW }), 18);
+  assert.equal(inactive.status, "fail");
+  assert.match(inactive.summary, /7 of 8 active users.*Truncated listing: users/);
+});
+
+test("a recent callback test remains observed when its inventory is truncated", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["governance"], now: NOW });
+  snapshot.callbackSecurityTests.truncated = true;
+  snapshot.callbackSecurityTests.total = snapshot.callbackSecurityTests.data.length + 1;
+  snapshot.callbackSecurityTests.limit = 20_000;
+
+  const vishing = findingFor(assessKnowbe4AccountGovernance(snapshot, { now: NOW }), 16);
+  assert.equal(vishing.status, "warn");
+  assert.match(vishing.summary, /1 callback.*Truncated listing: callback_security_tests/);
+
+  snapshot.callbackSecurityTests.data = [];
+  const unknownVishing = findingFor(assessKnowbe4AccountGovernance(snapshot, { now: NOW }), 16);
+  assert.equal(unknownVishing.status, "warn");
+  assert.match(unknownVishing.summary, /None of the 0 callback.*listing was truncated/);
 });
 
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
@@ -2952,4 +3073,34 @@ test("cookie attribute class: a later cookie whose name holds a dot or another t
   assertCookieAttributeCarriersScrubbed(assert, scrubErrorText, "knowbe4 scrubErrorText");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues({ note: text }).note, "knowbe4 redactCredentialValues");
   assertCookieAttributeCarriersScrubbed(assert, (text) => redactCredentialValues([{ message: text }])[0].message, "knowbe4 redactCredentialValues, error list");
+});
+
+test("byte differential fixtures: KnowBe4 assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assessAll = async (client, options = {}) => {
+    const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["phishing", "training", "risk", "governance"], now: NOW, ...options });
+    return [
+      assessKnowbe4PhishingProgram(snapshot, { now: NOW, ...options }),
+      assessKnowbe4TrainingProgram(snapshot, { now: NOW, ...options }),
+      assessKnowbe4UserRisk(snapshot, { now: NOW, ...options }),
+      assessKnowbe4AccountGovernance(snapshot, { now: NOW, ...options }),
+    ];
+  };
+  writeByteDifferentialFixture("knowbe4", "representative", await assessAll(mockClient(failingFixture())));
+  writeByteDifferentialFixture("knowbe4", "compliant", await assessAll(mockClient(healthyFixture(), { phisher: true })));
+  writeByteDifferentialFixture("knowbe4", "denied", await assessAll(mockClient(healthyFixture(), { failures: { listSecurityTests: forbidden("/v1/phishing/security_tests") } })));
+  writeByteDifferentialFixture("knowbe4", "missing-null", await assessAll(mockClient(sparseFixture())));
+  writeByteDifferentialFixture("knowbe4", "partial", await assessAll(mockClient(failingFixture())));
+  writeByteDifferentialFixture("knowbe4", "boundary", {
+    completion: await assessAll(mockClient(healthyFixture()), { minCompletionPct: 90, failCompletionPct: 80 }),
+    coverage: await assessAll(mockClient(healthyFixture()), { minCoveragePct: 90 }),
+    admins: await assessAll(mockClient(healthyFixture()), { maxAdminCount: 3 }),
+  });
+  const config = sampleConfig({ phisherApiToken: "phisher-token" });
+  const exported = await exportKnowbe4AuditBundle(
+    mockClient(healthyFixture(), { phisher: true, config }),
+    config,
+    prepareByteDifferentialExportRoot("knowbe4"),
+    { now: NOW },
+  );
+  writeByteDifferentialFixture("knowbe4", "export", snapshotExportBundle(exported));
 });

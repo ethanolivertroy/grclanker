@@ -20,7 +20,13 @@ import { createHmac, randomBytes } from "node:crypto";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { VERACODE_SPEC } from "./veracode.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -118,6 +124,25 @@ export const VERACODE_CONTROLS: ReadonlyArray<ControlDescriptor> = [
   { number: 19, title: "Scan completion rate", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-01"] },
   { number: 20, title: "Collections compliance posture", mappings: ["FedRAMP SA-11(1)", "CMMC L2 3.14.3", "SOC 2 CC7.1", "CIS Controls v8 16.2", "PCI-DSS 6.3", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-02"] },
 ];
+
+const VERACODE_FRAMEWORK_PREFIXES = {
+  fedramp: "FedRAMP ",
+  cmmc: "CMMC ",
+  soc2: "SOC 2 ",
+  cis: "CIS Controls v8 ",
+  pci_dss: "PCI-DSS ",
+  disa_stig: "STIG ",
+  irap: "IRAP ",
+  ismap: "ISMAP ",
+} as const;
+hydrateBatchFrameworkMappings(VERACODE_SPEC, Object.fromEntries(
+  VERACODE_CONTROLS.map((control) => [controlId(control.number), Object.fromEntries(
+    Object.entries(VERACODE_FRAMEWORK_PREFIXES).map(([framework, prefix]) => [
+      framework,
+      control.mappings.filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length)),
+    ]),
+  )]),
+));
 
 export interface VeracodeFinding {
   id: string;
@@ -1874,15 +1899,107 @@ function controlId(number: number): string {
   return `VERACODE-${String(number).padStart(2, "0")}`;
 }
 
+function veracodeEvidenceCount(evidence: JsonRecord, name: string): number {
+  const value = evidence[name];
+  if (Array.isArray(value)) return value.length;
+  return asNumber(value) ?? 0;
+}
+
+function veracodeDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
+  const counts = (...names: string[]) => names.reduce((total, name) => total + veracodeEvidenceCount(evidence, name), 0);
+  const inventory = (...names: string[]) => names.map((name) => asNumber(evidence[name])).find((value) => value !== undefined) ?? 0;
+  const partial = (
+    counts("unreadable_applications", "unchecked_applications", "users_without_last_login_count") > 0
+    || (asNumber(evidence.applications_total) ?? 0) > inventory("applications_seen", "applications_sampled")
+    || (asNumber(evidence.workspaces_seen) ?? 0) > inventory("workspaces_sampled")
+    || evidence.roles_complete === false
+    || evidence.teams_scope === "member_only"
+    || ["applications_on_default_policies", "applications_without_team", "api_accounts"]
+      .some((name) => Object.hasOwn(evidence, name) && evidence[name] === null)
+    || asRecords(evidence.per_application).some((entry) => entry.list_complete === false)
+  );
+  const fact = (population: number, violations: number, reviews: number) => ({
+    evidence_readable: true,
+    evidence_complete: !partial,
+    inventory_count: population,
+    violation_count: violations,
+    review_count: reviews,
+  });
+  switch (id) {
+    case "VERACODE-01":
+      return fact(inventory("applications_seen"), counts("stale_applications", "applications_without_static_scan"), counts("applications_with_unpublished_latest_static_scan", "applications_without_static_scan_date"));
+    case "VERACODE-02":
+      return fact(inventory("applications_seen"), counts("failing_applications", "applications_without_policy"), counts("conditional_pass_applications", "unassessed_applications"));
+    case "VERACODE-03":
+      return fact(counts("open_findings_evaluated", "findings_without_first_found_date"), counts("overdue_count"), counts("findings_without_first_found_date"));
+    case "VERACODE-04":
+      return fact(inventory("applications_seen"), counts("overdue_applications"), counts("unconfirmed_applications", "applications_without_frequency_requirement"));
+    case "VERACODE-05":
+      return fact(inventory("open_vulnerability_issues"), counts("high_severity_count"), 0);
+    case "VERACODE-06":
+      return fact(inventory("open_license_issues"), counts("high_risk_count"), counts("unknown_risk_count"));
+    case "VERACODE-07":
+      return fact(
+        inventory("users_seen"),
+        inventory("teams_seen") === 0 || veracodeEvidenceCount(evidence, "users_with_all_application_access_count") > (asNumber(evidence.max_unrestricted_users) ?? Number.POSITIVE_INFINITY) ? 1 : 0,
+        counts("applications_without_team"),
+      );
+    case "VERACODE-08":
+      return fact(
+        inventory("users_seen"),
+        counts("inactive_count", "api_accounts_without_team") + Math.max(0, veracodeEvidenceCount(evidence, "administrator_count") - (asNumber(evidence.max_admins) ?? 0)),
+        counts("users_without_last_login_count"),
+      );
+    case "VERACODE-09":
+      return fact(inventory("credentials_readable"), counts("credentials_over_max_age_count"), counts("credentials_missing_dates", "credentials_expired"));
+    case "VERACODE-10":
+      return fact(inventory("applications_sampled"), 0, counts("applications_without_sandboxes"));
+    case "VERACODE-12":
+      return fact(inventory("findings_seen"), counts("proposed_not_reviewed_count", "mitigations_without_justification"), 0);
+    case "VERACODE-13":
+      return fact(inventory("configured_scans"), counts("unauthenticated_scans", "crawl_disabled_scans"), 0);
+    case "VERACODE-15":
+      return fact(
+        inventory("policies_seen"),
+        veracodeEvidenceCount(evidence, "custom_policies") === 0 ? 1 : 0,
+        counts("custom_policies_without_finding_rules", "applications_on_default_policies"),
+      );
+    case "VERACODE-16":
+      return fact(inventory("applications_with_findings"), 0, counts("applications_exceeding"));
+    case "VERACODE-17":
+      return fact(inventory("applications_evaluated"), counts("applications_exceeding"), counts("applications_without_loc"));
+    case "VERACODE-18":
+      return fact(inventory("applications_sampled"), 0, counts("uncovered_applications", "unchecked_applications"));
+    case "VERACODE-19":
+      return fact(inventory("applications_seen"), counts("failed_scan_applications"), counts("applications_without_scans"));
+    default:
+      return {};
+  }
+}
+
+function veracodeCompleteFacts(id: string, evidence: JsonRecord, complete: boolean): Readonly<Record<string, unknown>> {
+  return { ...veracodeDecisionFacts(id, evidence), evidence_complete: complete };
+}
+
 function finding(
   number: number,
   severity: VeracodeFinding["severity"],
-  status: VeracodeFinding["status"],
   summary: string,
   evidence?: JsonRecord,
+  decisionFacts?: Readonly<Record<string, unknown>>,
 ): VeracodeFinding {
   const control = controlDescriptor(number);
-  return { id: controlId(number), title: control.title, severity, status, summary, mappings: [...control.mappings], evidence };
+  const id = controlId(number);
+  const facts = decisionFacts ?? veracodeDecisionFacts(id, evidence ?? {});
+  return {
+    id,
+    title: control.title,
+    severity,
+    status: evaluateBatchRuntimeCheckVerdict(VERACODE_SPEC, id, facts) as VeracodeFinding["status"],
+    summary,
+    mappings: [...control.mappings],
+    evidence,
+  };
 }
 
 function manualFinding(
@@ -1893,10 +2010,10 @@ function manualFinding(
   evidence: JsonRecord = {},
   caveats: Array<string | undefined> = [],
 ): VeracodeFinding {
-  return finding(number, severity, "manual", joinNotes(reason, ...caveats, `Manual evidence required: ${evidenceToCollect.join(" ")}`), {
+  return finding(number, severity, joinNotes(reason, ...caveats, `Manual evidence required: ${evidenceToCollect.join(" ")}`), {
     ...evidence,
     manual_evidence: evidenceToCollect,
-  });
+  }, {});
 }
 
 type UnreadableLinkedProjectList = { application: string; status: number | null; endpoint: string | null };
@@ -2109,18 +2226,18 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
     date_source: "scans[].modified_date of the latest STATIC scan in a published status",
   };
   if (stale.length > 0 || noStaticScan.length > 0) {
-    return finding(1, "critical", "fail", joinNotes(
+    return finding(1, "critical", joinNotes(
       `${stale.length}/${list.items.length} applications have no published static scan within ${maxScanAgeDays} days and ${noStaticScan.length} applications expose no static scan at all (dynamic, manual, or SCA scans and the scan-type agnostic last_completed_scan_date do not satisfy this control).`,
       partial,
     ), evidence);
   }
   if (notPublished.length > 0 || missingDate.length > 0) {
-    return finding(1, "critical", "warn", joinNotes(
+    return finding(1, "critical", joinNotes(
       `${notPublished.length}/${list.items.length} applications expose a latest static scan that is not in a published status and ${missingDate.length} expose no modified_date on their published static scan, so they are not counted as covered; ${fresh} applications have a published static scan within ${maxScanAgeDays} days.`,
       partial,
     ), evidence);
   }
-  return finding(1, "critical", limitedStatus("pass", [partial]), joinNotes(`All ${fresh} applications read have a published static scan within ${maxScanAgeDays} days.`, partial), evidence);
+  return finding(1, "critical", joinNotes(`All ${fresh} applications read have a published static scan within ${maxScanAgeDays} days.`, partial), evidence, veracodeCompleteFacts("VERACODE-01", evidence, !partial));
 }
 
 interface FrequencyRequirement {
@@ -2248,15 +2365,15 @@ function evaluateScanFrequency(snapshot: ApplicationSnapshot, policies: Surface<
     requirements_by_application: Object.fromEntries(Object.entries(requirementsByApplication).slice(0, 50)),
   };
   if (overdue.length > 0) {
-    return finding(4, "high", "fail", joinNotes(`${overdue.length}/${list.items.length} applications are overdue against their strictest scan frequency requirement from assigned policies and business criticality (${tiers}).`, partial), evidence);
+    return finding(4, "high", joinNotes(`${overdue.length}/${list.items.length} applications are overdue against their strictest scan frequency requirement from assigned policies and business criticality (${tiers}).`, partial), evidence);
   }
   if (noRequirement.length > 0 || unconfirmed.length > 0) {
-    return finding(4, "high", "warn", joinNotes(
+    return finding(4, "high", joinNotes(
       `${noRequirement.length} applications have neither a policy scan frequency rule nor a business criticality tier and ${unconfirmed.length} could not be confirmed (unpublished latest scan, missing scan date, or unresolved assigned policy), so frequency compliance is not established for them; ${compliant} applications meet their strictest requirement (${tiers}).`,
       partial,
     ), evidence);
   }
-  return finding(4, "high", limitedStatus("pass", [partial]), joinNotes(`All ${compliant} applications meet their strictest scan frequency requirement from assigned policies and business criticality (${tiers}).`, partial), evidence);
+  return finding(4, "high", joinNotes(`All ${compliant} applications meet their strictest scan frequency requirement from assigned policies and business criticality (${tiers}).`, partial), evidence, veracodeCompleteFacts("VERACODE-04", evidence, !partial));
 }
 
 function evaluateScanCompletion(snapshot: ApplicationSnapshot): VeracodeFinding {
@@ -2280,15 +2397,15 @@ function evaluateScanCompletion(snapshot: ApplicationSnapshot): VeracodeFinding 
   const partial = partialInventoryNote(list, "applications");
   const evidence = { applications_seen: list.items.length, healthy_applications: healthy, failed_scan_applications: failed.slice(0, 50), applications_without_scans: noScans.slice(0, 50) };
   if (failed.length > 0) {
-    return finding(19, "medium", "fail", joinNotes(`${failed.length}/${list.items.length} applications expose a latest scan in a failed, canceled, or incomplete status.`, partial), evidence);
+    return finding(19, "medium", joinNotes(`${failed.length}/${list.items.length} applications expose a latest scan in a failed, canceled, or incomplete status.`, partial), evidence);
   }
   if (healthy === 0) {
     return manualFinding(19, "medium", "No application exposed a scan record, so the completion rate could not be measured.", ["Review scan history in the Platform for failed scans."], evidence);
   }
   if (noScans.length > 0) {
-    return finding(19, "medium", "warn", joinNotes(`${healthy} applications expose only healthy scan statuses, but ${noScans.length} applications expose no scan records and were not counted as healthy.`, partial), evidence);
+    return finding(19, "medium", joinNotes(`${healthy} applications expose only healthy scan statuses, but ${noScans.length} applications expose no scan records and were not counted as healthy.`, partial), evidence);
   }
-  return finding(19, "medium", limitedStatus("pass", [partial]), joinNotes(`All ${healthy} applications with scan records expose no failed or canceled latest scans.`, partial), evidence);
+  return finding(19, "medium", joinNotes(`All ${healthy} applications with scan records expose no failed or canceled latest scans.`, partial), evidence, veracodeCompleteFacts("VERACODE-19", evidence, !partial));
 }
 
 async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSnapshot, maxApplications: number): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
@@ -2314,10 +2431,10 @@ async function evaluateSandboxUsage(client: ClientLike, snapshot: ApplicationSna
     return { finding: manualFinding(10, "medium", unreadableReason("sandboxes", unreadable[0].sandboxes), ["Confirm sandbox usage per application in the Platform."], evidence), raw, errors };
   }
   if (withoutSandboxes.length > 0) {
-    return { finding: finding(10, "medium", "warn", joinNotes(`${withoutSandboxes.length}/${sampled.length} sampled applications have no development sandboxes, so pre-policy scanning is not evidenced for them.`, ...caveats), evidence), raw, errors };
+    return { finding: finding(10, "medium", joinNotes(`${withoutSandboxes.length}/${sampled.length} sampled applications have no development sandboxes, so pre-policy scanning is not evidenced for them.`, ...caveats), evidence), raw, errors };
   }
   const status = limitedStatus("pass", [...caveats, unreadable.length > 0 ? "some sandbox lists were unreadable" : undefined]);
-  return { finding: finding(10, "medium", status, joinNotes(`All ${withSandboxes} sampled applications with readable sandbox lists use at least one development sandbox.`, ...caveats, unreadable.length > 0 ? `${unreadable.length} sandbox lists were unreadable.` : undefined), evidence), raw, errors };
+  return { finding: finding(10, "medium", joinNotes(`All ${withSandboxes} sampled applications with readable sandbox lists use at least one development sandbox.`, ...caveats, unreadable.length > 0 ? `${unreadable.length} sandbox lists were unreadable.` : undefined), evidence, veracodeCompleteFacts("VERACODE-10", evidence, !caveats.some(Boolean) && unreadable.length === 0)), raw, errors };
 }
 
 /**
@@ -2421,9 +2538,9 @@ async function evaluateDynamicScanConfiguration(client: ClientLike, maxAnalyses:
     return { finding: manualFinding(13, "medium", "No Dynamic Analysis scan configuration could be read, so authentication and crawl settings are unknown.", manualEvidence, evidence), raw, errors };
   }
   if (unauthenticated.length > 0 || crawlDisabled.length > 0) {
-    return { finding: finding(13, "medium", "fail", joinNotes(`${unauthenticated.length} dynamic scans have no authentication configured and ${crawlDisabled.length} have crawling disabled, out of ${configured + unauthenticated.length + crawlDisabled.length} readable scan configurations.`, ...caveats), evidence), raw, errors };
+    return { finding: finding(13, "medium", joinNotes(`${unauthenticated.length} dynamic scans have no authentication configured and ${crawlDisabled.length} have crawling disabled, out of ${configured + unauthenticated.length + crawlDisabled.length} readable scan configurations.`, ...caveats), evidence), raw, errors };
   }
-  return { finding: finding(13, "medium", limitedStatus("pass", caveats), joinNotes(`All ${configured} readable dynamic scan configurations include authentication and keep crawling enabled.`, ...caveats), evidence), raw, errors };
+  return { finding: finding(13, "medium", joinNotes(`All ${configured} readable dynamic scan configurations include authentication and keep crawling enabled.`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-13", evidence, !caveats.some(Boolean))), raw, errors };
 }
 
 function prescanManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
@@ -2523,12 +2640,12 @@ function evaluatePolicyCompliance(snapshot: ApplicationSnapshot): VeracodeFindin
   const partial = partialInventoryNote(list, "applications");
   const evidence = { applications_seen: list.items.length, passing_applications: passing, failing_applications: failing.slice(0, 50), conditional_pass_applications: conditional.slice(0, 50), unassessed_applications: unassessed.slice(0, 50), applications_without_policy: unassigned.slice(0, 50) };
   if (failing.length > 0 || unassigned.length > 0) {
-    return finding(2, "critical", "fail", joinNotes(`${failing.length}/${list.items.length} applications did not pass their assigned policy and ${unassigned.length} have no policy assigned.`, partial), evidence);
+    return finding(2, "critical", joinNotes(`${failing.length}/${list.items.length} applications did not pass their assigned policy and ${unassigned.length} have no policy assigned.`, partial), evidence);
   }
   if (conditional.length > 0 || unassessed.length > 0) {
-    return finding(2, "critical", "warn", joinNotes(`${conditional.length} applications are in conditional pass (grace period) and ${unassessed.length} expose a policy_compliance_status other than PASSED (NOT_ASSESSED, DETERMINING, VENDOR_REVIEW, or missing); ${passing} applications passed.`, partial), evidence);
+    return finding(2, "critical", joinNotes(`${conditional.length} applications are in conditional pass (grace period) and ${unassessed.length} expose a policy_compliance_status other than PASSED (NOT_ASSESSED, DETERMINING, VENDOR_REVIEW, or missing); ${passing} applications passed.`, partial), evidence);
   }
-  return finding(2, "critical", limitedStatus("pass", [partial]), joinNotes(`All ${passing} applications expose policy_compliance_status PASSED for every assigned policy.`, partial), evidence);
+  return finding(2, "critical", joinNotes(`All ${passing} applications expose policy_compliance_status PASSED for every assigned policy.`, partial), evidence, veracodeCompleteFacts("VERACODE-02", evidence, !partial));
 }
 
 function evaluateCustomPolicies(snapshot: ApplicationSnapshot, policies: Surface<HalListResult>): VeracodeFinding {
@@ -2560,13 +2677,13 @@ function evaluateCustomPolicies(snapshot: ApplicationSnapshot, policies: Surface
   // Per-application assignment counts come from the application inventory: null, never 0 or [], when it was not read.
   const evidence = { policies_seen: policies.value.items.length, custom_policies: customPolicies.length, custom_policies_without_finding_rules: customWithoutRules, custom_policies_without_grace_periods: customWithoutGrace, applications_on_default_policies: applicationsRead ? appsOnDefaultPolicies.slice(0, 50) : null, applications_on_custom_policies: applicationsRead ? appsOnCustom : null };
   if (customPolicies.length === 0) {
-    return finding(15, "high", "fail", joinNotes(`None of the ${policies.value.items.length} policies is a customer-defined (CUSTOMER type) policy, so applications rely on Veracode default policies.`, ...caveats), evidence);
+    return finding(15, "high", joinNotes(`None of the ${policies.value.items.length} policies is a customer-defined (CUSTOMER type) policy, so applications rely on Veracode default policies.`, ...caveats), evidence);
   }
   if (appsOnDefaultPolicies.length > 0 || customWithoutRules.length > 0) {
-    return finding(15, "high", "warn", joinNotes(`${customPolicies.length} custom policies exist, but ${appsOnDefaultPolicies.length}/${appsSeen} applications are assigned only built-in or Veracode Level policies and ${customWithoutRules.length} custom policies define no finding rules.`, ...caveats), evidence);
+    return finding(15, "high", joinNotes(`${customPolicies.length} custom policies exist, but ${appsOnDefaultPolicies.length}/${appsSeen} applications are assigned only built-in or Veracode Level policies and ${customWithoutRules.length} custom policies define no finding rules.`, ...caveats), evidence);
   }
   const assignmentNote = applicationsRead ? `all ${appsOnCustom} applications read are assigned a custom policy` : "the assignment per application is unknown";
-  return finding(15, "high", limitedStatus("pass", caveats), joinNotes(`${customPolicies.length} custom policies with finding rules exist and ${assignmentNote}.`, ...caveats), evidence);
+  return finding(15, "high", joinNotes(`${customPolicies.length} custom policies with finding rules exist and ${assignmentNote}.`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-15", evidence, !caveats.some(Boolean)));
 }
 
 function evaluateCollectionsPosture(snapshot: ApplicationSnapshot): VeracodeFinding {
@@ -2648,11 +2765,13 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
   }
   const overdue: Array<{ application: string; issue_id: string | null; severity: number; days_open: number }> = [];
   const missingDate: number[] = [];
+  let findingsRead = 0;
   let openEvaluated = 0;
   let incompletePagination = 0;
   for (const sample of readable) {
     const list = (sample.findings as { value: HalListResult }).value;
     if (!list.complete) incompletePagination += 1;
+    findingsRead += list.items.length;
     for (const item of list.items) {
       if (!isOpenUnresolved(item)) continue;
       const severity = findingSeverity(item);
@@ -2673,10 +2792,10 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
   const evidence = { applications_sampled: samples.length, applications_readable: readable.length, open_findings_evaluated: openEvaluated, overdue_findings: overdue.slice(0, 100), overdue_count: overdue.length, findings_without_first_found_date: missingDate.length, thresholds_days: FLAW_AGE_THRESHOLDS };
   if (overdue.length > 0) {
     const critical = overdue.filter((item) => item.severity === 5).length;
-    return finding(3, "high", "fail", joinNotes(`${overdue.length} open unmitigated findings exceed their severity SLA (${critical} Very High over 30 days) across ${readable.length} sampled applications.`, ...caveats), evidence);
+    return finding(3, "high", joinNotes(`${overdue.length} open unmitigated findings exceed their severity SLA (${critical} Very High over 30 days) across ${readable.length} sampled applications.`, ...caveats), evidence);
   }
   if (missingDate.length > 0) {
-    return finding(3, "high", "warn", joinNotes(`No open finding exceeds its SLA, but ${missingDate.length} open findings expose no first_found_date and could not be aged.`, ...caveats), evidence);
+    return finding(3, "high", joinNotes(`No open finding exceeds its SLA, but ${missingDate.length} open findings expose no first_found_date and could not be aged.`, ...caveats), evidence);
   }
   if (openEvaluated === 0) {
     const scanned = readable.filter((sample) => sample.findings.status === "ok" && sample.findings.value.items.length > 0).length;
@@ -2684,7 +2803,13 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
       return manualFinding(3, "high", `The ${readable.length} sampled applications returned zero findings, so there is no aging population to evaluate; confirm the applications have published scans before treating this as compliant.`, manualEvidence, evidence);
     }
   }
-  return finding(3, "high", limitedStatus("pass", caveats), joinNotes(`All ${openEvaluated} open unmitigated findings across ${readable.length} fully read applications are within their severity SLA.`, ...caveats), evidence);
+  return finding(
+    3,
+    "high",
+    joinNotes(`All ${openEvaluated} open unmitigated findings across ${readable.length} fully read applications are within their severity SLA.`, ...caveats),
+    evidence,
+    { ...veracodeCompleteFacts("VERACODE-03", evidence, !caveats.some(Boolean)), inventory_count: findingsRead },
+  );
 }
 
 function evaluateMitigationWorkflow(samples: ApplicationFindingsSample[], inventory: HalListResult): VeracodeFinding {
@@ -2721,9 +2846,9 @@ function evaluateMitigationWorkflow(samples: ApplicationFindingsSample[], invent
     return manualFinding(12, "high", "The sampled applications returned zero findings, so there are no mitigations to audit; the empty population is treated as unverifiable rather than compliant.", manualEvidence, evidence);
   }
   if (pendingReview.length > 0 || unjustified.length > 0) {
-    return finding(12, "high", "fail", joinNotes(`${pendingReview.length} mitigations are proposed but not reviewed and ${unjustified.length} mitigation annotations carry no justification comment.`, ...caveats), evidence);
+    return finding(12, "high", joinNotes(`${pendingReview.length} mitigations are proposed but not reviewed and ${unjustified.length} mitigation annotations carry no justification comment.`, ...caveats), evidence);
   }
-  return finding(12, "high", limitedStatus("pass", caveats), joinNotes(`No proposed-but-unreviewed mitigations and no unjustified mitigation annotations across ${findingsSeen} findings (${mitigationsSeen} mitigation annotations read with include_annot=TRUE).`, ...caveats), evidence);
+  return finding(12, "high", joinNotes(`No proposed-but-unreviewed mitigations and no unjustified mitigation annotations across ${findingsSeen} findings (${mitigationsSeen} mitigation annotations read with include_annot=TRUE).`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-12", evidence, !caveats.some(Boolean)));
 }
 
 function hasAnnotationAction(item: JsonRecord, action: string): boolean {
@@ -2779,9 +2904,9 @@ function evaluateFalsePositiveRate(samples: ApplicationFindingsSample[], invento
     return manualFinding(16, "medium", "No sampled application returned findings, so a false positive rate cannot be computed; the empty population is treated as unverifiable rather than compliant.", manualEvidence, evidence);
   }
   if (exceeding.length > 0) {
-    return finding(16, "medium", "warn", joinNotes(`${exceeding.length}/${evaluated} applications exceed a ${maxRatePercent} percent false positive rate (findings carrying an FP mitigation annotation), which may indicate scan tuning issues.`, ...caveats), evidence);
+    return finding(16, "medium", joinNotes(`${exceeding.length}/${evaluated} applications exceed a ${maxRatePercent} percent false positive rate (findings carrying an FP mitigation annotation), which may indicate scan tuning issues.`, ...caveats), evidence);
   }
-  return finding(16, "medium", limitedStatus("pass", caveats), joinNotes(`All ${evaluated} applications with findings stay at or below a ${maxRatePercent} percent false positive rate (findings carrying an FP mitigation annotation read with include_annot=TRUE).`, ...caveats), evidence);
+  return finding(16, "medium", joinNotes(`All ${evaluated} applications with findings stay at or below a ${maxRatePercent} percent false positive rate (findings carrying an FP mitigation annotation read with include_annot=TRUE).`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-16", evidence, !caveats.some(Boolean)));
 }
 
 function evaluateFlawDensity(samples: ApplicationFindingsSample[], inventory: HalListResult, maxDensity: number): VeracodeFinding {
@@ -2810,15 +2935,15 @@ function evaluateFlawDensity(samples: ApplicationFindingsSample[], inventory: Ha
   const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} summary reports were unreadable.` : undefined];
   const evidence = { applications_sampled: samples.length, applications_evaluated: evaluated, applications_exceeding: exceeding.slice(0, 50), applications_without_loc: missingLoc.slice(0, 50), max_density_per_kloc: maxDensity };
   if (exceeding.length > 0) {
-    return finding(17, "medium", "fail", joinNotes(`${exceeding.length}/${evaluated} applications exceed ${maxDensity} Very High/High flaws per KLOC.`, ...caveats), evidence);
+    return finding(17, "medium", joinNotes(`${exceeding.length}/${evaluated} applications exceed ${maxDensity} Very High/High flaws per KLOC.`, ...caveats), evidence);
   }
   if (evaluated === 0) {
     return manualFinding(17, "medium", "No summary report exposed static module lines of code, so flaw density cannot be computed.", manualEvidence, evidence);
   }
   if (missingLoc.length > 0) {
-    return finding(17, "medium", "warn", joinNotes(`${evaluated} applications stay within ${maxDensity} Very High/High flaws per KLOC, but ${missingLoc.length} applications expose no static module lines of code and were not evaluated.`, ...caveats), evidence);
+    return finding(17, "medium", joinNotes(`${evaluated} applications stay within ${maxDensity} Very High/High flaws per KLOC, but ${missingLoc.length} applications expose no static module lines of code and were not evaluated.`, ...caveats), evidence);
   }
-  return finding(17, "medium", limitedStatus("pass", caveats), joinNotes(`All ${evaluated} applications with static module data stay within ${maxDensity} Very High/High flaws per KLOC.`, ...caveats), evidence);
+  return finding(17, "medium", joinNotes(`All ${evaluated} applications with static module data stay within ${maxDensity} Very High/High flaws per KLOC.`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-17", evidence, !caveats.some(Boolean)));
 }
 
 export async function assessVeracodeFindingsHygiene(
@@ -2833,7 +2958,7 @@ export async function assessVeracodeFindingsHygiene(
   const manualEvidence = ["Export findings and summary reports per application from the Platform."];
   const blocker = applicationInventoryBlocker(3, "high", snapshot, manualEvidence);
   if (blocker) {
-    const findings = [3, 12, 16, 17].map((number) => ({ ...blocker, ...finding(number, blocker.severity, "manual", blocker.summary, blocker.evidence) }));
+    const findings = [3, 12, 16, 17].map((number) => ({ ...blocker, ...finding(number, blocker.severity, blocker.summary, blocker.evidence, {}) }));
     const skipped = notAttempted("the application inventory was not readable or empty, so no per-application list was requested.");
     return {
       title: "Veracode findings hygiene",
@@ -2942,12 +3067,12 @@ function evaluateScaCurrency(workspaces: Surface<HalListResult>, samples: ScaWor
   const anyLibraryListRead = readable.some((sample) => sample.libraries.status === "ok");
   const evidence = { workspaces_seen: list.items.length, workspaces_sampled: samples.length, open_vulnerability_issues: issues, libraries_seen: anyLibraryListRead ? librariesSeen : null, library_lists_unreadable: libraryListsUnreadable, library_lists_truncated: libraryListsIncomplete, high_severity_issues: high.slice(0, 100), high_severity_count: high.length, cvss_threshold: cvssThreshold };
   if (high.length > 0) {
-    return finding(5, "high", "fail", joinNotes(`${high.length} open SCA vulnerability issues at or above CVSS ${cvssThreshold} across ${readable.length} sampled workspaces.`, ...caveats), evidence);
+    return finding(5, "high", joinNotes(`${high.length} open SCA vulnerability issues at or above CVSS ${cvssThreshold} across ${readable.length} sampled workspaces.`, ...caveats), evidence);
   }
   if (librariesSeen === 0) {
     return manualFinding(5, "high", "No open vulnerability issues were returned, but no libraries were readable in the sampled workspaces, so it is unknown whether any scan has populated them.", ["Confirm the workspaces contain scanned projects and libraries."], evidence);
   }
-  return finding(5, "high", limitedStatus("pass", caveats), joinNotes(`No open SCA vulnerability issues at or above CVSS ${cvssThreshold} across ${readable.length} sampled workspaces (${librariesSeen} libraries read).`, ...caveats), evidence);
+  return finding(5, "high", joinNotes(`No open SCA vulnerability issues at or above CVSS ${cvssThreshold} across ${readable.length} sampled workspaces (${librariesSeen} libraries read).`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-05", evidence, !caveats.some(Boolean)));
 }
 
 function evaluateScaLicenseRisk(workspaces: Surface<HalListResult>, samples: ScaWorkspaceSample[]): VeracodeFinding {
@@ -2977,12 +3102,12 @@ function evaluateScaLicenseRisk(workspaces: Surface<HalListResult>, samples: Sca
   const caveats = [partialInventoryNote(list, "workspaces"), scopeNote(samples.length, list.items.length, "workspaces"), unreadable.length > 0 ? `${unreadable.length} workspace license lists were unreadable.` : undefined, incomplete > 0 ? `${incomplete} issue lists were truncated.` : undefined];
   const evidence = { workspaces_sampled: samples.length, open_license_issues: issues, high_risk_license_issues: highRisk.slice(0, 100), high_risk_count: highRisk.length, unknown_risk_count: unknownRisk.length };
   if (highRisk.length > 0) {
-    return finding(6, "medium", "fail", joinNotes(`${highRisk.length} open SCA license issues carry HIGH license risk (restrictive or copyleft) across ${readable.length} sampled workspaces.`, ...caveats), evidence);
+    return finding(6, "medium", joinNotes(`${highRisk.length} open SCA license issues carry HIGH license risk (restrictive or copyleft) across ${readable.length} sampled workspaces.`, ...caveats), evidence);
   }
   if (unknownRisk.length > 0) {
-    return finding(6, "medium", "warn", joinNotes(`No HIGH risk license issues are open, but ${unknownRisk.length} open license issues expose UNKNOWN or missing risk and need review.`, ...caveats), evidence);
+    return finding(6, "medium", joinNotes(`No HIGH risk license issues are open, but ${unknownRisk.length} open license issues expose UNKNOWN or missing risk and need review.`, ...caveats), evidence);
   }
-  return finding(6, "medium", limitedStatus("pass", caveats), joinNotes(`No open HIGH risk license issues across ${readable.length} sampled workspaces (${issues} open license issues read).`, ...caveats), evidence);
+  return finding(6, "medium", joinNotes(`No open HIGH risk license issues across ${readable.length} sampled workspaces (${issues} open license issues read).`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-06", evidence, !caveats.some(Boolean)));
 }
 
 async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: ApplicationSnapshot, workspaces: Surface<HalListResult>, maxApplications: number): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
@@ -3062,10 +3187,10 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
     return { finding: { ...scaBlocker, evidence: { ...scaBlocker.evidence, ...evidence } }, raw, errors };
   }
   if (unchecked.length > 0) {
-    return { finding: finding(18, "medium", "warn", joinNotes(`${unchecked.length}/${sampled.length} sampled applications have no upload-and-scan SCA and their linked SCA agent projects were not checked because ${scaAgentNote}, so their coverage is unknown.`, ...caveats), evidence), raw, errors };
+    return { finding: finding(18, "medium", joinNotes(`${unchecked.length}/${sampled.length} sampled applications have no upload-and-scan SCA and their linked SCA agent projects were not checked because ${scaAgentNote}, so their coverage is unknown.`, ...caveats), evidence), raw, errors };
   }
   if (uncovered.length > 0) {
-    return { finding: finding(18, "medium", "warn", joinNotes(`${uncovered.length}/${sampled.length} sampled applications have neither upload-and-scan SCA enabled nor a linked SCA agent project.`, ...caveats), evidence), raw, errors };
+    return { finding: finding(18, "medium", joinNotes(`${uncovered.length}/${sampled.length} sampled applications have neither upload-and-scan SCA enabled nor a linked SCA agent project.`, ...caveats), evidence), raw, errors };
   }
   if (covered.length === 0) {
     // Every list requested was unreadable: the reason names the lists, their count, the endpoint, and the observed status, so the manual verdict says what could not be read.
@@ -3076,7 +3201,7 @@ async function evaluateScaWorkspaceCoverage(client: ClientLike, snapshot: Applic
   }
   const agentlessNote = scaAgentNote ? `Linked agent projects were not checked because ${scaAgentNote}; every sampled application is covered by upload-and-scan SCA alone.` : undefined;
   const coveredCount = covered.length === sampled.length ? `All ${covered.length}` : `${covered.length} of ${sampled.length}`;
-  return { finding: finding(18, "medium", limitedStatus("pass", caveats), joinNotes(`${coveredCount} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, agentlessNote, ...caveats), evidence), raw, errors };
+  return { finding: finding(18, "medium", joinNotes(`${coveredCount} sampled applications have upload-and-scan SCA enabled or a linked SCA agent project (linked_projects from the SCA Agent API).`, agentlessNote, ...caveats), evidence, veracodeCompleteFacts("VERACODE-18", evidence, !caveats.some(Boolean))), raw, errors };
 }
 
 /** Names the observed cause when the SCA Agent API workspace list could not be used: its own status code, or the empty inventory. */
@@ -3185,15 +3310,15 @@ function evaluateTeamAccess(snapshot: IdentitySnapshot, maxUnrestricted: number)
     return manualFinding(7, "high", joinNotes("The organization-wide team list was refused and the API user is a member of no teams, so team scoping could not be verified.", ...teamScopeNotes), manualEvidence, evidence);
   }
   if (snapshot.teams.value.items.length === 0) {
-    return finding(7, "high", "fail", joinNotes("No teams exist (all_for_org=true was accepted), so every user with application visibility sees the whole portfolio and team-based least privilege is not in place.", ...caveats), evidence);
+    return finding(7, "high", joinNotes("No teams exist (all_for_org=true was accepted), so every user with application visibility sees the whole portfolio and team-based least privilege is not in place.", ...caveats), evidence);
   }
   if (unrestrictedUsers.length > maxUnrestricted) {
-    return finding(7, "high", "fail", joinNotes(`${unrestrictedUsers.length} active users hold roles that ignore team restrictions (all-application access), exceeding the threshold of ${maxUnrestricted}.`, ...caveats), evidence);
+    return finding(7, "high", joinNotes(`${unrestrictedUsers.length} active users hold roles that ignore team restrictions (all-application access), exceeding the threshold of ${maxUnrestricted}.`, ...caveats), evidence);
   }
   if (appsWithoutTeams.length > 0) {
-    return finding(7, "high", "warn", joinNotes(`${appsWithoutTeams.length} applications have no team assigned, so only team-unrestricted roles can see them; ${unrestrictedUsers.length} active users hold team-unrestricted roles.`, ...caveats), evidence);
+    return finding(7, "high", joinNotes(`${appsWithoutTeams.length} applications have no team assigned, so only team-unrestricted roles can see them; ${unrestrictedUsers.length} active users hold team-unrestricted roles.`, ...caveats), evidence);
   }
-  return finding(7, "high", limitedStatus("pass", caveats), joinNotes(`${snapshot.teams.value.items.length} teams scope access, every application read has a team, and ${unrestrictedUsers.length} active users hold team-unrestricted roles (threshold ${maxUnrestricted}).`, ...caveats), evidence);
+  return finding(7, "high", joinNotes(`${snapshot.teams.value.items.length} teams scope access, every application read has a team, and ${unrestrictedUsers.length} active users hold team-unrestricted roles (threshold ${maxUnrestricted}).`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-07", evidence, !caveats.some(Boolean)));
 }
 
 function evaluateUserRoles(snapshot: IdentitySnapshot, maxAdmins: number, inactiveDays: number, now: Date): VeracodeFinding {
@@ -3215,12 +3340,12 @@ function evaluateUserRoles(snapshot: IdentitySnapshot, maxAdmins: number, inacti
   const partial = partialInventoryNote(snapshot.users.value, "users");
   const evidence = { users_seen: users.length, active_users: active.length, administrators: admins.slice(0, 50), administrator_count: admins.length, max_admins: maxAdmins, inactive_users: inactive.slice(0, 100), inactive_count: inactive.length, users_without_last_login: neverLoggedIn.slice(0, 100), users_without_last_login_count: neverLoggedIn.length, api_accounts_without_team: serviceWithoutTeam.slice(0, 50), non_saml_human_users: nonSaml.length, inactive_days: inactiveDays };
   if (inactive.length > 0 || serviceWithoutTeam.length > 0 || admins.length > maxAdmins) {
-    return finding(8, "high", "fail", joinNotes(`${admins.length} Administrator accounts (threshold ${maxAdmins}), ${inactive.length} active human users with no login in ${inactiveDays} days, and ${serviceWithoutTeam.length} API accounts without a team assignment.`, partial), evidence);
+    return finding(8, "high", joinNotes(`${admins.length} Administrator accounts (threshold ${maxAdmins}), ${inactive.length} active human users with no login in ${inactiveDays} days, and ${serviceWithoutTeam.length} API accounts without a team assignment.`, partial), evidence);
   }
   if (neverLoggedIn.length > 0) {
-    return finding(8, "high", "warn", joinNotes(`${neverLoggedIn.length} active human users expose no last_login and were not counted as active; ${admins.length} Administrator accounts are within the threshold of ${maxAdmins}.`, partial), evidence);
+    return finding(8, "high", joinNotes(`${neverLoggedIn.length} active human users expose no last_login and were not counted as active; ${admins.length} Administrator accounts are within the threshold of ${maxAdmins}.`, partial), evidence);
   }
-  return finding(8, "high", limitedStatus("pass", [partial]), joinNotes(`${admins.length} Administrator accounts (threshold ${maxAdmins}), no active human users inactive beyond ${inactiveDays} days, and every API account has a team assignment.`, partial), evidence);
+  return finding(8, "high", joinNotes(`${admins.length} Administrator accounts (threshold ${maxAdmins}), no active human users inactive beyond ${inactiveDays} days, and every API account has a team assignment.`, partial), evidence, veracodeCompleteFacts("VERACODE-08", evidence, !partial));
 }
 
 async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnapshot, maxAgeDays: number, now: Date): Promise<{ finding: VeracodeFinding; raw: JsonRecord; errors: string[] }> {
@@ -3267,12 +3392,12 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
     return { finding: manualFinding(9, "high", unreadableReason("api_credentials (Administrator role)", unreadable[0].credentials), manualEvidence, evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
   }
   if (aged.length > 0) {
-    return { finding: finding(9, "high", "fail", joinNotes(`${aged.length}/${readable.length} readable API credentials were created more than ${maxAgeDays} days ago and have not been revoked${expired.length > 0 ? ` (${expired.length} are expired but still not revoked)` : ""}.`, ...caveats), evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
+    return { finding: finding(9, "high", joinNotes(`${aged.length}/${readable.length} readable API credentials were created more than ${maxAgeDays} days ago and have not been revoked${expired.length > 0 ? ` (${expired.length} are expired but still not revoked)` : ""}.`, ...caveats), evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
   }
   if (missingDates.length > 0 || expired.length > 0) {
-    return { finding: finding(9, "high", "warn", joinNotes(`${missingDates.length} credentials expose no created_ts or expiration_ts and were not counted as current, and ${expired.length} are expired but not revoked; ${current} credentials are within ${maxAgeDays} days.`, ...caveats), evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
+    return { finding: finding(9, "high", joinNotes(`${missingDates.length} credentials expose no created_ts or expiration_ts and were not counted as current, and ${expired.length} are expired but not revoked; ${current} credentials are within ${maxAgeDays} days.`, ...caveats), evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
   }
-  return { finding: finding(9, "high", limitedStatus("pass", caveats), joinNotes(`All ${current} readable, unrevoked API credentials were created within ${maxAgeDays} days and carry an expiration_ts.`, ...caveats), evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
+  return { finding: finding(9, "high", joinNotes(`All ${current} readable, unrevoked API credentials were created within ${maxAgeDays} days and carry an expiration_ts.`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-09", evidence, !caveats.some(Boolean))), raw: { api_credentials_by_user: rawCredentials }, errors };
 }
 
 export async function assessVeracodeAccessControls(
@@ -3793,6 +3918,7 @@ const applicationParams = {
 };
 
 export function registerVeracodeTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, VERACODE_SPEC);
   pi.registerTool({
     name: "veracode_check_access",
     label: "Check Veracode audit access",

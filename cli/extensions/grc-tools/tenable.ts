@@ -21,7 +21,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { TENABLE_SPEC } from "./tenable.spec.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -244,6 +250,28 @@ const CONTROL_TITLES: Record<number, string> = {
   19: "Export and reporting automation",
   20: "Target group management",
 };
+
+const TENABLE_FRAMEWORK_PREFIXES = {
+  fedramp: "FedRAMP ",
+  cmmc: "CMMC ",
+  soc2: "SOC 2 ",
+  cis: "CIS ",
+  pci_dss: "PCI-DSS ",
+  disa_stig: "STIG ",
+  irap: "IRAP ",
+  ismap: "ISMAP ",
+} as const;
+hydrateBatchFrameworkMappings(TENABLE_SPEC, Object.fromEntries(
+  Object.keys(CONTROL_TITLES).map((numberValue) => {
+    const number = Number(numberValue);
+    return [`TENABLE-${String(number).padStart(2, "0")}`, Object.fromEntries(
+      Object.entries(TENABLE_FRAMEWORK_PREFIXES).map(([framework, prefix]) => [
+        framework,
+        (CONTROL_MAPPINGS[number] ?? []).filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length)),
+      ]),
+    )];
+  }),
+));
 
 const FRAMEWORK_REPORTS: Array<{ prefix: string; slug: string; title: string }> = [
   { prefix: "FedRAMP", slug: "fedramp", title: "FedRAMP / NIST 800-53 Compliance Report" },
@@ -2812,23 +2840,236 @@ function collectionSummary(datasets: Record<string, TenableDataset<unknown>>): J
   return Object.fromEntries(Object.entries(datasets).map(([name, dataset]) => [name, collectionStatusOf(dataset)]));
 }
 
+const TENABLE_DECISION_FACTS = Symbol("tenable-decision-facts");
+
+type TenableFindingWithFacts = TenableFinding & {
+  [TENABLE_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
+};
+
+function tenableEvidenceCount(evidence: JsonRecord, name: string): number {
+  const value = evidence[name];
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === "object") {
+    return Object.values(value).reduce((total, entry) => total + (asNumber(entry) ?? 0), 0);
+  }
+  return asNumber(value) ?? 0;
+}
+
+function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
+  const value = (name: string) => asNumber(evidence[name]);
+  const count = (...names: string[]) => names.reduce((total, name) => total + tenableEvidenceCount(evidence, name), 0);
+  const statusIsIncomplete = (...names: string[]) => names.some((name) => {
+    const status = asString(evidence[name]);
+    return status !== undefined && status !== "ok";
+  });
+  const partial = evidence.inventory_truncated === true
+    || count("unevaluable_records", "asset_unevaluable_records") > 0;
+  const fact = (inventoryCount: number, violationCount = 0, reviewCount = 0, complete = !partial) => ({
+    evidence_readable: true,
+    evidence_complete: complete,
+    inventory_count: inventoryCount,
+    violation_count: violationCount,
+    review_count: reviewCount,
+  });
+  if (evidence.not_collected === true) return {};
+
+  switch (id) {
+    case "TENABLE-02-SC": {
+      const scans = value("sc_scan_count") ?? 0;
+      const completed = value("sc_completed_results_in_window");
+      if (completed === undefined && scans > 0) return {};
+      return fact(scans, scans === 0 || (value("sc_recurring_scans") ?? 0) === 0 || completed === 0 ? 1 : 0);
+    }
+    case "TENABLE-07-SC": {
+      const scanners = value("sc_scanner_count") ?? 0;
+      if (scanners === 0) return {};
+      const violations = count("sc_unhealthy", "sc_stale_checkin", "sc_stale_plugins") + (evidence.sc_feed_active_stale === true ? 1 : 0);
+      const complete = evidence.sc_feed_readable === true;
+      return fact(scanners, violations, count("sc_undated") + (complete ? 0 : 1), complete);
+    }
+    case "TENABLE-10-SC": {
+      const users = value("sc_user_count") ?? 0;
+      if (users === 0) return {};
+      return fact(users, count("sc_inactive_users"), count("sc_never_logged_in", "sc_locked_users"));
+    }
+    case "TENABLE-01": {
+      const scans = value("scan_count") ?? 0;
+      if (scans === 0) return fact(0, 1, 0);
+      const policies = asRecords(evidence.policies_evaluated);
+      const unreadable = policies.filter((item) => ["unreadable", "unverified"].includes(asString(item.verdict) ?? "")).length;
+      const violations = (value("discovery_only_scans") ?? 0) === scans && scans > 0
+        ? 1
+        : policies.filter((item) => asString(item.verdict) === "fail").length;
+      if (
+        asString(evidence.policy_details_status) !== "ok"
+        || unreadable > 0
+        || (policies.length === 0 && count("scans_without_policy_id") === scans && scans > 0)
+        || (evidence.policy_details_truncated === true && violations === 0)
+      ) return {};
+      const reviews = policies.filter((item) => asString(item.verdict) === "warn").length
+        + count("scans_without_policy_id")
+        + (evidence.caller_is_administrator === true ? 0 : 1)
+        + (statusIsIncomplete("scan_templates_status", "policies_status") ? 1 : 0);
+      return fact(scans, scans === 0 ? 1 : violations, reviews, !statusIsIncomplete("scan_templates_status", "policies_status") && evidence.caller_is_administrator === true);
+    }
+    case "TENABLE-02": {
+      const scans = value("scan_count") ?? 0;
+      const recurring = value("enabled_recurring_scans") ?? 0;
+      const violations = scans === 0 || recurring === 0 ? 1 : count("stale_recurring_scans");
+      return fact(scans, violations, count("never_run_or_undated_scans") + (evidence.caller_is_administrator === true ? 0 : 1), evidence.caller_is_administrator === true);
+    }
+    case "TENABLE-03": {
+      const assets = value("asset_count") ?? 0;
+      const expected = value("expected_asset_count");
+      if (assets > 0 && expected === undefined) return {};
+      const coverageFailure = expected !== undefined && expected > 0 && (value("fresh_assets") ?? 0) / expected < 0.95 ? 1 : 0;
+      const complete = !partial && !statusIsIncomplete("networks_status");
+      return fact(assets, assets === 0 ? 1 : coverageFailure, complete ? 0 : 1, complete);
+    }
+    case "TENABLE-04": {
+      const assets = value("asset_count") ?? 0;
+      if (assets === 0) return {};
+      const coverage = value("coverage_ratio");
+      const threshold = value("threshold");
+      return fact(assets, coverage !== undefined && threshold !== undefined && coverage < threshold ? 1 : 0, partial ? 1 : 0);
+    }
+    case "TENABLE-05": {
+      const agents = value("agent_count");
+      if (agents === undefined || agents === 0) return {};
+      const unhealthy = count("offline_agents", "stale_connect_agents");
+      const complete = !partial && !statusIsIncomplete("server_properties_status");
+      return fact(agents, unhealthy / agents > 0.1 ? unhealthy : 0, count("undated_agents", "outdated_agents_count") + (complete ? 0 : 1), complete);
+    }
+    case "TENABLE-06": {
+      const agents = value("agent_count");
+      const groups = value("agent_group_count");
+      if (agents === undefined || agents === 0 || groups === undefined || statusIsIncomplete("agent_groups_status")) return {};
+      const ungrouped = value("ungrouped_agents_count") ?? 0;
+      return fact(agents, groups === 0 || ungrouped / agents > 0.1 ? Math.max(1, ungrouped) : 0, ungrouped, !partial);
+    }
+    case "TENABLE-07": {
+      const scanners = value("linked_scanner_count");
+      if (scanners === undefined || scanners === 0) return {};
+      const violations = count("unlinked", "off", "stale_connect");
+      const reviews = count("undated", "outdated") + (evidence.caller_is_administrator === true ? 0 : 1) + (partial ? 1 : 0);
+      return fact(scanners, violations, reviews, !partial && evidence.caller_is_administrator === true);
+    }
+    case "TENABLE-08": {
+      const age = value("plugin_set_age_hours");
+      const evaluated = count("evaluated_scanners");
+      const threshold = value("threshold_hours") ?? 0;
+      const stale = count("stale_scanners");
+      if (age === undefined || (age <= threshold && stale === 0 && (statusIsIncomplete("scanners_status") || evaluated === 0))) return {};
+      const reviews = count("undated_scanners", "stale_online_agents") + (statusIsIncomplete("agents_status") || partial ? 1 : 0);
+      return fact(evaluated, age > threshold || stale > 0 ? Math.max(1, stale) : 0, reviews, !statusIsIncomplete("agents_status") && !partial);
+    }
+    case "TENABLE-09": {
+      const networks = value("network_count");
+      if (networks === undefined || networks === 0) return {};
+      return fact(networks, value("networks_without_scanners") ?? 0, (value("networks_without_scanner_count") ?? 0) + (partial ? 1 : 0), !partial);
+    }
+    case "TENABLE-10": {
+      const users = value("user_count") ?? 0;
+      const enabled = value("enabled_users");
+      if (users === 0 || enabled === undefined || enabled === 0 || evidence.caller_is_administrator === false) return {};
+      const admins = count("administrators");
+      const violations = count("administrators_without_strong_auth", "inactive_users") + (admins > (value("max_admins") ?? 0) ? admins - (value("max_admins") ?? 0) : 0);
+      const reviews = count("never_logged_in_users", "stale_api_key_users", "locked_out_users", "repeated_login_failures", "users_without_enabled_flag")
+        + (statusIsIncomplete("roles_status") ? 1 : 0);
+      return fact(enabled, violations, reviews, !statusIsIncomplete("roles_status"));
+    }
+    case "TENABLE-11": {
+      const permissions = value("permission_count");
+      if (permissions === undefined || permissions === 0) return {};
+      const complete = !partial
+        && evidence.access_groups_truncated !== true
+        && !statusIsIncomplete("access_groups_status")
+        && (evidence.user_groups !== null || evidence.groups_readable === true)
+        && evidence.caller_is_administrator === true;
+      return fact(permissions, value("broad_permission_count") ?? count("broad_permissions"), count("legacy_access_group_count") + (complete ? 0 : 1), complete);
+    }
+    case "TENABLE-12": {
+      const credentials = value("credential_count");
+      if (credentials === undefined || credentials === 0) return {};
+      return fact(credentials, 0, count("unused_credentials_count", "older_than_one_year_count", "undated_credentials") + (partial ? 1 : 0), !partial);
+    }
+    case "TENABLE-13":
+      return fact(value("exclusion_count") ?? 0, count("permanent_exclusions_count", "broad_exclusions_count"), count("undocumented_exclusions_count") + (partial ? 1 : 0), !partial);
+    case "TENABLE-14": {
+      const open = value("open_findings") ?? 0;
+      if ((value("asset_count") ?? 0) === 0 || open === 0) return {};
+      const coverage = value("vpr_coverage") ?? 0;
+      const complete = !partial && evidence.caller_is_administrator === true;
+      return fact(open, 0, coverage < 0.5 || !complete ? 1 : 0, complete);
+    }
+    case "TENABLE-15": {
+      if ((value("asset_count") ?? 0) === 0) return {};
+      const open = tenableEvidenceCount(evidence, "open_by_severity");
+      const overdue = asObject(evidence.overdue_by_severity) ?? {};
+      const severe = (asNumber(overdue.critical) ?? 0) + (asNumber(overdue.high) ?? 0);
+      const complete = !partial && evidence.caller_is_administrator === true;
+      const review = (asNumber(overdue.medium) ?? 0) + (asNumber(overdue.low) ?? 0) + (value("undated_open_findings") ?? 0) + (complete ? 0 : 1);
+      return fact(open === 0 && !complete ? 1 : open, severe, review, complete);
+    }
+    case "TENABLE-16": {
+      const assets = value("asset_count") ?? 0;
+      const categories = value("tag_category_count") ?? value("tag_category_count_read");
+      if (assets === 0 || categories === undefined) return {};
+      const ratio = value("tagged_ratio") ?? 0;
+      const threshold = value("threshold") ?? 0;
+      const complete = !partial
+        && evidence.tag_categories_truncated !== true
+        && evidence.tag_values_truncated !== true
+        && value("tag_value_count") !== undefined;
+      return fact(assets, categories === 0 && evidence.tag_categories_truncated !== true || ratio < threshold ? 1 : 0, complete ? 0 : 1, complete);
+    }
+    case "TENABLE-17":
+      return fact(1, count("enabled_recurring_compliance_scans") === 0 ? 1 : 0, evidence.caller_is_administrator === true ? 0 : 1, evidence.caller_is_administrator === true);
+    case "TENABLE-18": {
+      const events = value("event_count") ?? 0;
+      return fact(events, 0, events === 0 ? 1 : count("sensitive_events") + (evidence.inventory_truncated === true ? 1 : 0), evidence.inventory_truncated !== true);
+    }
+    case "TENABLE-19": {
+      const jobs = value("external_export_jobs_in_window") ?? 0;
+      const days = count("external_export_days");
+      if (jobs === 0) return {};
+      const complete = (evidence.vuln_export_jobs_listed !== null || value("vuln_export_jobs_read") !== undefined)
+        && (evidence.asset_export_jobs_listed !== null || value("asset_export_jobs_read") !== undefined)
+        && evidence.caller_is_administrator === true;
+      return fact(jobs, 0, days < 2 || !complete ? 1 : 0, complete);
+    }
+    case "TENABLE-20": {
+      const groups = value("target_group_count") ?? 0;
+      const nonAdministrator = evidence.caller_is_administrator !== true;
+      return fact(groups === 0 && nonAdministrator ? 1 : groups, 0, count("stale_or_undated_groups", "overlapping_targets") + (nonAdministrator ? 1 : 0), !nonAdministrator);
+    }
+    default:
+      return {};
+  }
+}
+
 function finding(
   control: number,
-  status: TenableFindingStatus,
   severity: TenableSeverity,
   summary: string,
   evidence: JsonRecord = {},
   idSuffix = "",
+  decisionContext: JsonRecord = {},
 ): TenableFinding {
-  return {
-    id: `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`,
+  const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
+  const facts = tenableDecisionFacts(id, { ...evidence, ...decisionContext });
+  const contractId = idSuffix ? id.slice(0, -idSuffix.length) : id;
+  const result: TenableFindingWithFacts = {
+    id,
     title: CONTROL_TITLES[control] + (idSuffix ? " (Tenable Security Center)" : ""),
     severity,
-    status,
+    status: evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, contractId, facts) as TenableFindingStatus,
     summary,
     evidence,
     mappings: CONTROL_MAPPINGS[control],
   };
+  Object.defineProperty(result, TENABLE_DECISION_FACTS, { value: facts });
+  return result;
 }
 
 /**
@@ -2864,7 +3105,7 @@ function unreadableFinding(control: number, severity: TenableSeverity, dataset: 
     : `Unknown: ${dataset.endpoint} could not be read because ${describeUnread(dataset)}. A human must collect ${manualEvidence}.`;
   // The evidence states the absence in the positive form (not_collected: true): a false
   // leaf appearing under a denied read is the shape an empty or disabled setting takes.
-  return finding(control, "manual", severity, summary, {
+  return finding(control, severity, summary, {
     not_collected: true,
     endpoint: dataset.endpoint,
     dataset_status: dataset.status,
@@ -2900,9 +3141,21 @@ function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>)
     records_seen: readable ? seenOrNull(dataset) ?? null : null,
     records_total: readable ? dataset.total ?? null : null,
   };
-  if (!readable || !dataset.truncated || item.summary.includes(" records were retrieved")) return { ...item, evidence };
+  const previousFacts = (item as TenableFindingWithFacts)[TENABLE_DECISION_FACTS] ?? {};
+  const facts = dataset.truncated && item.id !== "TENABLE-07-SC"
+    ? { ...previousFacts, evidence_complete: false }
+    : previousFacts;
+  const contractId = item.id.endsWith("-SC") ? item.id.slice(0, -3) : item.id;
+  const status = evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, contractId, facts) as TenableFindingStatus;
+  if (!readable || !dataset.truncated || item.summary.includes(" records were retrieved")) {
+    const result: TenableFindingWithFacts = { ...item, status, evidence };
+    Object.defineProperty(result, TENABLE_DECISION_FACTS, { value: facts });
+    return result;
+  }
   const partial = ` Only ${dataset.seen ?? "an unknown number"} of ${dataset.total ?? "unknown"} records were retrieved${dataset.error ? ` (${dataset.error})` : ""}; the verdict rests on the records retrieved.`;
-  return { ...item, summary: `${item.summary}${partial}`, evidence };
+  const result: TenableFindingWithFacts = { ...item, status, summary: `${item.summary}${partial}`, evidence };
+  Object.defineProperty(result, TENABLE_DECISION_FACTS, { value: facts });
+  return result;
 }
 
 // Rule 1 corollary: a finding that reads several inventories cannot pass while any of
@@ -3301,7 +3554,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       policySummary = `All ${evaluations.length} scan policies referenced by the ${scans.length} visible scans enable safe checks (safe_checks=yes), scan the default or full port range, and keep more than half of their plugin families enabled, per ${POLICY_DETAILS_ENDPOINT}.${scansWithoutPolicy.length > 0 ? ` ${scansWithoutPolicy.length} scans expose no policy_id and were not evaluated.` : ""}${templateNote}${nonAdminNote(callerIsAdministrator)}`;
       if (scansWithoutPolicy.length > 0 && policyStatus === "pass") policyStatus = "warn";
     }
-    findings.push(finding(1, policyStatus, "high", policySummary, {
+    findings.push(finding(1, "high", policySummary, {
       scan_count: scans.length,
       scan_types: scanTypes,
       policy_count: countOrNull(data.policies),
@@ -3325,6 +3578,9 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       policy_details_http_status: data.policyDetails.httpStatus,
       policy_details_requested: data.policyDetails.data.length,
       caller_is_administrator: callerIsAdministrator,
+    }, "", {
+      policies_status: data.policies.status,
+      policy_details_truncated: data.policyDetails.truncated,
     }));
 
     const recurring = scans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
@@ -3352,7 +3608,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       scheduleStatus = capForNonAdmin("pass", callerIsAdministrator);
       scheduleSummary = `All ${recurring.length} enabled recurring scans launched within the last ${staleScanDays} days.${nonAdminNote(callerIsAdministrator)}`;
     }
-    findings.push(finding(2, scheduleStatus, "high", scheduleSummary, {
+    findings.push(finding(2, "high", scheduleSummary, {
       scan_count: scans.length,
       enabled_recurring_scans: recurring.length,
       disabled_recurring_scans: disabledRecurring.length,
@@ -3372,7 +3628,6 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       const activeCompliance = complianceScans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
       findings.push(finding(
         17,
-        scans.length === 0 ? "fail" : activeCompliance.length > 0 ? capForNonAdmin("pass", callerIsAdministrator) : "fail",
         "medium",
         scans.length === 0
           ? "No scans are visible, so no compliance audit scan is configured; emptiness fails this control."
@@ -3384,6 +3639,8 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
           enabled_recurring_compliance_scans: activeCompliance.length,
           compliance_templates_available: data.templates.data.filter(templateLooksCompliance).map((template) => asString(template.title) ?? asString(template.name)).slice(0, 50),
         },
+        "",
+        { caller_is_administrator: callerIsAdministrator },
       ));
     }
   }
@@ -3411,7 +3668,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       status = capForPartial("pass", data.assetExport);
       summary = `${percent(coverage)} of ${assets.length} exported assets had a successful credentialed or agent scan (threshold ${percent(credentialThreshold)}).${partialNote(data.assetExport)}`;
     }
-    findings.push(finding(4, status, "high", summary, {
+    findings.push(finding(4, "high", summary, {
       asset_count: assets.length,
       credentialed_or_agent_assets: credentialed.length,
       authentication_failures: failures.length,
@@ -3421,7 +3678,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       export_status: data.assetExport.data.status,
       chunks_fetched: chunkRatio(data.assetExport),
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }));
+    }, "", { inventory_truncated: data.assetExport.truncated }));
   }
 
   if (data.exclusions.status !== "ok") {
@@ -3434,7 +3691,6 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     const issues = new Set([...permanent, ...undocumented, ...broad].map((item) => asString(item.name) ?? asString(item.id) ?? "exclusion"));
     findings.push(withPartialView(finding(
       13,
-      exclusions.length === 0 ? capForPartial("pass", data.exclusions) : issues.size === 0 ? capForPartial("pass", data.exclusions) : permanent.length > 0 || broad.length > 0 ? "fail" : "warn",
       "medium",
       exclusions.length === 0
         ? data.exclusions.truncated
@@ -3474,7 +3730,6 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     const overlapping = [...memberIndex.entries()].filter(([, owners]) => owners.length > 1);
     findings.push(finding(
       20,
-      groups.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : stale.length === 0 && overlapping.length === 0 ? capForNonAdmin("pass", callerIsAdministrator) : "warn",
       "low",
       groups.length === 0
         ? `No legacy target groups are visible (${data.targetGroups.endpoint} returned an empty list); target groups were deprecated in February 2022 in favor of tags, so emptiness is compliant.${nonAdminNote(callerIsAdministrator)}`
@@ -3486,6 +3741,8 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
         stale_or_undated_groups: stale.map((group) => asString(group.name)).slice(0, 50),
         overlapping_targets: overlapping.slice(0, 25).map(([member, owners]) => ({ member, groups: owners })),
       },
+      "",
+      { caller_is_administrator: callerIsAdministrator },
     ));
   }
 
@@ -3563,7 +3820,7 @@ function assessSecurityCenterSchedule(scans: TenableDataset<JsonRecord[]>, resul
     status = "pass";
     summary = `${scheduled.length} recurring Security Center scans exist and ${completed.length} scan results completed in the last ${staleScanDays} days.`;
   }
-  return finding(2, status, "high", summary, {
+  return finding(2, "high", summary, {
     sc_scan_count: scans.data.length,
     sc_recurring_scans: scheduled.length,
     sc_completed_results_in_window: results.status === "ok" ? completed.length : null,
@@ -3668,7 +3925,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = "manual";
       summary = `${assets.length} assets exported (${fresh.length} seen within ${staleAssetDays} days, ${stale} stale, ${undated.length} without last_seen). The API does not know the expected network ranges; pass expected_asset_count or compare the per-network counts in the evidence against the authoritative inventory.${networkNote}`;
     }
-    findings.push(finding(3, status, "high", summary, {
+    findings.push(finding(3, "high", summary, {
       asset_count: assets.length,
       fresh_assets: fresh.length,
       stale_assets: stale,
@@ -3680,7 +3937,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }));
+    }, "", { inventory_truncated: data.assetExport.truncated === true || data.networks.truncated === true }));
 
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
     const categories = data.tagCategories.status === "ok" ? data.tagCategories.data.map((item) => asString(item.name) ?? "category") : [];
@@ -3707,7 +3964,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       tagStatus = capForIncomplete(capForPartial("pass", data.assetExport), data.tagCategories, data.tagValues);
       tagSummary = `${percent(taggedRatio)} of ${assets.length} assets carry at least one tag across ${categories.length} categories. Confirm the categories cover compliance scope, business unit, and environment.${partialNote(data.assetExport)}${partialNote(data.tagCategories)}${partialNote(data.tagValues)}${unreadableNote([{ dataset: data.tagValues, consequence: "the tag value population is unknown" }])}`;
     }
-    findings.push(finding(16, tagStatus, "medium", tagSummary, {
+    findings.push(finding(16, "medium", tagSummary, {
       asset_count: assets.length,
       tagged_assets: tagged.length,
       tagged_ratio: taggedRatio,
@@ -3718,6 +3975,9 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       tag_value_count: countOrNull(data.tagValues),
       tag_values_truncated: data.tagValues.status === "ok" ? data.tagValues.truncated : null,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
+    }, "", {
+      inventory_truncated: data.assetExport.truncated,
+      tag_category_count_read: data.tagCategories.status === "ok" ? categories.length : undefined,
     }));
   }
 
@@ -3756,7 +4016,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForUnreadable("pass", data.serverProperties);
       summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.${unreadableNote([{ dataset: data.serverProperties, consequence: "the licensed agent count (license.agents) is unknown" }])}`;
     }
-    findings.push(withPartialView(finding(5, status, "high", summary, {
+    findings.push(withPartialView(finding(5, "high", summary, {
       agent_count: boundedCount(agents.length, data.agents),
       pagination_total: data.agents.total ?? null,
       licensed_agents: licensedAgents ?? null,
@@ -3790,7 +4050,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       groupStatus = "pass";
       groupSummary = `All ${agents.length} agents belong to at least one of ${groupCount} agent groups. Confirm the groups mirror network segments or business units.`;
     }
-    findings.push(withPartialView(finding(6, groupStatus, "medium", groupSummary, {
+    findings.push(withPartialView(finding(6, "medium", groupSummary, {
       agent_count: boundedCount(agents.length, data.agents),
       agent_group_count: groupCount,
       ungrouped_agents_count: boundedCount(ungrouped.length, data.agents),
@@ -3804,9 +4064,9 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
   if (data.scanners.status !== "ok") {
     findings.push(unreadableFinding(7, "high", data.scanners, "the linked scanner list with status, last connect, and Nessus version from Sensors > Nessus Scanners"));
   } else if (data.scanners.data.length === 0) {
-    findings.push(finding(7, "manual", "high", `${data.scanners.endpoint} returned zero scanners; even cloud scanners were not visible, so the key cannot see sensors. Collect the scanner inventory from Sensors > Nessus Scanners.`, { scanner_count: 0 }));
+    findings.push(finding(7, "high", `${data.scanners.endpoint} returned zero scanners; even cloud scanners were not visible, so the key cannot see sensors. Collect the scanner inventory from Sensors > Nessus Scanners.`, { scanner_count: 0 }));
   } else if (linkedScanners.length === 0) {
-    findings.push(finding(7, "manual", "high", `Not applicable to linked appliances: ${data.scanners.data.length} scanner entries are visible but all are Tenable-managed cloud scanners or groups. Confirm the tenant intentionally relies only on cloud scanners.`, {
+    findings.push(finding(7, "high", `Not applicable to linked appliances: ${data.scanners.data.length} scanner entries are visible but all are Tenable-managed cloud scanners or groups. Confirm the tenant intentionally relies only on cloud scanners.`, {
       scanner_count: data.scanners.data.length,
       cloud_scanners: data.scanners.data.map((scanner) => asString(scanner.name)).slice(0, 50),
     }));
@@ -3826,7 +4086,6 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     const unhealthy = new Set([...unlinked, ...off, ...staleConnect].map((scanner) => asString(scanner.name) ?? asString(scanner.id) ?? "scanner"));
     findings.push(withPartialView(finding(
       7,
-      unhealthy.size > 0 ? "fail" : undated.length > 0 || outdated.length > 0 ? "warn" : capForNonAdmin(capForPartial("pass", data.scanners), callerIsAdministrator),
       "high",
       unhealthy.size > 0
         ? `${unhealthy.size} of ${linkedScanners.length} linked scanners are unlinked, off, or have not connected in 24 hours: ${[...unhealthy].slice(0, 10).join(", ")}.`
@@ -3892,7 +4151,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForPartial("pass", data.agents);
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set (${linkedScanners.length} linked appliances) load a set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
     }
-    findings.push(withPartialView(finding(8, status, "high", summary, {
+    findings.push(withPartialView(finding(8, "high", summary, {
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
       plugin_set_age_hours: serverPluginMs === undefined ? null : Math.round((now - serverPluginMs) / 3_600_000),
       scanner_entries: countOrNull(data.scanners),
@@ -3914,7 +4173,6 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     const unknownCount = networks.filter((network) => asNumber(network.scanner_count) === undefined);
     findings.push(withPartialView(finding(
       9,
-      networks.length === 0 ? "manual" : withoutScanners.length > 0 ? "fail" : unknownCount.length > 0 ? "warn" : capForPartial("pass", data.networks),
       "medium",
       networks.length === 0
         ? `${data.networks.endpoint} returned zero network objects; the default network should always exist, so the view is incomplete. Collect the network list from Settings > Sensors > Networks.`
@@ -4014,7 +4272,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     status = "pass";
     summary = `All ${enabled.length} enabled Security Center scanners report status 1, checked in within 24 hours, load a plugin set newer than ${pluginStaleHours} hours, and the active plugin feed is not stale.`;
   }
-  return withPartialView(finding(7, status, "high", summary, {
+  return withPartialView(finding(7, "high", summary, {
     sc_scanner_count: scanners.data.length,
     sc_enabled_scanners: enabled.length,
     sc_unhealthy: unhealthy.map((scanner) => `${asString(scanner.name)} (status ${asString(scanner.status)})`).slice(0, 50),
@@ -4023,7 +4281,7 @@ function assessSecurityCenterScanners(scanners: TenableDataset<JsonRecord[]>, fe
     sc_stale_plugins: stalePlugins.map((scanner) => `${asString(scanner.name)} (${asString(scanner.loadedPluginSet) ?? asString(scanner.pluginSet)})`).slice(0, 50),
     sc_feed_active_stale: feedStale ?? null,
     sc_feed_active_update_time: asString(feedActive?.updateTime) ?? null,
-  }, "-SC"), scanners);
+  }, "-SC", { sc_feed_readable: feed.status === "ok" }), scanners);
 }
 
 export interface TenableAccessControlData {
@@ -4094,9 +4352,9 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   if (data.users.status !== "ok") {
     findings.push(unreadableFinding(10, "high", data.users, "the user list with roles, last login, MFA, and enabled state from Settings > Access Control > Users"));
   } else if (data.users.data.length === 0) {
-    findings.push(finding(10, "manual", "high", `${data.users.endpoint} returned zero users, which cannot be a complete view because the calling user must exist; collect the user list from Settings > Access Control > Users.`, { user_count: 0 }));
+    findings.push(finding(10, "high", `${data.users.endpoint} returned zero users, which cannot be a complete view because the calling user must exist; collect the user list from Settings > Access Control > Users.`, { user_count: 0 }));
   } else if (callerIsAdministrator !== true) {
-    findings.push(finding(10, "manual", "high", `Partial view: ${data.users.endpoint} returned ${data.users.data.length} users but only uuid, id, username, and email are exposed because the API key does not hold the Administrator [64] role. Role, last login, MFA, and enabled attributes require an Administrator key.`, {
+    findings.push(finding(10, "high", `Partial view: ${data.users.endpoint} returned ${data.users.data.length} users but only uuid, id, username, and email are exposed because the API key does not hold the Administrator [64] role. Role, last login, MFA, and enabled attributes require an Administrator key.`, {
       user_count: data.users.data.length,
       caller_is_administrator: false,
     }));
@@ -4132,7 +4390,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       status = capForUnreadable("pass", data.roles);
       summary = `${enabledUsers.length} enabled users, ${admins.length} administrators (threshold ${maxAdmins}) all enforcing SAML-only or two-factor authentication, none inactive past ${inactiveDays} days.${unreadableNote([{ dataset: data.roles, consequence: "custom roles are unknown" }])}`;
     }
-    findings.push(finding(10, status, "high", summary, {
+    findings.push(finding(10, "high", summary, {
       user_count: users.length,
       enabled_users: enabledUsers.length,
       users_without_enabled_flag: missingEnabledFlag.length,
@@ -4157,7 +4415,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
   if (data.permissions.status !== "ok") {
     findings.push(unreadableFinding(11, "high", data.permissions, "the access control permission list (Settings > Access Control > Permissions) and any legacy access groups"));
   } else if (data.permissions.data.length === 0) {
-    findings.push(finding(11, "manual", "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: boundedCount(0, data.permissions) }));
+    findings.push(finding(11, "high", `${data.permissions.endpoint} returned zero permissions, but Tenable always generates administrator permissions, so the view is incomplete; collect the permission list from Settings > Access Control > Permissions.`, { permission_count: boundedCount(0, data.permissions) }));
   } else {
     const permissions = data.permissions.data;
     const broad = permissions.filter((permission) => {
@@ -4172,7 +4430,6 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     const legacyAccessGroups = data.accessGroups.status === "ok" ? data.accessGroups.data.filter((group) => asBoolean(group.all_assets) !== true) : [];
     findings.push(finding(
       11,
-      broad.length > 0 ? "fail" : legacyAccessGroups.length > 0 || data.accessGroups.status !== "ok" ? "warn" : capForNonAdmin(capForUnreadable(capForPartial("pass", data.accessGroups), data.groups), callerIsAdministrator),
       "high",
       broad.length > 0
         ? `${broad.length} of ${permissions.length} permissions grant every user (AllUsers or the tenant-wide All Users group ${ALL_USERS_GROUP_UUID}) write-style actions (CanEdit, CanScan, or CanUse) on all assets, objects, or tags: ${broad.map((permission) => asString(permission.name)).slice(0, 10).join(", ")}. Narrow these to specific groups and tags.`
@@ -4190,13 +4447,19 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
         access_groups_truncated: data.accessGroups.status === "ok" ? data.accessGroups.truncated : null,
         user_groups: countOrNull(data.groups),
       },
+      "",
+      {
+        broad_permission_count: broad.length,
+        caller_is_administrator: callerIsAdministrator,
+        groups_readable: data.groups.status === "ok",
+      },
     ));
   }
 
   if (data.credentials.status !== "ok") {
     findings.push(unreadableFinding(12, "medium", data.credentials, "the managed credential inventory with types, owners, and last use from Settings > Credentials"));
   } else if (data.credentials.data.length === 0) {
-    findings.push(finding(12, "manual", "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}).${data.credentials.truncated ? " The walk was truncated before any record arrived, so the credential list was not reviewed." : ""} Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: boundedCount(0, data.credentials), pagination_total: data.credentials.total ?? null, inventory_truncated: data.credentials.truncated }));
+    findings.push(finding(12, "medium", `${data.credentials.endpoint} returned zero managed credentials (pagination.total ${data.credentials.total ?? "not reported"}).${data.credentials.truncated ? " The walk was truncated before any record arrived, so the credential list was not reviewed." : ""} Scan-embedded credentials are not listed by the API, so a human must confirm how scan credentials are managed and rotated.`, { credential_count: boundedCount(0, data.credentials), pagination_total: data.credentials.total ?? null, inventory_truncated: data.credentials.truncated }));
   } else {
     const credentials = data.credentials.data;
     const unused = credentials.filter((credential) => asNumber(asObject(credential.last_used_by)?.id) === undefined);
@@ -4212,7 +4475,6 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     }
     findings.push(withPartialView(finding(
       12,
-      unused.length > 0 || old.length > 0 ? "warn" : undated.length > 0 ? "warn" : capForPartial("pass", data.credentials),
       "medium",
       unused.length > 0 || old.length > 0
         ? `${credentials.length} managed credentials: ${unused.length} have never been used in a scan, ${old.length} were created over a year ago (the API exposes created_date but no rotation date, so confirm rotation manually).`
@@ -4256,7 +4518,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       status = "pass";
       summary = `${events.length} activity log events were retrieved completely for the last ${lookbackDays} days with no deletions, privilege changes, or exclusion changes; ${failures.length} failed actions recorded.`;
     }
-    findings.push(finding(18, status, "medium", summary, {
+    findings.push(finding(18, "medium", summary, {
       event_count: boundedCount(events.length, data.auditLog),
       pagination_total: data.auditLog.total ?? null,
       inventory_truncated: data.auditLog.truncated,
@@ -4342,7 +4604,7 @@ function assessSecurityCenterUsers(users: TenableDataset<JsonRecord[]>, now: num
     status = "pass";
     summary = `All ${active.length} active Security Center users logged in within ${inactiveDays} days; ${admins.length} hold the Administrator role.`;
   }
-  return finding(10, status, "high", summary, {
+  return finding(10, "high", summary, {
     sc_user_count: users.data.length,
     sc_active_users: active.length,
     sc_administrators: admins.map((user) => asString(user.username)).slice(0, 50),
@@ -4429,7 +4691,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       vprStatus = capPopulation("pass");
       vprSummary = `${percent(vprCoverage)} of ${rated.length} rated open findings carry a VPR score across ${assetCount} assets; ${vprCritical.length} findings have VPR 9 or higher and ${vprHigh.length} are VPR 7 to 8.9. Confirm remediation workflows sort by VPR.${populationNote}`;
     }
-    findings.push(finding(14, vprStatus, "high", vprSummary, {
+    findings.push(finding(14, "high", vprSummary, {
       exported_records: records.length,
       open_findings: open.length,
       fixed_findings_in_window: fixed.length,
@@ -4442,6 +4704,9 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       chunks: chunkRatio(data.vulnExport),
       unevaluable_records: unevaluableRecordsOf(data.vulnExport),
       asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
+    }, "", {
+      inventory_truncated: data.vulnExport.truncated === true || data.assetExport.truncated === true,
+      caller_is_administrator: callerIsAdministrator,
     }));
 
     const overdue: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -4484,7 +4749,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       slaStatus = capPopulation("pass");
       slaSummary = `All ${open.length} open findings are within SLA (critical ${sla.critical}d, high ${sla.high}d, medium ${sla.medium}d, low ${sla.low}d) across ${assetCount} assets${mttrDays !== null ? `; mean time to remediate over ${fixTimes.length} fixed findings is ${mttrDays} days` : ""}.${populationNote}`;
     }
-    findings.push(finding(15, slaStatus, "high", slaSummary, {
+    findings.push(finding(15, "high", slaSummary, {
       open_by_severity: openBySeverity,
       overdue_by_severity: overdue,
       undated_open_findings: undated,
@@ -4495,6 +4760,9 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       chunks: chunkRatio(data.vulnExport),
       unevaluable_records: unevaluableRecordsOf(data.vulnExport),
       asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
+    }, "", {
+      inventory_truncated: data.vulnExport.truncated === true || data.assetExport.truncated === true,
+      caller_is_administrator: callerIsAdministrator,
     }));
   }
 
@@ -4502,7 +4770,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
     const manualEvidence = "evidence of scheduled exports or report schedules from the Tenable UI (Reports) and integration logs";
     findings.push(data.vulnExportJobs.status === "not_configured"
       ? unreadableFinding(19, "medium", data.vulnExportJobs, manualEvidence)
-      : finding(19, "manual", "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
+      : finding(19, "medium", `Unknown: the export job lists could not be read because ${describeUnread(data.vulnExportJobs)} and ${describeUnread(data.assetExportJobs)}. A human must collect ${manualEvidence}.`, {
         not_collected: true,
         vuln_export_jobs: collectionStatusOf(data.vulnExportJobs),
         asset_export_jobs: collectionStatusOf(data.assetExportJobs),
@@ -4536,7 +4804,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       status = "manual";
       summary = `No export jobs other than this tool's own runs (${ownUuids.size} from this assessment and ${ownShaped.length} matching this tool's export shape) appear within the last ${EXPORT_JOB_WINDOW_DAYS} days, so automated exports are not evident in the observable window; a human must collect the integration or report schedule that distributes results. ${limitation}${unreadJobLists}`;
     }
-    findings.push(finding(19, status, "medium", summary, {
+    findings.push(finding(19, "medium", summary, {
       external_export_jobs_in_window: externalJobs.length,
       external_export_days: [...externalDays].sort(),
       window_days: EXPORT_JOB_WINDOW_DAYS,
@@ -4544,6 +4812,10 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       asset_export_jobs_listed: countOrNull(data.assetExportJobs),
       excluded_own_exports: [...ownUuids],
       excluded_own_shaped_jobs: ownShaped.map((job) => asString(job.uuid)).slice(0, 50),
+    }, "", {
+      asset_export_jobs_read: data.assetExportJobs.status === "ok" ? data.assetExportJobs.data.length : undefined,
+      caller_is_administrator: callerIsAdministrator,
+      vuln_export_jobs_read: data.vulnExportJobs.status === "ok" ? data.vulnExportJobs.data.length : undefined,
     }));
   }
 
@@ -5125,6 +5397,7 @@ function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: st
 }
 
 export function registerTenableTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, TENABLE_SPEC);
   pi.registerTool({
     name: "tenable_check_access",
     label: "Check Tenable audit access",

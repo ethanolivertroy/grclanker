@@ -34,6 +34,12 @@ import {
 } from "../dist/extensions/grc-tools/tenable.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = Date.parse("2026-09-21T12:00:00Z");
 const RECENT_SECONDS = Math.floor((NOW - 2 * 86_400_000) / 1000);
@@ -848,6 +854,42 @@ test("control 1 is manual only when the policy details read is refused or the po
   assert.ok(unlinked.summary.includes("exposes a policy_id"), unlinked.summary);
 });
 
+test("control 1 warns when policy details are readable but the policy-name inventory is denied", async () => {
+  const denied = healthyRoutes();
+  denied["GET /policies"] = { __status: 403 };
+
+  const finding = byId(await runAll(clientsFor(denied)), "TENABLE-01");
+  assert.equal(finding.status, "warn");
+  assert.equal(finding.evidence.policy_details_status, "ok");
+  assert.match(finding.summary, /policy names are unknown/);
+});
+
+test("control 1 preserves manual review for a truncated policy-detail inventory unless a failure is proved", async () => {
+  const healthyData = await collectTenableScanProgramData(clientsFor(healthyRoutes()), { now: NOW });
+  healthyData.policyDetails.truncated = true;
+  healthyData.policyDetails.total = healthyData.policyDetails.data.length + 1;
+  assert.equal(byId([assessTenableScanProgram(healthyData, { now: NOW })], "TENABLE-01").status, "manual");
+
+  const unsafeRoutes = healthyRoutes();
+  unsafeRoutes["GET /policies/2"] = healthyPolicyDetails({ settings: { safe_checks: "no" } });
+  const unsafeData = await collectTenableScanProgramData(clientsFor(unsafeRoutes), { now: NOW });
+  unsafeData.policyDetails.truncated = true;
+  unsafeData.policyDetails.total = unsafeData.policyDetails.data.length + 1;
+  assert.equal(byId([assessTenableScanProgram(unsafeData, { now: NOW })], "TENABLE-01").status, "fail");
+});
+
+test("control 1 preserves the empty-scan failure ahead of unreadable policy secondaries", async () => {
+  const data = await collectTenableScanProgramData(clientsFor(healthyRoutes(), { status: 403 }), { now: NOW });
+  data.scans.status = "ok";
+  data.scans.data = [];
+  data.scans.truncated = true;
+  data.scans.total = 1;
+  data.scans.error = undefined;
+  data.scans.notCollected = false;
+
+  assert.equal(byId([assessTenableScanProgram(data, { now: NOW })], "TENABLE-01").status, "fail");
+});
+
 test("control 11 treats the tenant-wide All Users group as broad, alongside AllUsers and AllTags", async () => {
   const allUsersGroup = healthyRoutes();
   allUsersGroup["GET /api/v3/access-control/permissions"] = {
@@ -871,6 +913,57 @@ test("control 11 treats the tenant-wide All Users group as broad, alongside AllU
     permissions: [{ permission_uuid: "p-view", name: "Everyone views", actions: ["CanView"], objects: [{ type: "AllAssets" }], subjects: [{ type: "UserGroup", uuid: "00000000-0000-0000-0000-000000000000", name: "All Users" }] }],
   };
   assert.equal(byId(await runAll(clientsFor(readOnly)), "TENABLE-11").status, "pass");
+});
+
+test("control 11 preserves parent truncation outcomes and keeps proved broad-permission failures first", async () => {
+  const cleanPermissions = await collectTenableAccessControlData(clientsFor(healthyRoutes()), { now: NOW });
+  cleanPermissions.permissions.truncated = true;
+  cleanPermissions.permissions.total = cleanPermissions.permissions.data.length + 1;
+  assert.equal(byId([assessTenableAccessControl(cleanPermissions, { now: NOW })], "TENABLE-11").status, "pass");
+
+  const cleanGroups = await collectTenableAccessControlData(clientsFor(healthyRoutes()), { now: NOW });
+  cleanGroups.groups.truncated = true;
+  cleanGroups.groups.total = cleanGroups.groups.data.length + 1;
+  assert.equal(byId([assessTenableAccessControl(cleanGroups, { now: NOW })], "TENABLE-11").status, "pass");
+
+  const routes = healthyRoutes();
+  routes["GET /api/v3/access-control/permissions"] = {
+    permissions: [
+      { permission_uuid: "p-default", name: "All Assets [CanScan, CanView]", actions: ["CanView", "CanScan"], objects: [{ type: "AllAssets" }], subjects: [{ type: "AllUsers" }] },
+    ],
+  };
+  const data = await collectTenableAccessControlData(clientsFor(routes), { now: NOW });
+  data.permissions.truncated = true;
+  data.permissions.total = data.permissions.data.length + 1;
+
+  const finding = byId([assessTenableAccessControl(data, { now: NOW })], "TENABLE-11");
+  assert.equal(finding.status, "fail");
+  assert.equal(finding.evidence.broad_permissions, null);
+});
+
+test("control 16 warns rather than becoming manual when loaded tag categories are truncated", async () => {
+  const data = await collectTenableSensorCoverageData(clientsFor(healthyRoutes()), { now: NOW });
+  data.tagCategories.truncated = true;
+  data.tagCategories.total = data.tagCategories.data.length + 1;
+
+  assert.equal(byId([assessTenableSensorCoverage(data, { now: NOW })], "TENABLE-16").status, "warn");
+});
+
+test("control 7 Security Center preserves the parent pass for a healthy truncated scanner sample", async () => {
+  const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+  const data = await collectTenableSensorCoverageData(clientsFor(routes, { configExtra: SC_FIXTURE }), { now: NOW });
+  data.scScanners.truncated = true;
+  data.scScanners.total = data.scScanners.data.length + 1;
+
+  assert.equal(byId([assessTenableSensorCoverage(data, { now: NOW })], "TENABLE-07-SC").status, "pass");
+});
+
+test("control 19 preserves the parent pass for observed two-day activity in a truncated job listing", async () => {
+  const data = await collectTenableVulnerabilityData(clientsFor(healthyRoutes()), { now: NOW });
+  data.assetExportJobs.truncated = true;
+  data.assetExportJobs.total = data.assetExportJobs.data.length + 1;
+
+  assert.equal(byId([assessTenableVulnerabilityManagement(data, { now: NOW })], "TENABLE-19").status, "pass");
 });
 
 test("control 19 ignores this tool's own export shape and only counts jobs within the documented three-day window", async () => {
@@ -3829,4 +3922,23 @@ test("Tenable tools appear in the registered tool catalog under the Tenable grou
   const tools = getRegisteredToolSummaries().filter((tool) => tool.name.startsWith("tenable_"));
   assert.equal(tools.length, 6);
   for (const tool of tools) assert.equal(tool.group, "Tenable");
+});
+
+test("byte differential fixtures: Tenable assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("tenable", "representative", await runAll(clientsFor(partialRoutes()), { maxChunks: 1, expectedAssetCount: 2 }));
+  writeByteDifferentialFixture("tenable", "compliant", await runAll(clientsFor(healthyRoutes()), { expectedAssetCount: 2 }));
+  writeByteDifferentialFixture("tenable", "denied", await runAll(clientsFor(healthyRoutes(), { status: 403 })));
+  writeByteDifferentialFixture("tenable", "missing-null", await runAll(clientsFor(emptyRoutes())));
+  writeByteDifferentialFixture("tenable", "partial", await runAll(clientsFor(partialRoutes()), { maxChunks: 1 }));
+  writeByteDifferentialFixture("tenable", "boundary", {
+    credentialRatio: await runAll(clientsFor(healthyRoutes()), { credentialThreshold: 0.8 }),
+    taggedRatio: await runAll(clientsFor(healthyRoutes()), { taggedThreshold: 0.9 }),
+    administratorCount: await runAll(clientsFor(healthyRoutes()), { maxAdmins: 5 }),
+  });
+  const exported = await exportTenableAuditBundle(
+    clientsFor(healthyRoutes()),
+    prepareByteDifferentialExportRoot("tenable"),
+    { expectedAssetCount: 2 },
+  );
+  writeByteDifferentialFixture("tenable", "export", snapshotExportBundle(exported));
 });

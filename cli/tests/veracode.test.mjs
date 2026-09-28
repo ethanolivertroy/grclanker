@@ -27,6 +27,12 @@ import {
 } from "../dist/extensions/grc-tools/veracode.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 const API_ID = "dbb6f2a2ed0b6890bbd32e949f72c8c8";
@@ -655,6 +661,19 @@ test("assessVeracodePolicyCompliance flags failing, unassigned, and default poli
   conditional.applications[1].profile.policies[0].policy_compliance_status = "NOT_ASSESSED";
   const conditionalResult = await assessVeracodePolicyCompliance(mockClient(conditional));
   assert.equal(statusOf(conditionalResult.findings, 2), "warn");
+});
+
+test("flaw aging passes when complete finding lists contain only resolved findings", async () => {
+  const fixture = healthyFixture();
+  fixture.findings = fixture.findings.map((item) => ({
+    ...item,
+    finding_status: { ...item.finding_status, status: "CLOSED", resolution_status: "APPROVED" },
+  }));
+  const result = await assessVeracodeFindingsHygiene(mockClient(fixture), { now: NOW });
+  const finding = result.findings.find((item) => item.id === "VERACODE-03");
+  assert.equal(finding.status, "pass");
+  assert.equal(finding.evidence.open_findings_evaluated, 0);
+  assert.match(finding.summary, /All 0 open unmitigated findings/);
 });
 
 test("assessVeracodeFindingsHygiene fails on aged flaws, unreviewed mitigations, and density and warns on missing dates", async () => {
@@ -2990,4 +3009,25 @@ test("class 10: a single object carrying a documented member is kept whatever el
   const [, , , , accessControls] = await runVeracodeAssessments(client);
   assert.deepEqual(accessControls.rawData.self, fixture.self, "the record is kept whole");
   assert.equal(accessControls.rawData.api_credentials_by_user["u-2"].api_id, "abc123", "the credential record is projected, not marked");
+});
+
+test("byte differential fixtures: Veracode assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("veracode", "representative", await runVeracodeAssessments(partialClient()));
+  writeByteDifferentialFixture("veracode", "compliant", await runVeracodeAssessments(mockClient()));
+  writeByteDifferentialFixture("veracode", "denied", await runVeracodeAssessments(forbiddenClient()));
+  writeByteDifferentialFixture("veracode", "missing-null", await runVeracodeAssessments(emptyClient()));
+  writeByteDifferentialFixture("veracode", "partial", await runVeracodeAssessments(partialClient()));
+  writeByteDifferentialFixture("veracode", "boundary", {
+    scanAge: await assessVeracodeScanCoverage(mockClient(), { now: NOW, maxScanAgeDays: 90 }),
+    falsePositiveRate: await assessVeracodeFindingsHygiene(mockClient(), { now: NOW, maxFpRatePercent: 20 }),
+    administrators: await assessVeracodeAccessControls(mockClient(), { now: NOW, maxAdmins: 5 }),
+  });
+  const config = sampleConfig();
+  const exported = await exportVeracodeAuditBundle(
+    mockClient(),
+    config,
+    prepareByteDifferentialExportRoot("veracode"),
+    { now: NOW },
+  );
+  writeByteDifferentialFixture("veracode", "export", snapshotExportBundle(exported));
 });
