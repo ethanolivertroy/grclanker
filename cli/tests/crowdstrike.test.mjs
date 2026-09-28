@@ -736,7 +736,7 @@ test("CrowdstrikeApiClient rejects malformed successful collection responses whi
     const fetchImpl = async (input) => {
       const url = new URL(typeof input === "string" ? input : input.toString());
       if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "token-1", expires_in: 1799 });
-      return jsonResponse({ resources: [], meta: { pagination: { total: 0 } }, errors: [] });
+      return jsonResponse({ resources: [] });
     };
     const result = await assessCrowdstrikeAccessGovernance(new CrowdstrikeApiClient(sampleConfig(), { fetchImpl }));
     for (const id of ["CS-19", "CS-20", "CS-21"]) {
