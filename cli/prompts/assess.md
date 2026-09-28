@@ -1,5 +1,7 @@
 # Posture Assessment
 
+Subject: $ARGUMENTS
+
 Assess the overall security and compliance posture of the specified vendor, product, module, or environment.
 
 ## Phase 1: Baseline

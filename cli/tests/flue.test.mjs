@@ -644,7 +644,8 @@ test("shipped prompts load as the instruction document, workflow skills, and sub
   assert.match(audit.description, /Compliance Audit workflow\./);
   assert.match(audit.description, /\/audit workflow/);
   assert.ok(audit.description.length <= 1024);
-  assert.equal(audit.instructions, readFileSync(resolve(cliRoot, "prompts", "audit.md"), "utf8").trim());
+  assert.equal(audit.instructions, readFileSync(resolve(cliRoot, "prompts", "audit.md"), "utf8").replace(/\$ARGUMENTS/g, "").trim());
+  assert.equal(audit.instructions.includes("$ARGUMENTS"), false);
   assert.ok(Object.isFrozen(audit), "defineSkill() validates and freezes workflow skills");
 
   assert.deepEqual(content.skills.map((skill) => skill.name), ["crypto-validation"]);

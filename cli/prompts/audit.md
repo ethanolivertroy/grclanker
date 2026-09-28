@@ -1,5 +1,7 @@
 # Compliance Audit
 
+Subject: $ARGUMENTS
+
 Run a structured compliance audit for the specified system, product, or deployment.
 
 ## Phase 1: Scope Lock

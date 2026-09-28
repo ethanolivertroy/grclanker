@@ -552,7 +552,8 @@ test("workflow prompts and the bundled skill map onto skill configs", () => {
   assert.deepEqual([...WORKFLOW_NAMES], ["investigate", "audit", "assess", "validate"]);
   for (const name of WORKFLOW_NAMES) {
     const skill = workflowSkillConfig(name);
-    assert.equal(skill.markdown, readFileSync(resolve(cliRoot, "prompts", `${name}.md`), "utf8").trim());
+    assert.equal(skill.markdown, readFileSync(resolve(cliRoot, "prompts", `${name}.md`), "utf8").replace(/\$ARGUMENTS/g, "").trim());
+    assert.equal(skill.markdown.includes("$ARGUMENTS"), false);
     assert.match(skill.description, /^Use when /);
   }
 
