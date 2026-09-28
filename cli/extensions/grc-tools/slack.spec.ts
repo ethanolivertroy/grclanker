@@ -255,7 +255,7 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   "SLACK-ID-03": inventory("scim", { empty: "fail" }),
   "SLACK-ID-04": {
     inputs: inputWith({
-      mismatch_count: "Non-negative cardinality of SCIM user records whose `active` field is not false and whose primary email equals the email of a deactivated Slack user.",
+      mismatch_count: "Non-negative cardinality of SCIM user records whose `active` field is not false and whose normalized `userName` equals the normalized email of a deactivated Slack user; only when `userName` is absent does the comparison use the SCIM record's normalized primary email instead.",
     }, "users_readable", "scim_readable", "complete", "scim_user_count", "mismatch_count"),
     rules: ordered(any(ne("users_readable", true), ne("scim_readable", true)), gt("mismatch_count", 0), any(ne("complete", true), eq("scim_user_count", 0)), gt("scim_user_count", 0)),
   },

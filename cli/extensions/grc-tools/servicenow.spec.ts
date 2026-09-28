@@ -343,7 +343,7 @@ const SERVICENOW_EXECUTABLE_DECISIONS: Readonly<Record<string, ServicenowExecuta
   },
   "SNOW-08": {
     inputs: inputWith({
-      concern_count: "Non-negative sum of active identity-provider certificate concerns and SSO configuration concerns: active certificates with an absent or unparseable expiry, active certificates expiring within the configured warning window, plus one when an active SSO provider exists while `glide.authenticate.multisso.enabled` is not true, plus one when an active SSO provider exists without a populated `glide.authenticate.sso.redirect.idp` value.",
+      concern_count: "Non-negative sum of active certificate concerns across all records returned by the unfiltered `sys_certificate` inventory and SSO configuration concerns: active certificates with an absent or unparseable expiry, active certificates expiring within the configured warning window, plus one when an active SSO provider exists while `glide.authenticate.multisso.enabled` is not true, plus one when an active SSO provider exists without a populated `glide.authenticate.sso.redirect.idp` value.",
     }, "readable", "complete", "providers_complete", "provider_count", "expired_certificate_count", "concern_count"),
     rules: [rule("manual", ne("readable", true)), rule("manual", all(eq("provider_count", 0), ne("providers_complete", true))), rule("fail", eq("provider_count", 0)), rule("fail", gt("expired_certificate_count", 0)), rule("warn", any(gt("concern_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
   },

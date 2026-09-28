@@ -561,14 +561,14 @@ test("all 1117 primitive input uses have explicit portable owner, domain, comple
 
 test("all 18 audited rule-driving facts have check-specific runtime meanings", () => {
   const expected = new Map([
-    ["SLACK-ID-04.mismatch_count", /SCIM user records.*`active` field is not false.*primary email.*deactivated Slack user/],
+    ["SLACK-ID-04.mismatch_count", /SCIM user records.*`active` field is not false.*normalized `userName`.*deactivated Slack user.*only when `userName` is absent.*normalized primary email/],
     ["SLACK-ADMIN-05.open_count", /Grid workspaces.*`discoverability`.*equals `open`/],
     ["SLACK-ADMIN-07.unrestricted_count", /admin\.teams\.settings\.info.*`team\.email_domain`.*empty string/],
     ["SLACK-APP-03.flagged_count", /distinct approved-app names.*internal.*outside the Slack Marketplace.*`is_sensitive`/],
     ["SLACK-CHAN-02.unrestricted_count", /announcement-channel preference records.*posting-restriction classifier returns false/],
     ["SLACK-CHAN-02.preference_count", /announcement-channel records.*admin\.conversations\.getConversationPrefs/],
     ["BOX-13.assigned_policy_count", /active or applying legal-hold policies.*assignment_counts.*legal-hold assignment inventory/],
-    ["SNOW-08.concern_count", /identity-provider certificate concerns and SSO configuration concerns.*glide\.authenticate\.multisso\.enabled.*glide\.authenticate\.sso\.redirect\.idp/],
+    ["SNOW-08.concern_count", /active certificate concerns across all records returned by the unfiltered `sys_certificate` inventory and SSO configuration concerns.*glide\.authenticate\.multisso\.enabled.*glide\.authenticate\.sso\.redirect\.idp/],
     ["SNOW-18.unverified_count", /active SMTP email-account rows.*cannot be classified.*STARTTLS.*SSL\/TLS/],
     ["SNOW-19.not_validated_count", /MID Server rows.*`ecc_agent`.*`validated` field is not true/],
     ["SF-19.disabled_count", /four SF-19 clickjack-protection flags.*explicitly false/],

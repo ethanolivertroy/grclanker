@@ -8,7 +8,10 @@ import { inflateRawSync } from "node:zlib";
 import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import { SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
-import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import {
+  captureBatchDecisionFacts,
+  evaluateBatchCheckVerdict,
+} from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -490,6 +493,47 @@ portableContractTest("MFA and SSO population primitives count every active user,
   const ssoDefinition = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ADMIN-02").evidenceFieldDefinitions.without_sso_count;
   assert.match(ssoDefinition, /active organization users with SSO disabled/);
   assert.doesNotMatch(ssoDefinition, /administrators with SSO disabled/);
+});
+
+portableContractTest("SLACK-ID-04 matches SCIM userName first and falls back to primary email only when absent", async () => {
+  const variants = [
+    ["Slack handle", "gone", 0, "pass"],
+    ["email-shaped userName", "gone@example.com", 1, "fail"],
+    ["absent userName", undefined, 1, "fail"],
+  ];
+  for (const [label, userName, expectedCount, expectedVerdict] of variants) {
+    const { result, facts } = await captureSlackFacts("SLACK-ID-04", () => assessSlackIdentity(makeClient((request) => {
+      if (request.pathname === "/scim/v2/Users") {
+        return {
+          totalResults: 1,
+          itemsPerPage: 1,
+          startIndex: 1,
+          Resources: [{
+            id: "S-gone",
+            ...(userName === undefined ? {} : { userName }),
+            active: true,
+            emails: [{ value: "gone@example.com", primary: true }],
+          }],
+        };
+      }
+      return compliantFixture(request);
+    })));
+    const finding = byId(result, "SLACK-ID-04");
+    assert.equal(facts.mismatch_count, expectedCount, `${label}: captured runtime count`);
+    assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-ID-04", facts), expectedVerdict, `${label}: portable verdict`);
+    assert.equal(finding.status, expectedVerdict, `${label}: runtime verdict`);
+    assert.equal(
+      finding.summary,
+      expectedCount === 0
+        ? "No SCIM-active user matched a deactivated Slack user across 1 SCIM users and 1 deactivated Slack users."
+        : "1 SCIM-active users are deactivated in Slack; reconcile IdP and Slack lifecycle state.",
+      `${label}: runtime wording`,
+    );
+  }
+  const definition = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ID-04").evidenceFieldDefinitions.mismatch_count;
+  assert.match(definition, /normalized `userName` equals the normalized email of a deactivated Slack user/);
+  assert.match(definition, /only when `userName` is absent.*normalized primary email instead/);
+  assert.doesNotMatch(definition, /whose primary email equals/);
 });
 
 portableContractTest("SLACK-APP-06 coverage completeness follows all three auth.test identity-gap variants", async () => {
