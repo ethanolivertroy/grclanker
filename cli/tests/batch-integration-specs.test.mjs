@@ -33,7 +33,7 @@ const batch = [
   [ZENDESK_SPEC, ZENDESK_RUNTIME_BEHAVIOR],
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
-const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|ZD|SF)-/.test(check.id);
+const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|ZD|SF|SNOW)-/.test(check.id);
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -455,6 +455,66 @@ test("Salesforce executable rules ignore legacy status and preserve boundaries, 
     stale_admin_count: 0,
     undated_admin_count: 0,
   }), "fail", "the complete 26-admin inventory, not a 25-item evidence sample, controls the result");
+});
+
+test("ServiceNow executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+  const legacyStatus = "pass";
+  const accessFacts = {
+    readable: true,
+    complete: true,
+    user_count: 100,
+    admin_assignment_count: 5,
+    admin_count: 5,
+    max_admins: 5,
+    stale_admin_count: 0,
+    warning_count: 0,
+  };
+  assert.equal(materializeBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", accessFacts, legacyStatus), "Pass");
+  assert.equal(materializeBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
+    ...accessFacts,
+    admin_count: 6,
+  }, legacyStatus), "Fail", "mutating raw administrator evidence changes the verdict while the legacy status is held constant");
+  assert.equal(legacyStatus, "pass");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
+    ...accessFacts,
+    admin_count: 26,
+    max_admins: 25,
+  }), "fail", "the complete 26-admin collector count, not a capped 25-name rendering sample, controls the result");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
+    ...accessFacts,
+    admin_count: 25,
+    max_admins: 25,
+  }), "pass", "administrator concentration passes exactly at the configured maximum");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
+    ...accessFacts,
+    complete: false,
+    admin_count: 26,
+    max_admins: 25,
+  }), "fail", "a proven administrator violation precedes partial companion evidence");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
+    ...accessFacts,
+    complete: false,
+  }), "warn", "partial evidence cannot pass");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-04", {
+    ...accessFacts,
+    readable: false,
+  }), "manual", "unreadable evidence cannot pass");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-08", {
+    readable: true,
+    complete: false,
+    providers_complete: false,
+    provider_count: 0,
+    expired_certificate_count: 0,
+    concern_count: 0,
+  }), "manual", "a missing provider in a partial provider inventory remains unknown");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-08", {
+    readable: true,
+    complete: false,
+    providers_complete: true,
+    provider_count: 0,
+    expired_certificate_count: 0,
+    concern_count: 0,
+  }), "fail", "a provider absence proved by complete provider inventories precedes partial companion evidence");
 });
 
 test("runtime behavior statements are explicit and generator-visible", () => {
