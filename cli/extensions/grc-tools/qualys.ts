@@ -3565,11 +3565,15 @@ export async function assessQualysVulnerabilityManagement(
     unknownBuckets: { hosts_without_os: hostsWithoutOs.length },
     decisionFacts: authRecords.error || hosts.error
       ? {}
-      : qualysDecisionFacts(
-        hosts.data.length,
-        authTypes.length === 0 || missingAuthTypes.length > 0 || scannedHosts.length === 0 ? Math.max(1, missingAuthTypes.length) : 0,
-        authTypes.length > 0 && missingAuthTypes.length === 0 && scannedHosts.length > 0 && (authScannedPercent ?? 0) < settings.minAuthScanPercent ? 1 : 0,
-      ),
+      : authTypes.length === 0
+        ? qualysDecisionFacts(0, 1)
+        : hosts.data.length === 0
+          ? {}
+          : qualysDecisionFacts(
+            hosts.data.length,
+            missingAuthTypes.length > 0 || scannedHosts.length === 0 ? Math.max(1, missingAuthTypes.length) : 0,
+            missingAuthTypes.length === 0 && scannedHosts.length > 0 && (authScannedPercent ?? 0) < settings.minAuthScanPercent ? 1 : 0,
+          ),
   }));
 
   const policyStatusVerdict: QualysFindingStatus = policies.error
