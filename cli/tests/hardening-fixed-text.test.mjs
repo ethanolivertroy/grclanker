@@ -134,7 +134,7 @@ const PROSE_CONTINUATION_PHRASES = Object.freeze([
   "api keys: 40 seen, total unknown",
   "secrets: not collected",
   "secrets: unreadable (GET /v1/secrets failed with 403 Forbidden: non-JSON body (text/html, 19 bytes))",
-  "token_type: Bearer token expected",
+  "token_type: bearer token expected",
   "token_type: Bearer",
   '{"token_type":"Bearer","expires_in":3600}',
   "user_session: 3 active sessions",
@@ -435,9 +435,9 @@ test("the scheme phrases main rendered intact come back from every sink with onl
   // as `{"detail":"Authorization: Bearer"[REDACTED]` because the quote that closes the enclosing JSON
   // string was read as a value opener. A quote followed by the structure after a string is not one.
   const phrases = [
-    "Bearer token is missing",
-    "Bearer token authentication is required",
-    "Bearer token-based auth is required",
+    "the bearer token is missing",
+    "authentication with bearer tokens is required",
+    "bearer-token authentication is required",
     "Basic authentication is disabled for this deployment",
     "Basic (deprecated) and Basic (full access) modes",
     "Token request failed",
@@ -456,7 +456,7 @@ test("the scheme phrases main rendered intact come back from every sink with onl
     "Authorization: Bearer",
     "Authorization: Bearer\nnext line starts here",
     "the token authentication flow failed",
-    "Bearer tokens expire after one hour",
+    "bearer tokens expire after one hour",
     "Basic auth is deprecated",
     "Token expiry is not enforced",
     "X-Api-Key:",

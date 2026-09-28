@@ -402,7 +402,7 @@ test("leak-probe harness: every planted row leaks against an identity scrubber a
   assert.match(result.report, /\| Informational \|/);
   assert.match(result.report, new RegExp(`\\| 2\\. Escape boundaries \\| \\d+ \\| \\d+ \\| 0 \\| 0 \\| ${escapes.informational} of ${escapes.informationalCells} \\|`));
   // Revision 2 gating rows are present and leak against identity.
-  for (const prefix of ["flag or path carrier password / word / --NAME=v after a command", "scheme-word order sslPassword / splunk / NAME=<scheme> rejected", "bearer-id key token_id / UUID / NAME=v", "slash-escaped https URL userinfo / token / bare", "& cookie name then a later pair (query separator)", "scheme bEaReR in prose / token"]) {
+  for (const prefix of ["flag or path carrier password / word / --NAME=v after a command", "scheme-word order sslPassword / splunk / NAME=<scheme> rejected", "bearer-id key token_id / UUID / NAME=v", "slash-escaped https URL userinfo / token / bare", "& cookie name then a later pair (query separator)", "scheme bEaReR in prose / token", "alphabetic Bearer value in bare server prose"]) {
     assert.ok(result.leaks.some((leak) => leak.label.startsWith(prefix)), `${prefix} leaks against identity`);
   }
   assert.ok(result.mustKeepLosses.every((loss) => !/^setting suffix control /.test(loss.label)), "the setting-suffix controls keep their values under identity");

@@ -278,7 +278,7 @@ const VOCABULARY = Object.freeze([
   "Token",
   "replayed",
   "upstream",
-  "Bearer token is missing",
+  "bearer responsibilities remain with the presenting party",
   'Bearer realm="api"',
   "502 Bad Gateway",
   "upstream replied with",
@@ -869,7 +869,13 @@ function schemeCasingCells(options, canaries) {
       }
     }
   }
-  cells.push(cell("fixed prose Bearer token is missing", "Bearer token is missing", { mustKeep: ["Bearer token is missing"] }));
+  const alphabeticBearer = canaries.alphabetic[0];
+  cells.push(cell("alphabetic Bearer value in bare server prose", `upstream rejected Bearer ${alphabeticBearer}`, {
+    planted: [alphabeticBearer],
+    mustKeep: ["upstream rejected Bearer"],
+    sinks: "error",
+  }));
+  cells.push(cell("fixed prose lowercase bearer responsibilities", "bearer responsibilities remain with the presenting party", { mustKeep: ["bearer responsibilities remain with the presenting party"] }));
   cells.push(cell('fixed prose Bearer realm="api"', 'Bearer realm="api"', { mustKeep: ['Bearer realm="api"'] }));
   cells.push(cell("proof parameter behind realm", `Digest realm="api", nonce="n", response="${canaries.tokens[7]}"`, {
     planted: [canaries.tokens[7]],

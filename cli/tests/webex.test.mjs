@@ -2022,6 +2022,16 @@ test("fetchJson never places a response body in an error string: non-JSON bodies
     return true;
   });
 
+  const alphabeticBearer = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ message: "Bearer abcdefghijk rejected" }, { status: 401, statusText: "Unauthorized" }),
+  });
+  await assert.rejects(() => alphabeticBearer.listPeople(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.message, "Webex request failed (401 Unauthorized) for /v1/people: Bearer [REDACTED] rejected");
+    assert.ok(!error.message.includes("abcdefghijk"));
+    return true;
+  });
+
   const bareJson = new WebexApiClient(sampleConfig(), { fetchImpl: async () => jsonResponse({ access_token: "leaked-if-copied", trackingId: "T1" }, { status: 500, statusText: "Internal Server Error" }) });
   await assert.rejects(() => bareJson.listRoles(), (error) => {
     assert.equal(error.message, `Webex request failed (500 Internal Server Error) for /v1/roles: JSON error body without a message field (${Buffer.byteLength(JSON.stringify({ access_token: "leaked-if-copied", trackingId: "T1" }))} bytes)`);

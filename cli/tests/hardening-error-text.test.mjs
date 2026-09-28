@@ -193,7 +193,7 @@ test("vendor token prefixes are removed even when the long-token rule is off", (
   }
 });
 
-test("scheme-carried values are removed whatever their casing or entropy; the prose exemption is one plain word, a lowercase compound, a dotted version, or an auth-param", () => {
+test("scheme-carried values are removed whatever their casing or entropy; capitalized Bearer is strict while lowercase prose and challenges remain", () => {
   assert.equal(scrubDataText(`Authorization: Bearer ${CANARY.bearer} rejected`), `Authorization: Bearer ${REDACTED} rejected`, "a lowercase word that continues into a token is a token");
   assert.equal(scrubDataText(`proxy replayed Basic ${CANARY.basic}`), `proxy replayed Basic ${REDACTED}`);
   assert.equal(scrubDataText("SSWS 00abcDEF123ghiJKL456 rejected"), `SSWS ${REDACTED} rejected`);
@@ -213,11 +213,14 @@ test("scheme-carried values are removed whatever their casing or entropy; the pr
       assert.equal(scrubErrorText(text), `replayed ${scheme} ${REDACTED}${tail}`, text);
     }
   }
+  assert.equal(scrubErrorText("upstream rejected Bearer abcdefghijk"), `upstream rejected Bearer ${REDACTED}`);
+  assert.equal(scrubErrorText("upstream rejected BEARER abcdefghijk"), `upstream rejected BEARER ${REDACTED}`);
+  assert.equal(scrubDataText("person Bearer Anderson remains visible"), "person Bearer Anderson remains visible");
+  for (const scrub of [scrubErrorText, scrubDataText]) assert.equal(scrub("bearer responsibilities remain with the presenting party"), "bearer responsibilities remain with the presenting party");
   // The prose exemption, derived from the 121 distinct continuations the integrations' fixed texts put after a scheme word.
   for (const prose of [
     "Basic authentication is disabled for this tenant.",
-    "Bearer token-based auth is required",
-    "Bearer token authentication is required",
+    "authentication with bearer tokens is required",
     "the token authentication flow failed",
     "Digest access authentication",
     "third-party OAuth sign-in (codes 1, 11) and Zoom-held passwords",
@@ -259,6 +262,7 @@ test("scheme-carried values are removed whatever their casing or entropy; the pr
     'basic "authentication" is on',
     "digest access authentication",
     "a splunk deployment-server role",
+    "bearer responsibilities remain with the presenting party",
   ]) {
     assert.equal(scrubErrorText(prose), prose, prose);
     assert.equal(scrubDataText(prose), prose, prose);
@@ -293,15 +297,15 @@ test("#78 row B: every scheme word carries in any casing on both sides, Snowflak
       }
     }
   }
-  // The prose exemption holds in every casing, and the lowercase English words take no word-shaped value.
+  // Challenges remain structured protocol prose, while exact lowercase English words take no word-shaped value.
   for (const prose of [
-    "Bearer token is missing",
     'BEARER realm="api"',
     "failed to negotiate TLS with the upstream",
     "the snowflake account was suspended",
     "Snowflake account locked",
     "NEGOTIATE authentication is disabled",
     "token canary-noexpiry-token-zq has no expiry",
+    "bearer responsibilities remain with the presenting party",
     "Authorization: SNOWFLAKE",
     "Authorization: aws4-hmac-sha256",
   ]) {
@@ -391,7 +395,7 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
     "tokens: 3 of 5 rotated",
     "tokens: none are stale",
     "user_session: 3 active sessions",
-    "token_type: Bearer token expected",
+    "token_type: bearer token expected",
     "secrets: unreadable (GET /v1/secrets failed with 403 Forbidden)",
     "secrets: not collected",
     "sdk-keys: 3 of 5 rotated",
@@ -538,7 +542,7 @@ test("a carrier after a two-character JSON escape is recognised through every en
   // The escape is a boundary, not a carrier: prose after it stays, as after a raw line break.
   for (const text of [
     "request failed\\nno token was sent",
-    "request failed\\nBearer token authentication is required",
+    "request failed\\nauthentication with bearer tokens is required",
     "request failed\\ttokens: 3 of 5 rotated",
     "request failed\\rInvalidAuthenticationToken: Access token has expired.",
     "config read from C:\\\\Users\\\\ops\\\\token-store\\\\settings.json",

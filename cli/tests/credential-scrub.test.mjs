@@ -270,7 +270,8 @@ const MUST_KEEP = [
   "team canary-empty-team-zq has no custom role; token canary-noexpiry-token-zq has no expiry",
   "Basic authentication is disabled for this deployment",
   "an Owner token for a complete inventory",
-  "Bearer token authentication is required",
+  "authentication with bearer tokens is required",
+  "bearer responsibilities remain with the presenting party",
   "InvalidAuthenticationToken: Access token has expired.",
   "Config precedence resolved from: environment-token -> config-base-url -> config-file-present.",
   "Unable to read LaunchDarkly config file /tmp/grclanker-dogrc-dir-gCpdGy (EISDIR)",
@@ -371,7 +372,9 @@ test("scrub boundary guard 1, quoted carriers: the reported forms, a plain word 
   assert.equal(scrubber.scrub('Authorization:"Bearer token"'), `Authorization:"Bearer ${REDACTED}"`);
   assert.equal(scrubber.scrub('\\"Authorization\\": \\"Bearer token\\"'), `\\"Authorization\\": \\"Bearer ${REDACTED}\\"`);
   assert.equal(scrubber.scrub('X-Api-Key: ""'), 'X-Api-Key: ""', "an empty quoted value has nothing to remove");
-  assert.equal(scrubber.scrub("Bearer token authentication is required"), "Bearer token authentication is required", "a bare plain word after a scheme word is still prose");
+  assert.equal(scrubber.scrub("upstream rejected Bearer abcdefghijk"), `upstream rejected Bearer ${REDACTED}`);
+  assert.equal(scrubber.scrub("upstream rejected BEARER abcdefghijk"), `upstream rejected BEARER ${REDACTED}`);
+  assert.equal(scrubber.scrub("bearer responsibilities remain with the presenting party"), "bearer responsibilities remain with the presenting party", "lowercase bearer remains an ordinary English noun");
 });
 
 test("scrub boundary guard 1, quoted carriers: a closing quote on the line wins over the following-header cut, which applies only to a value left unterminated", () => {
