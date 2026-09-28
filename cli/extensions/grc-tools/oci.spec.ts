@@ -1,11 +1,13 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
+  type BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
 import {
   batch2Any,
   batch2Checks,
   batch2ComparePaths,
+  batch2Completeness,
   batch2Eq,
   batch2GenericDecisionInputs,
   batch2Ne,
@@ -102,6 +104,14 @@ const rows: readonly Row[] = [
   ["OCI-CMP-03", 21, "Boot volume customer-managed encryption", "medium", ["compute"]],
 ] as const;
 
+const OCI_TRUNCATION_ONLY = ["truncated"] as const;
+const ociCompletenessSources = (
+  sourceSurfaces: readonly string[],
+): readonly BatchCompletenessSourceDefinition[] => sourceSurfaces.map((surfaceId) => ({
+  surfaceId,
+  falseWhen: OCI_TRUNCATION_ONLY,
+}));
+
 function owner(id: string): string {
   if (id.startsWith("OCI-IAM-")) return "oci_assess_identity";
   if (id.startsWith("OCI-LOG-")) return "oci_assess_logging_detection";
@@ -152,23 +162,8 @@ const decisionPredicate: Readonly<Record<string, string>> = {
   "OCI-CMP-03": "Fail when any AVAILABLE boot volume has no kmsKeyId; complete readable inventories with every boot volume using a customer-managed key pass.",
 };
 
-const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, manualOnly]) => ({
-  id,
-  control,
-  title,
-  severity,
-  owner: owner(id),
-  surfaces: sourceSurfaces,
-  manualOnly,
-  emptyOutcome: ({
-    "OCI-IAM-05": "fail",
-    "OCI-LOG-02": "pass",
-    "OCI-LOG-04": "warn",
-    "OCI-LOG-05": "fail",
-  } as const)[id as "OCI-IAM-05" | "OCI-LOG-02" | "OCI-LOG-04" | "OCI-LOG-05"] ?? "manual",
-  violationOutcome: id === "OCI-IAM-04" || id === "OCI-GRD-03" ? "warn" : "fail",
-  constants: decisionConstants(id),
-  decisionInputs: manualOnly
+const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, manualOnly]) => {
+  const decisionInputs = manualOnly
     ? {}
     : id === "OCI-IAM-01"
       ? {
@@ -179,24 +174,47 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
           numeric_required: "Boolean from passwordPolicy.isNumericCharactersRequired; only literal true satisfies the complexity predicate.",
           special_required: "Boolean from passwordPolicy.isSpecialCharactersRequired; only literal true satisfies the complexity predicate.",
         }
-      : batch2GenericDecisionInputs(decisionPredicate[id]),
-  decisionRules: id === "OCI-IAM-01"
-    ? [
-        batch2Rule("manual", batch2Ne("evidence_readable", true)),
-        batch2Rule("fail", batch2Any(
-          batch2ComparePaths("lt", "minimum_password_length", "minimum_password_length_required"),
-          batch2Ne("lowercase_required", true),
-          batch2Ne("uppercase_required", true),
-          batch2Ne("numeric_required", true),
-          batch2Ne("special_required", true),
-        )),
-        batch2Rule("pass", batch2Eq("evidence_readable", true)),
-        batch2Rule("manual", { op: "always" }),
-      ]
-    : undefined,
-  frameworks: frameworkMappings(id),
-  decision: `${decisionPredicate[id]} A proved violation takes precedence over partial collection; otherwise partial or unreadable evidence cannot pass.`,
-})));
+      : batch2GenericDecisionInputs(decisionPredicate[id]);
+  return {
+    id,
+    control,
+    title,
+    severity,
+    owner: owner(id),
+    surfaces: sourceSurfaces,
+    manualOnly,
+    emptyOutcome: ({
+      "OCI-IAM-05": "fail",
+      "OCI-LOG-02": "pass",
+      "OCI-LOG-04": "warn",
+      "OCI-LOG-05": "fail",
+    } as const)[id as "OCI-IAM-05" | "OCI-LOG-02" | "OCI-LOG-04" | "OCI-LOG-05"] ?? "manual",
+    violationOutcome: id === "OCI-IAM-04" || id === "OCI-GRD-03" ? "warn" : "fail",
+    constants: decisionConstants(id),
+    decisionInputs,
+    decisionRules: id === "OCI-IAM-01"
+      ? [
+          batch2Rule("manual", batch2Ne("evidence_readable", true)),
+          batch2Rule("fail", batch2Any(
+            batch2ComparePaths("lt", "minimum_password_length", "minimum_password_length_required"),
+            batch2Ne("lowercase_required", true),
+            batch2Ne("uppercase_required", true),
+            batch2Ne("numeric_required", true),
+            batch2Ne("special_required", true),
+          )),
+          batch2Rule("pass", batch2Eq("evidence_readable", true)),
+          batch2Rule("manual", { op: "always" }),
+        ]
+      : undefined,
+    completeness: batch2Completeness(
+      decisionInputs,
+      ociCompletenessSources(sourceSurfaces),
+      `true for ${title} only when every list and child read represented by the listed OCI command surface reaches its configured collection end without truncation.`,
+    ),
+    frameworks: frameworkMappings(id),
+    decision: `${decisionPredicate[id]} A proved violation takes precedence over partial collection; otherwise partial or unreadable evidence cannot pass.`,
+  };
+}));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 
 export const OCI_RUNTIME_BEHAVIOR = [

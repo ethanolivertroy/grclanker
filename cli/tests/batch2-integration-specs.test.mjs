@@ -69,9 +69,11 @@ test("batch 2 tool definitions carry non-enumerable contracts without changing e
 test("batch 2 executable decisions reject undeclared, missing, and null evidence", () => {
   const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant|availability|available|enforcement|enforced)(?:_|$)/;
   const documentedRawVendorStatusFields = new Set(["CF-IAM-02:verified_status"]);
+  let inputUses = 0;
   for (const [spec] of batch) {
     validateDecisionInputs(spec);
     for (const check of spec.checks) {
+      inputUses += check.evidenceFields.length;
       assert.ok(Object.keys(check.derivedFactRules ?? {}).length > 0, `${check.id}: derived rules`);
       assert.equal(Object.keys(check.derivedFactRules).length, check.criteria.rules.length, `${check.id}: branch parity`);
       assert.ok(check.criteria.rules.every((rule) => rule.condition.op === "eq"), `${check.id}: first-match rules consume derived facts`);
@@ -101,6 +103,61 @@ test("batch 2 executable decisions reject undeclared, missing, and null evidence
       }
     }
   }
+  assert.equal(inputUses, 811);
+});
+
+test("batch 2 completeness primitives have exact per-check sources, failure modes, and rendered semantics", () => {
+  const check = (spec, id) => spec.checks.find((entry) => entry.id === id);
+  let checksWithCompleteness = 0;
+  let completenessFields = 0;
+  let sourceEntries = 0;
+  for (const [spec] of batch) {
+    for (const entry of spec.checks) {
+      const inputs = entry.evidenceFields.filter((name) => name.includes("complete")).sort();
+      const contracts = Object.keys(entry.completeness ?? {}).sort();
+      assert.deepEqual(contracts, inputs, `${entry.id}: exact completeness input coverage`);
+      if (contracts.length > 0) checksWithCompleteness += 1;
+      completenessFields += contracts.length;
+      for (const [inputName, contract] of Object.entries(entry.completeness ?? {})) {
+        assert.ok(contract.semantics.length >= 40, `${entry.id}.${inputName}: substantive semantics`);
+        assert.equal(new Set(contract.sources.map((source) => source.surfaceId)).size, contract.sources.length);
+        sourceEntries += contract.sources.length;
+        for (const source of contract.sources) {
+          assert.ok(entry.sourceSurfaceIds.includes(source.surfaceId), `${entry.id}.${inputName}: ${source.surfaceId}`);
+          assert.equal(new Set(source.falseWhen).size, source.falseWhen.length);
+          assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected"].includes(mode)));
+        }
+        const rendered = entry.evidenceFieldDefinitions[inputName];
+        assert.match(rendered, new RegExp(`For ${entry.id},`));
+        assert.match(rendered, /Exact source-state effects:/);
+        assert.match(rendered, new RegExp(contract.semantics.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        assert.doesNotMatch(rendered, /all check-specific pages|check-specific source and precedence semantics/);
+      }
+    }
+  }
+  assert.equal(checksWithCompleteness, 156);
+  assert.equal(completenessFields, 156);
+  assert.equal(sourceEntries, 198);
+
+  assert.deepEqual(check(AZURE_SPEC, "AZURE-MON-06").completeness.complete.sources, [
+    { surfaceId: "diagnostic-settings", falseWhen: [] },
+    { surfaceId: "log-workspaces", falseWhen: ["truncated"] },
+  ]);
+  assert.deepEqual(check(AZURE_SPEC, "AZURE-DP-01").completeness.complete.sources.map((source) => source.surfaceId), [
+    "compliance-policies", "managed-devices", "conditional-access",
+  ]);
+  assert.deepEqual(check(CLOUDFLARE_SPEC, "CF-IAM-02").completeness.evidence_complete.sources, [
+    { surfaceId: "token-and-account", falseWhen: [] },
+  ]);
+  assert.deepEqual(check(GCP_SPEC, "GCP-IAM-02").completeness.evidence_complete.sources[0].falseWhen, [
+    "truncated", "error", "denied", "not-collected",
+  ]);
+  assert.equal(check(OCI_SPEC, "OCI-IAM-01").completeness, undefined);
+  assert.deepEqual(check(PALOALTO_SPEC, "PA-21").completeness.evidence_complete.sources.map((source) => source.surfaceId), [
+    "prisma-cspm", "panos-configuration",
+  ]);
+  assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /location inventory.*SSL-rule truncation/);
+  assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /capForUnreadableAll.*truncation exceptions/);
 });
 
 test("batch 2 threshold metadata is exhaustive and renders immutable defaults", () => {

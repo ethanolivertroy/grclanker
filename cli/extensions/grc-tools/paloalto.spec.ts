@@ -1,11 +1,13 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
+  type BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
 import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2Completeness,
   batch2Defined,
   batch2Eq,
   batch2GenericDecisionInputs,
@@ -31,6 +33,14 @@ const surfaces = [
   restSurface("panos-operational", "/api/?type=op&cmd={system-info|high-availability}", "PAN-OS XML API", PANOS_DOCS, ["hostname", "sw-version", "app-version", "threat-version", "ha"]),
   restSurface("panos-configuration", "/api/?type=config&action=get&xpath={configuration subtree}", "PAN-OS XML API", PANOS_DOCS, ["security rules", "zones", "decryption rules", "profiles", "administrators", "logging", "deviceconfig"]),
 ] as const;
+
+const PALOALTO_COMPLETENESS_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const paloaltoCompletenessSources = (
+  sourceIds: readonly string[],
+): readonly BatchCompletenessSourceDefinition[] => sourceIds.map((surfaceId) => ({
+  surfaceId,
+  falseWhen: PALOALTO_COMPLETENESS_FAILURE_MODES,
+}));
 
 const titles = [
   "CSPM compliance posture",
@@ -299,13 +309,23 @@ const checks = batch2Checks(titles.map((title, index) => {
         ...completePassRules,
       ]
     : undefined;
+  const custom = paloaltoDecision(control);
+  const decisionInputs = custom?.decisionInputs ?? (control === 10 || control === 25
+    ? {
+        evidence_readable: genericDecisionInputs.evidence_readable,
+        evidence_complete: genericDecisionInputs.evidence_complete,
+        violation_count: genericDecisionInputs.violation_count,
+        review_count: genericDecisionInputs.review_count,
+      }
+    : genericDecisionInputs);
+  const sourceIds = sourceSurfaces(control);
   return {
     id: `PA-${String(control).padStart(2, "0")}`,
     control,
     title,
     severity: severities[index],
     owner: owner(control),
-    surfaces: sourceSurfaces(control),
+    surfaces: sourceIds,
     emptyOutcome: "manual" as const,
     constants: ({
       7: { maximum_critical_cves: PALOALTO_DEFAULT_MAX_CRITICAL_CVES },
@@ -313,15 +333,13 @@ const checks = batch2Checks(titles.map((title, index) => {
       19: { default_maximum_superusers: PALOALTO_DEFAULT_MAX_SUPERUSERS },
     } as const)[control as 7 | 8 | 19],
     decisionRules,
-    decisionInputs: control === 10 || control === 25
-      ? {
-          evidence_readable: genericDecisionInputs.evidence_readable,
-          evidence_complete: genericDecisionInputs.evidence_complete,
-          violation_count: genericDecisionInputs.violation_count,
-          review_count: genericDecisionInputs.review_count,
-        }
-      : genericDecisionInputs,
-    ...paloaltoDecision(control),
+    decisionInputs,
+    ...custom,
+    completeness: batch2Completeness(
+      decisionInputs,
+      paloaltoCompletenessSources(sourceIds),
+      `true for ${title} only when every configured Prisma product inventory and PAN-OS device dependency named by the listed surfaces is collected without truncation, error, denial, or omission.`,
+    ),
     decision: `${decisionPredicate[index]} Unreadable configured-product evidence remains manual, a proved violation has first-match precedence, and partial evidence cannot pass.`,
   };
 }));
