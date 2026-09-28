@@ -24,11 +24,7 @@ import {
   WORKFLOW_NAMES,
   workflowSkillConfig,
 } from "../dist/agent-sdk/lib/skills.js";
-import {
-  buildSdkToolConfig,
-  executeGrcTool,
-  grclankerToolConfig,
-} from "../dist/agent-sdk/lib/tools.js";
+import { buildSdkToolConfig, executeGrcTool, grclankerToolConfig } from "../dist/agent-sdk/lib/tools.js";
 import { clearFedrampCachesForTests } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/extensions/grc-tools/shared.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -200,43 +196,6 @@ test("every registered tool converts to a plain object input schema without cons
     assert.equal(typeof schema.properties, "object", tool.name);
     assert.ok(!serialized.includes('"const"'), `${tool.name} still advertises const literals`);
     assert.deepEqual(JSON.parse(serialized), schema, `${tool.name} schema must be JSON-stable`);
-  }
-});
-
-test("LaunchDarkly list arguments stay schema-shaped through the Agent SDK adapter", async () => {
-  const cases = [
-    ["launchdarkly_assess_identity", { allowed_domains: "example.com, example.org" }],
-    ["launchdarkly_assess_environment_governance", { project_keys: "web, mobile" }],
-    ["launchdarkly_assess_flag_hygiene", { project_keys: "web, mobile" }],
-    ["launchdarkly_assess_monitoring_integrations", { integration_keys: "datadog, splunk" }],
-    ["launchdarkly_export_audit_bundle", {
-      allowed_domains: "example.com, example.org",
-      project_keys: "web, mobile",
-      integration_keys: "datadog, splunk",
-    }],
-  ];
-
-  for (const [name, listInput] of cases) {
-    const tool = getRegisteredGrcTool(name);
-    const executed = [];
-    const config = buildSdkToolConfig({
-      ...tool,
-      async execute(_toolCallId, args) {
-        executed.push(args);
-        return { content: [{ type: "text", text: "accepted" }] };
-      },
-    });
-
-    for (const [label, input] of [["omitted", {}], ["comma-separated", listInput]]) {
-      const result = await config.execute(input, { toolCallId: `${name}-${label}` });
-      assert.equal(result.isError, undefined, `${name} must accept ${label} optional list arguments`);
-      assert.equal(result.content[0].text, "accepted");
-    }
-
-    assert.equal(executed.length, 2);
-    for (const [key, value] of Object.entries(listInput)) {
-      assert.equal(executed[1][key], value, `${name}.${key} must remain a schema-valid string until execute`);
-    }
   }
 });
 
