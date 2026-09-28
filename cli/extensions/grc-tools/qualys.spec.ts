@@ -103,7 +103,7 @@ const rows: readonly Batch3CheckRow[] = [
       readable: "qualys_c10_host_and_detection_reads_succeeded",
       complete: "qualys_c10_host_and_detection_lists_complete",
       population: "qualys_c10_sla_scoped_detection_count",
-      failureMatches: "qualys_c10_sla_breach_count",
+      failureMatches: "qualys_c10_on_sla_detection_count",
       reviewMatches: "qualys_c10_undated_detection_count",
     },
     decisionInputs: {

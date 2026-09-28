@@ -116,8 +116,8 @@ const rows: readonly Batch3CheckRow[] = [
       readable: "tenable_03_asset_and_network_reads_succeeded",
       complete: "tenable_03_asset_export_and_networks_complete",
       population: "tenable_03_exported_asset_count",
-      failureMatches: "tenable_03_stale_or_missing_asset_count",
-      reviewMatches: "tenable_03_incomplete_source_count",
+      failureMatches: "tenable_03_fresh_asset_count",
+      reviewMatches: "tenable_03_expected_asset_count",
     },
     decisionInputs: {
       tenable_03_asset_and_network_reads_succeeded: "Boolean true only when the asset export workflow and network inventory returned the fields needed for coverage.",
@@ -181,8 +181,8 @@ const rows: readonly Batch3CheckRow[] = [
       readable: "tenable_06_agent_group_reads_succeeded",
       complete: "tenable_06_agent_and_group_lists_complete",
       population: "tenable_06_agent_count",
-      failureMatches: "tenable_06_ungrouped_agent_count",
-      reviewMatches: "tenable_06_ungrouped_agent_review_count",
+      failureMatches: "tenable_06_agent_group_count",
+      reviewMatches: "tenable_06_ungrouped_agent_count",
     },
     decisionInputs: {
       tenable_06_agent_group_reads_succeeded: "Boolean true only when both the linked-agent inventory and agent-group inventory are readable.",

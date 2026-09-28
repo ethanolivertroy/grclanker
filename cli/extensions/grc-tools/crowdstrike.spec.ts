@@ -153,8 +153,8 @@ const rows: readonly Batch3CheckRow[] = [
       readable: "cs_14_host_and_group_reads_succeeded",
       complete: "cs_14_host_and_group_lists_complete",
       population: "cs_14_host_count",
-      failureMatches: "cs_14_empty_required_inventory_count",
-      reviewMatches: "cs_14_unassigned_host_count",
+      failureMatches: "cs_14_host_group_count",
+      reviewMatches: "cs_14_assigned_host_count",
     },
     decisionInputs: {
       cs_14_host_and_group_reads_succeeded: "Boolean true only when both the Falcon host inventory and host-group inventory returned parseable responses.",
@@ -195,7 +195,7 @@ const rows: readonly Batch3CheckRow[] = [
       readable: "cs_22_alert_read_succeeded",
       complete: "cs_22_alert_list_complete",
       population: "cs_22_dated_alert_count",
-      failureMatches: "cs_22_sla_breach_count",
+      failureMatches: "cs_22_sla_compliant_alert_count",
       reviewMatches: "cs_22_undated_alert_count",
     },
     decisionInputs: {
@@ -232,7 +232,7 @@ const rows: readonly Batch3CheckRow[] = [
       readable: "cs_23_contained_host_read_succeeded",
       complete: "cs_23_contained_host_list_complete",
       population: "cs_23_contained_host_count",
-      failureMatches: "cs_23_aged_contained_host_count",
+      failureMatches: "cs_23_max_containment_age_hours",
       reviewMatches: "cs_23_undated_contained_host_count",
     },
     decisionInputs: {

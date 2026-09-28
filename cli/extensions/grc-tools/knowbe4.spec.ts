@@ -71,7 +71,7 @@ const rows: readonly Batch3CheckRow[] = [
       complete: "knowbe4_04_user_and_enrollment_lists_complete",
       population: "knowbe4_04_new_user_count",
       failureMatches: "knowbe4_04_late_or_missing_enrollment_count",
-      reviewMatches: "knowbe4_04_late_or_missing_enrollment_count",
+      reviewMatches: "knowbe4_04_late_enrollment_percent",
     },
     decisionInputs: {
       knowbe4_04_user_and_enrollment_reads_succeeded: "Boolean true only when active users and training enrollments returned the creation, enrollment, and campaign fields needed for the grace-window join.",
@@ -111,7 +111,7 @@ const rows: readonly Batch3CheckRow[] = [
       complete: "knowbe4_07_test_and_recipient_lists_complete",
       population: "knowbe4_07_security_tests_compared",
       failureMatches: "knowbe4_07_failure_rate_delta_points",
-      reviewMatches: "knowbe4_07_failure_rate_delta_points",
+      reviewMatches: "knowbe4_07_security_tests_compared",
     },
     decisionInputs: {
       knowbe4_07_test_reads_succeeded: "Boolean true only when security-test and required recipient records were readable for both chronological comparison periods.",
@@ -149,8 +149,8 @@ const rows: readonly Batch3CheckRow[] = [
       readable: "knowbe4_10_remediation_reads_succeeded",
       complete: "knowbe4_10_recipient_and_enrollment_reads_complete",
       population: "knowbe4_10_failed_user_count",
-      failureMatches: "knowbe4_10_failed_user_count",
-      reviewMatches: "knowbe4_10_unremediated_user_count",
+      failureMatches: "knowbe4_10_remediated_percent",
+      reviewMatches: "knowbe4_10_no_remediation_due",
     },
     decisionInputs: {
       knowbe4_10_remediation_reads_succeeded: "Boolean true only when sampled failed-recipient, training-enrollment, and active remediation-policy evidence is readable.",
@@ -197,7 +197,7 @@ const rows: readonly Batch3CheckRow[] = [
       complete: "knowbe4_19_security_test_and_recipient_lists_complete",
       population: "knowbe4_19_delivered_recipient_count",
       failureMatches: "knowbe4_19_report_rate_percent",
-      reviewMatches: "knowbe4_19_report_rate_percent",
+      reviewMatches: "knowbe4_19_configured_minimum_percent",
     },
     decisionInputs: {
       knowbe4_19_security_test_reads_succeeded: "Boolean true only when security tests and their delivered and reported counters were readable for the selected lookback.",
