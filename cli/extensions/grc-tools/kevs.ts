@@ -246,7 +246,7 @@ export function registerKevsTools(pi: any): void {
       }),
       limit: Type.Optional(
         Type.Number({
-          description: `Maximum results to show (default: ${DEFAULT_SEARCH_LIMIT}). Values above ${MAX_SEARCH_LIMIT} are capped at ${MAX_SEARCH_LIMIT}; narrow the query instead of raising it.`,
+          description: `Maximum results to show (default: ${DEFAULT_SEARCH_LIMIT}). Values below 1 use the default; values above ${MAX_SEARCH_LIMIT} are capped at ${MAX_SEARCH_LIMIT}, so narrow the query instead of raising it.`,
           default: DEFAULT_SEARCH_LIMIT,
         }),
       ),
@@ -263,7 +263,8 @@ export function registerKevsTools(pi: any): void {
       try {
         const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL);
         const normalizedQuery = args.query.toLowerCase();
-        const limit = Math.min(args.limit ?? DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+        const requestedLimit = Math.trunc(args.limit ?? DEFAULT_SEARCH_LIMIT);
+        const limit = requestedLimit < 1 ? DEFAULT_SEARCH_LIMIT : Math.min(requestedLimit, MAX_SEARCH_LIMIT);
 
         const allMatches = catalog.vulnerabilities.filter(
           (vulnerability) =>
@@ -274,7 +275,7 @@ export function registerKevsTools(pi: any): void {
             vulnerability.shortDescription.toLowerCase().includes(normalizedQuery),
         );
         const matches = allMatches.slice(0, limit);
-        const capped = (args.limit ?? 0) > MAX_SEARCH_LIMIT && allMatches.length > MAX_SEARCH_LIMIT;
+        const capped = requestedLimit > MAX_SEARCH_LIMIT && allMatches.length > MAX_SEARCH_LIMIT;
 
         if (matches.length === 0) {
           return textResult(
