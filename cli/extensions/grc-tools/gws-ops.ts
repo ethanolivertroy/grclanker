@@ -175,6 +175,16 @@ interface GwsOpsActivityExecution extends GwsOpsActivityResultBase {
   records: GwsOpsActivityRecord[];
 }
 
+/** An optional bundle category that the installed CLI cannot expose; null counts prevent an unavailable query becoming a false zero. */
+interface GwsOpsActivityUnavailable extends GwsOpsActivityResultBase {
+  mode: "unavailable";
+  count: null;
+  complete: false;
+  nextPageToken: null;
+  raw: null;
+  records: null;
+}
+
 /** A dry run never called the CLI, so every record-derived field is null beside a not-collected status, never 0 or []. */
 interface GwsOpsActivityPreview extends GwsOpsActivityResultBase {
   mode: "dry_run";
@@ -186,8 +196,11 @@ interface GwsOpsActivityPreview extends GwsOpsActivityResultBase {
 }
 
 type GwsOpsActivityResult = GwsOpsActivityExecution | GwsOpsActivityPreview;
+type GwsOpsBundleActivityResult = GwsOpsActivityExecution | GwsOpsActivityUnavailable;
 
 const PREVIEW_STATUS = "not collected: dry run previewed the command and did not execute it, so no records were requested";
+const ALERTS_UNAVAILABLE_STATUS =
+  "unsupported/unavailable: installed gws does not expose the alertcenter service, so alert evidence was not collected";
 
 interface GwsOpsBundleResult {
   outputDir: string;
@@ -195,7 +208,10 @@ interface GwsOpsBundleResult {
   fileCount: number;
   commandCount: number;
   recordCount: number;
-  categories: Record<ActivityCategory, number>;
+  complete: boolean;
+  status: string;
+  unavailableCategories: ActivityCategory[];
+  categories: Record<ActivityCategory, number | null>;
 }
 
 function asRecord(value: unknown): JsonRecord {
@@ -431,12 +447,21 @@ export const defaultGwsCliRunner: GwsCliRunner = async (request) => {
 };
 
 /**
- * The published gws source registers no `alertcenter` service alias
- * (crates/google-workspace/src/services.rs), so a validation failure on the
- * Alert Center command is explained instead of surfacing as a bare exit code.
+ * v0.22.5 emits this exact unknown-service shape because it strips the version
+ * suffix before consulting its static service registry. Keep this narrow:
+ * other validation failures can mean a supported Alert Center command failed.
  */
+function isAlertCenterUnsupportedFailure(error: unknown): error is GwsCliCommandError {
+  return error instanceof GwsCliCommandError
+    && error.kind === "validation"
+    && error.exitCode === 3
+    && error.command.includes(" alertcenter:v1beta1 ")
+    && /\bUnknown service ['"]alertcenter['"]\./.test(error.message);
+}
+
+/** Explain only the published missing-command signature; unexpected Alert Center failures remain unchanged and fatal. */
 function explainAlertCenterFailure(error: unknown): unknown {
-  if (error instanceof GwsCliCommandError && error.kind === "validation") {
+  if (isAlertCenterUnsupportedFailure(error)) {
     return new GwsCliCommandError(
       "validation",
       `${error.message} The installed gws build rejected the alertcenter:v1beta1 service (exit 3, validation error); the published googleworkspace/cli source registers no alertcenter alias. Use gws_assess_monitoring for native Alert Center API coverage.`,
@@ -933,6 +958,7 @@ function buildBundleReadme(): string {
     "- `analysis/` contains normalized investigation summaries prepared for GRC review.",
     "- `commands.json` records the exact read-only commands grclanker executed.",
     "- `summary.md` is the quickest human-readable starting point.",
+    "- Admin and token activity are core evidence. Alert Center is supplementary because some published gws builds do not expose `alertcenter`; when unsupported, its files say unavailable, its count is null, and the bundle is explicitly partial.",
     "",
     "This bundle is read-only evidence collection. It does not write back to the tenant.",
     "",
@@ -1132,17 +1158,85 @@ export async function reviewGwsTokenActivity(
   };
 }
 
-function buildBundleSummary(results: GwsOpsActivityExecution[]): string {
+function bundleRecordCount(result: GwsOpsBundleActivityResult): number {
+  switch (result.mode) {
+    case "execute":
+      return result.count;
+    case "unavailable":
+      return 0;
+    default: {
+      const exhaustive: never = result;
+      throw new Error(`Unhandled bundle activity result ${String(exhaustive)}`);
+    }
+  }
+}
+
+function bundleRecordLabel(result: GwsOpsBundleActivityResult): string {
+  return result.mode === "execute" ? String(result.count) : "not collected (unavailable)";
+}
+
+function bundleCompletenessLabel(result: GwsOpsBundleActivityResult): string {
+  if (result.mode === "unavailable") return "no (unsupported/unavailable)";
+  return result.complete ? "yes" : "no (nextPageToken present)";
+}
+
+function unavailableAlertBundleResult(args: GwsOpsAlertArgs, env: NodeJS.ProcessEnv): GwsOpsActivityUnavailable {
+  const executable = resolveGwsCliExecutable(args, env);
+  return {
+    title: "Google Workspace alert investigation",
+    category: "alerts",
+    mode: "unavailable",
+    status: ALERTS_UNAVAILABLE_STATUS,
+    count: null,
+    complete: false,
+    nextPageToken: null,
+    command: buildAlertCommand(executable, args),
+    raw: null,
+    records: null,
+    notes: [
+      "Alert Center is supplementary evidence in this operator bundle; admin and token activity remain the core gws evidence.",
+      "The installed gws command returned its documented unknown-service validation error for alertcenter.",
+      "No alert query ran, so this category is unavailable, the bundle is partial, and a zero alert count is not asserted.",
+      "Use gws_assess_monitoring for native Alert Center API coverage.",
+    ],
+    text: [
+      "Google Workspace alert investigation",
+      `Status: ${ALERTS_UNAVAILABLE_STATUS}`,
+      "",
+      "No alert records were collected.",
+    ].join("\n"),
+  };
+}
+
+async function collectBundleAlerts(
+  args: GwsOpsAlertArgs,
+  runner: GwsCliRunner,
+  env: NodeJS.ProcessEnv,
+): Promise<GwsOpsBundleActivityResult> {
+  try {
+    return executedResult(await investigateGwsAlerts(args, runner, env));
+  } catch (error) {
+    if (!isAlertCenterUnsupportedFailure(error)) throw error;
+    return unavailableAlertBundleResult(args, env);
+  }
+}
+
+function buildBundleSummary(results: GwsOpsBundleActivityResult[]): string {
+  const unavailableCategories = results
+    .filter((result) => result.mode === "unavailable")
+    .map((result) => result.category);
   return [
     "# Google Workspace CLI Operator Evidence Summary",
+    "",
+    `- Bundle completeness: ${unavailableCategories.length === 0 ? "complete for requested command pages" : `partial (${unavailableCategories.join(", ")} unsupported/unavailable)`}`,
     "",
     ...results.map((result) => [
       `## ${result.title}`,
       "",
       `- Category: ${result.category}`,
       `- Status: ${result.status}`,
-      `- Records: ${result.count}`,
-      `- Complete page: ${result.complete ? "yes" : "no (nextPageToken present)"}`,
+      `- Records: ${bundleRecordLabel(result)}`,
+      `- Complete evidence: ${bundleCompletenessLabel(result)}`,
       `- Command: ${result.command.command}`,
       "",
       ...result.notes.map((note) => `- ${note}`),
@@ -1175,7 +1269,7 @@ export async function collectGwsOperatorEvidenceBundle(
     };
   }
 
-  const alerts = executedResult(await investigateGwsAlerts(args, runner, env));
+  const alerts = await collectBundleAlerts(args, runner, env);
   const adminActivity = executedResult(await traceGwsAdminActivity(workflowArgs, runner, env));
   const tokenActivity = executedResult(await reviewGwsTokenActivity(workflowArgs, runner, env));
   const results = [alerts, adminActivity, tokenActivity];
@@ -1194,6 +1288,7 @@ export async function collectGwsOperatorEvidenceBundle(
   for (const result of results) {
     await writeSecureTextFile(outputDir, `analysis/${result.category}.json`, serializeJson({
       title: result.title,
+      mode: result.mode,
       status: result.status,
       count: result.count,
       complete: result.complete,
@@ -1216,7 +1311,16 @@ export async function collectGwsOperatorEvidenceBundle(
     zipPath,
     fileCount,
     commandCount: results.length,
-    recordCount: results.reduce((sum, result) => sum + result.count, 0),
+    recordCount: results.reduce((sum, result) => sum + bundleRecordCount(result), 0),
+    complete: results.every((result) => result.mode === "execute" && result.complete),
+    status: results.some((result) => result.mode === "unavailable")
+      ? "partial: one or more optional evidence categories were unsupported/unavailable"
+      : results.some((result) => !result.complete)
+        ? "partial: one or more commands returned a nextPageToken"
+        : "complete: all requested command pages were collected",
+    unavailableCategories: results
+      .filter((result) => result.mode === "unavailable")
+      .map((result) => result.category),
     categories: {
       alerts: alerts.count,
       admin_activity: adminActivity.count,
@@ -1310,8 +1414,9 @@ function renderBundleResult(
       `Output directory: ${result.outputDir}`,
       `Zip archive: ${result.zipPath}`,
       `Files written: ${result.fileCount}`,
-      `Commands executed: ${result.commandCount}`,
+      `Commands attempted: ${result.commandCount}`,
       `Records captured: ${result.recordCount}`,
+      `Bundle status: ${result.status}`,
     ].join("\n"),
     {
       output_dir: result.outputDir,
@@ -1319,6 +1424,9 @@ function renderBundleResult(
       file_count: result.fileCount,
       command_count: result.commandCount,
       record_count: result.recordCount,
+      complete: result.complete,
+      status: result.status,
+      unavailable_categories: result.unavailableCategories,
       categories: result.categories,
     },
   );
@@ -1445,7 +1553,7 @@ export function registerGwsOperatorTools(pi: any): void {
     name: "gws_ops_collect_evidence_bundle",
     label: "Collect Google Workspace operator evidence bundle",
     description:
-      "Run the curated read-only Google Workspace CLI alert, admin-activity, and token-activity workflows, then package the evidence and executed commands into a separate operator bundle.",
+      "Run core read-only Google Workspace CLI admin-activity and token-activity workflows plus supplementary Alert Center collection, then package the evidence and attempted commands. If the installed gws build lacks alertcenter, the executed bundle is explicitly partial instead of failing or claiming zero alerts.",
     parameters: Type.Object({
       ...activityParams,
       filter: Type.Optional(
