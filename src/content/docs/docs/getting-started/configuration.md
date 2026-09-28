@@ -128,6 +128,8 @@ These are the `GRCLANKER_*` variables grclanker reads:
 | `GRCLANKER_TRESTLE_BIN` | Path to the `trestle` executable for the `oscal_*` tools (`TRESTLE_BIN` also works). |
 | `GRCLANKER_GWS_BIN` | Path to the `gws` executable for the `gws_ops_*` tools. |
 | `GRCLANKER_LIVE_BACKENDS` | Comma-separated backend kinds that `npm --prefix cli run test:compute-backends:live` should exercise. |
+| `GRCLANKER_VERSION` | Build-only. Version stamped on release bundles built with `npm --prefix cli run build:bundle` (default: the `cli/package.json` version). |
+| `GRCLANKER_NODE_VERSION` | Build-only. Node.js version that `npm --prefix cli run build:bundle` packages (default `22.20.0`). |
 
 grclanker sets `GRCLANKER_CODING_AGENT_DIR` and `GRCLANKER_COMPUTE_BACKEND` itself when it launches the embedded Pi runtime, and `GRCLANKER_COMPUTE_BACKEND_OVERRIDE` when you pass `--compute <kind>`. Leave them unset; use `grclanker setup` or a per-run `--compute <kind>` instead.
 

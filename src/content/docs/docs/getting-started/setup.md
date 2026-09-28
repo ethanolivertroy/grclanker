@@ -128,8 +128,9 @@ That mode keeps grclanker focused on its bundled GRC workflows and prevents repo
 If you opt into `Bundled + project/local Pi skills`, Pi-style discovery is re-enabled for:
 
 - `.agents/skills/` in the current directory and its parents, up to the git repository root
-- `.pi/skills/` in the current directory
+- `.grclanker/skills/` in the current directory
 - `~/.agents/skills/` in your home directory
+- `~/.grclanker/agent/skills/`, where grclanker also keeps its bundled skills
 
 ## Re-running setup
 
