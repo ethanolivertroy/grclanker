@@ -878,6 +878,18 @@ test("control 1 preserves manual review for a truncated policy-detail inventory 
   assert.equal(byId([assessTenableScanProgram(unsafeData, { now: NOW })], "TENABLE-01").status, "fail");
 });
 
+test("control 1 preserves the empty-scan failure ahead of unreadable policy secondaries", async () => {
+  const data = await collectTenableScanProgramData(clientsFor(healthyRoutes(), { status: 403 }), { now: NOW });
+  data.scans.status = "ok";
+  data.scans.data = [];
+  data.scans.truncated = true;
+  data.scans.total = 1;
+  data.scans.error = undefined;
+  data.scans.notCollected = false;
+
+  assert.equal(byId([assessTenableScanProgram(data, { now: NOW })], "TENABLE-01").status, "fail");
+});
+
 test("control 11 treats the tenant-wide All Users group as broad, alongside AllUsers and AllTags", async () => {
   const allUsersGroup = healthyRoutes();
   allUsersGroup["GET /api/v3/access-control/permissions"] = {

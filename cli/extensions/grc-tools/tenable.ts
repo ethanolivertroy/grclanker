@@ -2894,6 +2894,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "TENABLE-01": {
       const scans = value("scan_count") ?? 0;
+      if (scans === 0) return fact(0, 1, 0);
       const policies = asRecords(evidence.policies_evaluated);
       const unreadable = policies.filter((item) => ["unreadable", "unverified"].includes(asString(item.verdict) ?? "")).length;
       const violations = (value("discovery_only_scans") ?? 0) === scans && scans > 0
