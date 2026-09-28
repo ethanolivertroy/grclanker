@@ -5,21 +5,28 @@ on:
   schedule:
     - cron: "23 14 * * *"
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   sync-fedramp:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       pull-requests: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22.20.0"
+          node-version: "22.23.3"
 
       - name: Install site dependencies
         run: npm ci
@@ -31,8 +38,18 @@ jobs:
       - name: Sync official FedRAMP sources
         run: npm run sync:fedramp
 
+      # Workflows on PRs opened with GITHUB_TOKEN do not run automatically and
+      # may wait for approval, so the sync must pass the CLI tests and site
+      # build before the PR is opened.
+      - name: Test CLI
+        working-directory: cli
+        run: npm run test:cli
+
+      - name: Build site
+        run: npm run build
+
       - name: Open reviewed sync PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           branch: automation/fedramp-sync
           commit-message: "chore: sync official FedRAMP sources"
