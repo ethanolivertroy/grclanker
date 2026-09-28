@@ -1124,14 +1124,18 @@ test("CF-IAM-06 treats token-list 404 as complete safe-empty evidence and other 
   assert.deepEqual(userTokens, { items: [], truncated: false, totalCount: 0 });
   assert.deepEqual(accountTokens, { items: [], truncated: false, totalCount: 0 });
 
-  const safeEmpty = await captureBatchDecisionFacts(() => assessCloudflareIdentity(fixtureClient("compliant", {
-    async listUserTokens() { return userTokens; },
-    async listAccountTokens() { return accountTokens; },
-  })));
-  const safeFacts = safeEmpty.captures.find((capture) =>
-    capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
-  assert.equal(safeFacts?.evidence_complete, true);
-  assert.equal(byId(safeEmpty.result, "CF-IAM-06").status, "pass");
+  const safeEmptyCases = [
+    { async listUserTokens() { return userTokens; } },
+    { async listAccountTokens() { return accountTokens; } },
+  ];
+  for (const overrides of safeEmptyCases) {
+    const safeEmpty = await captureBatchDecisionFacts(() =>
+      assessCloudflareIdentity(fixtureClient("compliant", overrides)));
+    const safeFacts = safeEmpty.captures.find((capture) =>
+      capture.integration === CLOUDFLARE_SPEC.identity.slug && capture.checks.has("CF-IAM-06"))?.checks.get("CF-IAM-06");
+    assert.equal(safeFacts?.evidence_complete, true);
+    assert.equal(byId(safeEmpty.result, "CF-IAM-06").status, "pass");
+  }
 
   const failed = await captureBatchDecisionFacts(() => assessCloudflareIdentity(fixtureClient("compliant", {
     async listUserTokens() { throw forbidden("/user/tokens"); },

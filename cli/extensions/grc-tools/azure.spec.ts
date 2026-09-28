@@ -646,7 +646,7 @@ export const AZURE_SPEC = buildBatchIntegrationSpec({
   },
   runtimeBehavior: AZURE_RUNTIME_BEHAVIOR,
   knownGaps: [
-    "Current-runtime limitation preserved for parity: AZURE-MON-06 caps pass only when the Log Analytics workspace inventory is truncated; truncation of diagnostic settings alone does not cap the finding. A runtime follow-up must make both dependencies completeness-gating.",
+    "AZURE-MON-06 currently caps pass only when the Log Analytics workspace inventory is truncated. Diagnostic-settings truncation leaves complete true and can pass; a collector follow-up must make both dependencies completeness-gating.",
     "Certificate authentication, managed identity, several mailbox and device surfaces, alternate reporters, and standalone binaries are not shipped.",
   ],
   sensitiveFields: ["client_secret", "graph_token", "management_token", "access_token", "authorization", "cookie"],
