@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "type": "module",
   "description": "Experimental local-first GRC CLI for CMVP, KEV, EPSS, and framework-mapped posture work",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ethanolivertroy/grclanker.git"
@@ -82,7 +82,9 @@
     "prompts",
     "scripts/patch-embedded-pi.mjs",
     "skills",
-    ".grclanker"
+    ".grclanker",
+    "LICENSE",
+    "NOTICE"
   ],
   "pi": {
     "extensions": [

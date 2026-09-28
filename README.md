@@ -247,4 +247,8 @@ Artifacts land in `cli/release/`.
 - Expect fast iteration.
 - Expect breaking changes before `0.1.x`.
 
+## License
+
+`grclanker` is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
 Built by [Ethan Troy](https://ethantroy.dev)
