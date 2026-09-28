@@ -27,13 +27,13 @@ Environment variables:
 |---|---|
 | `CS_CLIENT_ID` | Falcon API client ID (`FALCON_CLIENT_ID` is accepted as a fallback) |
 | `CS_CLIENT_SECRET` | Falcon API client secret (`FALCON_CLIENT_SECRET` is accepted as a fallback) |
-| `CS_BASE_URL` | Explicit API base URL; overrides the cloud alias |
-| `CS_CLOUD` | Regional cloud alias when `CS_BASE_URL` is not set |
-| `CS_MEMBER_CID` | Child CID for Falcon Flight Control (MSSP) tenants |
+| `CS_BASE_URL` | Explicit API base URL; overrides the cloud alias (`FALCON_BASE_URL` is accepted as a fallback) |
+| `CS_CLOUD` | Regional cloud alias when `CS_BASE_URL` is not set (`FALCON_CLOUD` is accepted as a fallback) |
+| `CS_MEMBER_CID` | Child CID for Falcon Flight Control (MSSP) tenants (`FALCON_MEMBER_CID` is accepted as a fallback) |
 | `CS_CONFIG_FILE` | Optional JSON config file path (defaults to `~/.crowdstrike/config.json`) |
 | `CS_TIMEOUT` | HTTP timeout in seconds (default 30) |
 
-Precedence is explicit tool arguments, then environment variables, then the JSON config file. The config file accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_cid`, and `timeout_seconds`; keep it outside the repository.
+Precedence is explicit tool arguments, then environment variables, then the JSON config file. The config file accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_cid`, and `timeout_seconds`, plus the camelCase spellings `clientId`, `clientSecret`, `baseUrl`, and `memberCid` and `region` as an alias of `cloud`; keep it outside the repository.
 
 Regional clouds:
 
@@ -77,7 +77,7 @@ Every tool accepts `client_id`, `client_secret`, `base_url`, `cloud`, `member_ci
 
 ### Audit bundle layout
 
-`crowdstrike_export_audit_bundle` writes to `./export/crowdstrike/<cloud>[-<member_cid>]-audit-bundle/` by default (override with `output_dir`) and refuses traversal or symlinked parent paths:
+`crowdstrike_export_audit_bundle` writes to `./export/crowdstrike/<cloud>[-<member_cid>]-audit-bundle/` by default (override with `output_dir`; when the base URL matches no known cloud alias, the base URL's hostname takes the place of `<cloud>`) and refuses traversal or symlinked parent paths:
 
 - `QUICK_REFERENCE.md` and `metadata.json` (no credentials)
 - `core_data/<category>/*.json`: projected and redacted API snapshots. Alerts and RTR audit sessions keep verdict fields only (process command lines, file paths, and RTR command strings are never exported), and the free-text fields of every exclusion (`cl_regex`, `ifn_regex`, `value`, `name`, `description`, `comment`) pass through the credential redaction pass. Every string a snapshot, an evidence list, or a summary keeps from a Falcon response passes the data-side pass at the collector (`collectDataset`): the client's remembered credentials in every form and every carrier (`Authorization`, `Cookie`, `Set-Cookie`, and API key headers, quoted or bare; URL userinfo and query strings, which go whole; credential-named assignments and fields; auth schemes; JWTs; PEM blocks) and, bare, the vendor-prefixed token shapes (`sk_live_`, `xoxb-`, `ghp_`, `AKIA`, and the rest) are removed from a description, a note, a name, or a comment: JWTs, PEM blocks, and vendor-prefixed tokens are unambiguous credential shapes with no identifier collision, so they go on the data side too, while the generic bare-run rule does not run on data, so identifiers such as `prod-us-east-2026`, a UUID, an opaque 24-character id, or a quoted `Content-Type` header stay. A resource nested deeper than 32 levels is replaced by `[REDACTED]` at that depth rather than passed through (the payload is server-controlled). A dataset that was denied, errored, or never requested is written as `{ collected: false, dataset, status, endpoint, error }` instead of an empty array, so `[]` always means a readable list with no items; a dependent read that was skipped carries `not requested: <parent read>` in `error`

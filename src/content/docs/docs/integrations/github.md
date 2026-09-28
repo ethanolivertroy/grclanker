@@ -33,7 +33,7 @@ Required read access for a complete run: organization owner (or an App with orga
 
 | Tool | What it does |
 |------|--------------|
-| `github_check_access` | Probes the org profile, members, repositories, audit log, organization roles, rulesets, Actions permissions, code security configurations, and the default code security configurations and reports `healthy` or `limited` |
+| `github_check_access` | Probes the org profile, repositories, audit log, organization roles, rulesets, Actions permissions, code security configurations, and the default code security configurations, and reports `healthy` when at least four of those eight probes are readable, otherwise `limited` |
 | `github_assess_org_access` | Identity and access findings GITHUB-ORG-001 to GITHUB-ORG-011 |
 | `github_assess_repo_protection` | Repository protection findings GITHUB-REPO-001 to GITHUB-REPO-007 |
 | `github_assess_actions_security` | Actions findings GITHUB-ACT-001 to GITHUB-ACT-005 |
@@ -41,7 +41,7 @@ Required read access for a complete run: organization owner (or an App with orga
 | `github_assess_integrations` | Webhook, deploy key, App installation, OAuth, and package findings GITHUB-INTEG-001 to GITHUB-INTEG-005 |
 | `github_export_audit_bundle` | Runs every collector once and writes an evidence bundle under `output_dir` |
 
-All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app_id`, `app_private_key`, `app_private_key_path`, `installation_id`, `enterprise`, and `lookback_days`; the export tool adds `output_dir`.
+All tools accept `organization`, `auth_mode` (`pat` or `app`), `api_token`, `app_id`, `app_private_key`, `app_private_key_path`, `installation_id`, `enterprise`, `api_base_url`, `graphql_url`, and `lookback_days`; the export tool adds `output_dir`.
 
 ## Control coverage
 
@@ -110,7 +110,7 @@ Each finding carries the FedRAMP (800-53 r5), CMMC 2.0, SOC 2, CIS GitHub Benchm
 GITHUB_ORG=my-org GITHUB_TOKEN=ghp_... npm --prefix cli run test:github:live
 ```
 
-The script exits 0 with a skip message when no credentials are present. With credentials it runs the access check and all five assessments and prints the per-status counts and every Fail summary.
+The script exits 0 with a skip message unless `GITHUB_ORG` (or `GH_ORG`) and either a PAT or the full GitHub App variable set are present. Otherwise it runs the access check, stops with exit 1 unless the access status is `healthy`, then runs all five assessments and prints the per-status counts and every Fail summary.
 
 ## Limitations and manual controls
 
@@ -138,6 +138,6 @@ The script exits 0 with a skip message when no credentials are present. With cre
 - [Self-hosted runner groups](https://docs.github.com/en/rest/actions/self-hosted-runner-groups) and [Self-hosted runners](https://docs.github.com/en/rest/actions/self-hosted-runners)
 - [Code security configurations](https://docs.github.com/en/rest/code-security/configurations) and [Get default code security configurations](https://docs.github.com/en/rest/code-security/configurations#get-default-code-security-configurations)
 - [Searching the audit log](https://docs.github.com/en/organizations/keeping-your-organization-secure/managing-security-settings-for-your-organization/reviewing-the-audit-log-for-your-organization#searching-the-audit-log) (`created:>=` phrase syntax)
-- GraphQL [Organization](https://docs.github.com/en/graphql/reference/objects#organization), [OrganizationIdentityProvider](https://docs.github.com/en/graphql/reference/objects#organizationidentityprovider), [IpAllowListEntry](https://docs.github.com/en/graphql/reference/objects#ipallowlistentry), [EnterpriseOwnerInfo](https://docs.github.com/en/graphql/reference/objects#enterpriseownerinfo)
+- GraphQL [Organization](https://docs.github.com/en/graphql/reference/orgs#object-organization), [OrganizationIdentityProvider](https://docs.github.com/en/graphql/reference/orgs#object-organizationidentityprovider), [IpAllowListEntry](https://docs.github.com/en/graphql/reference/enterprise-admin#object-ipallowlistentry), [EnterpriseOwnerInfo](https://docs.github.com/en/graphql/reference/enterprise-admin#object-enterpriseownerinfo)
 - [Generating a JWT for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
-- Deferred collectors: [Audit log stream configurations](https://docs.github.com/en/enterprise-cloud@latest/rest/enterprise-admin/audit-log#list-audit-log-stream-configurations-for-an-enterprise), [List packages for an organization](https://docs.github.com/en/rest/packages/packages#list-packages-for-an-organization), GraphQL [Repository.isSecurityPolicyEnabled](https://docs.github.com/en/graphql/reference/objects#repository)
+- Deferred collectors: [Audit log stream configurations](https://docs.github.com/en/enterprise-cloud@latest/rest/enterprise-admin/audit-log#list-audit-log-stream-configurations-for-an-enterprise), [List packages for an organization](https://docs.github.com/en/rest/packages/packages#list-packages-for-an-organization), GraphQL [Repository.isSecurityPolicyEnabled](https://docs.github.com/en/graphql/reference/repos#object-repository)
