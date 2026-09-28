@@ -587,6 +587,65 @@ test("151 completeness primitives have exact per-check sources, failure modes, a
   assert.equal(completenessFields, 151);
 });
 
+test("all 151 completeness source contracts feed the executable runtime-input derivations", () => {
+  const conditionUsesPath = (condition, path) => {
+    const operandUsesPath = (operand) => (
+      (operand.kind === "path" || operand.kind === "length") && operand.path === path
+    );
+    switch (condition.op) {
+      case "always":
+        return false;
+      case "and":
+      case "or":
+        return condition.conditions.some((child) => conditionUsesPath(child, path));
+      case "not":
+        return conditionUsesPath(condition.condition, path);
+      case "eq":
+      case "ne":
+      case "gt":
+      case "gte":
+      case "lt":
+      case "lte":
+        return operandUsesPath(condition.left) || operandUsesPath(condition.right);
+      case "ratio":
+        return operandUsesPath(condition.numerator)
+          || operandUsesPath(condition.denominator)
+          || operandUsesPath(condition.threshold);
+      case "matches":
+      case "defined":
+      case "null":
+        return operandUsesPath(condition.operand);
+      case "some":
+      case "every":
+        return condition.path === path || conditionUsesPath(condition.condition, path);
+      default:
+        assert.fail(`unhandled condition operator ${condition.op}`);
+    }
+  };
+  let comparisons = 0;
+  for (const [spec] of batch) {
+    for (const check of spec.checks) {
+      for (const [inputName, contract] of Object.entries(check.completeness ?? {})) {
+        comparisons += 1;
+        assert.ok(
+          Object.values(check.derivedFactRules).some((rule) => conditionUsesPath(rule.condition, inputName)),
+          `${check.id}.${inputName}: captured runtime input feeds an executable outcome`,
+        );
+        assert.deepEqual(
+          contract.sources.map((source) => source.surfaceId),
+          [...new Set(contract.sources.map((source) => source.surfaceId))],
+          `${check.id}.${inputName}: exact runtime source set has no aliases`,
+        );
+        const rendered = check.evidenceFieldDefinitions[inputName];
+        for (const source of contract.sources) {
+          assert.match(rendered, new RegExp(`\\\`${source.surfaceId}\\\``), `${check.id}.${inputName}: rendered runtime source ${source.surfaceId}`);
+        }
+      }
+    }
+  }
+  assert.equal(comparisons, 151);
+});
+
 test("portable source and population contracts encode the final audit distinctions", () => {
   const check = (spec, id) => spec.checks.find((entry) => entry.id === id);
   const sourceIds = (spec, id, inputName = "complete") =>
