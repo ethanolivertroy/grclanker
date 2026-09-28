@@ -324,12 +324,12 @@ const GWS_EXECUTABLE_DECISIONS: Readonly<Record<string, GwsExecutableDecision>> 
     }),
   },
   "GWS-MON-005": {
-    inputs: input("readable", "complete", "alert_count", "open_alert_count", "unknown_status_count"),
+    inputs: input("readable", "complete", "alert_count", "open_alert_count", "alert_without_known_state_count"),
     constants: { pass_maximum: 3, warning_maximum: 10 },
     rules: ordered({
       manual: any(unreadable, eq("alert_count", 0)),
       fail: gt("open_alert_count", 10),
-      warn: any(incomplete, gt("open_alert_count", 3), gt("unknown_status_count", 0)),
+      warn: any(incomplete, gt("open_alert_count", 3), gt("alert_without_known_state_count", 0)),
       pass: lte("open_alert_count", 3),
     }),
   },

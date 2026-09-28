@@ -101,12 +101,18 @@ function operandState(operand, constants) {
 function comparisonWitnesses(condition, desired, constants, domains) {
   const left = operandState(condition.left, constants);
   const right = operandState(condition.right, constants);
+  const candidatesFor = (knownPeer) => {
+    if (typeof knownPeer === "boolean") return [true, false, null];
+    if (typeof knownPeer === "string") return [knownPeer, ...domains.strings, "__different__", null];
+    if (typeof knownPeer === "number") return [knownPeer - 1, knownPeer, knownPeer + 1, ...domains.numbers, null, "__not_numeric__"];
+    return [...domains.numbers, ...domains.strings, true, false, null, "__not_numeric__"];
+  };
   const leftValues = left.known
     ? [left.value]
-    : [...domains.numbers, ...domains.strings, null, "__not_numeric__"];
+    : candidatesFor(right.known ? right.value : undefined);
   const rightValues = right.known
     ? [right.value]
-    : [...domains.numbers, ...domains.strings, null, "__not_numeric__"];
+    : candidatesFor(left.known ? left.value : undefined);
   return leftValues.flatMap((leftValue) => rightValues.flatMap((rightValue) => {
     const assignment = new Map();
     if (!left.known) assignment.set(left.path, leftValue);
