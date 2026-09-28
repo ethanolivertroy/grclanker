@@ -1379,6 +1379,17 @@ test("remedial training preserves the parent pass for an empty test list with re
   assert.match(remediation.summary, /100%.*across all 3 tests in the window/);
 });
 
+test("late enrollment failures remain proved against the users read from a truncated inventory", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["training"], now: NOW });
+  snapshot.activeUsers.truncated = true;
+  snapshot.activeUsers.total = snapshot.activeUsers.data.length + 1;
+  snapshot.activeUsers.limit = 5_000;
+
+  const timeliness = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 4);
+  assert.equal(timeliness.status, "fail");
+  assert.match(timeliness.summary, /2 of 2 recently joined users.*Truncated listing: users/);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });

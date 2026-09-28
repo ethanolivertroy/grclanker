@@ -2293,7 +2293,8 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const inventory = value("new_users_evaluated") ?? value("new_users_read") ?? 0;
       const late = value("late_or_missing_enrollments") ?? value("late_or_missing_enrollments_among_read_users");
       const complete = late !== undefined;
-      return fact(inventory, complete && (value("late_pct") ?? 0) > 5 ? late : 0, !complete || (late ?? 0) > 0 ? Math.max(1, late ?? 0) : 0, complete);
+      const latePct = value("late_pct") ?? (complete && inventory > 0 ? ((late ?? 0) / inventory) * 100 : 0);
+      return fact(inventory, complete && latePct > 5 ? late : 0, !complete || (late ?? 0) > 0 ? Math.max(1, late ?? 0) : 0, complete);
     }
     case "KNOWBE4-05":
       return fact(value("users_scored") ?? value("users_scored_read") ?? 0, (value("mean_risk_score") ?? 0) > (value("max_mean_risk_score") ?? 0) ? 1 : 0, value("mean_risk_score") === undefined || (value("stddev_risk_score") ?? 0) > (value("max_risk_score_stddev") ?? 0) ? 1 : 0);
