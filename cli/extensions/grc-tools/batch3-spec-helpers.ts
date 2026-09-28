@@ -37,6 +37,18 @@ export interface Batch3CheckRow {
   completenessSources?: readonly BatchCompletenessSourceDefinition[];
   completenessSemantics?: string;
   runtimeFactNames?: Batch3FactNames;
+  thresholds?: readonly Batch3ThresholdDefinition[];
+  thresholdOnly?: boolean;
+}
+
+export interface Batch3ThresholdDefinition {
+  constant: string;
+  observedFact: string;
+  configuredFact?: string;
+  comparator: "gt" | "gte" | "lt" | "lte";
+  status: "fail" | "warn";
+  observedDescription: string;
+  configuredDescription?: string;
 }
 
 export interface Batch3FactNames {
@@ -169,13 +181,46 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
   return batch2Checks(rows.map((row): Batch2CheckRow => {
     REGISTERED_FACT_NAMES.set(row.id, row.runtimeFactNames ?? checkOwnedFactNames(row));
     const names = batch3FactNames(row.id);
-    const decisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : {
+    const baseDecisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : {
       [names.readable]: `Boolean set from the named source read results before any finding is created. True only when every response and required field used by ${row.id} is readable.`,
       [names.complete]: `Boolean set from the named pagination and child-read states before any finding is created. Its exact source-state effects are defined by the ${row.id} completeness contract.`,
       [names.population]: `Non-negative integer cardinality of the exact ${row.id} record population evaluated before evidence samples are sliced. It is null when that population was not established.`,
       [names.failureMatches]: `Non-negative integer counted directly from primitive vendor fields before any per-record status exists. Exact predicate: ${row.predicate}`,
       [names.reviewMatches]: `Non-negative integer counted directly from missing, unknown, or review-only primitive fields before any per-record status exists. Exact predicate and precedence: ${row.predicate}`,
     });
+    const thresholdDecisionInputs = Object.fromEntries((row.thresholds ?? []).flatMap((threshold) => [
+      [threshold.observedFact, threshold.observedDescription],
+      ...(threshold.configuredFact
+        ? [[threshold.configuredFact, threshold.configuredDescription
+          ?? `Resolved runtime configuration for ${threshold.constant}; null means configuration resolution failed and cannot independently pass.`] as const]
+        : []),
+    ]));
+    const decisionInputs = { ...baseDecisionInputs, ...thresholdDecisionInputs };
+    const comparison = (
+      comparator: Batch3ThresholdDefinition["comparator"],
+      leftPath: string,
+      rightPath: string,
+    ) => ({
+      op: comparator,
+      left: batch2Path(leftPath),
+      right: batch2Path(rightPath),
+    } as const);
+    const thresholdRules = (row.thresholds ?? []).map((threshold) => batch2Rule(
+      threshold.status,
+      threshold.configuredFact
+        ? batch2Any(
+            batch2All(
+              batch2Defined(threshold.configuredFact),
+              comparison(threshold.comparator, threshold.observedFact, threshold.configuredFact),
+            ),
+            batch2All(
+              batch2Not(batch2Defined(threshold.configuredFact)),
+              comparison(threshold.comparator, threshold.observedFact, threshold.constant),
+            ),
+          )
+        : comparison(threshold.comparator, threshold.observedFact, threshold.constant),
+      `${threshold.observedFact} is compared directly to ${threshold.configuredFact ?? threshold.constant}; ${threshold.constant} is the executable default boundary.`,
+    ));
     const unreadableRule = batch2Rule("manual", batch2Any(
       batch2Ne(names.readable, true),
       batch2Not(batch2Defined(names.readable)),
@@ -184,8 +229,8 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     const violationRule = batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0));
     const suppliedDecisionRules = row.decisionRules ?? (row.manualOnly ? undefined : [
       ...(row.incompleteOutcome === "manual"
-        ? [unreadableRule, violationRule]
-        : [violationRule, unreadableRule]),
+        ? [unreadableRule, ...thresholdRules, ...(row.thresholdOnly ? [] : [violationRule])]
+        : [...thresholdRules, ...(row.thresholdOnly ? [] : [violationRule]), unreadableRule]),
       ...(row.emptyOutcome === undefined || row.emptyOutcome === "manual"
         ? [batch2Rule("manual", batch2Eq(names.population, 0))]
         : [batch2Rule(row.emptyOutcome, batch2All(batch2Eq(names.population, 0), batch2Eq(names.complete, true)))]),
