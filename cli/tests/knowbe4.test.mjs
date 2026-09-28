@@ -1399,6 +1399,17 @@ test("late enrollment failures remain proved against the users read from a trunc
   assert.match(timeliness.summary, /2 of 2 recently joined users.*Truncated listing: users/);
 });
 
+test("inactive-user failures remain proved against the users read from a truncated inventory", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(failingFixture()), { scopes: ["risk"], now: NOW });
+  snapshot.activeUsers.truncated = true;
+  snapshot.activeUsers.total = snapshot.activeUsers.data.length + 1;
+  snapshot.activeUsers.limit = 5_000;
+
+  const inactive = findingFor(assessKnowbe4UserRisk(snapshot, { now: NOW }), 18);
+  assert.equal(inactive.status, "fail");
+  assert.match(inactive.summary, /7 of 8 active users.*Truncated listing: users/);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });
