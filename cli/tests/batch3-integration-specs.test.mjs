@@ -110,6 +110,7 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
 test("batch 3 completeness names exact datasets and all six collection failure modes", () => {
   const expectedModes = ["denied", "error", "missing-required-field", "not-collected", "not-configured", "truncated"];
   const parentTruncationNoChange = new Set([
+    "TENABLE-07.sc-scanners",
     "TENABLE-11.groups",
     "TENABLE-11.permissions",
     "TENABLE-19.asset-export-jobs",

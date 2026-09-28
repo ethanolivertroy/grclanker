@@ -949,6 +949,15 @@ test("control 16 warns rather than becoming manual when loaded tag categories ar
   assert.equal(byId([assessTenableSensorCoverage(data, { now: NOW })], "TENABLE-16").status, "warn");
 });
 
+test("control 7 Security Center preserves the parent pass for a healthy truncated scanner sample", async () => {
+  const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+  const data = await collectTenableSensorCoverageData(clientsFor(routes, { configExtra: SC_FIXTURE }), { now: NOW });
+  data.scScanners.truncated = true;
+  data.scScanners.total = data.scScanners.data.length + 1;
+
+  assert.equal(byId([assessTenableSensorCoverage(data, { now: NOW })], "TENABLE-07-SC").status, "pass");
+});
+
 test("control 19 preserves the parent pass for observed two-day activity in a truncated job listing", async () => {
   const data = await collectTenableVulnerabilityData(clientsFor(healthyRoutes()), { now: NOW });
   data.assetExportJobs.truncated = true;

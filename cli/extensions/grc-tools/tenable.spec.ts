@@ -45,6 +45,7 @@ const surfaces = [
   surface("sc-scan-results", "/rest/scanResult", ["id", "name", "finishTime", "status"]),
   surface("sc-scanners", "/rest/scanner", ["id", "name", "status", "version"]),
   surface("sc-users", "/rest/user", ["id", "username", "role", "lastLogin"]),
+  surface("sc-feed", "/rest/feed", ["active.updateTime", "active.stale"]),
 ] as const;
 
 const rows: readonly Batch3CheckRow[] = [
@@ -54,7 +55,22 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "TENABLE-04", control: 4, title: "Credentialed scan ratio", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["scans", "scan-details", "policies", "policy-details"], predicate: "Compute credentialed scan count divided by the complete scan population; ratios below credential_threshold violate.", constants: { default_credential_threshold: 0.8 } },
   { id: "TENABLE-05", control: 5, title: "Agent deployment status", severity: "high", owner: "tenable_assess_sensor_coverage", surfaces: ["agents", "asset-export", "asset-export-status", "asset-export-chunks"], predicate: "Count linked agents offline beyond agent_offline_days and exported assets with no agent identifier.", constants: { default_agent_offline_days: 7 } },
   { id: "TENABLE-06", control: 6, title: "Agent group organization", severity: "medium", owner: "tenable_assess_sensor_coverage", surfaces: ["agents", "agent-groups"], predicate: "Count linked agents assigned to no agent group, plus empty group inventory when agents exist." },
-  { id: "TENABLE-07", control: 7, title: "Scanner health and version", severity: "high", owner: "tenable_assess_sensor_coverage", surfaces: ["scanners", "server-properties", "sc-scanners"], predicate: "Count scanners that are offline, disconnected, or whose version/plugin set differs from the readable server baseline." },
+  {
+    id: "TENABLE-07",
+    control: 7,
+    title: "Scanner health and version",
+    severity: "high",
+    owner: "tenable_assess_sensor_coverage",
+    surfaces: ["scanners", "server-properties", "sc-scanners", "sc-feed"],
+    predicate: "Count scanners that are offline, disconnected, or whose version/plugin set differs from the readable server or Security Center feed baseline.",
+    completenessSources: [
+      batch3Source("scanners"),
+      batch3Source("server-properties"),
+      batch3Source("sc-scanners", NON_TRUNCATION_FAILURES),
+      batch3Source("sc-feed"),
+    ],
+    completenessSemantics: "For TENABLE-07, Exact source-state effects: scanners sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field. server-properties sets evidence_complete false on the same six states. sc-feed sets evidence_complete false on the same six states. sc-scanners sets evidence_complete false on error, denied, not-collected, not-configured, and missing-required-field; truncated leaves it unchanged for the suffixed Security Center finding, matching the shipped parent. Finding previews and exported samples never establish source cardinality.",
+  },
   { id: "TENABLE-08", control: 8, title: "Plugin update currency", severity: "high", owner: "tenable_assess_sensor_coverage", surfaces: ["scanners", "server-properties", "sc-scanners"], predicate: "Count scanners whose plugin feed age exceeds plugin_stale_hours or whose plugin set is absent.", constants: { default_plugin_stale_hours: 24 } },
   { id: "TENABLE-09", control: 9, title: "Network zone configuration", severity: "medium", owner: "tenable_assess_sensor_coverage", surfaces: ["networks", "scanners"], predicate: "Count network zones without an assigned readable scanner or referencing a missing scanner." },
   { id: "TENABLE-10", control: 10, title: "User role and permission audit", severity: "high", owner: "tenable_assess_access_control", surfaces: ["users", "roles", "groups", "sc-users"], predicate: "Count active users inactive beyond inactive_user_days and administrator users above max_admins; unknown last-login fields require review.", constants: { default_inactive_user_days: 90, default_max_admins: 5 } },
@@ -165,6 +181,7 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
   runtimeBehavior: TENABLE_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Tenable Security Center contributes schedule, scanner, feed, and user equivalents only; cloud-only exports and access-group controls remain manual for Security Center-only tenants.",
+    "TENABLE-07-SC preserves the shipped parent behavior in which a healthy Security Center scanner sample can pass when the scanner inventory is truncated. This partial-pass exception is a report-only runtime candidate; the spec binding does not harden it.",
     "TENABLE-11 preserves the shipped parent behavior in which a clean permission result can pass when the permissions or user-group inventory is truncated; a broad permission observed in the loaded rows still fails. This partial-pass exception is a report-only runtime candidate; the spec binding does not harden it.",
     "TENABLE-19 preserves the shipped parent behavior in which external export jobs observed on at least two days can pass when either export-job listing is truncated. This partial-pass exception is a report-only runtime candidate; the spec binding does not harden it.",
   ],

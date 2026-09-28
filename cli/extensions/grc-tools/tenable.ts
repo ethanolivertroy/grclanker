@@ -2884,7 +2884,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const scanners = value("sc_scanner_count") ?? 0;
       if (scanners === 0) return {};
       const violations = count("sc_unhealthy", "sc_stale_checkin", "sc_stale_plugins") + (evidence.sc_feed_active_stale === true ? 1 : 0);
-      const complete = evidence.sc_feed_readable === true && evidence.inventory_truncated !== true;
+      const complete = evidence.sc_feed_readable === true;
       return fact(scanners, violations, count("sc_undated") + (complete ? 0 : 1), complete);
     }
     case "TENABLE-10-SC": {
@@ -3142,7 +3142,7 @@ function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>)
     records_total: readable ? dataset.total ?? null : null,
   };
   const previousFacts = (item as TenableFindingWithFacts)[TENABLE_DECISION_FACTS] ?? {};
-  const facts = dataset.truncated
+  const facts = dataset.truncated && item.id !== "TENABLE-07-SC"
     ? { ...previousFacts, evidence_complete: false }
     : previousFacts;
   const contractId = item.id.endsWith("-SC") ? item.id.slice(0, -3) : item.id;
