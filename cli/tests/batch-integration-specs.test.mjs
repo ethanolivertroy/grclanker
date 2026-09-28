@@ -137,22 +137,25 @@ function comparisonWitnesses(condition, desired, constants) {
   }
   if (!left.known && right.known) {
     const threshold = Number(right.value);
-    const value = comparison === "gt"
-      ? (desired ? threshold + 1 : threshold)
-      : (desired ? threshold : threshold + 1);
-    return [new Map([[left.path, value]])];
+    const values = comparison === "gt"
+      ? (desired ? [threshold + 1] : [threshold, threshold - 1])
+      : (desired ? [threshold, threshold - 1] : [threshold + 1]);
+    return values.map((value) => new Map([[left.path, value]]));
   }
   if (left.known && !right.known) {
     const threshold = Number(left.value);
-    const value = comparison === "gt"
-      ? (desired ? threshold - 1 : threshold)
-      : (desired ? threshold : threshold - 1);
-    return [new Map([[right.path, value]])];
+    const values = comparison === "gt"
+      ? (desired ? [threshold - 1] : [threshold, threshold + 1])
+      : (desired ? [threshold, threshold + 1] : [threshold - 1]);
+    return values.map((value) => new Map([[right.path, value]]));
   }
-  const values = comparison === "gt"
-    ? (desired ? [1, 0] : [0, 0])
-    : (desired ? [0, 0] : [1, 0]);
-  return [new Map([[left.path, values[0]], [right.path, values[1]]])];
+  const pairs = comparison === "gt"
+    ? (desired ? [[1, 0]] : [[0, 0], [-1, 0]])
+    : (desired ? [[0, 0], [-1, 0]] : [[1, 0]]);
+  return pairs.map(([leftValue, rightValue]) => new Map([
+    [left.path, leftValue],
+    [right.path, rightValue],
+  ]));
 }
 
 function conditionWitnesses(condition, desired, constants) {
