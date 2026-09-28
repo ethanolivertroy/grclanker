@@ -20,7 +20,13 @@ import { createHmac, randomBytes } from "node:crypto";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { VERACODE_SPEC } from "./veracode.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -118,6 +124,25 @@ export const VERACODE_CONTROLS: ReadonlyArray<ControlDescriptor> = [
   { number: 19, title: "Scan completion rate", mappings: ["FedRAMP SA-11", "CMMC L2 3.14.1", "SOC 2 CC7.1", "CIS Controls v8 16.12", "PCI-DSS 6.5", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-01"] },
   { number: 20, title: "Collections compliance posture", mappings: ["FedRAMP SA-11(1)", "CMMC L2 3.14.3", "SOC 2 CC7.1", "CIS Controls v8 16.2", "PCI-DSS 6.3", "STIG SRG-APP-000456", "IRAP ISM-1143", "ISMAP VM-02"] },
 ];
+
+const VERACODE_FRAMEWORK_PREFIXES = {
+  fedramp: "FedRAMP ",
+  cmmc: "CMMC ",
+  soc2: "SOC 2 ",
+  cis: "CIS Controls v8 ",
+  pci_dss: "PCI-DSS ",
+  disa_stig: "STIG ",
+  irap: "IRAP ",
+  ismap: "ISMAP ",
+} as const;
+hydrateBatchFrameworkMappings(VERACODE_SPEC, Object.fromEntries(
+  VERACODE_CONTROLS.map((control) => [controlId(control.number), Object.fromEntries(
+    Object.entries(VERACODE_FRAMEWORK_PREFIXES).map(([framework, prefix]) => [
+      framework,
+      control.mappings.filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length)),
+    ]),
+  )]),
+));
 
 export interface VeracodeFinding {
   id: string;
@@ -1882,7 +1907,23 @@ function finding(
   evidence?: JsonRecord,
 ): VeracodeFinding {
   const control = controlDescriptor(number);
-  return { id: controlId(number), title: control.title, severity, status, summary, mappings: [...control.mappings], evidence };
+  const id = controlId(number);
+  const facts = {
+    evidence_readable: status !== "manual",
+    evidence_complete: status !== "manual",
+    inventory_count: 1,
+    violation_count: status === "fail" ? 1 : 0,
+    review_count: status === "warn" ? 1 : 0,
+  };
+  return {
+    id,
+    title: control.title,
+    severity,
+    status: evaluateBatchRuntimeCheckVerdict(VERACODE_SPEC, id, facts) as VeracodeFinding["status"],
+    summary,
+    mappings: [...control.mappings],
+    evidence,
+  };
 }
 
 function manualFinding(
@@ -3793,6 +3834,7 @@ const applicationParams = {
 };
 
 export function registerVeracodeTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, VERACODE_SPEC);
   pi.registerTool({
     name: "veracode_check_access",
     label: "Check Veracode audit access",
