@@ -220,6 +220,7 @@ const SALESFORCE_EXECUTABLE_DECISIONS: Readonly<Record<string, SalesforceExecuta
     inputs: input("sets_readable", "users_readable", "profiles_readable", "user_count", "profile_count", "admin_profile_count", "admin_count", "set_count", "elevated_set_count", "assignments_readable", "complete", "assignee_count", "max_admins"),
     rules: [
       rule("manual", any(ne("sets_readable", true), populationUnavailable, eq("set_count", 0))),
+      rule("warn", all(eq("elevated_set_count", 0), ne("assignments_readable", true))),
       rule("warn", all(eq("elevated_set_count", 0), ne("complete", true))),
       rule("pass", eq("elevated_set_count", 0)),
       rule("manual", ne("assignments_readable", true)),
