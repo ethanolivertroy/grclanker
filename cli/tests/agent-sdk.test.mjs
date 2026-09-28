@@ -352,6 +352,33 @@ test("executeGrcTool withholds echoed arguments and credentials from every error
   assert.doesNotMatch(thrownEnvelope, /Received arguments:/);
   assert.ok(!thrownEnvelope.includes(credentialSentinel));
   assert.ok(!thrownEnvelope.includes(argumentSentinel));
+
+  const { tool: returningError } = fakeTool({
+    parameters,
+    async execute(_toolCallId, args) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `credential rejected: ${args.api_token}\n\nReceived arguments:\n${JSON.stringify(args)}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  });
+  const returned = await executeGrcTool(
+    returningError,
+    { api_token: credentialSentinel, query: argumentSentinel },
+    { toolCallId: "call_returned_error_redaction" },
+  );
+  const returnedEnvelope = JSON.stringify(returned);
+
+  assert.equal(returned.isError, true);
+  assert.match(returned.content[0].text, /credential rejected: \[redacted\]/);
+  assert.doesNotMatch(returnedEnvelope, /Received arguments:/);
+  assert.ok(!returnedEnvelope.includes(credentialSentinel));
+  assert.ok(!returnedEnvelope.includes(argumentSentinel));
 });
 
 test("executeGrcTool disables persistent caches only for dry-run sessions", async () => {

@@ -36,10 +36,28 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function safeErrorEnvelope(tool: RegisteredGrcTool, input: JsonObject, errorText: string): ToolExecuteResult {
+function sanitizeErrorText(tool: RegisteredGrcTool, input: JsonObject, errorText: string): string {
   const withoutArguments = withholdEchoedArguments(errorText);
   const sensitiveValues = collectSensitiveValues(input, tool.parameters);
-  return errorEnvelope(scrubSensitiveValues(withoutArguments, sensitiveValues));
+  return scrubSensitiveValues(withoutArguments, sensitiveValues);
+}
+
+function safeErrorEnvelope(tool: RegisteredGrcTool, input: JsonObject, errorText: string): ToolExecuteResult {
+  return errorEnvelope(sanitizeErrorText(tool, input, errorText));
+}
+
+function sanitizeErrorResult(
+  tool: RegisteredGrcTool,
+  input: JsonObject,
+  result: ToolExecuteResult,
+): ToolExecuteResult {
+  if (result.isError !== true) return result;
+  return {
+    ...result,
+    content: result.content.map((entry) =>
+      entry.type === "text" ? { ...entry, text: sanitizeErrorText(tool, input, entry.text) } : entry,
+    ),
+  };
 }
 
 /**
@@ -74,7 +92,7 @@ export async function executeGrcTool(
   const run = () => tool.execute(toolCallId, args);
   try {
     const result = options.dryRun === true ? await runWithoutPersistentCaches(run) : await run();
-    return toSdkToolResult(result);
+    return sanitizeErrorResult(tool, input, toSdkToolResult(result));
   } catch (error) {
     return safeErrorEnvelope(tool, input, `${tool.name} failed: ${describeError(error)}`);
   }
