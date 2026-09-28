@@ -13,7 +13,7 @@ The Cloudflare integration inspects accounts and zones through the Cloudflare v4
 
 ## Setup and authentication
 
-Use a scoped API token (`CLOUDFLARE_API_TOKEN`). The legacy Global API Key pair (`CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY`) is accepted but fails finding CF-IAM-01. Set `CLOUDFLARE_ACCOUNT_ID` (or pass `account_id`) when the token can see more than one account; account-scoped findings stay manual until the account is unambiguous. Zone checks sample up to `zone_limit` zones (default 20) from `GET /zones`, filtered by `account.id` when an account is configured.
+Use a scoped API token (`CLOUDFLARE_API_TOKEN`). The legacy Global API Key pair (`CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY`) is accepted but fails finding CF-IAM-01. Set `CLOUDFLARE_ACCOUNT_ID` (or pass `account_id`) when the token can see more than one account; account-scoped findings stay manual until the account is unambiguous. Zone checks sample up to `zone_limit` zones (default 20) from `GET /zones`, filtered by `account.id` when an account is configured. `CLOUDFLARE_API_BASE_URL` (or `base_url`) overrides the default `https://api.cloudflare.com/client/v4`, and `CLOUDFLARE_TIMEOUT` (or `timeout_seconds`) sets the HTTP timeout in seconds (default 30); tool arguments win over the environment.
 
 | Surface | Token permission (read) |
 |---------|-------------------------|
@@ -28,7 +28,7 @@ Use a scoped API token (`CLOUDFLARE_API_TOKEN`). The legacy Global API Key pair 
 | IP access rules | Account Firewall Access Rules: Read |
 | Access apps, policies, identity providers | Access: Apps and Policies: Read, Access: Organizations, Identity Providers, and Groups: Read |
 | Gateway rules and Zero Trust account (`gateway_tag`) | Zero Trust: Read |
-| API tokens | User API Tokens: Read, Account API Tokens: Read |
+| API tokens | API Tokens: Read (user level), Account API Tokens: Read |
 
 ## Tools
 
@@ -137,4 +137,4 @@ The script exits 0 with a skip message when neither `CLOUDFLARE_API_TOKEN` nor t
 - Audit logging (11): the API proves recent events exist; retention configuration is manual.
 - Gateway (24): zero Gateway rules fails when `/accounts/{account_id}/gateway` returns a `gateway_tag` (Gateway is provisioned) and is otherwise manual because the product may not be licensed.
 - Zone checks sample `zone_limit` zones; the summary reports seen and total counts whenever the inventory is partial and caps the verdict at warn.
-- Legacy `firewall/rules`, `firewall/waf/packages`, and `rate_limits` endpoints are deprecated; the rulesets API is authoritative. Legacy reads happen only when the corresponding rulesets read fails, are evidence only, and never produce a pass.
+- Legacy `firewall/rules` and `rate_limits` endpoints are deprecated (the legacy `firewall/waf/packages` endpoint is never read); the rulesets API is authoritative. Legacy reads happen only when the corresponding rulesets read fails, are evidence only, and never produce a pass.
