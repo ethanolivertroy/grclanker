@@ -7,7 +7,7 @@ The Vanta integration uses the read-only Auditor API. It validates an auditor OA
 
 ## Setup
 
-Create Auditor API credentials in Vanta with the audit and auditor read scopes, then set:
+Create Auditor API credentials in Vanta with the audit and auditor read scopes (the token request asks for `auditor-api.audit:read auditor-api.auditor:read`), then set:
 
 ```bash
 export VANTA_CLIENT_ID="..."

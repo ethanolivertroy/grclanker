@@ -9,11 +9,13 @@ The Slack tool family inspects a Slack Enterprise Grid organization (or a single
 
 | Variable | Purpose |
 |----------|---------|
-| `SLACK_USER_TOKEN` | Org-level user token (`xoxp-`) from an app installed on the whole Enterprise org. Required for every `admin.*` and Audit Logs method. |
+| `SLACK_USER_TOKEN` (or `SLACK_TOKEN`) | Org-level user token (`xoxp-`) from an app installed on the whole Enterprise org. Required for every `admin.*` and Audit Logs method. |
 | `SLACK_BOT_TOKEN` | Optional bot token (`xoxb-`). Used only for methods whose reference page lists bot tokens (`auth.test`, `users.list`, `team.preferences.list`). Admin methods are refused locally with `not_allowed_token_type` when only a bot token is present. |
 | `SLACK_SCIM_TOKEN` | SCIM bearer token (Business+ or Enterprise Grid). Enables provisioning and lifecycle checks. |
-| `SLACK_ORG_ID` | Enterprise Grid org ID (`E...`). Passed as `enterprise_id` to the app inventory methods. |
-| `SLACK_CONFIG_FILE` | Optional JSON file with `user_token`, `bot_token`, `scim_token`, and `org_id`. Defaults to `~/.config/grclanker/slack.json` when present. Arguments override environment variables, which override the file. A file that cannot be read reports `Unable to read Slack config file <path> (<code>)` with only the system error code (for example `EISDIR` or `EACCES`); a file that is not valid JSON reports a fixed `Unable to parse Slack config file <path>: the file is not valid JSON` message, so neither the file contents nor a library message can appear in the error. |
+| `SLACK_ORG_ID` (or `SLACK_ENTERPRISE_ID`) | Enterprise Grid org ID (`E...`). Passed as `enterprise_id` to the app inventory methods. |
+| `SLACK_TIMEOUT` | Optional request timeout in seconds (default 30, clamped to 1 through 300). |
+| `SLACK_WEB_API_BASE_URL`, `SLACK_SCIM_BASE_URL`, `SLACK_AUDIT_BASE_URL` | Optional API base overrides. Defaults are `https://slack.com/api`, `https://api.slack.com/scim/v2`, and `https://api.slack.com/audit/v1`. |
+| `SLACK_CONFIG_FILE` | Optional JSON file with `user_token` (or `token`), `bot_token`, `scim_token`, and `org_id`. Defaults to `~/.config/grclanker/slack.json` when present. Arguments override environment variables, which override the file. A file that cannot be read reports `Unable to read Slack config file <path> (<code>)` with only the system error code (for example `EISDIR` or `EACCES`); a file that is not valid JSON reports a fixed `Unable to parse Slack config file <path>: the file is not valid JSON` message, so neither the file contents nor a library message can appear in the error. |
 
 Required user-token scopes: `admin.teams:read`, `admin.users:read`, `admin.apps:read`, `admin.barriers:read`, `admin.conversations:read`, `admin.analytics:read` (optional probe), `auditlogs:read`, `users:read`, and `team.preferences:read`. The Admin API and Audit Logs API require an Enterprise Grid plan; an `ok:false` response of `not_allowed_token_type`, `missing_scope`, `not_an_enterprise`, or `feature_not_enabled` is rendered as a manual finding that names the cause, never as an empty or passing result.
 
