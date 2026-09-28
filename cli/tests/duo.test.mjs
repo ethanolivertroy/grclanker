@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -1648,33 +1649,41 @@ test("exportDuoAuditBundle omits _errors.log when every read succeeds", async ()
   assert.equal(findings.filter((finding) => finding.status === "Manual").map((finding) => finding.id).join(","), "DUO-AUTH-011");
 });
 
-test("exportDuoAuditBundle keeps bundle directories, evidence files, and archives private under umask 022", async () => {
-  const outputRoot = createTempBase("grclanker-duo-private-export-");
-  const config = createSampleConfig();
-  const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
-  const previousUmask = process.umask(0o022);
-  let result;
-
-  try {
-    result = await exportDuoAuditBundle(client, config, outputRoot);
-  } finally {
-    process.umask(previousUmask);
-  }
-
-  const assertPrivate = (path, expectedType) => {
-    const stats = statSync(path);
-    assert.equal(stats.mode & 0o077, 0, `${path} exposes ${expectedType} permissions to group or other users`);
+test("exportDuoAuditBundle preserves shared output roots while keeping every created path private", async () => {
+  const assertMode = (path, expectedMode, expectedType) => {
+    const actualMode = statSync(path).mode & 0o7777;
+    assert.equal(actualMode, expectedMode, `${path} has ${expectedType} mode ${actualMode.toString(8)}`);
   };
   const assertPrivateTree = (directory) => {
-    assertPrivate(directory, "directory");
+    assertMode(directory, 0o700, "directory");
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) assertPrivateTree(path);
-      else assertPrivate(path, "file");
+      else assertMode(path, 0o600, "file");
     }
   };
-  assertPrivateTree(result.outputDir);
-  assertPrivate(result.zipPath, "archive");
+
+  for (const { label, rootMode, umask } of [
+    { label: "ordinary shared root", rootMode: 0o755, umask: 0o022 },
+    { label: "setgid group root", rootMode: 0o2775, umask: 0o002 },
+  ]) {
+    const outputRoot = createTempBase("grclanker-duo-private-export-");
+    chmodSync(outputRoot, rootMode);
+    const config = createSampleConfig();
+    const client = new DuoAuditorClient(config, { fetchImpl: routedFetch(healthyDuoRoutes()) });
+    const previousUmask = process.umask(umask);
+    let result;
+
+    try {
+      result = await exportDuoAuditBundle(client, config, outputRoot);
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    assertMode(outputRoot, rootMode, label);
+    assertPrivateTree(result.outputDir);
+    assertMode(result.zipPath, 0o600, "archive");
+  }
 });
 
 function okEnvelope(response, metadata) {

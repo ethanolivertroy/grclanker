@@ -16,7 +16,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { chmod, readdir, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -5038,8 +5038,9 @@ function buildUnifiedMatrix(findings: DuoFinding[]): string {
 
 export function resolveSecureOutputPath(baseDir: string, targetDir: string): string {
   const root = resolve(baseDir);
+  const rootExisted = existsSync(root);
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  chmodSync(root, 0o700);
+  if (!rootExisted) chmodSync(root, 0o700);
   const rootReal = realpathSync(root);
   const destination = resolve(root, targetDir);
 
@@ -5052,12 +5053,22 @@ export function resolveSecureOutputPath(baseDir: string, targetDir: string): str
   }
 
   const parent = dirname(destination);
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const parentRelative = relative(root, parent);
+  if (parentRelative.startsWith("..") || isAbsolute(parentRelative)) {
+    throw new Error(`Refusing to write outside output root: ${destination}`);
+  }
+  let currentParent = root;
+  for (const segment of parentRelative.split(sep).filter(Boolean)) {
+    currentParent = join(currentParent, segment);
+    if (!existsSync(currentParent)) {
+      mkdirSync(currentParent, { mode: 0o700 });
+      chmodSync(currentParent, 0o700);
+    }
+  }
   const parentReal = realpathSync(parent);
   if (relative(rootReal, parentReal).startsWith("..")) {
     throw new Error(`Refusing to write outside output root: ${destination}`);
   }
-  chmodSync(parent, 0o700);
   return destination;
 }
 
