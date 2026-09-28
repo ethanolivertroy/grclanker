@@ -101,6 +101,17 @@ const searchData = searchEnabled
         : a.priority - b.priority,
     )
   : [];
+
+const siteName = 'grclanker';
+// The 404 page is served for any unknown path, so it must not claim a canonical URL.
+const isNotFoundPage = Astro.url.pathname.replace(/\/$/, '') === '/404';
+const canonicalURL = new URL(Astro.url.pathname, Astro.site).href;
+const ogImage = {
+  url: new URL('/og-card.jpg', Astro.site).href,
+  width: 1376,
+  height: 768,
+  alt: 'Spacecraft cockpit whose central radar screen reads GRCLANKER, AI GRC CLI',
+};
 ---
 
 <!doctype html>
@@ -111,15 +122,24 @@ const searchData = searchEnabled
     <meta name="description" content={description} />
     <title>{title}</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    {!isNotFoundPage && <link rel="canonical" href={canonicalURL} />}
+    <link rel="sitemap" href="/sitemap-index.xml" />
     <!-- Social / OG -->
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
-    <meta property="og:image" content="/og-card.jpg" />
     <meta property="og:type" content="website" />
+    {!isNotFoundPage && <meta property="og:url" content={canonicalURL} />}
+    <meta property="og:site_name" content={siteName} />
+    <meta property="og:image" content={ogImage.url} />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content={String(ogImage.width)} />
+    <meta property="og:image:height" content={String(ogImage.height)} />
+    <meta property="og:image:alt" content={ogImage.alt} />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
-    <meta name="twitter:image" content="/og-card.jpg" />
+    <meta name="twitter:image" content={ogImage.url} />
+    <meta name="twitter:image:alt" content={ogImage.alt} />
   </head>
   <body class="bg-base text-text font-sans min-h-screen antialiased flex flex-col">
 

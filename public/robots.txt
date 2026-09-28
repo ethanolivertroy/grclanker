@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://grclanker.com/sitemap.xml
+Sitemap: https://grclanker.com/sitemap-index.xml
