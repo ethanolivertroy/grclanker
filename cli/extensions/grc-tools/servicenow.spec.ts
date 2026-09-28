@@ -232,10 +232,9 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     enabled_debug_count: "debug properties whose value is true", smtp_account_count: "outbound SMTP accounts", starttls_count: "SMTP accounts requiring STARTTLS",
     insecure_count: "records matching the adjacent insecure predicate", server_count: "MID servers", recent_audit_count: "recent sys_audit records",
     sensitive_change_count: "recent sensitive changes", unaudited_count: "sensitive changes without audit evidence", update_set_aggregate_count: "update sets reported by Aggregate API",
-    in_progress_count: "in-progress update sets", in_progress_row_count: "visible in-progress update sets", not_validated_count: "unvalidated in-progress update sets",
-    concern_count: "update sets with unresolved concerns", integration_user_count: "active integration users", admin_integration_count: "integration users with admin roles",
+    in_progress_count: "in-progress update sets", in_progress_row_count: "visible in-progress update sets",
+    integration_user_count: "active integration users", admin_integration_count: "integration users with admin roles",
     public_page_count: "public pages", missing_required_count: "required controls absent from complete evidence", expired_certificate_count: "expired certificates",
-    unverified_count: "certificates with unknown validity",
   };
   const booleans: Readonly<Record<string, string>> = {
     readable: "the required table, aggregate, or property response was returned", complete: "defined by this check's structured completeness contract",
@@ -260,6 +259,12 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
   if (!definition) throw new Error(`ServiceNow primitive ${name} lacks an explicit portable definition`);
   return [name, definition];
 }));
+const inputWith = (
+  overrides: Readonly<Record<string, string>>,
+  ...names: string[]
+): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, overrides[name] ?? input(name)[name]]),
+);
 const propertyDecision = (): ServicenowExecutableDecision => ({
   inputs: input("readable", "complete", "unexpected_value_count", "absent_count"),
   rules: [rule("manual", ne("readable", true)), rule("fail", gt("unexpected_value_count", 0)), rule("warn", any(gt("absent_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
@@ -337,7 +342,9 @@ const SERVICENOW_EXECUTABLE_DECISIONS: Readonly<Record<string, ServicenowExecuta
     ],
   },
   "SNOW-08": {
-    inputs: input("readable", "complete", "providers_complete", "provider_count", "expired_certificate_count", "concern_count"),
+    inputs: inputWith({
+      concern_count: "Non-negative sum of active identity-provider certificate concerns and SSO configuration concerns: active certificates with an absent or unparseable expiry, active certificates expiring within the configured warning window, plus one when an active SSO provider exists while `glide.authenticate.multisso.enabled` is not true, plus one when an active SSO provider exists without a populated `glide.authenticate.sso.redirect.idp` value.",
+    }, "readable", "complete", "providers_complete", "provider_count", "expired_certificate_count", "concern_count"),
     rules: [rule("manual", ne("readable", true)), rule("manual", all(eq("provider_count", 0), ne("providers_complete", true))), rule("fail", eq("provider_count", 0)), rule("fail", gt("expired_certificate_count", 0)), rule("warn", any(gt("concern_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
   },
   "SNOW-09": manualDecision(),
@@ -390,11 +397,15 @@ const SERVICENOW_EXECUTABLE_DECISIONS: Readonly<Record<string, ServicenowExecuta
     ],
   },
   "SNOW-18": {
-    inputs: input("readable", "smtp_account_count", "insecure_count", "smtp_auth_disabled", "unverified_count", "starttls_count"),
+    inputs: inputWith({
+      unverified_count: "Non-negative cardinality of active SMTP email-account rows whose connection-security fields cannot be classified as no transport security, STARTTLS, or SSL/TLS.",
+    }, "readable", "smtp_account_count", "insecure_count", "smtp_auth_disabled", "unverified_count", "starttls_count"),
     rules: [rule("manual", ne("readable", true)), rule("fail", any(gt("insecure_count", 0), eq("smtp_auth_disabled", true))), rule("manual", eq("smtp_account_count", 0)), rule("manual", gt("unverified_count", 0)), rule("warn", gt("starttls_count", 0)), rule("manual", { op: "always" })],
   },
   "SNOW-19": {
-    inputs: input("readable", "server_count", "not_validated_count", "version_override_present"),
+    inputs: inputWith({
+      not_validated_count: "Non-negative cardinality of MID Server rows from `ecc_agent` whose normalized `validated` field is not true, including false, null, absent, and unrecognized values.",
+    }, "readable", "server_count", "not_validated_count", "version_override_present"),
     rules: [rule("manual", any(ne("readable", true), eq("server_count", 0))), rule("fail", gt("not_validated_count", 0)), rule("warn", eq("version_override_present", true)), rule("manual", { op: "always" })],
   },
   "SNOW-20": {

@@ -142,7 +142,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     failed_count: "failed logins", brute_force_source_count: "source IPs meeting repeated-failure threshold", legacy_tls_count: "legacy-TLS logins",
     country_count: "distinct login countries", undated_count: "records without timestamps", audit_count: "setup audit records", secret_count: "secret-bearing principals",
     active_count: "active records", undated_active_count: "active secret records without dates", certificate_count: "certificates", failure_count: "certificates in failure window",
-    warning_count: "certificates in warning window", disabled_count: "session-CSRF flags set false",
+    warning_count: "certificates in warning window",
   };
   const booleans: Readonly<Record<string, string>> = {
     readable: "the required query or metadata response was returned", complete: "defined by this check's structured completeness contract",
@@ -161,14 +161,18 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
   const raw: Readonly<Record<string, string>> = {
     score: "Numeric Security Health Check score.", timeout_minutes: "Configured session timeout in minutes.", mfa_risk_type: "Raw normalized MFA risk type.",
     max_admins: "Maximum accepted administrator population.", oldest_active_age_days: "Age in whole days of the oldest active secret.",
-    setup_flag: "Raw setup-page GET CSRF flag.", nonsetup_sfdc_flag: "Raw non-setup Salesforce GET CSRF flag.",
-    nonsetup_user_flag: "Raw custom-domain GET CSRF flag.", nonsetup_user_headerless_flag: "Raw headerless non-setup CSRF flag.",
   };
   const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Salesforce inventory at the verdict point.`
     : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
   if (!definition) throw new Error(`Salesforce primitive ${name} lacks an explicit portable definition`);
   return [name, definition];
 }));
+const inputWith = (
+  overrides: Readonly<Record<string, string>>,
+  ...names: string[]
+): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, overrides[name] ?? input(name)[name]]),
+);
 const populationUnavailable = any(
   ne("users_readable", true),
   ne("profiles_readable", true),
@@ -326,7 +330,13 @@ const SALESFORCE_EXECUTABLE_DECISIONS: Readonly<Record<string, SalesforceExecuta
     rules: [rule("manual", ne("readable", true)), rule("fail", ne("has_my_domain", true)), rule("manual", ne("can_only_login_with_my_domain_url_present", true)), rule("pass", all(eq("prevent_legacy_login", true), eq("require_domain_for_api", true))), rule("warn", eq("prevent_legacy_login", true)), rule("fail", { op: "always" })],
   },
   "SF-19": {
-    inputs: input("settings_readable", "setup_flag", "nonsetup_sfdc_flag", "nonsetup_user_flag", "nonsetup_user_headerless_flag", "disabled_count"),
+    inputs: inputWith({
+      setup_flag: "Raw nullable boolean from SecuritySettings `sessionSettings.enableClickjackSetup`, which controls clickjack protection for setup pages.",
+      nonsetup_sfdc_flag: "Raw nullable boolean from SecuritySettings `sessionSettings.enableClickjackNonsetupSFDC`, which controls clickjack protection for non-setup Salesforce pages.",
+      nonsetup_user_flag: "Raw nullable boolean from SecuritySettings `sessionSettings.enableClickjackNonsetupUser`, which controls clickjack protection for Visualforce pages with standard headers.",
+      nonsetup_user_headerless_flag: "Raw nullable boolean from SecuritySettings `sessionSettings.enableClickjackNonsetupUserHeaderless`, which controls clickjack protection for Visualforce pages without standard headers.",
+      disabled_count: "Non-negative cardinality of the four SF-19 clickjack-protection flags whose raw normalized value is explicitly false; absent or unparseable flags are not counted as disabled.",
+    }, "settings_readable", "setup_flag", "nonsetup_sfdc_flag", "nonsetup_user_flag", "nonsetup_user_headerless_flag", "disabled_count"),
     rules: [
       rule("manual", ne("settings_readable", true)),
       rule("pass", all(eq("setup_flag", true), eq("nonsetup_sfdc_flag", true), eq("nonsetup_user_flag", true), eq("nonsetup_user_headerless_flag", true))),

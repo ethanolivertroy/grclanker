@@ -363,7 +363,10 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     }),
   },
   "BOX-13": {
-    inputs: input("policies_readable", "assignments_readable", "complete", "assigned_policy_count"),
+    inputs: {
+      ...input("policies_readable", "assignments_readable", "complete", "assigned_policy_count"),
+      assigned_policy_count: "Non-negative cardinality of active or applying legal-hold policies for which either the policy's assignment_counts fields or the legal-hold assignment inventory proves at least one custodian or content assignment.",
+    },
     rules: ordered({
       manual: ne("policies_readable", true),
       warn: any(ne("complete", true), ne("assignments_readable", true), eq("assigned_policy_count", 0)),

@@ -544,7 +544,8 @@ test("all 1117 primitive input uses have explicit portable owner, domain, comple
       assert.deepEqual(Object.keys(check.evidenceFieldDefinitions ?? {}).sort(), [...check.evidenceFields].sort(), `${check.id}: every input is defined`);
       for (const [name, definition] of Object.entries(check.evidenceFieldDefinitions ?? {})) {
         inputUses += 1;
-        assert.match(definition, /^Type\/domain: /);
+        assert.match(definition, new RegExp(`^Semantic owner: \\\`${check.id}\\.${name}\\\`\\.`));
+        assert.match(definition, / Type\/domain: /);
         assert.match(definition, / Source\/owner: /);
         assert.match(definition, / Completeness\/sample semantics: /);
         assert.match(definition, / Null\/missing meaning: /);
@@ -556,6 +557,40 @@ test("all 1117 primitive input uses have explicit portable owner, domain, comple
     }
   }
   assert.equal(inputUses, 1117);
+});
+
+test("all 18 audited rule-driving facts have check-specific runtime meanings", () => {
+  const expected = new Map([
+    ["SLACK-ID-04.mismatch_count", /SCIM user records.*`active` field is not false.*primary email.*deactivated Slack user/],
+    ["SLACK-ADMIN-05.open_count", /Grid workspaces.*`discoverability`.*equals `open`/],
+    ["SLACK-ADMIN-07.unrestricted_count", /admin\.teams\.settings\.info.*`team\.email_domain`.*empty string/],
+    ["SLACK-APP-03.flagged_count", /distinct approved-app names.*internal.*outside the Slack Marketplace.*`is_sensitive`/],
+    ["SLACK-CHAN-02.unrestricted_count", /announcement-channel preference records.*posting-restriction classifier returns false/],
+    ["SLACK-CHAN-02.preference_count", /announcement-channel records.*admin\.conversations\.getConversationPrefs/],
+    ["BOX-13.assigned_policy_count", /active or applying legal-hold policies.*assignment_counts.*legal-hold assignment inventory/],
+    ["SNOW-08.concern_count", /identity-provider certificate concerns and SSO configuration concerns.*glide\.authenticate\.multisso\.enabled.*glide\.authenticate\.sso\.redirect\.idp/],
+    ["SNOW-18.unverified_count", /active SMTP email-account rows.*cannot be classified.*STARTTLS.*SSL\/TLS/],
+    ["SNOW-19.not_validated_count", /MID Server rows.*`ecc_agent`.*`validated` field is not true/],
+    ["SF-19.disabled_count", /four SF-19 clickjack-protection flags.*explicitly false/],
+    ["SF-19.setup_flag", /enableClickjackSetup.*clickjack protection for setup pages/],
+    ["SF-19.nonsetup_sfdc_flag", /enableClickjackNonsetupSFDC.*non-setup Salesforce pages/],
+    ["SF-19.nonsetup_user_flag", /enableClickjackNonsetupUser`.*Visualforce pages with standard headers/],
+    ["SF-19.nonsetup_user_headerless_flag", /enableClickjackNonsetupUserHeaderless.*Visualforce pages without standard headers/],
+    ["OKTA-AUTH-009.restricted_count", /ACTIVE authenticators.*`phone_number`.*`security_question`.*`okta_email`.*`settings\.allowedFor`/],
+    ["OKTA-MON-003.mode", /Okta ThreatInsight action mode.*top-level `action`.*top-level `mode`.*`settings\.action`/],
+    ["OKTA-MON-007.unrestricted_count", /API tokens.*`network\.connection`.*not `ZONE`.*defaults to `ANYWHERE`/],
+  ]);
+  const byId = new Map(batch.flatMap(([spec]) => spec.checks.map((check) => [check.id, check])));
+  for (const [qualifiedName, meaning] of expected) {
+    const separator = qualifiedName.lastIndexOf(".");
+    const checkId = qualifiedName.slice(0, separator);
+    const inputName = qualifiedName.slice(separator + 1);
+    const definition = byId.get(checkId)?.evidenceFieldDefinitions?.[inputName];
+    assert.ok(definition, `${qualifiedName}: definition exists`);
+    assert.match(definition, new RegExp(`^Semantic owner: \\\`${checkId}\\.${inputName}\\\`\\.`));
+    assert.match(definition, meaning, `${qualifiedName}: exact runtime population`);
+  }
+  assert.equal(expected.size, 18);
 });
 
 test("151 completeness primitives have exact per-check sources, failure modes, and rendered semantics", () => {
@@ -675,8 +710,11 @@ test("portable source and population contracts encode the final audit distinctio
   assert.deepEqual(falseWhen(SLACK_SPEC, "SLACK-APP-06", "auth-test", "coverage_complete"), ["error", "denied", "not-collected", "missing-required-field"]);
   assert.deepEqual(sourceIds(SLACK_SPEC, "SLACK-ADMIN-08", "roster_complete"), ["admin-users", "workspaces", "workspace-admins"]);
   assert.match(check(OKTA_SPEC, "OKTA-AUTH-002").evidenceFieldDefinitions.policy_inventory_readable, /at least one/);
-  assert.ok(OKTA_SPEC.knownGaps.some((gap) => /Pass for 32.*Partial for 3.*Manual for 2/.test(gap)));
+  assert.ok(OKTA_SPEC.knownGaps.some((gap) => /Pass for 31.*Partial for 3.*Manual for 2.*throws for the other 34/.test(gap)));
   assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-INTEG-004.*network-zone read is denied.*Pass/.test(gap)));
+  assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-AUTH-001 and OKTA-AUTH-009.*retain Pass.*organization-factor read is denied/.test(gap)));
+  assert.ok(DUO_SPEC.knownGaps.some((gap) => /DUO-AUTH-010.*user inventory only.*WebAuthn.*do not make that fact incomplete/.test(gap)));
+  assert.ok(ZOOM_SPEC.knownGaps.some((gap) => /ZOOM-COLLAB-01.*trusted-domain.*truncated.*assertion throw/.test(gap)));
 });
 
 test("ServiceNow metadata owns every concrete runtime property and relevant check", () => {
@@ -1234,6 +1272,16 @@ test("contracts enumerate exact surfaces, permission unlocks, framework mappings
       for (const surface of permission.unlocks) assert.ok(surfaceIds.has(surface), `${permission.id}: ${surface}`);
     }
   }
+  const publishedSurfaceCount = PUBLISHED_INTEGRATION_SPECS.reduce(
+    (count, entry) => count + entry.contract.apiSurfaces.length,
+    0,
+  );
+  assert.equal(publishedSurfaceCount, 251, "all runtime-owned pilot and batch surfaces are represented exactly once");
+  const slackConfig = resolveSlackConfiguration({ token: "surface-contract-token" }, {});
+  const slackScimUsers = SLACK_SPEC.apiSurfaces.find((surface) => surface.id === "scim-users");
+  assert.equal(slackConfig.scimBaseUrl, "https://api.slack.com/scim/v2");
+  assert.equal(slackScimUsers.path, `${new URL(slackConfig.scimBaseUrl).pathname}/Users`);
+  assert.equal(new URL(slackScimUsers.path, "https://api.slack.com").href, "https://api.slack.com/scim/v2/Users");
   assert.ok(!SERVICENOW_SPEC.authentication.modes.some((mode) => /mtls/i.test(mode)));
   assert.ok(SERVICENOW_SPEC.knownGaps.some((gap) => /reject.*unsupported-mode/i.test(gap)));
 });

@@ -696,7 +696,10 @@ export const DUO_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Honor bounded Retry-After, otherwise use bounded exponential retry and surface exhaustion.",
   },
   runtimeBehavior: DUO_RUNTIME_BEHAVIOR,
-  knownGaps: ["Auth API and Accounts API authentication modes, richer Trust Monitor analysis, and trend reporting are not shipped."],
+  knownGaps: [
+    "Auth API and Accounts API authentication modes, richer Trust Monitor analysis, and trend reporting are not shipped.",
+    "DUO-AUTH-010 derives its verdict completeness from the user inventory only. WebAuthn credential source errors, denials, or truncation do not make that fact incomplete, so a readable user inventory can retain Pass despite incomplete WebAuthn source evidence; changing that behavior requires a separate runtime fix.",
+  ],
   sensitiveFields: ["skey", "integration_key", "authorization", "cookie", "bypass_code"],
   credentialFormats: ["Duo integration keys", "Duo secret keys", "HMAC Authorization signatures"],
   output: buildBatchOutputContract({

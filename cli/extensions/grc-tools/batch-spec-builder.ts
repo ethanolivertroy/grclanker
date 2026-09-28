@@ -508,7 +508,7 @@ function renderPortableInputDefinitions(
     const portableMeaning = completenessContract?.semantics ?? supplied;
     return [
       name,
-      `Type/domain: ${inputTypes}.${values} Source/owner: ${definition.vendor} collector projection from ${source}. Completeness/sample semantics: ${completeness}. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule.${usedBy} Portable meaning: ${portableMeaning}`,
+      `Semantic owner: \`${check.id}.${name}\`. Type/domain: ${inputTypes}.${values} Source/owner: ${definition.vendor} collector projection from ${source}. Completeness/sample semantics: ${completeness}. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule.${usedBy} Portable meaning: ${portableMeaning}`,
     ];
   }));
 }
