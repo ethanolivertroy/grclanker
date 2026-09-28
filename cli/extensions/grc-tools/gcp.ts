@@ -2022,7 +2022,7 @@ export async function checkGcpAccess(
     recommendedNextStep:
       status === "healthy"
         ? "Run gcp_assess_identity, gcp_assess_logging_detection, gcp_assess_org_guardrails, gcp_assess_data_protection, gcp_assess_network_security, or gcp_export_audit_bundle."
-        : "Grant roles/cloudasset.viewer, roles/iam.securityReviewer, roles/logging.viewer, roles/orgpolicy.policyViewer, roles/compute.viewer, roles/storage.admin (read), and roles/securitycenter.findingsViewer to the audit principal and enable the corresponding APIs.",
+        : "Grant roles/cloudasset.viewer, roles/iam.securityReviewer, roles/logging.viewer, roles/orgpolicy.policyViewer, roles/compute.viewer, and roles/securitycenter.findingsViewer to the audit principal and enable the corresponding APIs. roles/iam.securityReviewer already includes storage.buckets.list for project bucket inventory. If the principal does not have roles/iam.securityReviewer, grant a custom role containing only storage.buckets.list at the organization or each audited project.",
   };
 }
 
