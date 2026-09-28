@@ -3292,6 +3292,10 @@ function completeOktaDatasets(...datasets: CollectedDataset<unknown>[]): boolean
   return datasets.every((dataset) => !dataset.error && !dataset.notCollected && dataset.truncated !== true);
 }
 
+function untruncatedOktaDatasets(...datasets: CollectedDataset<unknown>[]): boolean {
+  return datasets.every((dataset) => dataset.truncated !== true);
+}
+
 function buildFinding(
   id: keyof typeof OKTA_CHECKS,
   status: OktaFindingStatus,
@@ -4158,7 +4162,7 @@ export function assessOktaAuthentication(
     "Set Okta Verify compliance.fips to REQUIRED, disable SMS, voice, security question, and email authenticators (or limit email to recovery), and rely on FIPS 140 validated authenticators.";
   recordOktaDecisionFacts("OKTA-AUTH-009", {
     readable: !data.authenticators.error,
-    complete: completeOktaDatasets(data.authenticators, data.orgFactors),
+    complete: untruncatedOktaDatasets(data.authenticators, data.orgFactors),
     classic_engine: classicEngine,
     authenticator_count: authenticators.length,
     federal_tenant: isFederalTenant,
@@ -4893,7 +4897,7 @@ export function assessOktaIntegrations(
   const riskAwareRules = [...signOnRules, ...accessRules].filter(appUsesRiskSignal);
   recordOktaDecisionFacts("OKTA-INTEG-004", {
     policy_readable: !(data.signOnPolicies.error && data.accessPolicies.error),
-    complete: completeOktaDatasets(
+    complete: policyErrors.length === 0 && untruncatedOktaDatasets(
       data.signOnPolicies,
       data.signOnPolicyRules,
       data.accessPolicies,
@@ -5101,7 +5105,9 @@ export function assessOktaMonitoring(
   recordOktaDecisionFacts("OKTA-MON-001", {
     streams_readable: !data.logStreams.error,
     hooks_readable: !data.eventHooks.error,
-    complete: completeOktaDatasets(data.logStreams, data.eventHooks),
+    complete: !data.logStreams.error
+      && !data.eventHooks.error
+      && untruncatedOktaDatasets(data.logStreams, data.eventHooks),
     active_stream_count: activeStreams.length,
     active_hook_count: activeHooks.length,
   });

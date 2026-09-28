@@ -256,16 +256,19 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
   "DUO-AUTH-006": {
     inputs: input("readable", "complete", "settings_readable", "bypass_code_count", "flagged_code_count", "undated_code_count", "helpdesk_bypass", "helpdesk_bypass_expiration"),
     constants: { maximum_age_hours: 24 },
-    rules: ordered({
-      manual: unreadable,
-      fail: any(
+    rules: [
+      rule("manual", unreadable),
+      rule("warn", all(eq("bypass_code_count", 0), ne("settings_readable", true))),
+      rule("warn", all(eq("bypass_code_count", 0), incomplete)),
+      rule("pass", eq("bypass_code_count", 0)),
+      rule("fail", any(
         gt("flagged_code_count", 0),
         eq("helpdesk_bypass", "allow"),
         all(eq("helpdesk_bypass", "limit"), lte("helpdesk_bypass_expiration", 0)),
-      ),
-      warn: any(incomplete, ne("settings_readable", true), gt("bypass_code_count", 0), gt("undated_code_count", 0)),
-      pass: eq("bypass_code_count", 0),
-    }),
+      )),
+      rule("warn", any(incomplete, ne("settings_readable", true), gt("bypass_code_count", 0), gt("undated_code_count", 0))),
+      rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
+    ],
   },
   "DUO-AUTH-007": {
     inputs: input("policy_readable", "user_auth_behavior"),
@@ -516,22 +519,22 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
   "DUO-MON-005": {
     inputs: input("attempts_readable", "logs_readable", "counts_present", "complete", "attempt_count", "denied_attempt_count", "event_count", "located_event_count", "impossible_travel_count", "fraud_count"),
     constants: { travel_window_minutes: 60, denied_warning_percent: 20 },
-    rules: ordered({
-      manual: any(
+    rules: [
+      rule("manual", any(
         ne("attempts_readable", true),
         ne("logs_readable", true),
         ne("counts_present", true),
-        all(eq("impossible_travel_count", 0), eq("located_event_count", 0), gt("event_count", 0)),
-      ),
-      fail: gt("impossible_travel_count", 0),
-      warn: any(
-        incomplete,
-        all(eq("attempt_count", 0), eq("event_count", 0)),
+      )),
+      rule("warn", all(eq("attempt_count", 0), eq("event_count", 0))),
+      rule("fail", gt("impossible_travel_count", 0)),
+      rule("manual", eq("located_event_count", 0)),
+      rule("warn", any(
         gt("fraud_count", 0),
         ratio("gt", "denied_attempt_count", "attempt_count", 20, { scale: 100, roundDigits: 1 }),
-      ),
-      pass: { op: "always" },
-    }),
+      )),
+      rule("warn", incomplete),
+      rule("pass", { op: "always" }),
+    ],
   },
 };
 

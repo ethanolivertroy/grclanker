@@ -2716,6 +2716,14 @@ function roleCeilingReason(currentUser: ZendeskSnapshot<JsonRecord>): string | u
 
 function finalizeFindings(findings: ZendeskFinding[], currentUser: ZendeskSnapshot<JsonRecord>): ZendeskFinding[] {
   const reason = roleCeilingReason(currentUser);
+  const factsByCheck = ZENDESK_DECISION_CONTEXT.getStore();
+  if (!factsByCheck) throw new Error("Zendesk findings were finalized outside an assessment");
+  const credentialIsAdmin = reason === undefined;
+  for (const item of findings) {
+    const facts = factsByCheck.get(item.id);
+    if (!facts) throw new Error(`${item.id} has no runtime decision facts`);
+    factsByCheck.set(item.id, { ...facts, credential_is_admin: credentialIsAdmin });
+  }
   const capped = reason
     ? findings.map((item): ZendeskFinding => item.status === "pass"
       ? {

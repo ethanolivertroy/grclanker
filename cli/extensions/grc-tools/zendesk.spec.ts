@@ -129,6 +129,17 @@ const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or"
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
 const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete Zendesk collector state before rendered evidence arrays are capped.`]));
 const manual = (): ZendeskExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
+const withCredentialPassCap = (rules: readonly VerdictRule[]): readonly VerdictRule[] =>
+  rules.flatMap((entry) => entry.status === "pass"
+    ? [
+        {
+          status: "warn" as const,
+          condition: all(ne("credential_is_admin", true), entry.condition),
+          note: "An otherwise passing finding is capped at warn unless the current-user response confirms an administrator principal.",
+        },
+        entry,
+      ]
+    : [entry]);
 
 const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDecision>> = {
   "ZD-01": {
@@ -364,7 +375,7 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
   const control = index + 1;
   const id = `ZD-${String(control).padStart(2, "0")}`;
   const decision = ZENDESK_EXECUTABLE_DECISIONS[id];
-  const executable = deriveDecisionRules(id, decision.rules);
+  const executable = deriveDecisionRules(id, withCredentialPassCap(decision.rules));
   return {
     id,
     control,
@@ -373,7 +384,10 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
     owner: ownerFor(control),
     surfaces: ZENDESK_CHECK_SURFACES[control],
     evidenceFields: [...ZENDESK_CHECK_SURFACES[control], "complete_source_counts"],
-    decisionInputs: decision.inputs,
+    decisionInputs: {
+      ...decision.inputs,
+      credential_is_admin: "True only when a complete current-user response identifies the authenticated vendor principal as a Zendesk administrator; false includes a non-admin, missing, or unreadable role and caps only an otherwise passing finding.",
+    },
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
     decision: decisions[index],

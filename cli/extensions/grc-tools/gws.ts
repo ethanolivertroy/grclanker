@@ -1116,6 +1116,10 @@ function completeGwsDatasets(...datasets: Array<CollectedDataset<unknown> | unde
   );
 }
 
+function untruncatedGwsDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
+  return datasets.every((dataset) => dataset !== undefined && dataset.truncated !== true);
+}
+
 function buildFinding(
   definitionId: string,
   status: GwsFindingStatus,
@@ -3290,7 +3294,7 @@ export function assessGwsAdminAccess(
   });
   recordGwsDecisionFacts("GWS-ADMIN-005", {
     readable: !data.roleAssignments.error,
-    complete: directoryComplete,
+    complete: untruncatedGwsDatasets(data.users, data.roles, data.roleAssignments),
     assignment_count: roleAssignments.length,
     group_assignment_count: privileged.groupAssignmentCount,
   });
@@ -3561,6 +3565,7 @@ export function assessGwsIntegrations(
     && privileged.unresolvedAssignments === 0;
   const tokenReadsComplete = failed === 0
     && sampled >= population
+    && data.users.truncated !== true
     && sampleDependency.notes.length === 0;
   recordGwsDecisionFacts("GWS-INTEG-001", {
     users_readable: !data.users.error,
@@ -3571,7 +3576,7 @@ export function assessGwsIntegrations(
   });
   recordGwsDecisionFacts("GWS-INTEG-002", {
     directory_readable: !directoryProblem,
-    complete: integrationDirectoryComplete && tokenReadsComplete && privilegedSampled,
+    complete: integrationDirectoryComplete && failed === 0 && privilegedSampled,
     privileged_user_count: privileged.privilegedUsers.length,
     token_count: allTokens.length,
     failed_read_count: failed,

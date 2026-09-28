@@ -354,7 +354,7 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     rules: ordered({
       manual: unavailable,
       fail: gt("insecure_active_count", 0),
-      warn: incomplete,
+      warn: all(incomplete, gt("active_origin_count", 0)),
       info: eq("active_origin_count", 0),
       pass: { op: "always" },
       failFirst: true,
