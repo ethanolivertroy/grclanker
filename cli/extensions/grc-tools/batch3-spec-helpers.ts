@@ -383,8 +383,8 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       : row.decisionRules;
     const suppliedDecisionRules = explicitRules ?? (row.manualOnly ? undefined : [
       ...(row.incompleteOutcome === "manual"
-        ? [unreadableRule, ...primitiveRules, ...(row.thresholdOnly ? [] : [violationRule])]
-        : [...primitiveRules, ...(row.thresholdOnly ? [] : [violationRule]), unreadableRule]),
+        ? [unreadableRule, ...(row.thresholdOnly ? [] : [violationRule]), ...primitiveRules]
+        : [...(row.thresholdOnly ? [] : [violationRule]), unreadableRule, ...primitiveRules]),
       ...(row.emptyOutcome === undefined || row.emptyOutcome === "manual"
         ? [batch2Rule("manual", batch2Eq(names.population, 0))]
         : [batch2Rule(row.emptyOutcome, batch2All(batch2Eq(names.population, 0), batch2Eq(names.complete, true)))]),
@@ -407,7 +407,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
             rule.status === "pass" && rule.condition.op === "always"
               ? batch2Rule(
                   "pass",
-                  batch2All(...Object.keys(decisionInputs).map((name) => batch2Defined(name))),
+                  batch2All(...Object.keys(baseDecisionInputs).map((name) => batch2Defined(name))),
                   "Every declared primitive must be present and non-null before the fallback pass branch can match.",
                 )
               : rule),
