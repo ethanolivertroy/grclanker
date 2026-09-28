@@ -1148,7 +1148,8 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
 function readSchemeValue(text: string, valueStart: number, carrier: RegExpExecArray, strictBearerMode = true): ValueReplacement | null {
   const scheme = carrier[0].trim();
   const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(scheme);
-  const strictBearer = strictBearerMode && scheme.toLowerCase() === "bearer" && !lowercaseScheme;
+  const pairValue = carrier.index > 0 && (text[carrier.index - 1] === "=" || text[carrier.index - 1] === ":");
+  const strictBearer = strictBearerMode && !pairValue && scheme.toLowerCase() === "bearer" && !lowercaseScheme;
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);

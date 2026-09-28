@@ -1038,7 +1038,8 @@ function readSchemeValue(text: string, valueStart: number, carrier: RegExpExecAr
   const scheme = carrier[1];
   const conventional = CAPITALISED_SCHEMES.get(scheme.toLowerCase());
   if (conventional !== undefined && scheme !== conventional) return null;
-  const strictBearer = strictBearerMode && scheme.toLowerCase() === "bearer" && scheme !== "bearer";
+  const pairValue = carrier.index > 0 && (text[carrier.index - 1] === "=" || text[carrier.index - 1] === ":");
+  const strictBearer = strictBearerMode && !pairValue && scheme.toLowerCase() === "bearer" && scheme !== "bearer";
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);

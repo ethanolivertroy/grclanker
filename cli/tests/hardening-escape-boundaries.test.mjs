@@ -10,8 +10,8 @@ import { leakedCanaryWindow } from "./helpers/error-canaries.mjs";
  * break, an escaped quote, a space), with token-shaped and prose-shaped values, through the text scrubs
  * and describeErrorBody's nested sink (where a raw control in the inner text is JSON-encoded to the
  * escape before the scrub reads it). The rule under test: an escape prefix leaks exactly what the space
- * control leaks, and that is only the scheme-prose row with a plain lowercase word (`Bearer <word> was
- * replayed`, the prose exemption after a scheme word, which main at 02967cc kept too).
+ * control leaks. Strict error sinks remove a purely alphabetic value after capitalized Bearer; data
+ * sinks keep it because the same phrase can be a person's name in structured evidence.
  */
 
 const VALUES = Object.freeze([
@@ -86,12 +86,14 @@ function leakingRows(prefix) {
   return rows;
 }
 
-test("escape boundaries: every escape prefix leaks exactly what the space control leaks, and that is only the scheme-prose plain-word row", () => {
+test("escape boundaries: every escape prefix matches the space control, with alphabetic Bearer values kept only by data sinks", () => {
   const trialsPerPrefix = CARRIERS.length * VALUES.length * SINKS.length;
   assert.equal(trialsPerPrefix, 300);
   const spaceRows = leakingRows(CONTROL_PREFIXES[2][1]).sort();
-  // The one exemption in force under the control: a plain lowercase word after a scheme word in prose.
-  const exemptRows = ["lower11", "lower16"].flatMap((valueName) => SINKS.map(([sinkName]) => `scheme prose|${valueName}|${sinkName}`)).sort();
+  const dataSinkNames = new Set(["scrubDataText", "redactSecretValues"]);
+  const exemptRows = ["lower11", "lower16"].flatMap((valueName) => SINKS
+    .filter(([sinkName]) => dataSinkNames.has(sinkName))
+    .map(([sinkName]) => `scheme prose|${valueName}|${sinkName}`)).sort();
   assert.deepEqual(spaceRows, exemptRows);
   for (const [prefixName, prefix] of [...ESCAPE_PREFIXES, ...CONTROL_PREFIXES]) {
     const rows = leakingRows(prefix);
