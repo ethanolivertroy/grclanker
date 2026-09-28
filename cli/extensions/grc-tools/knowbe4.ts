@@ -2309,7 +2309,8 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "KNOWBE4-08":
       return fact(value("active_groups") ?? value("active_groups_read") ?? 0, observedViolation, (value("active_groups") ?? value("active_groups_read") ?? 0) === 0 || evidence.groups_missing_phishing === null || evidence.groups_missing_training === null ? 1 : 0);
     case "KNOWBE4-09": {
-      const campaigns = value("active_campaigns") ?? 0;
+      const campaigns = value("active_campaigns")
+        ?? count("full_targeting_campaigns", "partial_targeting_campaigns");
       const coverage = value("estimated_coverage_pct");
       const requireFull = evidence.require_full_targeting !== false;
       return fact(campaigns, campaigns === 0 || requireFull && coverage !== undefined && coverage < (value("min_coverage_pct") ?? 0) ? 1 : 0, coverage === undefined && campaigns > 0 ? 1 : 0);

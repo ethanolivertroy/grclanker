@@ -1322,6 +1322,17 @@ test("collectKnowbe4Snapshot flags user_limit truncation and user-set controls d
   assert.equal(findingFor(risk, 5).evidence.users_scored_read, 5);
 });
 
+test("campaign targeting retains the observed All Users proof when the campaign inventory is truncated", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["phishing"], now: NOW });
+  snapshot.phishingCampaigns.truncated = true;
+  snapshot.phishingCampaigns.total = snapshot.phishingCampaigns.data.length + 1;
+  snapshot.phishingCampaigns.limit = 20_000;
+
+  const targeting = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 9);
+  assert.equal(targeting.status, "warn");
+  assert.match(targeting.summary, /target All Users.*Truncated listing: phishing_campaigns/);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });
