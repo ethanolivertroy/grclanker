@@ -129,7 +129,7 @@ Re-running the export allocates a new directory and zip; it never overwrites a p
 DUO_API_HOST=... DUO_IKEY=... DUO_SKEY=... npm --prefix cli run test:duo:live
 ```
 
-The smoke test exits 0 without credentials. With credentials it runs the access check and all four assessments, prints every finding, and fails if any finding passed while carrying a collection error.
+The smoke test exits 0 without credentials. With credentials it runs the access check and stops with exit 1 unless the access status is `healthy`; otherwise it runs all four assessments, prints every finding, and fails if any finding passed while carrying a collection error.
 
 ## Limitations and manual controls
 
