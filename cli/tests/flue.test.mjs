@@ -449,6 +449,28 @@ test("the adapter stage accepts and normalizes arguments exactly like the Pi CLI
   );
 });
 
+test("Flue preserves AWS optional list defaults through its gate and adapter", () => {
+  const piTools = collectGrclankerDomainTools();
+  const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
+  const cases = [
+    ["aws_assess_data_protection", ["regions"]],
+    ["aws_assess_network_security", ["regions", "sensitive_ports"]],
+    ["aws_export_audit_bundle", ["regions", "sensitive_ports"]],
+  ];
+  for (const [name, fields] of cases) {
+    const tool = flueTools.get(name);
+    assert.ok(tool, `${name} is bridged into Flue`);
+    for (const value of [null, "", " \t "]) {
+      const input = Object.fromEntries(fields.map((field) => [field, value]));
+      const result = flueVerdict(tool, input);
+      assert.equal(result.ok, true, `${name} accepts optional defaults from ${JSON.stringify(input)}`);
+      for (const field of fields) {
+        assert.equal(result.args[field], undefined, `${name} maps ${field}=${JSON.stringify(value)} to its default`);
+      }
+    }
+  }
+});
+
 test("reviewer probe cases: the gate is the only difference from the Pi CLI, in both directions", () => {
   const piTools = collectGrclankerDomainTools();
   const flueTools = new Map(createGrclankerFlueTools(piTools).map((tool) => [tool.name, tool]));
