@@ -49,6 +49,10 @@ import {
   snapshotExportBundle,
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
+import {
+  captureBatchDecisionFacts,
+  evaluateBatchCheckVerdict,
+} from "../dist/extensions/grc-tools/batch-spec-builder.js";
 
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
@@ -470,6 +474,15 @@ function findingsById(result) {
   return new Map(result.findings.map((item) => [item.id, item]));
 }
 
+async function captureServicenowFacts(checkId, callback) {
+  const { result, captures } = await captureBatchDecisionFacts(callback);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].integration, SERVICENOW_SPEC.identity.slug);
+  const facts = captures[0].checks.get(checkId);
+  assert.ok(facts, `${checkId}: captured runtime facts`);
+  return { result, facts };
+}
+
 function assertNoPass(result, label) {
   const passing = result.findings.filter((item) => item.status === "pass").map((item) => item.id);
   assert.deepEqual(passing, [], `${label}: expected no passing findings but saw ${passing.join(", ")}`);
@@ -790,6 +803,32 @@ test("assessServicenowIdentityAccess passes a healthy identity fixture with fram
   assert.ok(byId.get("SNOW-07").mappings.includes("PCI-DSS 8.4.2"));
   assert.deepEqual(result.errors, []);
   assert.equal(result.summary.admin_users, 1);
+});
+
+test("SNOW-08 counts an active non-IdP integration TLS certificate across the unfiltered inventory", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_certificate.push({
+    sys_id: "cert-integration-tls",
+    name: "Payroll integration TLS client certificate",
+    type: "cert",
+    expires: "2026-10-01 00:00:00",
+    active: "true",
+  });
+  const { result, facts } = await captureServicenowFacts("SNOW-08", () => {
+    const { fetchImpl } = fixtureFetch(fixture);
+    return assessServicenowIdentityAccess(createClient(fetchImpl));
+  });
+  const finding = findingsById(result).get("SNOW-08");
+  assert.equal(facts.concern_count, 1, "captured runtime count includes the non-IdP certificate");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-08", facts), "warn");
+  assert.equal(finding.status, "warn");
+  assert.equal(
+    finding.summary,
+    "1 active SSO providers and 0 active LDAP servers are configured, but: 1 certificates expire within 30 days (Payroll integration TLS client certificate).",
+  );
+  const definition = SERVICENOW_SPEC.checks.find((check) => check.id === "SNOW-08").evidenceFieldDefinitions.concern_count;
+  assert.match(definition, /all records returned by the unfiltered `sys_certificate` inventory/);
+  assert.doesNotMatch(definition, /identity-provider certificate concerns/);
 });
 
 test("assessServicenowIdentityAccess fails weak identity controls and buckets users without login dates", async () => {
