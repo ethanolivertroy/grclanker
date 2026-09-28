@@ -21,7 +21,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import {
-  evaluateBatchCheckVerdict,
+  evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
@@ -1811,7 +1811,7 @@ interface VerdictInput {
 type PartialViewInput = Pick<VerdictInput, "total" | "deniedProjects" | "scannedProjects" | "apiDisabledProjects" | "truncated" | "unreachableScopes" | "unreadable">;
 
 function gcpVerdictStatus(checkId: string, facts: Readonly<Record<string, unknown>>): GcpFindingStatus {
-  const status = evaluateBatchCheckVerdict(GCP_SPEC, checkId, facts);
+  const status = evaluateBatchRuntimeCheckVerdict(GCP_SPEC, checkId, facts);
   switch (status) {
     case "pass":
     case "warn":

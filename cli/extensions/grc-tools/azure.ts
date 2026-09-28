@@ -20,7 +20,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import {
-  evaluateBatchCheckVerdict,
+  evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
@@ -1325,7 +1325,7 @@ function finding(
   evidence?: JsonRecord,
   decisionFacts?: Readonly<Record<string, unknown>>,
 ): AzureFinding {
-  const status = evaluateBatchCheckVerdict(AZURE_SPEC, id, decisionFacts ?? azureDecisionFacts(id, evidence)) as AzureFindingStatus;
+  const status = evaluateBatchRuntimeCheckVerdict(AZURE_SPEC, id, decisionFacts ?? azureDecisionFacts(id, evidence)) as AzureFindingStatus;
   return { id, title, severity, status, summary, control, evidence, mappings: frameworkMappings(control) };
 }
 
