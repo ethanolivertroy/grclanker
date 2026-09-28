@@ -68,7 +68,7 @@ function owner(area: "zia_policy" | "zia_access_control" | "zpa"): string {
 
 const checks = batch2Checks(rows.map(([title, severity, area], index) => {
   const control = index + 1;
-  const custom = control === 1
+  const custom: Partial<Batch2CheckRow> = control === 1
     ? {
         decisionInputs: {
           evidence_readable: "Boolean. True only when GET /urlFilteringRules returned a readable inventory.",

@@ -52,6 +52,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const STALE_GUEST_DAYS = 90;
 const LONG_LIVED_CREDENTIAL_DAYS = 730;
+const HIGH_PRIVILEGE_DELEGATED_SCOPE_SET = new Set<string>(HIGH_PRIVILEGE_DELEGATED_SCOPES);
 const SECURITY_DEFAULTS_ENDPOINT = "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy";
 const MESSAGE_RULES_ENDPOINT = "GET /v1.0/users/{id}/mailFolders/inbox/messageRules";
 const MAILBOX_RULES_PERMISSION = "MailboxSettings.Read (application)";
@@ -2746,7 +2747,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     const risky = grants.value.items.filter((grant) => {
       if (asLower(grant.consentType) !== "allprincipals") return false;
       const scopes = (asString(grant.scope) ?? "").toLowerCase().split(/\s+/);
-      return scopes.some((scope) => HIGH_PRIVILEGE_DELEGATED_SCOPES.includes(scope));
+      return scopes.some((scope) => HIGH_PRIVILEGE_DELEGATED_SCOPE_SET.has(scope));
     });
     const status: AzureFindingStatus = grants.value.items.length === 0 ? "manual" : risky.length > 0 ? "fail" : capForPartial("pass", grants.value);
     findings.push(finding("AZURE-ID-13", 22, "Tenant-wide delegated permission grants", "high", status,
