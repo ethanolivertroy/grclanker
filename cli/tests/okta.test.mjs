@@ -36,6 +36,7 @@ import {
   scrubErrorText,
 } from "../dist/extensions/grc-tools/okta.js";
 import { OKTA_SPEC } from "../dist/extensions/grc-tools/okta.spec.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   byteDifferentialEnabled,
@@ -58,6 +59,15 @@ function findingById(result, id) {
 
 function statusOf(result, id) {
   return findingById(result, id)?.status;
+}
+
+async function captureOktaFacts(checkId, callback) {
+  const { result, captures } = await captureBatchDecisionFacts(callback);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].integration, OKTA_SPEC.identity.slug);
+  const facts = captures[0].checks.get(checkId);
+  assert.ok(facts, `${checkId}: captured runtime facts`);
+  return { result, facts };
 }
 
 function createSampleConfig(overrides = {}) {
@@ -1199,6 +1209,70 @@ test("OKTA-AUTH-002 keeps the legacy Partial finding when only MFA enrollment po
     "1 ACTIVE rules across 1 ACTIVE admin or dashboard policies require MFA, and strong authenticators are active. Inventory truncated: MFA_ENROLL pagination cursor repeated after 1 item; total unknown",
   );
   assert.ok(finding.evidence.includes("Partial data: MFA_ENROLL pagination cursor repeated after 1 item; total unknown"));
+});
+
+test("portable completeness contracts match 103 runtime permission cases with truncation-only exceptions", async () => {
+  const onePolicyFamily = createSampleAuthenticationData();
+  onePolicyFamily.signOnPolicies = dataset([], "403 denied sign-on policies");
+  onePolicyFamily.signOnPolicyRules = dataset({}, "not collected after sign-on policy denial");
+  const readability = await captureOktaFacts("OKTA-AUTH-002", () =>
+    assessOktaAuthentication(onePolicyFamily, createSampleConfig()));
+  assert.equal(readability.facts.policy_inventory_readable, true);
+  assert.notEqual(findingById(readability.result, "OKTA-AUTH-002").status, "Manual");
+  assert.match(
+    OKTA_SPEC.checks.find((check) => check.id === "OKTA-AUTH-002").evidenceFieldDefinitions.policy_inventory_readable,
+    /at least one of the sign-on-policy or access-policy families is readable/,
+  );
+
+  const cases = [
+    ...Array.from({ length: 30 }, (_, index) => ({
+      id: "OKTA-AUTH-001",
+      source: "org-factors",
+      run: () => {
+        const data = createSampleAuthenticationData();
+        data.orgFactors = dataset([], `403 denied org factors case ${index}`);
+        return assessOktaAuthentication(data, createSampleConfig());
+      },
+    })),
+    ...Array.from({ length: 21 }, (_, index) => ({
+      id: "OKTA-AUTH-002",
+      source: "mfa-policies",
+      run: () => {
+        const data = createSampleAuthenticationData();
+        data.mfaPolicies = dataset([], `403 denied MFA policies case ${index}`);
+        return assessOktaAuthentication(data, createSampleConfig());
+      },
+    })),
+    ...Array.from({ length: 30 }, (_, index) => ({
+      id: "OKTA-AUTH-009",
+      source: "org-factors",
+      run: () => {
+        const data = createSampleAuthenticationData();
+        data.orgFactors = dataset([], `403 denied org factors case ${index}`);
+        return assessOktaAuthentication(data, createSampleConfig());
+      },
+    })),
+    ...Array.from({ length: 22 }, (_, index) => ({
+      id: "OKTA-INTEG-004",
+      source: "network-zones",
+      run: () => {
+        const data = createSampleIntegrationData();
+        data.networkZones = dataset([], `403 denied network zones case ${index}`);
+        return assessOktaIntegrations(data, createSampleConfig());
+      },
+    })),
+  ];
+  assert.equal(cases.length, 103);
+  for (const testCase of cases) {
+    const { result, facts } = await captureOktaFacts(testCase.id, testCase.run);
+    assert.equal(facts.complete, true, `${testCase.id} ${testCase.source}: runtime complete`);
+    const contract = OKTA_SPEC.checks.find((check) => check.id === testCase.id).completeness.complete;
+    const source = contract.sources.find((entry) => entry.surfaceId === testCase.source);
+    assert.ok(source, `${testCase.id}: ${testCase.source} is explicitly owned`);
+    assert.equal(source.falseWhen.includes("denied"), false, `${testCase.id}: denial does not change complete`);
+    assert.equal(source.falseWhen.includes("error"), false, `${testCase.id}: an error does not change complete`);
+    assert.equal(findingById(result, testCase.id).status, "Pass", `${testCase.id}: current-main outcome remains Pass`);
+  }
 });
 
 test("rule 2: empty inventories never pass by default and state fail or manual intent", () => {

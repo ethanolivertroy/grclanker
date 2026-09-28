@@ -8,6 +8,7 @@ import { inflateRawSync } from "node:zlib";
 import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import { SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -119,6 +120,15 @@ function byId(result, id) {
 
 function statuses(result) {
   return Object.fromEntries(result.findings.map((item) => [item.id, item.status]));
+}
+
+async function captureSlackFacts(checkId, callback) {
+  const { result, captures } = await captureBatchDecisionFacts(callback);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].integration, SLACK_SPEC.identity.slug);
+  const facts = captures[0].checks.get(checkId);
+  assert.ok(facts, `${checkId}: captured runtime facts`);
+  return { result, facts };
 }
 
 const deniedFixture = () => jsonResponse({ ok: false, error: "missing_scope" });
@@ -443,6 +453,42 @@ test("fixture (d): a compliant Enterprise Grid org passes every automatable cont
   assert.equal(new Set(all.map((item) => item.control)).size, SLACK_SPEC_CONTROLS.length);
   assert.ok(all.every((item) => item.mappings.length > 0));
   assert.ok(results.every((result) => result.errors.length === 0));
+});
+
+test("MFA and SSO population primitives count every active user, including non-administrators", async () => {
+  const identity = await captureSlackFacts("SLACK-ID-01", () => assessSlackIdentity(makeClient((request) => {
+    if (request.pathname === "/api/users.list") {
+      return {
+        ok: true,
+        members: compliantUsers.map((user) => user.id === "W2" ? { ...user, has_2fa: false } : user),
+        response_metadata: { next_cursor: "" },
+      };
+    }
+    return compliantFixture(request);
+  })));
+  assert.equal(identity.facts.active_user_count, 2);
+  assert.equal(identity.facts.without_mfa_count, 1);
+  assert.equal(byId(identity.result, "SLACK-ID-01").status, "fail");
+  const mfaDefinition = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ID-01").evidenceFieldDefinitions.without_mfa_count;
+  assert.match(mfaDefinition, /active human users with MFA disabled/);
+  assert.doesNotMatch(mfaDefinition, /administrators with MFA disabled/);
+
+  const admin = await captureSlackFacts("SLACK-ADMIN-02", () => assessSlackAdminAccess(makeClient((request) => {
+    if (request.pathname === "/api/admin.users.list") {
+      const response = compliantFixture(request);
+      return {
+        ...response,
+        users: response.users.map((user) => user.id === "W2" ? { ...user, has_sso: false } : user),
+      };
+    }
+    return compliantFixture(request);
+  })));
+  assert.equal(admin.facts.active_user_count, 2);
+  assert.equal(admin.facts.without_sso_count, 1);
+  assert.equal(byId(admin.result, "SLACK-ADMIN-02").status, "fail");
+  const ssoDefinition = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ADMIN-02").evidenceFieldDefinitions.without_sso_count;
+  assert.match(ssoDefinition, /active organization users with SSO disabled/);
+  assert.doesNotMatch(ssoDefinition, /administrators with SSO disabled/);
 });
 
 test("verdict rules: failing evidence, undated entries, and stale audit logs are graded correctly", async () => {

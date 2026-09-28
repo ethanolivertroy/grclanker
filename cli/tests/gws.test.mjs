@@ -40,6 +40,7 @@ import {
   runGwsAccessCheck,
 } from "../dist/extensions/grc-tools/gws.js";
 import { GWS_SPEC } from "../dist/extensions/grc-tools/gws.spec.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import {
   byteDifferentialEnabled,
@@ -59,6 +60,15 @@ function createTempBase(prefix) {
 
 function dataset(data, error) {
   return error ? { data, error } : { data };
+}
+
+async function captureGwsFacts(checkId, callback) {
+  const { result, captures } = await captureBatchDecisionFacts(callback);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].integration, GWS_SPEC.identity.slug);
+  const facts = captures[0].checks.get(checkId);
+  assert.ok(facts, `${checkId}: captured runtime facts`);
+  return { result, facts };
 }
 
 function jsonResponse(body, status = 200) {
@@ -839,6 +849,48 @@ test("GWS-INTEG-001 keeps the legacy Partial finding when readable users yield n
   assert.equal(finding.status, "Partial");
   assert.equal(finding.summary, "Third-party token inventory was only partially readable.");
   assert.ok(finding.evidence.includes("Per-user token reads that failed: 1"));
+});
+
+test("portable completeness contracts match the four truncation-only directory permission cases", async () => {
+  const cases = [
+    ["users", "403"],
+    ["users", "500"],
+    ["roles", "403"],
+    ["roles", "500"],
+  ];
+  for (const [sourceName, failureKind] of cases) {
+    const { result, facts } = await captureGwsFacts("GWS-ADMIN-005", async () => {
+      const collected = await collectGwsAuditData(createFakeCollector(denyOverrides(sourceName, failureKind)));
+      return assessGwsAdminAccess(collected.adminAccess, createSampleConfig());
+    });
+    assert.equal(facts.complete, true, `${sourceName}/${failureKind}: runtime complete ignores read failure`);
+    const surfaceId = sourceName === "users" ? "directory-users" : "roles";
+    const contract = GWS_SPEC.checks.find((check) => check.id === "GWS-ADMIN-005").completeness.complete;
+    const source = contract.sources.find((entry) => entry.surfaceId === surfaceId);
+    assert.ok(source);
+    assert.deepEqual(source.falseWhen, ["truncated"]);
+    assert.equal(findingById(result, "GWS-ADMIN-005").status, "Manual");
+  }
+});
+
+test("GWS-MON-002 primitive facts and contract both use login activity reports, never Alert Center alerts", async () => {
+  const { result, facts } = await captureGwsFacts("GWS-MON-002", () => assessGwsMonitoring({
+    loginActivities: dataset([], "403 Forbidden: login activity report"),
+    adminActivities: dataset(createAdminActivities()),
+    tokenActivities: dataset(createTokenActivities()),
+    alerts: dataset(createAlerts()),
+  }, createSampleConfig()));
+  assert.equal(facts.readable, false);
+  assert.equal(facts.complete, false);
+  assert.equal(facts.event_count, 0);
+  assert.equal(findingById(result, "GWS-MON-002").status, "Manual");
+  const check = GWS_SPEC.checks.find((entry) => entry.id === "GWS-MON-002");
+  assert.deepEqual(check.sourceSurfaceIds, ["login-activities"]);
+  assert.deepEqual(check.completeness.complete.sources.map((source) => source.surfaceId), ["login-activities"]);
+  for (const name of ["readable", "complete", "event_count", "suspicious_login_count"]) {
+    assert.match(check.evidenceFieldDefinitions[name], /login-activities/);
+    assert.doesNotMatch(check.evidenceFieldDefinitions[name], /Alert Center API/);
+  }
 });
 
 test("verdict rule 2 (by intent): an empty sub-population inside a non-empty inventory may pass and says so", () => {
