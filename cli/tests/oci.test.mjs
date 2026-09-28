@@ -543,6 +543,49 @@ test("Cloud Guard collection wrappers preserve compliant empty problems and bare
   assert.deepEqual(await real.listCloudGuardProblems(), []);
 });
 
+test("OCI-LOG-02 withholds a clean pass when the target list command fails", async () => {
+  const client = compliantClient();
+  client.listCloudGuardTargets = async () => {
+    throw DENIED_ERROR;
+  };
+
+  const result = await assessOciLoggingDetection(client);
+  const problems = byId(result, "OCI-LOG-02");
+  assert.equal(problems.status, "manual");
+  assert.match(problems.summary, /cloud-guard target list failed/);
+  assert.match(problems.summary, /empty result from oci cloud-guard problem list is not evidence/);
+  assert.match(problems.evidence.targets.status, /^unreadable: cloud-guard target list failed/);
+  assert.notEqual(problems.status, "pass");
+
+  client.listCloudGuardProblems = async () => [
+    { id: "critical-without-target-read", lifecycleDetail: "OPEN", lifecycleState: "ACTIVE", riskLevel: "CRITICAL" },
+  ];
+  const critical = byId(await assessOciLoggingDetection(client), "OCI-LOG-02");
+  assert.equal(critical.status, "fail");
+  assert.match(critical.summary, /CRITICAL or HIGH/);
+});
+
+test("OCI-LOG-02 withholds a clean pass when a valid target collection has no ACTIVE targets", async () => {
+  const responder = {
+    id: "responder-no-target",
+    lifecycleState: "ACTIVE",
+    responderRules: [{ id: "rule-no-target", details: { isEnabled: true } }],
+  };
+  const { client } = cloudGuardCollectionClient({
+    targets: { items: [] },
+    problems: { items: [] },
+    responders: { items: [responder] },
+  });
+
+  const result = await assessOciLoggingDetection(client);
+  const problems = byId(result, "OCI-LOG-02");
+  assert.equal(problems.status, "manual");
+  assert.match(problems.summary, /target list returned no ACTIVE targets/);
+  assert.match(problems.evidence.targets.status, /^complete: cloud-guard target list returned 0 targets \(0 ACTIVE\)$/);
+  assert.match(problems.evidence.problems.status, /^complete: cloud-guard problem list returned 0 problems \(0 OPEN\)$/);
+  assert.notEqual(problems.status, "pass");
+});
+
 test("Cloud Guard collection wrappers without items fail closed as unreadable", async () => {
   const malformedCanary = "CANARY-CLOUD-GUARD-COLLECTION-7f3a9c1d";
   const rows = [
@@ -583,6 +626,12 @@ test("Cloud Guard collection wrappers without items fail closed as unreadable", 
     assert.equal(finding.status, "manual", `${row.method}: ${finding.summary}`);
     assert.match(finding.summary, new RegExp(row.command));
     assert.ok(result.errors.some((error) => error.includes("neither a bare array nor an object with an items array")));
+    if (row.method === "listCloudGuardTargets") {
+      const problems = byId(result, "OCI-LOG-02");
+      assert.equal(problems.status, "manual");
+      assert.match(problems.summary, /cloud-guard target list failed/);
+      assert.notEqual(problems.status, "pass");
+    }
     assert.doesNotMatch(JSON.stringify(result), new RegExp(malformedCanary));
   }
 });
@@ -1089,7 +1138,7 @@ const INVENTORY_SWEEP = [
   { method: "getAuditConfiguration", command: "audit config get", dependents: ["OCI-LOG-06"] },
   { method: "listAuditEvents", command: "audit event list", dependents: ["OCI-LOG-04"] },
   { method: "getCloudGuardConfiguration", command: "cloud-guard configuration get", dependents: ["OCI-LOG-01", "OCI-LOG-02", "OCI-LOG-03"] },
-  { method: "listCloudGuardTargets", command: "cloud-guard target list", dependents: ["OCI-LOG-01"] },
+  { method: "listCloudGuardTargets", command: "cloud-guard target list", dependents: ["OCI-LOG-01", "OCI-LOG-02"] },
   { method: "listCloudGuardProblems", command: "cloud-guard problem list", dependents: ["OCI-LOG-02"] },
   { method: "listResponderRecipes", command: "cloud-guard responder-recipe list", dependents: ["OCI-LOG-03"] },
   { method: "listEventRules", command: "events rule list", dependents: ["OCI-LOG-05"], compartmentArg: 0 },

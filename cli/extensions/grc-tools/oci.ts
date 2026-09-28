@@ -2410,6 +2410,12 @@ export async function assessOciLoggingDetection(
   } else if (!cloudGuardEnabled) {
     problemStatus = "manual";
     problemSummary = `Manual: Cloud Guard configuration status is ${cloudGuardStatus || "missing"}, not ENABLED, so the empty result from oci cloud-guard problem list is not evidence; enable Cloud Guard or review problems after enablement.`;
+  } else if (!targets.ok) {
+    problemStatus = "manual";
+    problemSummary = `Manual: oci cloud-guard target list failed (${targets.error}), so the empty result from oci cloud-guard problem list is not evidence; confirm active target coverage and review open problems in the console.`;
+  } else if (activeTargets.length === 0) {
+    problemStatus = "manual";
+    problemSummary = "Manual: oci cloud-guard target list returned no ACTIVE targets, so the empty result from oci cloud-guard problem list does not confirm a monitored tenancy; configure target coverage and review open problems in the console.";
   } else {
     problemStatus = "pass";
     problemSummary = "No OPEN Cloud Guard problems were returned while Cloud Guard is ENABLED with active targets (emptiness is compliant here).";
@@ -2520,6 +2526,7 @@ export async function assessOciLoggingDetection(
       ["FedRAMP SI-4(5)", "CMMC L2 3.14.7", "SOC 2 CC7.3", "CIS OCI 3.2", "PCI-DSS 11.5.1.1", "STIG SRG-APP-000516", "IRAP ISM-0123", "ISMAP SO-02"],
       {
         problems: readEvidence("cloud-guard problem list", problemsRead, { open_problems: openProblems.length, high_risk_problems: highRiskProblems.length }),
+        targets: readEvidence("cloud-guard target list", targetsRead, { active_targets: activeTargets.length, total_targets: targets.items.length }),
         cloud_guard_configuration: cloudGuardEvidence,
       },
     ),
