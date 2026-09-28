@@ -3,7 +3,7 @@ title: Flue Runtime
 description: Run all 241 grclanker domain tools under the Flue Framework.
 ---
 
-grclanker ships as a Pi-based CLI. The same GRC agent can also run as a [Flue Framework](https://flueframework.com/) agent. Flue is itself built on Pi, so the full 241-tool domain registry and the shipped prompts carry over without changing what they do. Separately, each of the 35 integrations has a repository spec under `/specs`; those files are documentation and build inputs, not runtime registry entries.
+grclanker ships as a Pi-based CLI. The same GRC agent can also run as a [Flue Framework](https://flueframework.com/) agent. Flue is itself built on Pi, so the full 241-tool domain registry and the shipped prompts carry over without changing what they do.
 
 ## What the adapter maps
 
@@ -24,11 +24,19 @@ Pi tool results map onto Flue's result envelope: text content becomes the tool o
 
 ## Run with the bundled runner
 
-The runner uses Flue's documented `start()` and `init()` APIs from `@flue/runtime`, which is a dependency of `@grclanker/cli`. No additional install is needed.
+The runner uses Flue's documented `start()` and `init()` APIs from `@flue/runtime`, which is a dependency of the CLI package, so no separate Flue install is needed.
 
 ```bash
 export ANTHROPIC_API_KEY=...
 grclanker flue run --message "Is BoringCrypto FIPS validated?"
+```
+
+`grclanker flue --help` prints the options and environment variables. The `v0.0.1` release bundle predates the Flue adapter and answers `Unknown command: flue`; until a newer bundle ships, run it from a source checkout with Node.js 22.19 or newer:
+
+```bash
+npm --prefix cli ci
+npm --prefix cli run build
+node cli/bin/grclanker.js flue run --message "Is BoringCrypto FIPS validated?"
 ```
 
 Continue a conversation by reusing an id, or ask for a JSON envelope:

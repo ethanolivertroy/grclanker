@@ -7,6 +7,8 @@ grclanker separates model choice from execution environment on purpose.
 
 That part is similar to how Feynman presents model/provider setup separately from compute choices. The difference is that grclanker does not stop at a badge. Use `env doctor` and `env smoke-test` to verify the selected backend can actually execute the tool surface you expect.
 
+This page describes the CLI on `main`. The `v0.0.1` release bundle ships only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`, plus `env doctor`, `env smoke-test`, and `env exec`; `env list`, `setup --compute`, per-run `--compute`, compute profiles, and the Modal and RunPod backends need a source checkout (`npm --prefix cli ci && npm --prefix cli run build`, then `node cli/bin/grclanker.js env list`).
+
 ## What a compute backend controls
 
 The compute backend is where tool execution happens.
@@ -36,7 +38,7 @@ Model/provider settings still decide which LLM answers questions. Compute backen
 | `vercel-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
 | `cloudflare-sandbox` | sandboxed | stub | fails fast | no | no | no | no |
 
-`grclanker env list` prints the same matrix for your machine, including which backends are detected right now.
+`grclanker env list` lists every kind with its bucket, its readiness on this machine right now, and a one-line detail; the state, snapshot, GPU, and staging columns above are reference only and are not part of its output.
 
 ### Session lifecycle and teardown
 
@@ -115,7 +117,7 @@ grclanker audit --compute modal
 grclanker env smoke-test --compute runpod-serverless
 ```
 
-`setup --compute <kind>` saves the kind (and its default `computeProfile`) without running the interactive wizard. `investigate --compute` and `audit --compute` override the saved backend for that run only; grclanker passes the override to the in-process Pi extension through `GRCLANKER_COMPUTE_BACKEND_OVERRIDE`. `--compute` is also accepted as an alias for `--backend` on `env exec` and `env smoke-test`.
+`setup --compute <kind>` saves the kind (and its default `computeProfile`) without running the interactive wizard, and refuses the `vercel-sandbox` and `cloudflare-sandbox` stubs. `--compute <kind>` on `investigate`, `audit`, `assess`, or `validate` overrides the saved backend for that run only; grclanker passes the override to the in-process Pi extension through `GRCLANKER_COMPUTE_BACKEND_OVERRIDE`. `--compute` is also accepted as an alias for `--backend` on `env exec` and `env smoke-test`.
 
 Useful targeted checks:
 
@@ -179,13 +181,13 @@ Use it when:
 - you trust the current repo and commands
 - you are still setting up the rest of the environment
 
-Select it in setup:
+Select it without the wizard:
 
 ```bash
-grclanker setup
+grclanker setup --compute host
 ```
 
-Then choose `host` when prompted for the compute backend.
+Or run `grclanker setup`, answer yes to the advanced compute backend prompt, and choose `host`.
 
 ## sandbox-runtime
 
@@ -194,7 +196,7 @@ Use this when you want local execution, but you want filesystem and network poli
 The config merge order is:
 
 - global: `~/.grclanker/sandbox.json`
-- project: `<repo>/.grclanker/sandbox.json`
+- project: `.grclanker/sandbox.json` in the directory you launch grclanker from (usually the repo root)
 
 Project config is the right place for repo-specific rules.
 
@@ -446,8 +448,8 @@ Use `runpod-pod` when you want a persistent remote workstation with SSH that you
 - If `env smoke-test --backend docker` fails immediately, check the image name and confirm the image can run `bash`.
 - If Parallels fails before sandbox creation, confirm either `parallelsTemplateName` exists in `prlctl list -a -t` or `parallelsBaseVmName` points at a stopped VM, and confirm `parallelsAutoStart` is `true`.
 - If Parallels fails after the sandbox starts, confirm the template/base image has Parallels Tools plus `prlctl exec` guest access working, and set `parallelsWorkspacePath` if your guest does not mount shared folders at one of the common auto-detected paths.
-- If `sandbox-runtime` blocks something unexpectedly, inspect both `~/.grclanker/sandbox.json` and `<repo>/.grclanker/sandbox.json`.
-- If you want to switch back to a simpler path, rerun `grclanker setup` and choose `host`.
+- If `sandbox-runtime` blocks something unexpectedly, inspect both `~/.grclanker/sandbox.json` and `.grclanker/sandbox.json` in the directory you launched from (`env doctor` prints both paths as `sandbox.global` and `sandbox.project`).
+- If you want to switch back to a simpler path, run `grclanker setup --compute host`.
 
 ## Recommended operator flow
 

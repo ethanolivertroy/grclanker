@@ -3,7 +3,7 @@ title: Validate
 description: Answer a narrow FIPS validation question cleanly and directly.
 ---
 
-`/validate` is the narrow rail for “is this module validated or not?” style questions.
+`/validate` is the narrow rail for "is this module validated or not?" questions. It loads the shipped `cli/prompts/validate.md` prompt.
 
 ## Use it for
 
@@ -11,18 +11,30 @@ description: Answer a narrow FIPS validation question cleanly and directly.
 - module-level validation checks
 - quick answers that still need evidence
 
-## Examples
+## Start it
+
+Inside a grclanker session, send `/validate` on its own, then name the vendor, product, library, or appliance in your next message:
 
 ```text
-/validate BoringCrypto
-/validate whether this module is active, historical, in process, or absent
+/validate
+BoringCrypto
 ```
+
+From the shell, `grclanker validate` opens a session that starts with the same prompt. Text typed after `/validate` on the same line is dropped in this release because the shipped prompt has no argument placeholder, so put the subject in its own message.
+
+## What the prompt does
+
+1. Active validation: `cmvp_search_modules`, then `cmvp_get_module` for promising certificate numbers.
+2. Historical and drift check: `cmvp_search_historical` and `cmvp_search_in_process`, to decide whether the subject is actively validated, previously validated but expired, in process, or not found.
+3. Compliance interpretation against SC-13 and SC-12, including the precise implication when validation is missing.
 
 ## Output shape
 
-The ideal answer is short and exact:
+The answer should be short and exact:
 
-- certificate number if one exists
-- standard generation when known
-- status
-- the caveat that the exact tested configuration still matters
+- the validation status in one sentence
+- evidence: certificate IDs and URLs, with module name, vendor, FIPS standard, overall level, validation date, and sunset date
+- the compliance impact
+- the recommended next step
+
+The prompt forbids claiming a module is FIPS validated unless the certificate record was found.

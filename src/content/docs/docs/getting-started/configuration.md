@@ -9,7 +9,7 @@ grclanker keeps its runtime state under:
 ~/.grclanker/agent
 ```
 
-That directory is where settings, local model definitions, themes, bundled agents, and session state live.
+That directory is where settings, local model definitions, stored provider credentials (`auth.json`), themes, bundled agents, and session state live. Set `GRCLANKER_HOME` to move it (see [Environment variables](#environment-variables)).
 
 ## settings.json
 
@@ -36,7 +36,7 @@ Local-first setup adds these important fields:
 }
 ```
 
-Hosted setup writes the same `defaultProvider` and `defaultModel` pair, but switches `modelMode` to `hosted`.
+Hosted setup writes the same `defaultProvider` and `defaultModel` pair, sets `providerKind` to the hosted provider, switches `modelMode` to `hosted`, and removes `providerBaseUrl`.
 
 `skillDiscoveryMode` controls whether grclanker stays limited to its bundled GRC skills or also allows Pi-style project skill discovery from `.agents/skills` and related paths. The recommended default is `bundled-only`.
 
@@ -83,7 +83,7 @@ Example local configuration:
       "models": [
         {
           "id": "gemma4",
-          "name": "Gemma 4 (Local)",
+          "name": "gemma4 (Local)",
           "reasoning": false,
           "input": ["text"]
         }
@@ -114,3 +114,23 @@ grclanker setup
 That is the supported way to move between local-first and hosted mode in the current experimental release.
 
 If you need details on backend-specific fields or validation, use [Compute Backends](/docs/getting-started/compute-backends/).
+
+## Environment variables
+
+These are the `GRCLANKER_*` variables grclanker reads:
+
+| Variable | Effect |
+| --- | --- |
+| `GRCLANKER_HOME` | Base directory for runtime state instead of your home directory. grclanker uses `$GRCLANKER_HOME/.grclanker`, or the path itself when it already ends in `.grclanker`, and refuses any path inside a `.pi` directory. |
+| `GRCLANKER_FLUE_MODEL` | `provider/model` for `grclanker flue run`. See [Flue Runtime](/docs/getting-started/flue-runtime/#configuration). |
+| `GRCLANKER_FLUE_SANDBOX` | `local` (default) or `none` for `grclanker flue run`. |
+| `GRCLANKER_AGENT_SDK_MODEL` | Cursor model id for the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) project. |
+| `GRCLANKER_TRESTLE_BIN` | Path to the `trestle` executable for the `oscal_*` tools (`TRESTLE_BIN` also works). |
+| `GRCLANKER_GWS_BIN` | Path to the `gws` executable for the `gws_ops_*` tools. |
+| `GRCLANKER_LIVE_BACKENDS` | Comma-separated backend kinds that `npm --prefix cli run test:compute-backends:live` should exercise. |
+| `GRCLANKER_VERSION` | Build-only. Version stamped on release bundles built with `npm --prefix cli run build:bundle` (default: the `cli/package.json` version). |
+| `GRCLANKER_NODE_VERSION` | Build-only. Node.js version that `npm --prefix cli run build:bundle` packages (default `22.20.0`). |
+
+grclanker sets `GRCLANKER_CODING_AGENT_DIR` and `GRCLANKER_COMPUTE_BACKEND` itself when it launches the embedded Pi runtime, and `GRCLANKER_COMPUTE_BACKEND_OVERRIDE` when you pass `--compute <kind>`. Leave them unset; use `grclanker setup` or a per-run `--compute <kind>` instead.
+
+Provider and integration credentials use each vendor's own variable names (for example `ANTHROPIC_API_KEY`, `RUNPOD_API_KEY`, `MODAL_TOKEN_ID`); the integration and compute backend guides list them.
