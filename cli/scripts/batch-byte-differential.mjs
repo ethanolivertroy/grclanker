@@ -279,6 +279,46 @@ function filesUnder(root, relativePath = "") {
   }).sort();
 }
 
+function describeJsonlMismatches(expected, actual, limit = 25) {
+  let expectedStart = 0;
+  let actualStart = 0;
+  let mismatchCount = 0;
+  const descriptions = [];
+  while (expectedStart < expected.length || actualStart < actual.length) {
+    const expectedNewline = expected.indexOf(0x0a, expectedStart);
+    const actualNewline = actual.indexOf(0x0a, actualStart);
+    const expectedEnd = expectedNewline === -1 ? expected.length : expectedNewline;
+    const actualEnd = actualNewline === -1 ? actual.length : actualNewline;
+    const expectedLine = expected.subarray(expectedStart, expectedEnd);
+    const actualLine = actual.subarray(actualStart, actualEnd);
+    if (!expectedLine.equals(actualLine)) {
+      mismatchCount += 1;
+      if (descriptions.length < limit) {
+        try {
+          const expectedRecord = JSON.parse(expectedLine.toString("utf8"));
+          const actualRecord = JSON.parse(actualLine.toString("utf8"));
+          const expectedStatuses = new Map((expectedRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const actualStatuses = new Map((actualRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const statusChanges = [...new Set([...expectedStatuses.keys(), ...actualStatuses.keys()])]
+            .filter((id) => expectedStatuses.get(id) !== actualStatuses.get(id))
+            .map((id) => `${id}:${expectedStatuses.get(id) ?? "<missing>"}->${actualStatuses.get(id) ?? "<missing>"}`);
+          descriptions.push(
+            `${expectedRecord.name ?? actualRecord.name ?? "<unnamed>"}`
+            + (statusChanges.length > 0 ? ` [${statusChanges.join(", ")}]` : " [serialized evidence differs]"),
+          );
+        } catch {
+          descriptions.push("<unparseable record>");
+        }
+      }
+    }
+    expectedStart = expectedEnd + (expectedNewline === -1 ? 0 : 1);
+    actualStart = actualEnd + (actualNewline === -1 ? 0 : 1);
+  }
+  return mismatchCount === 0
+    ? ""
+    : `\n${mismatchCount} JSONL records differ; first ${descriptions.length}: ${descriptions.join("; ")}`;
+}
+
 function compareTrees(expectedRoot, actualRoot, label) {
   const expectedPaths = filesUnder(expectedRoot);
   const actualPaths = filesUnder(actualRoot);
@@ -307,6 +347,7 @@ function compareTrees(expectedRoot, actualRoot, label) {
       }
       throw new Error(
         `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset}${recordName})`
+        + (path.endsWith(".jsonl") ? describeJsonlMismatches(expected, actual) : "")
         + `\nmain context: ${JSON.stringify(mainContext)}`
         + `\nbranch context: ${JSON.stringify(branchContext)}`,
       );
