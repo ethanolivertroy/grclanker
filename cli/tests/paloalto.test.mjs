@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createServer } from "node:http";
@@ -1157,6 +1157,36 @@ test("exportPaloaltoAuditBundle writes core_data, analysis, compliance reports, 
   assert.equal(basename(clean.zipPath), `${basename(clean.outputDir)}.zip`);
   assert.notEqual(clean.zipPath, result.zipPath);
   assert.ok(existsSync(result.zipPath) && existsSync(clean.zipPath));
+});
+
+test("exportPaloaltoAuditBundle preserves an orphaned zip and allocates a distinct rerun path", async () => {
+  const base = createTempBase("grclanker-paloalto-orphaned-zip-");
+  const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch());
+  const first = await exportPaloaltoAuditBundle(clients, base);
+  const originalZip = readFileSync(first.zipPath);
+
+  rmSync(first.outputDir, { recursive: true });
+  const rerun = await exportPaloaltoAuditBundle(clients, base);
+
+  assert.deepEqual(readFileSync(first.zipPath), originalZip, "the retained archive must not be overwritten");
+  assert.notEqual(rerun.outputDir, first.outputDir);
+  assert.notEqual(rerun.zipPath, first.zipPath);
+  assert.equal(basename(rerun.zipPath), `${basename(rerun.outputDir)}.zip`);
+});
+
+test("exportPaloaltoAuditBundle treats a dangling zip symlink as an occupied bundle name", async () => {
+  const base = createTempBase("grclanker-paloalto-dangling-zip-");
+  const clients = createPaloaltoClients(bothProductsConfig(), mockedFetch());
+  const first = await exportPaloaltoAuditBundle(clients, base);
+
+  rmSync(first.outputDir, { recursive: true });
+  rmSync(first.zipPath);
+  symlinkSync(join(base, "missing-archive-target.zip"), first.zipPath);
+  const rerun = await exportPaloaltoAuditBundle(clients, base);
+
+  assert.notEqual(rerun.outputDir, first.outputDir);
+  assert.notEqual(rerun.zipPath, first.zipPath);
+  assert.equal(basename(rerun.zipPath), `${basename(rerun.outputDir)}.zip`);
 });
 
 test("redactXmlCredentials collapses credential-bearing PAN-OS nodes and leaves settings and the source tree intact", () => {
