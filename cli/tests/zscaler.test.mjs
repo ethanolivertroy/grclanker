@@ -32,6 +32,12 @@ import {
   resolveZscalerConfiguration,
 } from "../dist/extensions/grc-tools/zscaler.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00Z");
 
@@ -2499,4 +2505,68 @@ test("ZpaApiClient pages a bare array until a short page and reports a repeating
   }
   assert.ok(result.truncated.some((note) => /^segmentGroup: only 2 pages were read and the total is unknown/.test(note)), result.truncated.join("\n"));
   assert.ok(result.truncated.some((note) => /^idp: only 2 pages were read and the total is unknown/.test(note)), result.truncated.join("\n"));
+});
+
+test("byte differential fixtures: Zscaler assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = (accessData, policyData, zpaData) => ({
+    access: assessZiaAccessControlData(accessData),
+    policy: assessZiaPolicyData(policyData),
+    zpa: assessZpaData(zpaData),
+  });
+  const representative = () => assess(accessControlFixture(), policyFixture(), zpaFixture());
+  writeByteDifferentialFixture("zscaler", "representative", representative());
+
+  const deniedAccess = accessControlFixture();
+  for (const key of Object.keys(deniedAccess)) {
+    deniedAccess[key] = forbidden(Array.isArray(deniedAccess[key].data) ? [] : {});
+  }
+  const deniedPolicy = policyFixture();
+  for (const key of Object.keys(deniedPolicy)) {
+    deniedPolicy[key] = forbidden(Array.isArray(deniedPolicy[key].data) ? [] : {});
+  }
+  const deniedZpa = zpaFixture();
+  for (const key of Object.keys(deniedZpa)) {
+    if (key !== "now") deniedZpa[key] = forbidden([]);
+  }
+  writeByteDifferentialFixture("zscaler", "denied", assess(deniedAccess, deniedPolicy, deniedZpa));
+
+  writeByteDifferentialFixture("zscaler", "missing-null", {
+    access: await assessZiaAccessControl(undefined),
+    policy: await assessZiaPolicy(undefined),
+    zpa: await assessZpa(undefined),
+  });
+
+  const partialAccess = accessControlFixture();
+  partialAccess.adminUsers = { ...partialAccess.adminUsers, truncated: true, seen: 3, total: 4 };
+  const partialPolicy = policyFixture();
+  partialPolicy.locations = { ...partialPolicy.locations, truncated: true, seen: 1, total: 2 };
+  const partialZpa = zpaFixture();
+  partialZpa.applicationSegments = { ...partialZpa.applicationSegments, truncated: true, seen: 1, total: 2 };
+  writeByteDifferentialFixture("zscaler", "partial", assess(partialAccess, partialPolicy, partialZpa));
+  writeByteDifferentialFixture("zscaler", "compliant", representative());
+  writeByteDifferentialFixture("zscaler", "boundary", {
+    superAdministrators: [0, 1, 2].map((maxSuperAdmins) => (
+      assessZiaAccessControlData(accessControlFixture(), { maxSuperAdmins })
+    )),
+  });
+
+  const ziaStub = ziaTenantFetch(ziaCompliantTenant());
+  const zpaStub = zpaTenantFetch(zpaCompliantTenant());
+  const config = {
+    zia: ziaConfig(),
+    zpa: zpaConfig(),
+    oneApiDetected: false,
+    zdxDetected: false,
+    timeoutMs: 30000,
+    maxRetries: 0,
+    sourceChain: [],
+  };
+  const clients = {
+    config,
+    zia: new ZiaApiClient(config.zia, { fetchImpl: ziaStub.fetchImpl, maxRetries: 0, now: () => NOW }),
+    zpa: new ZpaApiClient(config.zpa, { fetchImpl: zpaStub.fetchImpl, maxRetries: 0, now: () => NOW }),
+  };
+  const exportRoot = prepareByteDifferentialExportRoot("zscaler");
+  const exported = await exportZscalerAuditBundle(clients, { outputDir: exportRoot });
+  writeByteDifferentialFixture("zscaler", "export", snapshotExportBundle(exported));
 });

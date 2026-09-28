@@ -38,6 +38,12 @@ import {
   resolveSecureOutputPath,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/gcp.js";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 
@@ -2842,4 +2848,40 @@ test("silent-success class: a 200 with an HTML, empty, or whitespace body on eve
   }
   assert.equal(walked, INVENTORY_SURFACES.length * Object.keys(SILENT_SUCCESS_SHAPES).length);
   assert.ok(markers > 0 && verdicts.manual > 0, `the walk visited ${markers} markers and ${verdicts.manual} manual plus ${verdicts.warn} warn verdicts, so the assertions are not vacuous`);
+});
+
+test("byte differential fixtures: GCP assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const compliantClient = createClient(async (url, init) => jsonResponse(routeCompliant(url, init)));
+  writeByteDifferentialFixture("gcp", "representative", await runAllAssessments(compliantClient, { maxProjects: 5 }));
+  writeByteDifferentialFixture("gcp", "denied", await runAllAssessments(createClient(async () => forbidden()), { maxProjects: 5 }));
+  writeByteDifferentialFixture("gcp", "missing-null", await runAllAssessments(createClient(async () => jsonResponse(null)), { maxProjects: 5 }));
+
+  const partialClient = createClient(async (url, init) => (
+    new URL(url).hostname === "dns.googleapis.com"
+      ? forbidden()
+      : jsonResponse(routeCompliant(url, init))
+  ));
+  writeByteDifferentialFixture("gcp", "partial", await runAllAssessments(partialClient, { maxProjects: 5 }));
+  writeByteDifferentialFixture("gcp", "compliant", await runAllAssessments(compliantClient, { maxProjects: 5 }));
+
+  const keysAt = async (count) => {
+    const data = {
+      ...COMPLIANT,
+      keys: {
+        keys: Array.from({ length: count }, (_, index) => ({
+          name: `projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/${index}`,
+          keyType: "USER_MANAGED",
+          validAfterTime: "2026-09-20T00:00:00Z",
+        })),
+      },
+    };
+    return assessGcpIdentity(createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data))), { maxProjects: 5, maxKeys: 1 });
+  };
+  writeByteDifferentialFixture("gcp", "boundary", {
+    serviceAccountKeys: await Promise.all([0, 1, 2].map(keysAt)),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("gcp");
+  const exported = await exportGcpAuditBundle(compliantClient, sampleConfig(), exportRoot, { max_projects: 5 });
+  writeByteDifferentialFixture("gcp", "export", snapshotExportBundle(exported));
 });

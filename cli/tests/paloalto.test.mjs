@@ -56,6 +56,12 @@ import {
 } from "../dist/extensions/grc-tools/paloalto.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const noSleep = async () => {};
 
@@ -4549,4 +4555,50 @@ test("review fix 5: PA-SW-01 maps to control 23 and the unified matrix has exact
   const supplementaryRows = controlColumn(supplementarySection);
   assert.deepEqual(supplementaryRows.map((cells) => cells[1]).sort(), ["PA-HA-01", "PA-SW-01"]);
   assert.ok(supplementaryRows.every((cells) => cells[2] === "23"));
+});
+
+test("byte differential fixtures: Palo Alto assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture(
+    "paloalto",
+    "representative",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch())),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "denied",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ denyAll: true }))),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "missing-null",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch({ emptyAll: true }))),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "partial",
+    await runAllAssessments(createPaloaltoClients(twoDeviceConfig(), mockedFetch({ partial: true }))),
+  );
+  writeByteDifferentialFixture(
+    "paloalto",
+    "compliant",
+    await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch())),
+  );
+
+  const boundarySnapshot = prismaSnapshot();
+  boundarySnapshot.posture = {
+    summary: { passedResources: 80, failedResources: 20, totalResources: 100 },
+    complianceDetails: [{ name: "CIS v1.4", passedResources: 80, failedResources: 20 }],
+  };
+  writeByteDifferentialFixture("paloalto", "boundary", {
+    complianceRate: [79, 80, 81].map((minCompliancePassRate) => (
+      assessPrismaCloudPosture(boundarySnapshot, { minCompliancePassRate })
+    )),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("paloalto");
+  const exported = await exportPaloaltoAuditBundle(
+    createPaloaltoClients(bothProductsConfig(), mockedFetch()),
+    exportRoot,
+  );
+  writeByteDifferentialFixture("paloalto", "export", snapshotExportBundle(exported));
 });

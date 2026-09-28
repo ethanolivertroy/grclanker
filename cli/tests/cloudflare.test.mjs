@@ -78,6 +78,12 @@ import {
   assertMustRedactRowsBesideMustKeep,
   withPlantedRoutes,
 } from "./helpers/redaction-table.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -2093,4 +2099,26 @@ test("rule 9 server-assigned 32-hex ids (round 4 open ruling): a real Cloudflare
     }
   }
   assert.ok(files.get("compliance/executive_summary.md").includes(`Account: ${account.id}`), "the executive summary's account line is a field rendering and keeps the id whole");
+});
+
+test("byte differential fixtures: Cloudflare assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = async (client) => ({
+    identity: await assessCloudflareIdentity(client),
+    zones: await assessCloudflareZoneSecurity(client),
+    traffic: await assessCloudflareTrafficControls(client),
+  });
+  writeByteDifferentialFixture("cloudflare", "representative", await assess(fixtureClient("compliant")));
+  writeByteDifferentialFixture("cloudflare", "denied", await assess(fixtureClient("forbidden")));
+  writeByteDifferentialFixture("cloudflare", "missing-null", await assess(fixtureClient("empty")));
+  writeByteDifferentialFixture("cloudflare", "partial", await assess(fixtureClient("partial")));
+  writeByteDifferentialFixture("cloudflare", "compliant", await assess(fixtureClient("compliant")));
+  writeByteDifferentialFixture("cloudflare", "boundary", {
+    superAdministrators: await Promise.all([0, 1, 2].map((maxSuperAdmins) => (
+      assessCloudflareIdentity(fixtureClient("compliant"), { maxSuperAdmins })
+    ))),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("cloudflare");
+  const exported = await exportCloudflareAuditBundle(fixtureClient("compliant"), sampleConfig(), exportRoot);
+  writeByteDifferentialFixture("cloudflare", "export", snapshotExportBundle(exported));
 });

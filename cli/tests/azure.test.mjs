@@ -86,6 +86,12 @@ import {
 } from "./helpers/redaction-table.mjs";
 import { getRegisteredToolSummaries, groupRegisteredTools } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-04-16T00:00:00.000Z");
 const ASSESSORS = [
@@ -2335,4 +2341,37 @@ test("config loader errors: a 200 answer whose body is short non-JSON text is re
   for (const [name, text] of readZipEntries(exported.zipPath)) assertNoShortBodyFragments(assert, text, `zip ${name}`);
   assertShortBodyRecordedAsNote(assert, files.get("_errors.log"), "_errors.log");
   assert.ok(seen.has(surface), "the surface named in the note was requested");
+});
+
+test("byte differential fixtures: Azure assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const assess = async (client) => Promise.all(ASSESSORS.map(([, run]) => run(client)));
+  writeByteDifferentialFixture("azure", "representative", await assess(compliantClient()));
+  writeByteDifferentialFixture("azure", "denied", await assess(forbiddenClient()));
+
+  const missing = clientWith(
+    Object.fromEntries(CLIENT_METHODS.map((method) => [method, async () => null])),
+    compliantClient(),
+  );
+  writeByteDifferentialFixture("azure", "missing-null", await assess(missing));
+
+  const partial = clientWith({
+    async listSecurityAlerts() {
+      throw forbidden();
+    },
+  }, compliantClient());
+  writeByteDifferentialFixture("azure", "partial", await assess(partial));
+  writeByteDifferentialFixture("azure", "compliant", await assess(compliantClient()));
+
+  const scoreAt = async (score) => assessAzureMonitoring(clientWith({
+    async listSecureScores() {
+      return [{ currentScore: score, maxScore: 100 }];
+    },
+  }, compliantClient()));
+  writeByteDifferentialFixture("azure", "boundary", {
+    secureScore: await Promise.all([59, 60, 61].map(scoreAt)),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("azure");
+  const exported = await exportAzureAuditBundle(compliantClient(), sampleConfig(), exportRoot, { max_assignments: 25 });
+  writeByteDifferentialFixture("azure", "export", snapshotExportBundle(exported));
 });

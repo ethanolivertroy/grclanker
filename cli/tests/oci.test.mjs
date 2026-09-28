@@ -41,6 +41,12 @@ import {
   scopedStatus,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/oci.js";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const TENANCY = "ocid1.tenancy.oc1..aaaaexample";
@@ -2170,6 +2176,21 @@ test("silent success: empty, whitespace-only, and foreign-JSON stdout on exit 0 
   } finally {
     fake.restore();
   }
+});
+
+test("byte differential fixtures: OCI assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture("oci", "representative", await runAllAssessments(compliantClient()));
+  writeByteDifferentialFixture("oci", "denied", await runAllAssessments(deniedClient()));
+  writeByteDifferentialFixture("oci", "missing-null", await runAllAssessments(emptyClient()));
+  writeByteDifferentialFixture("oci", "partial", await runAllAssessments(partialClient()));
+  writeByteDifferentialFixture("oci", "compliant", await runAllAssessments(compliantClient()));
+  writeByteDifferentialFixture("oci", "boundary", {
+    keyThresholds: await Promise.all([5, 6, 7].map((maxKeys) => assessOciIdentity(compliantClient(), { maxKeys }))),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("oci");
+  const exported = await exportOciAuditBundle(compliantClient(), sampleConfig(), exportRoot);
+  writeByteDifferentialFixture("oci", "export", snapshotExportBundle(exported));
 });
 
 test("silent success per surface: each shape on each surface the #68 review names renders the dependent finding manual or warn, never pass or fail, with a marker naming the command and the stdout state", { skip: POSIX_ONLY }, async () => {
