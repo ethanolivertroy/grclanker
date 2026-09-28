@@ -1949,10 +1949,32 @@ interface ZoneVerdict {
   zone: string;
   status: CloudflareFindingStatus;
   detail: string;
+  evidenceReadable: boolean;
+  violationCount: number;
+  reviewCount: number;
 }
 
-function verdict(zone: string, status: CloudflareFindingStatus, detail: string): ZoneVerdict {
-  return { zone, status, detail };
+interface ZonePredicateEvidence {
+  evidenceReadable: boolean;
+  violationCount?: number;
+  reviewCount?: number;
+}
+
+interface ZoneJudgement extends ZonePredicateEvidence {
+  detail: string;
+}
+
+function verdict(zone: string, detail: string, evidence: ZonePredicateEvidence): ZoneVerdict {
+  const violationCount = evidence.violationCount ?? 0;
+  const reviewCount = evidence.reviewCount ?? 0;
+  const status: CloudflareFindingStatus = !evidence.evidenceReadable
+    ? "manual"
+    : violationCount > 0
+      ? "fail"
+      : reviewCount > 0
+        ? "warn"
+        : "pass";
+  return { zone, status, detail, evidenceReadable: evidence.evidenceReadable, violationCount, reviewCount };
 }
 
 function judgeOriginPulls(
@@ -1963,7 +1985,7 @@ function judgeOriginPulls(
 ): ZoneVerdict {
   const settingReadable = Boolean(tlsClientAuth && !tlsClientAuth.error);
   if (!originOutcome.ok && !settingReadable) {
-    return verdict(zone, "manual", manualReason("/zones/{zone_id}/origin_tls_client_auth/settings and /zones/{zone_id}/settings/tls_client_auth", "SSL and Certificates: Read plus Zone Settings: Read", "the Authenticated Origin Pulls status", originOutcome.error));
+    return verdict(zone, manualReason("/zones/{zone_id}/origin_tls_client_auth/settings and /zones/{zone_id}/settings/tls_client_auth", "SSL and Certificates: Read plus Zone Settings: Read", "the Authenticated Origin Pulls status", originOutcome.error), { evidenceReadable: false });
   }
   const zoneLevelEnabled = originOutcome.ok ? asBoolean(originOutcome.value?.enabled) : undefined;
   const settingOn = tlsClientAuth && !tlsClientAuth.error ? asString(tlsClientAuth.value) : undefined;
@@ -1971,10 +1993,10 @@ function judgeOriginPulls(
   const zoneLevelOff = !zoneLevelOn && (zoneLevelEnabled === false || settingOn === "off");
   const zoneSummary = `zone-level enabled ${String(zoneLevelEnabled ?? "unread")}, tls_client_auth ${settingOn ?? "unread"}`;
   if (!zoneLevelOn && !zoneLevelOff) {
-    return verdict(zone, "manual", "Authenticated Origin Pulls status returned undocumented values; confirm under SSL/TLS > Origin Server.");
+    return verdict(zone, "Authenticated Origin Pulls status returned undocumented values; confirm under SSL/TLS > Origin Server.", { evidenceReadable: false });
   }
   if (!hostnamesOutcome.ok) {
-    return verdict(zone, "manual", `Zone-level Authenticated Origin Pulls is ${zoneLevelOn ? "enabled" : "disabled"} (${zoneSummary}), but ${manualReason("/zones/{zone_id}/origin_tls_client_auth/hostnames", "SSL and Certificates: Read", "the per-hostname certificate associations", hostnamesOutcome.error)}`);
+    return verdict(zone, `Zone-level Authenticated Origin Pulls is ${zoneLevelOn ? "enabled" : "disabled"} (${zoneSummary}), but ${manualReason("/zones/{zone_id}/origin_tls_client_auth/hostnames", "SSL and Certificates: Read", "the per-hostname certificate associations", hostnamesOutcome.error)}`, { evidenceReadable: false });
   }
   const associations = hostnamesOutcome.value.items.filter((item) => asString(item.status) !== "deleted");
   const active = associations.filter((item) => asBoolean(item.enabled) === true && asString(item.status) === "active");
@@ -1985,10 +2007,10 @@ function judgeOriginPulls(
     ? "no per-hostname certificate associations"
     : `${active.length} of ${associations.length} per-hostname associations active and enabled${inactive.length > 0 ? ` (${inactive.map((item) => `${asString(item.hostname) ?? "unknown-hostname"}: enabled ${String(asBoolean(item.enabled) ?? "unread")}, status ${asString(item.status) ?? "unread"}`).join("; ")})` : ""}`;
   if (zoneLevelOff && active.length === 0) {
-    return verdict(zone, "fail", `Authenticated Origin Pulls disabled (${zoneSummary}) and ${hostnameSummary}.`);
+    return verdict(zone, `Authenticated Origin Pulls disabled (${zoneSummary}) and ${hostnameSummary}.`, { evidenceReadable: true, violationCount: 1 });
   }
   if (zoneLevelOff) {
-    return verdict(zone, "warn", `Zone-level Authenticated Origin Pulls is disabled (${zoneSummary}); only ${hostnameSummary} enforce origin authentication.${partial ? ` ${partial}` : ""}`);
+    return verdict(zone, `Zone-level Authenticated Origin Pulls is disabled (${zoneSummary}); only ${hostnameSummary} enforce origin authentication.${partial ? ` ${partial}` : ""}`, { evidenceReadable: true, reviewCount: 1 });
   }
   if (inactive.length > 0 || undated.length > 0 || partial) {
     const reasons = [
@@ -1996,35 +2018,35 @@ function judgeOriginPulls(
       undated.length > 0 ? `${undated.length} active associations have no created_at or updated_at` : undefined,
       partial,
     ].filter((reason): reason is string => Boolean(reason));
-    return verdict(zone, "warn", `Zone-level Authenticated Origin Pulls enabled (${zoneSummary}); ${hostnameSummary}. ${reasons.join("; ")}.`);
+    return verdict(zone, `Zone-level Authenticated Origin Pulls enabled (${zoneSummary}); ${hostnameSummary}. ${reasons.join("; ")}.`, { evidenceReadable: true, reviewCount: reasons.length });
   }
-  return verdict(zone, "pass", `Authenticated Origin Pulls enabled (${zoneSummary}); ${hostnameSummary}.`);
+  return verdict(zone, `Authenticated Origin Pulls enabled (${zoneSummary}); ${hostnameSummary}.`, { evidenceReadable: true });
 }
 
 function settingVerdict(
   zone: string,
   settings: Map<string, ZoneSettingRead>,
   settingId: string,
-  judge: (value: unknown) => { status: CloudflareFindingStatus; detail: string },
+  judge: (value: unknown) => ZoneJudgement,
   permission = "Zone Settings: Read",
 ): ZoneVerdict {
   const read = settings.get(settingId);
   if (!read) {
-    return verdict(zone, "manual", manualReason(`/zones/{zone_id}/settings/${settingId}`, permission, `the ${settingId} zone setting`, "setting not returned"));
+    return verdict(zone, manualReason(`/zones/{zone_id}/settings/${settingId}`, permission, `the ${settingId} zone setting`, "setting not returned"), { evidenceReadable: false });
   }
   if (read.error) {
-    return verdict(zone, "manual", manualReason(`/zones/{zone_id}/settings/${settingId}`, permission, `the ${settingId} zone setting`, read.error));
+    return verdict(zone, manualReason(`/zones/{zone_id}/settings/${settingId}`, permission, `the ${settingId} zone setting`, read.error), { evidenceReadable: false });
   }
   const judged = judge(read.value);
-  return verdict(zone, judged.status, judged.detail);
+  return verdict(zone, judged.detail, judged);
 }
 
-function onOffJudge(label: string): (value: unknown) => { status: CloudflareFindingStatus; detail: string } {
+function onOffJudge(label: string): (value: unknown) => ZoneJudgement {
   return (value) => {
     const text = asString(value);
-    if (text === "on") return { status: "pass", detail: `${label} is on.` };
-    if (text === "off") return { status: "fail", detail: `${label} is off.` };
-    return { status: "manual", detail: `${label} returned an undocumented value (${String(text ?? "null")}); confirm in the dashboard.` };
+    if (text === "on") return { evidenceReadable: true, detail: `${label} is on.` };
+    if (text === "off") return { evidenceReadable: true, violationCount: 1, detail: `${label} is off.` };
+    return { evidenceReadable: false, detail: `${label} returned an undocumented value (${String(text ?? "null")}); confirm in the dashboard.` };
   };
 }
 
@@ -2079,6 +2101,9 @@ function aggregateZoneVerdicts(
     ? `${options.passDetail} (${verdicts.length} zones).${partialNote ? ` ${partialNote}` : ""}`
     : `${counts.fail} zones failed, ${counts.warn} warned, ${counts.manual} need manual review out of ${verdicts.length} sampled. ${nonPassing.slice(0, 3).map((item) => `${item.zone}: ${item.detail}`).join(" ")}${partialNote ? ` ${partialNote}` : ""}`;
 
+  const violationCount = verdicts.reduce((total, item) => total + item.violationCount, 0);
+  const reviewCount = verdicts.reduce((total, item) => total + item.reviewCount, 0);
+  const evidenceReadable = verdicts.every((item) => item.evidenceReadable) || violationCount > 0;
   return finding(id, title, severity, status, summary, specControl, {
     zones_seen: zones.items.length,
     zones_total: zones.totalCount ?? null,
@@ -2087,11 +2112,11 @@ function aggregateZoneVerdicts(
     zones: verdicts.slice(0, 50).map((item) => ({ zone: item.zone, status: item.status, detail: item.detail })),
     ...options.extraEvidence,
   }, cloudflareDecisionFacts(
-    counts.manual === 0 || counts.fail > 0,
+    evidenceReadable,
     !zones.truncated,
     zones.items.length,
-    counts.fail,
-    counts.warn,
+    violationCount,
+    reviewCount,
   ));
 }
 
@@ -2107,35 +2132,35 @@ function entrypointVerdict(
   zone: string,
   phase: string,
   outcome: ReadOutcome<JsonRecord | null>,
-  judge: (ruleset: JsonRecord | null) => { status: CloudflareFindingStatus; detail: string },
+  judge: (ruleset: JsonRecord | null) => ZoneJudgement,
   permission: string,
 ): ZoneVerdict {
   if (!outcome.ok) {
-    return verdict(zone, "manual", manualReason(`/zones/{zone_id}/rulesets/phases/${phase}/entrypoint`, permission, `the ${phase} entry point ruleset`, outcome.error));
+    return verdict(zone, manualReason(`/zones/{zone_id}/rulesets/phases/${phase}/entrypoint`, permission, `the ${phase} entry point ruleset`, outcome.error), { evidenceReadable: false });
   }
   const judged = judge(outcome.value);
-  return verdict(zone, judged.status, judged.detail);
+  return verdict(zone, judged.detail, judged);
 }
 
-function judgeManagedWaf(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
-  if (!ruleset) return { status: "fail", detail: "No http_request_firewall_managed entry point ruleset exists, so no WAF managed ruleset is deployed." };
+function judgeManagedWaf(ruleset: JsonRecord | null): ZoneJudgement {
+  if (!ruleset) return { evidenceReadable: true, violationCount: 1, detail: "No http_request_firewall_managed entry point ruleset exists, so no WAF managed ruleset is deployed." };
   const executes = enabledRules(ruleset).filter((rule) => ruleAction(rule) === "execute");
   if (executes.length === 0) {
-    return { status: "fail", detail: "The http_request_firewall_managed entry point has no enabled execute rule deploying a managed ruleset." };
+    return { evidenceReadable: true, violationCount: 1, detail: "The http_request_firewall_managed entry point has no enabled execute rule deploying a managed ruleset." };
   }
   const disabledOverride = executes.some((rule) => asBoolean(asObject(asObject(rule.action_parameters)?.overrides)?.enabled) === false);
-  if (disabledOverride) return { status: "fail", detail: "A managed ruleset execute rule has overrides.enabled false, disabling the managed rules." };
+  if (disabledOverride) return { evidenceReadable: true, violationCount: 1, detail: "A managed ruleset execute rule has overrides.enabled false, disabling the managed rules." };
   const ids = executes.map((rule) => asString(asObject(rule.action_parameters)?.id) ?? "unknown");
-  return { status: "pass", detail: `${executes.length} enabled managed ruleset execute rules (${ids.join(", ")}).` };
+  return { evidenceReadable: true, detail: `${executes.length} enabled managed ruleset execute rules (${ids.join(", ")}).` };
 }
 
-function judgeCustomWaf(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
-  if (!ruleset) return { status: "fail", detail: "No http_request_firewall_custom entry point ruleset exists, so no custom WAF rules are deployed." };
+function judgeCustomWaf(ruleset: JsonRecord | null): ZoneJudgement {
+  if (!ruleset) return { evidenceReadable: true, violationCount: 1, detail: "No http_request_firewall_custom entry point ruleset exists, so no custom WAF rules are deployed." };
   const rules = enabledRules(ruleset);
   const mitigating = rules.filter((rule) => ["block", "managed_challenge", "js_challenge", "challenge"].includes(ruleAction(rule)));
-  if (rules.length === 0) return { status: "fail", detail: "The http_request_firewall_custom entry point has no enabled rules." };
-  if (mitigating.length === 0) return { status: "warn", detail: `${rules.length} enabled custom rules, none with a block or challenge action.` };
-  return { status: "pass", detail: `${mitigating.length} of ${rules.length} enabled custom rules block or challenge.` };
+  if (rules.length === 0) return { evidenceReadable: true, violationCount: 1, detail: "The http_request_firewall_custom entry point has no enabled rules." };
+  if (mitigating.length === 0) return { evidenceReadable: true, reviewCount: 1, detail: `${rules.length} enabled custom rules, none with a block or challenge action.` };
+  return { evidenceReadable: true, detail: `${mitigating.length} of ${rules.length} enabled custom rules block or challenge.` };
 }
 
 function managedDdosL7Listed(rulesets: ReadOutcome<CloudflarePagedList>): boolean | undefined {
@@ -2143,35 +2168,35 @@ function managedDdosL7Listed(rulesets: ReadOutcome<CloudflarePagedList>): boolea
   return rulesets.value.items.some((ruleset) => asString(ruleset.kind) === "managed" && asString(ruleset.phase) === CLOUDFLARE_RULESET_PHASES.ddosL7);
 }
 
-function judgeDdosL7(ruleset: JsonRecord | null, managedListed: boolean | undefined): { status: CloudflareFindingStatus; detail: string } {
+function judgeDdosL7(ruleset: JsonRecord | null, managedListed: boolean | undefined): ZoneJudgement {
   if (!ruleset) {
     if (managedListed === true) {
       return {
-        status: "pass",
+        evidenceReadable: true,
         detail: "The managed ddos_l7 ruleset is listed for the zone and no override ruleset lowers its sensitivity, so HTTP DDoS Attack Protection runs at Cloudflare's default (high) sensitivity.",
       };
     }
     return {
-      status: "manual",
+      evidenceReadable: false,
       detail: managedListed === false
         ? "No ddos_l7 override exists and the zone ruleset list does not show a managed ddos_l7 ruleset; confirm HTTP DDoS Attack Protection under Security > DDoS."
         : "No ddos_l7 override exists and the zone ruleset list could not be read (Zone WAF: Read); confirm HTTP DDoS Attack Protection under Security > DDoS. Per-rule overrides need an Enterprise plan with Advanced DDoS Protection.",
     };
   }
   const executes = asRecordArray(ruleset.rules).filter((rule) => ruleAction(rule) === "execute");
-  if (executes.length === 0) return { status: "manual", detail: "The ddos_l7 entry point has no execute rule; confirm DDoS overrides in the dashboard." };
+  if (executes.length === 0) return { evidenceReadable: false, detail: "The ddos_l7 entry point has no execute rule; confirm DDoS overrides in the dashboard." };
   const disabled = executes.filter((rule) => asBoolean(rule.enabled) === false);
-  if (disabled.length === executes.length) return { status: "fail", detail: "Every ddos_l7 override rule is disabled." };
+  if (disabled.length === executes.length) return { evidenceReadable: true, violationCount: 1, detail: "Every ddos_l7 override rule is disabled." };
   const levels = executes
     .filter((rule) => asBoolean(rule.enabled) !== false)
     .map((rule) => asString(asObject(asObject(rule.action_parameters)?.overrides)?.sensitivity_level)?.toLowerCase() ?? "default");
-  if (levels.includes("eoff")) return { status: "fail", detail: "HTTP DDoS sensitivity override is essentially off (eoff)." };
-  if (levels.includes("low")) return { status: "warn", detail: "HTTP DDoS sensitivity override is low." };
-  return { status: "pass", detail: `HTTP DDoS override sensitivity is ${[...new Set(levels)].join(", ")}.` };
+  if (levels.includes("eoff")) return { evidenceReadable: true, violationCount: 1, detail: "HTTP DDoS sensitivity override is essentially off (eoff)." };
+  if (levels.includes("low")) return { evidenceReadable: true, reviewCount: 1, detail: "HTTP DDoS sensitivity override is low." };
+  return { evidenceReadable: true, detail: `HTTP DDoS override sensitivity is ${[...new Set(levels)].join(", ")}.` };
 }
 
-function judgeSecurityHeaders(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
-  if (!ruleset) return { status: "fail", detail: "No http_response_headers_transform entry point ruleset exists, so no security headers are set at the edge." };
+function judgeSecurityHeaders(ruleset: JsonRecord | null): ZoneJudgement {
+  if (!ruleset) return { evidenceReadable: true, violationCount: 1, detail: "No http_response_headers_transform entry point ruleset exists, so no security headers are set at the edge." };
   const setHeaders = new Set<string>();
   for (const rule of enabledRules(ruleset).filter((item) => ruleAction(item) === "rewrite")) {
     const headers = asObject(asObject(rule.action_parameters)?.headers) ?? {};
@@ -2182,16 +2207,16 @@ function judgeSecurityHeaders(ruleset: JsonRecord | null): { status: CloudflareF
     }
   }
   const missing = REQUIRED_SECURITY_HEADERS.filter((header) => !setHeaders.has(header));
-  if (missing.length === 0) return { status: "pass", detail: "Transform rules set Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, and Referrer-Policy." };
-  if (missing.length === REQUIRED_SECURITY_HEADERS.length) return { status: "fail", detail: "No enabled response header transform rule sets any required security header." };
-  return { status: "warn", detail: `Missing security headers: ${missing.join(", ")}.` };
+  if (missing.length === 0) return { evidenceReadable: true, detail: "Transform rules set Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, and Referrer-Policy." };
+  if (missing.length === REQUIRED_SECURITY_HEADERS.length) return { evidenceReadable: true, violationCount: 1, detail: "No enabled response header transform rule sets any required security header." };
+  return { evidenceReadable: true, reviewCount: missing.length, detail: `Missing security headers: ${missing.join(", ")}.` };
 }
 
-function judgeRateLimitRuleset(ruleset: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
-  if (!ruleset) return { status: "fail", detail: "No http_ratelimit entry point ruleset exists, so no rate limiting rules protect the zone." };
+function judgeRateLimitRuleset(ruleset: JsonRecord | null): ZoneJudgement {
+  if (!ruleset) return { evidenceReadable: true, violationCount: 1, detail: "No http_ratelimit entry point ruleset exists, so no rate limiting rules protect the zone." };
   const rules = enabledRules(ruleset).filter((rule) => asObject(rule.ratelimit) !== undefined);
-  if (rules.length === 0) return { status: "fail", detail: "The http_ratelimit entry point has no enabled rules with a ratelimit block." };
-  return { status: "pass", detail: `${rules.length} enabled http_ratelimit rules.` };
+  if (rules.length === 0) return { evidenceReadable: true, violationCount: 1, detail: "The http_ratelimit entry point has no enabled rules with a ratelimit block." };
+  return { evidenceReadable: true, detail: `${rules.length} enabled http_ratelimit rules.` };
 }
 
 function pageRuleIsRisky(rule: JsonRecord): boolean {
@@ -2215,25 +2240,25 @@ function pageRuleIsRisky(rule: JsonRecord): boolean {
   );
 }
 
-function botManagementJudgement(config: JsonRecord | null): { status: CloudflareFindingStatus; detail: string } {
+function botManagementJudgement(config: JsonRecord | null): ZoneJudgement {
   if (!config) {
-    return { status: "manual", detail: "No bot management configuration was returned; confirm the zone plan includes Bot Fight Mode, Super Bot Fight Mode, or Bot Management." };
+    return { evidenceReadable: false, detail: "No bot management configuration was returned; confirm the zone plan includes Bot Fight Mode, Super Bot Fight Mode, or Bot Management." };
   }
   const fightMode = asBoolean(config.fight_mode);
   const definitely = asString(config.sbfm_definitely_automated);
   const likely = asString(config.sbfm_likely_automated);
   const enterpriseShape = config.auto_update_model !== undefined || config.suppress_session_score !== undefined;
 
-  if (fightMode === true) return { status: "pass", detail: "Bot Fight Mode is enabled." };
+  if (fightMode === true) return { evidenceReadable: true, detail: "Bot Fight Mode is enabled." };
   if (definitely === "block" || definitely === "managed_challenge") {
-    return { status: "pass", detail: `Super Bot Fight Mode acts on definitely automated traffic (${definitely}${likely ? `, likely automated ${likely}` : ""}).` };
+    return { evidenceReadable: true, detail: `Super Bot Fight Mode acts on definitely automated traffic (${definitely}${likely ? `, likely automated ${likely}` : ""}).` };
   }
-  if (definitely === "allow") return { status: "fail", detail: "Super Bot Fight Mode allows definitely automated traffic." };
-  if (fightMode === false) return { status: "fail", detail: "Bot Fight Mode is disabled and no Super Bot Fight Mode action is configured." };
+  if (definitely === "allow") return { evidenceReadable: true, violationCount: 1, detail: "Super Bot Fight Mode allows definitely automated traffic." };
+  if (fightMode === false) return { evidenceReadable: true, violationCount: 1, detail: "Bot Fight Mode is disabled and no Super Bot Fight Mode action is configured." };
   if (enterpriseShape) {
-    return { status: "manual", detail: "Enterprise Bot Management is provisioned; enforcement lives in WAF custom rules using cf.bot_management.score, so confirm those rules manually." };
+    return { evidenceReadable: false, detail: "Enterprise Bot Management is provisioned; enforcement lives in WAF custom rules using cf.bot_management.score, so confirm those rules manually." };
   }
-  return { status: "manual", detail: "Bot management fields fight_mode and sbfm_definitely_automated were absent; confirm the plan includes Bot Fight Mode, Super Bot Fight Mode (Pro or Business), or Bot Management (Enterprise)." };
+  return { evidenceReadable: false, detail: "Bot management fields fight_mode and sbfm_definitely_automated were absent; confirm the plan includes Bot Fight Mode, Super Bot Fight Mode (Pro or Business), or Bot Management (Enterprise)." };
 }
 
 async function zonePlanNote(client: Partial<Pick<CloudflareReader, "getZoneSubscription">>, zoneId: string): Promise<string> {
@@ -2813,27 +2838,27 @@ export async function assessCloudflareZoneSecurity(
 
     strictSsl.push(settingVerdict(name, settings, "ssl", (value) => {
       const mode = asString(value);
-      if (mode === "strict") return { status: "pass", detail: "SSL mode is Full (Strict)." };
-      if (mode === "full" || mode === "origin_pull") return { status: "warn", detail: `SSL mode is ${mode}, which does not validate the origin certificate chain.` };
-      if (mode === "flexible" || mode === "off") return { status: "fail", detail: `SSL mode is ${mode}.` };
-      return { status: "manual", detail: `SSL mode returned an undocumented value (${String(mode ?? "null")}).` };
+      if (mode === "strict") return { evidenceReadable: true, detail: "SSL mode is Full (Strict)." };
+      if (mode === "full" || mode === "origin_pull") return { evidenceReadable: true, reviewCount: 1, detail: `SSL mode is ${mode}, which does not validate the origin certificate chain.` };
+      if (mode === "flexible" || mode === "off") return { evidenceReadable: true, violationCount: 1, detail: `SSL mode is ${mode}.` };
+      return { evidenceReadable: false, detail: `SSL mode returned an undocumented value (${String(mode ?? "null")}).` };
     }));
     minTls.push(settingVerdict(name, settings, "min_tls_version", (value) => {
       const version = asString(value);
-      if (version === "1.2" || version === "1.3") return { status: "pass", detail: `Minimum TLS version is ${version}.` };
-      if (version === "1.0" || version === "1.1") return { status: "fail", detail: `Minimum TLS version is ${version}.` };
-      return { status: "manual", detail: `min_tls_version returned an undocumented value (${String(version ?? "null")}).` };
+      if (version === "1.2" || version === "1.3") return { evidenceReadable: true, detail: `Minimum TLS version is ${version}.` };
+      if (version === "1.0" || version === "1.1") return { evidenceReadable: true, violationCount: 1, detail: `Minimum TLS version is ${version}.` };
+      return { evidenceReadable: false, detail: `min_tls_version returned an undocumented value (${String(version ?? "null")}).` };
     }));
     hsts.push(settingVerdict(name, settings, "security_header", (value) => {
       const sts = asObject(asObject(value)?.strict_transport_security);
-      if (!sts) return { status: "manual", detail: "security_header did not include strict_transport_security; confirm HSTS in SSL/TLS > Edge Certificates." };
+      if (!sts) return { evidenceReadable: false, detail: "security_header did not include strict_transport_security; confirm HSTS in SSL/TLS > Edge Certificates." };
       const enabled = asBoolean(sts.enabled);
       const maxAge = asNumber(sts.max_age);
-      if (enabled !== true) return { status: "fail", detail: "HSTS is not enabled." };
-      if (maxAge === undefined || maxAge < HSTS_MIN_MAX_AGE_SECONDS) return { status: "fail", detail: `HSTS max_age is ${maxAge ?? "unset"}, below ${HSTS_MIN_MAX_AGE_SECONDS} seconds.` };
-      if (asBoolean(sts.include_subdomains) !== true) return { status: "warn", detail: "HSTS is enabled without include_subdomains." };
-      if (asBoolean(sts.preload) !== true) return { status: "warn", detail: "HSTS is enabled with include_subdomains but without preload." };
-      return { status: "pass", detail: `HSTS enabled with max_age ${maxAge}, include_subdomains, and preload.` };
+      if (enabled !== true) return { evidenceReadable: true, violationCount: 1, detail: "HSTS is not enabled." };
+      if (maxAge === undefined || maxAge < HSTS_MIN_MAX_AGE_SECONDS) return { evidenceReadable: true, violationCount: 1, detail: `HSTS max_age is ${maxAge ?? "unset"}, below ${HSTS_MIN_MAX_AGE_SECONDS} seconds.` };
+      if (asBoolean(sts.include_subdomains) !== true) return { evidenceReadable: true, reviewCount: 1, detail: "HSTS is enabled without include_subdomains." };
+      if (asBoolean(sts.preload) !== true) return { evidenceReadable: true, reviewCount: 1, detail: "HSTS is enabled with include_subdomains but without preload." };
+      return { evidenceReadable: true, detail: `HSTS enabled with max_age ${maxAge}, include_subdomains, and preload.` };
     }));
     alwaysHttps.push(settingVerdict(name, settings, "always_use_https", onOffJudge("Always Use HTTPS")));
     httpsRewrites.push(settingVerdict(name, settings, "automatic_https_rewrites", onOffJudge("Automatic HTTPS Rewrites")));
@@ -2841,21 +2866,21 @@ export async function assessCloudflareZoneSecurity(
     emailObfuscation.push(settingVerdict(name, settings, "email_obfuscation", onOffJudge("Email Address Obfuscation")));
 
     if (!dnssecOutcome.ok) {
-      dnssec.push(verdict(name, "manual", manualReason("/zones/{zone_id}/dnssec", "DNS: Read", "the DNSSEC status", dnssecOutcome.error)));
+      dnssec.push(verdict(name, manualReason("/zones/{zone_id}/dnssec", "DNS: Read", "the DNSSEC status", dnssecOutcome.error), { evidenceReadable: false }));
     } else {
       const status = asString(dnssecOutcome.value?.status);
-      if (status === "active") dnssec.push(verdict(name, "pass", "DNSSEC status is active."));
-      else if (status === "pending" || status === "pending-disabled") dnssec.push(verdict(name, "warn", `DNSSEC status is ${status}; the DS record is not yet live at the registrar.`));
-      else if (status === "disabled" || status === "error") dnssec.push(verdict(name, "fail", `DNSSEC status is ${status}.`));
-      else dnssec.push(verdict(name, "manual", `DNSSEC status returned an undocumented value (${String(status ?? "null")}).`));
+      if (status === "active") dnssec.push(verdict(name, "DNSSEC status is active.", { evidenceReadable: true }));
+      else if (status === "pending" || status === "pending-disabled") dnssec.push(verdict(name, `DNSSEC status is ${status}; the DS record is not yet live at the registrar.`, { evidenceReadable: true, reviewCount: 1 }));
+      else if (status === "disabled" || status === "error") dnssec.push(verdict(name, `DNSSEC status is ${status}.`, { evidenceReadable: true, violationCount: 1 }));
+      else dnssec.push(verdict(name, `DNSSEC status returned an undocumented value (${String(status ?? "null")}).`, { evidenceReadable: false }));
     }
 
     if (!universalOutcome.ok) {
-      universalSsl.push(verdict(name, "manual", manualReason("/zones/{zone_id}/ssl/universal/settings", "SSL and Certificates: Read", "the Universal SSL status and edge certificate list", universalOutcome.error)));
+      universalSsl.push(verdict(name, manualReason("/zones/{zone_id}/ssl/universal/settings", "SSL and Certificates: Read", "the Universal SSL status and edge certificate list", universalOutcome.error), { evidenceReadable: false }));
     } else if (asBoolean(universalOutcome.value?.enabled) !== true) {
-      universalSsl.push(verdict(name, "fail", "Universal SSL is disabled for the zone."));
+      universalSsl.push(verdict(name, "Universal SSL is disabled for the zone.", { evidenceReadable: true, violationCount: 1 }));
     } else if (!certPacksOutcome.ok) {
-      universalSsl.push(verdict(name, "manual", manualReason("/zones/{zone_id}/ssl/certificate_packs", "SSL and Certificates: Read", "the certificate pack status and expiry dates", certPacksOutcome.error)));
+      universalSsl.push(verdict(name, manualReason("/zones/{zone_id}/ssl/certificate_packs", "SSL and Certificates: Read", "the certificate pack status and expiry dates", certPacksOutcome.error), { evidenceReadable: false }));
     } else {
       const packs = certPacksOutcome.value.items;
       const activePacks = packs.filter((pack) => asString(pack.status) === "active");
@@ -2869,27 +2894,27 @@ export async function assessCloudflareZoneSecurity(
         const expires = asDate(certificate.expires_on);
         return expires !== undefined && expires.getTime() >= now.getTime() && daysBetween(now, expires) <= CERTIFICATE_EXPIRY_WARNING_DAYS;
       });
-      if (packs.length === 0) universalSsl.push(verdict(name, "fail", "Universal SSL is enabled but no certificate packs exist for the zone."));
-      else if (activePacks.length === 0) universalSsl.push(verdict(name, "fail", `No certificate pack is active (statuses: ${[...new Set(packs.map((pack) => asString(pack.status) ?? "unknown"))].join(", ")}).`));
-      else if (expiredCertificates.length > 0) universalSsl.push(verdict(name, "fail", `${expiredCertificates.length} certificates in active packs are past expires_on.`));
-      else if (undatedCertificates.length > 0 || certificates.length === 0) universalSsl.push(verdict(name, "warn", `${activePacks.length} active certificate packs, but ${certificates.length === 0 ? "no certificate entries" : `${undatedCertificates.length} certificates without expires_on`} were returned, so validity cannot be confirmed.`));
-      else if (expiringSoon.length > 0) universalSsl.push(verdict(name, "warn", `${expiringSoon.length} certificates expire within ${CERTIFICATE_EXPIRY_WARNING_DAYS} days.`));
-      else if (certPacksOutcome.value.truncated) universalSsl.push(verdict(name, "warn", partialInventoryNote("certificate pack", certPacksOutcome.value) ?? "Certificate pack inventory was truncated."));
-      else universalSsl.push(verdict(name, "pass", `${activePacks.length} active certificate packs with ${certificates.length} valid certificates.`));
+      if (packs.length === 0) universalSsl.push(verdict(name, "Universal SSL is enabled but no certificate packs exist for the zone.", { evidenceReadable: true, violationCount: 1 }));
+      else if (activePacks.length === 0) universalSsl.push(verdict(name, `No certificate pack is active (statuses: ${[...new Set(packs.map((pack) => asString(pack.status) ?? "unknown"))].join(", ")}).`, { evidenceReadable: true, violationCount: 1 }));
+      else if (expiredCertificates.length > 0) universalSsl.push(verdict(name, `${expiredCertificates.length} certificates in active packs are past expires_on.`, { evidenceReadable: true, violationCount: expiredCertificates.length }));
+      else if (undatedCertificates.length > 0 || certificates.length === 0) universalSsl.push(verdict(name, `${activePacks.length} active certificate packs, but ${certificates.length === 0 ? "no certificate entries" : `${undatedCertificates.length} certificates without expires_on`} were returned, so validity cannot be confirmed.`, { evidenceReadable: true, reviewCount: Math.max(undatedCertificates.length, 1) }));
+      else if (expiringSoon.length > 0) universalSsl.push(verdict(name, `${expiringSoon.length} certificates expire within ${CERTIFICATE_EXPIRY_WARNING_DAYS} days.`, { evidenceReadable: true, reviewCount: expiringSoon.length }));
+      else if (certPacksOutcome.value.truncated) universalSsl.push(verdict(name, partialInventoryNote("certificate pack", certPacksOutcome.value) ?? "Certificate pack inventory was truncated.", { evidenceReadable: true, reviewCount: 1 }));
+      else universalSsl.push(verdict(name, `${activePacks.length} active certificate packs with ${certificates.length} valid certificates.`, { evidenceReadable: true }));
     }
 
     originPulls.push(judgeOriginPulls(name, settings.get("tls_client_auth"), originOutcome, originHostnamesOutcome));
 
     if (!dnsOutcome.ok) {
-      dnsExposure.push(verdict(name, "manual", manualReason("/zones/{zone_id}/dns_records", "DNS: Read", "the DNS record export", dnsOutcome.error)));
+      dnsExposure.push(verdict(name, manualReason("/zones/{zone_id}/dns_records", "DNS: Read", "the DNS record export", dnsOutcome.error), { evidenceReadable: false }));
     } else {
       const records = dnsOutcome.value.items;
       const exposed = records.filter((record) => ["A", "AAAA", "CNAME"].includes(asString(record.type) ?? "") && asBoolean(record.proxied) === false && asBoolean(record.proxiable) !== false);
       const partial = partialInventoryNote("DNS record", dnsOutcome.value);
-      if (records.length === 0) dnsExposure.push(verdict(name, "manual", "No DNS records were returned for the zone; confirm the zone is active and the token has DNS: Read."));
-      else if (exposed.length > 0) dnsExposure.push(verdict(name, "warn", `${exposed.length} of ${records.length} A/AAAA/CNAME records are unproxied and expose origin addresses (${exposed.slice(0, 5).map((record) => asString(record.name) ?? "?").join(", ")}).${partial ? ` ${partial}` : ""}`));
-      else if (partial) dnsExposure.push(verdict(name, "warn", partial));
-      else dnsExposure.push(verdict(name, "pass", `All ${records.length} proxiable records are proxied through Cloudflare.`));
+      if (records.length === 0) dnsExposure.push(verdict(name, "No DNS records were returned for the zone; confirm the zone is active and the token has DNS: Read.", { evidenceReadable: false }));
+      else if (exposed.length > 0) dnsExposure.push(verdict(name, `${exposed.length} of ${records.length} A/AAAA/CNAME records are unproxied and expose origin addresses (${exposed.slice(0, 5).map((record) => asString(record.name) ?? "?").join(", ")}).${partial ? ` ${partial}` : ""}`, { evidenceReadable: true, reviewCount: exposed.length }));
+      else if (partial) dnsExposure.push(verdict(name, partial, { evidenceReadable: true, reviewCount: 1 }));
+      else dnsExposure.push(verdict(name, `All ${records.length} proxiable records are proxied through Cloudflare.`, { evidenceReadable: true }));
     }
   }
 
@@ -3028,29 +3053,29 @@ export async function assessCloudflareTrafficControls(
 
     if (rateLimitRuleset.ok) {
       const rulesetJudgement = judgeRateLimitRuleset(rateLimitRuleset.value);
-      rateLimiting.push(verdict(name, rulesetJudgement.status, rulesetJudgement.detail));
+      rateLimiting.push(verdict(name, rulesetJudgement.detail, rulesetJudgement));
     } else {
       const legacyRateLimits = await attemptList(() => client.listRateLimits(zoneId));
       if (!legacyRateLimits.ok) errors.push(`${name} /rate_limits: ${legacyRateLimits.error}`);
       const legacyEnabled = legacyRateLimits.ok ? legacyRateLimits.value.items.filter((rule) => asBoolean(rule.disabled) !== true) : [];
       const manualDetail = manualReason(`/zones/{zone_id}/rulesets/phases/${CLOUDFLARE_RULESET_PHASES.rateLimit}/entrypoint`, "Zone WAF: Read", "the rate limiting rule list", rateLimitRuleset.error);
-      if (legacyEnabled.length > 0) rateLimiting.push(verdict(name, "warn", `The http_ratelimit entry point could not be read (${rateLimitRuleset.error}); the deprecated /rate_limits API shows ${legacyEnabled.length} enabled legacy rate limits as evidence only. Grant Zone WAF: Read and migrate them to http_ratelimit rules.`));
-      else rateLimiting.push(verdict(name, "manual", `${manualDetail}${legacyRateLimits.ok ? " The deprecated /rate_limits API returned no enabled legacy rate limits." : ""}`));
+      if (legacyEnabled.length > 0) rateLimiting.push(verdict(name, `The http_ratelimit entry point could not be read (${rateLimitRuleset.error}); the deprecated /rate_limits API shows ${legacyEnabled.length} enabled legacy rate limits as evidence only. Grant Zone WAF: Read and migrate them to http_ratelimit rules.`, { evidenceReadable: true, reviewCount: legacyEnabled.length }));
+      else rateLimiting.push(verdict(name, `${manualDetail}${legacyRateLimits.ok ? " The deprecated /rate_limits API returned no enabled legacy rate limits." : ""}`, { evidenceReadable: false }));
     }
 
-    if (!pageRuleOutcome.ok) pageRules.push(verdict(name, "manual", manualReason("/zones/{zone_id}/pagerules", "Page Rules: Read", "the page rule list", pageRuleOutcome.error)));
+    if (!pageRuleOutcome.ok) pageRules.push(verdict(name, manualReason("/zones/{zone_id}/pagerules", "Page Rules: Read", "the page rule list", pageRuleOutcome.error), { evidenceReadable: false }));
     else {
       const risky = pageRuleOutcome.value.items.filter(pageRuleIsRisky);
-      if (risky.length > 0) pageRules.push(verdict(name, "fail", `${risky.length} active page rules weaken security (disable_security, security_level essentially_off, ssl off/flexible, or cache_everything on sensitive paths).`));
-      else if (pageRuleOutcome.value.items.length === 0) pageRules.push(verdict(name, "pass", "No active page rules exist (status=active); emptiness is compliant because no active rule can weaken security."));
-      else pageRules.push(verdict(name, "pass", `${pageRuleOutcome.value.items.length} active page rules, none security-degrading.`));
+      if (risky.length > 0) pageRules.push(verdict(name, `${risky.length} active page rules weaken security (disable_security, security_level essentially_off, ssl off/flexible, or cache_everything on sensitive paths).`, { evidenceReadable: true, violationCount: risky.length }));
+      else if (pageRuleOutcome.value.items.length === 0) pageRules.push(verdict(name, "No active page rules exist (status=active); emptiness is compliant because no active rule can weaken security.", { evidenceReadable: true }));
+      else pageRules.push(verdict(name, `${pageRuleOutcome.value.items.length} active page rules, none security-degrading.`, { evidenceReadable: true }));
     }
 
-    if (!botOutcome.ok) botControls.push(verdict(name, "manual", manualReason("/zones/{zone_id}/bot_management", "Bot Management: Read", "the Bot Fight Mode or Bot Management settings", botOutcome.error)));
+    if (!botOutcome.ok) botControls.push(verdict(name, manualReason("/zones/{zone_id}/bot_management", "Bot Management: Read", "the Bot Fight Mode or Bot Management settings", botOutcome.error), { evidenceReadable: false }));
     else {
       const judged = botManagementJudgement(botOutcome.value);
-      const planNote = judged.status === "manual" ? await zonePlanNote(client, zoneId) : "";
-      botControls.push(verdict(name, judged.status, `${judged.detail}${planNote}`));
+      const planNote = !judged.evidenceReadable ? await zonePlanNote(client, zoneId) : "";
+      botControls.push(verdict(name, `${judged.detail}${planNote}`, judged));
     }
   }
 
