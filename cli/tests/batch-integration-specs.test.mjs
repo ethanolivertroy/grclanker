@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  evaluateBatchCheckVerdict,
   evaluateObservedFindingStatus,
+  materializeBatchCheckVerdict,
   preserveRuntimeFindingStatus,
 } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 import { BOX_RUNTIME_BEHAVIOR, BOX_SPEC } from "../dist/extensions/grc-tools/box.spec.js";
@@ -13,7 +15,7 @@ import { SERVICENOW_RUNTIME_BEHAVIOR, SERVICENOW_SPEC } from "../dist/extensions
 import { SLACK_RUNTIME_BEHAVIOR, SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
 import { ZENDESK_RUNTIME_BEHAVIOR, ZENDESK_SPEC } from "../dist/extensions/grc-tools/zendesk.spec.js";
 import { ZOOM_RUNTIME_BEHAVIOR, ZOOM_SPEC } from "../dist/extensions/grc-tools/zoom.spec.js";
-import { checkContract, collectDefinedGrcTools, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
+import { checkContract, collectDefinedGrcTools, evaluateCheckVerdict, evaluateVerdictCriteria } from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 import {
   renderAllIntegrationSpecs,
@@ -65,6 +67,7 @@ test("every batch tool definition carries adjacent non-enumerable metadata witho
 test("ordered rules preserve runtime statuses byte-for-byte and enforce first-match precedence", () => {
   for (const [spec] of batch) {
     for (const check of spec.checks) {
+      if (check.id.startsWith("OKTA-")) continue;
       const emitted = new Set(check.criteria.rules.map((rule) => rule.status));
       for (const status of emitted) {
         const payload = { id: check.id, status, values: [null, 0, 25, 26] };
@@ -86,7 +89,6 @@ test("ordered rules preserve runtime statuses byte-for-byte and enforce first-ma
       }
     }
   }
-  assert.equal(preserveRuntimeFindingStatus(OKTA_SPEC, OKTA_SPEC.checks[0].id, "Partial"), "Partial");
   assert.equal(preserveRuntimeFindingStatus(DUO_SPEC, DUO_SPEC.checks[0].id, "Info"), "Info");
 });
 
@@ -95,6 +97,16 @@ test("every rule has boundary coverage and null, missing, denied, or unreadable 
   for (const [spec] of batch) {
     validateDecisionInputs(spec);
     for (const check of spec.checks) {
+      if (check.id.startsWith("OKTA-")) {
+        const nullFacts = Object.fromEntries(check.evidenceFields.map((name) => [name, null]));
+        assert.equal(evaluateCheckVerdict(check, {}), "manual", `${check.id}: missing`);
+        assert.notEqual(evaluateCheckVerdict(check, nullFacts), "pass", `${check.id}: null cannot pass`);
+        assert.throws(
+          () => evaluateCheckVerdict(check, { ...nullFacts, undeclared_okta_input: true }),
+          new RegExp(`${check.id} received undeclared decision input`),
+        );
+        continue;
+      }
       const named = (suffix) => Object.keys(check.derivedFacts).find((name) => name.endsWith(`_${suffix}`));
       const readable = named("required_evidence_readable");
       const complete = named("required_evidence_complete");
@@ -133,6 +145,45 @@ test("every rule has boundary coverage and null, missing, denied, or unreadable 
       derivations.add(uniqueDerivation);
     }
   }
+});
+
+test("Okta executable rules ignore legacy status and use complete counts with ordered precedence", () => {
+  const phishingFacts = {
+    readable: true,
+    complete: true,
+    classic_engine: false,
+    authenticator_count: 2,
+    phishing_resistant_count: 1,
+    strong_count: 1,
+  };
+  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", phishingFacts, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-001", {
+    ...phishingFacts,
+    phishing_resistant_count: 0,
+    strong_count: 0,
+  }, "Pass"), "Fail");
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-006", {
+    readable: true,
+    complete: false,
+    exposed_value_count: 26,
+    over_limit_count: 1,
+  }), "fail", "proven violation precedes partial evidence");
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-003", {
+    readable: true,
+    complete: true,
+    inventory_count: 26,
+    policy_count: 26,
+    compliant_policy_count: 25,
+    all_policies_compliant: false,
+  }), "warn", "the complete 26-policy count, not a 25-item sample, controls the result");
+  assert.equal(evaluateBatchCheckVerdict(OKTA_SPEC, "OKTA-AUTH-003", {
+    readable: true,
+    complete: true,
+    inventory_count: 25,
+    policy_count: 25,
+    compliant_policy_count: 25,
+    all_policies_compliant: true,
+  }), "pass");
 });
 
 test("runtime behavior statements are explicit and generator-visible", () => {
