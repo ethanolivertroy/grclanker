@@ -125,6 +125,13 @@ export type VerdictCondition =
   | { op: "and" | "or"; conditions: readonly VerdictCondition[] }
   | { op: "not"; condition: VerdictCondition }
   | { op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte"; left: VerdictOperand; right: VerdictOperand }
+  | {
+      op: "ratio";
+      numerator: VerdictOperand;
+      denominator: VerdictOperand;
+      comparator: "gt" | "gte" | "lt" | "lte";
+      threshold: VerdictOperand;
+    }
   | { op: "matches"; operand: VerdictOperand; pattern: string; flags?: string }
   | { op: "defined" | "null"; operand: VerdictOperand }
   | { op: "some" | "every"; path: string; condition: VerdictCondition };
@@ -360,6 +367,29 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
       if (condition.op === "lt") return Number(left) < Number(right);
       return Number(left) <= Number(right);
     }
+    case "ratio": {
+      const numeratorValue = operandValue(condition.numerator, facts, item);
+      const denominatorValue = operandValue(condition.denominator, facts, item);
+      const thresholdValue = operandValue(condition.threshold, facts, item);
+      if (
+        numeratorValue === null || numeratorValue === undefined
+        || denominatorValue === null || denominatorValue === undefined
+        || thresholdValue === null || thresholdValue === undefined
+      ) {
+        return false;
+      }
+      const numerator = Number(numeratorValue);
+      const denominator = Number(denominatorValue);
+      const threshold = Number(thresholdValue);
+      if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0 || !Number.isFinite(threshold)) {
+        return false;
+      }
+      const ratio = numerator / denominator;
+      if (condition.comparator === "gt") return ratio > threshold;
+      if (condition.comparator === "gte") return ratio >= threshold;
+      if (condition.comparator === "lt") return ratio < threshold;
+      return ratio <= threshold;
+    }
     case "some":
     case "every": {
       const value = pathValue(facts, condition.path, item);
@@ -422,6 +452,16 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
       return `${renderOperand(condition.left)} is less than ${renderOperand(condition.right)}`;
     case "lte":
       return `${renderOperand(condition.left)} is at most ${renderOperand(condition.right)}`;
+    case "ratio":
+      return `${renderOperand(condition.numerator)} divided by ${renderOperand(condition.denominator)} is ${
+        condition.comparator === "gt"
+          ? "greater than"
+          : condition.comparator === "gte"
+            ? "at least"
+            : condition.comparator === "lt"
+              ? "less than"
+              : "at most"
+      } ${renderOperand(condition.threshold)}; a missing, nonnumeric, or nonpositive denominator does not match`;
     case "some":
       return `some item in \`${condition.path}\` satisfies (${renderVerdictCondition(condition.condition)})`;
     case "every":
@@ -458,6 +498,12 @@ export function verdictConditionPaths(condition: VerdictCondition): string[] {
     case "lt":
     case "lte":
       return [...operandPaths(condition.left), ...operandPaths(condition.right)];
+    case "ratio":
+      return [
+        ...operandPaths(condition.numerator),
+        ...operandPaths(condition.denominator),
+        ...operandPaths(condition.threshold),
+      ];
     case "some":
     case "every":
       return [condition.path, ...verdictConditionPaths(condition.condition)];
