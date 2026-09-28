@@ -5,7 +5,7 @@ import { runWithoutPersistentCaches } from "../../extensions/grc-tools/shared.js
 import { collectSensitiveValues, scrubSensitiveValues, withholdEchoedArguments } from "../../flue/redact.js";
 import { classifyGrcToolEffect, type GrcToolEffect, isGrcWriteTool } from "./effects.js";
 import { getRegisteredGrcTool, type RegisteredGrcTool } from "./registry.js";
-import { errorEnvelope, toSdkToolResult } from "./results.js";
+import { errorEnvelope, type SdkToolEnvelope, toSdkToolResult } from "./results.js";
 import { toJsonSchema } from "./schema.js";
 
 export interface GrcToolExecutionContext {
@@ -49,8 +49,8 @@ function safeErrorEnvelope(tool: RegisteredGrcTool, input: JsonObject, errorText
 function sanitizeErrorResult(
   tool: RegisteredGrcTool,
   input: JsonObject,
-  result: ToolExecuteResult,
-): ToolExecuteResult {
+  result: SdkToolEnvelope,
+): SdkToolEnvelope {
   if (result.isError !== true) return result;
   return {
     ...result,
