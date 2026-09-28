@@ -288,6 +288,10 @@ type CommonArgs = {
   connection?: string;
   timeout_seconds?: number;
   statement_timeout_seconds?: number;
+  poll_interval_ms?: number;
+  max_retries?: number;
+  retry_base_ms?: number;
+  max_partitions?: number;
   row_limit?: number;
 };
 
@@ -3828,6 +3832,10 @@ function normalizeCommonArgs(args: unknown): CommonArgs {
     connection: asString(value.connection),
     timeout_seconds: asNumber(value.timeout_seconds),
     statement_timeout_seconds: asNumber(value.statement_timeout_seconds),
+    poll_interval_ms: asNumber(value.poll_interval_ms),
+    max_retries: asNumber(value.max_retries),
+    retry_base_ms: asNumber(value.retry_base_ms),
+    max_partitions: asNumber(value.max_partitions),
     row_limit: asNumber(value.row_limit),
   };
 }
@@ -3888,6 +3896,10 @@ const authParams = {
   connection: Type.Optional(Type.String({ description: "Connection name in ~/.snowflake/connections.toml or config.toml. Defaults to SNOWFLAKE_CONNECTION_NAME, default_connection_name, or 'default'." })),
   timeout_seconds: Type.Optional(Type.Number({ description: "HTTP timeout per request in seconds. Defaults to 30.", default: 30 })),
   statement_timeout_seconds: Type.Optional(Type.Number({ description: "Server-side statement timeout in seconds. Defaults to 120.", default: 120 })),
+  poll_interval_ms: Type.Optional(Type.Integer({ description: "Polling interval for asynchronous SQL statements in milliseconds (0-30000). Defaults to SNOWFLAKE_POLL_INTERVAL_MS or 1000.", minimum: 0, maximum: 30_000, default: 1_000 })),
+  max_retries: Type.Optional(Type.Integer({ description: "Maximum retries for transient HTTP 429/5xx responses and network failures (0-10). Defaults to 3.", minimum: 0, maximum: 10, default: 3 })),
+  retry_base_ms: Type.Optional(Type.Integer({ description: "Base delay for exponential retry backoff in milliseconds (0-30000). Defaults to 500.", minimum: 0, maximum: 30_000, default: 500 })),
+  max_partitions: Type.Optional(Type.Integer({ description: "Maximum result partitions fetched per statement (1-10000); reaching the cap marks the result partial. Defaults to 50.", minimum: 1, maximum: 10_000, default: 50 })),
   row_limit: Type.Optional(Type.Number({ description: "Row limit for ACCOUNT_USAGE inventory queries; hitting it flags a partial result. Defaults to 20000.", default: 20000 })),
 };
 
