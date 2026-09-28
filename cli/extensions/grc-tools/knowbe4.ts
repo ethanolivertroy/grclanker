@@ -4231,7 +4231,7 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
     {
       evidence_readable: true,
       evidence_complete: true,
-      inventory_count: allTime.length,
+      inventory_count: allTime.length > 0 || listComplete ? allTime.length : 1,
       violation_count: recent.length === 0 && listComplete ? 1 : 0,
       review_count: recent.length === 0 && !listComplete ? 1 : 0,
     },

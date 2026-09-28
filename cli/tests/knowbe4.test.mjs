@@ -1419,6 +1419,11 @@ test("a recent callback test remains observed when its inventory is truncated", 
   const vishing = findingFor(assessKnowbe4AccountGovernance(snapshot, { now: NOW }), 16);
   assert.equal(vishing.status, "warn");
   assert.match(vishing.summary, /1 callback.*Truncated listing: callback_security_tests/);
+
+  snapshot.callbackSecurityTests.data = [];
+  const unknownVishing = findingFor(assessKnowbe4AccountGovernance(snapshot, { now: NOW }), 16);
+  assert.equal(unknownVishing.status, "warn");
+  assert.match(unknownVishing.summary, /None of the 0 callback.*listing was truncated/);
 });
 
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {

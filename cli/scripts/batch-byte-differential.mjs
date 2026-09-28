@@ -295,8 +295,18 @@ function compareTrees(expectedRoot, actualRoot, label) {
       const contextEnd = offset + 320;
       const mainContext = expected.subarray(contextStart, contextEnd).toString("utf8");
       const branchContext = actual.subarray(contextStart, contextEnd).toString("utf8");
+      const lineStart = path.endsWith(".jsonl") ? expected.lastIndexOf(0x0a, Math.max(0, offset - 1)) + 1 : -1;
+      const lineEnd = path.endsWith(".jsonl") ? expected.indexOf(0x0a, offset) : -1;
+      let recordName = "";
+      if (lineStart >= 0 && lineEnd > lineStart) {
+        try {
+          recordName = `, record=${JSON.parse(expected.subarray(lineStart, lineEnd).toString("utf8")).name}`;
+        } catch {
+          recordName = ", record=<unparseable>";
+        }
+      }
       throw new Error(
-        `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset})`
+        `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset}${recordName})`
         + `\nmain context: ${JSON.stringify(mainContext)}`
         + `\nbranch context: ${JSON.stringify(branchContext)}`,
       );
