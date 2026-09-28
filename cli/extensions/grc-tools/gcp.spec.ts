@@ -117,7 +117,7 @@ function gcpCompletenessFailureModes(checkId: string, surfaceId: string): BatchC
   if (surfaceId === "projects") return checkId === "GCP-ORG-01" ? GT : GA;
   if (surfaceId === "effective-org-policy") return checkId === "GCP-ORG-06" ? GA : GN;
   if (surfaceId === "service-account-keys") return GT;
-  if (["iam-policies", "public-iam-bindings", "kms", "scc-sources"].includes(surfaceId)) return GT;
+  if (["iam-policies", "public-iam-bindings", "kms", "scc-sources", "service-perimeters"].includes(surfaceId)) return GT;
   return GA;
 }
 export const GCP_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = Object.fromEntries(
