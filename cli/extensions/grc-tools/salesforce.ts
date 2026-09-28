@@ -21,7 +21,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 
@@ -1880,9 +1880,6 @@ function finding(
 ): SalesforceFinding {
   const definition = controlDefinition(control);
   const id = `SF-${String(control).padStart(2, "0")}`;
-  const facts = SALESFORCE_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = assertBatchCheckVerdict(SALESFORCE_SPEC, id, facts, status);
   return {
     id,
     control,
@@ -2453,7 +2450,7 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
 }
 
 export function assessSalesforcePlatformData(data: SalesforcePlatformData): SalesforceAssessmentResult {
-  return SALESFORCE_DECISION_CONTEXT.run(new Map(), () => assessSalesforcePlatformDataWithDecisionContext(data));
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforcePlatformDataWithDecisionContext(data));
 }
 
 export async function assessSalesforcePlatformSecurity(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
@@ -2840,7 +2837,7 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
 }
 
 export function assessSalesforceIdentityData(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
-  return SALESFORCE_DECISION_CONTEXT.run(new Map(), () => assessSalesforceIdentityDataWithDecisionContext(data, options));
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceIdentityDataWithDecisionContext(data, options));
 }
 
 export async function assessSalesforceIdentityAccess(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
@@ -3024,7 +3021,7 @@ function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceD
 }
 
 export function assessSalesforceDataProtectionData(data: SalesforceDataProtectionData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
-  return SALESFORCE_DECISION_CONTEXT.run(new Map(), () => assessSalesforceDataProtectionDataWithDecisionContext(data, options));
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceDataProtectionDataWithDecisionContext(data, options));
 }
 
 export async function assessSalesforceDataProtection(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
@@ -3253,7 +3250,7 @@ function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonit
 }
 
 export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): SalesforceAssessmentResult {
-  return SALESFORCE_DECISION_CONTEXT.run(new Map(), () => assessSalesforceMonitoringDataWithDecisionContext(data));
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceMonitoringDataWithDecisionContext(data));
 }
 
 export async function assessSalesforceMonitoringIntegrations(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {

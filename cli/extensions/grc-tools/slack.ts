@@ -21,7 +21,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { readResolverEnvironment, SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SLACK_SPEC } from "./slack.spec.js";
@@ -525,9 +525,6 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): SlackFinding {
-  const facts = SLACK_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = assertBatchCheckVerdict(SLACK_SPEC, id, facts, status);
   return { id, title, control, severity, status, summary, mappings: mappingsFor(control), evidence };
 }
 
@@ -1496,7 +1493,7 @@ export async function assessSlackIdentity(
   client: SlackApiClient,
   options: { userLimit?: number; skipScim?: boolean } = {},
 ): Promise<SlackAssessmentResult> {
-  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
+  return runBatchVerdictContext(SLACK_DECISION_CONTEXT, SLACK_SPEC, async () => {
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 20_000);
   const errors: string[] = [];
   const teamId = await resolveTeamId(client);
@@ -1725,7 +1722,7 @@ export async function assessSlackAdminAccess(
     sessionSample?: number;
   } = {},
 ): Promise<SlackAssessmentResult> {
-  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
+  return runBatchVerdictContext(SLACK_DECISION_CONTEXT, SLACK_SPEC, async () => {
   const workspaceLimit = clampNumber(options.workspaceLimit, DEFAULT_WORKSPACE_LIMIT, 1, 500);
   const userLimit = clampNumber(options.userLimit, DEFAULT_USER_LIMIT, 1, 20_000);
   const maxWorkspaceAdmins = clampNumber(options.maxWorkspaceAdmins, 5, 1, 100);
@@ -2139,7 +2136,7 @@ export async function assessSlackIntegrations(
   client: SlackApiClient,
   options: { appLimit?: number; workspaceLimit?: number } = {},
 ): Promise<SlackAssessmentResult> {
-  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
+  return runBatchVerdictContext(SLACK_DECISION_CONTEXT, SLACK_SPEC, async () => {
   const appLimit = clampNumber(options.appLimit, DEFAULT_APP_LIMIT, 1, 5000);
   const workspaceLimit = clampNumber(options.workspaceLimit, DEFAULT_WORKSPACE_LIMIT, 1, 500);
   const orgQuery = client.getOrgQuery();
@@ -2378,7 +2375,7 @@ export async function assessSlackChannelGovernance(
   client: SlackApiClient,
   options: { channelLimit?: number; minRetentionDays?: number } = {},
 ): Promise<SlackAssessmentResult> {
-  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
+  return runBatchVerdictContext(SLACK_DECISION_CONTEXT, SLACK_SPEC, async () => {
   const channelLimit = clampNumber(options.channelLimit, DEFAULT_CHANNEL_LIMIT, 1, 400);
   const minRetentionDays = clampNumber(options.minRetentionDays, DEFAULT_MIN_RETENTION_DAYS, 1, 36_500);
   const errors: string[] = [];
@@ -2581,7 +2578,7 @@ export async function assessSlackMonitoring(
   client: SlackApiClient,
   options: { days?: number; auditLimit?: number } = {},
 ): Promise<SlackAssessmentResult> {
-  return SLACK_DECISION_CONTEXT.run(new Map(), async () => {
+  return runBatchVerdictContext(SLACK_DECISION_CONTEXT, SLACK_SPEC, async () => {
   const now = client.getNow();
   const days = clampNumber(options.days, DEFAULT_LOOKBACK_DAYS, 1, 365);
   const auditLimit = clampNumber(options.auditLimit, DEFAULT_AUDIT_LIMIT, 1, 9999);

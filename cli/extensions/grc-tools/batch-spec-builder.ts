@@ -510,6 +510,65 @@ export function assertBatchCheckVerdict<T extends string>(
   return expectedStatus;
 }
 
+interface BatchVerdictContextStorage {
+  run<T>(
+    store: Map<string, Readonly<Record<string, unknown>>>,
+    callback: () => T,
+  ): T;
+}
+
+interface BatchVerdictFinding {
+  id: string;
+  status: string;
+}
+
+interface BatchVerdictResult {
+  findings: readonly BatchVerdictFinding[];
+}
+
+function assertBatchResultVerdicts<T>(
+  spec: IntegrationSpecContract,
+  factsByCheck: ReadonlyMap<string, Readonly<Record<string, unknown>>>,
+  result: T,
+): T {
+  const candidate = result as Partial<BatchVerdictResult> | null;
+  if (!candidate || !Array.isArray(candidate.findings)) {
+    throw new Error(`${spec.identity.slug} assessment did not return a findings array`);
+  }
+  for (const finding of candidate.findings) {
+    const facts = factsByCheck.get(finding.id);
+    if (!facts) throw new Error(`${finding.id} has no runtime decision facts`);
+    assertBatchCheckVerdict(spec, finding.id, facts, finding.status);
+  }
+  return result;
+}
+
+/**
+ * Runs one assessment with an isolated fact store, then verifies the final
+ * findings after all legacy partial/truncation decorators have been applied.
+ * The assessment result is returned unchanged.
+ */
+export function runBatchVerdictContext<T>(
+  storage: BatchVerdictContextStorage,
+  spec: IntegrationSpecContract,
+  callback: () => T,
+): T {
+  const factsByCheck = new Map<string, Readonly<Record<string, unknown>>>();
+  return storage.run(factsByCheck, () => {
+    const result = callback();
+    if (
+      typeof result === "object"
+      && result !== null
+      && "then" in result
+      && typeof result.then === "function"
+    ) {
+      return result.then((resolved: unknown) =>
+        assertBatchResultVerdicts(spec, factsByCheck, resolved)) as T;
+    }
+    return assertBatchResultVerdicts(spec, factsByCheck, result);
+  });
+}
+
 export function materializeBatchCheckVerdict(
   spec: IntegrationSpecContract,
   checkId: string,

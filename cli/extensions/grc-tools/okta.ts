@@ -22,7 +22,7 @@ import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -3304,9 +3304,6 @@ function buildFinding(
   },
 ): OktaFinding {
   const definition = OKTA_CHECKS[id];
-  const facts = OKTA_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = assertBatchCheckVerdict(OKTA_SPEC, id, facts, status);
   return {
     id: definition.id,
     title: definition.title,
@@ -3670,7 +3667,7 @@ export function assessOktaAuthentication(
   data: OktaAuthenticationData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const hostname = new URL(config.orgUrl).hostname;
   const isFederalTenant = FEDERAL_ORG_HOST_PATTERN.test(hostname);
@@ -4284,7 +4281,7 @@ export function assessOktaAdminAccess(
   data: OktaAdminAccessData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const privilegedUsers = data.usersWithRoleAssignments.data.map((user) => {
     const userId = asString(user.id) ?? "";
@@ -4727,7 +4724,7 @@ export function assessOktaIntegrations(
   data: OktaIntegrationData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const trustedOrigins = data.trustedOrigins.data.map((origin) => {
     const originUrl =
@@ -5095,7 +5092,7 @@ export function assessOktaMonitoring(
   data: OktaMonitoringData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const activeHooks = data.eventHooks.data.filter(isActiveRecord);
   const activeStreams = data.logStreams.data.filter(isActiveRecord);

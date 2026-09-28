@@ -23,7 +23,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZENDESK_SPEC } from "./zendesk.spec.js";
 
@@ -2376,9 +2376,6 @@ function finding(
   evidence?: JsonRecord,
 ): ZendeskFinding {
   const id = `ZD-${String(control).padStart(2, "0")}`;
-  const facts = ZENDESK_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = assertBatchCheckVerdict(ZENDESK_SPEC, id, facts, status);
   return {
     id,
     control,
@@ -3132,7 +3129,7 @@ export async function assessZendeskAuthentication(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
-  return ZENDESK_DECISION_CONTEXT.run(new Map(), () => assessZendeskAuthenticationWithDecisionContext(client, options));
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskAuthenticationWithDecisionContext(client, options));
 }
 
 interface ApiTokenEventSummary {
@@ -3486,7 +3483,7 @@ export async function assessZendeskAccessControl(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
-  return ZENDESK_DECISION_CONTEXT.run(new Map(), () => assessZendeskAccessControlWithDecisionContext(client, options));
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskAccessControlWithDecisionContext(client, options));
 }
 
 function describeConditions(list: unknown): string[] {
@@ -3784,7 +3781,7 @@ export async function assessZendeskDataProtection(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
-  return ZENDESK_DECISION_CONTEXT.run(new Map(), () => assessZendeskDataProtectionWithDecisionContext(client, options));
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskDataProtectionWithDecisionContext(client, options));
 }
 
 async function assessZendeskIntegrationsWithDecisionContext(
@@ -4138,7 +4135,7 @@ export async function assessZendeskIntegrations(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
-  return ZENDESK_DECISION_CONTEXT.run(new Map(), () => assessZendeskIntegrationsWithDecisionContext(client, options));
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskIntegrationsWithDecisionContext(client, options));
 }
 
 function ensurePrivateDir(pathname: string): void {

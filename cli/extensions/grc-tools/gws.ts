@@ -34,7 +34,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1126,9 +1126,6 @@ function buildFinding(
 ): GwsFinding {
   const definition = GWS_CHECKS[definitionId];
   if (!definition) throw new Error(`Unknown GWS check definition: ${definitionId}`);
-  const facts = GWS_DECISION_CONTEXT.getStore()?.get(definitionId);
-  if (!facts) throw new Error(`${definitionId} has no runtime decision facts`);
-  status = assertBatchCheckVerdict(GWS_SPEC, definitionId, facts, status);
   const finding: GwsFinding = {
     id: definition.id,
     title: definition.title,
@@ -2961,7 +2958,7 @@ export function assessGwsIdentity(
   data: GwsIdentityData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const users = data.users.data;
   const roles = data.roles.data;
   const roleAssignments = data.roleAssignments.data;
@@ -3246,7 +3243,7 @@ export function assessGwsAdminAccess(
   data: GwsAdminAccessData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const users = data.users.data;
   const roles = data.roles.data;
   const roleAssignments = data.roleAssignments.data;
@@ -3524,7 +3521,7 @@ export function assessGwsIntegrations(
   data: GwsIntegrationData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const privileged = getPrivilegedUsers(data.users.data, data.roles.data, data.roleAssignments.data);
   const privilegedIds = new Set(privileged.privilegedUsers.map((user) => asString(user.id)).filter((value): value is string => Boolean(value)));
   const allTokens = data.tokenInventory.data;
@@ -3847,7 +3844,7 @@ export function assessGwsMonitoring(
   data: GwsMonitoringData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const suspiciousLogins = countMatchingEvents(data.loginActivities.data, SUSPICIOUS_LOGIN_NAMES);
   const alerts = bucketAlerts(data.alerts.data);
   const loginStatus = sourceStatus(activitiesEndpoint("login"), data.loginActivities);
