@@ -49,6 +49,9 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     const decisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : batch2GenericDecisionInputs(row.predicate));
     const completenessSources = row.completenessSources
       ?? row.surfaces.map((surfaceId) => batch3Source(surfaceId));
+    const exactCompletenessSemantics = completenessSources.length === 0
+      ? `${row.id} has no automated source dataset; no collection state can establish completeness.`
+      : `For ${row.id}, evidence_complete is true only after ${completenessSources.map((source) => source.surfaceId).join(", ")} each completed and returned every field required by this check. Exact source-state effects: ${completenessSources.map((source) => `${source.surfaceId} sets evidence_complete false on ${source.falseWhen.join(", ") || "no collection state"}`).join("; ")}. Finding previews and exported samples never establish source cardinality.`;
     return {
       id: row.id,
       control: row.control,
@@ -66,8 +69,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       completeness: batch2Completeness(
         decisionInputs,
         completenessSources,
-        row.completenessSemantics
-          ?? `For ${row.id}, evidence_complete is true only when every explicitly named source dataset completed and every required response field was present. Truncated, errored, denied, not-collected, not-configured, and missing-required-field states have the exact per-source effects listed below.`,
+        row.completenessSemantics ?? exactCompletenessSemantics,
       ),
     };
   }));
