@@ -492,12 +492,27 @@ async function countFilesRecursively(rootDir: string): Promise<number> {
   return total;
 }
 
+type WebexCollectionMember = "items" | "sites";
+
 /** Webex list payloads wrap results in `items`; the meeting sites list uses `sites`. */
-function extractItems(payload: unknown): JsonRecord[] {
-  const object = asObject(payload);
-  if (!object) return [];
-  const list = Array.isArray(object.items) ? object.items : Array.isArray(object.sites) ? object.sites : [];
-  return list.map(asObject).filter((item): item is JsonRecord => Boolean(item));
+function extractItems(payload: JsonRecord, collectionMember: WebexCollectionMember, endpoint: string): JsonRecord[] {
+  const list = payload[collectionMember];
+  if (!Array.isArray(list)) {
+    throw new WebexApiError(
+      `Webex response for ${endpoint} did not include the required ${collectionMember} array.`,
+      200,
+      endpoint,
+    );
+  }
+  const items = list.map(asObject);
+  if (items.some((item) => item === undefined)) {
+    throw new WebexApiError(
+      `Webex response for ${endpoint} included a non-object entry in the ${collectionMember} array.`,
+      200,
+      endpoint,
+    );
+  }
+  return items as JsonRecord[];
 }
 
 function webexErrorSummary(payload: unknown): string | undefined {
@@ -512,13 +527,25 @@ function webexErrorSummary(payload: unknown): string | undefined {
   return messages.length > 0 ? messages.join("; ") : undefined;
 }
 
-/** A response body parsed as a JSON object; {} for an empty or non-object JSON body, undefined when the body is not JSON at all. */
+/** A response body parsed as a JSON object, or undefined when it is empty, non-JSON, or another JSON type. */
 function parseJsonObject(rawText: string): JsonRecord | undefined {
-  if (rawText.length === 0) return {};
+  if (rawText.trim().length === 0) return undefined;
   try {
-    return asObject(JSON.parse(rawText)) ?? {};
+    return asObject(JSON.parse(rawText));
   } catch {
     return undefined;
+  }
+}
+
+/** Describes an invalid success body without copying any attacker-controlled body text. */
+function describeInvalidJsonResponse(rawText: string, contentType: string | null): string {
+  if (rawText.trim().length === 0) return "an empty response body";
+  try {
+    const parsed = JSON.parse(rawText);
+    const shape = Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed;
+    return `a JSON ${shape} instead of an object`;
+  } catch {
+    return `non-JSON error body (${contentType ?? "unknown content type"}; ${Buffer.byteLength(rawText, "utf8")} bytes)`;
   }
 }
 
@@ -725,7 +752,7 @@ export class WebexApiClient {
     }
     if (payload === undefined) {
       throw new WebexApiError(
-        `Webex token refresh returned ${describeErrorBody(undefined, rawText, response.headers.get("content-type"))} with status ${response.status}`,
+        `Webex token refresh returned ${describeInvalidJsonResponse(rawText, response.headers.get("content-type"))} with status ${response.status}`,
         response.status,
         WEBEX_ENDPOINTS.tokenRefresh,
       );
@@ -742,7 +769,11 @@ export class WebexApiClient {
     return this.refreshAccessToken();
   }
 
-  private async fetchJson(url: string, attempt = 0): Promise<{ payload: JsonRecord; rawText: string; nextLink: ParsedNextLink }> {
+  private async fetchJson(
+    url: string,
+    attempt = 0,
+    allowPlainText = false,
+  ): Promise<{ payload: JsonRecord; rawText: string; nextLink: ParsedNextLink }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     const endpoint = new URL(url).pathname;
@@ -760,7 +791,7 @@ export class WebexApiClient {
       if (response.status === 429 && attempt < MAX_429_RETRIES) {
         const retryAfterSeconds = asNumber(response.headers.get("retry-after")) ?? 1;
         await this.sleep(Math.min(Math.max(retryAfterSeconds, 1) * 1000, MAX_RETRY_AFTER_MS));
-        return this.fetchJson(url, attempt + 1);
+        return this.fetchJson(url, attempt + 1, allowPlainText);
       }
 
       const rawText = await response.text();
@@ -770,6 +801,13 @@ export class WebexApiClient {
         const detail = describeErrorBody(payload, rawText, response.headers.get("content-type"));
         throw new WebexApiError(
           `Webex request failed (${response.status} ${response.statusText}) for ${endpoint}${detail ? `: ${detail}` : ""}`,
+          response.status,
+          endpoint,
+        );
+      }
+      if (payload === undefined && !allowPlainText) {
+        throw new WebexApiError(
+          `Webex request returned ${describeInvalidJsonResponse(rawText, response.headers.get("content-type"))} for ${endpoint}.`,
           response.status,
           endpoint,
         );
@@ -800,10 +838,11 @@ export class WebexApiClient {
   async list(
     path: string,
     query: JsonRecord = {},
-    options: { limit?: number; pageMax?: number } = {},
+    options: { limit?: number; pageMax?: number; collectionMember?: WebexCollectionMember } = {},
   ): Promise<WebexPage> {
     const limit = clampNumber(options.limit, DEFAULT_GENERIC_LIMIT, 1, 50_000);
     const pageQuery: JsonRecord = options.pageMax === undefined ? {} : { max: clampNumber(options.pageMax, 100, 1, 1000) };
+    const collectionMember = options.collectionMember ?? "items";
     const items: JsonRecord[] = [];
     const visited = new Set<string>();
     let pageCount = 0;
@@ -814,7 +853,7 @@ export class WebexApiClient {
       visited.add(currentUrl);
       const response = await this.fetchJson(currentUrl);
       pageCount += 1;
-      const pageItems = extractItems(response.payload);
+      const pageItems = extractItems(response.payload, collectionMember, new URL(currentUrl).pathname);
       const remaining = limit - items.length;
       items.push(...pageItems.slice(0, remaining));
       if (response.nextLink.kind === "unparseable") {
@@ -875,10 +914,13 @@ export class WebexApiClient {
    * answers with a bare number in a text/plain body.
    */
   async getGuestCount(): Promise<JsonRecord> {
-    const { payload, rawText } = await this.fetchJson(this.buildUrl(WEBEX_ENDPOINTS.guestCount));
+    const { payload, rawText } = await this.fetchJson(this.buildUrl(WEBEX_ENDPOINTS.guestCount), 0, true);
     const fromObject = Object.values(payload).map(asNumber).find((value) => value !== undefined);
     const count = fromObject ?? asNumber(rawText.trim());
-    return { count: count ?? null };
+    if (count === undefined) {
+      throw new WebexApiError("Webex guest count response did not include a numeric count.", 200, WEBEX_ENDPOINTS.guestCount);
+    }
+    return { count };
   }
 
   async listEvents(limit = DEFAULT_EVENT_LIMIT): Promise<WebexPage> {
@@ -909,7 +951,7 @@ export class WebexApiClient {
   }
 
   async listMeetingSites(limit = DEFAULT_GENERIC_LIMIT): Promise<WebexPage> {
-    return this.list(WEBEX_ENDPOINTS.meetingSites, {}, { limit });
+    return this.list(WEBEX_ENDPOINTS.meetingSites, {}, { limit, collectionMember: "sites" });
   }
 
   /**

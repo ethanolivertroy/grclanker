@@ -708,6 +708,94 @@ test("WebexApiClient refreshes an access token through POST /access_token and re
   );
 });
 
+test("WebexApiClient rejects malformed 2xx JSON endpoint bodies instead of treating them as complete", async () => {
+  const malformedBodies = [
+    {
+      name: "HTML",
+      response: () => textResponse("<html>sign in</html>", { headers: { "content-type": "text/html" } }),
+    },
+    {
+      name: "empty",
+      response: () => textResponse(""),
+    },
+    {
+      name: "array",
+      response: () => jsonResponse([]),
+    },
+    {
+      name: "foreign object",
+      response: () => jsonResponse({ status: "ok" }),
+    },
+  ];
+
+  for (const fixture of malformedBodies) {
+    const makeClient = () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async (input) => {
+        const url = new URL(input.toString());
+        return url.pathname === "/v1/guests/count" ? textResponse("0") : fixture.response();
+      },
+    });
+
+    await assert.rejects(
+      () => makeClient().listPeople(),
+      (error) => error instanceof WebexApiError && !error.message.includes("sign in"),
+      `${fixture.name} must not become a complete empty people list`,
+    );
+
+    const access = await checkWebexAccess(makeClient());
+    assert.notEqual(access.status, "healthy", `${fixture.name} must not produce healthy access`);
+    for (const surfaceName of ["organizations", "people", "roles", "licenses", "rooms", "meeting_sites"]) {
+      assert.equal(
+        access.surfaces.find((surface) => surface.name === surfaceName)?.status,
+        "not_readable",
+        `${fixture.name}: ${surfaceName}`,
+      );
+    }
+
+    const identity = await assessWebexIdentity(makeClient());
+    assert.equal(byId(identity.findings, "WEBEX-ID-03").status, "manual", `${fixture.name} must take the unreadable inventory path`);
+    assert.equal(byId(identity.findings, "WEBEX-ID-07").status, "manual", `${fixture.name} must not treat malformed people data as an empty inventory`);
+  }
+});
+
+test("WebexApiClient requires each endpoint's documented collection member and accepts valid empty collections", async () => {
+  const people = await new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [] }),
+  }).listPeople();
+  assert.deepEqual(people, { items: [], truncated: false, pageCount: 1 });
+
+  const sites = await new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ sites: [] }),
+  }).listMeetingSites();
+  assert.deepEqual(sites, { items: [], truncated: false, pageCount: 1 });
+
+  await assert.rejects(
+    () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ sites: [] }),
+    }).listPeople(),
+    /required items array/,
+  );
+  await assert.rejects(
+    () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ items: [] }),
+    }).listMeetingSites(),
+    /required sites array/,
+  );
+  await assert.rejects(
+    () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ items: {} }),
+    }).listPeople(),
+    /required items array/,
+  );
+});
+
+test("WebexApiClient preserves the text/plain guest count response", async () => {
+  const client = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => textResponse("112"),
+  });
+  assert.deepEqual(await client.getGuestCount(), { count: 112 });
+});
+
 test("WebexApiClient stops an empty page that still advertises a next link", async () => {
   const seen = [];
   const fetchImpl = async (input, init = {}) => {
