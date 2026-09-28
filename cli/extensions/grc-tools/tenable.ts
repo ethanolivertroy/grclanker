@@ -2991,7 +2991,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       return fact(assets, categories === 0 && evidence.tag_categories_truncated !== true || ratio < threshold ? 1 : 0, complete ? 0 : 1, complete);
     }
     case "TENABLE-17":
-      return fact(1, count("enabled_recurring_compliance_scans") === 0 ? 1 : 0, 0);
+      return fact(1, count("enabled_recurring_compliance_scans") === 0 ? 1 : 0, evidence.caller_is_administrator === true ? 0 : 1, evidence.caller_is_administrator === true);
     case "TENABLE-18": {
       const events = value("event_count") ?? 0;
       return fact(events, 0, events === 0 ? 1 : count("sensitive_events") + (evidence.inventory_truncated === true ? 1 : 0), evidence.inventory_truncated !== true);
@@ -3003,8 +3003,11 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const complete = evidence.vuln_export_jobs_listed !== null && evidence.asset_export_jobs_listed !== null;
       return fact(jobs, 0, days < 2 || !complete ? 1 : 0, complete);
     }
-    case "TENABLE-20":
-      return fact(value("target_group_count") ?? 0, 0, count("stale_or_undated_groups", "overlapping_targets"));
+    case "TENABLE-20": {
+      const groups = value("target_group_count") ?? 0;
+      const nonAdministrator = evidence.caller_is_administrator !== true;
+      return fact(groups === 0 && nonAdministrator ? 1 : groups, 0, count("stale_or_undated_groups", "overlapping_targets") + (nonAdministrator ? 1 : 0), !nonAdministrator);
+    }
     default:
       return {};
   }
@@ -3017,9 +3020,10 @@ function finding(
   summary: string,
   evidence: JsonRecord = {},
   idSuffix = "",
+  decisionContext: JsonRecord = {},
 ): TenableFinding {
   const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
-  const facts = tenableDecisionFacts(id, evidence);
+  const facts = tenableDecisionFacts(id, { ...evidence, ...decisionContext });
   const result: TenableFindingWithFacts = {
     id,
     title: CONTROL_TITLES[control] + (idSuffix ? " (Tenable Security Center)" : ""),
@@ -3103,11 +3107,9 @@ function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>)
     records_total: readable ? dataset.total ?? null : null,
   };
   const previousFacts = (item as TenableFindingWithFacts)[TENABLE_DECISION_FACTS] ?? {};
-  const facts = !readable
-    ? {}
-    : dataset.truncated
-      ? { ...previousFacts, evidence_complete: false }
-      : previousFacts;
+  const facts = dataset.truncated
+    ? { ...previousFacts, evidence_complete: false }
+    : previousFacts;
   const status = item.id.endsWith("-SC")
     ? item.status
     : evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, item.id, facts) as TenableFindingStatus;
@@ -3601,6 +3603,8 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
           enabled_recurring_compliance_scans: activeCompliance.length,
           compliance_templates_available: data.templates.data.filter(templateLooksCompliance).map((template) => asString(template.title) ?? asString(template.name)).slice(0, 50),
         },
+        "",
+        { caller_is_administrator: callerIsAdministrator },
       ));
     }
   }
@@ -3703,6 +3707,8 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
         stale_or_undated_groups: stale.map((group) => asString(group.name)).slice(0, 50),
         overlapping_targets: overlapping.slice(0, 25).map(([member, owners]) => ({ member, groups: owners })),
       },
+      "",
+      { caller_is_administrator: callerIsAdministrator },
     ));
   }
 
