@@ -553,9 +553,9 @@ const CONFIG_FILE_OPTIONS = { label: "Zscaler" } as const;
  * Reads and parses the config file through the shared loader, which interpolates neither library message: the YAML
  * parser quotes the offending source line, which for a malformed `apiKey:` line is the credential itself, and the
  * filesystem message carries its own wording and the path. The thrown text is fixed, plus the path, the parser's
- * structured position and code when it gives them, and the system error code when the read failed. The caller has
- * already checked the path exists, so the missing-file result is a race with a deletion and is reported as the read
- * failure it is.
+ * structured position and code when it gives them, and the system error code when the read failed. Explicit paths
+ * are always read, so a missing user-selected file is reported as a configuration error. The optional default is
+ * checked before reading, while a deletion after that check is still reported as the read failure it is.
  */
 function readConfigFile(pathname: string): JsonRecord {
   const read = readYamlConfig(pathname, CONFIG_FILE_OPTIONS);
@@ -600,15 +600,16 @@ function mergeOverlays(layers: Array<{ name: string; overlay: ConfigOverlay }>):
 export function resolveZscalerConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
+  homeDir: string = homedir(),
 ): ZscalerResolvedConfig {
-  const configFile = asString(input.config_file)
-    ?? asString(env.ZSCALER_CONFIG_FILE)
-    ?? (existsSync(join(homedir(), ".zscaler", "zscaler.yaml")) ? join(homedir(), ".zscaler", "zscaler.yaml") : undefined);
+  const explicitConfigFile = asString(input.config_file) ?? asString(env.ZSCALER_CONFIG_FILE);
+  const configFile = explicitConfigFile ?? join(homeDir, ".zscaler", "zscaler.yaml");
+  const loadConfigFile = explicitConfigFile !== undefined || existsSync(configFile);
   const layers = [
     { name: "arguments", overlay: overlayFromArgs(input) },
     { name: "environment", overlay: overlayFromEnv(env) },
   ];
-  if (configFile && existsSync(configFile)) {
+  if (loadConfigFile) {
     layers.push({ name: "config-file", overlay: overlayFromConfigFile(configFile) });
   }
   const { merged, sourceChain } = mergeOverlays(layers);
@@ -658,7 +659,7 @@ export function resolveZscalerConfiguration(
     timeoutMs: parseTimeoutSeconds(merged.timeoutSeconds),
     maxRetries: clampNumber(merged.maxRetries, DEFAULT_MAX_RETRIES, 0, 10),
     sourceChain: [...new Set(sourceChain)],
-    configFile: configFile && existsSync(configFile) ? configFile : undefined,
+    configFile: loadConfigFile ? configFile : undefined,
   };
 }
 
