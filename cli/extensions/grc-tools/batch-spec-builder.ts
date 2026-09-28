@@ -713,6 +713,10 @@ export function evaluateBatchRuntimeCheckVerdict(
   const declaredFacts = Object.fromEntries(
     Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
   );
+  BATCH_DECISION_CAPTURE.getStore()?.push({
+    integration: spec.identity.slug,
+    checks: new Map([[checkId, declaredFacts]]),
+  });
   return evaluateCheckVerdict(check, declaredFacts);
 }
 

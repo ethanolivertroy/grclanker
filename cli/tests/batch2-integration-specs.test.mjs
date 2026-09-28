@@ -125,19 +125,19 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
         for (const source of contract.sources) {
           assert.ok(entry.sourceSurfaceIds.includes(source.surfaceId), `${entry.id}.${inputName}: ${source.surfaceId}`);
           assert.equal(new Set(source.falseWhen).size, source.falseWhen.length);
-          assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected"].includes(mode)));
+          assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected", "missing-required-field"].includes(mode)));
         }
         const rendered = entry.evidenceFieldDefinitions[inputName];
         assert.match(rendered, new RegExp(`For ${entry.id},`));
         assert.match(rendered, /Exact source-state effects:/);
         assert.match(rendered, new RegExp(contract.semantics.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-        assert.doesNotMatch(rendered, /all check-specific pages|check-specific source and precedence semantics/);
+        assert.doesNotMatch(rendered, /all check-specific pages|check-specific source and precedence semantics|capForUnreadableAll|currently designated|preserved current behavior/);
       }
     }
   }
   assert.equal(checksWithCompleteness, 156);
   assert.equal(completenessFields, 156);
-  assert.equal(sourceEntries, 198);
+  assert.equal(sourceEntries, 244);
 
   assert.deepEqual(check(AZURE_SPEC, "AZURE-MON-06").completeness.complete.sources, [
     { surfaceId: "diagnostic-settings", falseWhen: [] },
@@ -154,10 +154,11 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   ]);
   assert.equal(check(OCI_SPEC, "OCI-IAM-01").completeness, undefined);
   assert.deepEqual(check(PALOALTO_SPEC, "PA-21").completeness.evidence_complete.sources.map((source) => source.surfaceId), [
-    "prisma-cspm", "panos-configuration",
+    "prisma-policies", "panos-policy-config",
   ]);
-  assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /location inventory.*SSL-rule truncation/);
-  assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /capForUnreadableAll.*truncation exceptions/);
+  assert.match(check(PALOALTO_SPEC, "PA-19").completeness.evidence_complete.semantics, /unconfigured product is omitted from the gate/);
+  assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /zia-ssl-inspection-rules: truncation leaves evidence_complete true/);
+  assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /zia-security-allowlist: truncation leaves evidence_complete true; an error, 403 denial, or not-collected read makes evidence_complete false/);
 });
 
 test("batch 2 threshold metadata is exhaustive and renders immutable defaults", () => {

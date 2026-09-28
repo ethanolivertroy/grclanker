@@ -27,20 +27,91 @@ export const PALOALTO_DEFAULT_MAX_CRITICAL_CVES = 0;
 export const PALOALTO_DEFAULT_MIN_HOST_COMPLIANCE_RATE = 90;
 export const PALOALTO_DEFAULT_MAX_SUPERUSERS = 3;
 export const PALOALTO_DEFAULT_MIN_COMPLIANCE_PASS_RATE = 90;
+const COMPUTE_DOCS = "https://pan.dev/compute/api/";
+const prismaSurface = (id: string, path: string, fields: readonly string[]) =>
+  restSurface(id, path, "Prisma Cloud CSPM", PRISMA_DOCS, fields);
+const computeSurface = (id: string, path: string, fields: readonly string[]) =>
+  restSurface(id, path, "Prisma Cloud Compute", COMPUTE_DOCS, fields);
+const panosConfigSurface = (id: string, xpath: string, fields: readonly string[]) =>
+  restSurface(id, `/api/?type=config&action=get&xpath=${xpath}`, "PAN-OS XML API", PANOS_DOCS, fields);
 const surfaces = [
-  restSurface("prisma-cspm", "/{compliance|alert|policy|cloud|user|integration} read endpoints", "Prisma Cloud CSPM", PRISMA_DOCS, ["compliance", "severity", "status", "policy", "cloudAccount", "role", "integration"]),
-  restSurface("prisma-compute", "/api/v1/{defenders|policies|registry|stats|cloud-discovery|ci-scans}", "Prisma Cloud Compute", "https://pan.dev/compute/api/", ["rules", "collections", "effect", "status", "specifications", "vulnerabilities"]),
-  restSurface("panos-operational", "/api/?type=op&cmd={system-info|high-availability}", "PAN-OS XML API", PANOS_DOCS, ["hostname", "sw-version", "app-version", "threat-version", "ha"]),
-  restSurface("panos-configuration", "/api/?type=config&action=get&xpath={configuration subtree}", "PAN-OS XML API", PANOS_DOCS, ["security rules", "zones", "decryption rules", "profiles", "administrators", "logging", "deviceconfig"]),
+  prismaSurface("prisma-compliance-posture", "/compliance/posture", ["summary.passedResources", "summary.failedResources", "summary.totalResources", "complianceDetails"]),
+  prismaSurface("prisma-alert-rules", "/alert/rule", ["name", "enabled", "alertRuleNotificationConfig"]),
+  prismaSurface("prisma-open-alerts", "/alert", ["policy", "policyId", "policyType", "severity", "status"]),
+  prismaSurface("prisma-policies", "/policy", ["name", "policyType", "severity", "enabled", "labels", "description"]),
+  prismaSurface("prisma-cloud-accounts", "/cloud", ["name", "enabled", "groups", "groupIds", "status"]),
+  prismaSurface("prisma-account-groups", "/cloud/group", ["id", "name"]),
+  prismaSurface("prisma-user-roles", "/user/role", ["name", "roleType"]),
+  prismaSurface("prisma-integrations", "/integration", ["name", "integrationType"]),
+  computeSurface("compute-vulnerability-image-policy", "/api/v1/policies/vulnerability/images", ["rules", "effect", "disabled"]),
+  computeSurface("compute-images", "/api/v1/images", ["id", "repoTag", "scanTime", "vulnerabilityDistribution"]),
+  computeSurface("compute-vulnerability-stats", "/api/v1/stats/vulnerabilities", ["images", "registryImages", "containers", "hosts", "functions"]),
+  computeSurface("compute-compliance-host-policy", "/api/v1/policies/compliance/host", ["rules", "effect", "disabled"]),
+  computeSurface("compute-compliance-container-policy", "/api/v1/policies/compliance/container", ["rules", "effect", "disabled"]),
+  computeSurface("compute-compliance-stats", "/api/v1/stats/compliance", ["rules", "categories", "failed", "total"]),
+  computeSurface("compute-defenders", "/api/v1/defenders", ["hostname", "connected", "lastModified", "version"]),
+  computeSurface("compute-runtime-container-policy", "/api/v1/policies/runtime/container", ["rules", "processes", "network", "filesystem", "dns"]),
+  computeSurface("compute-registry-settings", "/api/v1/settings/registry", ["specifications", "registry", "repository", "cap", "scanners"]),
+  computeSurface("compute-registry-scans", "/api/v1/registry", ["scanTime", "repoTag"]),
+  computeSurface("compute-cloud-discovery", "/api/v1/cloud/discovery", ["provider", "serviceType", "total", "defended", "err"]),
+  computeSurface("compute-ci-scans", "/api/v1/scans", ["time", "pass"]),
+  panosConfigSurface("panos-policy-config", "{/vsys|/device-group|/config/shared}", ["security rules", "default security rules", "decryption rules", "security profiles", "profile groups"]),
+  panosConfigSurface("panos-zone-config", "{/network|/template}", ["zones", "zone-protection-profile"]),
+  panosConfigSurface("panos-device-config", "{/deviceconfig|/mgt-config|/config/shared|/template|/config/panorama}", ["administrators", "password complexity", "logging", "system settings", "Panorama forwarding"]),
+  panosConfigSurface("panos-globalprotect-config", "{/vsys|/network|/template|/config/shared}", ["GlobalProtect portals", "GlobalProtect gateways", "authentication profiles", "multi-factor-auth"]),
+  restSurface("panos-ha-state", "/api/?type=op&cmd=show high-availability state", "PAN-OS XML API", PANOS_DOCS, ["enabled", "state"]),
 ] as const;
 
-const PALOALTO_COMPLETENESS_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
-const paloaltoCompletenessSources = (
-  sourceIds: readonly string[],
-): readonly BatchCompletenessSourceDefinition[] => sourceIds.map((surfaceId) => ({
-  surfaceId,
-  falseWhen: PALOALTO_COMPLETENESS_FAILURE_MODES,
-}));
+const PF = ["error", "denied", "not-collected", "missing-required-field"] as const;
+const PTF = ["truncated", "error", "denied", "not-collected", "missing-required-field"] as const;
+const PE = ["error", "denied", "not-collected"] as const;
+type PaloaltoCompletenessEntry = BatchCompletenessSourceDefinition & {
+  product: "cspm" | "compute" | "panos";
+};
+const paloaltoSource = (
+  surfaceId: string,
+  falseWhen: BatchCompletenessSourceDefinition["falseWhen"],
+  product: PaloaltoCompletenessEntry["product"],
+): PaloaltoCompletenessEntry => ({ surfaceId, falseWhen, product });
+
+export const PALOALTO_COMPLETENESS_SOURCES: Readonly<Record<string, readonly PaloaltoCompletenessEntry[]>> = {
+  "PA-01": [paloaltoSource("prisma-compliance-posture", PF, "cspm")],
+  "PA-02": [paloaltoSource("prisma-alert-rules", PF, "cspm"), paloaltoSource("prisma-open-alerts", PTF, "cspm")],
+  "PA-03": [paloaltoSource("prisma-policies", PF, "cspm"), paloaltoSource("prisma-open-alerts", PTF, "cspm")],
+  "PA-04": [paloaltoSource("prisma-cloud-accounts", PF, "cspm"), paloaltoSource("prisma-account-groups", PF, "cspm")],
+  "PA-05": [paloaltoSource("prisma-policies", PF, "cspm"), paloaltoSource("prisma-open-alerts", PTF, "cspm")],
+  "PA-06": [paloaltoSource("prisma-policies", PF, "cspm"), paloaltoSource("prisma-open-alerts", PTF, "cspm")],
+  "PA-07": [paloaltoSource("compute-vulnerability-image-policy", PTF, "compute"), paloaltoSource("compute-images", PTF, "compute"), paloaltoSource("compute-vulnerability-stats", PTF, "compute")],
+  "PA-08": [paloaltoSource("compute-compliance-host-policy", PTF, "compute"), paloaltoSource("compute-compliance-container-policy", PTF, "compute"), paloaltoSource("compute-compliance-stats", PTF, "compute"), paloaltoSource("compute-defenders", PTF, "compute")],
+  "PA-09": [paloaltoSource("compute-runtime-container-policy", PTF, "compute"), paloaltoSource("compute-defenders", PTF, "compute")],
+  "PA-10": [paloaltoSource("compute-defenders", PTF, "compute")],
+  "PA-11": [paloaltoSource("compute-registry-settings", PTF, "compute"), paloaltoSource("compute-registry-scans", PTF, "compute")],
+  "PA-12": [paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-13": [paloaltoSource("panos-zone-config", PE, "panos"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-14": [paloaltoSource("panos-policy-config", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos")],
+  "PA-15": [paloaltoSource("panos-globalprotect-config", PE, "panos")],
+  "PA-16": [paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-17": [paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-18": [paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-19": [paloaltoSource("prisma-user-roles", PF, "cspm"), paloaltoSource("panos-device-config", PE, "panos")],
+  "PA-20": [paloaltoSource("prisma-integrations", PF, "cspm"), paloaltoSource("panos-policy-config", PE, "panos"), paloaltoSource("panos-device-config", PE, "panos")],
+  "PA-21": [paloaltoSource("prisma-policies", PF, "cspm"), paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-22": [paloaltoSource("panos-policy-config", PE, "panos")],
+  "PA-23": [paloaltoSource("panos-device-config", PE, "panos"), paloaltoSource("panos-ha-state", PE, "panos")],
+  "PA-24": [paloaltoSource("compute-cloud-discovery", PTF, "compute")],
+  "PA-25": [paloaltoSource("compute-ci-scans", PTF, "compute")],
+};
+
+function paloaltoCompletenessSemantics(id: string): string {
+  const entries = PALOALTO_COMPLETENESS_SOURCES[id];
+  if (!entries) throw new Error(`${id} has no completeness source contract`);
+  const products = [...new Set(entries.map((entry) => entry.product))];
+  const sources = entries.map((entry) => `${entry.surfaceId}: ${entry.falseWhen.join(", ")} make evidence_complete false`).join("; ");
+  const configurationEffect = products.length === 1
+    ? `The ${products[0]} product not configured makes the finding manual and omits evidence_complete.`
+    : "Only configured products participate: an unconfigured product is omitted from the gate and does not make evidence_complete false when the other product is configured; configuring neither product makes the finding manual and omits evidence_complete.";
+  return `For ${id}, ${configurationEffect} Exact configured-source effects: ${sources}.`;
+}
 
 const titles = [
   "CSPM compliance posture",
@@ -75,13 +146,6 @@ function owner(control: number): string {
   if (control <= 14) return "paloalto_assess_firewall_policy";
   if ([16, 17, 18, 21, 22].includes(control)) return "paloalto_assess_threat_prevention";
   return "paloalto_assess_device_hardening";
-}
-
-function sourceSurfaces(control: number): readonly string[] {
-  if (control <= 6 || control >= 24) return ["prisma-cspm"];
-  if (control <= 11) return ["prisma-compute"];
-  if ([21].includes(control)) return ["prisma-cspm", "panos-configuration"];
-  return control === 23 ? ["panos-operational", "panos-configuration"] : ["panos-configuration"];
 }
 
 const severities: readonly Batch2CheckRow["severity"][] = [
@@ -301,6 +365,7 @@ function paloaltoDecision(control: number): Partial<Pick<Batch2CheckRow, "decisi
 
 const checks = batch2Checks(titles.map((title, index) => {
   const control = index + 1;
+  const id = `PA-${String(control).padStart(2, "0")}`;
   const genericDecisionInputs = batch2GenericDecisionInputs(decisionPredicate[index]);
   const decisionRules = control === 10 || control === 25
     ? [
@@ -318,9 +383,10 @@ const checks = batch2Checks(titles.map((title, index) => {
         review_count: genericDecisionInputs.review_count,
       }
     : genericDecisionInputs);
-  const sourceIds = sourceSurfaces(control);
+  const completenessSources = PALOALTO_COMPLETENESS_SOURCES[id];
+  const sourceIds = completenessSources.map((source) => source.surfaceId);
   return {
-    id: `PA-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title,
     severity: severities[index],
@@ -337,8 +403,8 @@ const checks = batch2Checks(titles.map((title, index) => {
     ...custom,
     completeness: batch2Completeness(
       decisionInputs,
-      paloaltoCompletenessSources(sourceIds),
-      `true for ${title} only when every configured Prisma product inventory and PAN-OS device dependency named by the listed surfaces is collected without truncation, error, denial, or omission.`,
+      completenessSources.map(({ surfaceId, falseWhen }) => ({ surfaceId, falseWhen })),
+      paloaltoCompletenessSemantics(id),
     ),
     decision: `${decisionPredicate[index]} Unreadable configured-product evidence remains manual, a proved violation has first-match precedence, and partial evidence cannot pass.`,
   };
@@ -361,8 +427,8 @@ export const PALOALTO_SPEC = buildBatchIntegrationSpec({
   baseServices: ["Prisma Cloud CSPM", "Prisma Cloud Compute", "PAN-OS XML API"],
   authentication: PALOALTO_AUTH_RESOLVER,
   permissions: [
-    { id: "prisma-read-role", kind: "role", value: "Prisma Cloud read access to compliance, alerts, policies, accounts, roles, integrations, and configured Compute surfaces", unlocks: ["prisma-cspm", "prisma-compute"] },
-    { id: "panos-read-role", kind: "role", value: "PAN-OS XML API operational and configuration read access", unlocks: ["panos-operational", "panos-configuration"] },
+    { id: "prisma-read-role", kind: "role", value: "Prisma Cloud read access to compliance, alerts, policies, accounts, roles, integrations, and configured Compute surfaces", unlocks: surfaces.filter((surface) => surface.id.startsWith("prisma-") || surface.id.startsWith("compute-")).map((surface) => surface.id) },
+    { id: "panos-read-role", kind: "role", value: "PAN-OS XML API operational and configuration read access", unlocks: surfaces.filter((surface) => surface.id.startsWith("panos-")).map((surface) => surface.id) },
   ],
   surfaces,
   checks,
@@ -375,7 +441,7 @@ export const PALOALTO_SPEC = buildBatchIntegrationSpec({
     paloalto_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [{
-    surfaceIds: ["prisma-cspm", "prisma-compute"],
+    surfaceIds: surfaces.filter((surface) => surface.id.startsWith("prisma-") || surface.id.startsWith("compute-")).map((surface) => surface.id),
     cursorFields: ["offset", "limit", "total", "next"],
     pageSize: null,
     itemCap: null,

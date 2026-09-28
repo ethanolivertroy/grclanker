@@ -31,6 +31,8 @@ import {
   resolveZpaBaseUrl,
   resolveZscalerConfiguration,
 } from "../dist/extensions/grc-tools/zscaler.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC } from "../dist/extensions/grc-tools/zscaler.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import {
   byteDifferentialEnabled,
@@ -743,6 +745,130 @@ function zpaFixture(overrides = {}) {
 }
 
 const ZPA_CONTROL_IDS = ["ZS-08", "ZS-09", "ZS-10", "ZS-11", "ZS-12", "ZS-13", "ZS-15", "ZS-21", "ZS-22", "ZS-23", "ZS-24"];
+
+const ZSCALER_SOURCE_DATASETS = {
+  "zia-admin-users": ["access", "adminUsers"],
+  "zia-admin-roles": ["access", "adminRoles"],
+  "zia-auth-settings": ["access", "authSettings"],
+  "zia-password-expiry": ["access", "passwordExpiry"],
+  "zia-audit-log-report": ["access", "auditLogReport"],
+  "zia-nss-feeds": ["access", "nssFeeds"],
+  "zia-url-filtering-rules": ["policy", "urlFilteringRules"],
+  "zia-firewall-rules": ["policy", "firewallRules"],
+  "zia-dlp-engines": ["policy", "dlpEngines"],
+  "zia-dlp-dictionaries": ["policy", "dlpDictionaries"],
+  "zia-web-dlp-rules": ["policy", "webDlpRules"],
+  "zia-ssl-inspection-rules": ["policy", "sslInspectionRules"],
+  "zia-ssl-exempted-urls": ["policy", "sslExemptedUrls"],
+  "zia-sandbox-rules": ["policy", "sandboxRules"],
+  "zia-sandbox-settings": ["policy", "sandboxSettings"],
+  "zia-advanced-threat-settings": ["policy", "advancedThreatSettings"],
+  "zia-malware-policy": ["policy", "malwarePolicy"],
+  "zia-malware-settings": ["policy", "malwareSettings"],
+  "zia-security-allowlist": ["policy", "securityAllowlist"],
+  "zia-security-denylist": ["policy", "securityDenylist"],
+  "zia-locations": ["policy", "locations"],
+  "zia-sub-locations": ["policy", "subLocations"],
+  "zia-gre-tunnels": ["policy", "greTunnels"],
+  "zia-vpn-credentials": ["policy", "vpnCredentials"],
+  "zia-bandwidth-rules": ["policy", "bandwidthRules"],
+  "zia-isolation-profiles": ["policy", "isolationProfiles"],
+  "zia-cloud-app-rules": ["policy", "cloudAppRules"],
+  "zia-dns-rules": ["policy", "dnsRules"],
+  "zpa-application-segments": ["zpa", "applicationSegments"],
+  "zpa-segment-groups": ["zpa", "segmentGroups"],
+  "zpa-access-rules": ["zpa", "accessRules"],
+  "zpa-timeout-rules": ["zpa", "timeoutRules"],
+  "zpa-forwarding-rules": ["zpa", "forwardingRules"],
+  "zpa-app-connector-groups": ["zpa", "appConnectorGroups"],
+  "zpa-app-connectors": ["zpa", "appConnectors"],
+  "zpa-service-edge-groups": ["zpa", "serviceEdgeGroups"],
+  "zpa-service-edges": ["zpa", "serviceEdges"],
+  "zpa-posture-profiles": ["zpa", "postureProfiles"],
+  "zpa-trusted-networks": ["zpa", "trustedNetworks"],
+  "zpa-idp-controllers": ["zpa", "idpControllers"],
+  "zpa-saml-attributes": ["zpa", "samlAttributes"],
+  "zpa-scim-groups": ["zpa", "scimGroups"],
+  "zpa-enrollment-certificates": ["zpa", "enrollmentCertificates"],
+  "zpa-browser-access-certificates": ["zpa", "browserAccessCertificates"],
+  "zpa-emergency-access-users": ["zpa", "emergencyAccessUsers"],
+  "zpa-administrators": ["zpa", "administrators"],
+};
+
+function zscalerFactsByCheck(captures) {
+  const facts = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, ZSCALER_SPEC.identity.slug);
+    for (const [id, values] of capture.checks) facts.set(id, values);
+  }
+  return facts;
+}
+
+async function captureZscalerCompleteness(fixtures) {
+  const { captures } = await captureBatchDecisionFacts(() => {
+    assessZiaAccessControlData(fixtures.access);
+    assessZiaPolicyData(fixtures.policy);
+    assessZpaData(fixtures.zpa);
+  });
+  return zscalerFactsByCheck(captures);
+}
+
+test("all 25 Zscaler checks replay every declared source failure mode against constructed decision facts", async () => {
+  const makeFixtures = () => {
+    const access = accessControlFixture();
+    access.adminUsers = readable(access.adminUsers.data.map((admin, index) => (
+      index === 0 ? { ...admin, isPasswordLoginAllowed: true } : admin
+    )));
+    return { access, policy: policyFixture(), zpa: zpaFixture() };
+  };
+  const baseline = await captureZscalerCompleteness(makeFixtures());
+  assert.equal(baseline.size, 25);
+  for (const check of ZSCALER_SPEC.checks) {
+    assert.equal(baseline.get(check.id)?.evidence_complete, true, `${check.id}: baseline complete`);
+  }
+
+  let replays = 0;
+  const modes = ["truncated", "error", "denied", "not-collected"];
+  for (const [checkId, sources] of Object.entries(ZSCALER_COMPLETENESS_SOURCES)) {
+    for (const source of sources) {
+      const [area, key] = ZSCALER_SOURCE_DATASETS[source.surfaceId] ?? [];
+      assert.ok(area && key, `${checkId}: fixture mapping for ${source.surfaceId}`);
+      for (const mode of modes) {
+        const fixtures = makeFixtures();
+        const original = fixtures[area][key];
+        fixtures[area][key] = mode === "truncated"
+          ? { ...original, truncated: true, seen: 1, total: 2 }
+          : {
+              data: Array.isArray(original.data) ? [] : {},
+              error: mode === "denied" ? "403 Forbidden" : mode === "not-collected" ? "not collected after prerequisite failure" : "500 read failed",
+              ...(mode === "denied" ? { statusCode: 403 } : {}),
+            };
+        const facts = await captureZscalerCompleteness(fixtures);
+        const actual = facts.get(checkId)?.evidence_complete;
+        if (source.falseWhen.includes(mode)) {
+          assert.equal(actual, false, `${checkId}/${source.surfaceId}/${mode}`);
+        } else if (mode !== "truncated" && source.role === "primary") {
+          assert.equal(actual, undefined, `${checkId}/${source.surfaceId}/${mode}: primary read makes completeness unavailable`);
+        } else {
+          assert.equal(actual, true, `${checkId}/${source.surfaceId}/${mode}: source does not lower completeness`);
+        }
+        replays += 1;
+      }
+    }
+  }
+  assert.equal(replays, 216);
+
+  const { captures } = await captureBatchDecisionFacts(async () => {
+    await assessZiaAccessControl(undefined);
+    await assessZiaPolicy(undefined);
+    await assessZpa(undefined);
+  });
+  const notConfigured = zscalerFactsByCheck(captures);
+  assert.equal(notConfigured.size, 25);
+  for (const check of ZSCALER_SPEC.checks) {
+    assert.equal(notConfigured.get(check.id)?.evidence_complete, undefined, `${check.id}: not configured omits completeness`);
+  }
+});
 
 test("assessZpa: compliant tenant passes every automatable ZPA control", () => {
   const result = assessZpaData(zpaFixture());

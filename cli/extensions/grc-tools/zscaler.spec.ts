@@ -33,28 +33,121 @@ export const ZSCALER_REQUIRED_ATP_FLAGS = [
   "suspectedPhishingSitesBlocked", "browserExploitsBlocked", "potentialMaliciousRequestsBlocked",
 ] as const;
 export const ZSCALER_REQUIRED_MALWARE_FLAGS = ["virusBlocked", "trojanBlocked", "wormBlocked", "ransomwareBlocked", "spywareBlocked"] as const;
+const ziaSurface = (id: string, path: string, fields: readonly string[]) =>
+  restSurface(id, `/api/v1${path}`, "ZIA API", ZIA_DOCS, fields);
+const zpaSurface = (id: string, path: string, fields: readonly string[]) =>
+  restSurface(id, `/mgmtconfig/v1/admin/customers/{customerId}${path}`, "ZPA API", ZPA_DOCS, fields);
 const surfaces = [
-  restSurface("zia-administration", "/api/v1/{adminUsers|adminRoles|authSettings|auditLogFeeds}", "ZIA API", ZIA_DOCS, ["id", "loginName", "role", "adminScope", "mfa", "status"]),
-  restSurface("zia-policy", "/api/v1/{urlFilteringRules|firewallFilteringRules|dlpEngines|sslInspectionRules|sandboxRules|locations}", "ZIA API", ZIA_DOCS, ["id", "name", "state", "action", "rank", "order", "destinations", "locations"]),
-  restSurface("zpa-policy", "/mgmtconfig/v1/admin/customers/{customerId}/{application|policy|posture|connector|idp|admin|certificate} resources", "ZPA API", ZPA_DOCS, ["id", "name", "enabled", "operator", "action", "health", "modifiedTime", "expirationDate"]),
+  ziaSurface("zia-admin-users", "/adminUsers", ["id", "loginName", "role", "adminScope", "disabled", "isPasswordLoginAllowed"]),
+  ziaSurface("zia-admin-roles", "/adminRoles/lite", ["id", "name", "roleType"]),
+  ziaSurface("zia-auth-settings", "/authSettings", ["samlEnabled"]),
+  ziaSurface("zia-password-expiry", "/passwordExpiry/settings", ["passwordExpirationEnabled", "passwordExpiryDays"]),
+  ziaSurface("zia-audit-log-report", "/auditlogEntryReport", ["status", "statusId"]),
+  ziaSurface("zia-nss-feeds", "/nssFeeds", ["id", "name", "feedStatus", "nssLogType"]),
+  ziaSurface("zia-url-filtering-rules", "/urlFilteringRules", ["id", "name", "state", "action", "urlCategories"]),
+  ziaSurface("zia-firewall-rules", "/firewallFilteringRules", ["id", "name", "state", "action", "defaultRule", "enableFullLogging"]),
+  ziaSurface("zia-dlp-engines", "/dlpEngines", ["id", "name"]),
+  ziaSurface("zia-dlp-dictionaries", "/dlpDictionaries", ["id", "name"]),
+  ziaSurface("zia-web-dlp-rules", "/webDlpRules", ["id", "name", "state", "action", "dlpEngines", "withoutContentInspection"]),
+  ziaSurface("zia-ssl-inspection-rules", "/sslInspectionRules", ["id", "name", "state", "action", "urlCategories", "locations"]),
+  ziaSurface("zia-ssl-exempted-urls", "/sslSettings/exemptedUrls", ["urls"]),
+  ziaSurface("zia-sandbox-rules", "/sandboxRules", ["id", "name", "state", "baRuleAction", "firstTimeEnable", "firstTimeOperation"]),
+  ziaSurface("zia-sandbox-settings", "/behavioralAnalysisAdvancedSettings", ["md5HashValueList"]),
+  ziaSurface("zia-advanced-threat-settings", "/cyberThreatProtection/advancedThreatSettings", [...ZSCALER_REQUIRED_ATP_FLAGS, "dgaDomainsBlocked"]),
+  ziaSurface("zia-malware-policy", "/cyberThreatProtection/malwarePolicy", ["blockUnscannableFiles", "blockPasswordProtectedArchiveFiles"]),
+  ziaSurface("zia-malware-settings", "/cyberThreatProtection/malwareSettings", ZSCALER_REQUIRED_MALWARE_FLAGS),
+  ziaSurface("zia-security-allowlist", "/security", ["whitelistUrls"]),
+  ziaSurface("zia-security-denylist", "/security/advanced", ["blacklistUrls"]),
+  ziaSurface("zia-locations", "/locations", ["id", "name", "authRequired", "sslScanEnabled", "ofwEnabled"]),
+  ziaSurface("zia-sub-locations", "/locations/{locationId}/sublocations", ["id", "name", "authRequired", "sslScanEnabled", "ofwEnabled"]),
+  ziaSurface("zia-gre-tunnels", "/greTunnels", ["id", "name"]),
+  ziaSurface("zia-vpn-credentials", "/vpnCredentials", ["id", "name"]),
+  ziaSurface("zia-bandwidth-rules", "/bandwidthControlRules", ["id", "name", "state", "minBandwidth", "maxBandwidth"]),
+  ziaSurface("zia-isolation-profiles", "/browserIsolation/profiles", ["id", "name"]),
+  ziaSurface("zia-cloud-app-rules", "/webApplicationRules/{ruleType}", ["id", "name", "state", "actions", "ruleType"]),
+  ziaSurface("zia-dns-rules", "/firewallDnsRules", ["id", "name", "state", "action", "defaultRule"]),
+  zpaSurface("zpa-application-segments", "/application", ["id", "name", "enabled", "domainNames", "tcpPortRange", "udpPortRange", "bypassType", "segmentGroupId"]),
+  zpaSurface("zpa-segment-groups", "/segmentGroup", ["id", "name", "enabled"]),
+  zpaSurface("zpa-access-rules", "/policySet/rules/policyType/ACCESS_POLICY", ["id", "name", "disabled", "action", "conditions"]),
+  zpaSurface("zpa-timeout-rules", "/policySet/rules/policyType/TIMEOUT_POLICY", ["id", "name", "disabled", "reauthTimeout", "reauthIdleTimeout"]),
+  zpaSurface("zpa-forwarding-rules", "/policySet/rules/policyType/CLIENT_FORWARDING_POLICY", ["id", "name", "disabled", "action", "conditions"]),
+  zpaSurface("zpa-app-connector-groups", "/appConnectorGroup", ["id", "name", "enabled"]),
+  zpaSurface("zpa-app-connectors", "/connector", ["id", "name", "enabled", "controlChannelStatus", "lastBrokerConnectTime", "appConnectorGroupName", "appConnectorGroupId"]),
+  zpaSurface("zpa-service-edge-groups", "/serviceEdgeGroup", ["id", "name", "enabled"]),
+  zpaSurface("zpa-service-edges", "/serviceEdge", ["id", "name", "enabled", "controlChannelStatus", "lastBrokerConnectTime"]),
+  zpaSurface("zpa-posture-profiles", "/posture", ["id", "name", "postureType"]),
+  zpaSurface("zpa-trusted-networks", "/network", ["id", "name"]),
+  zpaSurface("zpa-idp-controllers", "/idp", ["id", "name", "enabled", "ssoType", "scimEnabled", "signSamlRequest"]),
+  zpaSurface("zpa-saml-attributes", "/samlAttribute", ["id", "name"]),
+  zpaSurface("zpa-scim-groups", "/scimgroup/idpId/{idpId}", ["id", "name"]),
+  zpaSurface("zpa-enrollment-certificates", "/enrollmentCert", ["id", "name", "validToInEpochSec", "validTo"]),
+  zpaSurface("zpa-browser-access-certificates", "/clientlessCertificate/issued", ["id", "name", "validToInEpochSec", "validTo"]),
+  zpaSurface("zpa-emergency-access-users", "/emergencyAccess/users", ["userId", "emailId", "userStatus", "lastLoginTime"]),
+  zpaSurface("zpa-administrators", "/administrators", ["id", "username", "email", "isEnabled", "localLoginDisabled", "twoFactorAuthEnabled"]),
 ] as const;
 
-const ZSCALER_TRUNCATION_ONLY = ["truncated"] as const;
-const zscalerCompletenessSources = (
+const T = ["truncated"] as const;
+const F = ["error", "denied", "not-collected"] as const;
+const TF = ["truncated", "error", "denied", "not-collected"] as const;
+const N = [] as const;
+type ZscalerCompletenessEntry = BatchCompletenessSourceDefinition & {
+  role: "primary" | "secondary";
+};
+const zscalerSource = (
   surfaceId: string,
-): readonly BatchCompletenessSourceDefinition[] => [{
-  surfaceId,
-  falseWhen: ZSCALER_TRUNCATION_ONLY,
-}];
+  falseWhen: BatchCompletenessSourceDefinition["falseWhen"],
+  role: ZscalerCompletenessEntry["role"],
+): ZscalerCompletenessEntry => ({ surfaceId, falseWhen, role });
 
-function zscalerCompletenessSemantics(control: number, title: string): string {
-  if (control === 4) {
-    return "true unless the location inventory is truncated; SSL-rule truncation is disclosed but does not change this primitive in the preserved current behavior.";
-  }
-  if (control === 25) {
-    return "true unless a companion inventory that the current capForUnreadableAll path recognizes is incomplete; the documented single-dataset truncation exceptions do not change this primitive.";
-  }
-  return `true for ${title} only when every dataset currently designated as completeness-gating for this finding reaches its final page; the documented truncation exceptions remain excluded.`;
+export const ZSCALER_COMPLETENESS_SOURCES: Readonly<Record<string, readonly ZscalerCompletenessEntry[]>> = {
+  "ZS-01": [zscalerSource("zia-url-filtering-rules", T, "primary")],
+  "ZS-02": [zscalerSource("zia-firewall-rules", T, "primary")],
+  "ZS-03": [zscalerSource("zia-web-dlp-rules", N, "primary"), zscalerSource("zia-dlp-engines", N, "primary"), zscalerSource("zia-dlp-dictionaries", F, "secondary")],
+  "ZS-04": [zscalerSource("zia-ssl-inspection-rules", N, "primary"), zscalerSource("zia-ssl-exempted-urls", F, "secondary"), zscalerSource("zia-locations", TF, "secondary")],
+  "ZS-05": [zscalerSource("zia-sandbox-rules", N, "primary"), zscalerSource("zia-sandbox-settings", F, "secondary")],
+  "ZS-06": [zscalerSource("zia-admin-users", T, "primary"), zscalerSource("zia-auth-settings", F, "secondary")],
+  "ZS-07": [zscalerSource("zia-admin-users", T, "primary"), zscalerSource("zia-admin-roles", N, "primary"), zscalerSource("zia-password-expiry", F, "secondary")],
+  "ZS-08": [zscalerSource("zpa-application-segments", T, "primary"), zscalerSource("zpa-segment-groups", TF, "secondary")],
+  "ZS-09": [zscalerSource("zpa-access-rules", T, "primary")],
+  "ZS-10": [zscalerSource("zpa-posture-profiles", T, "primary"), zscalerSource("zpa-access-rules", T, "primary")],
+  "ZS-11": [zscalerSource("zpa-app-connectors", T, "primary"), zscalerSource("zpa-app-connector-groups", TF, "secondary")],
+  "ZS-12": [zscalerSource("zpa-idp-controllers", T, "primary"), zscalerSource("zpa-administrators", TF, "secondary"), zscalerSource("zpa-saml-attributes", TF, "secondary"), zscalerSource("zpa-scim-groups", TF, "secondary")],
+  "ZS-13": [zscalerSource("zpa-timeout-rules", T, "primary")],
+  "ZS-14": [zscalerSource("zia-audit-log-report", N, "primary"), zscalerSource("zia-nss-feeds", TF, "secondary")],
+  "ZS-15": [zscalerSource("zpa-trusted-networks", T, "primary"), zscalerSource("zpa-access-rules", TF, "secondary"), zscalerSource("zpa-forwarding-rules", TF, "secondary")],
+  "ZS-16": [zscalerSource("zia-bandwidth-rules", N, "primary")],
+  "ZS-17": [zscalerSource("zia-isolation-profiles", N, "primary"), zscalerSource("zia-url-filtering-rules", T, "primary")],
+  "ZS-18": [zscalerSource("zia-locations", T, "primary"), zscalerSource("zia-sub-locations", TF, "secondary"), zscalerSource("zia-gre-tunnels", TF, "secondary"), zscalerSource("zia-vpn-credentials", TF, "secondary")],
+  "ZS-19": [zscalerSource("zia-cloud-app-rules", T, "primary")],
+  "ZS-20": [zscalerSource("zia-dns-rules", N, "primary"), zscalerSource("zia-advanced-threat-settings", F, "secondary")],
+  "ZS-21": [zscalerSource("zpa-service-edges", T, "primary"), zscalerSource("zpa-service-edge-groups", TF, "secondary")],
+  "ZS-22": [zscalerSource("zpa-forwarding-rules", T, "primary")],
+  "ZS-23": [zscalerSource("zpa-emergency-access-users", T, "primary")],
+  "ZS-24": [zscalerSource("zpa-enrollment-certificates", T, "primary"), zscalerSource("zpa-browser-access-certificates", TF, "secondary")],
+  "ZS-25": [
+    zscalerSource("zia-advanced-threat-settings", N, "primary"),
+    zscalerSource("zia-malware-settings", N, "primary"),
+    zscalerSource("zia-malware-policy", F, "secondary"),
+    zscalerSource("zia-security-allowlist", F, "secondary"),
+    zscalerSource("zia-security-denylist", F, "secondary"),
+  ],
+};
+
+function zscalerCompletenessSemantics(id: string): string {
+  const entries = ZSCALER_COMPLETENESS_SOURCES[id];
+  if (!entries) throw new Error(`${id} has no completeness source contract`);
+  const clauses = entries.map((entry) => {
+    const truncated = entry.falseWhen.includes("truncated")
+      ? "truncation makes evidence_complete false"
+      : "truncation leaves evidence_complete true";
+    const failed = entry.falseWhen.includes("error")
+      ? "an error, 403 denial, or not-collected read makes evidence_complete false"
+      : entry.role === "primary"
+        ? "an error or 403 denial makes the finding manual and omits evidence_complete"
+        : "an error or 403 denial does not change evidence_complete";
+    return `${entry.surfaceId}: ${truncated}; ${failed}`;
+  });
+  return `For ${id}, product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
 }
 
 const rows: ReadonlyArray<readonly [string, Batch2CheckRow["severity"], "zia_policy" | "zia_access_control" | "zpa"]> = [
@@ -231,7 +324,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
           ? {
               decisionInputs: {
                 evidence_readable: "Boolean. True only when both Advanced Threat Protection and malware settings objects were readable.",
-                evidence_complete: "Boolean collector state disclosed by unreadable or truncated companion inventories. For parent parity, this value is not a direct ZS-25 decision gate; the documented capForUnreadableAll limitation remains.",
+                evidence_complete: "Boolean collector state defined by the five named ZS-25 source contracts. Primary-setting truncation leaves it true; an unreadable malware-policy, allowlist, or denylist read makes it false.",
                 atp_setting_count: "Non-negative integer count of raw fields in the Advanced Threat Protection settings object.",
                 malware_setting_count: "Non-negative integer count of raw fields in the malware settings object.",
                 missing_atp_flag_count: `Count of these required fields whose raw value is not true: ${ZSCALER_REQUIRED_ATP_FLAGS.join(", ")}.`,
@@ -257,25 +350,25 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
             }
           : {};
   const id = `ZS-${String(control).padStart(2, "0")}`;
-  const surfaceId = area === "zpa" ? "zpa-policy" : area === "zia_policy" ? "zia-policy" : "zia-administration";
   const decisionInputs = custom.decisionInputs ?? batch2GenericDecisionInputs(decisionPredicate[index]);
+  const completenessSources = ZSCALER_COMPLETENESS_SOURCES[id];
   return {
     id,
     control,
     title,
     severity,
     owner: owner(area),
-    surfaces: [surfaceId],
+    surfaces: completenessSources.map((source) => source.surfaceId),
     emptyOutcome: "manual" as const,
     constants: decisionConstants(control),
     decisionInputs,
     ...custom,
     completeness: batch2Completeness(
       decisionInputs,
-      zscalerCompletenessSources(surfaceId),
-      zscalerCompletenessSemantics(control, title),
+      completenessSources.map(({ surfaceId, falseWhen }) => ({ surfaceId, falseWhen })),
+      zscalerCompletenessSemantics(id),
     ),
-    decision: `${decisionPredicate[index]} Missing product credentials and unreadable or ambiguous feature responses remain manual; a proved violation has first-match precedence. The known truncation exceptions are listed as runtime gaps rather than silently hardened.`,
+    decision: `${decisionPredicate[index]} Missing product credentials and unreadable or ambiguous feature responses remain manual; a proved violation has first-match precedence. The known truncation exceptions are listed as implementation gaps rather than silently hardened.`,
   };
 }));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
@@ -296,8 +389,8 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
   baseServices: ["ZIA API", "ZPA API"],
   authentication: ZSCALER_AUTH_RESOLVER,
   permissions: [
-    { id: "zia-read-admin", kind: "role", value: "ZIA administrator API read access to the declared administrative and policy surfaces", unlocks: ["zia-administration", "zia-policy"] },
-    { id: "zpa-read-client", kind: "oauth-scope", value: "ZPA API client read access for the configured customer", unlocks: ["zpa-policy"] },
+    { id: "zia-read-admin", kind: "role", value: "ZIA administrator API read access to the declared administrative and policy surfaces", unlocks: surfaces.filter((surface) => surface.id.startsWith("zia-")).map((surface) => surface.id) },
+    { id: "zpa-read-client", kind: "oauth-scope", value: "ZPA API client read access for the configured customer", unlocks: surfaces.filter((surface) => surface.id.startsWith("zpa-")).map((surface) => surface.id) },
   ],
   surfaces,
   checks,
@@ -325,7 +418,7 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
   },
   runtimeBehavior: ZSCALER_RUNTIME_BEHAVIOR,
   knownGaps: [
-    "Current-runtime limitation preserved for parity: across the 41 ZIA-policy and ZPA single-dataset truncation replays, 16 affected finding cases remain pass for ZS-03, ZS-04, ZS-05, ZS-16, ZS-17, ZS-20, and ZS-25. Secondary inventories cap pass when unreadable, but those truncations and several primary ZIA truncations are not completeness-gating.",
+    "Known implementation limitation retained for output parity: across the 41 ZIA-policy and ZPA single-dataset truncation replays, 16 affected finding cases remain pass for ZS-03, ZS-04, ZS-05, ZS-16, ZS-17, ZS-20, and ZS-25. Secondary inventories cap pass when unreadable, but those truncations and several primary ZIA truncations are not completeness-gating.",
     "ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only.",
   ],
   sensitiveFields: ["apiKey", "password", "clientSecret", "authorization", "cookie", "token"],
