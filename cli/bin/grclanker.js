@@ -8,7 +8,7 @@ const distEntry = resolve(binDir, "../dist/index.js");
 const srcEntry = resolve(binDir, "../index.ts");
 const distBranding = resolve(binDir, "../dist/pi/branding.js");
 const srcBranding = resolve(binDir, "../pi/branding.ts");
-const MIN_NODE = [20, 19, 0];
+const MIN_NODE = [22, 19, 0];
 
 function parseVersion(version) {
   return version.replace(/^v/, "").split(".").map((part) => Number(part) || 0);
@@ -41,7 +41,7 @@ async function assertBrandedRuntime(entryPath) {
 async function run() {
   if (isOlderThan(MIN_NODE)) {
     console.error(
-      `grclanker requires Node.js 20.19.0 or newer for source/npm installs (found ${process.version}).`,
+      `grclanker requires Node.js 22.19.0 or newer for source/npm installs (found ${process.version}).`,
     );
     console.error("Use the release-bundle installer if you do not want to manage Node yourself.");
     process.exit(1);
