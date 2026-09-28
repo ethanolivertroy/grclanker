@@ -3546,7 +3546,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("both"),
           Type.Literal("any"),
         ], {
-          description: "FedRAMP baseline applicability to include.",
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: any).",
         }),
       ),
       limit: Type.Optional(
@@ -3757,7 +3757,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("both"),
           Type.Literal("any"),
         ], {
-          description: "FedRAMP baseline applicability to include.",
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: any).",
         }),
       ),
       audience: Type.Optional(
@@ -3766,7 +3766,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("trust-center"),
           Type.Literal("any"),
         ], {
-          description: "Intended audience for the readiness brief.",
+          description: "Intended audience for the readiness brief (default: provider).",
         }),
       ),
       limit: Type.Optional(
@@ -3854,7 +3854,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("both"),
           Type.Literal("any"),
         ], {
-          description: "FedRAMP baseline applicability to include.",
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: any).",
         }),
       ),
       audience: Type.Optional(
@@ -3863,7 +3863,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("trust-center"),
           Type.Literal("any"),
         ], {
-          description: "Intended audience for the artifact plan.",
+          description: "Intended audience for the artifact plan (default: provider).",
         }),
       ),
     }),
@@ -3921,7 +3921,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("both"),
           Type.Literal("any"),
         ], {
-          description: "FedRAMP baseline applicability to include.",
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: 20x).",
         }),
       ),
       audience: Type.Optional(
@@ -3930,7 +3930,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("trust-center"),
           Type.Literal("any"),
         ], {
-          description: "Intended audience for the ADS package plan.",
+          description: "Intended audience for the ADS package plan (default: trust-center).",
         }),
       ),
     }),
@@ -3988,7 +3988,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("both"),
           Type.Literal("any"),
         ], {
-          description: "FedRAMP baseline applicability to include.",
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: 20x).",
         }),
       ),
       audience: Type.Optional(
@@ -3997,7 +3997,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("trust-center"),
           Type.Literal("any"),
         ], {
-          description: "Intended audience for the generated ADS bundle.",
+          description: "Intended audience for the generated ADS bundle (default: trust-center).",
         }),
       ),
     }),
@@ -4057,7 +4057,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("both"),
           Type.Literal("any"),
         ], {
-          description: "FedRAMP baseline applicability to include.",
+          description: "FedRAMP 20x/Rev5 program applicability to include (default: 20x).",
         }),
       ),
       audience: Type.Optional(
@@ -4066,7 +4066,7 @@ export function registerFedrampTools(pi: any): void {
           Type.Literal("trust-center"),
           Type.Literal("any"),
         ], {
-          description: "Intended audience for the generated ADS site.",
+          description: "Intended audience for the generated ADS site (default: trust-center).",
         }),
       ),
       provider_name: Type.Optional(

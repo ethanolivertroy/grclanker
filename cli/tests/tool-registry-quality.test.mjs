@@ -5,7 +5,7 @@ import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 
 const SNAKE_CASE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 const STANDARD_TOOL_FAMILY =
-  /_(?:check_access|assess_[a-z0-9]+(?:_[a-z0-9]+)*|export_audit_bundle)$/;
+  /_(?:check_access|assess_[a-z0-9]+(?:_[a-z0-9]+)*|export_[a-z0-9]+(?:_[a-z0-9]+)*)$/;
 
 // These tools intentionally expose reference lookups or workspace workflows
 // instead of the check/assess/export integration family.
@@ -50,11 +50,8 @@ const GWS_OPERATOR_TOOL_EXCEPTIONS = [
   "gws_ops_trace_admin_activity",
 ];
 
-// Vanta's API surface currently provides these narrower list/export actions.
-const VANTA_TOOL_EXCEPTIONS = [
-  "vanta_export_audit",
-  "vanta_list_audits",
-];
+// Vanta's API surface currently provides this narrower list action.
+const VANTA_TOOL_EXCEPTIONS = ["vanta_list_audits"];
 
 const TOOL_FAMILY_EXCEPTIONS = new Set([
   ...REFERENCE_AND_WORKSPACE_TOOL_EXCEPTIONS,
@@ -73,7 +70,7 @@ function normalizeDescription(value) {
     : "";
 }
 
-function lintDomainRegistry(tools) {
+function lintDomainRegistry(tools, familyExceptions = TOOL_FAMILY_EXCEPTIONS) {
   const errors = [];
   const names = new Map();
   const descriptions = new Map();
@@ -103,7 +100,7 @@ function lintDomainRegistry(tools) {
       }
     }
 
-    if (!STANDARD_TOOL_FAMILY.test(tool.name) && !TOOL_FAMILY_EXCEPTIONS.has(tool.name)) {
+    if (!STANDARD_TOOL_FAMILY.test(tool.name) && !familyExceptions.has(tool.name)) {
       errors.push(`${tool.name}: tool name does not follow a registered family convention`);
     }
 
@@ -146,6 +143,15 @@ function lintDomainRegistry(tools) {
     }
   }
 
+  for (const exceptionName of familyExceptions) {
+    if (!names.has(exceptionName)) {
+      errors.push(`${exceptionName}: naming exception is not registered`);
+    }
+    if (STANDARD_TOOL_FAMILY.test(exceptionName)) {
+      errors.push(`${exceptionName}: conventional tool must not remain a naming exception`);
+    }
+  }
+
   return errors;
 }
 
@@ -178,7 +184,7 @@ test("registry quality lint rejects a malformed synthetic registry", () => {
     },
   ];
 
-  const errors = lintDomainRegistry(malformedTools).join("\n");
+  const errors = lintDomainRegistry(malformedTools, new Set()).join("\n");
   assert.match(errors, /case-insensitive duplicate/);
   assert.match(errors, /tool name must be lowercase snake_case/);
   assert.match(errors, /normalized description duplicates/);
@@ -187,4 +193,78 @@ test("registry quality lint rejects a malformed synthetic registry", () => {
   assert.match(errors, /required must not contain duplicates/);
   assert.match(errors, /required parameter missing is missing from properties/);
   assert.match(errors, /does not follow a registered family convention/);
+});
+
+test("registry quality lint rejects an empty tool description", () => {
+  const errors = lintDomainRegistry([
+    {
+      name: "synthetic_check_access",
+      description: " \n ",
+      parameters: { properties: {}, required: [] },
+    },
+  ], new Set());
+
+  assert.deepEqual(errors, ["synthetic_check_access: tool description must be non-empty"]);
+});
+
+test("registry quality lint handles malformed and omitted schema fields", () => {
+  const validWithoutRequired = {
+    name: "optional_schema_check_access",
+    description: "Valid schema with no required parameters.",
+    parameters: {
+      properties: {
+        optional_value: {
+          type: "string",
+          description: "Optional value.",
+        },
+      },
+    },
+  };
+  assert.deepEqual(lintDomainRegistry([validWithoutRequired], new Set()), []);
+
+  const malformedTools = [
+    {
+      name: "missing_properties_check_access",
+      description: "Schema with missing properties.",
+      parameters: { required: [] },
+    },
+    {
+      name: "malformed_properties_check_access",
+      description: "Schema with malformed properties.",
+      parameters: { properties: [], required: [] },
+    },
+    {
+      name: "malformed_required_check_access",
+      description: "Schema with malformed required.",
+      parameters: { properties: {}, required: "value" },
+    },
+    {
+      name: "non_string_required_check_access",
+      description: "Schema with a non-string required entry.",
+      parameters: {
+        properties: {
+          value: {
+            type: "string",
+            description: "Required value.",
+          },
+        },
+        required: ["value", 42],
+      },
+    },
+    {
+      name: "missing_required_property_check_access",
+      description: "Schema requiring an undeclared property.",
+      parameters: { properties: {}, required: ["missing"] },
+    },
+  ];
+
+  const errors = lintDomainRegistry(malformedTools, new Set()).join("\n");
+  assert.match(errors, /missing_properties_check_access: parameter schema must define top-level properties/);
+  assert.match(errors, /malformed_properties_check_access: parameter schema must define top-level properties/);
+  assert.match(errors, /malformed_required_check_access: required must be a string list/);
+  assert.match(errors, /non_string_required_check_access: required must contain only strings/);
+  assert.match(
+    errors,
+    /missing_required_property_check_access: required parameter missing is missing from properties/,
+  );
 });
