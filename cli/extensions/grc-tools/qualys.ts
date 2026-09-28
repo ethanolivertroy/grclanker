@@ -2817,13 +2817,17 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "export Scans > Schedules and Assets > Asset Groups from the Qualys UI and confirm each asset group has an active recurring scan and each host was scanned within the review window.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length, schedules_without_active_flag: schedulesWithoutActiveFlag.length },
-    decisionFacts: schedules.error || groups.data.length === 0 || hosts.data.length === 0
+    decisionFacts: schedules.error
       ? {}
-      : qualysDecisionFacts(
-        activeSchedules.length,
-        activeSchedules.length === 0 ? 1 : 0,
-        groupsWithoutSchedule.length + staleScannedHosts.length + hostsWithoutScanDate.length,
-      ),
+      : activeSchedules.length === 0
+        ? qualysDecisionFacts(0, 1)
+        : groups.data.length === 0 || hosts.data.length === 0
+          ? {}
+          : qualysDecisionFacts(
+            activeSchedules.length,
+            0,
+            groupsWithoutSchedule.length + staleScannedHosts.length + hostsWithoutScanDate.length,
+          ),
   }));
 
   const authStatus: QualysFindingStatus = hosts.error
@@ -3328,7 +3332,7 @@ export async function assessQualysAssetInventory(
     sources: [tags, hosts],
     scope,
     manualEvidence: "export the tag tree and confirm every in-scope asset carries a compliance scope tag.",
-    decisionFacts: tags.error || hosts.error || hosts.data.length === 0
+    decisionFacts: tags.error || hosts.error
       ? {}
       : qualysDecisionFacts(
         hosts.data.length,
@@ -3559,7 +3563,7 @@ export async function assessQualysVulnerabilityManagement(
     scope,
     manualEvidence: "review Scans > Authentication for Windows, Unix, and network device records and run an Authentication Report to find expired or failing credentials.",
     unknownBuckets: { hosts_without_os: hostsWithoutOs.length },
-    decisionFacts: authRecords.error || hosts.error || hosts.data.length === 0
+    decisionFacts: authRecords.error || hosts.error
       ? {}
       : qualysDecisionFacts(
         hosts.data.length,
@@ -4082,7 +4086,7 @@ export async function assessQualysAdministration(
       users_without_last_login: usersWithoutLastLogin.length,
       users_without_login_in_restricted_view: restrictedViewUsers.length,
     },
-    decisionFacts: bothUserSourcesUnreadable || !userListReadable || activeUsers.length === 0
+    decisionFacts: bothUserSourcesUnreadable || activeUsers.length === 0 && !excessiveManagers && sharedEmails.length === 0
       ? {}
       : qualysDecisionFacts(
         activeUsers.length,
