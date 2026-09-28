@@ -4073,6 +4073,7 @@ export function assessOktaAuthentication(
   recordOktaDecisionFacts("OKTA-AUTH-008", {
     idp_readable: !data.idps.error,
     authenticator_readable: !data.authenticators.error,
+    complete: untruncatedOktaDatasets(data.idps, data.authenticators),
     certificate_method_count: certIdps.length + certAuthenticators.length,
     federal_tenant: isFederalTenant,
   });

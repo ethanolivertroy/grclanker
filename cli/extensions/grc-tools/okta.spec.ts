@@ -262,7 +262,7 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-AUTH-008": {
-    inputs: input("idp_readable", "authenticator_readable", "certificate_method_count", "federal_tenant"),
+    inputs: input("idp_readable", "authenticator_readable", "complete", "certificate_method_count", "federal_tenant"),
     rules: ordered({
       manual: any(
         all(eq("idp_readable", false), eq("authenticator_readable", false)),
@@ -270,7 +270,11 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
         all(eq("certificate_method_count", 0), eq("federal_tenant", false)),
       ),
       fail: all(eq("certificate_method_count", 0), eq("federal_tenant", true)),
-      warn: any(eq("idp_readable", false), eq("authenticator_readable", false)),
+      warn: any(
+        eq("idp_readable", false),
+        eq("authenticator_readable", false),
+        all(incomplete, gt("certificate_method_count", 0)),
+      ),
       pass: gt("certificate_method_count", 0),
     }),
   },
