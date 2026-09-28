@@ -34,9 +34,10 @@ export function extractInitialPrompt(
     return undefined;
   }
 
+  const payload = parsed as { kind: InitialPromptPayload["kind"]; content: string };
   return {
     pipedInput: text.slice(0, offset),
-    payload: parsed,
+    payload,
   };
 }
 
