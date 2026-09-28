@@ -2481,7 +2481,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const ssoManualEvidence = "Admin Console > Enterprise Settings > User Settings > Configure Single Sign On (SSO): confirm SSO is set to Required, not Enabled (optional) or Test mode, and record the identity provider.";
   recordBoxDecisionFacts(1, {
     settings_readable: userSettingsReadable,
-    setting_unused: hasUnusedSettings(ssoUnused),
+    unused_setting_count: Object.keys(ssoUnused).length,
     sso_required: ssoRequired,
     sso_testing: ssoTesting,
   });
@@ -2520,11 +2520,13 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   recordBoxDecisionFacts(2, {
     settings_readable: securityReadable,
     users_readable: usersReadable,
-    setting_unused: hasUnusedSettings(mfaUnused),
+    unused_setting_count: Object.keys(mfaUnused).length,
     mfa_required: mfaRequired,
     sso_required: ssoRequired,
+    user_count: users.length,
+    admin_count: admins.length,
+    users_truncated: usersTruncated,
     exempt_privileged_count: exemptPrivileged.length,
-    inventory_gap: inventoryGap !== undefined,
   });
   findings.push(
     !securityReadable && !usersReadable
@@ -2561,11 +2563,13 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   recordBoxDecisionFacts(3, {
     settings_readable: securityReadable,
     users_readable: usersReadable,
-    setting_unused: hasUnusedSettings(mfaUnused),
+    unused_setting_count: Object.keys(mfaUnused).length,
     mfa_required: mfaRequired,
     sso_required: ssoRequired,
+    user_count: users.length,
+    admin_count: admins.length,
+    users_truncated: usersTruncated,
     exempt_user_count: exemptUsers.length,
-    inventory_gap: inventoryGap !== undefined,
   });
   findings.push(
     !securityReadable && !usersReadable
@@ -2603,7 +2607,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   };
   recordBoxDecisionFacts(17, {
     users_readable: usersReadable,
-    complete: usersReadable && inventoryGap === undefined,
+    users_truncated: usersTruncated,
+    user_count: users.length,
+    admin_count: admins.length,
     privileged_user_count: privileged.length,
     max_admins: maxAdmins,
   });
@@ -2619,7 +2625,9 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
 
   recordBoxDecisionFacts(18, {
     users_readable: usersReadable,
-    complete: usersReadable && inventoryGap === undefined,
+    users_truncated: usersTruncated,
+    user_count: users.length,
+    admin_count: admins.length,
     coadmin_count: coAdmins.length,
   });
   findings.push(
@@ -2667,7 +2675,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const complexityCount = [passwordUppercase, passwordNumeric, passwordSpecial].filter((value) => (value ?? 0) > 0).length;
   recordBoxDecisionFacts(21, {
     settings_readable: securityReadable,
-    setting_unused: hasUnusedSettings(passwordUnused),
+    unused_setting_count: Object.keys(passwordUnused).length,
     minimum_length: passwordMinLength,
     required_minimum_length: minPasswordLength,
     weak_password_prevention: weakPasswordPrevention,
@@ -2705,12 +2713,11 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   const sessionManualEvidence = "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.";
   recordBoxDecisionFacts(22, {
     settings_readable: securityReadable,
-    setting_unused: hasUnusedSettings(sessionUnused),
-    session_duration_present: sessionDuration !== undefined,
-    session_duration_parsed: sessionHours !== undefined,
+    unused_setting_count: Object.keys(sessionUnused).length,
+    session_duration_value: sessionDuration,
     session_hours: sessionHours,
     custom_session_enabled: customSessionEnabled,
-    custom_session_parsed: customSessionHours !== undefined,
+    custom_session_duration_value: customSessionValue,
     custom_session_hours: customSessionHours,
     max_session_hours: maxSessionHours,
   });
@@ -2789,10 +2796,12 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   recordBoxDecisionFacts(24, {
     users_readable: usersReadable,
     events_readable: eventsReadable,
-    complete: usersReadable && eventsReadable && inventoryGap === undefined && !eventsTruncated,
+    users_truncated: usersTruncated,
+    user_count: users.length,
+    admin_count: admins.length,
+    events_truncated: eventsTruncated,
     active_user_count: activeUsers.length,
     inactive_user_count: inactiveCandidates.length,
-    inactive_ratio: inactiveRatio,
   });
   findings.push(
     !usersReadable || !eventsReadable
@@ -2927,10 +2936,9 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   recordBoxDecisionFacts(4, {
     settings_readable: configReadable,
     allowlist_readable: allowlistReadable,
-    setting_unused: hasUnusedSettings(externalUnused),
+    unused_setting_count: Object.keys(externalUnused).length,
     external_status: externalStatus,
     allowlist_entry_count: entries.length,
-    allowlist_truncated: entriesTruncated,
   });
   findings.push(capForUnreadableInventories(
     !configReadable
@@ -3005,7 +3013,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     stale_entry_count: staleEntries.length,
     undated_entry_count: undatedEntries.length,
     exempt_target_count: exemptTargets.length,
-    allowlist_required: externalStatus === "limit_collaboration_to_allowlisted_domains",
+    external_status: externalStatus,
   });
   findings.push(capForUnreadableInventories(
     !allowlistReadable
@@ -3037,10 +3045,9 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const linkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.";
   recordBoxDecisionFacts(6, {
     settings_readable: configReadable,
-    setting_unused: hasUnusedSettings(linkUnused),
-    default_open: accessLevelIsOpen(sharedLinkDefault),
-    default_restricted: accessLevelIsRestricted(sharedLinkDefault),
-    open_links_allowed: accessLevelIsOpen(sharedLinkAllowed),
+    unused_setting_count: Object.keys(linkUnused).length,
+    shared_link_default_access: sharedLinkDefault,
+    shared_link_access: sharedLinkAllowed,
   });
   findings.push(
     !configReadable
@@ -3079,7 +3086,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const expirationManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.";
   recordBoxDecisionFacts(7, {
     settings_readable: configReadable,
-    setting_unused: hasUnusedSettings(expirationUnused),
+    unused_setting_count: Object.keys(expirationUnused).length,
     expiration_enabled: expirationEnabled,
     public_expiration_enabled: publicExpirationEnabled,
   });
@@ -3125,7 +3132,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const watermarkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.";
   recordBoxDecisionFacts(9, {
     settings_readable: configReadable,
-    setting_unused: hasUnusedSettings(watermarkUnused),
+    unused_setting_count: Object.keys(watermarkUnused).length,
     watermarking_enabled: watermarkingEnabled,
   });
   findings.push(
@@ -3682,7 +3689,7 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const monitoringEventsUnreadable = unreadableInventory("enterprise_events", data.events, "Shield alert and block events were not checked");
   recordBoxDecisionFacts(25, {
     shield_settings_readable: shieldReadable,
-    shield_source_readable: !data.configuration.error,
+    configuration_readable: !data.configuration.error,
     events_readable: eventsReadable,
     events_complete: completeBoxDatasets(data.events),
     anomaly_rule_count: anomalyRules.length,

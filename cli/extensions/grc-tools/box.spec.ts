@@ -1,4 +1,9 @@
-import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  deriveDecisionRules,
+  type BatchCheckDefinition,
+} from "./batch-spec-builder.js";
 import { BOX_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
@@ -93,6 +98,25 @@ const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne
 const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
 const gte = (name: string, entry: PortableValue): VerdictCondition => compare("gte", name, entry);
 const lt = (name: string, entry: PortableValue): VerdictCondition => compare("lt", name, entry);
+const defined = (name: string): VerdictCondition => ({ op: "defined", operand: path(name) });
+const matches = (name: string, pattern: string, flags?: string): VerdictCondition => ({
+  op: "matches",
+  operand: path(name),
+  pattern,
+  ...(flags ? { flags } : {}),
+});
+const ratio = (
+  comparator: "gt" | "gte" | "lt" | "lte",
+  numerator: string,
+  denominator: string,
+  threshold: number,
+): VerdictCondition => ({
+  op: "ratio",
+  numerator: path(numerator),
+  denominator: path(denominator),
+  comparator,
+  threshold: value(threshold),
+});
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
@@ -119,10 +143,10 @@ const manual = (): BoxExecutableDecision => ({ inputs: {}, rules: [rule("manual"
 
 const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> = {
   "BOX-01": {
-    inputs: input("settings_readable", "setting_unused", "sso_required", "sso_testing"),
+    inputs: input("settings_readable", "unused_setting_count", "sso_required", "sso_testing"),
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("warn", eq("setting_unused", true)),
+      rule("warn", gt("unused_setting_count", 0)),
       rule("fail", eq("sso_required", false)),
       rule("warn", any(ne("sso_required", true), eq("sso_testing", true))),
       rule("pass", all(eq("sso_required", true), ne("sso_testing", true))),
@@ -130,42 +154,58 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     ],
   },
   "BOX-02": {
-    inputs: input("settings_readable", "users_readable", "setting_unused", "mfa_required", "sso_required", "exempt_privileged_count", "inventory_gap"),
+    inputs: input("settings_readable", "users_readable", "unused_setting_count", "mfa_required", "sso_required", "user_count", "admin_count", "users_truncated", "exempt_privileged_count"),
     rules: [
       rule("manual", any(ne("settings_readable", true), ne("users_readable", true))),
-      rule("warn", eq("setting_unused", true)),
+      rule("warn", gt("unused_setting_count", 0)),
       rule("fail", any(
         all(eq("mfa_required", true), gt("exempt_privileged_count", 0)),
         all(eq("mfa_required", false), ne("sso_required", true)),
       )),
       rule("warn", any(
         ne("mfa_required", true),
-        eq("inventory_gap", true),
+        eq("users_truncated", true),
+        eq("user_count", 0),
+        eq("admin_count", 0),
       )),
-      rule("pass", all(eq("mfa_required", true), eq("exempt_privileged_count", 0), eq("inventory_gap", false))),
+      rule("pass", all(
+        eq("mfa_required", true),
+        eq("exempt_privileged_count", 0),
+        ne("users_truncated", true),
+        gt("user_count", 0),
+        gt("admin_count", 0),
+      )),
       rule("manual", { op: "always" }),
     ],
   },
   "BOX-03": {
-    inputs: input("settings_readable", "users_readable", "setting_unused", "mfa_required", "sso_required", "exempt_user_count", "inventory_gap"),
+    inputs: input("settings_readable", "users_readable", "unused_setting_count", "mfa_required", "sso_required", "user_count", "admin_count", "users_truncated", "exempt_user_count"),
     rules: [
       rule("manual", any(ne("settings_readable", true), ne("users_readable", true))),
-      rule("warn", eq("setting_unused", true)),
+      rule("warn", gt("unused_setting_count", 0)),
       rule("fail", all(eq("mfa_required", false), ne("sso_required", true))),
       rule("warn", any(
         ne("mfa_required", true),
         gt("exempt_user_count", 0),
-        eq("inventory_gap", true),
+        eq("users_truncated", true),
+        eq("user_count", 0),
+        eq("admin_count", 0),
       )),
-      rule("pass", all(eq("mfa_required", true), eq("exempt_user_count", 0), eq("inventory_gap", false))),
+      rule("pass", all(
+        eq("mfa_required", true),
+        eq("exempt_user_count", 0),
+        ne("users_truncated", true),
+        gt("user_count", 0),
+        gt("admin_count", 0),
+      )),
       rule("manual", { op: "always" }),
     ],
   },
   "BOX-04": {
-    inputs: input("settings_readable", "allowlist_readable", "setting_unused", "external_status", "allowlist_entry_count", "allowlist_truncated"),
+    inputs: input("settings_readable", "allowlist_readable", "unused_setting_count", "external_status", "allowlist_entry_count"),
     rules: [
       rule("manual", all(ne("settings_readable", true), any(ne("allowlist_readable", true), eq("allowlist_entry_count", 0)))),
-      rule("warn", eq("setting_unused", true)),
+      rule("warn", gt("unused_setting_count", 0)),
       rule("fail", eq("external_status", "enable_external_collaboration")),
       rule("warn", any(
         ne("settings_readable", true),
@@ -184,7 +224,7 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     ],
   },
   "BOX-05": {
-    inputs: input("allowlist_readable", "config_readable", "exempt_targets_readable", "complete", "allowlist_entry_count", "public_domain_count", "stale_entry_count", "undated_entry_count", "exempt_target_count", "allowlist_required"),
+    inputs: input("allowlist_readable", "config_readable", "exempt_targets_readable", "complete", "external_status", "allowlist_entry_count", "public_domain_count", "stale_entry_count", "undated_entry_count", "exempt_target_count"),
     rules: ordered({
       manual: ne("allowlist_readable", true),
       fail: gt("public_domain_count", 0),
@@ -192,7 +232,7 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
         ne("complete", true),
         ne("config_readable", true),
         ne("exempt_targets_readable", true),
-        all(eq("allowlist_entry_count", 0), eq("allowlist_required", true)),
+        all(eq("allowlist_entry_count", 0), eq("external_status", "limit_collaboration_to_allowlisted_domains")),
         gt("stale_entry_count", 0),
         gt("undated_entry_count", 0),
         gt("exempt_target_count", 0),
@@ -201,21 +241,27 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     }),
   },
   "BOX-06": {
-    inputs: input("settings_readable", "setting_unused", "default_open", "default_restricted", "open_links_allowed"),
+    inputs: input("settings_readable", "unused_setting_count", "shared_link_default_access", "shared_link_access"),
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("warn", eq("setting_unused", true)),
-      rule("fail", eq("default_open", true)),
-      rule("warn", any(ne("default_restricted", true), eq("open_links_allowed", true))),
-      rule("pass", all(eq("default_restricted", true), ne("open_links_allowed", true))),
+      rule("warn", gt("unused_setting_count", 0)),
+      rule("fail", matches("shared_link_default_access", "open|public|anyone", "i")),
+      rule("warn", any(
+        { op: "not", condition: matches("shared_link_default_access", "company|collaborators|enterprise|people_in|invited", "i") },
+        matches("shared_link_access", "open|public|anyone", "i"),
+      )),
+      rule("pass", all(
+        matches("shared_link_default_access", "company|collaborators|enterprise|people_in|invited", "i"),
+        { op: "not", condition: matches("shared_link_access", "open|public|anyone", "i") },
+      )),
       rule("manual", { op: "always" }),
     ],
   },
   "BOX-07": {
-    inputs: input("settings_readable", "setting_unused", "expiration_enabled", "public_expiration_enabled"),
+    inputs: input("settings_readable", "unused_setting_count", "expiration_enabled", "public_expiration_enabled"),
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("warn", eq("setting_unused", true)),
+      rule("warn", gt("unused_setting_count", 0)),
       rule("pass", eq("expiration_enabled", true)),
       rule("warn", eq("public_expiration_enabled", true)),
       rule("fail", eq("expiration_enabled", false)),
@@ -224,10 +270,10 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
   },
   "BOX-08": manual(),
   "BOX-09": {
-    inputs: input("settings_readable", "setting_unused", "watermarking_enabled"),
+    inputs: input("settings_readable", "unused_setting_count", "watermarking_enabled"),
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("warn", eq("setting_unused", true)),
+      rule("warn", gt("unused_setting_count", 0)),
       rule("pass", eq("watermarking_enabled", true)),
       rule("fail", eq("watermarking_enabled", false)),
       rule("warn", { op: "always" }),
@@ -291,18 +337,23 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     }),
   },
   "BOX-17": {
-    inputs: input("users_readable", "complete", "privileged_user_count", "max_admins"),
+    inputs: input("users_readable", "users_truncated", "user_count", "admin_count", "privileged_user_count", "max_admins"),
     rules: ordered({
       manual: ne("users_readable", true),
-      warn: any(ne("complete", true), { op: "gt", left: path("privileged_user_count"), right: path("max_admins") }),
+      warn: any(
+        eq("users_truncated", true),
+        eq("user_count", 0),
+        eq("admin_count", 0),
+        { op: "gt", left: path("privileged_user_count"), right: path("max_admins") },
+      ),
       pass: { op: "lte", left: path("privileged_user_count"), right: path("max_admins") },
     }),
   },
   "BOX-18": {
-    inputs: input("users_readable", "complete", "coadmin_count"),
+    inputs: input("users_readable", "users_truncated", "user_count", "admin_count", "coadmin_count"),
     rules: ordered({
       manual: any(ne("users_readable", true), gt("coadmin_count", 0)),
-      warn: ne("complete", true),
+      warn: any(eq("users_truncated", true), eq("user_count", 0), eq("admin_count", 0)),
       pass: eq("coadmin_count", 0),
     }),
   },
@@ -316,11 +367,11 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     }),
   },
   "BOX-21": {
-    inputs: input("settings_readable", "setting_unused", "minimum_length", "required_minimum_length", "weak_password_prevention", "complexity_rule_count"),
+    inputs: input("settings_readable", "unused_setting_count", "minimum_length", "required_minimum_length", "weak_password_prevention", "complexity_rule_count"),
     constants: { absolute_minimum_length: 8 },
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("warn", eq("setting_unused", true)),
+      rule("warn", gt("unused_setting_count", 0)),
       rule("warn", { op: "not", condition: { op: "defined", operand: path("minimum_length") } }),
       rule("pass", all(
         { op: "gte", left: path("minimum_length"), right: path("required_minimum_length") },
@@ -344,13 +395,20 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     ],
   },
   "BOX-22": {
-    inputs: input("settings_readable", "setting_unused", "session_duration_present", "session_duration_parsed", "session_hours", "custom_session_enabled", "custom_session_parsed", "custom_session_hours", "max_session_hours"),
+    inputs: input("settings_readable", "unused_setting_count", "session_duration_value", "session_hours", "custom_session_enabled", "custom_session_duration_value", "custom_session_hours", "max_session_hours"),
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("warn", any(eq("setting_unused", true), ne("session_duration_present", true), ne("session_duration_parsed", true))),
+      rule("warn", any(
+        gt("unused_setting_count", 0),
+        { op: "not", condition: defined("session_duration_value") },
+        { op: "not", condition: defined("session_hours") },
+      )),
       rule("fail", { op: "gt", left: path("session_hours"), right: path("max_session_hours") }),
       rule("pass", ne("custom_session_enabled", true)),
-      rule("warn", ne("custom_session_parsed", true)),
+      rule("warn", any(
+        { op: "not", condition: defined("custom_session_duration_value") },
+        { op: "not", condition: defined("custom_session_hours") },
+      )),
       rule("pass", { op: "lte", left: path("custom_session_hours"), right: path("max_session_hours") }),
       rule("fail", { op: "gt", left: path("custom_session_hours"), right: path("max_session_hours") }),
       rule("manual", { op: "always" }),
@@ -358,22 +416,28 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
   },
   "BOX-23": manual(),
   "BOX-24": {
-    inputs: input("users_readable", "events_readable", "complete", "active_user_count", "inactive_user_count", "inactive_ratio"),
+    inputs: input("users_readable", "events_readable", "users_truncated", "user_count", "admin_count", "events_truncated", "active_user_count", "inactive_user_count"),
     constants: { failure_ratio: 0.25 },
     rules: [
       rule("manual", any(ne("users_readable", true), ne("events_readable", true))),
-      rule("warn", any(ne("complete", true), eq("active_user_count", 0))),
+      rule("warn", any(
+        eq("users_truncated", true),
+        eq("user_count", 0),
+        eq("admin_count", 0),
+        eq("events_truncated", true),
+        eq("active_user_count", 0),
+      )),
       rule("pass", eq("inactive_user_count", 0)),
-      rule("fail", gt("inactive_ratio", 0.25)),
+      rule("fail", ratio("gt", "inactive_user_count", "active_user_count", 0.25)),
       rule("warn", gt("inactive_user_count", 0)),
       rule("manual", { op: "always" }),
     ],
   },
   "BOX-25": {
-    inputs: input("shield_settings_readable", "shield_source_readable", "events_readable", "events_complete", "anomaly_rule_count", "anomaly_event_count", "access_event_count"),
+    inputs: input("shield_settings_readable", "configuration_readable", "events_readable", "events_complete", "anomaly_rule_count", "anomaly_event_count", "access_event_count"),
     rules: [
       rule("manual", all(ne("shield_settings_readable", true), ne("events_readable", true))),
-      rule("warn", any(ne("shield_source_readable", true), ne("events_readable", true))),
+      rule("warn", any(ne("configuration_readable", true), ne("events_readable", true))),
       rule("pass", any(gt("anomaly_rule_count", 0), gt("anomaly_event_count", 0))),
       rule("warn", any(ne("shield_settings_readable", true), gt("access_event_count", 0), ne("events_complete", true))),
       rule("fail", { op: "always" }),
@@ -384,7 +448,8 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
 const checks: BatchCheckDefinition[] = controls.map((title, index) => {
   const control = index + 1;
   const id = `BOX-${String(control).padStart(2, "0")}`;
-  const executable = BOX_EXECUTABLE_DECISIONS[id];
+  const decision = BOX_EXECUTABLE_DECISIONS[id];
+  const executable = deriveDecisionRules(id, decision.rules);
   return {
     id,
     control,
@@ -393,9 +458,10 @@ const checks: BatchCheckDefinition[] = controls.map((title, index) => {
     owner: ownerFor(control),
     surfaces: BOX_CHECK_SURFACES[control],
     evidenceFields: [...BOX_CHECK_SURFACES[control], "complete_source_counts"],
-    decisionInputs: executable.inputs,
-    decisionConstants: executable.constants,
+    decisionInputs: decision.inputs,
+    decisionConstants: decision.constants,
     decisionRules: executable.rules,
+    derivedFactRules: executable.derivedFactRules,
     decision: decisions[index],
   };
 });
