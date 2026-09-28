@@ -811,7 +811,7 @@ test("checkMulesoftAccess reports a healthy organization when every surface is r
   assert.equal(result.organizationId, ORG_ID);
   assert.equal(result.controlPlane, "us");
   assert.equal(result.authMode, "token");
-  assert.ok(result.surfaces.length >= 18);
+  assert.equal(result.surfaces.length, 20);
   assert.ok(result.surfaces.every((surface) => surface.status === "readable"));
   assert.deepEqual(result.missingPermissions, []);
   assert.ok(result.notes.some((note) => note.includes("alice")));
@@ -822,56 +822,53 @@ test("checkMulesoftAccess reports a healthy organization when every surface is r
   }
 });
 
-test("checkMulesoftAccess uses documented permission or capability guidance for every access surface", async () => {
+test("checkMulesoftAccess maps every access surface to externally documented connected-app scope guidance", async () => {
   const result = await checkMulesoftAccess(healthyBundleClient());
 
-  // Verified against the current official permission catalog and the product-specific guidance:
+  // The live discovery document is authoritative for scope IDs. Public product docs verify the
+  // display names used below. IDs without a publicly documented display-name mapping stay as IDs.
+  // https://anypoint.mulesoft.com/accounts/api/v2/oauth2/.well-known/openid-configuration
+  // https://docs.mulesoft.com/anypoint-cli/latest/auth
+  // https://docs.mulesoft.com/access-management/creating-connected-apps-dev
   // https://docs.mulesoft.com/access-management/permissions-by-product
-  // https://docs.mulesoft.com/access-management/business-groups
-  // https://docs.mulesoft.com/access-management/troubleshooting-anypoint-platform-access
-  // https://docs.mulesoft.com/mq/mq-apis
+  // https://docs.mulesoft.com/mq/mq-connected-apps
   // https://docs.mulesoft.com/anypoint-security/asm-permission-concept
   const expectedPermissionsBySurface = {
-    current_user: "Any authenticated principal (profile scope)",
-    organization: "Access Management: membership in the target business group (organization visibility follows membership)",
-    identity_providers: "Access Management: Organization Administrator (identity provider settings)",
-    members: "Access Management: Organization Administrator (user management)",
-    mfa_exempt_users: "Access Management: Organization Administrator (user management)",
-    role_groups: "Access Management: Organization Administrator (roles and permissions)",
-    environments: "Access Management: any permission scoped to the target environment (environment visibility follows scoped access)",
-    connected_applications: "Access Management: root Organization Administrator (connected applications)",
-    organization_hierarchy: "Access Management: membership in the target business group (organization visibility follows membership)",
-    api_manager_apis: "API Manager: View APIs Configuration",
-    exchange_assets: "Exchange: Exchange Viewer",
-    cloudhub_applications: "Runtime Manager: Read Applications",
-    cloudhub_alerts: "Runtime Manager: Read Alerts",
-    vpcs: "Runtime Manager: CloudHub Network Viewer",
-    load_balancers: "Runtime Manager: CloudHub Network Viewer",
-    hybrid_servers: "Runtime Manager: Read Servers",
-    audit_platforms: "Access Management: Audit Log Viewer",
-    audit_query: "Access Management: Audit Log Viewer",
-    mq_regions: "Anypoint MQ: environment-scoped MQ access (the Admin API documents no dedicated region-view permission)",
-    secret_groups: "Secrets Manager: Manage secret groups (includes read access; no narrower secret-group viewer permission is documented)",
+    current_user: "Connected Apps: profile (implicit for client_credentials)",
+    organization: "Access Management: View Organization (`read:organization`)",
+    identity_providers: "Access Management connected-app scope `view:identityproviders`",
+    members: "Access Management connected-app scope `read:orgusers`",
+    mfa_exempt_users: "Access Management connected-app scope `read:orgusers`",
+    role_groups: "Connected Apps: Read-only full access (`read:full`; no narrower public role-group scope is documented)",
+    environments: "Access Management: View Environment (`read:orgenvironments`; `view:environment`)",
+    connected_applications: "Access Management connected-app scope `read:orgconnapps`",
+    organization_hierarchy: "Access Management: View Organization (`read:organization`)",
+    api_manager_apis: "API Manager: View APIs Configuration (`read:api_configuration`)",
+    exchange_assets: "Exchange: Exchange Viewer (`read:exchange`)",
+    cloudhub_applications: "Runtime Manager: Read Applications (`read:applications`)",
+    cloudhub_alerts: "Runtime Manager: Read Alerts (`read:application_alerts`)",
+    vpcs: "Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`)",
+    load_balancers: "Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`)",
+    hybrid_servers: "Runtime Manager: Read Servers (`read:servers`)",
+    audit_platforms: "Access Management: Audit Log Viewer (`read:audit_logs`)",
+    audit_query: "Access Management: Audit Log Viewer (`read:audit_logs`)",
+    mq_regions: "Anypoint MQ: View destinations (`view:destinations`)",
+    secret_groups: "Secrets Manager: Read secrets metadata (`read:secrets_metadata`)",
   };
   assert.deepEqual(
     Object.fromEntries(result.surfaces.map((surface) => [surface.name, surface.permission])),
     expectedPermissionsBySurface,
   );
 
-  const removedPermissionNames = [
-    "View Organization",
-    "View Users",
-    "View Role Groups",
-    "View Environment",
-    "View Connected Applications",
+  const invalidPermissionHints = [
     "CloudHub Network: CloudHub Network Viewer",
     "Audit Log: Audit Log Viewer",
     "Anypoint MQ: MQ Viewer",
     "Secrets Manager: Read Secret Groups",
   ];
   const accessOutput = JSON.stringify(result);
-  for (const removedPermissionName of removedPermissionNames) {
-    assert.ok(!accessOutput.includes(removedPermissionName), `removed permission name returned: ${removedPermissionName}`);
+  for (const invalidPermissionHint of invalidPermissionHints) {
+    assert.ok(!accessOutput.includes(invalidPermissionHint), `invalid permission hint returned: ${invalidPermissionHint}`);
   }
 });
 
@@ -902,8 +899,8 @@ test("checkMulesoftAccess reports limited access and missing permissions when su
   assert.ok(result.surfaces.some((surface) => surface.name === "cloudhub_applications" && surface.status === "skipped"));
   assert.ok(result.missingPermissions.some((permission) => /Audit Log Viewer/.test(permission)));
   assert.ok(result.missingPermissions.some((permission) => /CloudHub Network Viewer/.test(permission)));
-  assert.ok(result.missingPermissions.some((permission) => /root Organization Administrator \(connected applications\)/.test(permission)));
-  assert.match(result.recommendedNextStep, /Review these documented permission or access requirements/);
+  assert.ok(result.missingPermissions.some((permission) => /`read:orgconnapps`/.test(permission)));
+  assert.match(result.recommendedNextStep, /Add these documented connected-app scopes or permissions/);
   assert.ok(result.notes.some((note) => note.includes("No environment was readable")));
 });
 
