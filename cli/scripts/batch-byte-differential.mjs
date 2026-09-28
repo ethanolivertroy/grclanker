@@ -133,7 +133,7 @@ function __corpusRecord(name, kind, value) {
   if (!directory) return;
   __corpusMkdirSync(directory, { recursive: true });
   const serialized = JSON.stringify({ name, kind, value })
-    .replace(/http:\\/\\/127\\.0\\.0\\.1:\\d+/g, "http://127.0.0.1:<ephemeral-port>")
+    .replace(/127\\.0\\.0\\.1:\\d+/g, "127.0.0.1:<ephemeral-port>")
     .replace(/http:\\/\\/localhost:\\d+/g, "http://localhost:<ephemeral-port>");
   __corpusAppendFileSync(
     directory + "/${moduleName}.jsonl",
