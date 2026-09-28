@@ -2136,7 +2136,7 @@ test("QUALYS-C16 preserves exact proved-failure bytes across one denied source a
   const baselineBytes = project(await runAllAssessments(createFakeClient(baseOverrides)));
   assert.equal(
     createHash("sha256").update(baselineBytes).digest("hex"),
-    "QUALYS_C16_DENIED_PROFILE_BASELINE_SHA256",
+    "82faed1dbab2b63e3503d2da18761af6d651c987686f3d7d28fd750c07f51a98",
     "the status, summary, and evidence snapshot is intentionally byte-pinned",
   );
   assert.match(baselineBytes, /^{"status":"fail","summary":"1 excluded IP ranges span more than 256 addresses\. Additional evidence was not readable:/);
