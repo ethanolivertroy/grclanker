@@ -2348,8 +2348,10 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const minimum = value("min_report_rate_pct") ?? 0;
       return fact(value("delivered_count") ?? 0, rate !== undefined && rate < minimum / 2 ? 1 : 0, rate === undefined || rate < minimum ? 1 : 0);
     }
-    case "KNOWBE4-20":
-      return fact(value("security_tests_all_time") ?? value("security_tests_read") ?? 0, count("gaps_over_threshold"), 0);
+    case "KNOWBE4-20": {
+      const tests = value("security_tests_all_time") ?? value("security_tests_read") ?? 0;
+      return fact(tests, tests === 0 ? 1 : count("gaps_over_threshold"), 0);
+    }
     default:
       return {};
   }

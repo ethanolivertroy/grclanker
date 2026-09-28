@@ -1362,6 +1362,9 @@ test("an empty truncated security-test read still proves the no-test coverage fa
   const coverage = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 2);
   assert.equal(coverage.status, "fail");
   assert.match(coverage.summary, /No phishing security tests ran.*Truncated listing: security_tests/);
+  const cadence = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 20);
+  assert.equal(cadence.status, "fail");
+  assert.match(cadence.summary, /No phishing security tests have ever run.*Truncated listing: security_tests/);
 });
 
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
