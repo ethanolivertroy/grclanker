@@ -22,7 +22,7 @@ import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -3306,7 +3306,7 @@ function buildFinding(
   const definition = OKTA_CHECKS[id];
   const facts = OKTA_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(OKTA_SPEC, id, facts);
+  status = assertBatchCheckVerdict(OKTA_SPEC, id, facts, status);
   return {
     id: definition.id,
     title: definition.title,

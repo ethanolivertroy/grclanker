@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -2556,7 +2556,7 @@ function buildFinding(
   const definition = DUO_CHECKS[id];
   const facts = DUO_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(DUO_SPEC, id, facts);
+  status = assertBatchCheckVerdict(DUO_SPEC, id, facts, status);
   return {
     id: definition.id,
     title: definition.title,

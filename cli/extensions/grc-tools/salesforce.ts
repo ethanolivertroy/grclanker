@@ -21,7 +21,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 
@@ -1882,7 +1882,7 @@ function finding(
   const id = `SF-${String(control).padStart(2, "0")}`;
   const facts = SALESFORCE_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = evaluateBatchCheckVerdict(SALESFORCE_SPEC, id, facts) as SalesforceFindingStatus;
+  status = assertBatchCheckVerdict(SALESFORCE_SPEC, id, facts, status);
   return {
     id,
     control,

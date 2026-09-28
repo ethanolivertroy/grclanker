@@ -22,7 +22,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
 import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SERVICENOW_SPEC } from "./servicenow.spec.js";
 
@@ -1745,7 +1745,7 @@ function finding(controlNumber: number, evaluation: Evaluation): ServicenowFindi
   const id = findingId(controlNumber);
   const facts = SERVICENOW_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  const status = evaluateBatchCheckVerdict(SERVICENOW_SPEC, id, facts) as ServicenowFindingStatus;
+  const status = assertBatchCheckVerdict(SERVICENOW_SPEC, id, facts, evaluation.status);
   return {
     id,
     control: controlNumber,

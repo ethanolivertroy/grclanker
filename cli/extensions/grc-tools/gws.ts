@@ -34,7 +34,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1128,7 +1128,7 @@ function buildFinding(
   if (!definition) throw new Error(`Unknown GWS check definition: ${definitionId}`);
   const facts = GWS_DECISION_CONTEXT.getStore()?.get(definitionId);
   if (!facts) throw new Error(`${definitionId} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(GWS_SPEC, definitionId, facts);
+  status = assertBatchCheckVerdict(GWS_SPEC, definitionId, facts, status);
   const finding: GwsFinding = {
     id: definition.id,
     title: definition.title,

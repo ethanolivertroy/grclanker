@@ -23,7 +23,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZENDESK_SPEC } from "./zendesk.spec.js";
 
@@ -2378,7 +2378,7 @@ function finding(
   const id = `ZD-${String(control).padStart(2, "0")}`;
   const facts = ZENDESK_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = evaluateBatchCheckVerdict(ZENDESK_SPEC, id, facts) as ZendeskFindingStatus;
+  status = assertBatchCheckVerdict(ZENDESK_SPEC, id, facts, status);
   return {
     id,
     control,

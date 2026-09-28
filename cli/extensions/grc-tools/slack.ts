@@ -21,7 +21,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { readResolverEnvironment, SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readConfigText } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SLACK_SPEC } from "./slack.spec.js";
@@ -527,7 +527,7 @@ function finding(
 ): SlackFinding {
   const facts = SLACK_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = evaluateBatchCheckVerdict(SLACK_SPEC, id, facts) as SlackFindingStatus;
+  status = assertBatchCheckVerdict(SLACK_SPEC, id, facts, status);
   return { id, title, control, severity, status, summary, mappings: mappingsFor(control), evidence };
 }
 

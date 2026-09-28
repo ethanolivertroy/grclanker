@@ -22,7 +22,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { assertBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -2103,7 +2103,7 @@ function finding(
   const id = findingId(controlNumber);
   const facts = BOX_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = evaluateBatchCheckVerdict(BOX_SPEC, id, facts) as BoxFindingStatus;
+  status = assertBatchCheckVerdict(BOX_SPEC, id, facts, status);
   return {
     id,
     control: controlNumber,
