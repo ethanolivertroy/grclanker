@@ -4,26 +4,29 @@ import { resolve } from 'node:path';
 import Base from '../layouts/Base.astro';
 import { loadSpecs } from '../lib/specs';
 
-const specCount = loadSpecs().length;
+const integrationSpecCount = loadSpecs().filter((spec) => spec.vendor !== 'grclanker').length;
 
 const installCommands = [
   { key: 'curl', label: 'curl', command: 'curl -fsSL https://grclanker.com/install | bash' },
-  { key: 'npm', label: 'npm', command: 'npm install -g @grclanker/cli' },
-  { key: 'bun', label: 'bun', command: 'bun install -g @grclanker/cli' },
+  {
+    key: 'source',
+    label: 'source',
+    command: 'git clone https://github.com/ethanolivertroy/grclanker.git && cd grclanker/cli && npm ci && npm run build && npm link',
+  },
 ];
 
 const terminalExamples = [
   {
-    command: 'grclanker "what is the CMVP certificate for BoringCrypto?"',
+    command: 'grclanker flue run --message "What is the CMVP certificate for BoringCrypto?"',
     description: 'Resolve the exact validation record and answer with the cert, standard, and status.',
   },
   {
-    command: 'grclanker investigate "CVE-2024-3094"',
-    description: 'Trace KEV status, EPSS likelihood, and ransomware linkage in one pass.',
+    command: 'grclanker investigate',
+    description: 'Start the investigation workflow, then name a CVE, vendor, or module to trace KEV status, EPSS likelihood, and ransomware linkage.',
   },
   {
-    command: 'grclanker "compare the AWS spec with the shipped tools"',
-    description: 'Use the repo’s specs to review coverage and plan extensions to the native tool families.',
+    command: 'grclanker tools aws_check_access',
+    description: 'List every bundled tool, or show one tool’s group, description, and parameters before you run it.',
   },
 ];
 
@@ -53,7 +56,7 @@ const workflowCards = [
 const releaseFacts = [
   {
     label: '241 domain tools',
-    detail: 'Native checks, assessments, and evidence exports cover 35 integrations, each with a repository spec, plus CMVP, KEV, EPSS, FedRAMP, Vanta, SCF, and OSCAL.',
+    detail: 'Native checks, assessments, and evidence exports cover 35 vendor integrations, plus CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL tools. The v0.0.1 release bundle carries 8 of them; the rest run from a source checkout until the next release.',
   },
   {
     label: 'Three runtime paths',
@@ -64,8 +67,8 @@ const releaseFacts = [
     detail: 'Runtime adapters classify read effects, approval-gate writers, and redact credential-shaped arguments. Integration exports document sensitive-data handling and partial collection.',
   },
   {
-    label: `${specCount} integration specs`,
-    detail: 'Each shipped integration has a repository spec that remains a reusable design record and build input.',
+    label: `${integrationSpecCount} integration specs`,
+    detail: 'Every shipped vendor integration except Vanta has a repository spec that remains a reusable design record and build input.',
   },
 ];
 
@@ -83,7 +86,7 @@ const brandFrames = [
   {
     image: '/about-clanker.webp',
     eyebrow: 'Local-first',
-    title: 'Your data stays on your machine. Or choose a hosted path.',
+    title: 'Run a local model and prompts stay on your machine. Or choose a hosted provider.',
   },
 ];
 
@@ -98,7 +101,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
 );
 ---
 
-<Base title="grclanker: Put a Clanker on Your Compliance" description="241 domain tools, 35 integrations with repository specs, and Pi, Cursor Agent SDK, and Flue runtime paths.">
+<Base title="grclanker: Put a Clanker on Your Compliance" description="241 domain tools across 35 vendor integrations and CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL, with Pi, Cursor Agent SDK, and Flue runtime paths.">
   <section class="relative overflow-hidden border-b border-surface0/60">
     <div class="absolute inset-0 w-full h-full">
       <img src="/hero/command-center.webp" alt="Clanker command center" class="w-full h-full object-cover object-center" loading="eager" />
@@ -112,7 +115,7 @@ const previewImage = screenshotCandidates.find((candidate) =>
             Your compliance evidence is scattered.<br />Put a clanker on it.
           </h1>
           <p class="mx-auto mt-5 max-w-2xl text-base md:text-lg text-subtext1 leading-relaxed italic hero-copy-lede">
-            241 domain tools. 35 integrations with repository specs. Pi, Cursor Agent SDK, and Flue runtime paths.
+            241 domain tools. 35 vendor integrations. Pi, Cursor Agent SDK, and Flue runtime paths.
           </p>
         </div>
 
@@ -164,6 +167,9 @@ const previewImage = screenshotCandidates.find((candidate) =>
             </a>
           </div>
 
+          <p class="hero-support-copy">
+            The curl installer ships the v0.0.1 release bundle, which has 8 CMVP and KEV tools. Until the next release, build from source (Node 22.19 or newer) for all 241.
+          </p>
           <p class="hero-support-copy">
             Need just the skills? <a href="/docs/getting-started/installation#skills-only">Install the skills-only bundle</a>.
           </p>
