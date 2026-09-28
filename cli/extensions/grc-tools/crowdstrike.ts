@@ -2075,9 +2075,9 @@ function evaluateMlDetectionLevels(policies: JsonRecord[], partial = false): Cro
 function evaluateToggleControl(
   id: ControlId,
   policies: JsonRecord[],
-  requiredToggles: string[],
-  supplementalToggles: string[],
-  options: { policyKind: string; passSummary: string; skipPoliciesWithoutSettings?: boolean; failWhenDisabled: string[] },
+  requiredToggles: readonly string[],
+  supplementalToggles: readonly string[],
+  options: { policyKind: string; passSummary: string; skipPoliciesWithoutSettings?: boolean; failWhenDisabled: readonly string[] },
 ): CrowdstrikeFinding {
   const applied = assignedPolicies(policies);
   if (applied.length === 0) return noAssignedPolicyFinding(id, options.policyKind, policies);
