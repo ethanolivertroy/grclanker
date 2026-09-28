@@ -151,7 +151,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       [names.failureMatches]: `Non-negative integer counted directly from primitive vendor fields before any per-record status exists. Exact predicate: ${row.predicate}`,
       [names.reviewMatches]: `Non-negative integer counted directly from missing, unknown, or review-only primitive fields before any per-record status exists. Exact predicate and precedence: ${row.predicate}`,
     });
-    const coreDecisionRules = row.decisionRules ?? (row.manualOnly ? undefined : [
+    const suppliedDecisionRules = row.decisionRules ?? (row.manualOnly ? undefined : [
       batch2Rule("manual", batch2Any(
         batch2Ne(names.readable, true),
         batch2Not(batch2Defined(names.readable)),
@@ -172,6 +172,22 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       )),
       batch2Rule("manual", { op: "always" }),
     ]);
+    const terminalRule = suppliedDecisionRules?.at(-1);
+    const coreDecisionRules = suppliedDecisionRules
+      ? [
+          ...suppliedDecisionRules.map((rule) =>
+            rule.status === "pass" && rule.condition.op === "always"
+              ? batch2Rule(
+                  "pass",
+                  batch2All(...Object.keys(decisionInputs).map((name) => batch2Defined(name))),
+                  "Every declared primitive must be present and non-null before the fallback pass branch can match.",
+                )
+              : rule),
+          ...(terminalRule?.status === "manual" && terminalRule.condition.op === "always"
+            ? []
+            : [batch2Rule("manual", { op: "always" }, "Missing, null, malformed, or contradictory primitives require manual review.")]),
+        ]
+      : undefined;
     const numericConstants = Object.entries(row.constants ?? {})
       .filter(([, value]) => typeof value === "number")
       .map(([name]) => name);
