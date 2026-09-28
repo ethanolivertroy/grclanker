@@ -178,7 +178,22 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "KNOWBE4-12", control: 12, title: "Admin role audit", severity: "high", owner: "knowbe4_assess_account_governance", surfaces: ["account", "users"], predicate: "Count active KnowBe4 administrators above max_admin_count and administrator identifiers absent from the readable active-user inventory.", emptyOutcome: "warn", constants: { default_max_admin_count: 3 } },
   { id: "KNOWBE4-13", control: 13, title: "SSO integration status", severity: "critical", owner: "knowbe4_assess_account_governance", surfaces: ["account"], predicate: "Count one violation when the documented account SSO flag is explicitly false; absent SSO state requires manual review." },
   { id: "KNOWBE4-14", control: 14, title: "Reporting frequency", severity: "medium", owner: "knowbe4_assess_account_governance", surfaces: ["security-tests", "training-enrollments", "phisher-messages"], predicate: "Count the absence of recent phishing, training, and optional PhishER reporting evidence; unconfigured PhishER cannot independently fail the control." },
-  { id: "KNOWBE4-15", control: 15, title: "USB test campaign execution", severity: "medium", owner: "knowbe4_assess_account_governance", surfaces: [], predicate: "No Reporting API surface exposes USB drop tests; when require_usb_tests is true the check is manual and otherwise informational.", manualOnly: true },
+  {
+    id: "KNOWBE4-15",
+    control: 15,
+    title: "USB test campaign execution",
+    severity: "medium",
+    owner: "knowbe4_assess_account_governance",
+    surfaces: [],
+    predicate: "No Reporting API surface exposes USB drop tests, so the API capability fact is false and the check requires console evidence regardless of the configured requirement.",
+    decisionInputs: {
+      knowbe4_15_reporting_api_exposes_usb_tests: "Boolean capability fact owned by KNOWBE4-15. Type/domain: boolean. Source/owner: the fixed KnowBe4 Reporting API v1 surface inventory for this check, which has no USB-test resource. Completeness/sample semantics: false describes the complete documented API capability rather than a sampled tenant response. Null/missing meaning: the capability inventory was not supplied and the check requires manual review.",
+    },
+    decisionRules: [
+      batch2Rule("manual", batch2Ne("knowbe4_15_reporting_api_exposes_usb_tests", true)),
+      batch2Rule("manual", { op: "always" }),
+    ],
+  },
   { id: "KNOWBE4-16", control: 16, title: "Vishing campaign execution", severity: "medium", owner: "knowbe4_assess_account_governance", surfaces: ["callback-tests"], predicate: "Count the absence of a callback or vishing security test inside lookback_days when require_vishing_tests is true; otherwise report the observed inventory." },
   { id: "KNOWBE4-17", control: 17, title: "Compliance training modules", severity: "high", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments", "store-purchases"], predicate: "Count configured required topics absent from assigned content and required-topic enrollments whose completion percentage is below min_completion_pct.", constants: { default_min_completion_pct: 90 } },
   { id: "KNOWBE4-18", control: 18, title: "Inactive user cleanup", severity: "medium", owner: "knowbe4_assess_user_risk", surfaces: ["users", "security-test-recipients", "training-enrollments"], predicate: "Count active users with no phishing or training participation inside inactive_days.", emptyOutcome: "pass", constants: { default_inactive_days: 180 } },

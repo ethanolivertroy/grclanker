@@ -2279,12 +2279,24 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       failureMatches: violationCount,
       reviewMatches: reviewCount,
     });
+  if (id === "KNOWBE4-15") {
+    return { knowbe4_15_reporting_api_exposes_usb_tests: false };
+  }
   if (
     Object.prototype.hasOwnProperty.call(evidence, "collection_error")
     || asRecordArray(evidence.unreadable_inventories).length > 0
     || evidence.scoped_out_by_configuration === true
   ) {
     return batch3UnavailableFacts(id);
+  }
+  if (id === "KNOWBE4-04" && evidence.user_list_empty === true) {
+    return {
+      knowbe4_04_user_and_enrollment_reads_succeeded: true,
+      knowbe4_04_user_and_enrollment_lists_complete: true,
+      knowbe4_04_new_user_count: 1,
+      knowbe4_04_late_or_missing_enrollment_count: 1,
+      knowbe4_04_late_enrollment_percent: null,
+    };
   }
   if (evidence.user_list_empty === true) return fact(1, 0, 1);
   const observedViolation = evidence.violation_observed === true ? 1 : value("violation_observed") ?? 0;

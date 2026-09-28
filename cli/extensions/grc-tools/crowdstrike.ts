@@ -3031,7 +3031,7 @@ function evaluateSensorUpdate(policies: JsonRecord[], buildsByPlatform: Map<stri
         perPolicy.length,
         perPolicy.filter((item) => item.builds.some((build) => build.mode === "off" || (build.mode === "pinned" && item.supported_builds !== undefined && (build.number === undefined || !(build.number in item.supported_builds))))).length,
         perPolicy.filter((item) => item.status === "warn").length,
-        { readable: true, complete: catalogErrors.length === 0 },
+        { readable: true, complete: catalogErrors.every((error) => error === undefined) },
       ),
     ),
     "sensor build catalog",

@@ -127,11 +127,9 @@ const rows: readonly Batch3CheckRow[] = [
       tenable_03_expected_asset_count: "Non-negative expected asset population supplied by the operator; null means coverage has no authoritative denominator and cannot pass.",
     },
     decisionRules: [
-      batch2Rule("manual", batch2Any(
-        batch2Ne("tenable_03_asset_and_network_reads_succeeded", true),
-        batch2Not(batch2Defined("tenable_03_expected_asset_count")),
-      )),
+      batch2Rule("manual", batch2Ne("tenable_03_asset_and_network_reads_succeeded", true)),
       batch2Rule("fail", batch2Eq("tenable_03_exported_asset_count", 0)),
+      batch2Rule("manual", batch2Not(batch2Defined("tenable_03_expected_asset_count"))),
       batch2Rule("fail", { op: "ratio", numerator: batch2Path("tenable_03_fresh_asset_count"), denominator: batch2Path("tenable_03_expected_asset_count"), comparator: "lt", threshold: batch2Path("minimum_fresh_asset_ratio") }),
       batch2Rule("warn", batch2Ne("tenable_03_asset_export_and_networks_complete", true)),
       batch2Rule("pass", { op: "always" }),
