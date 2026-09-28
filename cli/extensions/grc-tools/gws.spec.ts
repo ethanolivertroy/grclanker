@@ -15,8 +15,8 @@ const GWS_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "GWS-ADMIN-002": ["directory-users", "roles", "role-assignments"],
   "GWS-ADMIN-003": ["directory-users", "roles", "role-assignments"], "GWS-ADMIN-004": ["admin-activities"],
   "GWS-ADMIN-005": ["directory-users", "roles", "role-assignments"],
-  "GWS-INTEG-001": ["directory-users", "user-tokens"], "GWS-INTEG-002": ["directory-users", "roles", "role-assignments", "user-tokens"],
-  "GWS-INTEG-003": ["directory-users", "user-tokens"], "GWS-INTEG-004": ["token-activities"],
+  "GWS-INTEG-001": ["directory-users", "roles", "role-assignments", "user-tokens"], "GWS-INTEG-002": ["directory-users", "roles", "role-assignments", "user-tokens"],
+  "GWS-INTEG-003": ["directory-users", "roles", "role-assignments", "user-tokens"], "GWS-INTEG-004": ["token-activities"],
   "GWS-MON-001": ["alerts"], "GWS-MON-002": ["login-activities"], "GWS-MON-003": ["admin-activities"],
   "GWS-MON-004": ["token-activities"], "GWS-MON-005": ["alerts"],
 };
@@ -47,27 +47,31 @@ const GWS_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCom
     complete: {
       sources: [
         { surfaceId: "directory-users", falseWhen: TRUNCATION_ONLY },
+        { surfaceId: "roles", falseWhen: ["error", "denied", "not-collected"] },
+        { surfaceId: "role-assignments", falseWhen: ["error", "denied", "not-collected"] },
         { surfaceId: "user-tokens", falseWhen: ALL_FAILURE_MODES },
       ],
-      semantics: "true when the user inventory is untruncated, every intended user was sampled, every per-user token request succeeded, and no token-sample dependency is unresolved; a denied or errored directory-user read is handled by `users_readable` and does not by itself change this fact.",
+      semantics: "true when the user inventory is untruncated, every intended user was sampled, every per-user token request succeeded, and both the roles and role-assignment inventories are readable; a denied or errored directory-user read is handled by `users_readable` and does not by itself change this fact.",
     },
   },
   "GWS-INTEG-002": {
     complete: {
       sources: [
         ...["directory-users", "roles", "role-assignments"].map((surfaceId) => ({ surfaceId, falseWhen: ALL_FAILURE_MODES })),
-        { surfaceId: "user-tokens", falseWhen: ALL_FAILURE_MODES },
+        { surfaceId: "user-tokens", falseWhen: ["error", "denied"] },
       ],
-      semantics: "true only when the complete directory inventory resolves every assignment, every privileged user fits within the 50-user priority sample, and no per-user token request failed.",
+      semantics: "true only when the complete directory inventory resolves every assignment, every privileged user fits within the 50-user priority sample, and no per-user token request failed; token-inventory truncation caused only by sampling fewer non-privileged users than the full population does not change this fact.",
     },
   },
   "GWS-INTEG-003": {
     complete: {
       sources: [
         { surfaceId: "directory-users", falseWhen: TRUNCATION_ONLY },
+        { surfaceId: "roles", falseWhen: ["error", "denied", "not-collected"] },
+        { surfaceId: "role-assignments", falseWhen: ["error", "denied", "not-collected"] },
         { surfaceId: "user-tokens", falseWhen: ALL_FAILURE_MODES },
       ],
-      semantics: "true when the user inventory is untruncated, every intended user was sampled, every per-user token request succeeded, and no token-sample dependency is unresolved; a denied or errored directory-user read is handled by `users_readable` and does not by itself change this fact.",
+      semantics: "true when the user inventory is untruncated, every intended user was sampled, every per-user token request succeeded, and both the roles and role-assignment inventories are readable; a denied or errored directory-user read is handled by `users_readable` and does not by itself change this fact.",
     },
   },
   "GWS-INTEG-004": { complete: completeFrom(["token-activities"], "true only when the token activity report is readable and untruncated.") },

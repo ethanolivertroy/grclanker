@@ -270,8 +270,8 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       active_stream_count: "active log streams", contact_count: "organization contacts",
     };
     const booleans: Readonly<Record<string, string>> = {
-      readable: "every dataset required by the check was collected and parseable", complete: "required datasets exhausted pagination under the check-specific truncation semantics",
-      classic_engine: "the organization reports Classic Engine", policy_inventory_readable: "all policy families needed for admin MFA were readable",
+      readable: "every dataset required by the check was collected and parseable", complete: "defined by this check's structured completeness contract",
+      classic_engine: "the organization reports Classic Engine", policy_inventory_readable: "at least one policy family needed for admin MFA was readable",
       idp_readable: "identity providers were returned and parseable", authenticator_readable: "authenticators were returned and parseable",
       federal_tenant: "the configured host uses the recognized federal suffix", okta_verify_active: "an active Okta Verify authenticator exists", fips_required: "Okta Verify explicitly requires FIPS",
       support_readable: "Okta Support settings were returned and parseable", support_present: "the support-access field is present",

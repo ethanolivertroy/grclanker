@@ -33,10 +33,10 @@ const SLACK_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "SLACK-ADMIN-01": ["workspaces", "workspace-admins"], "SLACK-ADMIN-02": ["admin-users"],
   "SLACK-ADMIN-03": ["admin-users", "session-settings"], "SLACK-ADMIN-04": [],
   "SLACK-ADMIN-05": ["workspaces", "workspace-settings"], "SLACK-ADMIN-06": [],
-  "SLACK-ADMIN-07": ["workspaces", "workspace-settings"], "SLACK-ADMIN-08": ["emoji", "admin-users", "workspace-admins"],
+  "SLACK-ADMIN-07": ["workspaces", "workspace-settings"], "SLACK-ADMIN-08": ["emoji", "admin-users", "workspaces", "workspace-admins"],
   "SLACK-ADMIN-09": ["analytics-export"], "SLACK-APP-01": ["approved-apps"], "SLACK-APP-02": ["restricted-apps"],
   "SLACK-APP-03": ["approved-apps"], "SLACK-APP-04": ["barriers"], "SLACK-APP-05": [],
-  "SLACK-APP-06": ["workspaces", "team-preferences"], "SLACK-APP-07": [],
+  "SLACK-APP-06": ["auth-test", "workspaces", "team-preferences"], "SLACK-APP-07": [],
   "SLACK-CHAN-01": ["channels"], "SLACK-CHAN-02": ["channels", "channel-preferences"],
   "SLACK-CHAN-03": ["channels", "channel-retention"], "SLACK-CHAN-04": [], "SLACK-CHAN-05": [],
   "SLACK-MON-01": ["audit-logs"], "SLACK-MON-02": ["audit-logs"], "SLACK-MON-03": ["audit-logs"],
@@ -61,7 +61,7 @@ const SLACK_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchC
   "SLACK-ADMIN-07": { teams_complete: completeFrom(["workspaces"], "true only when admin.teams.list is readable and completely paged; workspace-settings failures are counted separately and do not change this fact.") },
   "SLACK-ADMIN-08": {
     emoji_complete: completeFrom(["emoji"], "true only when admin.emoji.list is readable and completely paged."),
-    roster_complete: completeFrom(["admin-users", "workspace-admins"], "true only when the organization-user roster and every applicable workspace administrator roster are readable and completely paged."),
+    roster_complete: completeFrom(["admin-users", "workspaces", "workspace-admins"], "true only when the organization-user roster and workspace list are readable and completely paged and every listed workspace has a readable, completely paged administrator roster."),
   },
   "SLACK-APP-01": { approved_complete: completeFrom(["approved-apps"], "true only when the approved-app inventory is readable and completely paged.") },
   "SLACK-APP-02": { restricted_complete: completeFrom(["restricted-apps"], "true only when the restricted-app inventory is readable and completely paged.") },
@@ -71,9 +71,9 @@ const SLACK_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchC
     coverage_complete: {
       sources: [
         { surfaceId: "workspaces", falseWhen: ALL_FAILURE_MODES },
-        { surfaceId: "team-preferences", falseWhen: [] },
+        { surfaceId: "auth-test", falseWhen: ["error", "denied", "not-collected", "missing-required-field"] },
       ],
-      semantics: "true only when the token is scoped to one known workspace and the identity needed to select that workspace is resolved; failure of the preference read is represented by `preferences_readable` and does not itself change this fact.",
+      semantics: "true only when admin.teams.list is readable, completely paged, and returns no more than one workspace while auth.test is readable and returns a non-empty team_id; team.preferences.list readability does not change this fact.",
     },
   },
   "SLACK-CHAN-01": { external_complete: completeFrom(["channels"], "true only when the external-shared-channel search is readable and completely paged.") },

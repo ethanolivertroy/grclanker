@@ -161,7 +161,12 @@ export interface CheckContract {
   criteria: VerdictCriteria;
 }
 
-export type CompletenessFailureMode = "truncated" | "error" | "denied" | "not-collected";
+export type CompletenessFailureMode =
+  | "truncated"
+  | "error"
+  | "denied"
+  | "not-collected"
+  | "missing-required-field";
 
 export interface CompletenessSourceContract {
   surfaceId: string;

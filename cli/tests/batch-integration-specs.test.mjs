@@ -573,7 +573,7 @@ test("151 completeness primitives have exact per-check sources, failure modes, a
         for (const source of contract.sources) {
           assert.ok(check.sourceSurfaceIds.includes(source.surfaceId), `${check.id}.${inputName}: declared source ${source.surfaceId}`);
           assert.equal(new Set(source.falseWhen).size, source.falseWhen.length);
-          assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected"].includes(mode)));
+          assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected", "missing-required-field"].includes(mode)));
         }
         const rendered = check.evidenceFieldDefinitions[inputName];
         assert.match(rendered, new RegExp(`For ${check.id},`));
@@ -587,6 +587,65 @@ test("151 completeness primitives have exact per-check sources, failure modes, a
   assert.equal(completenessFields, 151);
 });
 
+test("all 151 completeness source contracts feed the executable runtime-input derivations", () => {
+  const conditionUsesPath = (condition, path) => {
+    const operandUsesPath = (operand) => (
+      (operand.kind === "path" || operand.kind === "length") && operand.path === path
+    );
+    switch (condition.op) {
+      case "always":
+        return false;
+      case "and":
+      case "or":
+        return condition.conditions.some((child) => conditionUsesPath(child, path));
+      case "not":
+        return conditionUsesPath(condition.condition, path);
+      case "eq":
+      case "ne":
+      case "gt":
+      case "gte":
+      case "lt":
+      case "lte":
+        return operandUsesPath(condition.left) || operandUsesPath(condition.right);
+      case "ratio":
+        return operandUsesPath(condition.numerator)
+          || operandUsesPath(condition.denominator)
+          || operandUsesPath(condition.threshold);
+      case "matches":
+      case "defined":
+      case "null":
+        return operandUsesPath(condition.operand);
+      case "some":
+      case "every":
+        return condition.path === path || conditionUsesPath(condition.condition, path);
+      default:
+        assert.fail(`unhandled condition operator ${condition.op}`);
+    }
+  };
+  let comparisons = 0;
+  for (const [spec] of batch) {
+    for (const check of spec.checks) {
+      for (const [inputName, contract] of Object.entries(check.completeness ?? {})) {
+        comparisons += 1;
+        assert.ok(
+          Object.values(check.derivedFactRules).some((rule) => conditionUsesPath(rule.condition, inputName)),
+          `${check.id}.${inputName}: captured runtime input feeds an executable outcome`,
+        );
+        assert.deepEqual(
+          contract.sources.map((source) => source.surfaceId),
+          [...new Set(contract.sources.map((source) => source.surfaceId))],
+          `${check.id}.${inputName}: exact runtime source set has no aliases`,
+        );
+        const rendered = check.evidenceFieldDefinitions[inputName];
+        for (const source of contract.sources) {
+          assert.match(rendered, new RegExp(`\\\`${source.surfaceId}\\\``), `${check.id}.${inputName}: rendered runtime source ${source.surfaceId}`);
+        }
+      }
+    }
+  }
+  assert.equal(comparisons, 151);
+});
+
 test("portable source and population contracts encode the final audit distinctions", () => {
   const check = (spec, id) => spec.checks.find((entry) => entry.id === id);
   const sourceIds = (spec, id, inputName = "complete") =>
@@ -598,8 +657,11 @@ test("portable source and population contracts encode the final audit distinctio
   assert.deepEqual(sourceIds(GWS_SPEC, "GWS-MON-002"), ["login-activities"]);
   assert.deepEqual(sourceIds(GWS_SPEC, "GWS-ADMIN-005"), ["directory-users", "roles", "role-assignments"]);
   assert.deepEqual(falseWhen(GWS_SPEC, "GWS-ADMIN-005", "roles"), ["truncated"]);
-  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-INTEG-001"), ["directory-users", "user-tokens"]);
-  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-INTEG-003"), ["directory-users", "user-tokens"]);
+  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-INTEG-001"), ["directory-users", "roles", "role-assignments", "user-tokens"]);
+  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-INTEG-003"), ["directory-users", "roles", "role-assignments", "user-tokens"]);
+  assert.deepEqual(falseWhen(GWS_SPEC, "GWS-INTEG-001", "roles"), ["error", "denied", "not-collected"]);
+  assert.deepEqual(falseWhen(GWS_SPEC, "GWS-INTEG-003", "role-assignments"), ["error", "denied", "not-collected"]);
+  assert.deepEqual(falseWhen(GWS_SPEC, "GWS-INTEG-002", "user-tokens"), ["error", "denied"]);
   assert.deepEqual(sourceIds(DUO_SPEC, "DUO-AUTH-010"), ["users"]);
   assert.deepEqual(sourceIds(SALESFORCE_SPEC, "SF-06"), ["profile-metadata"]);
   assert.deepEqual(falseWhen(SALESFORCE_SPEC, "SF-07", "users"), ["truncated"]);
@@ -609,6 +671,9 @@ test("portable source and population contracts encode the final audit distinctio
 
   assert.match(check(SLACK_SPEC, "SLACK-ID-01").evidenceFieldDefinitions.without_mfa_count, /active human users/);
   assert.match(check(SLACK_SPEC, "SLACK-ADMIN-02").evidenceFieldDefinitions.without_sso_count, /active organization users/);
+  assert.deepEqual(sourceIds(SLACK_SPEC, "SLACK-APP-06", "coverage_complete"), ["workspaces", "auth-test"]);
+  assert.deepEqual(falseWhen(SLACK_SPEC, "SLACK-APP-06", "auth-test", "coverage_complete"), ["error", "denied", "not-collected", "missing-required-field"]);
+  assert.deepEqual(sourceIds(SLACK_SPEC, "SLACK-ADMIN-08", "roster_complete"), ["admin-users", "workspaces", "workspace-admins"]);
   assert.match(check(OKTA_SPEC, "OKTA-AUTH-002").evidenceFieldDefinitions.policy_inventory_readable, /at least one/);
   assert.ok(OKTA_SPEC.knownGaps.some((gap) => /Pass for 32.*Partial for 3.*Manual for 2/.test(gap)));
   assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-INTEG-004.*network-zone read is denied.*Pass/.test(gap)));

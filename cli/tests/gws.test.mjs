@@ -894,6 +894,83 @@ portableContractTest("GWS-MON-002 primitive facts and contract both use login ac
   }
 });
 
+portableContractTest("GWS integration completeness contracts match 212 recorded role-read divergences and four collector failure shapes", async () => {
+  const lowScopeTokens = async (userKey) => (createTokens()[userKey] ?? [])
+    .map((token) => ({ ...token, scopes: ["https://www.googleapis.com/auth/calendar"] }));
+  const cases = [
+    ...Array.from({ length: 204 }, (_, index) => ({ id: "GWS-INTEG-001", index })),
+    ...Array.from({ length: 8 }, (_, index) => ({ id: "GWS-INTEG-003", index })),
+  ];
+  let targetedCases = 0;
+  for (const testCase of cases) {
+    const source = testCase.index % 2 === 0 ? "roles" : "role-assignments";
+    const status = testCase.index % 4 < 2 ? 403 : 500;
+    if (testCase.index < 4 && testCase.id === "GWS-INTEG-001") targetedCases += 1;
+    const fail = async () => {
+      throw new GwsApiError(
+        status,
+        status === 403
+          ? "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)"
+          : "500 Internal Server Error",
+        `https://admin.googleapis.com/${source}`,
+      );
+    };
+    const overrides = source === "roles" ? { collectRoles: fail } : { collectRoleAssignments: fail };
+    const { result, facts } = await captureGwsFacts(testCase.id, async () => {
+      const collected = await collectGwsAuditData(createFakeCollector({ ...overrides, listUserTokens: lowScopeTokens }));
+      return assessGwsIntegrations(collected.integrations, createSampleConfig());
+    });
+    assert.equal(facts.complete, false, `${testCase.id} ${source} HTTP ${status}`);
+    const finding = findingById(result, testCase.id);
+    assert.equal(finding.status, "Partial", `${testCase.id} ${source} HTTP ${status}`);
+    assert.match(finding.summary, /Partial|limited set/, `${testCase.id} ${source} HTTP ${status}`);
+    const contract = GWS_SPEC.checks.find((check) => check.id === testCase.id).completeness.complete;
+    const sourceContract = contract.sources.find((entry) => entry.surfaceId === source);
+    assert.ok(sourceContract, `${testCase.id}: ${source} is a declared completeness source`);
+    assert.ok(sourceContract.falseWhen.includes(status === 403 ? "denied" : "error"));
+  }
+  assert.equal(cases.filter((entry) => entry.id === "GWS-INTEG-001").length, 204);
+  assert.equal(cases.filter((entry) => entry.id === "GWS-INTEG-003").length, 8);
+  assert.equal(targetedCases, 4);
+});
+
+portableContractTest("GWS-INTEG-002 ignores token sampling truncation when every privileged user was sampled", async () => {
+  const users = [
+    ...createUsers(),
+    ...Array.from({ length: 60 }, (_, index) => ({
+      id: `u-extra-${index}`,
+      primaryEmail: `extra-${index}@example.com`,
+      isAdmin: false,
+      isDelegatedAdmin: false,
+      suspended: false,
+      archived: false,
+      isEnforcedIn2Sv: true,
+      isEnrolledIn2Sv: true,
+      lastLoginTime: RECENT_LOGIN,
+    })),
+  ];
+  const { result, facts } = await captureGwsFacts("GWS-INTEG-002", async () => {
+    const collected = await collectGwsAuditData(createFakeCollector({
+      collectUsers: async () => collection(users),
+      listUserTokens: async (userKey) => userKey === "user@example.com"
+        ? createTokens()[userKey]
+        : [],
+    }));
+    assert.equal(collected.integrations.tokenInventory.seen, 50);
+    assert.equal(collected.integrations.tokenInventory.total, 64);
+    assert.equal(collected.integrations.tokenInventory.truncated, true);
+    return assessGwsIntegrations(collected.integrations, createSampleConfig());
+  });
+  assert.equal(facts.complete, true);
+  assert.equal(findingById(result, "GWS-INTEG-002").status, "Pass");
+  const tokenSource = GWS_SPEC.checks
+    .find((check) => check.id === "GWS-INTEG-002")
+    .completeness.complete.sources
+    .find((source) => source.surfaceId === "user-tokens");
+  assert.ok(tokenSource);
+  assert.equal(tokenSource.falseWhen.includes("truncated"), false);
+});
+
 test("verdict rule 2 (by intent): an empty sub-population inside a non-empty inventory may pass and says so", () => {
   const config = createSampleConfig();
   const admin = assessGwsAdminAccess({
