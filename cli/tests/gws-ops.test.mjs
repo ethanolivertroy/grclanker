@@ -684,6 +684,8 @@ test("collectGwsOperatorEvidenceBundle writes raw evidence, summaries, completen
   assert.match(adminAnalysis.status, /^complete: the CLI response carried no nextPageToken/);
   assert.equal(adminAnalysis.records.length, 1);
   const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
+  assert.match(summary, /Bundle completeness: partial: one or more commands returned a nextPageToken/);
+  assert.doesNotMatch(summary, /Bundle completeness: complete:/);
   assert.match(summary, /Complete evidence: no \(nextPageToken present\)/);
   assert.match(summary, /Complete evidence: yes/);
   assert.match(summary, /^- Status: complete: the CLI response carried no nextPageToken/m);
@@ -721,7 +723,7 @@ test("collectGwsOperatorEvidenceBundle degrades the exact v0.22.5 missing-alertc
   assert.match(alertsRaw.command.command, /alertcenter:v1beta1 alerts list/);
 
   const summary = readFileSync(join(result.outputDir, "summary.md"), "utf8");
-  assert.match(summary, /Bundle completeness: partial \(alerts unsupported\/unavailable\)/);
+  assert.match(summary, /Bundle completeness: partial: one or more optional evidence categories were unsupported\/unavailable/);
   assert.match(summary, /Records: not collected \(unavailable\)/);
   assert.match(summary, /Complete evidence: no \(unsupported\/unavailable\)/);
   const alertsSection = summary.split("## Google Workspace admin activity trace")[0];
@@ -738,6 +740,17 @@ test("collectGwsOperatorEvidenceBundle keeps available alertcenter success and u
   assert.equal(available.complete, true);
   assert.deepEqual(available.unavailableCategories, []);
   assert.equal(available.categories.alerts, 2);
+
+  const pagedAvailable = await collectGwsOperatorEvidenceBundle(
+    { gwsBin: fake, output_dir: join(base, "paged-available") },
+    createRunner({ alerts: alertsPayload({ nextPageToken: "more-alerts" }) }),
+  );
+  assert.equal(pagedAvailable.complete, false);
+  assert.match(pagedAvailable.status, /^partial: one or more commands returned a nextPageToken/);
+  assert.deepEqual(pagedAvailable.unavailableCategories, []);
+  const pagedSummary = readFileSync(join(pagedAvailable.outputDir, "summary.md"), "utf8");
+  assert.match(pagedSummary, /Bundle completeness: partial: one or more commands returned a nextPageToken/);
+  assert.doesNotMatch(pagedSummary, /Bundle completeness: complete:/);
 
   const successRunner = createRunner();
   const unexpectedAlertFailure = async (request) => {

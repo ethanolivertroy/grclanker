@@ -202,15 +202,18 @@ const PREVIEW_STATUS = "not collected: dry run previewed the command and did not
 const ALERTS_UNAVAILABLE_STATUS =
   "unsupported/unavailable: installed gws does not expose the alertcenter service, so alert evidence was not collected";
 
-interface GwsOpsBundleResult {
+interface GwsOpsBundleCompletion {
+  complete: boolean;
+  status: string;
+  unavailableCategories: ActivityCategory[];
+}
+
+interface GwsOpsBundleResult extends GwsOpsBundleCompletion {
   outputDir: string;
   zipPath: string;
   fileCount: number;
   commandCount: number;
   recordCount: number;
-  complete: boolean;
-  status: string;
-  unavailableCategories: ActivityCategory[];
   categories: Record<ActivityCategory, number | null>;
 }
 
@@ -956,7 +959,7 @@ function buildBundleReadme(): string {
     "",
     "- `raw/` contains the Google Workspace CLI response projected to the documented Reports API and Alert Center fields; alert data payloads and event parameters are not stored, and credential-like keys plus known environment values are redacted.",
     "- `analysis/` contains normalized investigation summaries prepared for GRC review.",
-    "- `commands.json` records the exact read-only commands grclanker executed.",
+    "- `commands.json` records the exact read-only commands grclanker attempted.",
     "- `summary.md` is the quickest human-readable starting point.",
     "- Admin and token activity are core evidence. Alert Center is supplementary because some published gws builds do not expose `alertcenter`; when unsupported, its files say unavailable, its count is null, and the bundle is explicitly partial.",
     "",
@@ -1221,14 +1224,27 @@ async function collectBundleAlerts(
   }
 }
 
-function buildBundleSummary(results: GwsOpsBundleActivityResult[]): string {
+function getBundleCompletion(results: GwsOpsBundleActivityResult[]): GwsOpsBundleCompletion {
   const unavailableCategories = results
     .filter((result) => result.mode === "unavailable")
     .map((result) => result.category);
+  const complete = results.every((result) => result.mode === "execute" && result.complete);
+  const status = unavailableCategories.length > 0
+    ? "partial: one or more optional evidence categories were unsupported/unavailable"
+    : complete
+      ? "complete: all requested command pages were collected"
+      : "partial: one or more commands returned a nextPageToken";
+  return { complete, status, unavailableCategories };
+}
+
+function buildBundleSummary(
+  results: GwsOpsBundleActivityResult[],
+  completion: GwsOpsBundleCompletion,
+): string {
   return [
     "# Google Workspace CLI Operator Evidence Summary",
     "",
-    `- Bundle completeness: ${unavailableCategories.length === 0 ? "complete for requested command pages" : `partial (${unavailableCategories.join(", ")} unsupported/unavailable)`}`,
+    `- Bundle completeness: ${completion.status}`,
     "",
     ...results.map((result) => [
       `## ${result.title}`,
@@ -1273,12 +1289,13 @@ export async function collectGwsOperatorEvidenceBundle(
   const adminActivity = executedResult(await traceGwsAdminActivity(workflowArgs, runner, env));
   const tokenActivity = executedResult(await reviewGwsTokenActivity(workflowArgs, runner, env));
   const results = [alerts, adminActivity, tokenActivity];
+  const completion = getBundleCompletion(results);
 
   const outputRoot = args.output_dir?.trim() || DEFAULT_OUTPUT_DIR;
   const outputDir = await nextAvailableAuditDir(outputRoot, safeDirName("gws-operator-evidence"));
 
   await writeSecureTextFile(outputDir, "README.md", buildBundleReadme());
-  await writeSecureTextFile(outputDir, "summary.md", buildBundleSummary(results));
+  await writeSecureTextFile(outputDir, "summary.md", buildBundleSummary(results, completion));
   await writeSecureTextFile(
     outputDir,
     "commands.json",
@@ -1312,15 +1329,7 @@ export async function collectGwsOperatorEvidenceBundle(
     fileCount,
     commandCount: results.length,
     recordCount: results.reduce((sum, result) => sum + bundleRecordCount(result), 0),
-    complete: results.every((result) => result.mode === "execute" && result.complete),
-    status: results.some((result) => result.mode === "unavailable")
-      ? "partial: one or more optional evidence categories were unsupported/unavailable"
-      : results.some((result) => !result.complete)
-        ? "partial: one or more commands returned a nextPageToken"
-        : "complete: all requested command pages were collected",
-    unavailableCategories: results
-      .filter((result) => result.mode === "unavailable")
-      .map((result) => result.category),
+    ...completion,
     categories: {
       alerts: alerts.count,
       admin_activity: adminActivity.count,
