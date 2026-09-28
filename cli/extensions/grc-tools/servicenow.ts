@@ -24,7 +24,12 @@ import { YAMLError, parse as parseYaml } from "yaml";
 import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
-import { SERVICENOW_SPEC } from "./servicenow.spec.js";
+import {
+  SERVICENOW_BASELINE_HARDENING_PROPERTIES,
+  SERVICENOW_INSTANCE_SECURITY_PROPERTIES,
+  SERVICENOW_SCRIPT_RESTRICTION_PROPERTIES,
+  SERVICENOW_SPEC,
+} from "./servicenow.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -1937,34 +1942,9 @@ function criteriaRoleNames(row: JsonRecord): string[] {
   return [...names].sort();
 }
 
-const INSTANCE_SECURITY_PROPERTIES: PropertyExpectation[] = [
-  { name: "glide.security.use_csrf_token", expected: "true", describe: "true" },
-  { name: "glide.security.csrf.strict.validation.mode", expected: "true", describe: "true" },
-  { name: "glide.security.file.mime_type.validation", expected: "true", describe: "true" },
-  { name: "glide.security.diag_txns_acl", expected: "true", describe: "true" },
-  { name: "glide.security.strict.user_image_upload", expected: "true", describe: "true" },
-];
-
-const SCRIPT_RESTRICTION_PROPERTIES: PropertyExpectation[] = [
-  { name: "glide.script.use.sandbox", expected: "true", describe: "true" },
-  { name: "glide.script.allow.ajaxevaluate", expected: "false", describe: "false" },
-  { name: "glide.script.secure.ajaxgliderecord", expected: "true", describe: "true" },
-  { name: "glide.script.ccsi.ispublic", expected: "false", describe: "false" },
-];
-
-const HARDENING_PROPERTIES: PropertyExpectation[] = [
-  { name: "glide.security.strict.updates", expected: "true", describe: "true" },
-  { name: "glide.security.strict.actions", expected: "true", describe: "true" },
-  { name: "glide.ui.escape_html_list_field", expected: "true", describe: "true" },
-  { name: "glide.ui.escape_all_script", expected: "true", describe: "true" },
-  { name: "glide.html.escape_script", expected: "true", describe: "true" },
-  { name: "glide.html.sanitize_all_fields", expected: "true", describe: "true" },
-  { name: "glide.ui.security.allow_codetag", expected: "false", describe: "false" },
-  { name: "glide.ui.security.codetag.allow_script", expected: "false", describe: "false" },
-  { name: "glide.set_x_frame_options", expected: "true", describe: "true" },
-  { name: "glide.ui.secure_cookies", expected: "true", describe: "true" },
-  { name: "glide.cookies.http_only", expected: "true", describe: "true" },
-];
+const INSTANCE_SECURITY_PROPERTIES: PropertyExpectation[] = [...SERVICENOW_INSTANCE_SECURITY_PROPERTIES];
+const SCRIPT_RESTRICTION_PROPERTIES: PropertyExpectation[] = [...SERVICENOW_SCRIPT_RESTRICTION_PROPERTIES];
+const HARDENING_PROPERTIES: PropertyExpectation[] = [...SERVICENOW_BASELINE_HARDENING_PROPERTIES];
 
 const SESSION_PROPERTY_NAMES = ["glide.ui.session_timeout", "glide.ui.rotate_sessions", "glide.ui.user_cookie.max_life_span_in_days"];
 const IP_PROPERTY_NAMES = ["glide.ip.authenticate.strict"];

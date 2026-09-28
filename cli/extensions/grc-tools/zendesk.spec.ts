@@ -127,7 +127,53 @@ const lte = (name: string, entry: PortableValue) => cmp("lte", name, entry);
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
-const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete Zendesk collector state before rendered evidence arrays are capped.`]));
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
+  const counts: Readonly<Record<string, string>> = {
+    sso_method_count: "configured SSO methods", team_count: "agent and administrator users", without_two_factor_count: "team members explicitly lacking two-factor",
+    unknown_two_factor_count: "team members with unknown two-factor state", custom_gap_count: "custom policy fields missing secure values", range_count: "allowed network ranges",
+    populated_admin_equivalent_count: "assigned administrator-equivalent roles", unassigned_admin_equivalent_count: "unassigned administrator-equivalent roles",
+    agent_count: "agents", unrestricted_agent_count: "agents with unrestricted access", admin_count: "administrators", stale_admin_count: "stale administrators",
+    undated_admin_count: "administrators without last login", group_count: "groups", membership_count: "group memberships", entry_count: "audit entries",
+    schedule_count: "automation or trigger schedules", active_count: "active records", active_ticket_count: "active tickets matched by schedules",
+    active_without_conditions_count: "active schedules without limiting conditions", outstanding_token_count: "active API tokens", client_count: "OAuth clients",
+    unscoped_count: "OAuth clients without limited scopes", insecure_redirect_count: "clients with HTTP or wildcard redirects", token_count: "OAuth tokens",
+    public_client_count: "public OAuth clients", privileged_token_count: "tokens carrying administrator-equivalent scopes", non_expiring_token_count: "tokens without expiry",
+    stale_token_count: "tokens beyond the age threshold", undated_token_count: "tokens without creation dates", installation_count: "installed applications",
+    owned_app_count: "account-owned applications", retired_count: "retired owned applications", insecure_cdn_count: "attachments outside the accepted HTTPS CDN",
+    stale_count: "records beyond the review threshold", undated_count: "records without timestamps", brand_count: "brands",
+    inconsistent_state_count: "brands with conflicting host or security state", agreement_count: "agreements", broken_count: "agreements missing acceptance or current state",
+    insecure_count: "webhooks failing HTTPS or authentication requirements", unauthenticated_webhook_count: "webhooks without authentication",
+    rule_count: "triggers and automations", insecure_destination_count: "external destinations with insecure transport or missing auth", external_action_count: "actions sending data externally",
+  };
+  const booleans: Readonly<Record<string, string>> = {
+    readable: "the check's required Zendesk response was returned", complete: "all check-specific pages and child reads completed",
+    credential_is_admin: "the authenticated principal is an administrator", fields_present: "all required account fields exist", enforce_sso: "SSO enforcement is enabled",
+    zendesk_login: "native Zendesk login remains enabled", team_readable: "agent and administrator users were returned", security_readable: "security settings were returned",
+    two_factor_enforce_present: "the two-factor enforcement field exists", two_factor_enforce_value: "two-factor enforcement is enabled",
+    enforce_sso_value: "the raw enforce-SSO field is enabled", enabled_present: "the network restriction enabled field exists", enabled: "network restrictions are enabled",
+    mobile_app_access: "mobile app access is enabled", roles_readable: "custom roles were returned", groups_readable: "groups were returned",
+    memberships_readable: "group memberships were returned", truncated: "the audit collection stopped before exhaustion", dateable: "a parseable timestamp exists",
+    secondary_complete: "the secondary ticket or condition inventory completed", settings_readable: "API and authentication settings were returned",
+    api_token_access: "API token access is enabled", token_history_readable: "API token history was returned", token_history_complete: "all token history pages completed",
+    clients_readable: "OAuth clients were returned", clients_complete: "all client pages completed", tokens_readable: "OAuth tokens were returned",
+    tokens_complete: "all token pages completed", installations_readable: "app installations were returned", installations_complete: "all installation pages completed",
+    owned_apps_complete: "metadata reads completed for every owned app", flag_present: "the named account setting exists", sandbox_enabled: "sandbox mode is enabled",
+    private_attachments: "attachments require authentication", account_settings_complete: "all required security fields were present", admin_view: "the principal can read admin-only brand settings",
+    any_readable: "at least one webhook source was readable", rules_readable: "trigger and automation rules were returned", rules_complete: "all rule pages completed",
+    destination_sources_complete: "all referenced destination records were readable",
+  };
+  const raw: Readonly<Record<string, string>> = {
+    security_policy_name: "Raw normalized selected security-policy name.", agent_session_timeout: "Agent browser timeout in minutes.",
+    mobile_app_session_timeout: "Mobile app timeout in minutes.", threshold_minutes: "Preferred maximum timeout in minutes.",
+    severe_threshold_minutes: "Failure timeout threshold in minutes.", admin_threshold: "Maximum accepted administrator population.",
+    sample_size: "Maximum audit records requested.", oldest_age_days: "Age in whole days of the oldest retained audit record.",
+    required_retention_days: "Minimum required audit retention in days.",
+  };
+  const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Zendesk inventory at the verdict point.`
+    : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+  if (!definition) throw new Error(`Zendesk primitive ${name} lacks an explicit portable definition`);
+  return [name, definition];
+}));
 const manual = (): ZendeskExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
 const withCredentialPassCap = (rules: readonly VerdictRule[]): readonly VerdictRule[] =>
   rules.flatMap((entry) => entry.status === "pass"
@@ -315,7 +361,7 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
   },
   "ZD-19": manual(),
   "ZD-20": {
-    inputs: input("readable", "complete", "ticket_count", "stale_count", "undated_count"),
+    inputs: input("readable", "complete", "stale_count", "undated_count"),
     rules: [
       rule("manual", ne("readable", true)),
       rule("warn", any(gt("stale_count", 0), gt("undated_count", 0), ne("complete", true))),
@@ -384,10 +430,12 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
     owner: ownerFor(control),
     surfaces: ZENDESK_CHECK_SURFACES[control],
     evidenceFields: [...ZENDESK_CHECK_SURFACES[control], "complete_source_counts"],
-    decisionInputs: {
-      ...decision.inputs,
-      credential_is_admin: "True only when a complete current-user response identifies the authenticated vendor principal as a Zendesk administrator; false includes a non-admin, missing, or unreadable role and caps only an otherwise passing finding.",
-    },
+    decisionInputs: decision.rules.some((entry) => entry.status === "pass")
+      ? {
+        ...decision.inputs,
+        credential_is_admin: "True only when a complete current-user response identifies the authenticated vendor principal as a Zendesk administrator; false includes a non-admin, missing, or unreadable role and caps only an otherwise passing finding.",
+      }
+      : decision.inputs,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
     decision: decisions[index],

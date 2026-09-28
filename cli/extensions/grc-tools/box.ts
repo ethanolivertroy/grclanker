@@ -3172,7 +3172,6 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   };
   recordBoxDecisionFacts(20, {
     terms_readable: !data.termsOfServices.error,
-    managed_term_count: managedTerms.length,
     enabled_managed_term_count: enabledManaged.length,
   });
   findings.push(
@@ -3466,7 +3465,6 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     policies_readable: !data.legalHoldPolicies.error,
     assignments_readable: !data.legalHoldAssignments.error,
     complete: !holdsTruncated,
-    active_policy_count: activeHolds.length,
     assigned_policy_count: assignedHolds.length,
   });
   findings.push(capForUnreadableInventories(
@@ -3622,9 +3620,6 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   recordBoxDecisionFacts(15, {
     barriers_readable: !data.barriers.error,
     segments_readable: !data.barrierSegments.error,
-    complete: completeBoxDatasets(data.barriers, data.barrierSegments),
-    barrier_count: barriers.length,
-    enabled_barrier_count: enabledBarriers.length,
     enabled_with_segments_count: enabledWithSegments.length,
   });
   findings.push(capForUnreadableInventories(

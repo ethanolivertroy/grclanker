@@ -52,6 +52,7 @@ export interface BatchCheckDefinition {
   frameworks?: Partial<Record<FrameworkKey, readonly string[]>>;
   evidenceFields: readonly string[];
   decisionInputs?: Readonly<Record<string, string>>;
+  decisionInputTypes?: Readonly<Record<string, readonly PortableInputType[]>>;
   decisionConstants?: Readonly<Record<string, PortableValue>>;
   decisionRules?: readonly VerdictRule[];
   derivedFacts?: Readonly<Record<string, string>>;
@@ -336,7 +337,7 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
   };
 }
 
-type PortableInputType = "array" | "boolean" | "null" | "number" | "string";
+export type PortableInputType = "array" | "boolean" | "null" | "number" | "string";
 
 interface PortableInputUsage {
   types: Set<PortableInputType>;
@@ -395,18 +396,19 @@ function collectPortableInputUsage(
     case "lte": {
       const leftValue = condition.left.kind === "value" ? condition.left.value : undefined;
       const rightValue = condition.right.kind === "value" ? condition.right.value : undefined;
+      const pathComparisonType = leftValue === undefined && rightValue === undefined ? "number" : undefined;
       recordOperandUsage(
         usage,
         condition.left,
         derivedFact,
-        rightValue === undefined ? undefined : portableValueType(rightValue),
+        rightValue === undefined ? pathComparisonType : portableValueType(rightValue),
         rightValue,
       );
       recordOperandUsage(
         usage,
         condition.right,
         derivedFact,
-        leftValue === undefined ? undefined : portableValueType(leftValue),
+        leftValue === undefined ? pathComparisonType : portableValueType(leftValue),
         leftValue,
       );
       return;
@@ -435,18 +437,7 @@ function collectPortableInputUsage(
   }
 }
 
-function portableInputType(name: string, usage: PortableInputUsage | undefined): string {
-  if (usage && usage.types.size > 0) return [...usage.types].sort().join(" or ");
-  if (/(?:^|_)(?:count|days?|hours?|minutes?|percent|ratio|threshold|limit|maximum|max|pages?|total|age)(?:_|$)/.test(name)) {
-    return "number";
-  }
-  if (/(?:^|_)(?:readable|complete|present|enabled|active|known|configured|federal|truncated)(?:_|$)/.test(name)) {
-    return "boolean";
-  }
-  return "string, number, boolean, or null as documented by the named vendor field";
-}
-
-function portableInputDefinitions(
+function renderPortableInputDefinitions(
   definition: BatchSpecDefinition,
   check: BatchCheckDefinition,
 ): Readonly<Record<string, string>> | undefined {
@@ -455,23 +446,41 @@ function portableInputDefinitions(
   for (const [name, rule] of Object.entries(check.derivedFactRules ?? {})) {
     collectPortableInputUsage(rule.condition, name, usage);
   }
-  const source = check.surfaces.length > 0
-    ? check.surfaces.map((surface) => `\`${surface}\``).join(", ")
-    : "the explicitly manual collector state (no vendor read surface exists)";
   return Object.fromEntries(Object.entries(check.decisionInputs).map(([name, supplied]) => {
     const inputUsage = usage.get(name);
+    for (const inputType of check.decisionInputTypes?.[name] ?? []) {
+      inputUsage?.types.add(inputType);
+    }
+    if (!inputUsage || inputUsage.types.size === 0) {
+      throw new Error(`${check.id} input ${name} has no explicit executable type/domain`);
+    }
+    const inputTypes = [...inputUsage.types].sort().join(" or ");
+    if (
+      !supplied.trim()
+      || /Runtime-owned .* (?:computed|derived) from (?:the )?complete/i.test(supplied)
+      || supplied.trim().toLowerCase() === name.replaceAll("_", " ").toLowerCase()
+    ) {
+      throw new Error(`${check.id} input ${name} uses a fallback or name-restating definition`);
+    }
     const values = inputUsage && inputUsage.values.size > 0
       ? ` Compared literal domain: ${[...inputUsage.values].sort().join(", ")}.`
       : "";
-    const completeSemantics = /(?:count|total|ratio|percent|maximum|max|complete)/.test(name)
-      ? " Cardinalities and ratios use the complete collector inventory, never a rendered or 25-item evidence sample, unless the input name explicitly says sampled."
-      : " The value is computed before evidence rendering or display caps.";
     const usedBy = inputUsage && inputUsage.derivedFacts.size > 0
       ? ` It feeds executable derived facts ${[...inputUsage.derivedFacts].sort().map((fact) => `\`${fact}\``).join(", ")}.`
       : " It is declared for the finding's explicit manual-only contract.";
+    const source = check.surfaces.length > 0
+      ? check.surfaces.map((surfaceId) => {
+        const surface = definition.surfaces.find((candidate) => candidate.id === surfaceId);
+        if (!surface) throw new Error(`${check.id} input ${name} references unknown source ${surfaceId}`);
+        return `\`${surface.method ?? "GET"} ${surface.path}\` (${surface.id})`;
+      }).join(", ")
+      : "the explicitly manual collector state; this check performs no vendor read";
+    const completeness = name === "complete"
+      ? `For ${check.id}, this boolean is true only under the check-specific source and precedence semantics stated here: ${check.decision}`
+      : "The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained";
     return [
       name,
-      `Type/domain: ${portableInputType(name, inputUsage)}.${values} Source: ${definition.vendor} vendor evidence or collector state from ${source}.${completeSemantics} Null or missing means the source did not establish the value; it cannot independently prove a passing branch.${usedBy} Integration semantics: ${supplied}`,
+      `Type/domain: ${inputTypes}.${values} Source/owner: ${definition.vendor} collector projection from ${source}. Completeness/sample semantics: ${completeness}. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule.${usedBy} Portable meaning: ${supplied}`,
     ];
   }));
 }
@@ -538,7 +547,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       ? Object.keys(check.decisionInputs)
       : [...new Set(check.evidenceFields.flatMap((field) =>
         definition.surfaces.find((surface) => surface.id === field)?.fields ?? [field]))],
-    ...(check.decisionInputs ? { evidenceFieldDefinitions: portableInputDefinitions(definition, check) } : {}),
+    ...(check.decisionInputs ? { evidenceFieldDefinitions: renderPortableInputDefinitions(definition, check) } : {}),
     derivedFacts: check.decisionInputs
       ? Object.fromEntries(Object.entries(check.derivedFactRules ?? {}).map(([name, rule]) => [name, rule.description]))
       : {

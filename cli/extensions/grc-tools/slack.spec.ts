@@ -138,7 +138,41 @@ const ordered = (manual: VerdictCondition, fail: VerdictCondition | undefined, w
   rule("manual", { op: "always" }),
 ];
 const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete collector state before evidence samples are capped.`]),
+  names.map((name) => {
+    const counts: Readonly<Record<string, string>> = {
+      human_user_count: "non-bot users", active_user_count: "active human users", admin_user_count: "active owners and administrators",
+      admin_inventory_count: "administrator assignments across readable workspaces", excessive_admin_workspace_count: "workspaces above the administrator threshold",
+      guest_count: "active guest users", unknown_mfa_count: "administrators without known MFA state", without_mfa_count: "administrators with MFA disabled",
+      unknown_sso_count: "administrators without known SSO state", without_sso_count: "administrators with SSO disabled", workspace_count: "Grid workspaces",
+      channel_count: "channels", open_count: "public channels matching the open-membership predicate", announcement_channel_count: "announcement-only channels",
+      external_count: "external organizations or externally shared channels", external_event_count: "external-collaboration audit events",
+      approved_count: "approved applications", scim_count: "SCIM user records", scim_user_count: "active users represented in SCIM",
+      preference_count: "workspace preference records", settings_error_count: "workspace preference reads that failed", duration_count: "readable session durations",
+      overlong_count: "session durations above the maximum", audit_count: "audit events in the lookback", security_event_count: "events in the security action set",
+      non_admin_upload_count: "uploads by non-administrators", retention_record_count: "retention preference records", short_retention_count: "retention values below the minimum",
+      restricted_count: "restricted applications", unrestricted_count: "applications outside approved and restricted inventories", schema_count: "audit schemas",
+      mismatch_count: "schemas with incorrect treatment", barrier_count: "information barriers", emoji_count: "custom emoji", flagged_count: "emoji matching the sensitive-term pattern",
+      unknown_count: "records whose required classification is unknown", domain_count: "distinct verified or allowed domains",
+    };
+    const booleans: Readonly<Record<string, string>> = {
+      complete: "all check-specific pages and workspace child reads completed", users_readable: "user rosters were returned", users_complete: "all roster pages completed",
+      teams_readable: "Grid workspaces were returned", teams_complete: "all workspace pages completed", every_admin_list_unreadable: "no workspace admin roster was readable",
+      channels_readable: "channels were returned", external_readable: "external-collaboration records were returned", external_complete: "all external pages completed",
+      approved_readable: "approved applications were returned", approved_complete: "all approved-app pages completed", scim_readable: "SCIM users were returned",
+      scim_complete: "all SCIM pages completed", preferences_readable: "workspace preferences were returned", session_readable: "session controls were returned",
+      audit_readable: "audit events were returned", audit_complete: "audit collection covered the lookback", restricted_readable: "restricted applications were returned",
+      restricted_complete: "all restricted-app pages completed", schema_readable: "audit schemas were returned", schema_complete: "all schema pages completed",
+      barrier_readable: "information barriers were returned", barrier_complete: "all barrier pages completed", coverage_complete: "all users and barrier assignments were readable",
+      emoji_readable: "custom emoji were returned", emoji_complete: "all emoji pages completed", roster_complete: "all required rosters completed",
+    };
+    const raw: Readonly<Record<string, string>> = {
+      setting_value: "Raw Slack preference value retained without outcome translation.", latest_age_days: "Age in whole days of the newest relevant audit event.",
+    };
+    const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Slack inventory at the verdict point.`
+      : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+    if (!definition) throw new Error(`Slack primitive ${name} lacks an explicit portable definition`);
+    return [name, definition];
+  }),
 );
 const manual = (): SlackExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
 const inventory = (prefix: string, options: { empty?: "fail" | "warn" | "manual"; positive?: "pass" | "warn" } = {}): SlackExecutableDecision => {

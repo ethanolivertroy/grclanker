@@ -2839,7 +2839,6 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     recordGwsDecisionFacts("GWS-ID-005", {
       readable: false,
       complete: false,
-      policy_count: 0,
       two_step_policy_count: 0,
       effective_policy_count: 0,
       policy_disallowing_enrollment_count: 0,
@@ -2857,7 +2856,6 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     recordGwsDecisionFacts("GWS-ID-005", {
       readable: false,
       complete: false,
-      policy_count: 0,
       two_step_policy_count: 0,
       effective_policy_count: 0,
       policy_disallowing_enrollment_count: 0,
@@ -2879,7 +2877,6 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     recordGwsDecisionFacts("GWS-ID-005", {
       readable: true,
       complete: completeGwsDatasets(dataset),
-      policy_count: dataset.data.length,
       two_step_policy_count: 0,
       effective_policy_count: 0,
       policy_disallowing_enrollment_count: 0,
@@ -2916,7 +2913,6 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
   recordGwsDecisionFacts("GWS-ID-005", {
     readable: true,
     complete: completeGwsDatasets(dataset),
-    policy_count: dataset.data.length,
     two_step_policy_count: enforcement.length,
     effective_policy_count: enforced.length,
     policy_disallowing_enrollment_count: enrollmentDisabled.length,

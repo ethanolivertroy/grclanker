@@ -92,7 +92,48 @@ const not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", con
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
-const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from complete Salesforce query and metadata collector state before rendered evidence arrays are capped.`]));
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
+  const counts: Readonly<Record<string, string>> = {
+    high_risk_count: "high-risk records", gap_count: "required settings missing the secure value", user_count: "users", profile_count: "profiles",
+    admin_profile_count: "administrator-equivalent profiles", admin_count: "active administrator-equivalent users", active_standard_user_count: "active standard users",
+    unenrolled_count: "active standard users without two-factor enrollment", resolved_profile_count: "profiles with resolved metadata",
+    profiles_with_ranges_count: "profiles with login IP ranges", org_range_count: "organization trusted IP ranges", fully_restricted_count: "admin profiles restricted every day",
+    partially_restricted_count: "partially restricted admin profiles", api_profile_count: "admin-equivalent profiles granting API access",
+    sensitive_field_count: "fields classified sensitive", broad_field_count: "sensitive fields readable broadly", set_count: "permission sets",
+    elevated_set_count: "administrator-equivalent permission sets", assignee_count: "active users assigned elevated sets", stale_admin_count: "stale administrators",
+    undated_admin_count: "administrators without last login", app_count: "connected applications", unknown_policy_count: "apps with unknown OAuth policy",
+    open_app_count: "apps allowing unrestricted self-authorization", default_field_count: "sharing defaults", open_default_count: "public or read/write sharing defaults",
+    active_guest_count: "active guest users", risky_guest_count: "privileged or stale guest users", login_count: "login-history records",
+    failed_count: "failed logins", brute_force_source_count: "source IPs meeting repeated-failure threshold", legacy_tls_count: "legacy-TLS logins",
+    country_count: "distinct login countries", undated_count: "records without timestamps", audit_count: "setup audit records", secret_count: "secret-bearing principals",
+    active_count: "active records", undated_active_count: "active secret records without dates", certificate_count: "certificates", failure_count: "certificates in failure window",
+    warning_count: "certificates in warning window", disabled_count: "session-CSRF flags set false",
+  };
+  const booleans: Readonly<Record<string, string>> = {
+    readable: "the required query or metadata response was returned", complete: "all check-specific pages and metadata reads completed",
+    health_readable: "Security Health Check summary was returned", score_present: "Health Check contains a numeric score", risks_readable: "Health Check risks were returned",
+    risks_complete: "all risk pages completed", settings_readable: "required organization settings were returned", required_fields_present: "every required settings field exists",
+    force_logout: "sessions force logout on timeout", lock_to_ip: "sessions are locked to originating IP", security_settings_readable: "security settings were returned",
+    mfa_required: "organization settings require MFA", mfa_risk_present: "Health Check contains an MFA risk", two_factor_methods_readable: "two-factor enrollment was returned",
+    users_readable: "users were returned", profiles_readable: "profiles were returned", enrollment_complete: "enrollment was established for every active standard user",
+    health_check_risks_readable: "MFA fallback risk evidence was readable", profile_metadata_readable: "profile metadata was returned", profile_complete: "all required profile metadata resolved",
+    enforce_every_request: "IP ranges are enforced on every request", sets_readable: "permission sets were returned", assignments_readable: "permission-set assignments were returned",
+    users_complete: "all user pages completed", audit_readable: "setup audit trail was returned", audit_complete: "audit trail covered the lookback",
+    event_log_readable: "event-log files were returned", has_my_domain: "My Domain is configured",
+    can_only_login_with_my_domain_url_present: "exclusive My Domain login field exists", prevent_legacy_login: "legacy login hosts are disabled",
+    require_domain_for_api: "API logins require My Domain", get_enabled: "GET CSRF protection is enabled", post_enabled: "POST CSRF protection is enabled",
+  };
+  const raw: Readonly<Record<string, string>> = {
+    score: "Numeric Security Health Check score.", timeout_minutes: "Configured session timeout in minutes.", mfa_risk_type: "Raw normalized MFA risk type.",
+    max_admins: "Maximum accepted administrator population.", oldest_active_age_days: "Age in whole days of the oldest active secret.",
+    setup_flag: "Raw setup-page GET CSRF flag.", nonsetup_sfdc_flag: "Raw non-setup Salesforce GET CSRF flag.",
+    nonsetup_user_flag: "Raw custom-domain GET CSRF flag.", nonsetup_user_headerless_flag: "Raw headerless non-setup CSRF flag.",
+  };
+  const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Salesforce inventory at the verdict point.`
+    : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+  if (!definition) throw new Error(`Salesforce primitive ${name} lacks an explicit portable definition`);
+  return [name, definition];
+}));
 const populationUnavailable = any(
   ne("users_readable", true),
   ne("profiles_readable", true),
@@ -260,7 +301,7 @@ const SALESFORCE_EXECUTABLE_DECISIONS: Readonly<Record<string, SalesforceExecuta
     ],
   },
   "SF-20": {
-    inputs: input("settings_readable", "both_present", "get_enabled", "post_enabled"),
+    inputs: input("settings_readable", "get_enabled", "post_enabled"),
     rules: [
       rule("manual", ne("settings_readable", true)),
       rule("pass", all(eq("get_enabled", true), eq("post_enabled", true))),

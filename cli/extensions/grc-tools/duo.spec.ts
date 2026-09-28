@@ -189,7 +189,47 @@ const ordered = (branches: {
   rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
 ];
 const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} computed from the complete declared source inventories.`]),
+  names.map((name) => {
+    const counts: Readonly<Record<string, string>> = {
+      user_count: "Duo users", enrolled_user_count: "users with an enrolled device or method", unenrolled_user_count: "users without an enrolled method",
+      known_enrollment_count: "users with established enrollment state", undated_user_count: "users without parseable last login", inactive_user_count: "users beyond the inactivity threshold",
+      admin_count: "administrators", active_admin_count: "active administrators", stale_admin_count: "stale active administrators", undated_admin_count: "administrators without last login",
+      owner_count: "Owner administrators", admin_api_count: "Admin API applications", overprivileged_admin_api_count: "Admin API applications broader than read-only",
+      policy_attached_count: "integrations with explicit policies", applicable_integration_count: "policy-capable integrations", protected_integration_count: "Duo-protected integrations",
+      tagged_integration_count: "integrations included by the governance tag", tagged_without_policy_count: "tagged integrations without policy",
+      universal_prompt_count: "Universal Prompt integrations", self_service_enabled_count: "policies permitting self-service device management",
+      bypass_code_count: "bypass-code issuance events", bypass_user_count: "users receiving bypass codes", flagged_code_count: "active or long-lived bypass codes",
+      undated_code_count: "bypass codes without issuance dates", attempt_count: "authentication attempts", denied_attempt_count: "denied attempts", fraud_count: "fraud-marked attempts",
+      impossible_travel_count: "impossible-travel attempts", telephony_event_count: "SMS or voice events", blocked_telephony_count: "blocked telephony events",
+      explicitly_allowed_telephony_count: "explicitly allowed telephony events", located_event_count: "events with geographic location", event_count: "required Duo events",
+      review_event_count: "events matching the check's review predicate", field_exposed_count: "edition fields exposed by the tenant",
+      supporting_strong_method_count: "enabled strong methods", webauthn_user_count: "WebAuthn-enrolled users", deprecated_u2f_user_count: "deprecated-U2F-only users",
+      access_user_count: "users observed in access activity", duo_desktop_platform_count: "platform policies requiring Duo Desktop",
+      encryption_platform_count: "platform policies requiring disk encryption", firewall_platform_count: "platform policies requiring a firewall",
+      system_password_platform_count: "platform policies requiring a system password", restricted_os_count: "OS rules restricting unsupported versions",
+      enabled_notification_count: "enabled administrator notifications",
+    };
+    const booleans: Readonly<Record<string, string>> = {
+      readable: "the check's required Duo response was collected and parseable", complete: "all check-specific pages and child reads completed",
+      settings_readable: "Duo authentication settings were returned", allows_push: "push is enabled", requires_verified_push: "verified push is required", has_webauthn: "WebAuthn is enabled",
+      sms_enabled: "SMS authentication is enabled", voice_enabled: "voice authentication is enabled", policy_readable: "Duo policies were returned",
+      helpdesk_bypass: "help-desk administrators may issue bypass codes", attempts_readable: "authentication attempts were returned", logs_readable: "the required Duo log was returned",
+      counts_present: "edition licensed and consumed counts are numeric", edition_sections_present: "all required edition sections are present",
+      webauthn_enabled: "WebAuthn is enabled in policy", verified_push_enabled: "verified push is enabled in policy",
+      allowed_list_exposed: "the telephony allowed-country list is visible", blocked_list_exposed: "the blocked-country list is visible",
+      trusted_endpoint_checking: "trusted-endpoint checking is enabled", full_disk_encryption_required: "endpoint policy requires disk encryption",
+      screen_lock_required: "endpoint policy requires screen lock",
+    };
+    const raw: Readonly<Record<string, string>> = {
+      helpdesk_bypass_expiration: "Raw Duo help-desk bypass expiration setting.", credits_remaining: "Current non-negative telephony-credit balance, or null when unavailable.",
+      lockout_threshold: "Configured failed-attempt lockout threshold.", remembered_device_days: "Configured remembered-device duration in days.",
+      user_auth_behavior: "Raw Duo user-authentication behavior.", new_user_behavior: "Raw Duo new-user behavior.",
+    };
+    const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Duo inventory at the verdict point.`
+      : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+    if (!definition) throw new Error(`Duo primitive ${name} lacks an explicit portable definition`);
+    return [name, definition];
+  }),
 );
 const unreadable = ne("readable", true);
 const incomplete = ne("complete", true);

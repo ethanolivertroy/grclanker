@@ -7,6 +7,46 @@ import {
 import { SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
+export const SERVICENOW_INSTANCE_SECURITY_PROPERTIES = [
+  { name: "glide.security.use_csrf_token", expected: "true", describe: "true" },
+  { name: "glide.security.csrf.strict.validation.mode", expected: "true", describe: "true" },
+  { name: "glide.security.file.mime_type.validation", expected: "true", describe: "true" },
+  { name: "glide.security.diag_txns_acl", expected: "true", describe: "true" },
+  { name: "glide.security.strict.user_image_upload", expected: "true", describe: "true" },
+] as const;
+export const SERVICENOW_SCRIPT_RESTRICTION_PROPERTIES = [
+  { name: "glide.script.use.sandbox", expected: "true", describe: "true" },
+  { name: "glide.script.allow.ajaxevaluate", expected: "false", describe: "false" },
+  { name: "glide.script.secure.ajaxgliderecord", expected: "true", describe: "true" },
+  { name: "glide.script.ccsi.ispublic", expected: "false", describe: "false" },
+] as const;
+export const SERVICENOW_BASELINE_HARDENING_PROPERTIES = [
+  { name: "glide.security.strict.updates", expected: "true", describe: "true" },
+  { name: "glide.security.strict.actions", expected: "true", describe: "true" },
+  { name: "glide.ui.escape_html_list_field", expected: "true", describe: "true" },
+  { name: "glide.ui.escape_all_script", expected: "true", describe: "true" },
+  { name: "glide.html.escape_script", expected: "true", describe: "true" },
+  { name: "glide.html.sanitize_all_fields", expected: "true", describe: "true" },
+  { name: "glide.ui.security.allow_codetag", expected: "false", describe: "false" },
+  { name: "glide.ui.security.codetag.allow_script", expected: "false", describe: "false" },
+  { name: "glide.set_x_frame_options", expected: "true", describe: "true" },
+  { name: "glide.ui.secure_cookies", expected: "true", describe: "true" },
+  { name: "glide.cookies.http_only", expected: "true", describe: "true" },
+] as const;
+export const SERVICENOW_PROPERTY_SOURCES = {
+  "SNOW-01": SERVICENOW_INSTANCE_SECURITY_PROPERTIES.map((property) => property.name),
+  "SNOW-05": ["glide.ui.session_timeout", "glide.ui.rotate_sessions", "glide.ui.user_cookie.max_life_span_in_days"],
+  "SNOW-06": ["glide.enable.password_policy", "glide.apply.password_policy.on_login", "glide.login.no_blank_password"],
+  "SNOW-07": ["glide.authenticate.multifactor", "glide.authenticate.multifactor.email.otp.enabled"],
+  "SNOW-08": ["glide.authenticate.multisso.enabled", "glide.authenticate.sso.redirect.idp", "glide.sso.acr.enabled"],
+  "SNOW-12": SERVICENOW_SCRIPT_RESTRICTION_PROPERTIES.map((property) => property.name),
+  "SNOW-13": SERVICENOW_BASELINE_HARDENING_PROPERTIES.map((property) => property.name),
+  "SNOW-16": ["dynamic sys_properties query: nameLIKEdebug and value=true"],
+  "SNOW-17": ["glide.ip.authenticate.strict"],
+  "SNOW-18": ["glide.smtp.auth", "glide.email.email_with_no_target_visible_to_all"],
+  "SNOW-19": ["mid.version.override"],
+} as const;
+
 const tableSurface = (id: string, table: string, fields: readonly string[]) => ({
   id,
   path: `/api/now/table/${table}`,
@@ -133,7 +173,51 @@ const not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", con
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
-const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from complete ServiceNow table and aggregate collector state before rendered evidence arrays are capped.`]));
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
+  const counts: Readonly<Record<string, string>> = {
+    unexpected_value_count: "required properties with explicitly insecure values", absent_count: "required properties absent from the visible complete inventory",
+    user_count: "active users", admin_count: "active administrator-equivalent users", privileged_assignment_count: "active privileged role assignments",
+    role_aggregate_count: "role assignments reported by Aggregate API", inheriting_count: "privileged roles inherited through containment",
+    admin_assignment_count: "administrator role assignments", stale_admin_count: "stale administrators", warning_count: "records in the check warning condition",
+    provider_count: "active identity providers", plugin_count: "required plugin records", visible_required_plugin_inactive_count: "visible required plugins whose active field is false",
+    criteria_count: "active MFA criteria", active_role_criteria_count: "active criteria targeting privileged roles", required_privileged_role_count: "roles requiring MFA coverage",
+    covered_privileged_role_count: "required roles covered by active criteria", admins_without_mfa_flag_count: "admins without the user MFA flag",
+    policy_count: "active password policies", policy_with_minimum_length_count: "policies meeting the minimum length", weak_policy_count: "policies missing complexity controls",
+    active_rule_count: "active business rules", eval_rule_count: "active rules using dynamic evaluation", wildcard_count: "wildcard ACLs", unrestricted_count: "ACLs without role requirements",
+    acl_aggregate_count: "record ACLs reported by Aggregate API", visible_acl_count: "record ACL rows visible to the caller",
+    uncovered_table_count: "sensitive tables without a privileged read ACL", missing_dictionary_count: "sensitive tables without dictionary records",
+    operation_gap_count: "sensitive tables missing required ACL operations", hardening_property_count: "baseline properties owned by the check",
+    enabled_debug_count: "debug properties whose value is true", smtp_account_count: "outbound SMTP accounts", starttls_count: "SMTP accounts requiring STARTTLS",
+    insecure_count: "records matching the adjacent insecure predicate", server_count: "MID servers", recent_audit_count: "recent sys_audit records",
+    sensitive_change_count: "recent sensitive changes", unaudited_count: "sensitive changes without audit evidence", update_set_aggregate_count: "update sets reported by Aggregate API",
+    in_progress_count: "in-progress update sets", in_progress_row_count: "visible in-progress update sets", not_validated_count: "unvalidated in-progress update sets",
+    concern_count: "update sets with unresolved concerns", integration_user_count: "active integration users", admin_integration_count: "integration users with admin roles",
+    public_page_count: "public pages", missing_required_count: "required controls absent from complete evidence", expired_certificate_count: "expired certificates",
+    unverified_count: "certificates with unknown validity",
+  };
+  const booleans: Readonly<Record<string, string>> = {
+    readable: "the required table, aggregate, or property response was returned", complete: "all check-specific pages, totals, and child reads completed",
+    role_aggregate_readable: "the role aggregate was returned", role_total_known: "role total is reported or pagination exhausted", providers_complete: "all provider pages completed",
+    plugin_present: "the named plugin has a visible record", plugin_active_value: "the named plugin is active", plugin_inventory_complete: "all plugin pages completed",
+    password_policy_property_present: "glide.enable.password_policy has a visible row", platform_property_present: "the required platform property has a visible row",
+    properties_complete: "sys_properties exhausted without ACL-hidden remainder", timeout_present: "glide.ui.session_timeout has a visible row",
+    rule_inventory_complete: "all relevant ACL or business-rule pages completed", table_readable: "the required sensitive-table inventory was returned",
+    acl_aggregate_readable: "the ACL aggregate was returned", smtp_auth_disabled: "glide.smtp.auth is explicitly false",
+    version_override_present: "mid.version.override has a non-empty visible value", recent_audit_count_known: "an aggregate or exhausted pages establish the recent audit count",
+    update_set_aggregate_readable: "the update-set aggregate was returned", in_progress_total_known: "the update-set total is reported or pages exhausted",
+  };
+  const raw: Readonly<Record<string, string>> = {
+    role_pages: "Number of role-assignment pages read.", max_admins: "Maximum accepted administrator population.", plugin_active_value: "Raw plugin active flag.",
+    multifactor_property_value: "Raw glide.authenticate.multifactor value.", email_otp_property_value: "Raw glide.authenticate.multifactor.email.otp.enabled value.",
+    password_policy_property_value: "Raw glide.enable.password_policy value.", timeout_minutes: "Session timeout converted to minutes.",
+    max_timeout_minutes: "Maximum accepted timeout in minutes.", rotate_sessions_value: "Raw glide.ui.rotate_sessions value.",
+    strict_property_value: "Raw glide.ip.authenticate.strict value.", in_progress_pages: "Number of in-progress update-set pages read.",
+  };
+  const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete ServiceNow inventory at the verdict point.`
+    : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+  if (!definition) throw new Error(`ServiceNow primitive ${name} lacks an explicit portable definition`);
+  return [name, definition];
+}));
 const propertyDecision = (): ServicenowExecutableDecision => ({
   inputs: input("readable", "complete", "unexpected_value_count", "absent_count"),
   rules: [rule("manual", ne("readable", true)), rule("fail", gt("unexpected_value_count", 0)), rule("warn", any(gt("absent_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
@@ -303,6 +387,7 @@ export const SERVICENOW_RUNTIME_BEHAVIOR = [
   "Encoded-query pagination uses sysparm_offset plus X-Total-Count, rejects foreign next links, and preserves exact seen, total, page, and stop-reason evidence.",
   "MFA, encryption, script, IP, email, and outbound TLS controls use documented properties and tables available to the runtime; unavailable Instance Security Center and product-specific proofs remain manual.",
   "SNOW-11 evaluates record ACL coverage for exactly these sensitive tables: sys_user, sys_user_has_role, sys_user_role, sys_properties, sys_script, sys_security_acl, syslog, and sys_audit.",
+  `ServiceNow property ownership is check-specific: ${Object.entries(SERVICENOW_PROPERTY_SOURCES).map(([checkId, properties]) => `${checkId} reads ${properties.join(", ")}`).join("; ")}.`,
 ] as const;
 
 export const SERVICENOW_SPEC = buildBatchIntegrationSpec({

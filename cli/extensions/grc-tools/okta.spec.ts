@@ -188,7 +188,50 @@ const ordered = (branches: {
   rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
 ];
 const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} computed from the complete declared source inventories.`]),
+  names.map((name) => {
+    const counts: Readonly<Record<string, string>> = {
+      authenticator_count: "active authenticators", phishing_resistant_count: "active WebAuthn, FIDO2, smart-card, certificate, PIV, or CAC authenticators",
+      strong_count: "active authenticators in the documented strong-method set", admin_policy_count: "active Admin Console or Dashboard policies",
+      admin_mfa_rule_count: "active admin-policy rules requiring MFA", strong_authenticator_count: "active strong authenticators", mfa_control_count: "visible MFA controls",
+      inventory_count: "active records in the check's policy inventory", policy_count: "active policies", gap_count: "policies missing a requirement enumerated by the check",
+      exposed_value_count: "readable policy threshold values", over_limit_count: "values above the declared maximum", persistent_cookie_count: "rules permitting persistent cookies",
+      certificate_method_count: "active certificate, smart-card, PIV, or CAC methods", restricted_count: "rules meeting the check's device or platform restriction",
+      privileged_user_count: "distinct directly or indirectly privileged users", super_admin_count: "SUPER_ADMIN users", stale_count: "records beyond the check's age threshold",
+      unknown_activity_count: "users without required activity timestamps", privileged_group_count: "groups matching the documented privileged-name pattern",
+      oversized_group_count: "privileged groups with more than 25 members", inspected_user_count: "privileged users with usable factor inventories",
+      unenrolled_count: "inspected privileged users without an active factor", weak_factor_count: "inspected privileged users without an active phishing-resistant factor",
+      user_count: "users", stale_active_count: "active users inactive over 90 days", never_activated_count: "STAGED or PROVISIONED users older than 30 days",
+      attention_state_count: "users in SUSPENDED, LOCKED_OUT, EXPIRED, or RECOVERY state", active_origin_count: "active trusted origins",
+      insecure_active_count: "active origins using HTTP or wildcards", risk_aware_rule_count: "active sign-on rules with risk conditions",
+      risky_active_count: "active applications using SWA, SWA with synchronization, or BOOKMARK mode", risky_inactive_count: "inactive applications using those modes",
+      inactive_app_count: "inactive applications", deactivation_app_count: "DEPROVISIONED or INACTIVE applications", provisioning_app_count: "applications with provisioning enabled",
+      app_count: "applications", token_count: "API tokens", expired_count: "expired API tokens", missing_expiry_count: "tokens without parseable expiry",
+      long_window_count: "tokens exceeding the lifetime threshold", undated_count: "records without parseable creation or activity timestamps",
+      unrestricted_count: "rules missing the required restriction", zone_count: "network zones", custom_zone_count: "active non-blocklist zones with gateways or CIDRs",
+      active_hook_count: "active event hooks", active_behavior_count: "active behavior rules", event_count: "system-log events in the requested lookback",
+      active_stream_count: "active log streams", contact_count: "organization contacts",
+    };
+    const booleans: Readonly<Record<string, string>> = {
+      readable: "every dataset required by the check was collected and parseable", complete: "required datasets exhausted pagination under the check-specific truncation semantics",
+      classic_engine: "the organization reports Classic Engine", policy_inventory_readable: "all policy families needed for admin MFA were readable",
+      idp_readable: "identity providers were returned and parseable", authenticator_readable: "authenticators were returned and parseable",
+      federal_tenant: "the configured host uses the recognized federal suffix", okta_verify_active: "an active Okta Verify authenticator exists", fips_required: "Okta Verify explicitly requires FIPS",
+      support_readable: "Okta Support settings were returned and parseable", support_present: "the support-access field is present",
+      third_party_readable: "the third-party administrator setting was returned", third_party_admin: "the third-party administrator setting is enabled",
+      ssws_auth: "the request uses SSWS rather than OAuth", configuration_present: "the vendor response contains the required configuration object",
+      hooks_readable: "event hooks were returned and parseable", streams_readable: "log streams were returned and parseable",
+      technical_contact_present: "a TECHNICAL contact exists", technical_user_assigned: "the TECHNICAL contact references a user",
+      technical_lookup_failed: "the referenced technical user lookup failed", policy_readable: "the policy family required by the check was readable",
+    };
+    const raw: Readonly<Record<string, string>> = {
+      support_state: "Raw Okta Support access state compared case-insensitively with DISABLED.", mode: "Raw normalized application sign-on mode.",
+      technical_user_state: "Raw lifecycle state of the user assigned as TECHNICAL contact.",
+    };
+    const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Okta inventory at the verdict point.`
+      : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+    if (!definition) throw new Error(`Okta primitive ${name} lacks an explicit portable definition`);
+    return [name, definition];
+  }),
 );
 const unavailable = any(ne("readable", true), { op: "not", condition: { op: "defined", operand: path("readable") } });
 const incomplete = ne("complete", true);
@@ -599,7 +642,10 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Honor bounded Retry-After or reset delays, then use bounded exponential retry; preserve exhaustion as unreadable evidence.",
   },
   runtimeBehavior: OKTA_RUNTIME_BEHAVIOR,
-  knownGaps: ["Lifecycle workflow and broader trust-center evidence remain manual or deferred."],
+  knownGaps: [
+    "Lifecycle workflow and broader trust-center evidence remain manual or deferred.",
+    "OKTA-ADMIN-004 on main can emit Pass when factor evidence inspects zero of the identified privileged users. This branch's strict conformance assertion rejects that collector-unreachable inconsistency; a separate runtime fix should define a stable non-pass result and matching prose.",
+  ],
   sensitiveFields: ["apiToken", "clientAssertion", "privateKey", "credentials", "authorization", "cookie"],
   credentialFormats: ["SSWS tokens", "OAuth bearer tokens", "private keys", "signed JWT assertions"],
   output: buildBatchOutputContract({

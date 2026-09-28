@@ -29,7 +29,14 @@ import { resolveZendeskConfiguration } from "../dist/extensions/grc-tools/zendes
 import { resolveSalesforceConfiguration } from "../dist/extensions/grc-tools/salesforce.js";
 import { resolveServicenowConfiguration } from "../dist/extensions/grc-tools/servicenow.js";
 import { SALESFORCE_RUNTIME_BEHAVIOR, SALESFORCE_SPEC } from "../dist/extensions/grc-tools/salesforce.spec.js";
-import { SERVICENOW_RUNTIME_BEHAVIOR, SERVICENOW_SPEC } from "../dist/extensions/grc-tools/servicenow.spec.js";
+import {
+  SERVICENOW_BASELINE_HARDENING_PROPERTIES,
+  SERVICENOW_INSTANCE_SECURITY_PROPERTIES,
+  SERVICENOW_PROPERTY_SOURCES,
+  SERVICENOW_RUNTIME_BEHAVIOR,
+  SERVICENOW_SCRIPT_RESTRICTION_PROPERTIES,
+  SERVICENOW_SPEC,
+} from "../dist/extensions/grc-tools/servicenow.spec.js";
 import { SLACK_RUNTIME_BEHAVIOR, SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
 import { ZENDESK_RUNTIME_BEHAVIOR, ZENDESK_SPEC } from "../dist/extensions/grc-tools/zendesk.spec.js";
 import { ZOOM_RUNTIME_BEHAVIOR, ZOOM_SPEC } from "../dist/extensions/grc-tools/zoom.spec.js";
@@ -527,6 +534,47 @@ test("all nine integration decision inputs contain no preselected conclusion tok
         assert.doesNotMatch(inputName, forbidden, `${check.id}: ${inputName}`);
       }
     }
+  }
+});
+
+test("all 1117 primitive input uses have explicit portable owner, domain, completeness, and null contracts", () => {
+  let inputUses = 0;
+  for (const [spec] of batch) {
+    for (const check of spec.checks) {
+      assert.deepEqual(Object.keys(check.evidenceFieldDefinitions ?? {}).sort(), [...check.evidenceFields].sort(), `${check.id}: every input is defined`);
+      for (const [name, definition] of Object.entries(check.evidenceFieldDefinitions ?? {})) {
+        inputUses += 1;
+        assert.match(definition, /^Type\/domain: /);
+        assert.match(definition, / Source\/owner: /);
+        assert.match(definition, / Completeness\/sample semantics: /);
+        assert.match(definition, / Null\/missing meaning: /);
+        assert.match(definition, / Portable meaning: /);
+        assert.doesNotMatch(definition, /Runtime-owned|replaceAll|portable interpretation is the raw measurement/i);
+        assert.doesNotMatch(definition, new RegExp(`Portable meaning: ${name.replaceAll("_", " ")}(?:\\.|$)`, "i"));
+        if (name === "complete") assert.match(definition, new RegExp(`For ${check.id},`));
+      }
+    }
+  }
+  assert.equal(inputUses, 1117);
+});
+
+test("ServiceNow metadata owns every concrete runtime property and relevant check", () => {
+  const concrete = new Set(Object.values(SERVICENOW_PROPERTY_SOURCES).flat().filter((name) => !name.startsWith("dynamic ")));
+  const expected = new Set([
+    ...SERVICENOW_INSTANCE_SECURITY_PROPERTIES.map((property) => property.name),
+    ...SERVICENOW_SCRIPT_RESTRICTION_PROPERTIES.map((property) => property.name),
+    ...SERVICENOW_BASELINE_HARDENING_PROPERTIES.map((property) => property.name),
+    "glide.ui.session_timeout", "glide.ui.rotate_sessions", "glide.ui.user_cookie.max_life_span_in_days",
+    "glide.enable.password_policy", "glide.apply.password_policy.on_login", "glide.login.no_blank_password",
+    "glide.authenticate.multifactor", "glide.authenticate.multifactor.email.otp.enabled",
+    "glide.authenticate.multisso.enabled", "glide.authenticate.sso.redirect.idp", "glide.sso.acr.enabled",
+    "glide.ip.authenticate.strict", "glide.smtp.auth", "glide.email.email_with_no_target_visible_to_all", "mid.version.override",
+  ]);
+  assert.deepEqual(concrete, expected);
+  assert.equal([...concrete].filter((name) => name.startsWith("glide.")).length, 34, "runtime has 34 distinct glide.* source properties");
+  assert.deepEqual(SERVICENOW_PROPERTY_SOURCES["SNOW-16"], ["dynamic sys_properties query: nameLIKEdebug and value=true"]);
+  for (const checkId of Object.keys(SERVICENOW_PROPERTY_SOURCES)) {
+    assert.ok(SERVICENOW_SPEC.checks.some((check) => check.id === checkId));
   }
 });
 
