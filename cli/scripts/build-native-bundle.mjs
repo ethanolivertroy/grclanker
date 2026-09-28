@@ -1,7 +1,19 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  lutimesSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +26,8 @@ const packageJson = JSON.parse(readFileSync(join(companionDir, "package.json"), 
 
 const companionVersion = process.env.GRCLANKER_VERSION || packageJson.version;
 const nodeVersion = process.env.GRCLANKER_NODE_VERSION || "22.20.0";
+// Zip entries store DOS timestamps, which cannot represent anything before 1980-01-01.
+const MIN_ARCHIVE_EPOCH = 315532800;
 
 function parseArgs(argv) {
   const targets = [];
@@ -65,7 +79,7 @@ function run(command, args, options = {}) {
   return result;
 }
 
-function findPythonCommand() {
+export function findPythonCommand() {
   const candidates = [
     { command: "python3", args: ["--version"] },
     { command: "python", args: ["--version"] },
@@ -280,20 +294,65 @@ function writeLauncher(bundleDir, target) {
   run("chmod", ["+x", launcherPath]);
 }
 
-function createArchive(bundleDir, artifactPath, target, pythonCommand) {
-  rmSync(artifactPath, { force: true });
+export function resolveSourceDateEpoch({ env = process.env, cwd = companionDir } = {}) {
+  const configured = env.SOURCE_DATE_EPOCH;
+  if (configured !== undefined && configured !== "") {
+    if (!/^\d+$/.test(configured)) {
+      throw new Error(`SOURCE_DATE_EPOCH must be a whole number of seconds, got ${JSON.stringify(configured)}`);
+    }
+    return Math.max(Number(configured), MIN_ARCHIVE_EPOCH);
+  }
 
-  if (target.archiveExt === "zip") {
-    const entries = readdirSync(bundleDir);
+  const result = spawnSync("git", ["log", "-1", "--format=%ct"], { cwd, encoding: "utf8", shell: false });
+  const commitTime = result.status === 0 ? result.stdout.trim() : "";
+  return /^\d+$/.test(commitTime) ? Math.max(Number(commitTime), MIN_ARCHIVE_EPOCH) : MIN_ARCHIVE_EPOCH;
+}
+
+export function normalizeTimestamps(root, epoch) {
+  const timestamp = new Date(epoch * 1000);
+  const visit = (path) => {
+    if (lstatSync(path).isDirectory()) {
+      for (const entry of readdirSync(path)) {
+        visit(join(path, entry));
+      }
+    }
+    lutimesSync(path, timestamp, timestamp);
+  };
+  visit(root);
+}
+
+let gnuTarDetected;
+function isGnuTar() {
+  if (gnuTarDetected === undefined) {
+    const result = spawnSync("tar", ["--version"], { encoding: "utf8", shell: false });
+    gnuTarDetected = result.status === 0 && /GNU tar/.test(result.stdout);
+  }
+  return gnuTarDetected;
+}
+
+export function createArchive(bundleDir, artifactPath, archiveExt, { pythonCommand, epoch }) {
+  rmSync(artifactPath, { force: true });
+  normalizeTimestamps(bundleDir, epoch);
+
+  if (archiveExt === "zip") {
+    const entries = readdirSync(bundleDir).sort();
     run(
       pythonCommand.command,
       [...pythonCommand.args.slice(0, -1), "-m", "zipfile", "-c", artifactPath, ...entries],
-      { cwd: bundleDir },
+      // zipfile stores local wall-clock time, so pin the zone for stable timestamps.
+      { cwd: bundleDir, env: { ...process.env, TZ: "UTC" } },
     );
     return;
   }
 
-  run("tar", ["-czf", artifactPath, "-C", bundleDir, "."]);
+  const reproducibleTarArgs = isGnuTar()
+    ? ["--sort=name", "--format=gnu", "--owner=0", "--group=0", "--numeric-owner", `--mtime=@${epoch}`, "--mode=go-w"]
+    : [];
+  if (reproducibleTarArgs.length === 0) {
+    console.warn("GNU tar not found; the tar.gz archive will not be byte-for-byte reproducible.");
+  }
+  const { GZIP: _ignoredGzipOptions, ...tarEnv } = process.env;
+  run("tar", [...reproducibleTarArgs, "-czf", artifactPath, "-C", bundleDir, "."], { env: tarEnv });
 }
 
 function sha256(filePath) {
@@ -302,7 +361,7 @@ function sha256(filePath) {
   return hash.digest("hex");
 }
 
-function buildBundle(targetId, target, outputDir, pythonCommand) {
+function buildBundle(targetId, target, outputDir, pythonCommand, epoch) {
   console.log(`\nBuilding ${targetId}`);
   const workingDir = mkdtempSync(join(tmpdir(), `grclanker-${targetId}-`));
   const bundleDir = join(workingDir, "bundle");
@@ -318,7 +377,7 @@ function buildBundle(targetId, target, outputDir, pythonCommand) {
   const artifactName = `grclanker-${companionVersion}-${targetId}.${target.archiveExt}`;
   const artifactPath = join(outputDir, artifactName);
 
-  createArchive(bundleDir, artifactPath, target, pythonCommand);
+  createArchive(bundleDir, artifactPath, target.archiveExt, { pythonCommand, epoch });
   rmSync(workingDir, { recursive: true, force: true });
 
   return artifactPath;
@@ -339,6 +398,8 @@ function main() {
 
   console.log(`Building grclanker release bundles v${companionVersion}`);
   console.log(`Bundled Node runtime: v${nodeVersion}`);
+  const epoch = resolveSourceDateEpoch();
+  console.log(`Archive timestamp (SOURCE_DATE_EPOCH): ${epoch}`);
 
   run("npm", ["run", "build"]);
   run("node", [join(companionDir, "scripts", "patch-embedded-pi.mjs")]);
@@ -349,7 +410,7 @@ function main() {
     if (!target) {
       throw new Error(`Unsupported target: ${targetId}`);
     }
-    artifacts.push(buildBundle(targetId, target, args.outputDir, pythonCommand));
+    artifacts.push(buildBundle(targetId, target, args.outputDir, pythonCommand, epoch));
   }
 
   const checksumLines = artifacts
@@ -363,10 +424,12 @@ function main() {
   }
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`Bundle build failed: ${message}`);
-  process.exit(1);
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Bundle build failed: ${message}`);
+    process.exit(1);
+  }
 }
