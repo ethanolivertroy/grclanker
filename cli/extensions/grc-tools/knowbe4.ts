@@ -2321,8 +2321,8 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       return fact(value("callback_tests_all_time") ?? value("callback_tests_read") ?? 0, (value("callback_tests_in_window") ?? 0) === 0 ? 1 : 0, evidence.callback_tests_in_window === null ? 1 : 0, evidence.callback_tests_in_window !== null);
     case "KNOWBE4-17": {
       const topics = asRecordArray(evidence.topics);
-      const required = asStringArray(evidence.required_compliance_topics);
-      const missing = topics.filter((topic) => asArray(topic.assigned_modules).length === 0).length;
+      const required = asStringArray(evidence.required_compliance_topics) ?? [];
+      const missing = topics.filter((topic) => !Array.isArray(topic.assigned_modules) || topic.assigned_modules.length === 0).length;
       const incomplete = evidence.completion_data_partial === true;
       const low = topics.filter((topic) => (asNumber(topic.completion_pct) ?? 100) < (value("min_completion_pct") ?? 0)).length;
       return fact(topics.length, required.length > 0 ? missing : 0, (required.length === 0 ? missing : 0) + low + (incomplete ? 1 : 0), !incomplete);
