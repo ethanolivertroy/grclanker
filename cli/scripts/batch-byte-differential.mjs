@@ -278,12 +278,18 @@ async function __corpusAsyncSweep(name, args, original) {
   if (__corpusSweptAsyncInputs.has(signature)) return;
   __corpusSweptAsyncInputs.add(signature);
   const client = args[0];
-  for (const methodName of __corpusClientMethods(client)) {
-    for (const mode of ["truncated", "empty"]) {
+  const methodNames = __corpusClientMethods(client);
+  const modes = ["truncated", "denied", "empty"];
+  const override = (proxy, methodName, mode) => {
+    proxy[methodName] = async (...methodArgs) => {
+      if (mode === "denied") throw new Error("403 Forbidden from independent differential " + methodName);
+      return __corpusMutateCollection(await client[methodName](...methodArgs), mode);
+    };
+  };
+  for (const methodName of methodNames) {
+    for (const mode of modes) {
       const proxy = Object.create(client);
-      proxy[methodName] = async (...methodArgs) => {
-        return __corpusMutateCollection(await client[methodName](...methodArgs), mode);
-      };
+      override(proxy, methodName, mode);
       const mutatedArgs = [proxy, ...args.slice(1)];
       try {
         __corpusRecord(name + "::sweep::" + mode + "::" + methodName, "result", await original(...mutatedArgs));
@@ -292,6 +298,29 @@ async function __corpusAsyncSweep(name, args, original) {
           name: error instanceof Error ? error.name : typeof error,
           message: error instanceof Error ? error.message : String(error),
         });
+      }
+    }
+  }
+  for (let left = 0; left < methodNames.length; left += 1) {
+    for (let right = left + 1; right < methodNames.length; right += 1) {
+      for (const leftMode of modes) {
+        for (const rightMode of modes) {
+          const leftMethod = methodNames[left];
+          const rightMethod = methodNames[right];
+          const proxy = Object.create(client);
+          override(proxy, leftMethod, leftMode);
+          override(proxy, rightMethod, rightMode);
+          const mutatedArgs = [proxy, ...args.slice(1)];
+          const recordName = name + "::pairwise::" + leftMode + "::" + leftMethod + "::" + rightMode + "::" + rightMethod;
+          try {
+            __corpusRecord(recordName, "result", await original(...mutatedArgs));
+          } catch (error) {
+            __corpusRecord(recordName, "error", {
+              name: error instanceof Error ? error.name : typeof error,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       }
     }
   }
@@ -448,13 +477,14 @@ function corpusCallCount(root, paths) {
 }
 
 function corpusSweepCounts(root, paths) {
-  const counts = { truncated: 0, denied: 0, empty: 0 };
+  const counts = { truncated: 0, denied: 0, empty: 0, pairwise: 0 };
   for (const path of paths) {
     for (const line of readFileSync(join(root, path), "utf8").trim().split("\n").filter(Boolean)) {
       const name = JSON.parse(line).name;
-      for (const mode of Object.keys(counts)) {
+      for (const mode of ["truncated", "denied", "empty"]) {
         if (name.includes(`::sweep::${mode}::`)) counts[mode] += 1;
       }
+      if (name.includes("::pairwise::")) counts.pairwise += 1;
     }
   }
   return counts;
@@ -532,6 +562,7 @@ try {
   const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
   console.log(`Whole-corpus replay passed against immutable stack base ${baselineSha}: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the stacked parent.`);
   console.log(`Realistic single-dataset sweeps matched the stacked parent: ${sweepCounts.truncated} truncated, ${sweepCounts.denied} denied, ${sweepCounts.empty} empty.`);
+  console.log(`Realistic pairwise source-state sweeps matched the stacked parent: ${sweepCounts.pairwise} exact serialized assessment calls.`);
   console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
   console.log(`Fixture classes: ${classes.join(", ")}.`);
 } finally {
