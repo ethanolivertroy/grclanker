@@ -442,7 +442,8 @@ const searchData = searchEnabled
         searchResults.hidden = !items.length;
         searchEmpty.hidden = !!items.length;
         searchInput.setAttribute('aria-expanded', items.length ? 'true' : 'false');
-        searchInput.removeAttribute('aria-activedescendant');
+        if (items.length) searchInput.setAttribute('aria-activedescendant', 'search-option-0');
+        else searchInput.removeAttribute('aria-activedescendant');
         announceResultCount(items.length);
       }
 
@@ -462,6 +463,8 @@ const searchData = searchEnabled
         if (els[selectedIndex]) {
           searchInput.setAttribute('aria-activedescendant', els[selectedIndex].id);
           els[selectedIndex].scrollIntoView({ block: 'nearest' });
+        } else {
+          searchInput.removeAttribute('aria-activedescendant');
         }
       }
 
@@ -537,7 +540,7 @@ const searchData = searchEnabled
       searchResults.addEventListener('click', function(e) { if (e.target.closest('.search-result')) closeSearch(); });
       searchResults.addEventListener('mousemove', function(e) {
         var link = e.target.closest('.search-result');
-        if (link) { var idx = parseInt(link.getAttribute('data-index'),10); if (!isNaN(idx) && idx !== selectedIndex) { selectedIndex = idx; updateActive(); } }
+        if (link) { var idx = parseInt(link.getAttribute('data-index'),10); if (!isNaN(idx) && (idx !== selectedIndex || searchInput.getAttribute('aria-activedescendant') !== link.id)) { selectedIndex = idx; updateActive(); } }
       });
       if (mobileNavToggle && mobileNavPanel) {
         mobileNavToggle.addEventListener('click', function() {
