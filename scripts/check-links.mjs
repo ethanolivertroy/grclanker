@@ -19,8 +19,12 @@ export const HUB_LINKED_DOCS = [
 ];
 
 const LINK_ATTRS = new Set(['href', 'src', 'srcset', 'poster']);
-const SKIP_SCHEMES = /^(mailto|tel|javascript|data|blob):/i;
-const EXTERNAL = /^(https?:)?\/\//i;
+// RFC 3986 scheme. Only http(s) and protocol-relative URLs are probed by
+// --external; mailto:, sms:, data:, and other schemes are not site paths.
+const URI_SCHEME = /^([A-Za-z][A-Za-z0-9+.-]*):/;
+const WEB_SCHEMES = new Set(['http', 'https']);
+// Only these count as navigation for the sidebar and hub backlink rules.
+const NAV_TAGS = new Set(['a', 'area']);
 const ORIGIN = 'https://site.invalid';
 // Comments, plus the bodies of elements whose contents are text rather than
 // markup. The opening tag is kept so attributes like `<script src>` are checked.
@@ -97,7 +101,7 @@ function linksFrom(tags) {
       if (!LINK_ATTRS.has(key)) continue;
       const refs = key === 'srcset' ? parseSrcset(value) : [value.trim()];
       for (const ref of refs) {
-        if (ref) links.push({ ref, tag: name, rel: attrs.rel ?? '' });
+        if (ref) links.push({ ref, rel: attrs.rel ?? '', nav: key === 'href' && NAV_TAGS.has(name) });
       }
     }
   }
@@ -143,9 +147,14 @@ export function checkSite({ distDir = 'dist', hubs = HUB_LINKED_DOCS } = {}) {
   let internalLinks = 0;
 
   for (const [key, page] of pages) {
-    for (const { ref, rel } of page.links) {
-      if (SKIP_SCHEMES.test(ref)) continue;
-      if (EXTERNAL.test(ref)) {
+    for (const { ref, rel, nav } of page.links) {
+      const scheme = ref.match(URI_SCHEME)?.[1].toLowerCase();
+      if (scheme?.length === 1) {
+        problems.push(`${page.file}: ${ref} (looks like a local drive path)`);
+        continue;
+      }
+      if (scheme && !WEB_SCHEMES.has(scheme)) continue;
+      if (scheme || ref.startsWith('//')) {
         if (/\b(preconnect|dns-prefetch)\b/.test(rel)) continue;
         const target = new URL(ref, ORIGIN);
         target.hash = '';

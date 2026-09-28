@@ -161,6 +161,30 @@ test('relative links, query strings, and public files resolve', () => {
   assert.match(problems[0], /\.\.\/missing\/ \(no built file\)/);
 });
 
+test('only same-site paths are internal and only http(s) is external', () => {
+  const dir = site({
+    'page/index.html': `
+      <a href="sms:+15551234">ok</a>
+      <a href="geo:37.78,-122.41">ok</a>
+      <a href="webcal://calendar.example/feed.ics">ok</a>
+      <a href="ftp://ftp.example/file.txt">ok</a>
+      <a href="data:text/plain,hi">ok</a>
+      <a href="MAILTO:team@example.com">ok</a>
+      <a href="urn:isbn:0451450523">ok</a>
+      <a href="HTTPS://docs.example/a#x">external</a>
+      <a href="//cdn.example/lib.js">external</a>
+      <a href="C:\\Users\\me\\notes.html">bad</a>
+      <a href="./missing:colon/">bad</a>
+      <a href="/also:missing">bad</a>`,
+  });
+  const { problems, external } = checkSite({ distDir: dir, hubs });
+  assert.deepEqual([...external.keys()].sort(), ['https://cdn.example/lib.js', 'https://docs.example/a']);
+  assert.equal(problems.length, 3);
+  assert.match(problems[0], /C:\\Users\\me\\notes\.html \(looks like a local drive path\)/);
+  assert.match(problems[1], /\.\/missing:colon\/ \(no built file\)/);
+  assert.match(problems[2], /\/also:missing \(no built file\)/);
+});
+
 test('docs pages must be in the sidebar or linked from their hub', () => {
   const orphan = problemsFor({ 'docs/orphan/index.html': sidebar });
   assert.equal(orphan.length, 1);
