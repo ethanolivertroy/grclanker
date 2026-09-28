@@ -24,12 +24,12 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { evaluateBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import {
   OCI_AUTH_RESOLVER,
   readResolverEnvironment,
 } from "./auth-resolver-contracts.js";
-import { OCI_SPEC } from "./oci.spec.js";
+import { OCI_RUNTIME_FRAMEWORK_MAPPINGS, OCI_SPEC } from "./oci.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -654,11 +654,13 @@ function finding(
   id: string,
   title: string,
   severity: OciFinding["severity"],
-  status: OciFindingStatus,
+  _status: OciFindingStatus,
   summary: string,
-  mappings: string[],
+  _mappings: string[],
   evidence?: JsonRecord,
+  decisionFacts?: Readonly<Record<string, unknown>>,
 ): OciFinding {
+  const status = evaluateBatchCheckVerdict(OCI_SPEC, id, decisionFacts ?? {}) as OciFindingStatus;
   return {
     id,
     title,
@@ -666,7 +668,23 @@ function finding(
     status,
     summary: redactSensitiveText(summary),
     evidence: evidence ? redactSensitiveValues(evidence) : undefined,
-    mappings,
+    mappings: [...(OCI_RUNTIME_FRAMEWORK_MAPPINGS[id] ?? [])],
+  };
+}
+
+function ociDecisionFacts(
+  evidenceReadable: boolean,
+  evidenceComplete: boolean,
+  inventoryCount: number,
+  violationCount: number,
+  reviewCount = 0,
+): Readonly<Record<string, unknown>> {
+  return {
+    evidence_readable: evidenceReadable,
+    evidence_complete: evidenceComplete,
+    inventory_count: inventoryCount,
+    violation_count: violationCount,
+    review_count: reviewCount,
   };
 }
 
@@ -2183,6 +2201,7 @@ export async function assessOciIdentity(
         authentication_policy: readEvidence("iam authentication-policy get", authPolicyRead, { password_policy: passwordPolicy ?? null }),
         source: OCI_SURFACE_DOCS.authenticationPolicy.rest,
       },
+      ociDecisionFacts(authPolicy.ok && passwordPolicy !== undefined && minLength !== undefined, true, authPolicy.items.length, minLength !== undefined && (minLength < 14 || !complexitySatisfied) ? 1 : 0),
     ),
     finding(
       "OCI-IAM-06",
@@ -2208,6 +2227,7 @@ export async function assessOciIdentity(
           users_with_unknown_mfa: usersWithUnknownMfa.slice(0, 25),
         }),
       },
+      ociDecisionFacts(users.ok, true, consoleUsers.length, usersWithoutMfa.length, usersWithUnknownMfa.length),
     ),
     finding(
       "OCI-IAM-03",
@@ -2230,6 +2250,7 @@ export async function assessOciIdentity(
         }),
         credential_cap: maxKeys,
       },
+      ociDecisionFacts(users.ok && !(credentialErrors.length > 0 && credentialsSeen === 0), !credentialCapHit && credentialErrors.length === 0, activeUsers.length, staleCredentials.length, undatedCredentials.length),
     ),
     finding(
       "OCI-IAM-04",
@@ -2247,6 +2268,7 @@ export async function assessOciIdentity(
         }, policyCapDetail),
         policy_cap: maxPolicies,
       },
+      ociDecisionFacts(policyScope.readable, !isPartial(policyScope) && !policyCapHit, policyScope.items.length, broadPolicies.length),
     ),
     finding(
       "OCI-IAM-05",
@@ -2262,6 +2284,7 @@ export async function assessOciIdentity(
           max_depth: maxDepth,
         }),
       },
+      ociDecisionFacts(compartments.ok, true, nonRootCompartments.length, nonRootCompartments.length === 0 ? 1 : 0),
     ),
   ];
 
@@ -2479,6 +2502,7 @@ export async function assessOciLoggingDetection(
         cloud_guard_configuration: cloudGuardEvidence,
         targets: readEvidence("cloud-guard target list", targetsRead, { active_targets: activeTargets.length, total_targets: targets.items.length }),
       },
+      ociDecisionFacts(cloudGuardConfig.ok && Boolean(cloudGuardStatus) && (!cloudGuardEnabled || targets.ok), true, activeTargets.length, !cloudGuardEnabled || activeTargets.length === 0 ? 1 : 0),
     ),
     finding(
       "OCI-LOG-02",
@@ -2491,6 +2515,7 @@ export async function assessOciLoggingDetection(
         problems: readEvidence("cloud-guard problem list", problemsRead, { open_problems: openProblems.length, high_risk_problems: highRiskProblems.length }),
         cloud_guard_configuration: cloudGuardEvidence,
       },
+      ociDecisionFacts(problems.ok && (openProblems.length > 0 || (cloudGuardConfig.ok && cloudGuardEnabled)), true, problems.items.length, highRiskProblems.length, openProblems.length - highRiskProblems.length),
     ),
     finding(
       "OCI-LOG-03",
@@ -2507,6 +2532,7 @@ export async function assessOciLoggingDetection(
         }),
         cloud_guard_configuration: cloudGuardEvidence,
       },
+      ociDecisionFacts(responderRecipes.ok && cloudGuardConfig.ok && cloudGuardEnabled, true, responderRecipes.items.length, activeResponders.length === 0 || activeRespondersWithRules.length === 0 ? 1 : 0),
     ),
     finding(
       "OCI-LOG-06",
@@ -2520,6 +2546,7 @@ export async function assessOciLoggingDetection(
         required_days: AUDIT_RETENTION_REQUIRED_DAYS,
         source: OCI_SURFACE_DOCS.auditConfiguration.rest,
       },
+      ociDecisionFacts(auditConfig.ok && retentionDays !== undefined, true, retentionDays === undefined ? 0 : 1, retentionDays !== undefined && retentionDays < AUDIT_RETENTION_REQUIRED_DAYS ? 1 : 0),
     ),
     finding(
       "OCI-LOG-04",
@@ -2533,6 +2560,7 @@ export async function assessOciLoggingDetection(
         lookback_days: lookbackDays,
         role: "supporting evidence for control 11; not a spec control, so no framework mappings",
       },
+      ociDecisionFacts(auditEvents.ok, true, datedEvents.length, 0),
     ),
     finding(
       "OCI-LOG-05",
@@ -2542,6 +2570,7 @@ export async function assessOciLoggingDetection(
       ruleSummary,
       ["FedRAMP AU-12", "CMMC L2 3.3.1", "SOC 2 CC7.2", "CIS OCI 3.5", "PCI-DSS 10.6.1", "STIG SRG-APP-000492", "IRAP ISM-0580", "ISMAP LG-02"],
       { event_rules: scopeEvidence(ruleScope, { enabled_rules: enabledRules.length, critical_event_rules: criticalRules.length }) },
+      ociDecisionFacts(ruleScope.readable, !isPartial(ruleScope), ruleScope.items.length, criticalRules.length === 0 ? 1 : 0),
     ),
   ];
 
@@ -3050,6 +3079,7 @@ export async function assessOciTenancyGuardrails(
           permissive_security_lists: permissiveSecurityLists.slice(0, 25).map((item) => asString(item.id) ?? asString(item.displayName)),
         }),
       },
+      ociDecisionFacts(securityLists.readable, !isPartial(securityLists), securityLists.items.length, permissiveSecurityLists.length),
     ),
     finding(
       "OCI-GRD-02",
@@ -3068,6 +3098,13 @@ export async function assessOciTenancyGuardrails(
         }),
         security_list_witness: securityListWitnessEvidence(nsgs, "network nsg rules list"),
       },
+      ociDecisionFacts(
+        nsgs.readable && (nsgs.items.length > 0 || (securityLists.readable && securityLists.items.length > 0)),
+        !isPartial(nsgs) && (nsgs.items.length > 0 || !isPartial(securityLists)),
+        nsgs.items.length > 0 ? nsgs.items.length : securityLists.items.length > 0 ? 1 : 0,
+        permissiveNsgRules.length,
+        nsgRuleErrors,
+      ),
     ),
     finding(
       "OCI-GRD-03",
@@ -3082,6 +3119,12 @@ export async function assessOciTenancyGuardrails(
         }),
         security_list_witness: securityListWitnessEvidence(internetGateways, "the isEnabled flag of every listed gateway"),
       },
+      ociDecisionFacts(
+        internetGateways.readable && (internetGateways.items.length > 0 || (securityLists.readable && securityLists.items.length > 0)),
+        !isPartial(internetGateways) && (internetGateways.items.length > 0 || !isPartial(securityLists)),
+        internetGateways.items.length > 0 ? internetGateways.items.length : securityLists.items.length > 0 ? 1 : 0,
+        enabledGateways.length,
+      ),
     ),
     finding(
       "OCI-GRD-04",
@@ -3103,6 +3146,7 @@ export async function assessOciTenancyGuardrails(
           session_list_errors: sessionListErrors,
         }),
       },
+      ociDecisionFacts(bastions.readable, !isPartial(bastions), activeBastions.length, longRunningSessions.length + exposedBastions.length, weakBastions.length + bastionDetailErrors + undatedSessions.length),
     ),
     finding(
       "OCI-GRD-05",
@@ -3128,6 +3172,7 @@ export async function assessOciTenancyGuardrails(
         ecdsa_accepted_curves: [...ECDSA_ACCEPTED_CURVES],
         source: OCI_SURFACE_DOCS.keyDetail.rest,
       },
+      ociDecisionFacts(vaults.readable, !isPartial(vaults) && !keyCapHit && keyDetailErrors === 0 && keyReadErrors === 0, keysJudged, weakKeys.length, undatedKeys.length + keyDetailErrors + keyReadErrors),
     ),
     finding(
       "OCI-GRD-06",
@@ -3146,6 +3191,7 @@ export async function assessOciTenancyGuardrails(
         }),
         bucket_cap: maxBuckets,
       },
+      ociDecisionFacts(buckets.readable, !isPartial(buckets) && !bucketCapHit && bucketDetailErrors === 0, bucketsSeen, publicBuckets.length, longLivedPars.length + undatedPars.length + bucketDetailErrors),
     ),
   ];
 
@@ -3245,6 +3291,7 @@ export async function assessOciComputeAndStorage(
         }),
         source: OCI_SURFACE_DOCS.instances.rest,
       },
+      ociDecisionFacts(instances.readable, !isPartial(instances), liveInstances.length, legacyImdsInstances.length),
     ),
     finding(
       "OCI-CMP-02",
@@ -3257,6 +3304,7 @@ export async function assessOciComputeAndStorage(
         volumes: scopeEvidence(volumes, { live_volumes: blockVolumes.live, oracle_managed_volumes: blockVolumes.oracleManaged }),
         source: OCI_SURFACE_DOCS.volumes.rest,
       },
+      ociDecisionFacts(volumes.readable, !isPartial(volumes), blockVolumes.live, blockVolumes.oracleManaged.length),
     ),
     finding(
       "OCI-CMP-03",
@@ -3270,6 +3318,7 @@ export async function assessOciComputeAndStorage(
         boot_volumes: scopeEvidence(bootVolumes, { live_boot_volumes: boot.live, oracle_managed_boot_volumes: boot.oracleManaged }),
         source: OCI_SURFACE_DOCS.bootVolumes.rest,
       },
+      ociDecisionFacts(bootVolumes.readable, !isPartial(bootVolumes), boot.live, boot.oracleManaged.length),
     ),
   ];
 

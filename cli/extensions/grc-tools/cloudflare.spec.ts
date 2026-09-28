@@ -63,7 +63,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   severity,
   owner: owner(id),
   surfaces: sourceSurfaces,
-  emptyOutcome: "manual",
+  emptyOutcome: id === "CF-IAM-05" ? "fail" : id === "CF-TRF-05" ? "pass" : "manual",
   decision: `Evaluate ${title} from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account.`,
 })));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
