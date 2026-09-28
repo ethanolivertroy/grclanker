@@ -137,7 +137,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   }
   assert.equal(checksWithCompleteness, 156);
   assert.equal(completenessFields, 156);
-  assert.equal(sourceEntries, 244);
+  assert.equal(sourceEntries, 272);
 
   assert.deepEqual(check(AZURE_SPEC, "AZURE-MON-06").completeness.complete.sources, [
     { surfaceId: "diagnostic-settings", falseWhen: [] },
@@ -147,7 +147,8 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
     "compliance-policies", "managed-devices", "conditional-access",
   ]);
   assert.deepEqual(check(CLOUDFLARE_SPEC, "CF-IAM-02").completeness.evidence_complete.sources, [
-    { surfaceId: "token-and-account", falseWhen: [] },
+    { surfaceId: "token-verification", falseWhen: [] },
+    { surfaceId: "current-token-detail", falseWhen: [] },
   ]);
   assert.deepEqual(check(GCP_SPEC, "GCP-IAM-02").completeness.evidence_complete.sources[0].falseWhen, [
     "truncated", "error", "denied", "not-collected",
@@ -156,7 +157,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   assert.deepEqual(check(PALOALTO_SPEC, "PA-21").completeness.evidence_complete.sources.map((source) => source.surfaceId), [
     "prisma-policies", "panos-policy-config",
   ]);
-  assert.match(check(PALOALTO_SPEC, "PA-19").completeness.evidence_complete.semantics, /unconfigured product is omitted from the gate/);
+  assert.match(check(PALOALTO_SPEC, "PA-19").completeness.evidence_complete.semantics, /unconfigured product is omitted/);
   assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /zia-ssl-inspection-rules: truncation leaves evidence_complete true/);
   assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /zia-security-allowlist: truncation leaves evidence_complete true; an error, 403 denial, or not-collected read makes evidence_complete false/);
 });

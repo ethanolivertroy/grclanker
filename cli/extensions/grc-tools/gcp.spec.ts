@@ -95,13 +95,20 @@ const rows: readonly Row[] = [
   ["GCP-NET-06", 19, "Cloud Armor on external backend services", "medium", ["projects", "compute"], "manual", "warn"],
 ] as const;
 
-const GCP_COMPLETENESS_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
-const gcpCompletenessSources = (
-  sourceSurfaces: readonly string[],
-): readonly BatchCompletenessSourceDefinition[] => sourceSurfaces.map((surfaceId) => ({
-  surfaceId,
-  falseWhen: GCP_COMPLETENESS_FAILURE_MODES,
-}));
+const GA = ["truncated", "error", "denied", "not-collected"] as const;
+const GT = ["truncated"] as const;
+const GN = [] as const;
+function gcpCompletenessFailureModes(surfaceId: string): BatchCompletenessSourceDefinition["falseWhen"] {
+  if (surfaceId === "organization" || surfaceId === "effective-org-policy") return GN;
+  if (["iam-policies", "security-command-center", "kms", "access-context-manager"].includes(surfaceId)) return GT;
+  return GA;
+}
+export const GCP_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = Object.fromEntries(
+  rows.map(([id, , , , sourceSurfaces]) => [
+    id,
+    sourceSurfaces.map((surfaceId) => ({ surfaceId, falseWhen: gcpCompletenessFailureModes(surfaceId) })),
+  ]),
+);
 
 function owner(id: string): string {
   if (id.startsWith("GCP-IAM-")) return "gcp_assess_identity";
@@ -248,8 +255,8 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     ...custom,
     completeness: batch2Completeness(
       decisionInputs,
-      gcpCompletenessSources(sourceSurfaces),
-      `true for ${title} only when the organization or project scope and every listed dependent read are free of truncation, errors, denials, and not-collected states.`,
+      GCP_COMPLETENESS_SOURCES[id],
+      `For ${id}, project and per-project scan failures make evidence_complete false. Organization and effective-policy object failures instead make the finding manual and omit or bypass this primitive. Direct organization-scoped list truncation makes it false, while a direct-list error makes the finding manual without lowering it.`,
     ),
     decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
   };
