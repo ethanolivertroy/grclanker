@@ -15,7 +15,7 @@ import {
   restSurface,
 } from "./batch2-spec-helpers.js";
 import { KNOWBE4_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import { batch3Checks, batch3Threshold, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://developer.knowbe4.com/rest/reporting";
 const kb = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") =>
@@ -53,9 +53,15 @@ const surfaces = [
 ] as const;
 
 const rows: readonly Batch3CheckRow[] = [
-  { id: "KNOWBE4-01", control: 1, title: "Phishing simulation frequency", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["phishing-campaigns", "security-tests"], predicate: "Count the absence of a completed phishing test inside max_campaign_gap_days and adjacent completed tests separated by more than that threshold.", constants: { default_max_campaign_gap_days: 30 } },
-  { id: "KNOWBE4-02", control: 2, title: "Phishing simulation coverage", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["users", "security-tests", "security-test-recipients"], predicate: "Compute unique active users receiving a test inside lookback_days divided by the complete active-user population; percentages below min_coverage_pct violate.", constants: { default_lookback_days: 90, default_min_coverage_pct: 90 } },
-  { id: "KNOWBE4-03", control: 3, title: "Training completion rates", severity: "high", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments"], predicate: "Compute completed enrollments divided by all due enrollments for each active campaign; below fail_completion_pct fails and below min_completion_pct warns.", emptyOutcome: "warn", constants: { default_min_completion_pct: 90, default_fail_completion_pct: 80 } },
+  { id: "KNOWBE4-01", control: 1, title: "Phishing simulation frequency", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["phishing-campaigns", "security-tests"], predicate: "Count the absence of a completed phishing test inside max_campaign_gap_days and adjacent completed tests separated by more than that threshold.", constants: { default_max_campaign_gap_days: 30 }, thresholds: [batch3Threshold("KNOWBE4-01", "default_max_campaign_gap_days", "days_since_last_test", "gt", "fail", "Whole days since the latest completed phishing test.", "max_campaign_gap_days")] },
+  { id: "KNOWBE4-02", control: 2, title: "Phishing simulation coverage", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["users", "security-tests", "security-test-recipients"], predicate: "Compute unique active users receiving a test inside lookback_days divided by the complete active-user population; percentages below min_coverage_pct violate.", constants: { default_lookback_days: 90, default_min_coverage_pct: 90 }, thresholds: [
+    batch3Threshold("KNOWBE4-02", "default_lookback_days", "oldest_included_test_age_days", "gt", "fail", "Age of the oldest security test included in the coverage numerator.", "lookback_days"),
+    batch3Threshold("KNOWBE4-02", "default_min_coverage_pct", "coverage_pct", "lt", "fail", "Unique tested active users divided by all active users, multiplied by 100.", "min_coverage_pct"),
+  ] },
+  { id: "KNOWBE4-03", control: 3, title: "Training completion rates", severity: "high", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments"], predicate: "Compute completed enrollments divided by all due enrollments for each active campaign; below fail_completion_pct fails and below min_completion_pct warns.", emptyOutcome: "warn", constants: { default_min_completion_pct: 90, default_fail_completion_pct: 80 }, thresholds: [
+    batch3Threshold("KNOWBE4-03", "default_fail_completion_pct", "min:campaigns_evaluated.completion_pct", "lt", "fail", "Lowest uncapped completed-campaign enrollment completion percentage.", "fail_completion_pct"),
+    batch3Threshold("KNOWBE4-03", "default_min_completion_pct", "min:campaigns_evaluated.completion_pct", "lt", "warn", "Lowest uncapped completed-campaign enrollment completion percentage.", "min_completion_pct"),
+  ] },
   {
     id: "KNOWBE4-04",
     control: 4,
@@ -94,7 +100,10 @@ const rows: readonly Batch3CheckRow[] = [
       batch2Rule("pass", { op: "always" }),
     ],
   },
-  { id: "KNOWBE4-05", control: 5, title: "User risk score distribution", severity: "medium", owner: "knowbe4_assess_user_risk", surfaces: ["users", "risk-history"], predicate: "Compute mean and population standard deviation over every user with a numeric risk score; mean above max_mean_risk_score or deviation above max_risk_score_stddev violates.", emptyOutcome: "warn", constants: { default_max_mean_risk_score: 50, default_max_risk_score_stddev: 25 } },
+  { id: "KNOWBE4-05", control: 5, title: "User risk score distribution", severity: "medium", owner: "knowbe4_assess_user_risk", surfaces: ["users", "risk-history"], predicate: "Compute mean and population standard deviation over every user with a numeric risk score; mean above max_mean_risk_score or deviation above max_risk_score_stddev violates.", emptyOutcome: "warn", constants: { default_max_mean_risk_score: 50, default_max_risk_score_stddev: 25 }, thresholds: [
+    batch3Threshold("KNOWBE4-05", "default_max_mean_risk_score", "mean_risk_score", "gt", "fail", "Arithmetic mean over every returned numeric user risk score.", "max_mean_risk_score"),
+    batch3Threshold("KNOWBE4-05", "default_max_risk_score_stddev", "stddev_risk_score", "gt", "warn", "Population standard deviation over every returned numeric user risk score.", "max_risk_score_stddev"),
+  ] },
   {
     id: "KNOWBE4-06",
     control: 6,
@@ -186,7 +195,7 @@ const rows: readonly Batch3CheckRow[] = [
     ],
   },
   { id: "KNOWBE4-08", control: 8, title: "Group coverage analysis", severity: "medium", owner: "knowbe4_assess_user_risk", surfaces: ["groups", "phishing-campaigns", "training-campaigns"], predicate: "Count active groups absent from both a phishing campaign and a training campaign inside lookback_days.", emptyOutcome: "warn" },
-  { id: "KNOWBE4-09", control: 9, title: "Campaign targeting completeness", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["users", "phishing-campaigns", "security-test-recipients"], predicate: "Count campaigns whose unique recipient coverage is below min_coverage_pct, or below 100 percent when require_full_targeting is true.", constants: { default_min_coverage_pct: 90 } },
+  { id: "KNOWBE4-09", control: 9, title: "Campaign targeting completeness", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["users", "phishing-campaigns", "security-test-recipients"], predicate: "Count campaigns whose unique recipient coverage is below min_coverage_pct, or below 100 percent when require_full_targeting is true.", constants: { default_min_coverage_pct: 90 }, thresholds: [batch3Threshold("KNOWBE4-09", "default_min_coverage_pct", "estimated_coverage_pct", "lt", "fail", "Estimated percentage of the complete active-user population targeted by active campaigns.", "min_coverage_pct")] },
   {
     id: "KNOWBE4-10",
     control: 10,
@@ -229,7 +238,7 @@ const rows: readonly Batch3CheckRow[] = [
       batch2Rule("pass", { op: "always" }),
     ],
   },
-  { id: "KNOWBE4-11", control: 11, title: "Training content currency", severity: "medium", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments", "store-purchases"], predicate: "Count assigned store purchases whose publication or update age exceeds max_content_age_days or whose date is absent.", emptyOutcome: "warn", constants: { default_max_content_age_days: 365 } },
+  { id: "KNOWBE4-11", control: 11, title: "Training content currency", severity: "medium", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments", "store-purchases"], predicate: "Count assigned store purchases whose publication or update age exceeds max_content_age_days or whose date is absent.", emptyOutcome: "warn", constants: { default_max_content_age_days: 365 }, thresholds: [batch3Threshold("KNOWBE4-11", "default_max_content_age_days", "max_observed_content_age_days", "gt", "fail", "Greatest age in days among all assigned dated store purchases.", "max_content_age_days")] },
   {
     id: "KNOWBE4-12",
     control: 12,
@@ -291,8 +300,8 @@ const rows: readonly Batch3CheckRow[] = [
     ],
   },
   { id: "KNOWBE4-16", control: 16, title: "Vishing campaign execution", severity: "medium", owner: "knowbe4_assess_account_governance", surfaces: ["callback-tests"], predicate: "Count the absence of a callback or vishing security test inside lookback_days when require_vishing_tests is true; otherwise report the observed inventory." },
-  { id: "KNOWBE4-17", control: 17, title: "Compliance training modules", severity: "high", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments", "store-purchases"], predicate: "Count configured required topics absent from assigned content and required-topic enrollments whose completion percentage is below min_completion_pct.", constants: { default_min_completion_pct: 90 } },
-  { id: "KNOWBE4-18", control: 18, title: "Inactive user cleanup", severity: "medium", owner: "knowbe4_assess_user_risk", surfaces: ["users", "security-test-recipients", "training-enrollments"], predicate: "Count active users with no phishing or training participation inside inactive_days.", emptyOutcome: "pass", constants: { default_inactive_days: 180 } },
+  { id: "KNOWBE4-17", control: 17, title: "Compliance training modules", severity: "high", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments", "store-purchases"], predicate: "Count configured required topics absent from assigned content and required-topic enrollments whose completion percentage is below min_completion_pct.", constants: { default_min_completion_pct: 90 }, thresholds: [batch3Threshold("KNOWBE4-17", "default_min_completion_pct", "min:topics.completion_pct", "lt", "warn", "Lowest uncapped completion percentage among required compliance topics.", "min_completion_pct")] },
+  { id: "KNOWBE4-18", control: 18, title: "Inactive user cleanup", severity: "medium", owner: "knowbe4_assess_user_risk", surfaces: ["users", "security-test-recipients", "training-enrollments"], predicate: "Count active users with no phishing or training participation inside inactive_days.", emptyOutcome: "pass", constants: { default_inactive_days: 180 }, thresholds: [batch3Threshold("KNOWBE4-18", "default_inactive_days", "max_observed_inactivity_days", "gt", "warn", "Greatest elapsed days since phishing, training, or sign-in activity among active users.", "inactive_days")] },
   {
     id: "KNOWBE4-19",
     control: 19,
@@ -332,7 +341,7 @@ const rows: readonly Batch3CheckRow[] = [
       batch2Rule("pass", { op: "always" }),
     ],
   },
-  { id: "KNOWBE4-20", control: 20, title: "Campaign scheduling regularity", severity: "medium", owner: "knowbe4_assess_phishing_program", surfaces: ["phishing-campaigns", "security-tests"], predicate: "Count adjacent completed security tests separated by more than max_schedule_gap_days and no upcoming recurring campaign schedule.", emptyOutcome: "fail", constants: { default_max_schedule_gap_days: 45 } },
+  { id: "KNOWBE4-20", control: 20, title: "Campaign scheduling regularity", severity: "medium", owner: "knowbe4_assess_phishing_program", surfaces: ["phishing-campaigns", "security-tests"], predicate: "Count adjacent completed security tests separated by more than max_schedule_gap_days and no upcoming recurring campaign schedule.", emptyOutcome: "fail", constants: { default_max_schedule_gap_days: 45 }, thresholds: [batch3Threshold("KNOWBE4-20", "default_max_schedule_gap_days", "max_gap_days", "gt", "fail", "Greatest adjacent or current-boundary gap in days across the complete test series.", "max_schedule_gap_days")] },
 ] as const;
 
 const checks = batch3Checks(rows);

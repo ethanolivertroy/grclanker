@@ -15,7 +15,7 @@ import {
   restSurface,
 } from "./batch2-spec-helpers.js";
 import { QUALYS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, batch3Threshold, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 import type { RequestParameterContract } from "./spec-model.js";
 
 const DOCS = "https://docs.qualys.com/en/vm/api/";
@@ -125,7 +125,7 @@ const surfaces = [
 ] as const;
 
 const rows: readonly Batch3CheckRow[] = [
-  { id: "QUALYS-C01", control: 1, title: "Scan schedule coverage", severity: "high", owner: "qualys_assess_scan_coverage", surfaces: ["scheduled-scans", "scans", "asset-groups"], predicate: "Count asset groups with no active recurring vulnerability scan and schedules whose most recent completed scan is older than lookback_days.", constants: { default_lookback_days: 30 } },
+  { id: "QUALYS-C01", control: 1, title: "Scan schedule coverage", severity: "high", owner: "qualys_assess_scan_coverage", surfaces: ["scheduled-scans", "scans", "asset-groups"], predicate: "Count asset groups with no active recurring vulnerability scan and schedules whose most recent completed scan is older than lookback_days.", constants: { default_lookback_days: 30 }, thresholds: [batch3Threshold("QUALYS-C01", "default_lookback_days", "max_observed_scan_age_days", "gt", "fail", "Greatest elapsed days since the last completed scan associated with an active schedule.", "lookback_days")] },
   {
     id: "QUALYS-C02",
     control: 2,
@@ -175,7 +175,7 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "QUALYS-C04", control: 4, title: "Asset group completeness", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["hosts", "asset-groups"], predicate: "Count host assets assigned to no asset group, empty group IP sets, and group members absent from the complete host inventory." },
   { id: "QUALYS-C05", control: 5, title: "Cloud connector status", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["connectors"], predicate: "Count cloud connectors not in an active or successful synchronization state or with no readable last-sync timestamp." },
   { id: "QUALYS-C06", control: 6, title: "Scanner appliance health", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["appliances"], predicate: "Count scanner appliances that are offline, whose heartbeat is stale, or whose software version is absent." },
-  { id: "QUALYS-C07", control: 7, title: "Agent deployment coverage", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["hosts", "cloud-agents"], predicate: "Compute unique Cloud Agent host coverage over the complete host inventory; percentages below min_agent_coverage_percent violate.", constants: { default_min_agent_coverage_percent: 50 } },
+  { id: "QUALYS-C07", control: 7, title: "Agent deployment coverage", severity: "high", owner: "qualys_assess_asset_inventory", surfaces: ["hosts", "cloud-agents"], predicate: "Compute unique Cloud Agent host coverage over the complete host inventory; percentages below min_agent_coverage_percent violate.", constants: { default_min_agent_coverage_percent: 50 }, thresholds: [batch3Threshold("QUALYS-C07", "default_min_agent_coverage_percent", "agent_coverage_percent", "lt", "fail", "Unique cloud-agent host identifiers divided by the uncapped complete host population, multiplied by 100.", "min_agent_coverage_percent")] },
   { id: "QUALYS-C08", control: 8, title: "Authentication record completeness", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["auth-records", "hosts"], predicate: "Count missing Windows, Unix/Linux, or network-device authentication record types and records whose latest status is failed or expired." },
   { id: "QUALYS-C09", control: 9, title: "Policy compliance profile assignment", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["compliance-policies", "asset-groups"], predicate: "Count draft or disabled compliance policies and policies with no readable asset-group assignment; no policy is a violation." },
   {
@@ -324,7 +324,7 @@ const rows: readonly Batch3CheckRow[] = [
   },
   { id: "QUALYS-C17", control: 17, title: "Vulnerability prioritization (QDS)", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["detections", "knowledge-base"], predicate: "Count open severe detections with no numeric QDS; an empty complete detection population passes only when the endpoint was readable." },
   { id: "QUALYS-C18", control: 18, title: "Tag-based asset management", severity: "medium", owner: "qualys_assess_asset_inventory", surfaces: ["hosts", "tags"], predicate: "Count hosts with no Qualys tag and the absence of tags identifying compliance scope, environment, or business ownership." },
-  { id: "QUALYS-C19", control: 19, title: "Activity log monitoring", severity: "medium", owner: "qualys_assess_administration", surfaces: ["activity-log"], predicate: "Count sensitive user, policy, report, and scan administration actions inside lookback_days; empty activity is review evidence.", constants: { default_lookback_days: 30 } },
+  { id: "QUALYS-C19", control: 19, title: "Activity log monitoring", severity: "medium", owner: "qualys_assess_administration", surfaces: ["activity-log"], predicate: "Count sensitive user, policy, report, and scan administration actions inside lookback_days; empty activity is review evidence.", constants: { default_lookback_days: 30 }, thresholds: [batch3Threshold("QUALYS-C19", "default_lookback_days", "oldest_included_activity_age_days", "gt", "warn", "Age in days of the oldest activity-log row admitted to the assessment window.", "lookback_days")] },
   { id: "QUALYS-C20", control: 20, title: "Network segmentation scanning", severity: "high", owner: "qualys_assess_scan_coverage", surfaces: ["scheduled-scans", "asset-groups"], predicate: "Count the absence of distinct active scan schedules covering separate DMZ, internal, and OT or ICS asset-group segments." },
 ] as const;
 

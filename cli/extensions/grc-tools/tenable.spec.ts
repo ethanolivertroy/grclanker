@@ -14,7 +14,7 @@ import {
   restSurface,
 } from "./batch2-spec-helpers.js";
 import { TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, batch3Threshold, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://developer.tenable.com/reference/navigate";
 const surface = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") => {
@@ -101,7 +101,7 @@ const surfaces = [
 
 const rows: readonly Batch3CheckRow[] = [
   { id: "TENABLE-01", control: 1, title: "Scan policy configuration", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["policies", "policy-details"], predicate: "Count policies whose readable detail omits safe checks, an appropriate port range, enabled plugin families, or credential configuration; failed detail reads make evidence incomplete." },
-  { id: "TENABLE-02", control: 2, title: "Scan schedule discipline", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["scans", "scan-details", "networks", "sc-scans", "sc-scan-results"], predicate: "Count enabled networks without a recurring scan or scans whose latest completed run is older than stale_scan_days.", constants: { default_stale_scan_days: 30 } },
+  { id: "TENABLE-02", control: 2, title: "Scan schedule discipline", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["scans", "scan-details", "networks", "sc-scans", "sc-scan-results"], predicate: "Count enabled networks without a recurring scan or scans whose latest completed run is older than stale_scan_days.", constants: { default_stale_scan_days: 30 }, thresholds: [batch3Threshold("TENABLE-02", "default_stale_scan_days", "max_observed_scan_age_days", "gt", "fail", "Greatest elapsed days since the latest completed run among enabled recurring scans.", "stale_scan_days")] },
   {
     id: "TENABLE-03",
     control: 3,
@@ -135,7 +135,7 @@ const rows: readonly Batch3CheckRow[] = [
       batch2Rule("pass", { op: "always" }),
     ],
   },
-  { id: "TENABLE-04", control: 4, title: "Credentialed scan ratio", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["scans", "scan-details", "policies", "policy-details"], predicate: "Compute credentialed scan count divided by the complete scan population; ratios below credential_threshold violate.", constants: { default_credential_threshold: 0.8 } },
+  { id: "TENABLE-04", control: 4, title: "Credentialed scan ratio", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["scans", "scan-details", "policies", "policy-details"], predicate: "Compute credentialed scan count divided by the complete scan population; ratios below credential_threshold violate.", constants: { default_credential_threshold: 0.8 }, thresholds: [batch3Threshold("TENABLE-04", "default_credential_threshold", "coverage_ratio", "lt", "fail", "Credentialed scans divided by the uncapped complete scan population.", "threshold")] },
   {
     id: "TENABLE-05",
     control: 5,
@@ -213,9 +213,12 @@ const rows: readonly Batch3CheckRow[] = [
     ],
     completenessSemantics: "The TENABLE-07 check-owned population-complete fact becomes false when scanners, server-properties, or sc-feed is truncated, errors, is denied, is not collected, is not configured, or lacks a required field. sc-scanners has the same effects except that truncation leaves the fact unchanged for the Security Center finding, matching the documented compatibility behavior. Finding previews and exported samples never establish source cardinality.",
   },
-  { id: "TENABLE-08", control: 8, title: "Plugin update currency", severity: "high", owner: "tenable_assess_sensor_coverage", surfaces: ["scanners", "server-properties", "sc-scanners"], predicate: "Count scanners whose plugin feed age exceeds plugin_stale_hours or whose plugin set is absent.", constants: { default_plugin_stale_hours: 24 } },
+  { id: "TENABLE-08", control: 8, title: "Plugin update currency", severity: "high", owner: "tenable_assess_sensor_coverage", surfaces: ["scanners", "server-properties", "sc-scanners"], predicate: "Count scanners whose plugin feed age exceeds plugin_stale_hours or whose plugin set is absent.", constants: { default_plugin_stale_hours: 24 }, thresholds: [batch3Threshold("TENABLE-08", "default_plugin_stale_hours", "plugin_set_age_hours", "gt", "fail", "Greatest readable plugin-set age in hours across evaluated scanners.", "threshold_hours")] },
   { id: "TENABLE-09", control: 9, title: "Network zone configuration", severity: "medium", owner: "tenable_assess_sensor_coverage", surfaces: ["networks", "scanners"], predicate: "Count network zones without an assigned readable scanner or referencing a missing scanner." },
-  { id: "TENABLE-10", control: 10, title: "User role and permission audit", severity: "high", owner: "tenable_assess_access_control", surfaces: ["users", "roles", "groups", "sc-users"], predicate: "Count active users inactive beyond inactive_user_days and administrator users above max_admins; unknown last-login fields require review.", constants: { default_inactive_user_days: 90, default_max_admins: 5 } },
+  { id: "TENABLE-10", control: 10, title: "User role and permission audit", severity: "high", owner: "tenable_assess_access_control", surfaces: ["users", "roles", "groups", "sc-users"], predicate: "Count active users inactive beyond inactive_user_days and administrator users above max_admins; unknown last-login fields require review.", constants: { default_inactive_user_days: 90, default_max_admins: 5 }, thresholds: [
+    batch3Threshold("TENABLE-10", "default_inactive_user_days", "max_observed_inactive_days", "gt", "fail", "Greatest elapsed days since last login among active users with readable timestamps.", "inactive_user_days"),
+    batch3Threshold("TENABLE-10", "default_max_admins", "length:administrators", "gt", "fail", "Uncapped active Administrator user count.", "max_admins"),
+  ] },
   {
     id: "TENABLE-11",
     control: 11,
@@ -234,10 +237,15 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "TENABLE-12", control: 12, title: "Managed credential hygiene", severity: "high", owner: "tenable_assess_access_control", surfaces: ["credentials"], predicate: "Count managed credential metadata records with no type or modification timestamp; empty readable inventory requires review." },
   { id: "TENABLE-13", control: 13, title: "Scan exclusion audit", severity: "medium", owner: "tenable_assess_scan_program", surfaces: ["exclusions"], predicate: "Count enabled permanent exclusions, broad member ranges, and exclusions without a readable justification or expiry.", emptyOutcome: "pass" },
   { id: "TENABLE-14", control: 14, title: "Vulnerability prioritization (VPR)", severity: "high", owner: "tenable_assess_vulnerability_management", surfaces: ["vuln-export", "vuln-export-status", "vuln-export-chunks"], predicate: "Count open critical or high vulnerabilities without a numeric VPR score; an export with no evaluable records requires manual review." },
-  { id: "TENABLE-15", control: 15, title: "Vulnerability SLA tracking", severity: "critical", owner: "tenable_assess_vulnerability_management", surfaces: ["vuln-export", "vuln-export-status", "vuln-export-chunks"], predicate: "Count open vulnerabilities older than the configurable severity SLA: critical, high, medium, or low days.", emptyOutcome: "pass", constants: { default_sla_critical_days: 15, default_sla_high_days: 30, default_sla_medium_days: 90, default_sla_low_days: 180 } },
-  { id: "TENABLE-16", control: 16, title: "Asset tagging strategy", severity: "medium", owner: "tenable_assess_sensor_coverage", surfaces: ["asset-export", "asset-export-status", "asset-export-chunks", "tag-categories", "tag-values"], predicate: "Compute assets carrying at least one tag divided by the complete asset export; ratios below tagged_threshold violate.", constants: { default_tagged_threshold: 0.9 } },
+  { id: "TENABLE-15", control: 15, title: "Vulnerability SLA tracking", severity: "critical", owner: "tenable_assess_vulnerability_management", surfaces: ["vuln-export", "vuln-export-status", "vuln-export-chunks"], predicate: "Count open vulnerabilities older than the configurable severity SLA: critical, high, medium, or low days.", emptyOutcome: "pass", constants: { default_sla_critical_days: 15, default_sla_high_days: 30, default_sla_medium_days: 90, default_sla_low_days: 180 }, thresholds: [
+    batch3Threshold("TENABLE-15", "default_sla_critical_days", "max_critical_age_days", "gt", "fail", "Greatest age in days among uncapped open critical findings.", "sla_critical_days"),
+    batch3Threshold("TENABLE-15", "default_sla_high_days", "max_high_age_days", "gt", "fail", "Greatest age in days among uncapped open high findings.", "sla_high_days"),
+    batch3Threshold("TENABLE-15", "default_sla_medium_days", "max_medium_age_days", "gt", "warn", "Greatest age in days among uncapped open medium findings.", "sla_medium_days"),
+    batch3Threshold("TENABLE-15", "default_sla_low_days", "max_low_age_days", "gt", "warn", "Greatest age in days among uncapped open low findings.", "sla_low_days"),
+  ] },
+  { id: "TENABLE-16", control: 16, title: "Asset tagging strategy", severity: "medium", owner: "tenable_assess_sensor_coverage", surfaces: ["asset-export", "asset-export-status", "asset-export-chunks", "tag-categories", "tag-values"], predicate: "Compute assets carrying at least one tag divided by the complete asset export; ratios below tagged_threshold violate.", constants: { default_tagged_threshold: 0.9 }, thresholds: [batch3Threshold("TENABLE-16", "default_tagged_threshold", "tagged_ratio", "lt", "fail", "Tagged assets divided by the uncapped complete exported asset population.", "threshold")] },
   { id: "TENABLE-17", control: 17, title: "Compliance audit templates", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["scan-templates", "scans", "policies"], predicate: "Count the absence of a compliance audit template and the absence of an enabled recurring scan using one." },
-  { id: "TENABLE-18", control: 18, title: "Audit log review", severity: "medium", owner: "tenable_assess_access_control", surfaces: ["audit-events"], predicate: "Count sensitive administrative events inside audit_lookback_days; an empty readable event window is review evidence, not proof that review occurs.", emptyOutcome: "warn", constants: { default_audit_lookback_days: 30 } },
+  { id: "TENABLE-18", control: 18, title: "Audit log review", severity: "medium", owner: "tenable_assess_access_control", surfaces: ["audit-events"], predicate: "Count sensitive administrative events inside audit_lookback_days; an empty readable event window is review evidence, not proof that review occurs.", emptyOutcome: "warn", constants: { default_audit_lookback_days: 30 }, thresholds: [batch3Threshold("TENABLE-18", "default_audit_lookback_days", "oldest_included_event_age_days", "gt", "warn", "Age in days of the oldest administrative event admitted to the review window.", "audit_lookback_days")] },
   {
     id: "TENABLE-19",
     control: 19,

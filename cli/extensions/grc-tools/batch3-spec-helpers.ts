@@ -54,6 +54,33 @@ export interface Batch3ThresholdDefinition {
   configuredDescription?: string;
 }
 
+export function batch3Threshold(
+  id: string,
+  constant: string,
+  evidencePath: string,
+  comparator: Batch3ThresholdDefinition["comparator"],
+  status: Batch3ThresholdDefinition["status"],
+  observedMeaning: string,
+  configuredEvidencePath?: string,
+): Batch3ThresholdDefinition {
+  const prefix = checkPrefix(id);
+  return {
+    constant,
+    observedFact: `${prefix}_${constant}_observed_value`,
+    evidencePath,
+    ...(configuredEvidencePath
+      ? {
+          configuredFact: `${prefix}_${constant}_configured_value`,
+          configuredEvidencePath,
+          configuredDescription: `${id} resolved configuration read from ${configuredEvidencePath}; null means the configured boundary was unavailable, so the declared ${constant} default is used.`,
+        }
+      : {}),
+    comparator,
+    status,
+    observedDescription: `${id} primitive from ${evidencePath}: ${observedMeaning} This value is captured before a finding status is selected; null means the named source did not expose a comparable value.`,
+  };
+}
+
 export interface Batch3FactNames {
   readable: string;
   complete: string;
@@ -105,6 +132,26 @@ export function batch3FactNames(id: string): Batch3FactNames {
 }
 
 function evidencePathValue(evidence: Readonly<Record<string, unknown>>, path: string): unknown {
+  const aggregate = /^(min|max|length):(.+)$/.exec(path);
+  if (aggregate) {
+    const [, operation, nestedPath] = aggregate;
+    const [collectionPath, ...itemSegments] = nestedPath.split(".");
+    const collection = evidencePathValue(evidence, collectionPath);
+    if (!Array.isArray(collection)) return undefined;
+    if (operation === "length") return collection.length;
+    const values = collection
+      .map((item) => {
+        let current: unknown = item;
+        for (const segment of itemSegments) {
+          if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
+          current = (current as Readonly<Record<string, unknown>>)[segment];
+        }
+        return typeof current === "number" && Number.isFinite(current) ? current : undefined;
+      })
+      .filter((value): value is number => value !== undefined);
+    if (values.length === 0) return undefined;
+    return operation === "min" ? Math.min(...values) : Math.max(...values);
+  }
   let current: unknown = evidence;
   for (const segment of path.split(".")) {
     if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
