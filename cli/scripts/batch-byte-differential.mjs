@@ -222,10 +222,31 @@ function __corpusSweep(name, args, original) {
   }
 }
 function __corpusClientMethods(client) {
+  const transportMethods = new Set([
+    "get",
+    "getByIds",
+    "getJson",
+    "getResources",
+    "getText",
+    "getTotal",
+    "getXml",
+    "listAfter",
+    "listHal",
+    "listOffset",
+    "listXml",
+    "postJson",
+    "postQps",
+    "searchQps",
+  ]);
   const methods = new Set();
   for (let value = client; value && value !== Object.prototype; value = Object.getPrototypeOf(value)) {
     for (const name of Object.getOwnPropertyNames(value)) {
-      if (name !== "constructor" && name !== "getResolvedConfig" && typeof client[name] === "function") methods.add(name);
+      if (
+        name !== "constructor"
+        && name !== "getResolvedConfig"
+        && !transportMethods.has(name)
+        && typeof client[name] === "function"
+      ) methods.add(name);
     }
   }
   return [...methods].sort();
@@ -233,7 +254,6 @@ function __corpusClientMethods(client) {
 function __corpusMutateCollection(value, mode) {
   if (Array.isArray(value)) {
     if (mode === "empty") return [];
-    if (mode === "truncated") return { items: value, truncated: true, truncationReason: "independent differential truncation", pages: 1 };
     return value;
   }
   if (!value || typeof value !== "object" || !Array.isArray(value.items)) return mode === "empty" ? {} : value;
