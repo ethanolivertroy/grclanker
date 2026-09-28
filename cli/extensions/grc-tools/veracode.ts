@@ -1907,12 +1907,22 @@ function controlId(number: number): string {
 }
 
 const VERACODE_UNCAPPED_COUNT = Symbol("veracode-uncapped-decision-count");
+const VERACODE_ALL_CHILD_LISTS_COMPLETE = Symbol("veracode-all-child-lists-complete");
 
-type DecisionSample<T> = T[] & { [VERACODE_UNCAPPED_COUNT]?: number };
+type DecisionSample<T> = T[] & {
+  [VERACODE_UNCAPPED_COUNT]?: number;
+  [VERACODE_ALL_CHILD_LISTS_COMPLETE]?: boolean;
+};
 
 function decisionSample<T>(items: readonly T[], limit: number): DecisionSample<T> {
   const sampled = items.slice(0, limit) as DecisionSample<T>;
   Object.defineProperty(sampled, VERACODE_UNCAPPED_COUNT, { value: items.length });
+  Object.defineProperty(sampled, VERACODE_ALL_CHILD_LISTS_COMPLETE, {
+    value: items.every((item) => {
+      const record = asObject(item);
+      return record?.list_complete !== false;
+    }),
+  });
   return sampled;
 }
 
@@ -1929,8 +1939,14 @@ function veracodeEvidenceComplete(id: string, evidence: JsonRecord): boolean {
     count("unreadable_applications", "unchecked_applications") === 0
     && (asNumber(evidence.applications_total) ?? inventory("applications_seen", "applications_sampled"))
       <= inventory("applications_seen", "applications_sampled");
-  const childListsComplete = (): boolean =>
-    !asRecords(evidence.per_application).some((entry) => entry.list_complete === false);
+  const childListsComplete = (): boolean => {
+    const perApplication = evidence.per_application;
+    if (Array.isArray(perApplication)) {
+      const uncapped = (perApplication as DecisionSample<unknown>)[VERACODE_ALL_CHILD_LISTS_COMPLETE];
+      if (uncapped !== undefined) return uncapped;
+    }
+    return !asRecords(perApplication).some((entry) => entry.list_complete === false);
+  };
   switch (id) {
     case "VERACODE-01":
     case "VERACODE-02":
