@@ -109,6 +109,11 @@ export interface VerdictRule {
   note?: string;
 }
 
+export interface DerivedFactRule {
+  description: string;
+  condition: VerdictCondition;
+}
+
 export type VerdictOperand =
   | { kind: "value"; value: PortableValue }
   | { kind: "path"; path: string; fallback?: PortableValue }
@@ -138,6 +143,7 @@ export interface CheckContract {
   sourceSurfaceIds: readonly string[];
   evidenceFields: readonly string[];
   derivedFacts: Readonly<Record<string, string>>;
+  derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   criteria: VerdictCriteria;
 }
 
@@ -269,6 +275,22 @@ export function evaluateVerdictCriteria(criteria: VerdictCriteria, facts: Verdic
     if (evaluateVerdictCondition(rule.condition, facts)) return rule.status;
   }
   throw new Error("No verdict criterion matched the supplied facts");
+}
+
+export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFacts): EvaluatedFindingStatus {
+  const declaredRawInputs = new Set(check.evidenceFields);
+  const undeclared = Object.keys(rawFacts).filter((name) => !declaredRawInputs.has(name));
+  if (undeclared.length > 0) {
+    throw new Error(`${check.id} received undeclared decision input(s): ${undeclared.sort().join(", ")}`);
+  }
+  const facts: Record<string, unknown> = {
+    ...check.criteria.constants,
+    ...rawFacts,
+  };
+  for (const [name, derivation] of Object.entries(check.derivedFactRules ?? {})) {
+    facts[name] = evaluateVerdictCondition(derivation.condition, facts);
+  }
+  return evaluateVerdictCriteria(check.criteria, facts);
 }
 
 function pathValue(root: unknown, path: string, item: unknown): unknown {

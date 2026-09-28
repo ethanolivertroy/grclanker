@@ -17,7 +17,13 @@ import {
   SHARED_PAGINATION_STOP_KINDS,
   SHARED_REDACTION_RULES,
 } from "../dist/extensions/grc-tools/hardening/contract.js";
-import { checkContract, collectDefinedGrcTools, evaluateVerdictCriteria, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
+import {
+  checkContract,
+  collectDefinedGrcTools,
+  evaluateCheckVerdict,
+  evaluateVerdictCriteria,
+  renderVerdictCondition,
+} from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 import { redactSecrets, resolveWebexConfiguration } from "../dist/extensions/grc-tools/webex.js";
 import {
@@ -46,6 +52,53 @@ const expectedPaginationStops = [
   "missing_total",
   "rejected_next_link",
 ];
+
+test("check evaluator derives facts from declared raw evidence and rejects undeclared inputs", () => {
+  const check = {
+    id: "TEST-01",
+    controlNumbers: [1],
+    title: "Synthetic decision",
+    severity: "medium",
+    owningTool: "test",
+    sourceSurfaceIds: [],
+    evidenceFields: ["readable", "complete", "violation_count"],
+    derivedFacts: {
+      has_violation: "At least one complete-record violation exists.",
+    },
+    derivedFactRules: {
+      has_violation: {
+        description: "At least one complete-record violation exists.",
+        condition: {
+          op: "gt",
+          left: { kind: "path", path: "violation_count" },
+          right: { kind: "value", value: 0 },
+        },
+      },
+    },
+    criteria: {
+      pass: "Readable complete evidence has no violations.",
+      warn: "Evidence is partial.",
+      fail: "At least one violation exists.",
+      manual: "Evidence is unreadable.",
+      constants: {},
+      examples: [],
+      rules: [
+        { status: "fail", condition: { op: "eq", left: { kind: "path", path: "has_violation" }, right: { kind: "value", value: true } } },
+        { status: "manual", condition: { op: "ne", left: { kind: "path", path: "readable" }, right: { kind: "value", value: true } } },
+        { status: "warn", condition: { op: "ne", left: { kind: "path", path: "complete" }, right: { kind: "value", value: true } } },
+        { status: "pass", condition: { op: "always" } },
+      ],
+    },
+  };
+  assert.equal(evaluateCheckVerdict(check, { readable: true, complete: true, violation_count: 0 }), "pass");
+  assert.equal(evaluateCheckVerdict(check, { readable: true, complete: false, violation_count: 0 }), "warn");
+  assert.equal(evaluateCheckVerdict(check, { readable: false, complete: true, violation_count: 0 }), "manual");
+  assert.equal(evaluateCheckVerdict(check, { readable: false, complete: false, violation_count: 1 }), "fail");
+  assert.throws(
+    () => evaluateCheckVerdict(check, { readable: true, complete: true, violation_count: 0, selected_status: "pass" }),
+    /TEST-01 received undeclared decision input.*selected_status/,
+  );
+});
 
 test("generated integration specs are current", async () => {
   assert.deepEqual(await checkIntegrationSpecs(), []);

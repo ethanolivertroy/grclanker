@@ -193,7 +193,13 @@ function renderChecks(spec) {
   const exampleRows = spec.checks.flatMap((check) => check.criteria.examples
     .map((example) => `| \`${check.id}\` | ${example.kind} | ${escapeCell(example.input)} | ${example.expected} | ${escapeCell(example.reason)} |`));
   const derivedRows = spec.checks.flatMap((check) => Object.entries(check.derivedFacts)
-    .map(([name, derivation]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(derivation)} |`));
+    .map(([name, derivation]) => {
+      const executable = check.derivedFactRules?.[name];
+      const rendered = executable
+        ? `${derivation} Computed as: ${renderVerdictCondition(executable.condition)}.`
+        : derivation;
+      return `| \`${check.id}\` | \`${name}\` | ${escapeCell(rendered)} |`;
+    }));
   return [
     "## Checks",
     "",
@@ -432,7 +438,21 @@ export function renderSharedContract() {
 
 export function validateDecisionInputs(contract) {
   for (const check of contract.checks) {
-    const declared = new Set([...check.evidenceFields, ...Object.keys(check.derivedFacts)]);
+    const available = new Set([...check.evidenceFields, ...Object.keys(check.criteria.constants)]);
+    for (const [name, derivation] of Object.entries(check.derivedFactRules ?? {})) {
+      if (!(name in check.derivedFacts)) {
+        throw new Error(`${check.id} executable derivation ${name} has no declared derived-fact description`);
+      }
+      for (const path of verdictConditionPaths(derivation.condition)) {
+        if (path === "$" || path.startsWith("$.")) continue;
+        const root = path.split(".")[0];
+        if (!available.has(root)) {
+          throw new Error(`${check.id} derived input ${name} references undeclared or forward decision input ${root}`);
+        }
+      }
+      available.add(name);
+    }
+    const declared = new Set([...available, ...Object.keys(check.derivedFacts)]);
     for (const [index, rule] of check.criteria.rules.entries()) {
       for (const path of verdictConditionPaths(rule.condition)) {
         if (path === "$" || path.startsWith("$.")) continue;
