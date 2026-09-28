@@ -33,7 +33,7 @@ const batch = [
   [ZENDESK_SPEC, ZENDESK_RUNTIME_BEHAVIOR],
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
-const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|ZD)-/.test(check.id);
+const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|ZD|SF)-/.test(check.id);
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -410,6 +410,50 @@ test("Zendesk executable rules ignore legacy status and preserve boundaries, pre
     stale_admin_count: 0,
     undated_admin_count: 0,
     complete: true,
+  }), "fail", "the complete 26-admin inventory, not a 25-item evidence sample, controls the result");
+});
+
+test("Salesforce executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+  const legacyStatus = "pass";
+  const passwordFacts = {
+    settings_readable: true,
+    required_fields_present: true,
+    gap_count: 0,
+  };
+  assert.equal(evaluateBatchCheckVerdict(SALESFORCE_SPEC, "SF-03", passwordFacts), "pass");
+  assert.equal(evaluateBatchCheckVerdict(SALESFORCE_SPEC, "SF-03", {
+    ...passwordFacts,
+    gap_count: 2,
+  }), "fail", "mutating password-policy evidence changes the verdict while the legacy status is held constant");
+  assert.equal(legacyStatus, "pass");
+  assert.equal(evaluateBatchCheckVerdict(SALESFORCE_SPEC, "SF-02", {
+    settings_readable: true,
+    required_fields_present: true,
+    timeout_minutes: 120,
+    force_logout: true,
+    lock_to_ip: true,
+  }), "pass", "session timeout passes exactly at 120 minutes");
+  assert.equal(evaluateBatchCheckVerdict(SALESFORCE_SPEC, "SF-02", {
+    settings_readable: true,
+    required_fields_present: true,
+    timeout_minutes: 121,
+    force_logout: true,
+    lock_to_ip: true,
+  }), "fail", "session timeout fails immediately above 120 minutes");
+  assert.equal(evaluateBatchCheckVerdict(SALESFORCE_SPEC, "SF-14", {
+    readable: true,
+    login_count: 26,
+    complete: false,
+    severe_anomaly: true,
+    warning_anomaly: true,
+  }), "warn", "the runtime's partial-window guard precedes sample anomaly classifications");
+  assert.equal(evaluateBatchCheckVerdict(SALESFORCE_SPEC, "SF-10", {
+    population_sane: true,
+    complete: true,
+    admin_count: 26,
+    max_admins: 25,
+    stale_admin_count: 0,
+    undated_admin_count: 0,
   }), "fail", "the complete 26-admin inventory, not a 25-item evidence sample, controls the result");
 });
 
