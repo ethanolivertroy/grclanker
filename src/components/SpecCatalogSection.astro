@@ -99,6 +99,7 @@ const categories = groupSpecsByCategory(specs);
         return;
       }
 
+      window.__announce && window.__announce('Raw spec URL copied to clipboard');
       btn.textContent = 'COPIED';
       btn.classList.add('copied');
       setTimeout(function() {
