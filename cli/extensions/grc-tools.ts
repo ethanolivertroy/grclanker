@@ -152,6 +152,12 @@ function resolveCliVersion(currentDir: string): string {
   return "0.0.0";
 }
 
+export function registerInitialPromptInputHandler(
+  pi: Pick<ExtensionAPI, "on">,
+): void {
+  pi.on("input", (event) => initialPromptInputResult(event.text, event.source));
+}
+
 export default function grcTools(pi: ExtensionAPI): void {
   const cliVersion = resolveCliVersion(import.meta.dirname);
   const localCwd = process.cwd();
@@ -169,9 +175,7 @@ export default function grcTools(pi: ExtensionAPI): void {
   const localFind = createFindTool(localCwd);
   const localGrep = createGrepTool(localCwd);
 
-  pi.on("input", (event) => {
-    return initialPromptInputResult(event.text, event.source);
-  });
+  registerInitialPromptInputHandler(pi);
 
   function getSettings() {
     if (!runtime.settings) {

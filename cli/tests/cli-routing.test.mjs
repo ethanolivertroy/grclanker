@@ -7,11 +7,11 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "@earendil-works/pi-coding-agent";
 import { runPrintMode } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/print-mode.js";
 import { CLI_HELP } from "../dist/pi/cli-help.js";
+import { registerInitialPromptInputHandler } from "../dist/extensions/grc-tools.js";
 import { routeCliInvocation } from "../dist/pi/cli-routing.js";
 import { buildCliLaunchArgs } from "../dist/pi/launch.js";
 import {
   extractInitialPrompt,
-  initialPromptInputResult,
   materializeInitialPrompt,
   serializeInitialPrompt,
 } from "../dist/pi/prompt-envelope.js";
@@ -27,7 +27,20 @@ function renderWorkflow(workflow, subject) {
   );
 }
 
-async function runRecordingPrintMode(initialMessage) {
+function registeredInitialPromptHandler() {
+  let handler;
+  registerInitialPromptInputHandler({
+    on(event, candidate) {
+      assert.equal(event, "input");
+      handler = candidate;
+      return () => {};
+    },
+  });
+  assert.equal(typeof handler, "function");
+  return handler;
+}
+
+async function runRecordingPrintMode(initialMessage, inputHandler) {
   const promptCalls = [];
   const lifecycle = [];
   const session = {
@@ -39,7 +52,7 @@ async function runRecordingPrintMode(initialMessage) {
     },
     async prompt(text) {
       lifecycle.push("prompt");
-      const result = initialPromptInputResult(text, "interactive");
+      const result = await inputHandler({ type: "input", text, source: "interactive" });
       assert.equal(result.action, "transform");
       promptCalls.push(result.text);
       await Promise.resolve();
@@ -173,7 +186,7 @@ test("initial prompt envelopes preserve literal user text and workflow precedenc
 test("serialized prompts complete in print mode before runtime disposal", async () => {
   const content = renderWorkflow("investigate", `@evidence "quoted" O'Reilly`);
   const initialMessage = serializeInitialPrompt({ kind: "workflow", content });
-  const result = await runRecordingPrintMode(initialMessage);
+  const result = await runRecordingPrintMode(initialMessage, registeredInitialPromptHandler());
 
   assert.deepEqual(result.promptCalls, [content]);
   assert.deepEqual(result.lifecycle, ["prompt", "turn-complete", "disposed"]);
