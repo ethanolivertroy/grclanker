@@ -6,7 +6,9 @@ import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2ComparePaths,
   batch2Eq,
+  batch2GenericDecisionInputs,
   batch2Gt,
   batch2Ne,
   batch2Rule,
@@ -22,6 +24,7 @@ export const CLOUDFLARE_STALE_IP_RULE_DAYS = 365;
 export const CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
 export const CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS = 30;
 export const CLOUDFLARE_REQUIRED_SECURITY_HEADERS = ["content-security-policy", "x-frame-options", "x-content-type-options", "referrer-policy"] as const;
+export const CLOUDFLARE_WEAK_IDENTITY_PROVIDER_TYPES = ["onetimepin"] as const;
 const surfaces = [
   restSurface("token-and-account", "/user/tokens/verify and /accounts/{account_id}", "Cloudflare API v4", DOCS, ["status", "expires_on", "id", "name", "settings"]),
   restSurface("members-and-tokens", "/accounts/{account_id}/{members|tokens}", "Cloudflare API v4", DOCS, ["id", "status", "roles", "policies", "expires_on", "modified_on"]),
@@ -70,19 +73,20 @@ function owner(id: string): string {
 
 const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
   "CF-IAM-03": { default_maximum_super_administrators: CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS },
+  "CF-IAM-05": { weak_identity_provider_types: CLOUDFLARE_WEAK_IDENTITY_PROVIDER_TYPES },
   "CF-ZONE-04": { minimum_hsts_max_age_seconds: CLOUDFLARE_HSTS_MIN_MAX_AGE_SECONDS },
   "CF-ZONE-10": { certificate_expiry_warning_days: CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS },
   "CF-ZONE-14": { required_security_headers: CLOUDFLARE_REQUIRED_SECURITY_HEADERS },
   "CF-TRF-04": { audit_log_lookback_days: CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS },
   "CF-TRF-05": { stale_ip_access_rule_days: CLOUDFLARE_STALE_IP_RULE_DAYS },
-} as const)[id as "CF-IAM-03" | "CF-ZONE-04" | "CF-ZONE-10" | "CF-ZONE-14" | "CF-TRF-04" | "CF-TRF-05"];
+} as const)[id as "CF-IAM-03" | "CF-IAM-05" | "CF-ZONE-04" | "CF-ZONE-10" | "CF-ZONE-14" | "CF-TRF-04" | "CF-TRF-05"];
 
 const decisionPredicate: Readonly<Record<string, string>> = {
   "CF-IAM-01": "Fail when authMethod is the legacy Global API Key; pass only when the resolved raw authentication method is token.",
   "CF-IAM-02": "Use the explicit token-verification, policy, permission-group, and resource-scope rules rendered below.",
-  "CF-IAM-03": `Fail when the complete active-member inventory contains more than ${CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS} Super Administrator roles; warn for members whose two-factor authentication field is not true.`,
+  "CF-IAM-03": `Fail when the complete active-member inventory contains more Super Administrator roles than max_super_admins. The operator option defaults to ${CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS} and is clamped to the inclusive range 0 through 100; warn for members whose two-factor authentication field is not true.`,
   "CF-IAM-04": "Fail when an Access application has no attached or reusable policy or any policy decision is bypass; pass only after both complete application and policy inventories establish coverage without bypass.",
-  "CF-IAM-05": "Fail when the complete identity-provider inventory is empty or every provider type is on the runtime weak-provider list; warn when weak providers coexist with a stronger provider.",
+  "CF-IAM-05": `Fail when the complete identity-provider inventory is empty or every lowercased provider type is ${CLOUDFLARE_WEAK_IDENTITY_PROVIDER_TYPES.join(" or ")}; warn when one of those weak types coexists with any other provider type.`,
   "CF-IAM-06": "Fail for active API tokens with no expires_on or an expires_on in the past; warn for undocumented token status or active tokens with no last_used_on.",
   "CF-ZONE-01": "For every zone, fail when the managed-firewall entry point is absent, has no enabled execute rule, or an execute rule has overrides.enabled=false.",
   "CF-ZONE-02": "For every zone, pass only for ssl=strict, warn for full or origin_pull, fail for flexible or off, and treat every other or absent value as unreadable.",
@@ -132,6 +136,26 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
           batch2Rule("pass", { op: "always" }),
         ],
       }
+    : id === "CF-IAM-03"
+      ? {
+          decisionInputs: {
+            evidence_readable: "Boolean. True only when account context and the complete account-member response were readable.",
+            evidence_complete: "Boolean. True only when member pagination exhausted without reaching a configured item cap.",
+            member_count: "Non-negative integer count of every account member returned before evidence-display slicing.",
+            super_administrator_count: "Non-negative integer count of members with at least one role name containing both `super` and `admin`, using case-insensitive substring matching.",
+            member_without_two_factor_count: "Non-negative integer count of members whose raw two_factor_authentication_enabled field is not true.",
+            maximum_super_administrator_count: `Non-negative integer max_super_admins operator option after clamping to 0 through 100; omitted or non-finite input uses ${CLOUDFLARE_DEFAULT_MAX_SUPER_ADMINS}.`,
+          },
+          decisionRules: [
+            batch2Rule("manual", batch2Ne("evidence_readable", true)),
+            batch2Rule("fail", batch2ComparePaths("gt", "super_administrator_count", "maximum_super_administrator_count")),
+            batch2Rule("warn", batch2Any(
+              batch2Ne("evidence_complete", true),
+              batch2Gt("member_without_two_factor_count", 0),
+            )),
+            batch2Rule("pass", { op: "always" }),
+          ],
+        }
     : id === "CF-TRF-06"
       ? {
           decisionInputs: {
@@ -167,6 +191,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     surfaces: sourceSurfaces,
     emptyOutcome: id === "CF-IAM-05" ? "fail" : id === "CF-TRF-05" ? "pass" : "manual",
     constants: decisionConstants(id),
+    decisionInputs: batch2GenericDecisionInputs(decisionPredicate[id]),
     ...custom,
     decision: `${decisionPredicate[id]} Across zones, evaluator counts come from these raw predicates rather than rendered per-zone statuses; a proved violation has first-match precedence and incomplete or unreadable evidence cannot pass.`,
   };

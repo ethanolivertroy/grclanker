@@ -56,6 +56,18 @@ export const batch2Rule = (status: VerdictRule["status"], condition: VerdictCond
   ...(note ? { note } : {}),
 });
 
+export function batch2GenericDecisionInputs(
+  predicate: string,
+): Readonly<Record<string, string>> {
+  return {
+    evidence_readable: "Boolean collector state. True only when every vendor response and raw field needed by this check was returned and parseable; false, null, or missing means the check cannot pass.",
+    evidence_complete: "Boolean collector state. True only when every required inventory exhausted pagination and configured collection caps; false, null, or missing means cardinality is a lower bound and cannot support pass.",
+    inventory_count: "Non-negative integer computed over the complete required vendor inventories before any evidence-display slicing. Zero retains the check-specific empty-inventory outcome; null or missing means cardinality is unknown.",
+    violation_count: `Non-negative integer computed over the complete required vendor inventories before display slicing. It counts records satisfying this exact predicate: ${predicate}`,
+    review_count: `Non-negative integer computed over the complete required vendor inventories before display slicing. It counts records satisfying the warning or manual-review branches of this exact predicate, excluding records already counted as violations: ${predicate}`,
+  };
+}
+
 function executableRules(row: Batch2CheckRow): readonly VerdictRule[] {
   if (row.decisionRules) return row.decisionRules;
   if (row.manualOnly) return [batch2Rule("manual", { op: "always" }, "The shipped runtime has no decisive read surface for this check.")];
@@ -86,15 +98,10 @@ function executableRules(row: Batch2CheckRow): readonly VerdictRule[] {
 
 export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinition[] {
   return rows.map((row) => {
-    const inputs = row.decisionInputs ?? (row.manualOnly
-      ? {}
-      : {
-          evidence_readable: "True only when every raw vendor field required by this finding was returned and is non-null.",
-          evidence_complete: "Boolean. True only when every required inventory proved exhaustion before any presentation sample was capped; null or missing means completeness was not proved and cannot support pass.",
-          inventory_count: "Non-negative integer. The complete number of source records evaluated by this finding before presentation truncation; null or missing means cardinality is unknown and cannot support pass.",
-          violation_count: "Non-negative integer. The complete count of source records that satisfy the finding-specific violation predicate stated by this check; null or missing means the predicate was not evaluated and cannot support pass.",
-          review_count: "Non-negative integer. The complete count of readable source records that satisfy the finding-specific warning predicate stated by this check; null or missing means the predicate was not evaluated and cannot support pass.",
-        });
+    if (row.decisionInputs === undefined) {
+      throw new Error(`${row.id} must declare explicit portable decision input definitions`);
+    }
+    const inputs = row.decisionInputs;
     const executable = deriveDecisionRules(row.id, executableRules(row));
     return {
       id: row.id,

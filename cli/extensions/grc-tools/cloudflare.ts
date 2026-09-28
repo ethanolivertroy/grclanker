@@ -2627,7 +2627,14 @@ export async function assessCloudflareIdentity(
     members_truncated: memberList?.truncated ?? null,
     members_without_2fa: memberList ? membersWithout2fa.length : null,
     ...(members && !members.ok ? { members_http_status: members.status ?? null, members_error: members.error } : {}),
-  }, cloudflareDecisionFacts(Boolean(accountId && memberList), memberList?.truncated !== true, memberList?.items.length ?? 0, superAdmins.length > maxSuperAdmins ? 1 : 0, membersWithout2fa.length)));
+  }, {
+    evidence_readable: Boolean(accountId && memberList),
+    evidence_complete: memberList?.truncated !== true,
+    member_count: memberList?.items.length ?? 0,
+    super_administrator_count: superAdmins.length,
+    member_without_two_factor_count: membersWithout2fa.length,
+    maximum_super_administrator_count: maxSuperAdmins,
+  }));
 
   const apps = readList(accessApps);
   const reusablePolicies = readList(accessPolicies);

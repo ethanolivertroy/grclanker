@@ -8,6 +8,7 @@ import {
   batch2Checks,
   batch2Defined,
   batch2Eq,
+  batch2GenericDecisionInputs,
   batch2Gt,
   batch2Ne,
   batch2Not,
@@ -106,7 +107,7 @@ const decisionPredicate: readonly string[] = [
   "Fail when the complete Defender inventory is empty or contains disconnected Defenders; partial Defender pagination warns.",
   "Fail when no registry scan configuration exists or an enabled registry is not covered by a vulnerability scan rule.",
   "Fail for enabled PAN-OS allow rules with any source, destination, application, or service and for disabled or shadowed security controls; warn for incomplete rule metadata.",
-  "Fail when PAN-OS zones or enabled inter-zone rules do not establish the runtime's trust-to-untrust segmentation predicate.",
+  "Fail when any enabled PAN-OS allow rule has source zone `any` or destination zone `any`. Otherwise warn unless an `intrazone-default` rule has action `deny`, an `interzone-default` rule has log-end `yes`, and every returned zone has a nonempty network.zone-protection-profile value.",
   "Fail when no enabled decryption rule applies decrypt action; warn for broad no-decrypt exceptions or incomplete profile evidence.",
   "Fail when GlobalProtect portal, gateway, tunnel, authentication-profile, or certificate-profile evidence required by the declared predicate is absent.",
   "Fail when antivirus, anti-spyware, vulnerability-protection, or security-profile-group coverage is absent from enabled security rules.",
@@ -124,7 +125,10 @@ const decisionPredicate: readonly string[] = [
 function paloaltoDecision(control: number): Partial<Pick<Batch2CheckRow, "decisionInputs" | "decisionRules" | "constants">> | undefined {
   if (control === 1) {
     return {
-      constants: { warning_margin_percentage_points: 20 },
+      constants: {
+        default_minimum_pass_rate_percent: PALOALTO_DEFAULT_MIN_COMPLIANCE_PASS_RATE,
+        warning_margin_percentage_points: 20,
+      },
       decisionInputs: {
         evidence_readable: "Boolean. True only when the Prisma compliance posture summary was readable.",
         evidence_complete: "Boolean. True only when the posture inventory was complete; false means the result is partial.",
@@ -255,6 +259,33 @@ function paloaltoDecision(control: number): Partial<Pick<Batch2CheckRow, "decisi
       ],
     };
   }
+  if (control === 13) {
+    return {
+      decisionInputs: {
+        evidence_readable: "Boolean. True only when every configured PAN-OS device returned both its zone configuration and security/default-rule policy subtrees.",
+        evidence_complete: "Boolean. True when all configured PAN-OS snapshots and required configuration subtrees were readable; PAN-OS configuration reads are not paged.",
+        zone_count: "Non-negative integer count of every returned PAN-OS zone before the evidence list is capped.",
+        any_zone_allow_rule_count: "Non-negative integer count of enabled security rules whose action is `allow` and whose source-zone list or destination-zone list contains `any`.",
+        intrazone_default_denied: "Boolean. True when a returned default security rule named `intrazone-default` has action exactly `deny`.",
+        interzone_default_logs_at_end: "Boolean. True when a returned default security rule named `interzone-default` has log-end exactly `yes`.",
+        zone_without_protection_profile_count: "Non-negative integer count of returned zones whose network.zone-protection-profile value is absent or empty.",
+      },
+      decisionRules: [
+        batch2Rule("manual", batch2Any(
+          batch2Ne("evidence_readable", true),
+          batch2Eq("zone_count", 0),
+        )),
+        batch2Rule("fail", batch2Gt("any_zone_allow_rule_count", 0)),
+        batch2Rule("warn", batch2Any(
+          batch2Ne("evidence_complete", true),
+          batch2Ne("intrazone_default_denied", true),
+          batch2Ne("interzone_default_logs_at_end", true),
+          batch2Gt("zone_without_protection_profile_count", 0),
+        )),
+        batch2Rule("pass", { op: "always" }),
+      ],
+    };
+  }
   return undefined;
 }
 
@@ -281,6 +312,7 @@ const checks = batch2Checks(titles.map((title, index) => {
       19: { default_maximum_superusers: PALOALTO_DEFAULT_MAX_SUPERUSERS },
     } as const)[control as 7 | 8 | 19],
     decisionRules,
+    decisionInputs: batch2GenericDecisionInputs(decisionPredicate[index]),
     ...paloaltoDecision(control),
     decision: `${decisionPredicate[index]} Unreadable configured-product evidence remains manual, a proved violation has first-match precedence, and partial evidence cannot pass.`,
   };

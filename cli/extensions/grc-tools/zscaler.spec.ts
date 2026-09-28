@@ -6,7 +6,9 @@ import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2ComparePaths,
   batch2Eq,
+  batch2GenericDecisionInputs,
   batch2Gt,
   batch2Ne,
   batch2Rule,
@@ -21,6 +23,8 @@ export const ZSCALER_DEFAULT_MAX_SUPER_ADMINS = 5;
 export const ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS = 30;
 export const ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS = 30;
 export const ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS = 24;
+export const ZSCALER_DEFAULT_MAX_SSL_EXEMPTIONS = 50;
+export const ZSCALER_MAX_SECURITY_ALLOWLIST_URLS = 100;
 export const ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES = ["ANONYMIZER", "OTHER_SECURITY", "ADULT_THEMES", "PORNOGRAPHY", "GAMBLING"] as const;
 export const ZSCALER_REQUIRED_ATP_FLAGS = [
   "malwareSitesBlocked", "cmdCtlServerBlocked", "cmdCtlTrafficBlocked", "knownPhishingSitesBlocked",
@@ -78,6 +82,7 @@ function owner(area: "zia_policy" | "zia_access_control" | "zpa"): string {
 
 const decisionConstants = (control: number): Batch2CheckRow["constants"] => ({
   1: { required_url_block_categories: ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES },
+  4: { default_maximum_ssl_exemptions: ZSCALER_DEFAULT_MAX_SSL_EXEMPTIONS },
   7: { default_maximum_super_administrators: ZSCALER_DEFAULT_MAX_SUPER_ADMINS },
   11: { default_stale_connector_days: ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS },
   13: { default_maximum_timeout_hours: ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS },
@@ -85,23 +90,24 @@ const decisionConstants = (control: number): Batch2CheckRow["constants"] => ({
   25: {
     required_advanced_threat_protection_flags: ZSCALER_REQUIRED_ATP_FLAGS,
     required_malware_protection_flags: ZSCALER_REQUIRED_MALWARE_FLAGS,
+    maximum_security_allowlist_urls: ZSCALER_MAX_SECURITY_ALLOWLIST_URLS,
   },
-} as const)[control as 1 | 7 | 11 | 13 | 24 | 25];
+} as const)[control as 1 | 4 | 7 | 11 | 13 | 24 | 25];
 
 const decisionPredicate: readonly string[] = [
   `Use the explicit enabled BLOCK-rule and required-category rules rendered below; required categories are ${ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES.join(", ")}.`,
   "Use the explicit default-rule, unbounded-ALLOW, full-logging, and enabled non-default rule predicates rendered below.",
   "Fail when web DLP rules or engines are empty or all rules are disabled; warn when no enabled blocking rule references a DLP engine or withoutContentInspection.",
-  "Fail when no enabled DECRYPT rule exists or an unscoped DO_NOT_DECRYPT rule exists; warn for unreadable or excessive exemptions or locations with sslScanEnabled=false.",
+  `Fail when no enabled DECRYPT rule exists or an unscoped DO_NOT_DECRYPT rule exists. Warn when the exemption list is unreadable, its count exceeds max_ssl_exemptions (default ${ZSCALER_DEFAULT_MAX_SSL_EXEMPTIONS}, clamped to 0 through 100000), or a location has sslScanEnabled=false.`,
   "Remain manual when no sandbox rule exists; fail when all rules are disabled; warn when enabled rules do not use BLOCK.",
   "Fail when any enabled ZIA administrator permits password login without readable SAML authentication evidence; warn for incomplete administrators.",
-  `Fail when enabled administrator coverage is absent or enabled Super Admin membership exceeds ${ZSCALER_DEFAULT_MAX_SUPER_ADMINS}; warn for missing role resolution, local-password access, or unreadable password-expiry settings.`,
+  `Fail when enabled administrator coverage is absent or enabled Super Admin membership exceeds max_super_admins. That option defaults to ${ZSCALER_DEFAULT_MAX_SUPER_ADMINS} and is clamped to 0 through 500; warn for missing role resolution, local-password access, or unreadable password-expiry settings.`,
   "Fail when no enabled application segment exists or a segment is wildcard-domain plus full-port-range or bypassType=ALWAYS; warn for wildcard domains, full ranges, bypass, ungrouped segments, or partial segment/group data.",
   "Fail when no enabled access ALLOW rule exists or an unconditional ALLOW rule exists; warn for ALLOW rules without identity criteria.",
   "Fail when no posture profile exists or no ALLOW access rule uses posture; warn when only a subset of ALLOW rules uses posture.",
-  `Fail when no authenticated App Connector exists; warn for disconnected, undated, older-than-${ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS}-day connectors or connector groups with fewer than two connectors.`,
+  `Fail when no authenticated App Connector exists; warn for disconnected, undated, or older-than-stale_connector_days connectors and connector groups with fewer than two connectors. stale_connector_days defaults to ${ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS} and is clamped to 1 through 3650.`,
   "Fail when no user IdP is enabled; warn for absent SCIM, unsigned SAML requests, weak ZPA administrators, absent admin IdP coverage, or partial IdP companion inventories.",
-  `Fail when no enabled timeout rule exists or reauthentication exceeds ${ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS} hours; warn for missing timeout values.`,
+  `Fail when no enabled timeout rule exists or reauthentication exceeds max_timeout_hours; warn for missing timeout values. max_timeout_hours defaults to ${ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS} and is clamped to 1 through 8760.`,
   "Fail when the audit report is not COMPLETE and NSS feeds exist but none is an enabled ADMIN_AUDIT feed; warn when no NSS feed exists.",
   "Remain manual when no trusted network exists; warn when no enabled access or forwarding rule references a TRUSTED_NETWORK condition.",
   "Remain manual when no bandwidth-control rule exists; warn when every returned rule is disabled.",
@@ -109,11 +115,11 @@ const decisionPredicate: readonly string[] = [
   "Fail when any location or sub-location lacks authentication, SSL scanning, or firewall enablement; warn when tunnel/VPN coverage or child-location collection is partial.",
   "Remain manual when no cloud-application control rule exists; warn when no enabled restrictive action covers an assessed cloud-app rule type.",
   "Fail when no non-default enabled DNS rule blocks or redirects; warn when dgaDomainsBlocked is not true.",
-  `Warn for disconnected, undated, or older-than-${ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS}-day private Service Edges; a complete empty inventory documents reliance on public edges.`,
+  `Warn for disconnected, undated, or older-than-stale_connector_days private Service Edges; the option defaults to ${ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS} and is clamped to 1 through 3650. A complete empty inventory documents reliance on public edges.`,
   "Remain manual when no forwarding rule exists; fail for an unconditional BYPASS and warn for scoped BYPASS rules.",
   "Remain manual when no emergency-access user exists; warn when any returned emergency user is active.",
-  `Fail for expired enrollment or browser-access certificates; warn for missing expiry or expiry within ${ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS} days.`,
-  `Fail when any required ATP flag (${ZSCALER_REQUIRED_ATP_FLAGS.join(", ")}) or malware flag (${ZSCALER_REQUIRED_MALWARE_FLAGS.join(", ")}) is not true; warn when unscannable files are not blocked or the allowlist is excessive.`,
+  `Fail for expired enrollment or browser-access certificates; warn for missing expiry or expiry within cert_expiry_warn_days. That option defaults to ${ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS} and is clamped to 1 through 3650 days.`,
+  `Fail when any required ATP flag (${ZSCALER_REQUIRED_ATP_FLAGS.join(", ")}) or malware flag (${ZSCALER_REQUIRED_MALWARE_FLAGS.join(", ")}) is not true; warn when blockUnscannableFiles is not true or the security whitelistUrls count exceeds ${ZSCALER_MAX_SECURITY_ALLOWLIST_URLS}.`,
 ] as const;
 
 const checks = batch2Checks(rows.map(([title, severity, area], index) => {
@@ -172,7 +178,62 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
             batch2Rule("pass", { op: "always" }),
           ],
         }
-      : {};
+      : control === 4
+        ? {
+            decisionInputs: {
+              evidence_readable: "Boolean. True only when GET /sslInspectionRules returned a readable array; unreadable companion datasets are represented separately.",
+              evidence_complete: "Boolean. For parent parity, true unless the location inventory is truncated; SSL-rule truncation is disclosed but currently does not cap pass.",
+              rule_count: "Non-negative integer count of every returned SSL inspection rule before display slicing.",
+              decrypt_rule_count: "Non-negative integer count of enabled rules whose action type is exactly `DECRYPT`.",
+              blanket_bypass_rule_count: "Non-negative integer count of enabled `DO_NOT_DECRYPT` rules with empty URL-category, cloud-application, destination-IP-group, location, user, group, and department scopes.",
+              exemptions_readable: "Boolean. True when GET /sslSettings/exemptedUrls returned a readable urls array.",
+              exemption_count: "Non-negative integer count of entries in the raw exempted URL array; null means that companion surface was unreadable.",
+              maximum_exemption_count: `Non-negative integer max_ssl_exemptions option after clamping to 0 through 100000; omitted or non-finite input uses ${ZSCALER_DEFAULT_MAX_SSL_EXEMPTIONS}.`,
+              location_without_ssl_scan_count: "Non-negative integer count of returned locations whose raw sslScanEnabled field is false; null means the location companion surface was unreadable.",
+            },
+            decisionRules: [
+              batch2Rule("manual", batch2Ne("evidence_readable", true)),
+              batch2Rule("fail", batch2Any(
+                batch2Eq("rule_count", 0),
+                batch2Eq("decrypt_rule_count", 0),
+                batch2Gt("blanket_bypass_rule_count", 0),
+              )),
+              batch2Rule("warn", batch2Any(
+                batch2Ne("exemptions_readable", true),
+                batch2ComparePaths("gt", "exemption_count", "maximum_exemption_count"),
+                batch2Gt("location_without_ssl_scan_count", 0),
+                batch2Ne("evidence_complete", true),
+              )),
+              batch2Rule("pass", { op: "always" }),
+            ],
+          }
+        : control === 25
+          ? {
+              decisionInputs: {
+                evidence_readable: "Boolean. True only when both Advanced Threat Protection and malware settings objects were readable.",
+                atp_setting_count: "Non-negative integer count of raw fields in the Advanced Threat Protection settings object.",
+                malware_setting_count: "Non-negative integer count of raw fields in the malware settings object.",
+                missing_atp_flag_count: `Count of these required fields whose raw value is not true: ${ZSCALER_REQUIRED_ATP_FLAGS.join(", ")}.`,
+                missing_malware_flag_count: `Count of these required fields whose raw value is not true: ${ZSCALER_REQUIRED_MALWARE_FLAGS.join(", ")}.`,
+                block_unscannable_files: "Boolean from malwarePolicy.blockUnscannableFiles; false or missing triggers warning when primary protection flags pass.",
+                allowlist_url_count: "Non-negative integer count of security whitelistUrls; null means the companion allowlist surface was unreadable.",
+              },
+              decisionRules: [
+                batch2Rule("manual", batch2Ne("evidence_readable", true)),
+                batch2Rule("fail", batch2Any(
+                  batch2Eq("atp_setting_count", 0),
+                  batch2Eq("malware_setting_count", 0),
+                  batch2Gt("missing_atp_flag_count", 0),
+                  batch2Gt("missing_malware_flag_count", 0),
+                )),
+                batch2Rule("warn", batch2Any(
+                  batch2Ne("block_unscannable_files", true),
+                  batch2Gt("allowlist_url_count", ZSCALER_MAX_SECURITY_ALLOWLIST_URLS),
+                )),
+                batch2Rule("pass", { op: "always" }),
+              ],
+            }
+          : {};
   return {
     id: `ZS-${String(control).padStart(2, "0")}`,
     control,
@@ -182,6 +243,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
     surfaces: [area === "zpa" ? "zpa-policy" : area === "zia_policy" ? "zia-policy" : "zia-administration"],
     emptyOutcome: "manual" as const,
     constants: decisionConstants(control),
+    decisionInputs: batch2GenericDecisionInputs(decisionPredicate[index]),
     ...custom,
     decision: `${decisionPredicate[index]} Missing product credentials and unreadable or ambiguous feature responses remain manual; a proved violation has first-match precedence. The known truncation exceptions are listed as runtime gaps rather than silently hardened.`,
   };

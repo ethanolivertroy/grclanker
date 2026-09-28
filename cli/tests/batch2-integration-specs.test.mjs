@@ -93,10 +93,67 @@ test("batch 2 executable decisions reject undeclared, missing, and null evidence
         }
         const description = check.evidenceFieldDefinitions?.[name] ?? "";
         assert.ok(description.length >= 40, `${check.id}: ${name} has a substantive portable description`);
-        assert.doesNotMatch(description, /Primitive value computed|implementation|repository|TypeScript/i, `${check.id}: ${name}`);
+        assert.doesNotMatch(
+          description,
+          /Primitive value computed|complete unsliced .* value for|evidence-derived boolean for|implementation|repository|TypeScript/i,
+          `${check.id}: ${name}`,
+        );
       }
     }
   }
+});
+
+test("batch 2 threshold metadata is exhaustive and renders immutable defaults", () => {
+  const scalarConstants = Object.fromEntries(batch.flatMap(([spec]) => spec.checks.flatMap((check) =>
+    Object.entries(check.criteria.constants)
+      .filter(([, value]) => typeof value === "number")
+      .map(([name, value]) => [`${check.id}:${name}`, value]),
+  )).sort(([left], [right]) => left.localeCompare(right)));
+  assert.deepEqual(scalarConstants, {
+    "AZURE-ID-03:warning_ratio_maximum": 0.1,
+    "AZURE-ID-04:fail_above_assignments": 10,
+    "AZURE-ID-04:maximum_global_admins": 4,
+    "AZURE-ID-04:pass_maximum_assignments": 5,
+    "AZURE-ID-05:expiring_days": 30,
+    "AZURE-ID-05:long_lived_days": 730,
+    "AZURE-ID-06:maximum_permanent_privileged_assignments": 2,
+    "AZURE-ID-08:stale_days": 90,
+    "AZURE-ID-12:expiring_days": 30,
+    "AZURE-ID-12:long_lived_days": 730,
+    "AZURE-MON-01:pass_minimum_ratio": 0.75,
+    "AZURE-MON-01:warn_minimum_ratio": 0.5,
+    "AZURE-MON-06:minimum_retention_days": 90,
+    "AZURE-SUB-01:default_maximum_owner_assignments": 2,
+    "AZURE-SUB-02:default_maximum_contributor_assignments": 5,
+    "CF-IAM-03:default_maximum_super_administrators": 2,
+    "CF-TRF-04:audit_log_lookback_days": 30,
+    "CF-TRF-05:stale_ip_access_rule_days": 365,
+    "CF-ZONE-04:minimum_hsts_max_age_seconds": 15_552_000,
+    "CF-ZONE-10:certificate_expiry_warning_days": 30,
+    "GCP-DATA-03:maximum_kms_rotation_days": 365,
+    "GCP-IAM-02:default_maximum_service_account_key_age_days": 90,
+    "GCP-LOG-04:minimum_log_retention_days": 90,
+    "OCI-GRD-04:maximum_bastion_ttl_seconds": 10_800,
+    "OCI-GRD-04:maximum_session_hours": 8,
+    "OCI-GRD-05:maximum_key_rotation_days": 365,
+    "OCI-GRD-05:minimum_aes_key_bytes": 32,
+    "OCI-GRD-05:minimum_rsa_key_bytes": 512,
+    "OCI-GRD-06:long_lived_preauthenticated_request_days": 30,
+    "OCI-IAM-01:minimum_password_length_required": 14,
+    "OCI-IAM-03:maximum_credential_age_days": 365,
+    "OCI-LOG-06:minimum_audit_retention_days": 365,
+    "PA-01:default_minimum_pass_rate_percent": 90,
+    "PA-01:warning_margin_percentage_points": 20,
+    "PA-07:maximum_critical_cves": 0,
+    "PA-08:minimum_host_compliance_rate_percent": 90,
+    "PA-19:default_maximum_superusers": 3,
+    "ZS-04:default_maximum_ssl_exemptions": 50,
+    "ZS-07:default_maximum_super_administrators": 5,
+    "ZS-11:default_stale_connector_days": 30,
+    "ZS-13:default_maximum_timeout_hours": 24,
+    "ZS-24:default_certificate_expiry_warning_days": 30,
+    "ZS-25:maximum_security_allowlist_urls": 100,
+  });
 });
 
 test("batch 2 generic decisions use complete source counts and preserve violation precedence", () => {
@@ -122,6 +179,116 @@ test("batch 2 generic decisions use complete source counts and preserve violatio
       );
       assert.equal(evaluateCheckVerdict(check, { ...complete, evidence_readable: false }), "manual", `${check.id}: denied`);
     }
+  }
+});
+
+test("portable numeric operands reject booleans and numeric strings", () => {
+  const check = checkContract(PALOALTO_SPEC, "PA-01");
+  const base = {
+    evidence_readable: true,
+    evidence_complete: true,
+    passed_resource_count: 60,
+    total_resource_count: 100,
+  };
+  assert.equal(evaluateCheckVerdict(check, { ...base, minimum_pass_rate_percent: 90 }), "fail");
+  assert.equal(evaluateCheckVerdict(check, { ...base, minimum_pass_rate_percent: "90" }), "manual");
+  assert.equal(evaluateCheckVerdict(check, { ...base, minimum_pass_rate_percent: true }), "manual");
+});
+
+test("batch 2 configurable and numeric decision boundaries execute below, equal, and above", () => {
+  const cases = [];
+  const add = (spec, id, facts, expected) => cases.push({ spec, id, facts, expected });
+  const azureBase = { readable: true, complete: true, inventory_count: 20 };
+  for (const [without_mfa_ratio, expected] of [[0.09, "warn"], [0.1, "warn"], [0.11, "fail"]]) {
+    add(AZURE_SPEC, "AZURE-ID-03", { ...azureBase, without_mfa_count: 1, without_mfa_ratio }, expected);
+  }
+  for (const [privileged_assignment_count, expected] of [[5, "pass"], [6, "warn"], [11, "fail"]]) {
+    add(AZURE_SPEC, "AZURE-ID-04", { ...azureBase, global_admin_count: 0, privileged_assignment_count }, expected);
+  }
+  for (const [permanent_privileged_count, expected] of [[0, "pass"], [2, "warn"], [3, "fail"]]) {
+    add(AZURE_SPEC, "AZURE-ID-06", { ...azureBase, eligible_assignment_count: 1, permanent_privileged_count }, expected);
+  }
+  for (const [matching_assignment_count, expected] of [[0, "pass"], [2, "warn"], [3, "fail"]]) {
+    add(AZURE_SPEC, "AZURE-SUB-01", { ...azureBase, matching_assignment_count, warn_maximum: 2 }, expected);
+  }
+  for (const [matching_assignment_count, expected] of [[0, "pass"], [5, "warn"], [6, "fail"]]) {
+    add(AZURE_SPEC, "AZURE-SUB-02", { ...azureBase, matching_assignment_count, warn_maximum: 5 }, expected);
+  }
+  for (const [score_ratio, expected] of [[0.49, "fail"], [0.5, "warn"], [0.75, "pass"]]) {
+    add(AZURE_SPEC, "AZURE-MON-01", { readable: true, maximum_score: 100, score_ratio }, expected);
+  }
+  const cloudflareBase = {
+    evidence_readable: true,
+    evidence_complete: true,
+    member_count: 10,
+    member_without_two_factor_count: 0,
+  };
+  for (const [super_administrator_count, maximum_super_administrator_count, expected] of [
+    [1, 2, "pass"], [2, 2, "pass"], [3, 2, "fail"],
+    [4, 5, "pass"], [5, 5, "pass"], [6, 5, "fail"],
+  ]) {
+    add(CLOUDFLARE_SPEC, "CF-IAM-03", {
+      ...cloudflareBase,
+      super_administrator_count,
+      maximum_super_administrator_count,
+    }, expected);
+  }
+  for (const [minimum_password_length, expected] of [[13, "fail"], [14, "pass"], [15, "pass"]]) {
+    add(OCI_SPEC, "OCI-IAM-01", {
+      evidence_readable: true,
+      minimum_password_length,
+      lowercase_required: true,
+      uppercase_required: true,
+      numeric_required: true,
+      special_required: true,
+    }, expected);
+  }
+  const paloaltoBase = {
+    evidence_readable: true,
+    evidence_complete: true,
+    panos_configured: true,
+    prisma_configured: true,
+    panos_administrator_count: 5,
+    password_complexity_disabled_device_count: 0,
+    local_password_only_administrator_count: 0,
+    prisma_system_admin_role_count: 0,
+    prisma_role_count: 1,
+  };
+  for (const [panos_superuser_count, maximum_superuser_count, expected] of [
+    [2, 3, "pass"], [3, 3, "pass"], [4, 3, "fail"],
+    [4, 5, "pass"], [5, 5, "pass"], [6, 5, "fail"],
+  ]) {
+    add(PALOALTO_SPEC, "PA-19", { ...paloaltoBase, panos_superuser_count, maximum_superuser_count }, expected);
+  }
+  const zscalerSslBase = {
+    evidence_readable: true,
+    evidence_complete: true,
+    rule_count: 2,
+    decrypt_rule_count: 1,
+    blanket_bypass_rule_count: 0,
+    exemptions_readable: true,
+    location_without_ssl_scan_count: 0,
+  };
+  for (const [exemption_count, maximum_exemption_count, expected] of [
+    [49, 50, "pass"], [50, 50, "pass"], [51, 50, "warn"],
+    [9, 10, "pass"], [10, 10, "pass"], [11, 10, "warn"],
+  ]) {
+    add(ZSCALER_SPEC, "ZS-04", { ...zscalerSslBase, exemption_count, maximum_exemption_count }, expected);
+  }
+  const zscalerBaseline = {
+    evidence_readable: true,
+    atp_setting_count: 7,
+    malware_setting_count: 5,
+    missing_atp_flag_count: 0,
+    missing_malware_flag_count: 0,
+    block_unscannable_files: true,
+  };
+  for (const [allowlist_url_count, expected] of [[99, "pass"], [100, "pass"], [101, "warn"]]) {
+    add(ZSCALER_SPEC, "ZS-25", { ...zscalerBaseline, allowlist_url_count }, expected);
+  }
+  assert.equal(cases.length, 42);
+  for (const { spec, id, facts, expected } of cases) {
+    assert.equal(evaluateCheckVerdict(checkContract(spec, id), facts), expected, `${id}: ${JSON.stringify(facts)}`);
   }
 });
 

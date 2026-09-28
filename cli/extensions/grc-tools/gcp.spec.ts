@@ -8,6 +8,7 @@ import {
   batch2Checks,
   batch2Defined,
   batch2Eq,
+  batch2GenericDecisionInputs,
   batch2Gt,
   batch2Ne,
   batch2Not,
@@ -23,6 +24,7 @@ export const GCP_MIN_LOG_RETENTION_DAYS = 90;
 export const GCP_ADMIN_PORTS = [22, 3389] as const;
 export const GCP_FLOW_LOG_UNSUPPORTED_PURPOSES = ["REGIONAL_MANAGED_PROXY", "GLOBAL_MANAGED_PROXY", "INTERNAL_HTTPS_LOAD_BALANCER", "PRIVATE_SERVICE_CONNECT", "PRIVATE_NAT"] as const;
 export const GCP_HTTP_BACKEND_PROTOCOLS = ["HTTP", "HTTPS", "HTTP2", "H2C"] as const;
+export const GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS = 90;
 const surfaces = [
   restSurface("organization", "cloudresourcemanager.googleapis.com/v1/organizations/{organization}", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/organizations/get", ["name", "displayName", "state"]),
   restSurface("projects", "cloudasset.googleapis.com/v1/{scope}:searchAllResources", "Cloud Asset Inventory", ASSET_DOCS, ["name", "displayName", "state", "project"]),
@@ -94,25 +96,22 @@ function owner(id: string): string {
 }
 
 const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
+  "GCP-IAM-02": { default_maximum_service_account_key_age_days: GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS },
   "GCP-LOG-04": { minimum_log_retention_days: GCP_MIN_LOG_RETENTION_DAYS },
   "GCP-DATA-03": { maximum_kms_rotation_days: GCP_MAX_KMS_ROTATION_DAYS },
   "GCP-NET-01": { administrative_ports: GCP_ADMIN_PORTS },
   "GCP-NET-02": { flow_log_unsupported_subnet_purposes: GCP_FLOW_LOG_UNSUPPORTED_PURPOSES },
   "GCP-NET-06": { http_backend_protocols: GCP_HTTP_BACKEND_PROTOCOLS },
-} as const)[id as "GCP-LOG-04" | "GCP-DATA-03" | "GCP-NET-01" | "GCP-NET-02" | "GCP-NET-06"];
+} as const)[id as "GCP-IAM-02" | "GCP-LOG-04" | "GCP-DATA-03" | "GCP-NET-01" | "GCP-NET-02" | "GCP-NET-06"];
 
 const orgPolicyDecision = (outcome: "fail" | "warn") => ({
   decisionInputs: {
-    evidence_readable: "Boolean. True only when the effective organization policy response was readable and its enforced state was present; null or missing means unavailable, never disabled.",
+    evidence_readable: "Boolean. True only when the effective organization policy request completed without an error; the policy object itself may be absent and is then interpreted as disabled.",
     evidence_complete: "Boolean. True only when the complete project inventory supports applying the sampled effective policy to the assessed scope; false means the scope is partial.",
-    policy_enabled: "Boolean raw interpretation of booleanPolicy.enforced or a non-empty listPolicy.allowedValues/deniedValues result from the effective policy response; null means the documented policy fields were absent.",
+    policy_enabled: "Boolean interpretation of the effective-policy object: booleanPolicy.enforced is true only when literally true; listPolicy is true for non-empty allowedValues, non-empty deniedValues, or allValues=`DENY`; absent policy, restoreDefault, absent recognized policy fields, and every other list-policy shape become false.",
   },
   decisionRules: [
-    batch2Rule("manual", batch2Any(
-      batch2Ne("evidence_readable", true),
-      batch2Not(batch2Defined("policy_enabled")),
-      batch2Eq("policy_enabled", null),
-    )),
+    batch2Rule("manual", batch2Ne("evidence_readable", true)),
     batch2Rule(outcome, batch2Eq("policy_enabled", false)),
     batch2Rule("warn", batch2Ne("evidence_complete", true)),
     batch2Rule("pass", batch2All(batch2Eq("evidence_readable", true), batch2Eq("evidence_complete", true), batch2Eq("policy_enabled", true))),
@@ -184,7 +183,7 @@ function customDecision(id: string): Partial<Pick<Batch2CheckRow, "decisionInput
 
 const decisionPredicate: Readonly<Record<string, string>> = {
   "GCP-IAM-01": "Fail for IAM bindings to owner, editor, or the runtime privileged-role set when a member is allUsers, allAuthenticatedUsers, a user, or an external principal outside the assessed organization.",
-  "GCP-IAM-02": "Fail for a USER_MANAGED service-account key with missing creation time, expired validity, or age beyond the runtime rotation baseline; complete empty key inventories pass.",
+  "GCP-IAM-02": `Fail for a USER_MANAGED service-account key with missing creation time, expired validity, or age beyond stale_days. The option defaults to ${GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS} and is clamped to 1 through 3650 days; complete empty key inventories pass.`,
   "GCP-IAM-03": "Warn when any enabled service account has a USER_MANAGED key; pass only after complete service-account and key inventories prove none.",
   "GCP-IAM-04": "Warn when an IAM member serviceAccount principal belongs to a project different from the resource project.",
   "GCP-IAM-05": "Fail when a default Compute or App Engine service account has an owner, editor, or other runtime broad role binding.",
@@ -212,7 +211,7 @@ const decisionPredicate: Readonly<Record<string, string>> = {
   "GCP-NET-02": `Fail when a subnet whose purpose is not one of ${GCP_FLOW_LOG_UNSUPPORTED_PURPOSES.join(", ")} lacks enableFlowLogs/logConfig.enable=true.`,
   "GCP-NET-03": "Warn when a subnet has privateIpGoogleAccess other than true.",
   "GCP-NET-04": "Warn when an instance has an external accessConfig or a network with private workloads lacks Cloud NAT coverage.",
-  "GCP-NET-05": "Fail when an external target HTTPS/SSL proxy has no SSL policy or uses a policy profile/minimum TLS version below the runtime secure baseline.",
+  "GCP-NET-05": "Fail when an external target HTTPS/SSL proxy has no SSL policy, when minTlsVersion is not TLS_1_2 or TLS_1_3, or when profile is not MODERN, RESTRICTED, or FIPS_202205.",
   "GCP-NET-06": `Warn when an external backend service using ${GCP_HTTP_BACKEND_PROTOCOLS.join(", ")} has no securityPolicy Cloud Armor reference.`,
 };
 
@@ -226,6 +225,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   emptyOutcome,
   violationOutcome,
   constants: decisionConstants(id),
+  decisionInputs: batch2GenericDecisionInputs(decisionPredicate[id]),
   ...customDecision(id),
   decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
 })));
