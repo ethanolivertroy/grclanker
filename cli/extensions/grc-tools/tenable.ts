@@ -2957,7 +2957,11 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-11": {
       const permissions = value("permission_count");
       if (permissions === undefined || permissions === 0) return {};
-      const complete = !partial && !statusIsIncomplete("access_groups_status") && evidence.user_groups !== null;
+      const complete = !partial
+        && evidence.access_groups_truncated !== true
+        && !statusIsIncomplete("access_groups_status")
+        && evidence.user_groups !== null
+        && evidence.caller_is_administrator === true;
       return fact(permissions, count("broad_permissions"), count("legacy_access_group_count") + (complete ? 0 : 1), complete);
     }
     case "TENABLE-12": {
@@ -4418,6 +4422,8 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
         access_groups_truncated: data.accessGroups.status === "ok" ? data.accessGroups.truncated : null,
         user_groups: countOrNull(data.groups),
       },
+      "",
+      { caller_is_administrator: callerIsAdministrator },
     ));
   }
 
