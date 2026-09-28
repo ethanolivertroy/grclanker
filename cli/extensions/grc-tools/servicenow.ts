@@ -6,6 +6,7 @@
  * is evidence-gated: unreadable, forbidden, ACL-filtered, truncated, or empty
  * inventories never produce a pass on their own.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -20,7 +21,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
-import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SERVICENOW_SPEC } from "./servicenow.spec.js";
 
@@ -1739,9 +1740,12 @@ function gatedPrincipals(principals: Record<string, unknown[] | number> | undefi
 
 function finding(controlNumber: number, evaluation: Evaluation): ServicenowFinding {
   const definition = SERVICENOW_CONTROLS[controlNumber];
-  const status = preserveRuntimeFindingStatus(SERVICENOW_SPEC, findingId(controlNumber), evaluation.status);
+  const id = findingId(controlNumber);
+  const facts = SERVICENOW_DECISION_CONTEXT.getStore()?.get(id);
+  if (!facts) throw new Error(`${id} has no runtime decision facts`);
+  const status = evaluateBatchCheckVerdict(SERVICENOW_SPEC, id, facts) as ServicenowFindingStatus;
   return {
-    id: findingId(controlNumber),
+    id,
     control: controlNumber,
     title: definition.title,
     severity: definition.severity,
@@ -1751,6 +1755,23 @@ function finding(controlNumber: number, evaluation: Evaluation): ServicenowFindi
     mappings: mappingsForControl(controlNumber),
     manualEvidence: evaluation.manualEvidence,
   };
+}
+
+const SERVICENOW_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordServicenowDecisionFacts(controlNumber: number, facts: Readonly<Record<string, unknown>>): void {
+  const id = findingId(controlNumber);
+  const store = SERVICENOW_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a ServiceNow assessment`);
+  store.set(id, facts);
+}
+
+function decisionInputsReadable(inputs: TableSnapshot[]): boolean {
+  return inputs.every((snapshot) => snapshotIssue(snapshot) === undefined);
+}
+
+function decisionInputsComplete(inputs: TableSnapshot[]): boolean {
+  return inputs.every((snapshot) => snapshotPartialNote(snapshot) === undefined);
 }
 
 /**
@@ -2096,7 +2117,7 @@ function findPolicyFlag(policy: JsonRecord, pattern: RegExp): boolean | undefine
   return undefined;
 }
 
-export function assessServicenowIdentityAccessData(data: ServicenowIdentityData): ServicenowAssessmentResult {
+function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowIdentityData): ServicenowAssessmentResult {
   const errors = [
     ...snapshotErrors("users", data.users),
     ...snapshotErrors("privileged role assignments", data.privilegedAssignments),
@@ -2127,6 +2148,17 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
   }
   const multiPrivilegedUsers = [...privilegedByUser.entries()].filter(([, roles]) => roles.size > 1);
 
+  const roleInputs = [data.roleInheritance];
+  const roleVisibilityProof = data.roleInheritanceTotal.count;
+  recordServicenowDecisionFacts(3, {
+    readable: decisionInputsReadable(roleInputs),
+    complete: decisionInputsComplete(roleInputs),
+    inventory_proven: !data.roleInheritanceTotal.error
+      && roleVisibilityProof !== undefined
+      && roleVisibilityProof > 0
+      && !visibilityUnproven(data.roleInheritance),
+    inheriting_count: data.roleInheritance.rows.length,
+  });
   const roleHierarchy = gatedFinding(3, [data.roleInheritance], "Navigate to User Administration > Roles, open admin and security_admin, and review the Contained By related list; justify every role that inherits admin or security_admin.", () => {
     const inheriting = data.roleInheritance.rows.map((row) => ({
       role: rowString(row, "role.name") ?? rowString(row, "role") ?? "unknown",
@@ -2161,6 +2193,40 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     };
   });
 
+  const userAccessInputs = [data.users, data.privilegedAssignments];
+  const decisionStaleUsers: string[] = [];
+  const decisionNeverLoggedIn: string[] = [];
+  const decisionStaleAdmins: string[] = [];
+  for (const user of users) {
+    const lastLogin = parseServicenowDate(user.last_login_time);
+    const id = rowString(user, "sys_id") ?? "";
+    if (!lastLogin) {
+      decisionNeverLoggedIn.push(userLabel(user));
+      continue;
+    }
+    if (daysBetween(data.now, lastLogin) > data.inactiveDays) {
+      decisionStaleUsers.push(userLabel(user));
+      if (elevatedUserIds.has(id)) decisionStaleAdmins.push(userLabel(user));
+    }
+  }
+  const decisionAdminsWithoutLogin = users.filter((user) =>
+    elevatedUserIds.has(rowString(user, "sys_id") ?? "")
+    && !parseServicenowDate(user.last_login_time));
+  const decisionLockedOut = users.filter((user) => rowBoolean(user, "locked_out") === true);
+  recordServicenowDecisionFacts(4, {
+    readable: decisionInputsReadable(userAccessInputs),
+    complete: decisionInputsComplete(userAccessInputs),
+    user_count: users.length,
+    admin_assignment_count: elevatedAssignments.length,
+    admin_count: elevatedUserIds.size,
+    max_admins: data.maxAdmins,
+    stale_admin_count: decisionStaleAdmins.length,
+    warning_count: decisionStaleUsers.length
+      + decisionNeverLoggedIn.length
+      + decisionAdminsWithoutLogin.length
+      + multiPrivilegedUsers.length
+      + decisionLockedOut.length,
+  });
   const userAccessReview = gatedFinding(4, [data.users, data.privilegedAssignments], `Export User Administration > Users filtered on Active = true with Last login time, and User Administration > Roles > admin > Users; review accounts with no login in ${data.inactiveDays} days and every admin assignment.`, () => {
     if (users.length === 0) {
       return {
@@ -2247,6 +2313,25 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     };
   });
 
+  const passwordInputs = [data.properties, data.passwordPolicies];
+  const decisionEnablement = readProperty(data.properties, "glide.enable.password_policy");
+  const decisionPolicies = data.passwordPolicies.rows.map((policy) => ({
+    minLength: findPolicyNumber(policy, /min.*(length|len)/i),
+    upper: findPolicyFlag(policy, /upper/i),
+    lower: findPolicyFlag(policy, /lower/i),
+    digit: findPolicyFlag(policy, /digit|numer/i),
+  }));
+  recordServicenowDecisionFacts(6, {
+    readable: decisionInputsReadable(passwordInputs),
+    complete: decisionInputsComplete(passwordInputs),
+    policy_enabled: decisionEnablement.exists ? asBoolean(decisionEnablement.value) : undefined,
+    policy_count: decisionPolicies.length,
+    minimum_fields_readable: decisionPolicies.some((policy) => policy.minLength !== undefined),
+    weak_policy_count: decisionPolicies.filter((policy) =>
+      policy.minLength !== undefined
+      && (policy.minLength < data.minPasswordLength || policy.upper === false || policy.lower === false || policy.digit === false)).length,
+    enablement_present: decisionEnablement.exists,
+  });
   const passwordPolicy = gatedFinding(6, [data.properties, data.passwordPolicies], `Open Password Policy > Password Policies > Default and Password Policy > Properties; record minimum length (expected ${data.minPasswordLength}+), character class requirements, and glide.enable.password_policy.`, () => {
     const enablement = readProperty(data.properties, "glide.enable.password_policy");
     const applyOnLogin = readProperty(data.properties, "glide.apply.password_policy.on_login");
@@ -2313,6 +2398,31 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     };
   });
 
+  const mfaInputs = [data.properties, data.users, data.privilegedAssignments, data.mfaCriteria];
+  const decisionMfaEnabled = readProperty(data.properties, "glide.authenticate.multifactor");
+  const decisionEmailOtp = readProperty(data.properties, "glide.authenticate.multifactor.email.otp.enabled");
+  const decisionAdmins = users.filter((user) => elevatedUserIds.has(rowString(user, "sys_id") ?? ""));
+  const decisionAdminsWithoutFlag = decisionAdmins.filter((user) => rowBoolean(user, "enable_multifactor_authn") !== true);
+  const decisionCriteria = data.mfaCriteria.rows.map((row) => ({
+    name: rowString(row, "name") ?? rowString(row, "sys_id") ?? "criteria",
+    active: rowBoolean(row, "active") ?? null,
+    roles: criteriaRoleNames(row),
+  }));
+  const decisionActiveRoleCriteria = decisionCriteria.filter((item) => /role/i.test(item.name) && item.active === true);
+  const decisionEnforcedRoles = new Set(decisionActiveRoleCriteria.flatMap((item) => item.roles));
+  recordServicenowDecisionFacts(7, {
+    readable: decisionInputsReadable(mfaInputs),
+    complete: decisionInputsComplete(mfaInputs),
+    properties_complete: tablesComplete([data.properties]),
+    platform_property_present: decisionMfaEnabled.exists,
+    platform_enabled: asBoolean(decisionMfaEnabled.value) === true,
+    criteria_count: decisionCriteria.length,
+    admin_count: decisionAdmins.length,
+    active_role_criteria_count: decisionActiveRoleCriteria.length,
+    role_enforced: ELEVATED_ROLE_NAMES.every((role) => decisionEnforcedRoles.has(role)),
+    user_enforced: decisionAdmins.length > 0 && decisionAdminsWithoutFlag.length === 0,
+    email_otp_enabled: decisionEmailOtp.exists && asBoolean(decisionEmailOtp.value) === true,
+  });
   const mfa = gatedFinding(7, [data.properties, data.users, data.privilegedAssignments, data.mfaCriteria], `Open Multi-factor Authentication > Multi-factor Criteria (${MFA_CRITERIA_TABLE}) and confirm the Role-based multi-factor authentication record is Active with admin and security_admin in its Multi-factor Roles list; open System Properties for glide.authenticate.multifactor and glide.authenticate.multifactor.email.otp.enabled; confirm every admin user carries enable_multifactor_authn or is covered by an MFA authentication policy.`, () => {
     const enabled = readProperty(data.properties, "glide.authenticate.multifactor");
     const emailOtp = readProperty(data.properties, "glide.authenticate.multifactor.email.otp.enabled");
@@ -2436,6 +2546,34 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     };
   });
 
+  const ssoInputs = [data.ssoProviders, data.ldapServers, data.properties, data.certificates];
+  const decisionActiveSso = data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true);
+  const decisionActiveLdap = data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true);
+  const decisionMultisso = readProperty(data.properties, "glide.authenticate.multisso.enabled");
+  const decisionRedirect = readProperty(data.properties, "glide.authenticate.sso.redirect.idp");
+  const decisionCertificates = data.certificates.rows.filter((row) => rowBoolean(row, "active") !== false);
+  let decisionExpiredCertificates = 0;
+  let decisionCertificateConcerns = 0;
+  for (const certificate of decisionCertificates) {
+    const expires = parseServicenowDate(certificate.expires);
+    if (!expires) {
+      decisionCertificateConcerns += 1;
+      continue;
+    }
+    const remaining = daysBetween(expires, data.now);
+    if (remaining < 0) decisionExpiredCertificates += 1;
+    else if (remaining <= data.certExpiryWarnDays) decisionCertificateConcerns += 1;
+  }
+  if (decisionActiveSso.length > 0 && asBoolean(decisionMultisso.value) !== true) decisionCertificateConcerns += 1;
+  if (decisionActiveSso.length > 0 && (!decisionRedirect.exists || !decisionRedirect.value)) decisionCertificateConcerns += 1;
+  recordServicenowDecisionFacts(8, {
+    readable: decisionInputsReadable(ssoInputs),
+    complete: decisionInputsComplete(ssoInputs),
+    providers_complete: tablesComplete([data.ssoProviders, data.ldapServers]),
+    provider_count: decisionActiveSso.length + decisionActiveLdap.length,
+    expired_certificate_count: decisionExpiredCertificates,
+    concern_count: decisionCertificateConcerns,
+  });
   const sso = gatedFinding(8, [data.ssoProviders, data.ldapServers, data.properties, data.certificates], "Open Multi-Provider SSO > Identity Providers and System LDAP > LDAP Servers; record active providers, certificate expiration dates, glide.authenticate.multisso.enabled, and the default redirect IdP.", () => {
     const activeSso = data.ssoProviders.rows.filter((row) => rowBoolean(row, "active") === true);
     const activeLdap = data.ldapServers.rows.filter((row) => rowBoolean(row, "active") === true);
@@ -2503,6 +2641,18 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
     };
   });
 
+  const integrationInputs = [data.users, data.privilegedAssignments, data.oauthEntities];
+  const decisionIntegrationUsers = users.filter(isIntegrationUser);
+  const decisionAdminIntegrations = assignments.filter((row) =>
+    assignmentIsIntegration(row) && ELEVATED_ROLE_NAMES.includes(rowString(row, "role.name") ?? ""));
+  const decisionPrivilegedIntegrations = assignments.filter(assignmentIsIntegration);
+  recordServicenowDecisionFacts(14, {
+    readable: decisionInputsReadable(integrationInputs),
+    complete: decisionInputsComplete(integrationInputs),
+    integration_user_count: decisionIntegrationUsers.length,
+    admin_integration_count: decisionAdminIntegrations.length,
+    privileged_assignment_count: decisionPrivilegedIntegrations.length,
+  });
   const integrationUsers = gatedFinding(14, [data.users, data.privilegedAssignments, data.oauthEntities], "List User Administration > Users with Web service access only = true or Internal Integration User = true, and System OAuth > Application Registry; confirm each integration account holds only the roles its integration needs and none hold admin.", () => {
     const integration = users.filter(isIntegrationUser);
     const integrationWithAdmin = assignments.filter((row) => assignmentIsIntegration(row) && ELEVATED_ROLE_NAMES.includes(rowString(row, "role.name") ?? "")).map(userLabel);
@@ -2589,6 +2739,10 @@ export function assessServicenowIdentityAccessData(data: ServicenowIdentityData)
   };
 }
 
+export function assessServicenowIdentityAccessData(data: ServicenowIdentityData): ServicenowAssessmentResult {
+  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowIdentityAccessDataWithDecisionContext(data));
+}
+
 export async function assessServicenowIdentityAccess(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords" | "getNow">,
   options: ServicenowIdentityOptions = {},
@@ -2668,7 +2822,7 @@ function classifyEmailConnectionSecurity(row: JsonRecord): EmailAccountSecurity 
   return { name, connection_security: null, level: "unknown", source: "not_returned" };
 }
 
-export function assessServicenowPlatformHardeningData(data: ServicenowHardeningData): ServicenowAssessmentResult {
+function assessServicenowPlatformHardeningDataWithDecisionContext(data: ServicenowHardeningData): ServicenowAssessmentResult {
   const errors = [
     ...snapshotErrors("hardening properties", data.properties),
     ...snapshotErrors("debug properties", data.debugProperties),
@@ -2678,9 +2832,30 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     ...snapshotErrors("email accounts", data.emailAccounts),
   ];
 
+  const instanceSecurityInputs = [data.properties];
+  const instanceSecurityChecks = checkProperties(data.properties, INSTANCE_SECURITY_PROPERTIES);
+  recordServicenowDecisionFacts(1, {
+    readable: decisionInputsReadable(instanceSecurityInputs),
+    complete: decisionInputsComplete(instanceSecurityInputs),
+    noncompliant_count: instanceSecurityChecks.filter((item) => item.compliant === false).length,
+    absent_count: instanceSecurityChecks.filter((item) => !item.exists).length,
+  });
   const instanceSecurity = gatedFinding(1, [data.properties], "Open System Properties > Security (or the Instance Security Center hardening view) and record glide.security.use_csrf_token, glide.security.csrf.strict.validation.mode, glide.security.file.mime_type.validation, glide.security.diag_txns_acl, and glide.security.strict.user_image_upload.", () =>
     propertyVerdict(checkProperties(data.properties, INSTANCE_SECURITY_PROPERTIES), "instance security"));
 
+  const sessionInputs = [data.properties];
+  const decisionTimeout = readProperty(data.properties, "glide.ui.session_timeout");
+  const decisionRotate = readProperty(data.properties, "glide.ui.rotate_sessions");
+  const decisionTimeoutMinutes = asNumber(decisionTimeout.value);
+  recordServicenowDecisionFacts(5, {
+    readable: decisionInputsReadable(sessionInputs),
+    complete: decisionInputsComplete(sessionInputs),
+    timeout_present: decisionTimeout.exists,
+    timeout_valid: decisionTimeoutMinutes !== undefined
+      && decisionTimeoutMinutes > 0
+      && decisionTimeoutMinutes <= data.maxSessionTimeoutMinutes,
+    rotate_disabled: decisionRotate.exists && asBoolean(decisionRotate.value) === false,
+  });
   const session = gatedFinding(5, [data.properties], `Open System Properties > UI Properties and record glide.ui.session_timeout (expected ${data.maxSessionTimeoutMinutes} minutes or less), glide.ui.rotate_sessions, and glide.ui.user_cookie.max_life_span_in_days.`, () => {
     const timeout = readProperty(data.properties, "glide.ui.session_timeout");
     const rotate = readProperty(data.properties, "glide.ui.rotate_sessions");
@@ -2721,6 +2896,15 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     };
   });
 
+  const scriptInputs = [data.properties, data.evalScripts];
+  const scriptChecks = checkProperties(data.properties, SCRIPT_RESTRICTION_PROPERTIES);
+  recordServicenowDecisionFacts(12, {
+    readable: decisionInputsReadable(scriptInputs),
+    complete: decisionInputsComplete(scriptInputs),
+    noncompliant_count: scriptChecks.filter((item) => item.compliant === false).length,
+    absent_count: scriptChecks.filter((item) => !item.exists).length,
+    eval_rule_count: data.evalScripts.rows.length,
+  });
   const scripts = gatedFinding(12, [data.properties, data.evalScripts], "Open System Properties > Security and record glide.script.use.sandbox, glide.script.allow.ajaxevaluate, glide.script.secure.ajaxgliderecord, and glide.script.ccsi.ispublic; search System Definition > Business Rules for eval( usage.", () => {
     const verdict = propertyVerdict(checkProperties(data.properties, SCRIPT_RESTRICTION_PROPERTIES), "script restriction");
     const evalRules = data.evalScripts.rows.map((row) => `${rowString(row, "name") ?? rowString(row, "sys_id") ?? "rule"} (${rowString(row, "collection") ?? "table"})`);
@@ -2735,9 +2919,24 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     return { ...verdict, summary: `${verdict.summary} No active business rule calls eval().`, evidence };
   });
 
+  const hardeningInputs = [data.properties];
+  const hardeningChecks = checkProperties(data.properties, HARDENING_PROPERTIES);
+  recordServicenowDecisionFacts(13, {
+    readable: decisionInputsReadable(hardeningInputs),
+    complete: decisionInputsComplete(hardeningInputs),
+    noncompliant_count: hardeningChecks.filter((item) => item.compliant === false).length,
+    absent_count: hardeningChecks.filter((item) => !item.exists).length,
+  });
   const hardening = gatedFinding(13, [data.properties], "Open System Properties > Security and the Instance Security Center hardening view; record the strict update, strict action, HTML escaping, sanitizer, code tag, X-Frame-Options, and cookie properties.", () =>
     propertyVerdict(checkProperties(data.properties, HARDENING_PROPERTIES), "hardening"));
 
+  const debugInputs = [data.properties, data.debugProperties];
+  recordServicenowDecisionFacts(16, {
+    readable: decisionInputsReadable(debugInputs),
+    complete: decisionInputsComplete(debugInputs),
+    enabled_debug_count: data.debugProperties.rows.length,
+    hardening_property_count: data.properties.rows.length,
+  });
   const debug = gatedFinding(16, [data.properties, data.debugProperties], "Filter System Properties on name contains debug and confirm every debug property is false, then confirm no session debug is enabled for shared accounts.", () => {
     const enabledDebug = data.debugProperties.rows.map((row) => rowString(row, "name") ?? "property");
     const evidence: JsonRecord = { enabled_debug_properties: truncateList(enabledDebug), hardening_properties_visible: data.properties.rows.length };
@@ -2758,6 +2957,23 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     };
   });
 
+  const ipInputs = [data.properties, data.ipAccessRules, data.ipAuthenticatorPlugin];
+  const decisionStrict = readProperty(data.properties, "glide.ip.authenticate.strict");
+  const decisionPluginRow = data.ipAuthenticatorPlugin.rows.find((row) =>
+    rowString(row, "source") === IP_AUTHENTICATOR_PLUGIN) ?? data.ipAuthenticatorPlugin.rows[0];
+  const decisionPluginState = decisionPluginRow ? pluginActive(decisionPluginRow) : undefined;
+  const decisionActiveRules = data.ipAccessRules.rows.filter((row) => rowBoolean(row, "active") !== false);
+  recordServicenowDecisionFacts(17, {
+    readable: decisionInputsReadable(ipInputs),
+    complete: decisionInputsComplete(ipInputs),
+    plugin_present: decisionPluginRow !== undefined,
+    plugin_inventory_complete: tablesComplete([data.ipAuthenticatorPlugin]),
+    plugin_active: decisionPluginState === true,
+    active_rule_count: decisionActiveRules.length,
+    rule_inventory_complete: tablesComplete([data.ipAccessRules]),
+    table_available: data.ipAccessRules.unavailable === undefined,
+    strict_enabled: decisionStrict.exists && asBoolean(decisionStrict.value) === true,
+  });
   const ipAccess = gatedFinding(17, [data.properties, data.ipAccessRules, data.ipAuthenticatorPlugin], `Open System Definition > Plugins and confirm IP Range Based Authentication (${IP_AUTHENTICATOR_PLUGIN}) is active, then open System Security > IP Address Access Control and record the active allow and deny rules (type, direction, range) plus glide.ip.authenticate.strict.`, () => {
     const strict = readProperty(data.properties, "glide.ip.authenticate.strict");
     const pluginRow = data.ipAuthenticatorPlugin.rows.find((row) => rowString(row, "source") === IP_AUTHENTICATOR_PLUGIN) ?? data.ipAuthenticatorPlugin.rows[0];
@@ -2832,6 +3048,19 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
     };
   });
 
+  const emailInputs = [data.properties, data.emailAccounts];
+  const decisionSmtpAuth = readProperty(data.properties, "glide.smtp.auth");
+  const decisionSmtpAccounts = data.emailAccounts.rows.filter((row) =>
+    /smtp/i.test(rowString(row, "type") ?? "") && rowBoolean(row, "active") !== false);
+  const decisionClassifiedAccounts = decisionSmtpAccounts.map(classifyEmailConnectionSecurity);
+  recordServicenowDecisionFacts(18, {
+    readable: decisionInputsReadable(emailInputs),
+    smtp_account_count: decisionSmtpAccounts.length,
+    insecure_count: decisionClassifiedAccounts.filter((item) => item.level === "none").length,
+    smtp_auth_disabled: decisionSmtpAuth.exists && asBoolean(decisionSmtpAuth.value) === false,
+    unverified_count: decisionClassifiedAccounts.filter((item) => item.level === "unknown").length,
+    starttls_count: decisionClassifiedAccounts.filter((item) => item.level === "starttls").length,
+  });
   const email = gatedFinding(18, [data.properties, data.emailAccounts], "Open System Mailboxes > Administration > Email Accounts and record the Connection Security choice (SSL/TLS expected) on each active SMTP account; open Email Properties for glide.smtp.auth; record DKIM signing configuration and notification security headers.", () => {
     const smtpAuth = readProperty(data.properties, "glide.smtp.auth");
     const smtpAuthDisabled = smtpAuth.exists && asBoolean(smtpAuth.value) === false;
@@ -2914,6 +3143,10 @@ export function assessServicenowPlatformHardeningData(data: ServicenowHardeningD
   };
 }
 
+export function assessServicenowPlatformHardeningData(data: ServicenowHardeningData): ServicenowAssessmentResult {
+  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowPlatformHardeningDataWithDecisionContext(data));
+}
+
 export async function assessServicenowPlatformHardening(
   client: Pick<ServicenowReadClient, "queryTable">,
   options: ServicenowHardeningOptions = {},
@@ -2989,7 +3222,7 @@ function aclLabel(row: JsonRecord): string {
   return `${rowString(row, "name") ?? "acl"}:${rowString(row, "operation") ?? "op"}`;
 }
 
-export function assessServicenowAccessControlData(data: ServicenowAccessControlData): ServicenowAssessmentResult {
+function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAccessControlData): ServicenowAssessmentResult {
   const errors = [
     ...snapshotErrors("acls", data.acls),
     ...snapshotErrors("acl roles", data.aclRoles),
@@ -3015,6 +3248,16 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
   const wildcard = described.filter((item) => item.name === "*" || item.name.startsWith("*."));
   const unrestricted = described.filter((item) => item.unrestricted);
 
+  const completenessInputs = [data.acls, data.aclRoles, data.publicPages];
+  recordServicenowDecisionFacts(2, {
+    readable: decisionInputsReadable(completenessInputs),
+    complete: decisionInputsComplete(completenessInputs),
+    inventory_proven: !data.aclTotal.error && data.aclTotal.count !== undefined && data.aclTotal.count > 0,
+    visible_acl_count: described.length,
+    unrestricted_count: unrestricted.length,
+    wildcard_count: wildcard.length,
+    public_page_count: data.publicPages.rows.length,
+  });
   const completeness = gatedFinding(2, [data.acls, data.aclRoles, data.publicPages], "Open System Security > Access Control (ACL), filter Active = true and Type = record; review wildcard (*) rules and rules with no role, condition, or script. Open System Definition > Public Pages and justify each active page.", () => {
     const publicPages = data.publicPages.rows.map((row) => rowString(row, "page") ?? rowString(row, "sys_id") ?? "page");
     const proven = data.aclTotal.count;
@@ -3075,6 +3318,22 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
     };
   });
 
+  const tableLevelInputs = [data.acls, data.aclRoles];
+  const decisionCoverage = SENSITIVE_ACL_TABLES.map((table) => {
+    const rows = described.filter((item) => item.name === table || item.name.startsWith(`${table}.`));
+    const operations = new Set(rows.map((item) => item.operation));
+    return {
+      aclCount: rows.length,
+      missingOperationCount: ["read", "write", "delete"].filter((operation) => !operations.has(operation)).length,
+    };
+  });
+  recordServicenowDecisionFacts(11, {
+    readable: decisionInputsReadable(tableLevelInputs),
+    complete: tablesComplete(tableLevelInputs),
+    inventory_proven: !data.aclTotal.error && data.aclTotal.count !== undefined && data.aclTotal.count > 0,
+    uncovered_table_count: decisionCoverage.filter((item) => item.aclCount === 0).length,
+    operation_gap_count: decisionCoverage.filter((item) => item.aclCount > 0 && item.missingOperationCount > 0).length,
+  });
   const tableLevel = gatedFinding(11, [data.acls, data.aclRoles], `Open System Security > Access Control (ACL) and confirm read, write, and delete record ACLs with roles exist for ${SENSITIVE_ACL_TABLES.join(", ")}.`, () => {
     const proven = data.aclTotal.count;
     // Per-table "no ACL" and "missing operation" claims are absence claims; on a partial ACL read they render null.
@@ -3160,6 +3419,10 @@ export function assessServicenowAccessControlData(data: ServicenowAccessControlD
   };
 }
 
+export function assessServicenowAccessControlData(data: ServicenowAccessControlData): ServicenowAssessmentResult {
+  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowAccessControlDataWithDecisionContext(data));
+}
+
 export async function assessServicenowAccessControl(
   client: Pick<ServicenowReadClient, "queryTable" | "countRecords">,
   options: ServicenowAccessControlOptions = {},
@@ -3231,7 +3494,7 @@ function pluginActive(row: JsonRecord): boolean | undefined {
   return undefined;
 }
 
-export function assessServicenowOperationsGovernanceData(data: ServicenowOperationsData): ServicenowAssessmentResult {
+function assessServicenowOperationsGovernanceDataWithDecisionContext(data: ServicenowOperationsData): ServicenowAssessmentResult {
   const errors = [
     ...snapshotErrors("encryption contexts", data.encryptionContexts),
     ...snapshotErrors("cryptographic modules", data.cryptoModules),
@@ -3247,6 +3510,7 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     ...snapshotErrors("plugins", data.plugins),
   ];
 
+  recordServicenowDecisionFacts(9, {});
   const encryption = gatedFinding(9, [data.encryptionContexts, data.cryptoModules, data.encryptedFields], `Open Key Management Framework > Cryptographic Modules (${CRYPTO_MODULE_TABLE}), System Security > Field Encryption > Encryption Contexts (legacy), and System Definition > Dictionary filtered on Type = Encrypted Text; confirm every field holding regulated data is encrypted, and record whether Column Level Encryption Enterprise, Cloud Encryption, or Edge Encryption is licensed.`, () => {
     const contexts = data.encryptionContexts.rows.map((row) => rowString(row, "name") ?? rowString(row, "sys_id") ?? "context");
     const modules = data.cryptoModules.rows.map((row) => rowString(row, "name") ?? rowString(row, "module_name") ?? rowString(row, "sys_id") ?? "module");
@@ -3274,6 +3538,18 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     };
   });
 
+  const auditInputs = [data.auditDictionary];
+  const decisionAuditRows = new Map(data.auditDictionary.rows.map((row) => [rowString(row, "name") ?? "", row]));
+  const decisionMissingAuditRows = AUDITED_CRITICAL_TABLES.filter((table) => !decisionAuditRows.has(table));
+  const decisionUnaudited = AUDITED_CRITICAL_TABLES.filter((table) =>
+    decisionAuditRows.has(table) && rowBoolean(decisionAuditRows.get(table) ?? {}, "audit") !== true);
+  recordServicenowDecisionFacts(10, {
+    readable: decisionInputsReadable(auditInputs),
+    unaudited_count: decisionUnaudited.length,
+    missing_dictionary_count: decisionMissingAuditRows.length,
+    recent_audit_count_known: data.recentAuditCount.count !== undefined,
+    recent_audit_count: data.recentAuditCount.count,
+  });
   const audit = gatedFinding(10, [data.auditDictionary], `Open System Definition > Dictionary, filter Type = Collection, and confirm Audit is checked for ${AUDITED_CRITICAL_TABLES.join(", ")}; open System Archiving or Table Rotation to record the sys_audit retention period.`, () => {
     const rowsByTable = new Map(data.auditDictionary.rows.map((row) => [rowString(row, "name") ?? "", row]));
     const missing = AUDITED_CRITICAL_TABLES.filter((table) => !rowsByTable.has(table));
@@ -3316,6 +3592,17 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     };
   });
 
+  const updateSetInputs = [data.updateSetsInProgress, data.sensitiveUpdateXml];
+  recordServicenowDecisionFacts(15, {
+    readable: decisionInputsReadable(updateSetInputs),
+    complete: decisionInputsComplete(updateSetInputs),
+    inventory_proven: !data.updateSetTotal.error
+      && data.updateSetTotal.count !== undefined
+      && data.updateSetTotal.count > 0,
+    visibility_proven: !visibilityUnproven(data.updateSetsInProgress),
+    in_progress_count: data.updateSetsInProgress.rows.length,
+    sensitive_change_count: data.sensitiveUpdateXml.rows.length,
+  });
   const updateSets = gatedFinding(15, [data.updateSetsInProgress, data.sensitiveUpdateXml], "Open System Update Sets > Local Update Sets filtered on State = In progress and review Customer Updates for ACL, role, script, and property changes; confirm each has a change record.", () => {
     const inProgress = data.updateSetsInProgress.rows.map((row) => rowString(row, "name") ?? rowString(row, "sys_id") ?? "update set");
     const sensitive = data.sensitiveUpdateXml.rows.map((row) => `${rowString(row, "update_set.name") ?? rowString(row, "update_set") ?? "set"}: ${rowString(row, "type") ?? "type"} ${rowString(row, "target_name") ?? rowString(row, "name") ?? ""}`.trim());
@@ -3362,6 +3649,15 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     };
   });
 
+  const midServerInputs = [data.midServers, data.properties];
+  const decisionMidServers = data.midServers.rows;
+  const decisionVersionOverride = readProperty(data.properties, "mid.version.override");
+  recordServicenowDecisionFacts(19, {
+    readable: decisionInputsReadable(midServerInputs),
+    server_count: decisionMidServers.length,
+    not_validated_count: decisionMidServers.filter((row) => rowBoolean(row, "validated") !== true).length,
+    version_override_present: decisionVersionOverride.exists && Boolean(decisionVersionOverride.value),
+  });
   const midServer = gatedFinding(19, [data.midServers, data.properties], "Open MID Server > Servers and record Validated, Status, Version, mutual authentication (client certificate) configuration, and the allowed host list in config.xml; record mid.version.override in System Properties.", () => {
     const servers = data.midServers.rows;
     const override = readProperty(data.properties, "mid.version.override");
@@ -3403,6 +3699,20 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     };
   });
 
+  const pluginInputs = [data.plugins];
+  const decisionPluginRows = data.plugins.rows;
+  const decisionPluginsComplete = tablesComplete(pluginInputs);
+  const decisionRequiredPlugins = REQUIRED_SECURITY_PLUGINS.map((definition) => {
+    const match = decisionPluginRows.find((row) => definition.pattern.test(rowString(row, "name") ?? ""));
+    return { present: match !== undefined, active: match ? pluginActive(match) : undefined };
+  });
+  recordServicenowDecisionFacts(20, {
+    readable: decisionInputsReadable(pluginInputs),
+    complete: decisionPluginsComplete,
+    plugin_count: decisionPluginRows.length,
+    observed_inactive_required_count: decisionRequiredPlugins.filter((item) => item.present && item.active !== true).length,
+    missing_required_count: decisionRequiredPlugins.filter((item) => !item.present).length,
+  });
   const plugins = gatedFinding(20, [data.plugins], "Open System Definition > Plugins; confirm High Security Settings, Contextual Security: Role Management V2, and Security Jump Start are active, record Instance Security Center, Security Incident Response, GRC, and Vulnerability Response status, and review every other active plugin for necessity.", () => {
     const rows = data.plugins.rows;
     // A plugin absent from a partial sys_plugins read may sit among the unread rows, so its presence is unknown rather than false.
@@ -3487,6 +3797,10 @@ export function assessServicenowOperationsGovernanceData(data: ServicenowOperati
     findings,
     errors,
   };
+}
+
+export function assessServicenowOperationsGovernanceData(data: ServicenowOperationsData): ServicenowAssessmentResult {
+  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowOperationsGovernanceDataWithDecisionContext(data));
 }
 
 export async function assessServicenowOperationsGovernance(

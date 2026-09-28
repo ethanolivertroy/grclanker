@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const tableSurface = (id: string, table: string, fields: readonly string[]) => ({
   id,
@@ -112,16 +113,138 @@ const decisions = [
   "return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable.",
   "return fail when a complete plugin inventory is missing a required baseline security plugin or a visible required plugin is inactive, and manual when the inventory is empty, partial around a missing baseline plugin, or all required plugins are active because licensing and intended use cannot be inferred from the API.",
 ] as const;
+
+interface ServicenowExecutableDecision { inputs: Readonly<Record<string, string>>; rules: readonly VerdictRule[] }
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const cmp = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry: PortableValue): VerdictCondition => ({ op, left: path(name), right: value(entry) });
+const eq = (name: string, entry: PortableValue) => cmp("eq", name, entry);
+const ne = (name: string, entry: PortableValue) => cmp("ne", name, entry);
+const gt = (name: string, entry: PortableValue) => cmp("gt", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from complete ServiceNow table and aggregate collector state before rendered evidence arrays are capped.`]));
+const propertyDecision = (): ServicenowExecutableDecision => ({
+  inputs: input("readable", "complete", "noncompliant_count", "absent_count"),
+  rules: [rule("manual", ne("readable", true)), rule("fail", gt("noncompliant_count", 0)), rule("warn", any(gt("absent_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+});
+const manualDecision = (): ServicenowExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
+
+const SERVICENOW_EXECUTABLE_DECISIONS: Readonly<Record<string, ServicenowExecutableDecision>> = {
+  "SNOW-01": propertyDecision(),
+  "SNOW-02": {
+    inputs: input("readable", "complete", "inventory_proven", "visible_acl_count", "unrestricted_count", "wildcard_count", "public_page_count"),
+    rules: [rule("manual", any(ne("readable", true), ne("inventory_proven", true), eq("visible_acl_count", 0))), rule("fail", gt("unrestricted_count", 0)), rule("warn", any(gt("wildcard_count", 0), gt("public_page_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SNOW-03": {
+    inputs: input("readable", "complete", "inventory_proven", "inheriting_count"),
+    rules: [rule("manual", any(ne("readable", true), ne("inventory_proven", true))), rule("warn", gt("inheriting_count", 0)), rule("warn", ne("complete", true)), rule("pass", { op: "always" })],
+  },
+  "SNOW-04": {
+    inputs: input("readable", "complete", "user_count", "admin_assignment_count", "admin_count", "max_admins", "stale_admin_count", "warning_count"),
+    rules: [rule("manual", any(ne("readable", true), eq("user_count", 0), eq("admin_assignment_count", 0))), rule("fail", any({ op: "gt", left: path("admin_count"), right: path("max_admins") }, gt("stale_admin_count", 0))), rule("warn", any(gt("warning_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SNOW-05": {
+    inputs: input("readable", "complete", "timeout_present", "timeout_valid", "rotate_disabled"),
+    rules: [rule("manual", ne("readable", true)), rule("fail", all(eq("timeout_present", true), ne("timeout_valid", true))), rule("warn", any(ne("timeout_present", true), eq("rotate_disabled", true), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SNOW-06": {
+    inputs: input("readable", "complete", "policy_enabled", "policy_count", "minimum_fields_readable", "weak_policy_count", "enablement_present"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("fail", eq("policy_enabled", false)),
+      rule("manual", all(eq("policy_count", 0), ne("complete", true))),
+      rule("fail", eq("policy_count", 0)),
+      rule("manual", ne("minimum_fields_readable", true)),
+      rule("fail", gt("weak_policy_count", 0)),
+      rule("warn", any(ne("enablement_present", true), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "SNOW-07": {
+    inputs: input("readable", "complete", "properties_complete", "platform_property_present", "platform_enabled", "criteria_count", "admin_count", "active_role_criteria_count", "role_enforced", "user_enforced", "email_otp_enabled"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("manual", all(ne("platform_property_present", true), ne("properties_complete", true))),
+      rule("fail", ne("platform_enabled", true)),
+      rule("manual", any(eq("criteria_count", 0), eq("admin_count", 0))),
+      rule("fail", all(eq("active_role_criteria_count", 0), ne("user_enforced", true))),
+      rule("warn", any(eq("active_role_criteria_count", 0), all(ne("role_enforced", true), ne("user_enforced", true)), eq("email_otp_enabled", true), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "SNOW-08": {
+    inputs: input("readable", "complete", "providers_complete", "provider_count", "expired_certificate_count", "concern_count"),
+    rules: [rule("manual", ne("readable", true)), rule("manual", all(eq("provider_count", 0), ne("providers_complete", true))), rule("fail", eq("provider_count", 0)), rule("fail", gt("expired_certificate_count", 0)), rule("warn", any(gt("concern_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SNOW-09": manualDecision(),
+  "SNOW-10": {
+    inputs: input("readable", "unaudited_count", "missing_dictionary_count", "recent_audit_count_known", "recent_audit_count"),
+    rules: [rule("manual", ne("readable", true)), rule("fail", gt("unaudited_count", 0)), rule("manual", gt("missing_dictionary_count", 0)), rule("fail", all(eq("recent_audit_count_known", true), eq("recent_audit_count", 0))), rule("manual", { op: "always" })],
+  },
+  "SNOW-11": {
+    inputs: input("readable", "complete", "inventory_proven", "uncovered_table_count", "operation_gap_count"),
+    rules: [rule("manual", any(ne("readable", true), ne("inventory_proven", true))), rule("manual", all(ne("complete", true), any(gt("uncovered_table_count", 0), gt("operation_gap_count", 0)))), rule("fail", gt("uncovered_table_count", 0)), rule("warn", gt("operation_gap_count", 0)), rule("warn", ne("complete", true)), rule("pass", { op: "always" })],
+  },
+  "SNOW-12": {
+    inputs: input("readable", "complete", "noncompliant_count", "absent_count", "eval_rule_count"),
+    rules: [rule("manual", ne("readable", true)), rule("fail", any(gt("eval_rule_count", 0), gt("noncompliant_count", 0))), rule("warn", any(gt("absent_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SNOW-13": propertyDecision(),
+  "SNOW-14": {
+    inputs: input("readable", "complete", "integration_user_count", "admin_integration_count", "privileged_assignment_count"),
+    rules: [rule("manual", ne("readable", true)), rule("fail", gt("admin_integration_count", 0)), rule("manual", eq("integration_user_count", 0)), rule("warn", any(gt("privileged_assignment_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SNOW-15": {
+    inputs: input("readable", "complete", "inventory_proven", "visibility_proven", "in_progress_count", "sensitive_change_count"),
+    rules: [rule("manual", any(ne("readable", true), ne("inventory_proven", true), ne("visibility_proven", true))), rule("warn", any(gt("in_progress_count", 0), gt("sensitive_change_count", 0), ne("complete", true))), rule("pass", { op: "always" })],
+  },
+  "SNOW-16": {
+    inputs: input("readable", "complete", "enabled_debug_count", "hardening_property_count"),
+    rules: [rule("manual", ne("readable", true)), rule("fail", gt("enabled_debug_count", 0)), rule("manual", eq("hardening_property_count", 0)), rule("warn", ne("complete", true)), rule("pass", { op: "always" })],
+  },
+  "SNOW-17": {
+    inputs: input("readable", "complete", "plugin_present", "plugin_inventory_complete", "plugin_active", "active_rule_count", "rule_inventory_complete", "table_available", "strict_enabled"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("warn", all(ne("plugin_present", true), gt("active_rule_count", 0))),
+      rule("manual", all(ne("plugin_present", true), ne("plugin_inventory_complete", true))),
+      rule("fail", ne("plugin_active", true)),
+      rule("manual", ne("table_available", true)),
+      rule("manual", all(eq("active_rule_count", 0), ne("rule_inventory_complete", true))),
+      rule("fail", eq("active_rule_count", 0)),
+      rule("warn", any(ne("strict_enabled", true), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "SNOW-18": {
+    inputs: input("readable", "smtp_account_count", "insecure_count", "smtp_auth_disabled", "unverified_count", "starttls_count"),
+    rules: [rule("manual", ne("readable", true)), rule("fail", any(gt("insecure_count", 0), eq("smtp_auth_disabled", true))), rule("manual", eq("smtp_account_count", 0)), rule("manual", gt("unverified_count", 0)), rule("warn", gt("starttls_count", 0)), rule("manual", { op: "always" })],
+  },
+  "SNOW-19": {
+    inputs: input("readable", "server_count", "not_validated_count", "version_override_present"),
+    rules: [rule("manual", any(ne("readable", true), eq("server_count", 0))), rule("fail", gt("not_validated_count", 0)), rule("warn", eq("version_override_present", true)), rule("manual", { op: "always" })],
+  },
+  "SNOW-20": {
+    inputs: input("readable", "complete", "plugin_count", "observed_inactive_required_count", "missing_required_count"),
+    rules: [rule("manual", any(ne("readable", true), eq("plugin_count", 0))), rule("fail", gt("observed_inactive_required_count", 0)), rule("manual", all(gt("missing_required_count", 0), ne("complete", true))), rule("fail", gt("missing_required_count", 0)), rule("manual", { op: "always" })],
+  },
+};
+
 const checks: BatchCheckDefinition[] = titles.map((title, index) => {
   const control = index + 1;
+  const id = `SNOW-${String(control).padStart(2, "0")}`;
   return {
-    id: `SNOW-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title,
     severity: control === 7 ? "critical" : [1, 2, 3, 4, 6, 8, 10, 11, 12, 13, 14].includes(control) ? "high" : "medium",
     owner: ownerFor(control),
     surfaces: SERVICENOW_CHECK_SURFACES[control],
     evidenceFields: [...SERVICENOW_CHECK_SURFACES[control], "complete_source_counts"],
+    decisionInputs: SERVICENOW_EXECUTABLE_DECISIONS[id].inputs,
+    decisionRules: SERVICENOW_EXECUTABLE_DECISIONS[id].rules,
     decision: decisions[index],
   };
 });
