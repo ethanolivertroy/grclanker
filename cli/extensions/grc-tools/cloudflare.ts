@@ -20,6 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import {
+  evaluateBatchCheckVerdict,
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
@@ -1776,11 +1777,13 @@ function finding(
   id: string,
   title: string,
   severity: CloudflareFinding["severity"],
-  status: CloudflareFindingStatus,
+  _status: CloudflareFindingStatus,
   summary: string,
   specControl: number | undefined,
   evidence?: JsonRecord,
+  decisionFacts?: Readonly<Record<string, unknown>>,
 ): CloudflareFinding {
+  const status = evaluateBatchCheckVerdict(CLOUDFLARE_SPEC, id, decisionFacts ?? {}) as CloudflareFindingStatus;
   return {
     id,
     title,
@@ -1790,6 +1793,22 @@ function finding(
     evidence,
     mappings: specControl ? mappingsForControl(specControl) : [],
     specControl,
+  };
+}
+
+function cloudflareDecisionFacts(
+  evidenceReadable: boolean,
+  evidenceComplete: boolean,
+  inventoryCount: number,
+  violationCount: number,
+  reviewCount = 0,
+): Readonly<Record<string, unknown>> {
+  return {
+    evidence_readable: evidenceReadable,
+    evidence_complete: evidenceComplete,
+    inventory_count: inventoryCount,
+    violation_count: violationCount,
+    review_count: reviewCount,
   };
 }
 
@@ -2037,7 +2056,7 @@ function aggregateZoneVerdicts(
       zones_http_status: zonesOutcome.status ?? null,
       zones_error: zonesOutcome.error,
       ...options.extraEvidence,
-    });
+    }, cloudflareDecisionFacts(false, false, 0, 0));
   }
   const zones = zonesOutcome.value;
   const partialNote = partialInventoryNote("zone", zones);
@@ -2047,7 +2066,7 @@ function aggregateZoneVerdicts(
       zones_total: zones.totalCount ?? null,
       zone_inventory_truncated: zones.truncated,
       ...options.extraEvidence,
-    });
+    }, cloudflareDecisionFacts(true, !zones.truncated, 0, 0));
   }
 
   const nonPassing = verdicts.filter((item) => item.status !== "pass");
@@ -2071,7 +2090,13 @@ function aggregateZoneVerdicts(
     counts,
     zones: verdicts.slice(0, 50).map((item) => ({ zone: item.zone, status: item.status, detail: item.detail })),
     ...options.extraEvidence,
-  });
+  }, cloudflareDecisionFacts(
+    counts.manual === 0 || counts.fail > 0,
+    !zones.truncated,
+    zones.items.length,
+    counts.fail,
+    counts.warn,
+  ));
 }
 
 function enabledRules(ruleset: JsonRecord | null): JsonRecord[] {
@@ -2419,20 +2444,21 @@ export async function assessCloudflareIdentity(
       : "Cloudflare access is using a legacy Global API Key; move to a scoped API token.",
     12,
     { auth_method: config.authMethod },
+    cloudflareDecisionFacts(true, true, 1, config.authMethod === "token" ? 0 : 1),
   ));
 
   if (config.authMethod !== "token") {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
       "Global API Key auth has no token to verify; create a scoped read-only API token and record its permission groups manually.", 12,
-      { auth_method: config.authMethod }));
+      { auth_method: config.authMethod }, cloudflareDecisionFacts(false, false, 0, 0)));
   } else if (!verify.ok) {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
       manualReason("/user/tokens/verify", "any valid API token (verify needs no extra permission)", "the token status and permission groups from the dashboard", verify.error), 12,
-      { error: verify.error }));
+      { error: verify.error }, cloudflareDecisionFacts(false, false, 0, 0)));
   } else if (verifiedStatus !== "active") {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "fail",
       `The active API token reported status ${verifiedStatus ?? "unknown"} instead of active.`, 12,
-      { verified_status: verifiedStatus ?? null }));
+      { verified_status: verifiedStatus ?? null }, cloudflareDecisionFacts(true, true, 1, 1)));
   } else if (!tokenDetails || !tokenDetails.ok) {
     findings.push(finding("CF-IAM-02", "Current token verification and scoping", "high", "manual",
       manualReason(
@@ -2441,7 +2467,7 @@ export async function assessCloudflareIdentity(
         "the token permission groups and resource scope",
         tokenDetails && !tokenDetails.ok ? tokenDetails.error : notAttempted("getUserToken").error,
       ), 12,
-      { verified_status: verifiedStatus, token_id: verifiedId ?? null, ...(tokenDetails && !tokenDetails.ok ? { http_status: tokenDetails.status ?? null } : {}) }));
+      { verified_status: verifiedStatus, token_id: verifiedId ?? null, ...(tokenDetails && !tokenDetails.ok ? { http_status: tokenDetails.status ?? null } : {}) }, cloudflareDecisionFacts(false, false, 0, 0)));
   } else {
     const broadPolicies = policies.filter((policy) => {
       const resources = asObject(policy.resources) ?? {};
@@ -2457,7 +2483,8 @@ export async function assessCloudflareIdentity(
           ? `The active token is active but carries ${writeGroups.length} write-capable permission groups (${writeGroups.slice(0, 5).join(", ")}); audit tokens should be read-only.`
           : `The active token is active with ${permissionGroups.length} read-only permission groups across ${policies.length} policies.`,
       12,
-      { verified_status: verifiedStatus, policies: policies.length, permission_groups: permissionGroups.slice(0, 50), write_capable_groups: writeGroups.slice(0, 50), broad_resource_policies: broadPolicies.length, expires_on: asString(verified?.expires_on) ?? null }));
+      { verified_status: verifiedStatus, policies: policies.length, permission_groups: permissionGroups.slice(0, 50), write_capable_groups: writeGroups.slice(0, 50), broad_resource_policies: broadPolicies.length, expires_on: asString(verified?.expires_on) ?? null },
+      cloudflareDecisionFacts(true, true, policies.length, policies.length === 0 ? 1 : 0, writeGroups.length)));
   }
 
   const tokenSources: Array<{ label: string; outcome: ReadOutcome<CloudflarePagedList> | undefined }> = [
@@ -2531,7 +2558,7 @@ export async function assessCloudflareIdentity(
       http_status: source.outcome && !source.outcome.ok ? source.outcome.status ?? null : null,
       error: source.outcome && !source.outcome.ok ? source.outcome.error : null,
     })),
-  }));
+  }, cloudflareDecisionFacts(tokensReadable, truncatedTokenLists.length === 0 && failedTokenLists.length === 0, allTokens.length, tokensWithoutExpiry.length + expiredButActive.length, unknownStatusTokens.length)));
 
   const memberList = readList(members);
   const superAdmins = (memberList?.items ?? []).filter((member) =>
@@ -2565,7 +2592,7 @@ export async function assessCloudflareIdentity(
     members_truncated: memberList?.truncated ?? null,
     members_without_2fa: memberList ? membersWithout2fa.length : null,
     ...(members && !members.ok ? { members_http_status: members.status ?? null, members_error: members.error } : {}),
-  }));
+  }, cloudflareDecisionFacts(Boolean(accountId && memberList), memberList?.truncated !== true, memberList?.items.length ?? 0, superAdmins.length > maxSuperAdmins ? 1 : 0, membersWithout2fa.length)));
 
   const apps = readList(accessApps);
   const reusablePolicies = readList(accessPolicies);
@@ -2615,7 +2642,12 @@ export async function assessCloudflareIdentity(
     apps_without_policies: apps ? appsWithoutPolicies.slice(0, 25).map((app) => asString(app.name) ?? asString(app.id) ?? "unknown") : null,
     ...(accessApps && !accessApps.ok ? { access_apps_http_status: accessApps.status ?? null, access_apps_error: accessApps.error } : {}),
     ...(accessPolicies && !accessPolicies.ok ? { reusable_policies_http_status: accessPolicies.status ?? null, reusable_policies_error: accessPolicies.error } : {}),
-  }));
+  }, cloudflareDecisionFacts(
+    Boolean(accountId && apps && (bypassPolicies.length + appsWithoutPolicies.length > 0 || reusablePolicies)),
+    apps?.truncated !== true && reusablePolicies?.truncated !== true,
+    apps?.items.length ?? 0,
+    bypassPolicies.length + appsWithoutPolicies.length,
+  )));
 
   const idps = readList(identityProviders);
   const idpTypes = (idps?.items ?? []).map((idp) => asString(idp.type) ?? "unknown");
@@ -2644,7 +2676,7 @@ export async function assessCloudflareIdentity(
     identity_provider_types: idps ? [...new Set(idpTypes)] : null,
     identity_providers_truncated: idps?.truncated ?? null,
     ...(identityProviders && !identityProviders.ok ? { identity_providers_http_status: identityProviders.status ?? null, identity_providers_error: identityProviders.error } : {}),
-  }));
+  }, cloudflareDecisionFacts(Boolean(accountId && idps), idps?.truncated !== true, idps?.items.length ?? 0, idps && idps.items.length > 0 && weakIdpTypes.length === idpTypes.length ? weakIdpTypes.length : 0, idps && weakIdpTypes.length < idpTypes.length ? weakIdpTypes.length : 0)));
 
   // Summary counts render null, never the zero of an empty fallback, for every inventory whose read failed or never ran.
   return {
@@ -3066,7 +3098,7 @@ export async function assessCloudflareTrafficControls(
       newest_event: newest?.toISOString() ?? null,
       failed_actions: failedActions,
       truncated: auditLogs!.truncated,
-    }));
+    }, cloudflareDecisionFacts(true, !auditLogs!.truncated, auditLogs!.items.length, 0)));
   }
 
   const ipRules = readList(ipRulesOutcome);
@@ -3092,7 +3124,8 @@ export async function assessCloudflareTrafficControls(
         ? "No account-level IP access rules exist; emptiness is compliant because there are no allowlist entries to go stale."
         : `${ipRules!.items.length} IP access rules (${allowRules.length} allow, ${stale.length} unmodified for over ${STALE_IP_RULE_DAYS} days or undated, ${undocumented.length} without notes).${partial ? ` ${partial}` : ""}`,
       17,
-      { account_id: accountId, ip_access_rules: ipRules!.items.length, allow_rules: allowRules.length, stale_rules: stale.length, rules_without_notes: undocumented.length, truncated: ipRules!.truncated }));
+      { account_id: accountId, ip_access_rules: ipRules!.items.length, allow_rules: allowRules.length, stale_rules: stale.length, rules_without_notes: undocumented.length, truncated: ipRules!.truncated },
+      cloudflareDecisionFacts(true, !ipRules!.truncated, ipRules!.items.length, 0, stale.length + undocumented.length)));
   }
 
   const gatewayRules = readList(gatewayOutcome);
@@ -3107,15 +3140,15 @@ export async function assessCloudflareTrafficControls(
     if (gatewayRules!.items.length === 0) {
       const gatewayTag = gatewayAccountOutcome!.ok ? asString(gatewayAccountOutcome!.value?.gateway_tag) : undefined;
       if (gatewayTag) {
-        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `Zero Trust Gateway is provisioned for this account (gateway_tag ${gatewayTag} from /accounts/{account_id}/gateway) but no Gateway DNS or HTTP policies exist.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: gatewayTag }));
+        findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `Zero Trust Gateway is provisioned for this account (gateway_tag ${gatewayTag} from /accounts/{account_id}/gateway) but no Gateway DNS or HTTP policies exist.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: gatewayTag }, cloudflareDecisionFacts(true, true, 0, 1)));
       } else {
         findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "manual", `No Gateway rules exist and ${gatewayAccountOutcome!.ok ? "/accounts/{account_id}/gateway returned no gateway_tag" : `/accounts/{account_id}/gateway could not be read (${gatewayAccountOutcome!.error})`}. Zero Trust Gateway requires a Zero Trust subscription with the Gateway product; confirm whether Gateway is licensed and, if so, define DNS and HTTP filtering policies.`, 24, { account_id: accountId, gateway_rules: 0, gateway_tag: null }));
       }
     } else if (blocking.length === 0 || !(filters.has("dns") || filters.has("http"))) {
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }));
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", "fail", `${enabled.length} enabled Gateway rules, but none block, isolate, or override on DNS or HTTP filters.`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, filters: [...filters] }, cloudflareDecisionFacts(true, !gatewayRules!.truncated, gatewayRules!.items.length, 1)));
     } else {
       const partial = partialInventoryNote("Gateway rule", gatewayRules!);
-      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", partial ? "warn" : "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }));
+      findings.push(finding("CF-TRF-06", "Gateway SWG policies", "medium", partial ? "warn" : "pass", `${enabled.length} enabled Gateway rules (${blocking.length} blocking or isolating) across filters ${[...filters].join(", ")}.${partial ? ` ${partial}` : ""}`, 24, { account_id: accountId, gateway_rules: gatewayRules!.items.length, enabled_rules: enabled.length, blocking_rules: blocking.length, filters: [...filters] }, cloudflareDecisionFacts(true, !gatewayRules!.truncated, gatewayRules!.items.length, 0)));
     }
   }
 
