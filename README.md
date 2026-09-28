@@ -106,7 +106,7 @@ Current behavior:
 - Docker and Parallels route Pi's `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` tools, plus user `!` commands, through the selected backend.
 - `sandbox-runtime` routes `bash`, `grep`, and `find` through the sandbox and enforces the same filesystem policy for `read`, `write`, `edit`, and `ls`.
 - On `main`, `runpod-pod` copies the repo's tracked files into a pod you already own and runs the full tool surface over SSH. `modal` and `runpod-serverless` are one-shot: only `bash` runs remotely, and the file tools stay on the local workspace.
-- On `main`, `grclanker setup --compute <kind>` saves a preferred backend and `--compute <kind>` overrides it for one run.
+- On `main`, `grclanker setup --compute <kind>` saves a preferred backend. To override it for one run, put `--compute <kind>` after a workflow command or an `env smoke-test` / `env exec` subcommand, for example `grclanker investigate --compute docker` or `grclanker env smoke-test --compute host`. The flag is not accepted on its own (`grclanker --compute docker` exits with `Unknown command`), and `env doctor` and `env list` ignore it.
 - `env smoke-test` validates both file-tool behavior and backend-native search behavior.
 - The Parallels path is intentionally safer than directly reusing one of your existing VMs: grclanker prefers deploying disposable sandboxes from a dedicated Parallels template, with stopped-base cloning as a fallback, and attaches only the repo share to the sandbox it creates.
 - grclanker validates runtime readiness and only claims a backend when it can actually be used.
@@ -173,7 +173,7 @@ What `main` adds (run it from a source checkout until the next release bundle):
 
 - 241 domain tools across AWS, Azure, GCP, OCI, Cloudflare, Webex, Zoom, Ansible AAP, CMVP, KEV/EPSS, FedRAMP, SCF, OSCAL, GitHub, Google Workspace, Slack, Okta, Duo, Vanta, Box, CrowdStrike, Datadog, Elastic, KnowBe4, LaunchDarkly, MuleSoft, New Relic, PagerDuty, Palo Alto Networks, Qualys, Salesforce, ServiceNow, Snowflake, Splunk, Sumo Logic, Tenable, Veracode, Zendesk, Zscaler, and operator evidence workflows
 - `grclanker tools` to list the bundled tool inventory from the same extension registration path the agent uses, and the generated [tool catalog](https://grclanker.com/docs/tools/catalog) for the same list on the website
-- The Modal and RunPod compute backends, `grclanker env list`, and `--compute`
+- The Modal and RunPod compute backends, `grclanker env list`, and the `--compute` flag on `setup`, the workflow commands, `env smoke-test`, and `env exec`
 - The [Cursor Agent SDK](#cursor-agent-sdk-runtime) and [Flue](#run-under-flue) runtimes
 
 ## Run Under Flue
