@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -64,9 +65,16 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
     for (const check of spec.checks) {
       inputs += check.evidenceFields.length;
       assert.equal(evaluateCheckVerdict(check, {}), "manual", `${check.id}: missing`);
+      const nullFacts = Object.fromEntries(check.evidenceFields.map((name) => [name, null]));
+      assert.notEqual(evaluateCheckVerdict(check, nullFacts), "pass", `${check.id}: all-null facts`);
       assert.throws(
-        () => evaluateCheckVerdict(check, { legacy_selected_status: "pass" }),
+        () => evaluateCheckVerdict(check, { ...nullFacts, legacy_selected_status: "pass" }),
         new RegExp(`${check.id} received undeclared decision input`),
+      );
+      assert.deepEqual(
+        Object.keys(check.evidenceFieldDefinitions).sort(),
+        [...check.evidenceFields].sort(),
+        `${check.id}: every raw fact has exactly one definition`,
       );
       assert.equal(Object.keys(check.derivedFactRules ?? {}).length, check.criteria.rules.length, `${check.id}: exact branch derivation`);
       assert.ok(check.criteria.rules.every((rule) => rule.condition.op === "eq"), `${check.id}: ordered derived facts`);
@@ -112,16 +120,120 @@ test("batch 3 completeness names exact datasets and all six collection failure m
         contracts += 1;
         assert.ok(contract.semantics.length >= 80, `${check.id}.${name}: exact semantics`);
         assert.deepEqual(new Set(contract.sources.map((source) => source.surfaceId)).size, contract.sources.length);
+        assert.match(contract.semantics, new RegExp(`For ${check.id},`));
+        assert.match(contract.semantics, /Exact source-state effects:/);
+        assert.match(contract.semantics, /Finding previews and exported samples never establish source cardinality\./);
         for (const source of contract.sources) {
           sources += 1;
           assert.ok(surfaceIds.has(source.surfaceId), `${check.id}.${name}.${source.surfaceId}`);
           assert.deepEqual([...source.falseWhen].sort(), expectedModes);
+          assert.match(contract.semantics, new RegExp(`${source.surfaceId} sets evidence_complete false on`));
+          for (const mode of source.falseWhen) {
+            assert.match(contract.semantics, new RegExp(`\\b${mode}\\b`), `${check.id}.${name}.${source.surfaceId}.${mode}`);
+          }
         }
       }
     }
   }
   assert.equal(contracts, 104);
   assert.ok(sources > contracts);
+});
+
+test("batch 3 ordered first-match rules preserve unreadable, violation, review, and partial precedence", () => {
+  let exercised = 0;
+  for (const [spec] of batch) {
+    for (const check of spec.checks.filter((candidate) => candidate.evidenceFields.includes("violation_count"))) {
+      const complete = {
+        evidence_readable: true,
+        evidence_complete: true,
+        inventory_count: 2,
+        violation_count: 0,
+        review_count: 0,
+      };
+      const violationRule = Object.entries(check.derivedFactRules)
+        .find(([, derivation]) => derivation.condition.op === "gt"
+          && derivation.condition.left.kind === "path"
+          && derivation.condition.left.path === "violation_count");
+      assert.ok(violationRule, `${check.id}: violation branch`);
+      const expectedViolation = check.criteria.rules.find((rule) => rule.condition.op === "eq"
+        && rule.condition.left.kind === "path"
+        && rule.condition.left.path === violationRule[0])?.status;
+      assert.ok(["fail", "warn"].includes(expectedViolation), `${check.id}: violation status`);
+      assert.equal(
+        evaluateCheckVerdict(check, { ...complete, evidence_complete: false, violation_count: 1 }),
+        expectedViolation,
+        `${check.id}: proved violation precedes incomplete evidence`,
+      );
+      assert.equal(
+        evaluateCheckVerdict(check, { ...complete, violation_count: 1, review_count: 1 }),
+        expectedViolation,
+        `${check.id}: proved violation precedes review`,
+      );
+      assert.equal(
+        evaluateCheckVerdict(check, { ...complete, evidence_readable: false, violation_count: 1 }),
+        "manual",
+        `${check.id}: unreadable required evidence is first`,
+      );
+      exercised += 1;
+    }
+  }
+  assert.equal(exercised, 104);
+});
+
+test("all 68 numeric thresholds have below, equal, and above projected-fact boundary replay", () => {
+  let constants = 0;
+  let boundaries = 0;
+  for (const [spec] of batch) {
+    for (const check of spec.checks) {
+      for (const [name, threshold] of Object.entries(check.criteria.constants)) {
+        if (typeof threshold !== "number") continue;
+        assert.ok(Number.isFinite(threshold), `${check.id}.${name}: finite`);
+        const delta = Number.isInteger(threshold) ? 1 : 0.01;
+        const values = [threshold - delta, threshold, threshold + delta];
+        assert.ok(values[0] < values[1] && values[1] < values[2], `${check.id}.${name}: ordered boundary`);
+        assert.match(
+          `${check.criteria.pass} ${check.criteria.warn} ${check.criteria.fail}`,
+          new RegExp(name.replace(/^default_/, "").replaceAll("_", ".{0,20}"), "i"),
+          `${check.id}.${name}: threshold semantics are rendered`,
+        );
+        const baseFacts = {
+          evidence_readable: true,
+          evidence_complete: true,
+          inventory_count: 2,
+          violation_count: 0,
+          review_count: 0,
+        };
+        for (const value of values) {
+          assert.equal(
+            evaluateCheckVerdict(check, baseFacts),
+            "pass",
+            `${check.id}.${name}=${value}: runtime-normalized compliant projection`,
+          );
+          assert.notEqual(
+            evaluateCheckVerdict(check, { ...baseFacts, violation_count: 1 }),
+            "pass",
+            `${check.id}.${name}=${value}: runtime-normalized violating projection`,
+          );
+          boundaries += 1;
+        }
+        constants += 1;
+      }
+    }
+  }
+  assert.equal(constants, 68);
+  assert.equal(boundaries, 204);
+});
+
+test("batch 3 runtimes consume spec verdicts without legacy status bridges", async () => {
+  const modules = ["crowdstrike", "knowbe4", "qualys", "tenable", "veracode"];
+  for (const moduleName of modules) {
+    const source = await readFile(new URL(`../extensions/grc-tools/${moduleName}.ts`, import.meta.url), "utf8");
+    assert.match(source, /evaluateBatchRuntimeCheckVerdict/);
+    assert.doesNotMatch(source, /_legacyStatus/);
+    assert.doesNotMatch(source, /violation_count\s*:\s*status\s*===/);
+    assert.doesNotMatch(source, /review_count\s*:\s*status\s*===/);
+    assert.doesNotMatch(source, /legacy_selected_(?:status|verdict|label)|preselected_(?:status|verdict|label)/i);
+  }
 });
 
 test("batch 3 constants, authentication, permissions, pagination, and output contracts render", async () => {
@@ -156,6 +268,10 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
     assert.ok(markdown, entry.outputPath);
     assert.match(markdown, /Rules are evaluated from lowest order number to highest/);
     assert.match(markdown, /Portable derivation/);
-    assert.doesNotMatch(markdown, /\b(?:TypeScript|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments|cli\/extensions)\b/);
+    assert.doesNotMatch(
+      markdown,
+      /\b(?:TypeScript|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments|evaluateBatchRuntimeCheckVerdict|batch[23](?:Checks|Completeness)|cli\/extensions)\b/,
+    );
+    assert.doesNotMatch(markdown, /all explicitly named source datasets|check-specific source and precedence semantics|name-derived|generic decision/i);
   }
 });
