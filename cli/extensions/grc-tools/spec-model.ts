@@ -166,6 +166,7 @@ export type CompletenessFailureMode =
   | "error"
   | "denied"
   | "not-collected"
+  | "not-configured"
   | "missing-required-field";
 
 export interface CompletenessSourceContract {

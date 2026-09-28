@@ -19,7 +19,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "0ae89670cdf4ae291a326e40ecc7daaadef09de0";
+const baselineRef = "4abca89d98c1182afa3111c528a42c1cb5a3f87a";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -42,9 +42,15 @@ const testFiles = [
   "cloudflare.test.mjs",
   "paloalto.test.mjs",
   "zscaler.test.mjs",
+  "crowdstrike.test.mjs",
+  "tenable.test.mjs",
+  "qualys.test.mjs",
+  "veracode.test.mjs",
+  "knowbe4.test.mjs",
 ];
 const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
 const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
+const batch3Integrations = ["crowdstrike", "knowbe4", "qualys", "tenable", "veracode"];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -156,6 +162,8 @@ const __corpusSweepFunctions = new Set([
   "assessZoomIdentityFromSnapshot", "assessZoomCollaborationGovernanceFromSnapshot", "assessZoomMeetingSecurityFromSnapshot",
   "assessSalesforcePlatformData", "assessSalesforceIdentityData", "assessSalesforceDataProtectionData", "assessSalesforceMonitoringData",
   "assessServicenowIdentityAccessData", "assessServicenowPlatformHardeningData", "assessServicenowAccessControlData", "assessServicenowOperationsGovernanceData",
+  "assessTenableScanProgram", "assessTenableSensorCoverage", "assessTenableAccessControl", "assessTenableVulnerabilityManagement",
+  "assessKnowbe4PhishingProgram", "assessKnowbe4TrainingProgram", "assessKnowbe4UserRisk", "assessKnowbe4AccountGovernance",
 ]);
 const __corpusSweptInputs = new Set();
 function __corpusSweep(name, args, original) {
@@ -271,6 +279,53 @@ function filesUnder(root, relativePath = "") {
   }).sort();
 }
 
+function describeJsonlMismatches(expected, actual, limit = 25) {
+  let expectedStart = 0;
+  let actualStart = 0;
+  let mismatchCount = 0;
+  const descriptions = [];
+  const seenDescriptions = new Set();
+  while (expectedStart < expected.length || actualStart < actual.length) {
+    const expectedNewline = expected.indexOf(0x0a, expectedStart);
+    const actualNewline = actual.indexOf(0x0a, actualStart);
+    const expectedEnd = expectedNewline === -1 ? expected.length : expectedNewline;
+    const actualEnd = actualNewline === -1 ? actual.length : actualNewline;
+    const expectedLine = expected.subarray(expectedStart, expectedEnd);
+    const actualLine = actual.subarray(actualStart, actualEnd);
+    if (!expectedLine.equals(actualLine)) {
+      mismatchCount += 1;
+      if (descriptions.length < limit) {
+        try {
+          const expectedRecord = JSON.parse(expectedLine.toString("utf8"));
+          const actualRecord = JSON.parse(actualLine.toString("utf8"));
+          const expectedStatuses = new Map((expectedRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const actualStatuses = new Map((actualRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const statusChanges = [...new Set([...expectedStatuses.keys(), ...actualStatuses.keys()])]
+            .filter((id) => expectedStatuses.get(id) !== actualStatuses.get(id))
+            .map((id) => `${id}:${expectedStatuses.get(id) ?? "<missing>"}->${actualStatuses.get(id) ?? "<missing>"}`);
+          const description =
+            `${expectedRecord.name ?? actualRecord.name ?? "<unnamed>"}`
+            + (statusChanges.length > 0 ? ` [${statusChanges.join(", ")}]` : " [serialized evidence differs]");
+          if (!seenDescriptions.has(description)) {
+            seenDescriptions.add(description);
+            descriptions.push(description);
+          }
+        } catch {
+          if (!seenDescriptions.has("<unparseable record>")) {
+            seenDescriptions.add("<unparseable record>");
+            descriptions.push("<unparseable record>");
+          }
+        }
+      }
+    }
+    expectedStart = expectedEnd + (expectedNewline === -1 ? 0 : 1);
+    actualStart = actualEnd + (actualNewline === -1 ? 0 : 1);
+  }
+  return mismatchCount === 0
+    ? ""
+    : `\n${mismatchCount} JSONL records differ; first ${descriptions.length}: ${descriptions.join("; ")}`;
+}
+
 function compareTrees(expectedRoot, actualRoot, label) {
   const expectedPaths = filesUnder(expectedRoot);
   const actualPaths = filesUnder(actualRoot);
@@ -287,8 +342,19 @@ function compareTrees(expectedRoot, actualRoot, label) {
       const contextEnd = offset + 320;
       const mainContext = expected.subarray(contextStart, contextEnd).toString("utf8");
       const branchContext = actual.subarray(contextStart, contextEnd).toString("utf8");
+      const lineStart = path.endsWith(".jsonl") ? expected.lastIndexOf(0x0a, Math.max(0, offset - 1)) + 1 : -1;
+      const lineEnd = path.endsWith(".jsonl") ? expected.indexOf(0x0a, offset) : -1;
+      let recordName = "";
+      if (lineStart >= 0 && lineEnd > lineStart) {
+        try {
+          recordName = `, record=${JSON.parse(expected.subarray(lineStart, lineEnd).toString("utf8")).name}`;
+        } catch {
+          recordName = ", record=<unparseable>";
+        }
+      }
       throw new Error(
-        `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset})`
+        `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset}${recordName})`
+        + (path.endsWith(".jsonl") ? describeJsonlMismatches(expected, actual) : "")
         + `\nmain context: ${JSON.stringify(mainContext)}`
         + `\nbranch context: ${JSON.stringify(branchContext)}`,
       );
@@ -323,22 +389,21 @@ try {
   }
   run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
   const batchSpecificPaths = [
-    "cli/extensions/grc-tools/azure.ts",
-    "cli/extensions/grc-tools/cloudflare.ts",
-    "cli/extensions/grc-tools/gcp.ts",
-    "cli/extensions/grc-tools/oci.ts",
-    "cli/extensions/grc-tools/paloalto.ts",
-    "cli/extensions/grc-tools/zscaler.ts",
+    "cli/extensions/grc-tools/crowdstrike.ts",
+    "cli/extensions/grc-tools/tenable.ts",
+    "cli/extensions/grc-tools/qualys.ts",
+    "cli/extensions/grc-tools/veracode.ts",
+    "cli/extensions/grc-tools/knowbe4.ts",
   ];
   const batchDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", ...batchSpecificPaths], {
     cwd: repoRoot,
     stdio: "ignore",
   });
   if (batchDiff.status === 0) {
-    throw new Error(`No batch-2 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
+    throw new Error(`No batch-3 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
   }
   if (batchDiff.status !== 1) {
-    throw new Error(`Unable to inspect batch-2 diff between ${baselineSha} and ${headSha}`);
+    throw new Error(`Unable to inspect batch-3 diff between ${baselineSha} and ${headSha}`);
   }
   run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
   worktreeAdded = true;
@@ -373,7 +438,7 @@ try {
     throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
   }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
-  for (const integration of batch2Integrations) {
+  for (const integration of [...batch2Integrations, ...batch3Integrations]) {
     const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
     const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
     if (representative.equals(compliant)) {
