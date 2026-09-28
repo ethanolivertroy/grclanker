@@ -2352,7 +2352,13 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const inactive = value("inactive_users") ?? value("users_without_loaded_activity") ?? 0;
       const inactivePct = value("inactive_pct") ?? (inventory > 0 ? (inactive / inventory) * 100 : 0);
       const partial = evidence.partial_activity_data === true;
-      return fact(inventory, !partial && inactivePct > 5 ? inactive : 0, partial || inactive > 0 ? Math.max(1, inactive) : 0, !partial);
+      const noInactiveUsers = inventory > 0 && inactive === 0;
+      return fact(
+        inventory,
+        !partial && inactivePct > 5 ? inactive : 0,
+        noInactiveUsers ? 0 : partial || inactive > 0 ? Math.max(1, inactive) : 0,
+        noInactiveUsers || !partial,
+      );
     }
     case "KNOWBE4-19": {
       const rate = value("report_rate_pct");

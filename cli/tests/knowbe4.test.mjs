@@ -1216,6 +1216,17 @@ test("assessKnowbe4UserRisk passes balanced risk, full group coverage, and activ
   assert.equal(findingFor(result, 18).evidence.inactive_users, 0);
 });
 
+test("inactive-user cleanup preserves the parent pass for an empty test list with stale activity metadata", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["risk"], now: NOW });
+  snapshot.securityTests.data = [];
+  snapshot.unsampledSecurityTestIds = ["stale-test"];
+
+  const inactive = findingFor(assessKnowbe4UserRisk(snapshot, { now: NOW }), 18);
+  assert.equal(inactive.status, "pass");
+  assert.equal(inactive.evidence.partial_activity_data, true);
+  assert.equal(inactive.evidence.inactive_users, null);
+});
+
 test("assessKnowbe4UserRisk fails high risk, uncovered groups, and inactive users", async () => {
   const client = mockClient(failingFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["risk"], now: NOW });
