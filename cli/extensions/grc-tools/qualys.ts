@@ -36,6 +36,7 @@ import { errorResult, formatTable, textResult } from "./shared.js";
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
 type JsonRecord = Record<string, unknown>;
+type QualysDecisionValues = Batch3RuntimeFactValues | Readonly<Record<string, never>>;
 
 const DEFAULT_OUTPUT_DIR = "./export/qualys";
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -1955,10 +1956,10 @@ function finding(
   severity: QualysFindingSeverity,
   summary: string,
   evidence: JsonRecord = {},
-  decisionValues?: Batch3RuntimeFactValues,
+  decisionValues?: QualysDecisionValues,
 ): QualysFinding {
   const id = `QUALYS-C${String(control).padStart(2, "0")}`;
-  const decisionFacts = decisionValues
+  const decisionFacts = decisionValues && "readable" in decisionValues
     ? batch3RuntimeFacts(id, decisionValues)
     : batch3UnavailableFacts(id);
   return {
@@ -1983,7 +1984,7 @@ interface VerdictInput {
   scope: QualysViewScope;
   manualEvidence: string;
   unknownBuckets?: Record<string, number>;
-  decisionFacts?: Batch3RuntimeFactValues;
+  decisionFacts?: QualysDecisionValues;
 }
 
 function qualysDecisionFacts(inventoryCount: number, violationCount = 0, reviewCount = 0): Batch3RuntimeFactValues {
