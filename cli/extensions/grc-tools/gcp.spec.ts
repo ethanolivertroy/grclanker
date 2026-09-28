@@ -115,7 +115,7 @@ const GN = [] as const;
 export const GCP_SERVICE_ACCOUNT_KEY_AGGREGATE = {
   kind: "attempted-child-reads",
   parentSurfaceId: "service-accounts",
-  attemptedUnit: "one service-account-key list request for every service account returned by each requested project's readable service-account inventory",
+  attemptedUnit: "one service-account-key list request for every service account with a nonempty email returned by each requested project's readable service-account inventory; rows without a nonempty email issue no request and are excluded from attempted, successful, and failed counts",
   mixedFailureModes: ["error", "denied"],
   mixedFailureEffect: "false",
   allAttemptsFailedEffect: "unchanged",
@@ -138,7 +138,7 @@ function gcpCompletenessSource(checkId: string, surfaceId: string): BatchComplet
   if (surfaceId === "service-account-keys" && ["GCP-IAM-02", "GCP-IAM-03"].includes(checkId)) {
     return {
       ...source,
-      scope: "Project-scoped child aggregate over every attempted service-account key-list request.",
+      scope: "Project-scoped child aggregate over attempted service-account key-list requests only; service-account rows without a nonempty email are outside the aggregate because no key-list request is issued.",
       aggregate: GCP_SERVICE_ACCOUNT_KEY_AGGREGATE,
     };
   }
@@ -264,7 +264,7 @@ function gcpCompletenessSemantics(id: string): string {
 
 const decisionPredicate: Readonly<Record<string, string>> = {
   "GCP-IAM-01": `Fail when a binding to any of ${GCP_PRIVILEGED_IAM_ROLES.join(", ")} contains allUsers, allAuthenticatedUsers, any user: principal, or a principal whose email suffix is outside the assessed organization's primary domain.`,
-  "GCP-IAM-02": `Fail for a USER_MANAGED service-account key with missing creation time, expired validity, or age beyond stale_days. The option defaults to ${GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS} and is clamped to 1 through 3650 days; complete empty key inventories pass.`,
+  "GCP-IAM-02": `Remain manual when readable project inventories return zero service accounts because the collector interprets that successful-empty response as likely missing iam.serviceAccounts.list permission. Otherwise fail for a USER_MANAGED service-account key with missing creation time, expired validity, or age beyond stale_days. The option defaults to ${GCP_DEFAULT_SERVICE_ACCOUNT_KEY_MAX_AGE_DAYS} and is clamped to 1 through 3650 days; complete empty key inventories pass only after at least one service account was listed.`,
   "GCP-IAM-03": "Warn when any enabled service account has a USER_MANAGED key; pass only after complete service-account and key inventories prove none.",
   "GCP-IAM-04": "Warn when an IAM member serviceAccount principal belongs to a project different from the resource project.",
   "GCP-IAM-05": "Fail when a default Compute or App Engine service account has an owner, editor, or other runtime broad role binding.",
@@ -298,7 +298,13 @@ const decisionPredicate: Readonly<Record<string, string>> = {
 
 const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome, violationOutcome]) => {
   const custom = customDecision(id);
-  const decisionInputs = custom?.decisionInputs ?? batch2GenericDecisionInputs(decisionPredicate[id]);
+  const genericDecisionInputs = batch2GenericDecisionInputs(decisionPredicate[id]);
+  const decisionInputs = custom?.decisionInputs ?? (id === "GCP-IAM-02"
+    ? {
+        ...genericDecisionInputs,
+        evidence_readable: "Boolean. True only when project and service-account responses were readable and at least one service account was listed. A successful empty service-account response sets this false because the collector treats that state as likely missing iam.serviceAccounts.list permission; false, null, or missing requires manual review.",
+      }
+    : genericDecisionInputs);
   return {
     id,
     control,

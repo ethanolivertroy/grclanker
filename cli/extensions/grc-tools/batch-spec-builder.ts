@@ -532,15 +532,15 @@ function renderCompletenessSemantics(
     }
     const scope = source.scope ? ` (${source.scope})` : "";
     const aggregate = source.aggregate
-      ? ` Aggregate rule: count ${source.aggregate.attemptedUnit} under \`${source.aggregate.parentSurfaceId}\`; `
+      ? `; aggregate rule: count ${source.aggregate.attemptedUnit} under \`${source.aggregate.parentSurfaceId}\`; `
         + `${source.aggregate.mixedFailureModes.join(" or ")} makes this fact false only when at least one attempted child read succeeds and at least one fails; `
         + "if every attempted child read fails, this fact is unchanged and evidence_readable is false; "
         + "zero attempted child reads leave this fact unchanged"
       : "";
     if (source.falseWhen.length === 0) {
-      return `\`${source.surfaceId}\`${scope}: does not lower this fact for any declared failure mode.${aggregate}`;
+      return `\`${source.surfaceId}\`${scope}: does not lower this fact for any declared failure mode${aggregate}`;
     }
-    return `\`${source.surfaceId}\`${scope}: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact.${aggregate}`;
+    return `\`${source.surfaceId}\`${scope}: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact${aggregate}`;
   }).join("; ");
   return `For ${check.id}, ${contract.semantics} Exact source-state effects: ${sourceText}`;
 }

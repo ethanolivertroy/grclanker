@@ -143,6 +143,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
         assert.match(rendered, /Exact source-state effects:/);
         assert.match(rendered, new RegExp(contract.semantics.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
         assert.doesNotMatch(rendered, /all check-specific pages|check-specific source and precedence semantics|capForUnreadableAll|currently designated|preserved current behavior/);
+        assert.doesNotMatch(rendered, /\.;/, `${entry.id}.${inputName}: scoped source entries use clean semicolon punctuation`);
       }
     }
   }
@@ -168,6 +169,8 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
     .find((source) => source.surfaceId === "service-account-keys");
   assert.ok(keySource);
   assert.match(keySource.scope, /project-scoped child aggregate/i);
+  assert.match(keySource.scope, /without a nonempty email.*no key-list request/i);
+  assert.match(keySource.aggregate.attemptedUnit, /with a nonempty email/);
   assert.equal(evaluateCompletenessSource(keySource, {
     attemptedCount: 2,
     successfulCount: 1,
@@ -201,6 +204,22 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
       .find((source) => source.surfaceId === "effective-org-policy").scope,
     /constraints\/compute\.requireOsLogin/,
   );
+  const keyRotation = check(GCP_SPEC, "GCP-IAM-02");
+  assert.match(keyRotation.evidenceFieldDefinitions.evidence_readable, /successful empty service-account response sets this false/);
+  assert.equal(evaluateCheckVerdict(keyRotation, {
+    evidence_readable: false,
+    evidence_complete: true,
+    inventory_count: 0,
+    violation_count: 0,
+    review_count: 0,
+  }), "manual");
+  assert.equal(evaluateCheckVerdict(keyRotation, {
+    evidence_readable: true,
+    evidence_complete: true,
+    inventory_count: 0,
+    violation_count: 0,
+    review_count: 0,
+  }), "pass", "a listed service account with a complete empty key inventory remains compliant");
   assert.equal(check(OCI_SPEC, "OCI-IAM-01").completeness, undefined);
   assert.deepEqual(check(PALOALTO_SPEC, "PA-21").completeness.evidence_complete.sources.map((source) => source.surfaceId), [
     "prisma-policies", "panos-system-info", "panos-policy-config",
@@ -208,6 +227,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   assert.match(check(PALOALTO_SPEC, "PA-19").completeness.evidence_complete.semantics, /unconfigured product is omitted/);
   assert.match(check(ZSCALER_SPEC, "ZS-04").completeness.evidence_complete.semantics, /zia-ssl-inspection-rules: truncation leaves evidence_complete true/);
   assert.match(check(ZSCALER_SPEC, "ZS-25").completeness.evidence_complete.semantics, /zia-security-allowlist: truncation leaves evidence_complete true; an error, 403 denial, or not-collected read makes evidence_complete false/);
+  assert.match(check(ZSCALER_SPEC, "ZS-07").criteria.pass, /Remain manual when the administrator or role inventory is empty/);
 });
 
 test("batch 2 threshold metadata is exhaustive and renders immutable defaults", () => {
