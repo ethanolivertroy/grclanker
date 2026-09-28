@@ -62,7 +62,7 @@ The SDK keys endpoint (`/api/v2/projects/{projectKey}/environments/{environmentK
 | `launchdarkly_assess_monitoring_integrations` | Controls 12, 13, 18, 20, 21. Arguments: `retention_days`, `integration_keys`, `relay_config_max_age_days`, `production_pattern`. |
 | `launchdarkly_export_audit_bundle` | Runs the access check and all five assessments, then writes a bundle plus zip under `output_dir` (default `./export/launchdarkly`). |
 
-Every tool accepts the shared auth arguments `token`, `base_url`, `api_version`, `config_path`, and `timeout_seconds`. The list arguments `allowed_domains`, `project_keys`, and `integration_keys` are comma-separated strings (for example `"web,mobile"`); the environment variables take the same form, and the config file takes TOML arrays.
+Every tool accepts the shared auth arguments `token`, `base_url`, `api_version`, `config_path`, and `timeout_seconds`. The list arguments `allowed_domains`, `project_keys`, and `integration_keys` are comma-separated strings (for example `"web,mobile"`). `allowed_domains` and `project_keys` can also come from their environment variables (same comma-separated form) or the config file (TOML arrays); `integration_keys` is a tool argument only.
 
 Production environments are those flagged `critical` in LaunchDarkly or whose key or name matches `production_pattern` (default `prod`, case-insensitive).
 

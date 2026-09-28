@@ -36,7 +36,7 @@ Optional settings:
 | `PAGERDUTY_IDENTITY_TOKEN_URL` | Overrides the OAuth token endpoint (default `https://identity.pagerduty.com/oauth/token`) |
 | `PAGERDUTY_CONFIG_FILE` | JSON file with `api_token` (or `api_key`, `token`), `access_token`, `client_id`, `client_secret`, `subdomain`, `region`, `base_url`, `from_email` (or `email`), `timeout_seconds` |
 
-The `api_key` and `token` aliases for `api_token`, and `email` for `from_email`, are also accepted as tool arguments. When more than one credential resolves, the REST API key wins, then the OAuth bearer token, then client credentials.
+The `api_key` and `token` aliases for `api_token` are also accepted as tool arguments; the `email` alias for `from_email` is read from the config file only. When more than one credential resolves, the REST API key wins, then the OAuth bearer token, then client credentials.
 
 Every request carries `Accept: application/vnd.pagerduty+json;version=2`. The client follows classic `limit`/`offset` pagination using the `more` flag (100 per page, capped at the documented 10,000 record ceiling) and cursor pagination (`cursor`, `next_cursor`) on audit records and incident workflow triggers. `GET /change_events` declares no `more` or `total` field, so the client keeps reading offset pages until a page comes back shorter than requested; a full final page at the requested limit is recorded as incomplete. It retries 429 and 5xx responses, waiting for the `ratelimit-reset` or `Retry-After` value when present, and redacts tokens from error messages.
 
