@@ -3,21 +3,79 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
 } from "./batch-spec-builder.js";
 import { GWS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const GWS_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
-  "GWS-ID-001": ["directory-users"], "GWS-ID-002": ["directory-users"], "GWS-ID-003": ["directory-users"],
-  "GWS-ID-004": ["directory-users", "login-activities"], "GWS-ID-005": ["two-step-policies"],
+  "GWS-ID-001": ["directory-users", "roles", "role-assignments"], "GWS-ID-002": ["directory-users"], "GWS-ID-003": ["directory-users"],
+  "GWS-ID-004": ["directory-users", "roles", "role-assignments"], "GWS-ID-005": ["two-step-policies"],
   "GWS-ADMIN-001": ["directory-users", "roles", "role-assignments"],
   "GWS-ADMIN-002": ["directory-users", "roles", "role-assignments"],
-  "GWS-ADMIN-003": ["roles", "role-assignments"], "GWS-ADMIN-004": ["admin-activities"],
-  "GWS-ADMIN-005": ["role-assignments"],
+  "GWS-ADMIN-003": ["directory-users", "roles", "role-assignments"], "GWS-ADMIN-004": ["admin-activities"],
+  "GWS-ADMIN-005": ["directory-users", "roles", "role-assignments"],
   "GWS-INTEG-001": ["directory-users", "user-tokens"], "GWS-INTEG-002": ["directory-users", "roles", "role-assignments", "user-tokens"],
-  "GWS-INTEG-003": ["user-tokens"], "GWS-INTEG-004": ["token-activities"],
-  "GWS-MON-001": ["alerts"], "GWS-MON-002": ["alerts"], "GWS-MON-003": ["admin-activities"],
+  "GWS-INTEG-003": ["directory-users", "user-tokens"], "GWS-INTEG-004": ["token-activities"],
+  "GWS-MON-001": ["alerts"], "GWS-MON-002": ["login-activities"], "GWS-MON-003": ["admin-activities"],
   "GWS-MON-004": ["token-activities"], "GWS-MON-005": ["alerts"],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const TRUNCATION_ONLY = ["truncated"] as const;
+const completeFrom = (
+  sourceIds: readonly string[],
+  semantics: string,
+  falseWhen: readonly ("truncated" | "error" | "denied" | "not-collected")[] = ALL_FAILURE_MODES,
+): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen })),
+  semantics,
+});
+
+const GWS_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "GWS-ID-001": { complete: completeFrom(["directory-users", "roles", "role-assignments"], "true only when all three directory inventories are readable and untruncated and every role assignment resolves to a collected user.") },
+  "GWS-ID-002": { complete: completeFrom(["directory-users"], "true only when the directory user inventory is readable and untruncated.") },
+  "GWS-ID-003": { complete: completeFrom(["directory-users"], "true only when the directory user inventory is readable and untruncated.") },
+  "GWS-ID-004": { complete: completeFrom(["directory-users", "roles", "role-assignments"], "true only when all three directory inventories are readable and untruncated and every role assignment resolves to a collected user.") },
+  "GWS-ID-005": { complete: completeFrom(["two-step-policies"], "true only when the policy inventory is readable and untruncated.") },
+  "GWS-ADMIN-001": { complete: completeFrom(["directory-users", "roles", "role-assignments"], "true only when all three directory inventories are readable and untruncated and every role assignment resolves to a collected user.") },
+  "GWS-ADMIN-002": { complete: completeFrom(["directory-users", "roles", "role-assignments"], "true only when all three directory inventories are readable and untruncated and every role assignment resolves to a collected user.") },
+  "GWS-ADMIN-003": { complete: completeFrom(["directory-users", "roles", "role-assignments"], "true only when all three directory inventories are readable and untruncated and every role assignment resolves to a collected user.") },
+  "GWS-ADMIN-004": { complete: completeFrom(["admin-activities"], "true only when the administrator activity report is readable and untruncated.") },
+  "GWS-ADMIN-005": { complete: completeFrom(["directory-users", "roles", "role-assignments"], "true when those three inventories are untruncated; read errors, denials, and not-collected markers do not themselves change this fact.", TRUNCATION_ONLY) },
+  "GWS-INTEG-001": {
+    complete: {
+      sources: [
+        { surfaceId: "directory-users", falseWhen: TRUNCATION_ONLY },
+        { surfaceId: "user-tokens", falseWhen: ALL_FAILURE_MODES },
+      ],
+      semantics: "true when the user inventory is untruncated, every intended user was sampled, every per-user token request succeeded, and no token-sample dependency is unresolved; a denied or errored directory-user read is handled by `users_readable` and does not by itself change this fact.",
+    },
+  },
+  "GWS-INTEG-002": {
+    complete: {
+      sources: [
+        ...["directory-users", "roles", "role-assignments"].map((surfaceId) => ({ surfaceId, falseWhen: ALL_FAILURE_MODES })),
+        { surfaceId: "user-tokens", falseWhen: ALL_FAILURE_MODES },
+      ],
+      semantics: "true only when the complete directory inventory resolves every assignment, every privileged user fits within the 50-user priority sample, and no per-user token request failed.",
+    },
+  },
+  "GWS-INTEG-003": {
+    complete: {
+      sources: [
+        { surfaceId: "directory-users", falseWhen: TRUNCATION_ONLY },
+        { surfaceId: "user-tokens", falseWhen: ALL_FAILURE_MODES },
+      ],
+      semantics: "true when the user inventory is untruncated, every intended user was sampled, every per-user token request succeeded, and no token-sample dependency is unresolved; a denied or errored directory-user read is handled by `users_readable` and does not by itself change this fact.",
+    },
+  },
+  "GWS-INTEG-004": { complete: completeFrom(["token-activities"], "true only when the token activity report is readable and untruncated.") },
+  "GWS-MON-001": { complete: completeFrom(["alerts"], "true only when the Alert Center inventory is readable and untruncated.") },
+  "GWS-MON-002": { complete: completeFrom(["login-activities"], "true only when the login activity report is readable and untruncated.") },
+  "GWS-MON-003": { complete: completeFrom(["admin-activities"], "true only when the administrator activity report is readable and untruncated.") },
+  "GWS-MON-004": { complete: completeFrom(["token-activities"], "true only when the token activity report is readable and untruncated.") },
+  "GWS-MON-005": { complete: completeFrom(["alerts"], "true only when the Alert Center inventory is readable and untruncated and every returned alert has a recognized open-or-closed status.") },
 };
 
 const groups = {
@@ -381,6 +439,7 @@ const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([key, tit
       decisionConstants: decision.constants,
       decisionRules: executable.rules,
       derivedFactRules: executable.derivedFactRules,
+      completeness: GWS_COMPLETENESS[id],
       decision: decisions[group][index],
     };
   });

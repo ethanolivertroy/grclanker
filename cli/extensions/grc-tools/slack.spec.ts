@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
 } from "./batch-spec-builder.js";
 import { SLACK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
@@ -32,7 +33,7 @@ const SLACK_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "SLACK-ADMIN-01": ["workspaces", "workspace-admins"], "SLACK-ADMIN-02": ["admin-users"],
   "SLACK-ADMIN-03": ["admin-users", "session-settings"], "SLACK-ADMIN-04": [],
   "SLACK-ADMIN-05": ["workspaces", "workspace-settings"], "SLACK-ADMIN-06": [],
-  "SLACK-ADMIN-07": ["workspaces", "workspace-settings"], "SLACK-ADMIN-08": ["emoji", "workspace-admins"],
+  "SLACK-ADMIN-07": ["workspaces", "workspace-settings"], "SLACK-ADMIN-08": ["emoji", "admin-users", "workspace-admins"],
   "SLACK-ADMIN-09": ["analytics-export"], "SLACK-APP-01": ["approved-apps"], "SLACK-APP-02": ["restricted-apps"],
   "SLACK-APP-03": ["approved-apps"], "SLACK-APP-04": ["barriers"], "SLACK-APP-05": [],
   "SLACK-APP-06": ["workspaces", "team-preferences"], "SLACK-APP-07": [],
@@ -40,6 +41,49 @@ const SLACK_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "SLACK-CHAN-03": ["channels", "channel-retention"], "SLACK-CHAN-04": [], "SLACK-CHAN-05": [],
   "SLACK-MON-01": ["audit-logs"], "SLACK-MON-02": ["audit-logs"], "SLACK-MON-03": ["audit-logs"],
   "SLACK-MON-04": ["audit-schemas"], "SLACK-MON-05": ["audit-logs"], "SLACK-MON-06": [],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const completeFrom = (sourceIds: readonly string[], semantics: string): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen: ALL_FAILURE_MODES })),
+  semantics,
+});
+const SLACK_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "SLACK-ID-01": { users_complete: completeFrom(["users"], "true only when users.list is readable and its cursor is exhausted without a page or item cap.") },
+  "SLACK-ID-02": { users_complete: completeFrom(["users"], "true only when users.list is readable and its cursor is exhausted without a page or item cap.") },
+  "SLACK-ID-03": { scim_complete: completeFrom(["scim-users"], "true only when SCIM /Users is readable and its cursor is exhausted without a page or item cap.") },
+  "SLACK-ID-04": { complete: completeFrom(["users", "scim-users"], "true only when both users.list and SCIM /Users are readable and completely paged.") },
+  "SLACK-ID-05": { users_complete: completeFrom(["users"], "true only when users.list is readable and its cursor is exhausted without a page or item cap.") },
+  "SLACK-ADMIN-01": { complete: completeFrom(["workspaces", "workspace-admins"], "true only when the workspace list is completely paged and every listed workspace has a readable, completely paged administrator roster.") },
+  "SLACK-ADMIN-02": { users_complete: completeFrom(["admin-users"], "true only when admin.users.list is readable and its cursor is exhausted without a page or item cap.") },
+  "SLACK-ADMIN-03": { complete: completeFrom(["admin-users", "session-settings"], "true only when admin.users.list is completely paged and every active organization user has a successful explicit session-settings response.") },
+  "SLACK-ADMIN-05": { teams_complete: completeFrom(["workspaces"], "true only when admin.teams.list is readable and completely paged; workspace-settings failures do not change this fact.") },
+  "SLACK-ADMIN-07": { teams_complete: completeFrom(["workspaces"], "true only when admin.teams.list is readable and completely paged; workspace-settings failures are counted separately and do not change this fact.") },
+  "SLACK-ADMIN-08": {
+    emoji_complete: completeFrom(["emoji"], "true only when admin.emoji.list is readable and completely paged."),
+    roster_complete: completeFrom(["admin-users", "workspace-admins"], "true only when the organization-user roster and every applicable workspace administrator roster are readable and completely paged."),
+  },
+  "SLACK-APP-01": { approved_complete: completeFrom(["approved-apps"], "true only when the approved-app inventory is readable and completely paged.") },
+  "SLACK-APP-02": { restricted_complete: completeFrom(["restricted-apps"], "true only when the restricted-app inventory is readable and completely paged.") },
+  "SLACK-APP-03": { approved_complete: completeFrom(["approved-apps"], "true only when the approved-app inventory is readable and completely paged.") },
+  "SLACK-APP-04": { barrier_complete: completeFrom(["barriers"], "true only when the information-barrier inventory is readable and completely paged.") },
+  "SLACK-APP-06": {
+    coverage_complete: {
+      sources: [
+        { surfaceId: "workspaces", falseWhen: ALL_FAILURE_MODES },
+        { surfaceId: "team-preferences", falseWhen: [] },
+      ],
+      semantics: "true only when the token is scoped to one known workspace and the identity needed to select that workspace is resolved; failure of the preference read is represented by `preferences_readable` and does not itself change this fact.",
+    },
+  },
+  "SLACK-CHAN-01": { external_complete: completeFrom(["channels"], "true only when the external-shared-channel search is readable and completely paged.") },
+  "SLACK-CHAN-02": { complete: completeFrom(["channels", "channel-preferences"], "true only when the channel search is completely paged, every announcement channel is classifiable, and every required conversation-preferences read succeeds.") },
+  "SLACK-CHAN-03": { complete: completeFrom(["channels", "channel-retention"], "true only when the channel search is completely paged and every required custom-retention read succeeds.") },
+  "SLACK-MON-01": { audit_complete: completeFrom(["audit-logs"], "true only when the audit-log lookback is readable and completely paged within its configured limit.") },
+  "SLACK-MON-02": { audit_complete: completeFrom(["audit-logs"], "true only when the audit-log lookback is readable and completely paged within its configured limit.") },
+  "SLACK-MON-03": { audit_complete: completeFrom(["audit-logs"], "true only when the audit-log lookback is readable and completely paged within its configured limit.") },
+  "SLACK-MON-04": { schema_complete: completeFrom(["audit-schemas"], "true only when the audit-schema inventory is readable and completely paged.") },
+  "SLACK-MON-05": { audit_complete: completeFrom(["audit-logs"], "true only when the audit-log lookback is readable and completely paged within its configured limit.") },
 };
 
 const checkRows = [
@@ -142,8 +186,8 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
     const counts: Readonly<Record<string, string>> = {
       human_user_count: "non-bot users", active_user_count: "active human users", admin_user_count: "active owners and administrators",
       admin_inventory_count: "administrator assignments across readable workspaces", excessive_admin_workspace_count: "workspaces above the administrator threshold",
-      guest_count: "active guest users", unknown_mfa_count: "administrators without known MFA state", without_mfa_count: "administrators with MFA disabled",
-      unknown_sso_count: "administrators without known SSO state", without_sso_count: "administrators with SSO disabled", workspace_count: "Grid workspaces",
+      guest_count: "active guest users", unknown_mfa_count: "active human users without known MFA state", without_mfa_count: "active human users with MFA disabled",
+      unknown_sso_count: "active organization users without known SSO state", without_sso_count: "active organization users with SSO disabled", workspace_count: "Grid workspaces",
       channel_count: "channels", open_count: "public channels matching the open-membership predicate", announcement_channel_count: "announcement-only channels",
       external_count: "external organizations or externally shared channels", external_event_count: "external-collaboration audit events",
       approved_count: "approved applications", scim_count: "SCIM user records", scim_user_count: "active users represented in SCIM",
@@ -314,6 +358,7 @@ const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, sever
     decisionInputs: decision.inputs,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
+    completeness: SLACK_COMPLETENESS[id],
     decision: decisions[index],
   };
 });

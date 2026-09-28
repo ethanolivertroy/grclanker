@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
   type PortableInputType,
 } from "./batch-spec-builder.js";
 import { BOX_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
@@ -30,6 +31,24 @@ const BOX_CHECK_SURFACES: Readonly<Record<number, readonly string[]>> = {
   16: ["events"], 17: ["users"], 18: ["users"], 19: ["events", "shield-lists"],
   20: ["terms-of-service"], 21: ["enterprise-configuration"], 22: ["enterprise-configuration"],
   23: ["shield-lists"], 24: ["users", "events"], 25: ["shield-lists", "events"],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const TRUNCATION_ONLY = ["truncated"] as const;
+const completeFrom = (
+  sourceIds: readonly string[],
+  semantics: string,
+  falseWhen: readonly ("truncated" | "error" | "denied" | "not-collected")[] = ALL_FAILURE_MODES,
+): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen })),
+  semantics,
+});
+const BOX_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "BOX-05": { complete: completeFrom(["allowlist-entries", "allowlist-exempt-targets"], "true only when allowlist entries and exempt targets are readable and untruncated; enterprise configuration readability is tracked separately.") },
+  "BOX-10": { complete: completeFrom(["device-pinners"], "true only when the device-pinner inventory is readable and untruncated.") },
+  "BOX-12": { complete: completeFrom(["retention-policies"], "true when the retention-policy inventory is untruncated; policy or assignment read errors and assignment truncation do not themselves change this fact.", TRUNCATION_ONLY) },
+  "BOX-13": { complete: completeFrom(["legal-hold-policies"], "true when the legal-hold policy inventory is untruncated; policy or assignment read errors and assignment truncation do not themselves change this fact.", TRUNCATION_ONLY) },
+  "BOX-25": { events_complete: completeFrom(["events"], "true only when the enterprise-event inventory is readable and untruncated; Shield-list and enterprise-configuration reads do not contribute.") },
 };
 
 const controls = [
@@ -504,6 +523,7 @@ const checks: BatchCheckDefinition[] = controls.map((title, index) => {
     decisionConstants: decision.constants,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
+    completeness: BOX_COMPLETENESS[id],
     decision: decisions[index],
   };
 });

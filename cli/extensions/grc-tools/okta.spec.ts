@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
 import { OKTA_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
@@ -74,6 +75,63 @@ const OKTA_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "OKTA-MON-007": ["api-tokens"],
   "OKTA-MON-008": ["org-contacts", "users"],
   "OKTA-MON-009": [],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const TRUNCATION_ONLY = ["truncated"] as const;
+const completeFrom = (
+  sourceIds: readonly string[],
+  semantics: string,
+  falseWhen: readonly ("truncated" | "error" | "denied" | "not-collected")[] = ALL_FAILURE_MODES,
+): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen })),
+  semantics,
+});
+
+const OKTA_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "OKTA-AUTH-001": { complete: completeFrom(["authenticators", "org-factors"], "true when both inventories are untruncated; read errors, denials, and not-collected states do not themselves change this fact.", TRUNCATION_ONLY) },
+  "OKTA-AUTH-002": {
+    complete: {
+      sources: [
+        ...["sign-on-policies", "sign-on-policy-rules", "access-policies", "access-policy-rules", "authenticators"].map((surfaceId) => ({ surfaceId, falseWhen: ALL_FAILURE_MODES })),
+        { surfaceId: "mfa-policies", falseWhen: TRUNCATION_ONLY },
+      ],
+      semantics: "true only when sign-on policies and rules, access policies and rules, and authenticators are readable, collected, and untruncated, and the MFA-enrollment policy inventory is untruncated; an MFA-enrollment read error, denial, or not-collected marker does not itself change this fact.",
+    },
+  },
+  "OKTA-AUTH-003": { complete: completeFrom(["password-policies"], "true only when the password-policy inventory is readable, collected, and untruncated.") },
+  "OKTA-AUTH-004": { complete: completeFrom(["password-policies"], "true only when the password-policy inventory is readable, collected, and untruncated.") },
+  "OKTA-AUTH-005": { complete: completeFrom(["password-policies"], "true only when the password-policy inventory is readable, collected, and untruncated.") },
+  "OKTA-AUTH-006": { complete: completeFrom(["sign-on-policies", "sign-on-policy-rules"], "true only when sign-on policies and their child rules are readable, collected, and untruncated.") },
+  "OKTA-AUTH-007": { complete: completeFrom(["sign-on-policies", "sign-on-policy-rules"], "true only when sign-on policies and their child rules are readable, collected, and untruncated.") },
+  "OKTA-AUTH-008": { complete: completeFrom(["idps", "authenticators"], "true when both inventories are untruncated; read errors, denials, and not-collected states are represented by the separate readability facts and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "OKTA-AUTH-009": { complete: completeFrom(["authenticators", "org-factors"], "true when both inventories are untruncated; read errors, denials, and not-collected states do not themselves change this fact.", TRUNCATION_ONLY) },
+  "OKTA-ADMIN-001": { complete: completeFrom(["role-assignees", "user-roles"], "true only when direct role assignees and per-user role reads are readable, collected, and untruncated.") },
+  "OKTA-ADMIN-002": { complete: completeFrom(["role-assignees", "user-roles"], "true only when direct role assignees and per-user role reads are readable, collected, and untruncated.") },
+  "OKTA-ADMIN-003": { complete: completeFrom(["groups", "group-roles", "group-members"], "true only when groups, privileged group-role lookups, and privileged group-member expansions are readable, collected, and untruncated.") },
+  "OKTA-ADMIN-004": { complete: completeFrom(["role-assignees", "user-factors"], "true only when the privileged-user inventory and every requested privileged-user factor inventory are readable, collected, and untruncated.") },
+  "OKTA-ADMIN-005": { complete: completeFrom(["users"], "true only when the user inventory is readable, collected, and untruncated.") },
+  "OKTA-INTEG-001": { complete: completeFrom(["trusted-origins"], "true only when the trusted-origin inventory is readable, collected, and untruncated.") },
+  "OKTA-INTEG-002": { complete: completeFrom(["network-zones"], "true only when the network-zone inventory is readable, collected, and untruncated.") },
+  "OKTA-INTEG-003": { complete: completeFrom(["apps"], "true only when the application inventory is readable, collected, and untruncated.") },
+  "OKTA-INTEG-004": {
+    complete: {
+      sources: [
+        ...["sign-on-policies", "sign-on-policy-rules", "access-policies", "access-policy-rules"].map((surfaceId) => ({ surfaceId, falseWhen: ALL_FAILURE_MODES })),
+        { surfaceId: "network-zones", falseWhen: TRUNCATION_ONLY },
+      ],
+      semantics: "true only when sign-on and access policies and their child rules are readable and untruncated and network zones are untruncated; a network-zone error, denial, or not-collected marker does not itself change this fact.",
+    },
+  },
+  "OKTA-INTEG-005": { complete: completeFrom(["apps"], "true only when the application inventory is readable, collected, and untruncated.") },
+  "OKTA-INTEG-006": { complete: completeFrom(["apps", "group-rules"], "true only when applications and group rules are readable, collected, and untruncated.") },
+  "OKTA-MON-001": { complete: completeFrom(["event-hooks", "log-streams"], "true only when event hooks and log streams are readable, collected, and untruncated.") },
+  "OKTA-MON-002": { complete: completeFrom(["system-log"], "true only when the System Log lookback is readable, collected, and untruncated.") },
+  "OKTA-MON-004": { complete: completeFrom(["behaviors"], "true only when the behavior-rule inventory is readable, collected, and untruncated.") },
+  "OKTA-MON-005": { complete: completeFrom(["api-tokens"], "true only when the API-token inventory is readable, collected, and untruncated.") },
+  "OKTA-MON-006": { complete: completeFrom(["device-assurance"], "true only when the device-assurance inventory is readable, collected, and untruncated.") },
+  "OKTA-MON-007": { complete: completeFrom(["api-tokens"], "true only when the API-token inventory is readable, collected, and untruncated.") },
+  "OKTA-MON-008": { complete: completeFrom(["org-contacts"], "true only when the organization-contact inventory is readable, collected, and untruncated; the referenced user lookup does not contribute to this fact.") },
 };
 
 const titles: Readonly<Record<string, string>> = {
@@ -247,7 +305,10 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-AUTH-002": {
-    inputs: input("policy_inventory_readable", "complete", "admin_policy_count", "admin_mfa_rule_count", "strong_authenticator_count", "mfa_control_count"),
+    inputs: {
+      ...input("policy_inventory_readable", "complete", "admin_policy_count", "admin_mfa_rule_count", "strong_authenticator_count", "mfa_control_count"),
+      policy_inventory_readable: "Boolean true when at least one of the sign-on-policy or access-policy families is readable; false only when both family reads fail.",
+    },
     rules: ordered({
       manual: ne("policy_inventory_readable", true),
       fail: all(eq("admin_policy_count", 0), eq("mfa_control_count", 0), eq("strong_authenticator_count", 0)),
@@ -558,6 +619,7 @@ const checks: BatchCheckDefinition[] = Object.entries(titles).map(([id, title], 
     decisionConstants: decision.constants,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
+    completeness: OKTA_COMPLETENESS[id],
     decision: decisions[id],
   };
 });
@@ -644,7 +706,8 @@ export const OKTA_SPEC = buildBatchIntegrationSpec({
   runtimeBehavior: OKTA_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Lifecycle workflow and broader trust-center evidence remain manual or deferred.",
-    "OKTA-ADMIN-004 on main can emit Pass when factor evidence inspects zero of the identified privileged users. This branch's strict conformance assertion rejects that collector-unreachable inconsistency; a separate runtime fix should define a stable non-pass result and matching prose.",
+    "OKTA-ADMIN-004 has a collector-unreachable mismatched-ID state in which zero of N identified privileged users receive factor results. Main emits Pass for 32 observed variants, Partial for 3 variants, and Manual for 2 variants; this branch preserves the Manual variants but its strict metadata/runtime assertion throws for the 32 Pass and 3 Partial variants. A separate runtime fix must define one stable non-pass outcome and matching prose without disguising the current inconsistency.",
+    "OKTA-INTEG-004 can emit Pass when a readable contextual policy rule exists even if the network-zone read is denied. Network-zone denial does not make its `complete` fact false; this main-compatible limitation requires a separate runtime change if zone evidence is to gate Pass.",
   ],
   sensitiveFields: ["apiToken", "clientAssertion", "privateKey", "credentials", "authorization", "cookie"],
   credentialFormats: ["SSWS tokens", "OAuth bearer tokens", "private keys", "signed JWT assertions"],
