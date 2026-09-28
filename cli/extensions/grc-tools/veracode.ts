@@ -2765,11 +2765,13 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
   }
   const overdue: Array<{ application: string; issue_id: string | null; severity: number; days_open: number }> = [];
   const missingDate: number[] = [];
+  let findingsRead = 0;
   let openEvaluated = 0;
   let incompletePagination = 0;
   for (const sample of readable) {
     const list = (sample.findings as { value: HalListResult }).value;
     if (!list.complete) incompletePagination += 1;
+    findingsRead += list.items.length;
     for (const item of list.items) {
       if (!isOpenUnresolved(item)) continue;
       const severity = findingSeverity(item);
@@ -2801,7 +2803,13 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
       return manualFinding(3, "high", `The ${readable.length} sampled applications returned zero findings, so there is no aging population to evaluate; confirm the applications have published scans before treating this as compliant.`, manualEvidence, evidence);
     }
   }
-  return finding(3, "high", joinNotes(`All ${openEvaluated} open unmitigated findings across ${readable.length} fully read applications are within their severity SLA.`, ...caveats), evidence, veracodeCompleteFacts("VERACODE-03", evidence, !caveats.some(Boolean)));
+  return finding(
+    3,
+    "high",
+    joinNotes(`All ${openEvaluated} open unmitigated findings across ${readable.length} fully read applications are within their severity SLA.`, ...caveats),
+    evidence,
+    { ...veracodeCompleteFacts("VERACODE-03", evidence, !caveats.some(Boolean)), inventory_count: findingsRead },
+  );
 }
 
 function evaluateMitigationWorkflow(samples: ApplicationFindingsSample[], inventory: HalListResult): VeracodeFinding {
