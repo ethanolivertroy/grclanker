@@ -54,6 +54,7 @@ import {
   evaluateBatchCheckVerdict,
 } from "../dist/extensions/grc-tools/batch-spec-builder.js";
 
+const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
 const STALE_LOGIN = "2026-01-05 08:15:00";
@@ -805,7 +806,7 @@ test("assessServicenowIdentityAccess passes a healthy identity fixture with fram
   assert.equal(result.summary.admin_users, 1);
 });
 
-test("SNOW-08 counts an active non-IdP integration TLS certificate across the unfiltered inventory", async () => {
+portableContractTest("SNOW-08 counts an active non-IdP integration TLS certificate across the unfiltered inventory", async () => {
   const fixture = healthyFixture();
   fixture.tables.sys_certificate.push({
     sys_id: "cert-integration-tls",

@@ -19,7 +19,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "7b3e2ae9ac21050da5e8c65145b980c8735d02aa";
+const baselineRef = "f129d63dda795997e3263499ae2e42b455d36bd6";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -74,6 +74,8 @@ function instrumentedMainTest(source) {
     .replace(/^import \{ SERVICENOW_SPEC \} from .*servicenow\.spec\.js";\n/m, "")
     .replace(/^import \{ PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC \} from .*paloalto\.spec\.js";\n/m, "")
     .replace(/^import \{ ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC \} from .*zscaler\.spec\.js";\n/m, "")
+    .replace(/^import \{ captureBatchDecisionFacts \} from .*batch-spec-builder\.js";\n/m, "")
+    .replace(/^import \{\n  captureBatchDecisionFacts,\n  evaluateBatchCheckVerdict,\n\} from .*batch-spec-builder\.js";\n/m, "")
     .replace(
       'import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',
       'import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',
@@ -245,7 +247,7 @@ function runCorpusSuite(root, fixtureDirectory) {
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate)",
+    "--test-skip-pattern=^all 25 (?:Palo Alto|Zscaler) checks replay",
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
