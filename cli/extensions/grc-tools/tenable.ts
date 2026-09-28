@@ -2935,7 +2935,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const evaluated = count("evaluated_scanners");
       const threshold = value("threshold_hours") ?? 0;
       const stale = count("stale_scanners");
-      if (age === undefined || (stale === 0 && (statusIsIncomplete("scanners_status") || evaluated === 0))) return {};
+      if (age === undefined || (age <= threshold && stale === 0 && (statusIsIncomplete("scanners_status") || evaluated === 0))) return {};
       const reviews = count("undated_scanners", "stale_online_agents") + (statusIsIncomplete("agents_status") || partial ? 1 : 0);
       return fact(evaluated, age > threshold || stale > 0 ? Math.max(1, stale) : 0, reviews, !statusIsIncomplete("agents_status") && !partial);
     }
@@ -2971,15 +2971,17 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const open = value("open_findings") ?? 0;
       if ((value("asset_count") ?? 0) === 0 || open === 0) return {};
       const coverage = value("vpr_coverage") ?? 0;
-      return fact(open, 0, coverage < 0.5 || partial ? 1 : 0);
+      const complete = !partial && evidence.caller_is_administrator === true;
+      return fact(open, 0, coverage < 0.5 || !complete ? 1 : 0, complete);
     }
     case "TENABLE-15": {
       if ((value("asset_count") ?? 0) === 0) return {};
       const open = tenableEvidenceCount(evidence, "open_by_severity");
       const overdue = asObject(evidence.overdue_by_severity) ?? {};
       const severe = (asNumber(overdue.critical) ?? 0) + (asNumber(overdue.high) ?? 0);
-      const review = (asNumber(overdue.medium) ?? 0) + (asNumber(overdue.low) ?? 0) + (value("undated_open_findings") ?? 0) + (partial ? 1 : 0);
-      return fact(open, severe, review, !partial);
+      const complete = !partial && evidence.caller_is_administrator === true;
+      const review = (asNumber(overdue.medium) ?? 0) + (asNumber(overdue.low) ?? 0) + (value("undated_open_findings") ?? 0) + (complete ? 0 : 1);
+      return fact(open === 0 && !complete ? 1 : open, severe, review, complete);
     }
     case "TENABLE-16": {
       const assets = value("asset_count") ?? 0;
@@ -2987,7 +2989,10 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       if (assets === 0 || categories === undefined) return {};
       const ratio = value("tagged_ratio") ?? 0;
       const threshold = value("threshold") ?? 0;
-      const complete = !partial && evidence.tag_categories_truncated !== true && evidence.tag_values_truncated !== true;
+      const complete = !partial
+        && evidence.tag_categories_truncated !== true
+        && evidence.tag_values_truncated !== true
+        && value("tag_value_count") !== undefined;
       return fact(assets, categories === 0 && evidence.tag_categories_truncated !== true || ratio < threshold ? 1 : 0, complete ? 0 : 1, complete);
     }
     case "TENABLE-17":
@@ -3642,7 +3647,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       export_status: data.assetExport.data.status,
       chunks_fetched: chunkRatio(data.assetExport),
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }));
+    }, "", { inventory_truncated: data.assetExport.truncated }));
   }
 
   if (data.exclusions.status !== "ok") {
@@ -3903,7 +3908,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }));
+    }, "", { inventory_truncated: data.assetExport.truncated === true || data.networks.truncated === true }));
 
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
     const categories = data.tagCategories.status === "ok" ? data.tagCategories.data.map((item) => asString(item.name) ?? "category") : [];
@@ -3941,7 +3946,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       tag_value_count: countOrNull(data.tagValues),
       tag_values_truncated: data.tagValues.status === "ok" ? data.tagValues.truncated : null,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }));
+    }, "", { inventory_truncated: data.assetExport.truncated }));
   }
 
   const licensedAgents = asNumber(asObject(asObject(data.serverProperties.data)?.license)?.agents);
@@ -4665,6 +4670,9 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       chunks: chunkRatio(data.vulnExport),
       unevaluable_records: unevaluableRecordsOf(data.vulnExport),
       asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
+    }, "", {
+      inventory_truncated: data.vulnExport.truncated === true || data.assetExport.truncated === true,
+      caller_is_administrator: callerIsAdministrator,
     }));
 
     const overdue: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
@@ -4718,6 +4726,9 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       chunks: chunkRatio(data.vulnExport),
       unevaluable_records: unevaluableRecordsOf(data.vulnExport),
       asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
+    }, "", {
+      inventory_truncated: data.vulnExport.truncated === true || data.assetExport.truncated === true,
+      caller_is_administrator: callerIsAdministrator,
     }));
   }
 
