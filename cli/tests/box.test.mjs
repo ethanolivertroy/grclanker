@@ -2034,8 +2034,11 @@ test("assessBoxSharingCollaboration passes with restricted collaboration, links,
 });
 
 test("BOX-05 keeps the legacy pass when the allowlist is empty even when exempt users exist", async () => {
+  const configuration = hardenedConfiguration();
+  configuration.content_and_sharing.external_collaboration_status = item("limit_collaboration_to_users_within_enterprise");
   const result = await assessBoxSharingCollaboration(createStubClient({
     ...hardenedFixture(),
+    configuration,
     allowlistEntries: [],
     exemptTargets: [{ id: "exempt-1", type: "collaboration_whitelist_exempt_target", user: { id: "member-1", type: "user" } }],
   }));
