@@ -422,6 +422,19 @@ code {
   z-index: 5 !important;
 }
 
+/* Selection fills are too close to the editor background to show on their own */
+#monaco-container .selected-text {
+  box-shadow: inset 0 0 0 1px var(--color-overlay1);
+}
+#monaco-container .focused .selected-text {
+  box-shadow: inset 0 0 0 1px var(--color-blue);
+}
+
+/* Tailwind's preflight placeholder color would otherwise override Monaco's theme */
+#monaco-container .monaco-findInput textarea::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+
 /* Fallback */
 .fallback-notice {
   padding: 0.5rem 1rem;
