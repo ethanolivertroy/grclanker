@@ -221,13 +221,6 @@ function compareTrees(expectedRoot, actualRoot, label) {
       );
     }
   }
-  for (const integration of batch2Integrations) {
-    const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
-    const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
-    if (representative.equals(compliant)) {
-      throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
-    }
-  }
   return expectedPaths;
 }
 
@@ -269,8 +262,15 @@ try {
     throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
   }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
+  for (const integration of batch2Integrations) {
+    const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
+    const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
+    if (representative.equals(compliant)) {
+      throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
+    }
+  }
   const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
-  console.log(`Whole-corpus replay passed: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched current main.`);
+  console.log(`Whole-corpus replay passed: ${mainCorpusTests.executed}/${mainCorpusTests.total} non-skipped tests and ${corpusCalls} exact serialized assessment calls matched the stacked parent.`);
   console.log(`Byte differential passed: ${compared.length} exact fixtures across ${testFiles.length} integrations.`);
   console.log(`Fixture classes: ${classes.join(", ")}.`);
 } finally {
