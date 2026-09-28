@@ -25,7 +25,11 @@ From the shell, `grclanker audit` opens a session that starts with the same prom
 ## What the prompt does
 
 1. Scope lock: confirms the target, the frameworks in scope, the evidence boundary (documentation, live configuration, or both), and the output format.
-2. Evidence collection: CMVP and KEV/EPSS lookups; the FedRAMP source, readiness, and ADS tools when FedRAMP is in scope; each integration's `*_check_access` tool followed by its `*_assess_*` tools or `*_export_audit_bundle` for the platform in scope; `vanta_list_audits` and `vanta_export_audit` for a Vanta audit; the `scf_*` tools for control language and crosswalks; and the `oscal_*` tools when the deliverable must become OSCAL.
+2. Evidence collection:
+   - CMVP and KEV/EPSS lookups, plus the FedRAMP source, readiness, and ADS tools when FedRAMP is in scope.
+   - For the platform in scope, the integration's `*_check_access` tool, then its `*_assess_*` tools or `*_export_audit_bundle`.
+   - Two integrations differ. For operator-side Google Workspace investigation or raw evidence collection with the `gws` CLI installed, the prompt uses `gws_ops_check_cli`, then `gws_ops_investigate_alerts`, `gws_ops_trace_admin_activity`, or `gws_ops_review_tokens`, or `gws_ops_collect_evidence_bundle` for a separate operator evidence bundle. Vanta has no assessment tools: a Vanta audit starts with `vanta_check_access`, then uses `vanta_list_audits` and `vanta_export_audit` to pull an offline evidence package.
+   - The `scf_*` tools for control language and crosswalks, and the `oscal_*` tools when the deliverable must become OSCAL.
 3. Control mapping: at minimum SC-13, SC-12, SI-2, and RA-5, each with one of the four classifications above.
 4. Prioritization by exploitability, compliance impact, operational blast radius, and remediation effort, using EPSS and KEV status where vulnerability data exists.
 
