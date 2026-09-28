@@ -21,7 +21,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { TENABLE_SPEC } from "./tenable.spec.js";
 
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
@@ -244,6 +250,28 @@ const CONTROL_TITLES: Record<number, string> = {
   19: "Export and reporting automation",
   20: "Target group management",
 };
+
+const TENABLE_FRAMEWORK_PREFIXES = {
+  fedramp: "FedRAMP ",
+  cmmc: "CMMC ",
+  soc2: "SOC 2 ",
+  cis: "CIS ",
+  pci_dss: "PCI-DSS ",
+  disa_stig: "STIG ",
+  irap: "IRAP ",
+  ismap: "ISMAP ",
+} as const;
+hydrateBatchFrameworkMappings(TENABLE_SPEC, Object.fromEntries(
+  Object.keys(CONTROL_TITLES).map((numberValue) => {
+    const number = Number(numberValue);
+    return [`TENABLE-${String(number).padStart(2, "0")}`, Object.fromEntries(
+      Object.entries(TENABLE_FRAMEWORK_PREFIXES).map(([framework, prefix]) => [
+        framework,
+        (CONTROL_MAPPINGS[number] ?? []).filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length)),
+      ]),
+    )];
+  }),
+));
 
 const FRAMEWORK_REPORTS: Array<{ prefix: string; slug: string; title: string }> = [
   { prefix: "FedRAMP", slug: "fedramp", title: "FedRAMP / NIST 800-53 Compliance Report" },
@@ -2820,11 +2848,19 @@ function finding(
   evidence: JsonRecord = {},
   idSuffix = "",
 ): TenableFinding {
+  const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
+  const facts = {
+    evidence_readable: status !== "manual",
+    evidence_complete: status !== "manual",
+    inventory_count: 1,
+    violation_count: status === "fail" ? 1 : 0,
+    review_count: status === "warn" ? 1 : 0,
+  };
   return {
-    id: `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`,
+    id,
     title: CONTROL_TITLES[control] + (idSuffix ? " (Tenable Security Center)" : ""),
     severity,
-    status,
+    status: idSuffix ? status : evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, id, facts) as TenableFindingStatus,
     summary,
     evidence,
     mappings: CONTROL_MAPPINGS[control],
@@ -5125,6 +5161,7 @@ function registerAssessmentTool(pi: ExtensionAPI, kind: AssessmentKind, name: st
 }
 
 export function registerTenableTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, TENABLE_SPEC);
   pi.registerTool({
     name: "tenable_check_access",
     label: "Check Tenable audit access",
