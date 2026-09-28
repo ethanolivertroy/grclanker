@@ -112,7 +112,10 @@ export const CLOUDFLARE_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Honor bounded Retry-After and use bounded retries for transient responses; exhausted reads remain unreadable.",
   },
   runtimeBehavior: CLOUDFLARE_RUNTIME_BEHAVIOR,
-  knownGaps: ["Feature and plan ambiguity is preserved as manual evidence where the API cannot distinguish an unlicensed feature from an empty configuration."],
+  knownGaps: [
+    "Feature and plan ambiguity is preserved as manual evidence where the API cannot distinguish an unlicensed feature from an empty configuration.",
+    "The shipped runtime has no framework mapping for CF-ZONE-15 (DNS record origin exposure); this migration preserves that gap rather than inventing a control mapping.",
+  ],
   sensitiveFields: ["api_token", "api_key", "authorization", "x-auth-key", "x-auth-email", "cookie"],
   credentialFormats: ["Cloudflare API tokens", "Cloudflare Global API keys", "session cookies"],
   output: buildBatchOutputContract({

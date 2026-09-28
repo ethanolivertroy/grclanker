@@ -36,6 +36,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 - Zone findings aggregate per-zone judgments, and a proved failing zone has precedence over warnings while any unreadable sampled zone prevents pass.
 - Every paged result retains seen, reported total, page count, and truncation; finding evidence arrays are presentation samples only.
 - Feature and plan ambiguity is preserved as manual evidence where the API cannot distinguish an unlicensed feature from an empty configuration.
+- The shipped runtime has no framework mapping for CF-ZONE-15 (DNS record origin exposure); this migration preserves that gap rather than inventing a control mapping.
 
 ## Tools
 

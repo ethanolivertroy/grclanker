@@ -474,7 +474,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `GCP-DATA-06` | 6 | manual | `gcp_data_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `GCP-DATA-07` | 1 | manual | `gcp_data_07_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
 | `GCP-DATA-07` | 2 | warn | `gcp_data_07_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
-| `GCP-DATA-07` | 3 | manual | `gcp_data_07_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-DATA-07` | 3 | fail | `gcp_data_07_branch_03_matches` equals true |  |
 | `GCP-DATA-07` | 4 | warn | `gcp_data_07_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
 | `GCP-DATA-07` | 5 | pass | `gcp_data_07_branch_05_matches` equals true |  |
 | `GCP-DATA-07` | 6 | manual | `gcp_data_07_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
@@ -665,7 +665,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `GCP-DATA-06` | `gcp_data_06_branch_06_matches` | GCP-DATA-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `GCP-DATA-07` | `gcp_data_07_branch_01_matches` | GCP-DATA-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
 | `GCP-DATA-07` | `gcp_data_07_branch_02_matches` | GCP-DATA-07 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
-| `GCP-DATA-07` | `gcp_data_07_branch_03_matches` | GCP-DATA-07 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-DATA-07` | `gcp_data_07_branch_03_matches` | GCP-DATA-07 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
 | `GCP-DATA-07` | `gcp_data_07_branch_04_matches` | GCP-DATA-07 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
 | `GCP-DATA-07` | `gcp_data_07_branch_05_matches` | GCP-DATA-07 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
 | `GCP-DATA-07` | `gcp_data_07_branch_06_matches` | GCP-DATA-07 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
