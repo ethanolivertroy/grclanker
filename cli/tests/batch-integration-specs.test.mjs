@@ -383,6 +383,58 @@ function orderedBranchWitness(check, branchIndex) {
         inactive_user_count: 25,
       },
     ],
+    "SF-07": [
+      {
+        users_readable: false,
+        profiles_readable: false,
+        user_count: 0,
+        profile_count: 0,
+        admin_profile_count: 0,
+        admin_count: 0,
+        complete: false,
+        api_profile_count: 0,
+      },
+      {
+        users_readable: true,
+        profiles_readable: true,
+        user_count: 10,
+        profile_count: 10,
+        admin_profile_count: 1,
+        admin_count: 1,
+        complete: false,
+        api_profile_count: 0,
+      },
+      {
+        users_readable: true,
+        profiles_readable: true,
+        user_count: 10,
+        profile_count: 10,
+        admin_profile_count: 1,
+        admin_count: 1,
+        complete: true,
+        api_profile_count: 6,
+      },
+      {
+        users_readable: true,
+        profiles_readable: true,
+        user_count: 10,
+        profile_count: 10,
+        admin_profile_count: 1,
+        admin_count: 1,
+        complete: true,
+        api_profile_count: 3,
+      },
+      {
+        users_readable: true,
+        profiles_readable: true,
+        user_count: 10,
+        profile_count: 10,
+        admin_profile_count: 1,
+        admin_count: 1,
+        complete: true,
+        api_profile_count: 2,
+      },
+    ],
   }[check.id]?.[branchIndex];
   if (explicit) return explicit;
   const branches = Object.values(check.derivedFactRules ?? {});
@@ -433,8 +485,8 @@ test("every batch tool definition carries adjacent non-enumerable metadata witho
   }
 });
 
-test("Okta, Duo, GWS, Box, Slack, and Zoom execute declared derived facts with ordered first-match precedence", () => {
-  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+test("all nine integrations execute declared derived facts with ordered first-match precedence", () => {
+  for (const [spec] of batch) {
     for (const check of spec.checks) {
       assert.ok(Object.keys(check.derivedFactRules ?? {}).length > 0, `${check.id}: executable derived facts`);
       assert.ok(check.criteria.rules.every((entry) => entry.condition.op === "eq"), `${check.id}: outcomes consume derived branches`);
@@ -467,9 +519,9 @@ test("Okta, Duo, GWS, Box, Slack, and Zoom execute declared derived facts with o
   }
 });
 
-test("Okta, Duo, GWS, Box, Slack, and Zoom decision inputs contain no preselected conclusion tokens", () => {
+test("all nine integration decision inputs contain no preselected conclusion tokens", () => {
   const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant|availability|available|enforcement|enforced)(?:_|$)/;
-  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+  for (const [spec] of batch) {
     for (const check of spec.checks) {
       for (const inputName of check.evidenceFields) {
         assert.doesNotMatch(inputName, forbidden, `${check.id}: ${inputName}`);

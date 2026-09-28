@@ -39,6 +39,12 @@ import {
 import { ZENDESK_SPEC } from "../dist/extensions/grc-tools/zendesk.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -4720,4 +4726,26 @@ test("rule 9: a user-and-secret prefix on a configured base URL is dropped at co
     assert.ok(!text.includes("zd-operator"), `${name}: the configured URL's user is not written either`);
   }
   assert.match(files.get(join("compliance", "executive_summary.md")), /^Subdomain: acme$/m);
+});
+
+test("byte differential fixtures: Zendesk assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const representative = {
+    access: await checkZendeskAccess(healthyClient()),
+    assessments: await runAllAssessments(healthyClient()),
+  };
+  writeByteDifferentialFixture("zendesk", "representative", representative);
+  writeByteDifferentialFixture("zendesk", "boundary", {
+    authentication: await assessZendeskAuthentication(healthyClient(), { now: () => NOW, sessionTimeoutMinutes: 480 }),
+    accessControl: await assessZendeskAccessControl(healthyClient(), { now: () => NOW, adminThreshold: 1, staleDays: 180 }),
+    dataProtection: await assessZendeskDataProtection(healthyClient(), { now: () => NOW, retentionDays: 365, suspendedTicketAgeDays: 30 }),
+    integrations: await assessZendeskIntegrations(healthyClient(), { now: () => NOW, staleDays: 180 }),
+  });
+  writeByteDifferentialFixture("zendesk", "denied", await runAllAssessments(forbiddenClient()));
+  writeByteDifferentialFixture("zendesk", "partial", await runAllAssessments(truncatedClient()));
+  writeByteDifferentialFixture("zendesk", "missing-null", await runAllAssessments(emptyClient()));
+  writeByteDifferentialFixture("zendesk", "compliant", await runAllAssessments(healthyClient()));
+
+  const outputRoot = prepareByteDifferentialExportRoot("zendesk");
+  const exported = await exportZendeskAuditBundle(healthyClient(), sampleConfig(), outputRoot, { now: () => NOW });
+  writeByteDifferentialFixture("zendesk", "export", snapshotExportBundle(exported));
 });

@@ -44,6 +44,12 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const { privateKey: TEST_PRIVATE_KEY, publicKey: TEST_PUBLIC_KEY } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -2583,4 +2589,48 @@ test("reviewer B round 4 verdict N3: SF-16 is manual, not fail, on a TenantSecre
   assert.equal(findingById(completeEmptyEvents, "SF-15").evidence.event_monitoring.event_log_files_last_7_days, 0);
   assert.equal(completeEmptyEvents.summary.event_log_files, 0);
   assert.equal(completeEmptyEvents.summary.event_log_status, "ok");
+});
+
+test("byte differential fixtures: Salesforce assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const assessAll = async (client) => ({
+    platform: await assessSalesforcePlatformSecurity(client),
+    identity: await assessSalesforceIdentityAccess(client),
+    dataProtection: await assessSalesforceDataProtection(client),
+    monitoring: await assessSalesforceMonitoringIntegrations(client),
+  });
+  writeByteDifferentialFixture("salesforce", "representative", {
+    access: await checkSalesforceAccess(createFullMockClient()),
+    assessments: await assessAll(createFullMockClient()),
+  });
+  writeByteDifferentialFixture("salesforce", "boundary", {
+    platform: assessSalesforcePlatformData(goodPlatformData()),
+    identity: assessSalesforceIdentityData(goodIdentityData(), { maxAdmins: 1, now: NOW }),
+    dataProtection: assessSalesforceDataProtectionData(goodDataProtectionData(), { now: NOW }),
+    monitoring: assessSalesforceMonitoringData(goodMonitoringData()),
+  });
+  writeByteDifferentialFixture("salesforce", "denied", await assessAll(forbiddenClient()));
+  writeByteDifferentialFixture("salesforce", "partial", {
+    identity: assessSalesforceIdentityData(goodIdentityData({
+      users: okDataset("User", goodUsers, { truncated: true, seen: goodUsers.length, total: goodUsers.length + 25 }),
+    }), { now: NOW }),
+    monitoring: assessSalesforceMonitoringData(goodMonitoringData({
+      loginHistory: okDataset("LoginHistory", goodMonitoringData().loginHistory.data, { truncated: true, total: 100 }),
+    })),
+  });
+  writeByteDifferentialFixture("salesforce", "missing-null", {
+    platform: assessSalesforcePlatformData(goodPlatformData({
+      healthCheck: okDataset("SecurityHealthCheck", undefined),
+      securitySettings: okDataset("SecuritySettings", {}),
+    })),
+    identity: assessSalesforceIdentityData(goodIdentityData({
+      users: okDataset("User", []),
+      profiles: okDataset("Profile", []),
+      profileMetadata: okDataset("Profile metadata", []),
+    }), { now: NOW }),
+  });
+  writeByteDifferentialFixture("salesforce", "compliant", await assessAll(createFullMockClient()));
+
+  const outputRoot = prepareByteDifferentialExportRoot("salesforce");
+  const exported = await exportSalesforceAuditBundle(createFullMockClient(), sampleConfig(), outputRoot, { now: NOW });
+  writeByteDifferentialFixture("salesforce", "export", snapshotExportBundle(exported));
 });
