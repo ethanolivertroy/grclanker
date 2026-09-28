@@ -240,7 +240,12 @@ export function registerKevsTools(pi: any): void {
         description:
           "Search term: CVE ID (for example: 'CVE-2024-1234'), vendor, product name, or keyword.",
       }),
-      limit: Type.Optional(Type.Number({ default: 10 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: "Max results to return (default: 10).",
+          default: 10,
+        }),
+      ),
     }),
     prepareArguments: normalizeSearchArgs,
     async execute(_toolCallId: string, args: SearchArgs) {
@@ -366,7 +371,12 @@ export function registerKevsTools(pi: any): void {
           default: 30,
         }),
       ),
-      limit: Type.Optional(Type.Number({ default: 10 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: "Max results to return (default: 10).",
+          default: 10,
+        }),
+      ),
     }),
     prepareArguments: normalizeRecentArgs,
     async execute(_toolCallId: string, args: RecentArgs) {
@@ -417,7 +427,12 @@ export function registerKevsTools(pi: any): void {
       "Find KEV entries with known ransomware campaign use. Critical for prioritizing patches against ransomware threats.",
     parameters: Type.Object({
       vendor: Type.Optional(Type.String({ description: "Filter by vendor or product name." })),
-      limit: Type.Optional(Type.Number({ default: 20 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: "Max results to return (default: 20).",
+          default: 20,
+        }),
+      ),
     }),
     prepareArguments: normalizeRansomwareArgs,
     async execute(_toolCallId: string, args: RansomwareArgs) {

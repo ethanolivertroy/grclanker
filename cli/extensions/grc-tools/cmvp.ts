@@ -245,7 +245,12 @@ export function registerCmvpTools(pi: any): void {
       query: Type.String({
         description: "Search term: vendor name, module name, or certificate number.",
       }),
-      limit: Type.Optional(Type.Number({ default: 10 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: "Max results to return (default: 10).",
+          default: 10,
+        }),
+      ),
     }),
     prepareArguments: normalizeSearchArgs,
     async execute(_toolCallId: string, args: SearchArgs) {
@@ -297,7 +302,12 @@ export function registerCmvpTools(pi: any): void {
       query: Type.String({
         description: "Search term: vendor name or module name.",
       }),
-      limit: Type.Optional(Type.Number({ default: 10 })),
+      limit: Type.Optional(
+        Type.Number({
+          description: "Max results to return (default: 10).",
+          default: 10,
+        }),
+      ),
     }),
     prepareArguments: normalizeSearchArgs,
     async execute(_toolCallId: string, args: SearchArgs) {

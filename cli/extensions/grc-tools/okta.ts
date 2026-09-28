@@ -5959,8 +5959,11 @@ export function registerOktaTools(pi: any): void {
     scopes: Type.Optional(
       Type.Array(
         Type.String({
-          description: "Optional Okta OAuth read scopes to request in PrivateKey mode.",
+          description: "Okta OAuth read scope.",
         }),
+        {
+          description: "Optional Okta OAuth read scopes to request in PrivateKey mode.",
+        },
       ),
     ),
   } as const;
