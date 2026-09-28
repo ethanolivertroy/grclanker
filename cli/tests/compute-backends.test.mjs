@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   COMPUTE_BACKEND_KINDS,
@@ -233,6 +233,72 @@ test("extractComputeFlag plumbs --compute for setup, investigate, and audit", ()
   assert.deepEqual(extractComputeFlag([]), { compute: undefined, rest: [] });
   assert.throws(() => extractComputeFlag(["--compute", "nope"]), /Unknown compute backend/);
   assert.throws(() => extractComputeFlag(["--compute"]), /Missing value/);
+});
+
+test("CLI help scopes --compute to the workflow commands that extract it", () => {
+  const cliEntry = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
+  const help = spawnSync(process.execPath, [cliEntry, "--help"], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(help.status, 0, `--help exited ${help.status}: ${help.stderr}`);
+  assert.match(help.stdout, /--compute <kind>\s+Run investigate\/audit\/assess\/validate on a specific backend/);
+  assert.match(help.stdout, /interactive mode uses the backend saved by setup --compute/);
+  assert.doesNotMatch(help.stdout, /Run investigate\/audit on a specific backend/);
+
+  // Interactive mode has no command to carry the flag, so a leading --compute is rejected.
+  const interactive = spawnSync(process.execPath, [cliEntry, "--compute", "docker"], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(interactive.status, 1);
+  assert.match(interactive.stderr, /Unknown command: --compute/);
+});
+
+test("--compute reaches the investigate, audit, assess, and validate launch dispatch", () => {
+  const cliRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const cliEntry = join(cliRoot, "dist", "index.js");
+  const hooksUrl = pathToFileURL(join(cliRoot, "tests", "helpers", "pi-launch-mock-hooks.mjs")).href;
+  const preload = `data:text/javascript,${encodeURIComponent(`import { register } from "node:module"; register(${JSON.stringify(hooksUrl)});`)}`;
+  const base = mkdtempSync(join(tmpdir(), "grclanker-compute-dispatch-"));
+  const recordPath = join(base, "pi-launch.json");
+  const env = { ...process.env, GRCLANKER_HOME: base, GRCLANKER_TEST_PI_LAUNCH_RECORD: recordPath };
+  delete env.GRCLANKER_COMPUTE_BACKEND;
+  delete env.GRCLANKER_COMPUTE_BACKEND_OVERRIDE;
+
+  const launch = (args) => {
+    rmSync(recordPath, { force: true });
+    const run = spawnSync(process.execPath, ["--import", preload, cliEntry, ...args], { encoding: "utf8", timeout: 60_000, cwd: base, env });
+    assert.equal(run.status, 0, `grclanker ${args.join(" ")} exited ${run.status}: ${run.stdout}${run.stderr}`);
+    assert.ok(existsSync(recordPath), `grclanker ${args.join(" ")} never reached the Pi launch`);
+    return JSON.parse(readFileSync(recordPath, "utf8"));
+  };
+
+  try {
+    const agentDir = join(base, ".grclanker", "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+      modelMode: "hosted",
+      defaultProvider: "openai",
+      defaultModel: "gpt-test",
+      providerKind: "openai",
+      computeBackend: "host",
+    }));
+
+    for (const workflow of ["investigate", "audit", "assess", "validate"]) {
+      const prompt = readFileSync(join(cliRoot, "prompts", `${workflow}.md`), "utf8");
+
+      const flagged = launch([workflow, "--compute", "docker"]);
+      assert.equal(flagged.computeBackend, "docker", `${workflow} --compute docker`);
+      assert.equal(flagged.computeOverride, "docker", `${workflow} --compute docker`);
+      assert.equal(flagged.args.at(-1), prompt, `${workflow} must launch its own workflow prompt`);
+
+      const inline = launch([workflow, "--compute=modal"]);
+      assert.equal(inline.computeBackend, "modal", `${workflow} --compute=modal`);
+      assert.equal(inline.args.at(-1), prompt);
+
+      const saved = launch([workflow]);
+      assert.equal(saved.computeBackend, "host", `${workflow} without --compute uses the saved backend`);
+      assert.equal(saved.computeOverride, null);
+      assert.equal(saved.args.at(-1), prompt);
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("docker run args keep the phase 1 shape and honor computeDefaults", () => {

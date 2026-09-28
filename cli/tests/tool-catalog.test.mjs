@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   findRegisteredTool,
@@ -11,6 +14,7 @@ import {
 import { buildToolCatalogMarkdown } from "../scripts/generate-tool-catalog-docs.mjs";
 
 const BASELINE_DOMAIN_TOOL_COUNT = 107;
+const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function countTools(tools, kind) {
   return tools.filter((tool) => tool.kind === kind).length;
@@ -60,6 +64,44 @@ test("tool catalog reflects the bundled extension registration surface", () => {
   assert.ok(tools.some((tool) => tool.name === "webex_export_audit_bundle"));
   assert.ok(tools.some((tool) => tool.name === "zoom_check_access"));
   assert.ok(tools.some((tool) => tool.name === "zoom_export_audit_bundle"));
+});
+
+test("audit and assess prompts name the exact Google Workspace operator tools", () => {
+  const checkTool = "gws_ops_check_cli";
+  const purposeByTool = {
+    gws_ops_investigate_alerts: /\balerts?\b/i,
+    gws_ops_trace_admin_activity: /\badmin activity\b/i,
+    gws_ops_review_tokens: /\btokens?\b/i,
+    gws_ops_collect_evidence_bundle: /\bevidence\b/i,
+  };
+  const operatorTools = [checkTool, ...Object.keys(purposeByTool)];
+
+  const registeredOperatorTools = getRegisteredToolSummaries()
+    .filter((tool) => tool.name.startsWith("gws_ops_"))
+    .map((tool) => tool.name);
+  assert.deepEqual([...registeredOperatorTools].sort(), [...operatorTools].sort());
+
+  for (const prompt of ["audit", "assess"]) {
+    const text = readFileSync(resolve(cliRoot, "prompts", `${prompt}.md`), "utf8").replace(/\s+/g, " ");
+    const referenced = new Set([...text.matchAll(/`(gws_ops_[^`]*)`/g)].map((match) => match[1]));
+    assert.deepEqual([...referenced].sort(), [...operatorTools].sort(), `${prompt}.md must reference exactly the registered operator tools`);
+
+    const checkIndex = text.indexOf(`\`${checkTool}\``);
+    for (const [name, purpose] of Object.entries(purposeByTool)) {
+      const toolIndex = text.indexOf(`\`${name}\``);
+      assert.ok(toolIndex > checkIndex, `${prompt}.md must name ${name} after ${checkTool}`);
+
+      // The description that follows a tool reference runs until the next backticked name.
+      const afterTool = toolIndex + name.length + 2;
+      const nextReference = text.indexOf("`", afterTool);
+      const description = text.slice(afterTool, nextReference === -1 ? afterTool + 80 : Math.min(nextReference, afterTool + 80));
+      assert.match(description, purpose, `${prompt}.md must pair ${name} with its purpose`);
+      for (const [otherName, otherPurpose] of Object.entries(purposeByTool)) {
+        if (otherName === name) continue;
+        assert.doesNotMatch(description, otherPurpose, `${prompt}.md pairs ${name} with ${otherName}'s purpose`);
+      }
+    }
+  }
 });
 
 test("tool catalog groups tools by domain for CLI display", () => {

@@ -53,9 +53,10 @@ Usage:
   grclanker flue run -m <text>  Run the same GRC agent under the Flue Framework runtime
   grclanker investigate         Trace crypto status, KEVs, and exploitability
   grclanker audit               Map evidence against a requested framework
-  ... --compute <kind>          Run investigate/audit on a specific backend
   grclanker assess              Produce a posture readout and remediation order
   grclanker validate            Answer a narrow FIPS validation question
+  ... --compute <kind>          Run investigate/audit/assess/validate on a specific backend
+                                (interactive mode uses the backend saved by setup --compute)
 
 Install:
   curl -fsSL https://grclanker.com/install | bash
