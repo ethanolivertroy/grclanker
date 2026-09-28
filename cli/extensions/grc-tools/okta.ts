@@ -3696,7 +3696,7 @@ export function assessOktaAuthentication(
     !data.authenticators.error && authenticators.length === 0 && data.orgFactors.data.length > 0;
   recordOktaDecisionFacts("OKTA-AUTH-001", {
     readable: !data.authenticators.error,
-    complete: completeOktaDatasets(data.authenticators),
+    complete: untruncatedOktaDatasets(data.authenticators, data.orgFactors),
     classic_engine: classicEngine,
     authenticator_count: authenticators.length,
     phishing_resistant_count: phishingResistantAuthenticators.length,
