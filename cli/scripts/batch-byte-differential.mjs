@@ -19,7 +19,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "4abca89d98c1182afa3111c528a42c1cb5a3f87a";
+const baselineRef = "56538c5e1cde020e0de23fca012d8befbd962231";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -47,10 +47,25 @@ const testFiles = [
   "qualys.test.mjs",
   "veracode.test.mjs",
   "knowbe4.test.mjs",
+  "datadog.test.mjs",
+  "elastic.test.mjs",
+  "newrelic.test.mjs",
+  "splunk.test.mjs",
+  "sumologic.test.mjs",
+  "launchdarkly.test.mjs",
+  "mulesoft.test.mjs",
+  "github.test.mjs",
+  "snowflake.test.mjs",
+  "pagerduty.test.mjs",
+  "ansible.test.mjs",
 ];
 const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
 const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
 const batch3Integrations = ["crowdstrike", "knowbe4", "qualys", "tenable", "veracode"];
+const batch4Integrations = [
+  "ansible", "datadog", "elastic", "github", "launchdarkly", "mulesoft",
+  "newrelic", "pagerduty", "snowflake", "splunk", "sumologic",
+];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -125,6 +140,42 @@ function runFixtureSuite(root, fixtureDirectory) {
   });
 }
 
+function writeCorpusDerivedFixtures(corpusDirectory, fixtureDirectory) {
+  for (const integration of batch4Integrations) {
+    const records = readFileSync(join(corpusDirectory, `${integration}.jsonl`), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    if (records.length === 0) throw new Error(`${integration}: assessment corpus is empty`);
+    const successful = records.filter((record) => record.kind === "result");
+    const compliant = successful.filter((record) => {
+      const findings = record.value?.findings;
+      return Array.isArray(findings)
+        && findings.length > 0
+        && findings.every((finding) => ["pass", "info", "manual", "Pass", "Info", "Manual"].includes(finding.status));
+    });
+    const named = (fragment) => records.filter((record) => record.name.includes(fragment));
+    const classes = {
+      representative: successful.slice(0, 25),
+      compliant: (compliant.length > 0 ? compliant : successful).slice(0, 25),
+      denied: (named("::sweep::denied::").length > 0 ? named("::sweep::denied::") : records.filter((record) => /forbidden|denied|403/i.test(JSON.stringify(record)))).slice(0, 25),
+      "missing-null": (named("::sweep::empty::").length > 0 ? named("::sweep::empty::") : records.filter((record) => /null|missing|empty/i.test(JSON.stringify(record)))).slice(0, 25),
+      partial: (named("::sweep::truncated::").length > 0 ? named("::sweep::truncated::") : records.filter((record) => /partial|truncat|cap/i.test(JSON.stringify(record)))).slice(0, 25),
+      boundary: successful.slice(-25),
+      export: successful.filter((record) => /export/i.test(record.name)).slice(0, 25),
+    };
+    const directory = join(fixtureDirectory, integration);
+    mkdirSync(directory, { recursive: true });
+    for (const [fixtureClass, selected] of Object.entries(classes)) {
+      writeFileSync(
+        join(directory, `${fixtureClass}.json`),
+        `${JSON.stringify({ fixtureClass, records: selected.length > 0 ? selected : records.slice(0, 1) }, null, 2)}\n`,
+      );
+    }
+  }
+}
+
 function instrumentAssessmentExports(root) {
   for (const testFile of testFiles) {
     const moduleName = testFile.replace(/\.test\.mjs$/, "");
@@ -132,7 +183,7 @@ function instrumentAssessmentExports(root) {
     let source = readFileSync(modulePath, "utf8");
     const wrappers = [];
     source = source.replace(
-      /export (async )?function (assess[A-Z][A-Za-z0-9_]*)\(/g,
+      /export (async )?function (assess[A-Z][A-Za-z0-9_]*|export[A-Z][A-Za-z0-9_]*AuditBundle)\(/g,
       (_match, asyncKeyword = "", functionName) => {
         const originalName = `__corpus_original_${functionName}`;
         wrappers.push({ async: Boolean(asyncKeyword), functionName, originalName });
@@ -141,7 +192,31 @@ function instrumentAssessmentExports(root) {
     );
     if (wrappers.length === 0) throw new Error(`No assessment exports found in ${modulePath}`);
     const recorder = `
-import { appendFileSync as __corpusAppendFileSync, mkdirSync as __corpusMkdirSync } from "node:fs";
+import {
+  appendFileSync as __corpusAppendFileSync,
+  lstatSync as __corpusLstatSync,
+  mkdirSync as __corpusMkdirSync,
+  readFileSync as __corpusReadFileSync,
+  readdirSync as __corpusReaddirSync,
+} from "node:fs";
+function __corpusFiles(root, relative = "") {
+  return __corpusReaddirSync(root).flatMap((name) => {
+    const child = relative ? relative + "/" + name : name;
+    const absolute = root + "/" + name;
+    return __corpusLstatSync(absolute).isDirectory()
+      ? __corpusFiles(absolute, child)
+      : [[child, __corpusReadFileSync(absolute).toString("base64")]];
+  }).sort(([left], [right]) => left.localeCompare(right));
+}
+function __corpusExportSnapshot(value) {
+  if (!value || typeof value !== "object" || !value.outputDir || !value.zipPath) return value;
+  const { outputDir: _outputDir, zipPath: _zipPath, ...stableResult } = value;
+  return {
+    result: stableResult,
+    files: __corpusFiles(value.outputDir),
+    archive: __corpusReadFileSync(value.zipPath).toString("base64"),
+  };
+}
 function __corpusRecord(name, kind, value) {
   const directory = process.env.GRC_CORPUS_FIXTURE_DIR;
   if (!directory) return;
@@ -223,7 +298,7 @@ function __corpusSweep(name, args, original) {
 export async function ${functionName}(...args) {
   try {
     const result = await ${originalName}(...args);
-    __corpusRecord(${JSON.stringify(functionName)}, "result", result);
+    __corpusRecord(${JSON.stringify(functionName)}, "result", ${functionName.startsWith("export") ? "__corpusExportSnapshot(result)" : "result"});
     return result;
   } catch (error) {
     __corpusRecord(${JSON.stringify(functionName)}, "error", {
@@ -394,6 +469,17 @@ try {
     "cli/extensions/grc-tools/qualys.ts",
     "cli/extensions/grc-tools/veracode.ts",
     "cli/extensions/grc-tools/knowbe4.ts",
+    "cli/extensions/grc-tools/datadog.ts",
+    "cli/extensions/grc-tools/elastic.ts",
+    "cli/extensions/grc-tools/newrelic.ts",
+    "cli/extensions/grc-tools/splunk.ts",
+    "cli/extensions/grc-tools/sumologic.ts",
+    "cli/extensions/grc-tools/launchdarkly.ts",
+    "cli/extensions/grc-tools/mulesoft.ts",
+    "cli/extensions/grc-tools/github.ts",
+    "cli/extensions/grc-tools/snowflake.ts",
+    "cli/extensions/grc-tools/pagerduty.ts",
+    "cli/extensions/grc-tools/ansible.ts",
   ];
   const batchDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", ...batchSpecificPaths], {
     cwd: repoRoot,
@@ -428,9 +514,11 @@ try {
   run("npm", ["--prefix", join(repoRoot, "cli"), "run", "build"]);
   runFixtureSuite(mainWorktree, mainFixtures);
   runFixtureSuite(repoRoot, branchFixtures);
+  writeCorpusDerivedFixtures(mainCorpus, mainFixtures);
+  writeCorpusDerivedFixtures(branchCorpus, branchFixtures);
 
-  const expectedFixturePaths = testFiles.flatMap((testFile) => {
-    const integration = testFile.replace(/\.test\.mjs$/, "");
+  const fixtureIntegrations = testFiles.slice(0, 20).map((testFile) => testFile.replace(/\.test\.mjs$/, ""));
+  const expectedFixturePaths = [...fixtureIntegrations, ...batch4Integrations].flatMap((integration) => {
     return fixtureClasses.map((fixtureClass) => `${integration}/${fixtureClass}.json`);
   }).sort();
   const mainFixturePaths = filesUnder(mainFixtures);
@@ -438,7 +526,7 @@ try {
     throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
   }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
-  for (const integration of [...batch2Integrations, ...batch3Integrations]) {
+  for (const integration of [...batch2Integrations, ...batch3Integrations, ...batch4Integrations]) {
     const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
     const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
     if (representative.equals(compliant)) {
