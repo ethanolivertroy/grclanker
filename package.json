@@ -18,6 +18,7 @@
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
+    "@astrojs/sitemap": "^3.7.4",
     "@monaco-editor/loader": "^1.7.0",
     "@tailwindcss/vite": "^4.3.1",
     "astro": "^7.2.8",
