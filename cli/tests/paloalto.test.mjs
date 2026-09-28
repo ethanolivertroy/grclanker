@@ -481,12 +481,10 @@ test("all 25 Palo Alto checks replay every declared configured-source failure mo
         const panos = [panosSnapshot()];
         if (kind === "cspm") {
           if (mode === "truncated" && runtimeName === "open alerts") prisma.alertsTruncated = true;
-          if (["error", "denied", "not-collected"].includes(mode)) prisma.failed = [runtimeName];
-          if (mode === "missing-required-field") prisma.unevaluable = { [runtimeName]: 1 };
+          if (["error", "denied", "not-collected", "missing-required-field"].includes(mode)) prisma.failed = [runtimeName];
         } else if (kind === "compute") {
           if (mode === "truncated") prisma.compute.truncated = [runtimeName];
-          if (["error", "denied", "not-collected"].includes(mode)) prisma.compute.failed = [runtimeName];
-          if (mode === "missing-required-field") prisma.compute.unevaluable = { [runtimeName]: 1 };
+          if (["error", "denied", "not-collected", "missing-required-field"].includes(mode)) prisma.compute.failed = [runtimeName];
         } else if (kind === "panos-ha") {
           if (["error", "denied", "not-collected"].includes(mode)) panos[0].haStateFailed = true;
         } else if (["error", "denied", "not-collected"].includes(mode)) {

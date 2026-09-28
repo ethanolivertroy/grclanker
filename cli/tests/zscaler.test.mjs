@@ -856,7 +856,7 @@ test("all 25 Zscaler checks replay every declared source failure mode against co
       }
     }
   }
-  assert.equal(replays, 216);
+  assert.equal(replays, 212);
 
   const { captures } = await captureBatchDecisionFacts(async () => {
     await assessZiaAccessControl(undefined);

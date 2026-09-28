@@ -67,50 +67,86 @@ function frameworkMappings(id: string): Batch2CheckRow["frameworks"] {
     ismap: values("ISMAP "),
   };
 }
+const ociSurface = (id: string, command: string, service: string, fields: readonly string[]) =>
+  restSurface(id, command, service, OCI_DOCS, fields);
 const surfaces = [
-  restSurface("identity", "oci iam {authentication-policy|user|compartment|policy|credential} read commands", "OCI CLI Identity", OCI_DOCS, ["lifecycleState", "isMfaActivated", "capabilities.canUseConsolePassword", "passwordPolicy", "timeCreated", "statements"]),
-  restSurface("cloud-guard", "oci cloud-guard {configuration|target|problem|responder-recipe} read commands", "OCI CLI Cloud Guard", OCI_DOCS, ["status", "reportingRegion", "lifecycleState", "riskLevel", "responderRules.details.isEnabled"]),
-  restSurface("audit-events", "oci audit {config get|event list}", "OCI CLI Audit", OCI_DOCS, ["retentionPeriodDays", "eventId", "eventTime"]),
-  restSurface("event-rules", "oci events rule list", "OCI CLI Events", OCI_DOCS, ["displayName", "condition", "isEnabled", "lifecycleState"]),
-  restSurface("networking", "oci network {security-list|nsg|internet-gateway} read commands", "OCI CLI Networking", OCI_DOCS, ["ingressSecurityRules", "direction", "source", "protocol", "tcpOptions", "isEnabled", "lifecycleState"]),
-  restSurface("bastion", "oci bastion {bastion|session} read commands", "OCI CLI Bastion", OCI_DOCS, ["maxSessionTtlInSeconds", "clientCidrBlockAllowList", "sessionTtlInSeconds", "lifecycleState"]),
-  restSurface("vault", "oci kms management {vault|key|key-version} read commands", "OCI CLI Vault", OCI_DOCS, ["algorithm", "protectionMode", "keyShape", "timeCreated", "lifecycleState"]),
-  restSurface("object-storage", "oci os {bucket|preauth-request} read commands", "OCI CLI Object Storage", OCI_DOCS, ["publicAccessType", "kmsKeyId", "timeExpires", "accessType"]),
-  restSurface("compute", "oci compute {instance|volume|boot-volume} read commands", "OCI CLI Compute", OCI_DOCS, ["instanceOptions.areLegacyImdsEndpointsDisabled", "kmsKeyId", "availabilityDomain", "lifecycleState"]),
+  ociSurface("identity-authentication-policy", "oci iam authentication-policy get", "OCI CLI Identity", ["passwordPolicy"]),
+  ociSurface("identity-users", "oci iam user list", "OCI CLI Identity", ["lifecycleState", "isMfaActivated", "capabilities.canUseConsolePassword"]),
+  ociSurface("identity-credentials", "oci iam {api-key|customer-secret-key|auth-token} list", "OCI CLI Identity", ["lifecycleState", "timeCreated"]),
+  ociSurface("identity-compartments", "oci iam compartment list", "OCI CLI Identity", ["id", "compartmentId", "lifecycleState"]),
+  ociSurface("identity-policies", "oci iam policy list", "OCI CLI Identity", ["lifecycleState", "statements"]),
+  ociSurface("cloud-guard-configuration", "oci cloud-guard configuration get", "OCI CLI Cloud Guard", ["status", "reportingRegion"]),
+  ociSurface("cloud-guard-targets", "oci cloud-guard target list", "OCI CLI Cloud Guard", ["lifecycleState"]),
+  ociSurface("cloud-guard-problems", "oci cloud-guard problem list", "OCI CLI Cloud Guard", ["lifecycleState", "riskLevel"]),
+  ociSurface("cloud-guard-responder-recipes", "oci cloud-guard responder-recipe list", "OCI CLI Cloud Guard", ["lifecycleState", "responderRules.details.isEnabled"]),
+  ociSurface("audit-configuration", "oci audit config get", "OCI CLI Audit", ["retentionPeriodDays"]),
+  ociSurface("audit-event-inventory", "oci audit event list", "OCI CLI Audit", ["eventId", "eventTime"]),
+  ociSurface("event-rule-inventory", "oci events rule list", "OCI CLI Events", ["displayName", "condition", "isEnabled", "lifecycleState"]),
+  ociSurface("network-security-lists", "oci network security-list list", "OCI CLI Networking", ["ingressSecurityRules"]),
+  ociSurface("network-security-list-witness", "oci network security-list list when the primary inventory is empty", "OCI CLI Networking", ["ingressSecurityRules"]),
+  ociSurface("network-security-groups", "oci network nsg list and nsg rules list", "OCI CLI Networking", ["direction", "source", "protocol", "tcpOptions"]),
+  ociSurface("network-internet-gateways", "oci network internet-gateway list", "OCI CLI Networking", ["isEnabled", "lifecycleState"]),
+  ociSurface("bastion-inventory", "oci bastion bastion list", "OCI CLI Bastion", ["maxSessionTtlInSeconds", "clientCidrBlockAllowList", "lifecycleState"]),
+  ociSurface("bastion-details-and-sessions", "oci bastion {bastion get|session list}", "OCI CLI Bastion", ["sessionTtlInSeconds", "lifecycleState"]),
+  ociSurface("vault-inventory", "oci kms management vault list", "OCI CLI Vault", ["lifecycleState"]),
+  ociSurface("vault-keys", "oci kms management {key list|key get|key-version list}", "OCI CLI Vault", ["algorithm", "protectionMode", "keyShape", "timeCreated", "lifecycleState"]),
+  ociSurface("object-storage-buckets", "oci os bucket list", "OCI CLI Object Storage", ["publicAccessType", "kmsKeyId"]),
+  ociSurface("object-storage-details", "oci os {bucket get|preauth-request list}", "OCI CLI Object Storage", ["publicAccessType", "timeExpires", "accessType"]),
+  ociSurface("compute-instances", "oci compute instance list", "OCI CLI Compute", ["instanceOptions.areLegacyImdsEndpointsDisabled", "lifecycleState"]),
+  ociSurface("compute-volumes", "oci compute volume list", "OCI CLI Compute", ["kmsKeyId", "lifecycleState"]),
+  ociSurface("compute-boot-volumes", "oci compute boot-volume list", "OCI CLI Compute", ["kmsKeyId", "availabilityDomain", "lifecycleState"]),
 ] as const;
 
 type Row = readonly [string, number, string, Batch2CheckRow["severity"], readonly string[], boolean?];
 const rows: readonly Row[] = [
-  ["OCI-IAM-01", 1, "IAM password policy length and complexity", "high", ["identity"]],
-  ["OCI-IAM-02", 2, "Console MFA enforcement", "high", ["identity"]],
-  ["OCI-IAM-03", 3, "API key, customer secret key, and auth token rotation", "high", ["identity"]],
-  ["OCI-IAM-04", 4, "Broad IAM policies", "high", ["identity"]],
-  ["OCI-IAM-05", 5, "Compartment hierarchy depth", "medium", ["identity"]],
+  ["OCI-IAM-01", 1, "IAM password policy length and complexity", "high", ["identity-authentication-policy"]],
+  ["OCI-IAM-02", 2, "Console MFA enforcement", "high", ["identity-users"]],
+  ["OCI-IAM-03", 3, "API key, customer secret key, and auth token rotation", "high", ["identity-users", "identity-credentials"]],
+  ["OCI-IAM-04", 4, "Broad IAM policies", "high", ["identity-compartments", "identity-policies"]],
+  ["OCI-IAM-05", 5, "Compartment hierarchy depth", "medium", ["identity-compartments"]],
   ["OCI-IAM-06", 6, "IAM password expiration (manual)", "medium", [], true],
-  ["OCI-LOG-01", 7, "Cloud Guard enabled and active targets", "high", ["cloud-guard"]],
-  ["OCI-LOG-02", 8, "Open Cloud Guard problems", "high", ["cloud-guard"]],
-  ["OCI-LOG-03", 9, "Responder recipe activation", "medium", ["cloud-guard"]],
-  ["OCI-LOG-04", 10, "Audit event visibility", "medium", ["audit-events"]],
-  ["OCI-LOG-05", 11, "Event rules for critical operations", "medium", ["event-rules"]],
-  ["OCI-LOG-06", 12, "Audit log retention", "high", ["audit-events"]],
-  ["OCI-GRD-01", 13, "Security list ingress exposure", "critical", ["networking"]],
-  ["OCI-GRD-02", 14, "Network security group ingress exposure", "critical", ["networking"]],
-  ["OCI-GRD-03", 15, "Internet gateway exposure", "medium", ["networking"]],
-  ["OCI-GRD-04", 16, "Bastion controls", "medium", ["bastion"]],
-  ["OCI-GRD-05", 17, "Vault key rotation and algorithm", "high", ["vault"]],
-  ["OCI-GRD-06", 18, "Object storage public access and pre-authenticated requests", "high", ["object-storage"]],
-  ["OCI-CMP-01", 19, "IMDSv2-only instance metadata access", "high", ["compute"]],
-  ["OCI-CMP-02", 20, "Block volume customer-managed encryption", "medium", ["compute"]],
-  ["OCI-CMP-03", 21, "Boot volume customer-managed encryption", "medium", ["compute"]],
+  ["OCI-LOG-01", 7, "Cloud Guard enabled and active targets", "high", ["cloud-guard-configuration", "cloud-guard-targets"]],
+  ["OCI-LOG-02", 8, "Open Cloud Guard problems", "high", ["cloud-guard-configuration", "cloud-guard-problems"]],
+  ["OCI-LOG-03", 9, "Responder recipe activation", "medium", ["cloud-guard-configuration", "cloud-guard-responder-recipes"]],
+  ["OCI-LOG-04", 10, "Audit event visibility", "medium", ["audit-event-inventory"]],
+  ["OCI-LOG-05", 11, "Event rules for critical operations", "medium", ["identity-compartments", "event-rule-inventory"]],
+  ["OCI-LOG-06", 12, "Audit log retention", "high", ["audit-configuration"]],
+  ["OCI-GRD-01", 13, "Security list ingress exposure", "critical", ["identity-compartments", "network-security-lists"]],
+  ["OCI-GRD-02", 14, "Network security group ingress exposure", "critical", ["identity-compartments", "network-security-groups", "network-security-list-witness"]],
+  ["OCI-GRD-03", 15, "Internet gateway exposure", "medium", ["identity-compartments", "network-internet-gateways", "network-security-list-witness"]],
+  ["OCI-GRD-04", 16, "Bastion controls", "medium", ["identity-compartments", "bastion-inventory", "bastion-details-and-sessions"]],
+  ["OCI-GRD-05", 17, "Vault key rotation and algorithm", "high", ["identity-compartments", "vault-inventory", "vault-keys"]],
+  ["OCI-GRD-06", 18, "Object storage public access and pre-authenticated requests", "high", ["identity-compartments", "object-storage-buckets", "object-storage-details"]],
+  ["OCI-CMP-01", 19, "IMDSv2-only instance metadata access", "high", ["identity-compartments", "compute-instances"]],
+  ["OCI-CMP-02", 20, "Block volume customer-managed encryption", "medium", ["identity-compartments", "compute-volumes"]],
+  ["OCI-CMP-03", 21, "Boot volume customer-managed encryption", "medium", ["identity-compartments", "compute-boot-volumes"]],
 ] as const;
 
-const OCI_TRUNCATION_ONLY = ["truncated"] as const;
-const ociCompletenessSources = (
-  sourceSurfaces: readonly string[],
-): readonly BatchCompletenessSourceDefinition[] => sourceSurfaces.map((surfaceId) => ({
-  surfaceId,
-  falseWhen: OCI_TRUNCATION_ONLY,
-}));
+const OF = ["error", "denied", "not-collected"] as const;
+const OTF = ["truncated", "error", "denied", "not-collected"] as const;
+const ON = [] as const;
+const ociSource = (surfaceId: string, falseWhen: BatchCompletenessSourceDefinition["falseWhen"]): BatchCompletenessSourceDefinition => ({ surfaceId, falseWhen });
+export const OCI_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = {
+  "OCI-IAM-02": [ociSource("identity-users", ON)],
+  "OCI-IAM-03": [ociSource("identity-credentials", OTF)],
+  "OCI-IAM-04": [ociSource("identity-policies", OTF)],
+  "OCI-IAM-05": [ociSource("identity-compartments", ON)],
+  "OCI-LOG-01": [ociSource("cloud-guard-configuration", ON), ociSource("cloud-guard-targets", ON)],
+  "OCI-LOG-02": [ociSource("cloud-guard-configuration", ON), ociSource("cloud-guard-problems", ON)],
+  "OCI-LOG-03": [ociSource("cloud-guard-configuration", ON), ociSource("cloud-guard-responder-recipes", ON)],
+  "OCI-LOG-04": [ociSource("audit-event-inventory", ON)],
+  "OCI-LOG-05": [ociSource("event-rule-inventory", OTF)],
+  "OCI-LOG-06": [ociSource("audit-configuration", ON)],
+  "OCI-GRD-01": [ociSource("network-security-lists", OTF)],
+  "OCI-GRD-02": [ociSource("network-security-groups", OTF), ociSource("network-security-list-witness", OTF)],
+  "OCI-GRD-03": [ociSource("network-internet-gateways", OTF), ociSource("network-security-list-witness", OTF)],
+  "OCI-GRD-04": [ociSource("bastion-inventory", OTF), ociSource("bastion-details-and-sessions", ON)],
+  "OCI-GRD-05": [ociSource("vault-inventory", OTF), ociSource("vault-keys", OTF)],
+  "OCI-GRD-06": [ociSource("object-storage-buckets", OTF), ociSource("object-storage-details", OF)],
+  "OCI-CMP-01": [ociSource("compute-instances", OTF)],
+  "OCI-CMP-02": [ociSource("compute-volumes", OTF)],
+  "OCI-CMP-03": [ociSource("compute-boot-volumes", OTF)],
+};
 
 function owner(id: string): string {
   if (id.startsWith("OCI-IAM-")) return "oci_assess_identity";
@@ -208,8 +244,8 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
       : undefined,
     completeness: batch2Completeness(
       decisionInputs,
-      ociCompletenessSources(sourceSurfaces),
-      `true for ${title} only when every list and child read represented by the listed OCI command surface reaches its configured collection end without truncation.`,
+      OCI_COMPLETENESS_SOURCES[id] ?? [],
+      `For ${id}, true only when each named completeness source avoids exactly its declared source-state failures. A source with no failure modes affects evidence_readable or review facts instead; it does not lower evidence_complete. Qualified witness sources participate only when the primary inventory is empty.`,
     ),
     frameworks: frameworkMappings(id),
     decision: `${decisionPredicate[id]} A proved violation takes precedence over partial collection; otherwise partial or unreadable evidence cannot pass.`,

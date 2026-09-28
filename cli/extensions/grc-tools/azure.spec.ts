@@ -214,13 +214,13 @@ const AZURE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchComplete
 function azureCompletenessSemantics(id: string, title: string): string {
   switch (id) {
     case "AZURE-MON-02":
-      return "true after a readable directory-audit response; pagination truncation is not represented by this primitive in the current assessment.";
+      return "true after a readable directory-audit response; directory-audit pagination truncation leaves this primitive true.";
     case "AZURE-MON-03":
-      return "true after a readable sign-in response; pagination truncation is not represented by this primitive in the current assessment.";
+      return "true after a readable sign-in response; sign-in pagination truncation leaves this primitive true.";
     case "AZURE-MON-06":
-      return "true when the Log Analytics workspace inventory is untruncated; diagnostic-settings truncation does not change this primitive in the preserved current behavior.";
+      return "true when the Log Analytics workspace inventory is untruncated; diagnostic-settings truncation leaves this primitive true.";
     case "AZURE-SUB-04":
-      return "true after a readable Network Watcher response; pagination truncation is not represented by this primitive in the current assessment.";
+      return "true after a readable Network Watcher response; Network Watcher pagination truncation leaves this primitive true.";
     case "AZURE-DP-06":
       return "true when the member-user inventory is untruncated; individual mailbox-rule read failures are represented by mailbox_unreadable_count instead.";
     default:
