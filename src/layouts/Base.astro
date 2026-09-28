@@ -290,6 +290,27 @@ const searchData = searchEnabled
     )}
     </div>
 
+    <!-- Polite status region for copy confirmations; call window.__announce(message) -->
+    <div id="site-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script is:inline>
+    (function() {
+      var region = document.getElementById('site-announcer');
+      var setTimer = null;
+      var clearTimer = null;
+      window.__announce = function(message) {
+        if (!region) return;
+        clearTimeout(setTimer);
+        clearTimeout(clearTimer);
+        // Empty first so repeating the same message is announced again.
+        region.textContent = '';
+        setTimer = setTimeout(function() {
+          region.textContent = message;
+          clearTimer = setTimeout(function() { region.textContent = ''; }, 5000);
+        }, 100);
+      };
+    })();
+    </script>
+
     <!-- Search data for command palette -->
     {searchEnabled && (
       <script type="application/json" id="site-search-data" set:html={JSON.stringify(searchData)} />
