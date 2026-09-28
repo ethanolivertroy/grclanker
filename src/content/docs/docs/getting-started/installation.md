@@ -178,7 +178,7 @@ These installers download only `skills/grclanker/SKILL.md` from the `main` branc
 
 ## Package managers
 
-`@grclanker/cli` is not published to npm, so `npm install -g @grclanker/cli` and `bun install -g @grclanker/cli` fail. If the installer cannot use a release bundle, it prints the [source checkout](#install-from-source) steps instead.
+`@grclanker/cli` is not published to npm, so `npm install -g @grclanker/cli` and `bun install -g @grclanker/cli` fail. If no release bundle fits your platform, use a [source checkout](#install-from-source) instead.
 
 ## Verify the install
 
