@@ -27,54 +27,83 @@ export const CLOUDFLARE_CERTIFICATE_EXPIRY_WARNING_DAYS = 30;
 export const CLOUDFLARE_AUDIT_LOG_LOOKBACK_DAYS = 30;
 export const CLOUDFLARE_REQUIRED_SECURITY_HEADERS = ["content-security-policy", "x-frame-options", "x-content-type-options", "referrer-policy"] as const;
 export const CLOUDFLARE_WEAK_IDENTITY_PROVIDER_TYPES = ["onetimepin"] as const;
+const cfSurface = (id: string, path: string, fields: readonly string[]) =>
+  restSurface(id, path, "Cloudflare API v4", DOCS, fields);
 const surfaces = [
-  restSurface("token-and-account", "/user/tokens/verify and /accounts/{account_id}", "Cloudflare API v4", DOCS, ["status", "expires_on", "id", "name", "settings"]),
-  restSurface("members-and-tokens", "/accounts/{account_id}/{members|tokens}", "Cloudflare API v4", DOCS, ["id", "status", "roles", "policies", "expires_on", "modified_on"]),
-  restSurface("zero-trust-identity", "/accounts/{account_id}/access/{apps|policies|identity_providers}", "Cloudflare API v4", DOCS, ["id", "name", "type", "decision", "include", "exclude", "require"]),
-  restSurface("zones-and-settings", "/zones and /zones/{zone_id}/settings", "Cloudflare API v4", DOCS, ["id", "name", "status", "plan", "value"]),
-  restSurface("zone-rules-and-certificates", "/zones/{zone_id}/{rulesets|dnssec|ssl|origin_tls_client_auth|dns_records}", "Cloudflare API v4", DOCS, ["phase", "kind", "rules", "status", "enabled", "expires_on", "content", "proxied"]),
-  restSurface("traffic-and-account-controls", "/accounts/{account_id}/{audit_logs|firewall/access_rules/rules|gateway/rules}", "Cloudflare API v4", DOCS, ["action", "when", "mode", "notes", "modified_on", "enabled", "filters"]),
+  cfSurface("credential-method", "resolved API credential configuration", ["authMethod"]),
+  cfSurface("token-verification", "/user/tokens/verify", ["id", "status", "expires_on"]),
+  cfSurface("current-token-detail", "/user/tokens/{token_id}", ["policies", "permission_groups", "resources"]),
+  cfSurface("account-members", "/accounts/{account_id}/members", ["id", "roles", "user.two_factor_authentication_enabled"]),
+  cfSurface("user-token-inventory", "/user/tokens", ["id", "status", "expires_on", "last_used_on"]),
+  cfSurface("account-token-inventory", "/accounts/{account_id}/tokens", ["id", "status", "expires_on", "last_used_on"]),
+  cfSurface("access-applications", "/accounts/{account_id}/access/apps", ["id", "name", "type", "policies"]),
+  cfSurface("access-reusable-policies", "/accounts/{account_id}/access/policies", ["id", "name", "decision", "include", "exclude", "require"]),
+  cfSurface("access-identity-providers", "/accounts/{account_id}/access/identity_providers", ["id", "name", "type"]),
+  cfSurface("zone-inventory", "/zones", ["id", "name", "status", "plan"]),
+  cfSurface("zone-security-datasets", "/zones/{zone_id}/{settings|rulesets|dnssec|ssl|origin_tls_client_auth|dns_records|pagerules|rate_limits|bot_management}", ["phase", "kind", "rules", "status", "enabled", "expires_on", "content", "proxied", "value"]),
+  cfSurface("account-audit-logs", "/accounts/{account_id}/audit_logs", ["action", "when"]),
+  cfSurface("account-ip-access-rules", "/accounts/{account_id}/firewall/access_rules/rules", ["mode", "notes", "modified_on"]),
+  cfSurface("gateway-rules", "/accounts/{account_id}/gateway/rules", ["action", "enabled", "filters"]),
+  cfSurface("gateway-account", "/accounts/{account_id}/gateway", ["gateway_tag"]),
 ] as const;
 
 type Row = readonly [string, number, string, Batch2CheckRow["severity"], readonly string[]];
+const zoneRows: readonly Row[] = [
+  ["CF-ZONE-01", 1, "WAF managed rulesets deployed", "high", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-02", 5, "SSL mode Full (Strict)", "high", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-03", 6, "Minimum TLS version", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-04", 7, "HSTS enforcement", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-05", 8, "DNSSEC enabled", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-06", 2, "WAF custom rules with blocking actions", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-07", 3, "HTTP DDoS protection sensitivity", "high", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-08", 21, "Always Use HTTPS", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-09", 22, "Automatic HTTPS Rewrites", "low", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-10", 25, "Universal SSL and certificate validity", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-11", 18, "Authenticated Origin Pulls", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-12", 19, "Browser Integrity Check", "low", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-13", 20, "Email Address Obfuscation", "low", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-14", 23, "Security headers via transform rules", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-ZONE-15", 27, "DNS record origin exposure", "low", ["zone-inventory", "zone-security-datasets"]],
+];
 const rows: readonly Row[] = [
-  ["CF-IAM-01", 12, "Authentication method hygiene", "high", ["token-and-account"]],
-  ["CF-IAM-02", 13, "Current token verification and scoping", "high", ["token-and-account"]],
-  ["CF-IAM-03", 14, "Account member privilege concentration", "medium", ["members-and-tokens"]],
-  ["CF-IAM-04", 9, "Zero Trust Access app and policy coverage", "high", ["zero-trust-identity"]],
-  ["CF-IAM-05", 10, "Zero Trust identity provider coverage", "medium", ["zero-trust-identity"]],
-  ["CF-IAM-06", 13, "API token expiration", "medium", ["members-and-tokens"]],
-  ["CF-ZONE-01", 1, "WAF managed rulesets deployed", "high", ["zones-and-settings", "zone-rules-and-certificates"]],
-  ["CF-ZONE-02", 5, "SSL mode Full (Strict)", "high", ["zones-and-settings"]],
-  ["CF-ZONE-03", 6, "Minimum TLS version", "medium", ["zones-and-settings"]],
-  ["CF-ZONE-04", 7, "HSTS enforcement", "medium", ["zones-and-settings"]],
-  ["CF-ZONE-05", 8, "DNSSEC enabled", "medium", ["zone-rules-and-certificates"]],
-  ["CF-ZONE-06", 2, "WAF custom rules with blocking actions", "medium", ["zone-rules-and-certificates"]],
-  ["CF-ZONE-07", 3, "HTTP DDoS protection sensitivity", "high", ["zone-rules-and-certificates"]],
-  ["CF-ZONE-08", 21, "Always Use HTTPS", "medium", ["zones-and-settings"]],
-  ["CF-ZONE-09", 22, "Automatic HTTPS Rewrites", "low", ["zones-and-settings"]],
-  ["CF-ZONE-10", 25, "Universal SSL and certificate validity", "medium", ["zone-rules-and-certificates"]],
-  ["CF-ZONE-11", 18, "Authenticated Origin Pulls", "medium", ["zone-rules-and-certificates"]],
-  ["CF-ZONE-12", 19, "Browser Integrity Check", "low", ["zones-and-settings"]],
-  ["CF-ZONE-13", 20, "Email Address Obfuscation", "low", ["zones-and-settings"]],
-  ["CF-ZONE-14", 23, "Security headers via transform rules", "medium", ["zone-rules-and-certificates"]],
-  ["CF-ZONE-15", 27, "DNS record origin exposure", "low", ["zone-rules-and-certificates"]],
-  ["CF-TRF-01", 16, "Rate limiting coverage", "medium", ["zone-rules-and-certificates"]],
-  ["CF-TRF-02", 15, "Page rule security regressions", "medium", ["zone-rules-and-certificates"]],
-  ["CF-TRF-03", 4, "Bot and automated traffic controls", "medium", ["zones-and-settings"]],
-  ["CF-TRF-04", 11, "Account audit log visibility", "high", ["traffic-and-account-controls"]],
-  ["CF-TRF-05", 17, "IP access rules", "medium", ["traffic-and-account-controls"]],
-  ["CF-TRF-06", 24, "Gateway SWG policies", "medium", ["traffic-and-account-controls"]],
+  ["CF-IAM-01", 12, "Authentication method hygiene", "high", ["credential-method"]],
+  ["CF-IAM-02", 13, "Current token verification and scoping", "high", ["token-verification", "current-token-detail"]],
+  ["CF-IAM-03", 14, "Account member privilege concentration", "medium", ["account-members"]],
+  ["CF-IAM-04", 9, "Zero Trust Access app and policy coverage", "high", ["access-applications", "access-reusable-policies"]],
+  ["CF-IAM-05", 10, "Zero Trust identity provider coverage", "medium", ["access-identity-providers"]],
+  ["CF-IAM-06", 13, "API token expiration", "medium", ["user-token-inventory", "account-token-inventory"]],
+  ...zoneRows,
+  ["CF-TRF-01", 16, "Rate limiting coverage", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-TRF-02", 15, "Page rule security regressions", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-TRF-03", 4, "Bot and automated traffic controls", "medium", ["zone-inventory", "zone-security-datasets"]],
+  ["CF-TRF-04", 11, "Account audit log visibility", "high", ["account-audit-logs"]],
+  ["CF-TRF-05", 17, "IP access rules", "medium", ["account-ip-access-rules"]],
+  ["CF-TRF-06", 24, "Gateway SWG policies", "medium", ["gateway-rules", "gateway-account"]],
 ] as const;
 
-const CLOUDFLARE_TRUNCATION_ONLY = ["truncated"] as const;
-const cloudflareCompletenessSources = (
-  id: string,
-  sourceSurfaces: readonly string[],
-): readonly BatchCompletenessSourceDefinition[] => sourceSurfaces.map((surfaceId) => ({
-  surfaceId,
-  falseWhen: id === "CF-IAM-02" ? [] : CLOUDFLARE_TRUNCATION_ONLY,
-}));
+const CT = ["truncated"] as const;
+const CTF = ["truncated", "error", "denied", "not-collected"] as const;
+const CN = [] as const;
+const cfSource = (surfaceId: string, falseWhen: BatchCompletenessSourceDefinition["falseWhen"]): BatchCompletenessSourceDefinition => ({ surfaceId, falseWhen });
+const zoneCompleteness = () => [
+  cfSource("zone-inventory", CTF),
+  cfSource("zone-security-datasets", CN),
+] as const;
+export const CLOUDFLARE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = {
+  "CF-IAM-01": [cfSource("credential-method", CN)],
+  "CF-IAM-02": [cfSource("token-verification", CN), cfSource("current-token-detail", CN)],
+  "CF-IAM-03": [cfSource("account-members", CT)],
+  "CF-IAM-04": [cfSource("access-applications", CT), cfSource("access-reusable-policies", CT)],
+  "CF-IAM-05": [cfSource("access-identity-providers", CT)],
+  "CF-IAM-06": [cfSource("user-token-inventory", CTF), cfSource("account-token-inventory", CTF)],
+  ...Object.fromEntries(zoneRows.map(([id]) => [id, zoneCompleteness()])),
+  "CF-TRF-01": zoneCompleteness(),
+  "CF-TRF-02": zoneCompleteness(),
+  "CF-TRF-03": zoneCompleteness(),
+  "CF-TRF-04": [cfSource("account-audit-logs", CT)],
+  "CF-TRF-05": [cfSource("account-ip-access-rules", CT)],
+  "CF-TRF-06": [cfSource("gateway-rules", CT), cfSource("gateway-account", CN)],
+};
 
 function owner(id: string): string {
   if (id.startsWith("CF-IAM-")) return "cloudflare_assess_identity";
@@ -210,10 +239,12 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     ...custom,
     completeness: batch2Completeness(
       decisionInputs,
-      cloudflareCompletenessSources(id, sourceSurfaces),
-      id === "CF-IAM-02"
-        ? "true for current-token verification because both dependencies are single-object reads; pagination state does not change this primitive."
-        : `true for ${title} only when the account, zone, and per-zone inventories represented by the listed surfaces reach their declared ends without truncation.`,
+      CLOUDFLARE_COMPLETENESS_SOURCES[id],
+      id.startsWith("CF-ZONE-") || ["CF-TRF-01", "CF-TRF-02", "CF-TRF-03"].includes(id)
+        ? `For ${id}, the zone inventory governs evidence_complete: truncation, error, denial, or absence makes it false. Per-zone endpoint failures instead increase manual or review counts and leave evidence_complete unchanged.`
+        : id === "CF-IAM-06"
+          ? "For CF-IAM-06, each token inventory participates only when attempted. Any attempted list that truncates or fails makes evidence_complete false; an account-token read omitted because no account context exists is not a failed source."
+          : `For ${id}, each named source changes evidence_complete only for its declared source-state failures. A primary single-object error instead makes the finding manual and omits the primitive; a source with no failure modes does not lower it.`,
     ),
     decision: `${decisionPredicate[id]} ${aggregationSemantics} A proved violation has first-match precedence and incomplete or unreadable evidence cannot pass.`,
   };
