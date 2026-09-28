@@ -1323,9 +1323,9 @@ function finding(
 
 const AZURE_MANUAL_ONLY_CHECKS = new Set(["AZURE-MON-07", "AZURE-DP-02", "AZURE-DP-07"]);
 
-function evidenceCount(evidence: JsonRecord, key: string): number {
+function evidenceCount(evidence: JsonRecord, key: string): number | null {
   const entry = evidence[key];
-  return Array.isArray(entry) ? entry.length : asNumber(entry) ?? 0;
+  return Array.isArray(entry) ? entry.length : asNumber(entry) ?? null;
 }
 
 function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<string, unknown>> {
@@ -1345,49 +1345,52 @@ function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<
     ?? asNumber(item.labels)
     ?? asNumber(item.vaults)
     ?? asNumber(item.storage_accounts)
-    ?? 0;
+    ?? null;
   switch (id) {
     case "AZURE-ID-01":
-      return { policy_readable: readable, complete, policy_count: asNumber(item.total_policies) ?? 0, mfa_policy_count: asNumber(item.mfa_policies) ?? 0, security_defaults_readable: item.security_defaults_readable, security_defaults_enabled: item.security_defaults_enabled };
+      return { policy_readable: readable, complete, policy_count: asNumber(item.total_policies) ?? null, mfa_policy_count: asNumber(item.mfa_policies) ?? null, security_defaults_readable: item.security_defaults_readable, security_defaults_enabled: item.security_defaults_enabled };
     case "AZURE-ID-02":
-      return { policy_readable: readable, complete, legacy_block_policy_count: asNumber(item.legacy_auth_block_policies) ?? 0, security_defaults_readable: item.security_defaults_readable, security_defaults_enabled: item.security_defaults_enabled };
+      return { policy_readable: readable, complete, legacy_block_policy_count: asNumber(item.legacy_auth_block_policies) ?? null, security_defaults_readable: item.security_defaults_readable, security_defaults_enabled: item.security_defaults_enabled };
     case "AZURE-ID-03": {
-      const users = asNumber(item.users) ?? 0;
-      const withoutMfa = asNumber(item.users_without_mfa) ?? 0;
-      return { readable, complete, inventory_count: users, without_mfa_count: withoutMfa, without_mfa_ratio: users > 0 ? withoutMfa / users : 1 };
+      const users = asNumber(item.users);
+      const withoutMfa = asNumber(item.users_without_mfa);
+      return { readable, complete, inventory_count: users ?? null, without_mfa_count: withoutMfa ?? null, without_mfa_ratio: users !== undefined && users > 0 && withoutMfa !== undefined ? withoutMfa / users : null };
     }
     case "AZURE-ID-04":
-      return { readable, complete: item.members_truncated !== true, inventory_count: asNumber(item.activated_roles) ?? 0, global_admin_count: asNumber(item.global_administrators) ?? 0, privileged_assignment_count: asNumber(item.privileged_role_assignments) ?? 0 };
+      return { readable, complete: item.members_truncated !== true, inventory_count: asNumber(item.activated_roles) ?? null, global_admin_count: asNumber(item.global_administrators) ?? null, privileged_assignment_count: asNumber(item.privileged_role_assignments) ?? null };
     case "AZURE-ID-05":
-      return { readable, complete, inventory_count: inventoryCount, expired_credential_count: evidenceCount(item, "expired"), expiring_credential_count: evidenceCount(item, "expiring"), missing_expiry_count: asNumber(item.missing_expiry) ?? 0, long_lived_credential_count: asNumber(item.long_lived) ?? 0 };
-    case "AZURE-ID-06":
-      return { readable, complete: true, inventory_count: (asNumber(item.eligible_assignments) ?? 0) + (asNumber(item.permanent_privileged_assignments) ?? 0), eligible_assignment_count: asNumber(item.eligible_assignments) ?? 0, permanent_privileged_count: asNumber(item.permanent_privileged_assignments) ?? 0 };
+      return { readable, complete, inventory_count: inventoryCount, expired_credential_count: evidenceCount(item, "expired"), expiring_credential_count: evidenceCount(item, "expiring"), missing_expiry_count: asNumber(item.missing_expiry) ?? null, long_lived_credential_count: asNumber(item.long_lived) ?? null };
+    case "AZURE-ID-06": {
+      const eligible = asNumber(item.eligible_assignments);
+      const permanent = asNumber(item.permanent_privileged_assignments);
+      return { readable, complete: true, inventory_count: eligible !== undefined && permanent !== undefined ? eligible + permanent : null, eligible_assignment_count: eligible ?? null, permanent_privileged_count: permanent ?? null };
+    }
     case "AZURE-ID-07": {
       const guestRole = asLower(item.guestUserRoleId);
       const invites = asLower(item.allowInvitesFrom);
       return { readable, guest_role_id: guestRole ?? null, allow_invites_from: invites ?? null };
     }
     case "AZURE-ID-08":
-      return { readable, complete, inventory_count: asNumber(item.guests) ?? 0, stale_guest_count: evidenceCount(item, "stale_guests"), unknown_activity_count: asNumber(item.unknown_activity) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.guests) ?? null, stale_guest_count: evidenceCount(item, "stale_guests"), unknown_activity_count: asNumber(item.unknown_activity) ?? null };
     case "AZURE-ID-09":
     case "AZURE-ID-10":
       return { readable, complete, inventory_count: evidenceCount(item, "enforcing_policies"), license_present: item.entra_id_p2, enforcing_policy_count: evidenceCount(item, "enforcing_policies") };
     case "AZURE-ID-11":
-      return { readable, complete, inventory_count: asNumber(item.risky_users) ?? 0, high_risk_user_count: asNumber(item.high_risk_users) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.risky_users) ?? null, high_risk_user_count: asNumber(item.high_risk_users) ?? null };
     case "AZURE-ID-12":
-      return { readable, complete, inventory_count: asNumber(item.applications) ?? 0, expired_credential_count: evidenceCount(item, "expired"), expiring_credential_count: evidenceCount(item, "expiring"), missing_expiry_count: asNumber(item.missing_expiry) ?? 0, long_lived_credential_count: asNumber(item.long_lived) ?? 0, ownerless_application_count: evidenceCount(item, "ownerless") };
+      return { readable, complete, inventory_count: asNumber(item.applications) ?? null, expired_credential_count: evidenceCount(item, "expired"), expiring_credential_count: evidenceCount(item, "expiring"), missing_expiry_count: asNumber(item.missing_expiry) ?? null, long_lived_credential_count: asNumber(item.long_lived) ?? null, ownerless_application_count: evidenceCount(item, "ownerless") };
     case "AZURE-ID-13":
-      return { readable, complete, inventory_count: asNumber(item.grants) ?? 0, risky_grant_count: evidenceCount(item, "risky_grants") };
+      return { readable, complete, inventory_count: asNumber(item.grants) ?? null, risky_grant_count: evidenceCount(item, "risky_grants") };
     case "AZURE-MON-01":
-      return { readable, maximum_score: asNumber(item.max_score) ?? 0, score_ratio: asNumber(item.ratio) ?? 0 };
+      return { readable, maximum_score: asNumber(item.max_score) ?? null, score_ratio: asNumber(item.ratio) ?? null };
     case "AZURE-MON-02":
-      return { readable, complete: true, inventory_count: asNumber(item.directory_audits) ?? 0 };
+      return { readable, complete: true, inventory_count: asNumber(item.directory_audits) ?? null };
     case "AZURE-MON-03":
-      return { readable, complete: true, inventory_count: asNumber(item.sign_ins) ?? 0 };
+      return { readable, complete: true, inventory_count: asNumber(item.sign_ins) ?? null };
     case "AZURE-MON-04":
-      return { readable, complete, inventory_count: asNumber(item.total_plans) ?? 0, standard_plan_count: asNumber(item.standard_plans) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.total_plans) ?? null, standard_plan_count: asNumber(item.standard_plans) ?? null };
     case "AZURE-MON-05":
-      return { readable, complete, inventory_count: inventoryCount, effective_setting_count: asNumber(item.effective_settings) ?? 0 };
+      return { readable, complete, inventory_count: inventoryCount, effective_setting_count: asNumber(item.effective_settings) ?? null };
     case "AZURE-MON-06": {
       const workspaces = asRecords(item.workspaces);
       return { readable, complete: true, inventory_count: workspaces.length, destination_workspace_count: workspaces.length, linked_workspace_count: workspaces.length, workspace_retention_at_least_minimum_count: workspaces.filter((workspace) => (asNumber(workspace.retentionInDays) ?? 0) >= MIN_RETENTION_DAYS).length };
@@ -1397,33 +1400,33 @@ function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<
     case "AZURE-SUB-02":
       return { readable, complete, inventory_count: inventoryCount, matching_assignment_count: evidenceCount(item, "contributor_assignments"), warn_maximum: 5 };
     case "AZURE-SUB-03":
-      return { readable, complete: true, inventory_count: asNumber(item.security_contacts) ?? 0, configured_contact_count: asNumber(item.security_contacts) ?? 0 };
+      return { readable, complete: true, inventory_count: asNumber(item.security_contacts) ?? null, configured_contact_count: asNumber(item.security_contacts) ?? null };
     case "AZURE-SUB-04":
-      return { readable, complete: true, inventory_count: asNumber(item.network_watchers) ?? 0 };
+      return { readable, complete: true, inventory_count: asNumber(item.network_watchers) ?? null };
     case "AZURE-SUB-05":
       return { readable, complete, inventory_count: inventoryCount, privileged_service_principal_count: evidenceCount(item, "privileged_service_principals") };
     case "AZURE-DP-01":
-      return { readable, complete, inventory_count: asNumber(item.compliance_policies) ?? 0, license_present: item.intune_license ?? true, device_count: asNumber(item.devices) ?? 0, device_policy_with_required_settings_count: asNumber(item.compliant_device_ca_policies) ?? 0, noncompliant_device_count: asNumber(item.noncompliant_devices) ?? 0, unknown_device_count: asNumber(item.unknown_state_devices) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.compliance_policies) ?? null, license_present: item.intune_license ?? null, device_count: asNumber(item.devices) ?? null, device_policy_with_required_settings_count: asNumber(item.compliant_device_ca_policies) ?? null, noncompliant_device_count: asNumber(item.noncompliant_devices) ?? null, unknown_device_count: asNumber(item.unknown_state_devices) ?? null };
     case "AZURE-DP-03":
-      return { readable, complete, inventory_count: asNumber(item.labels) ?? 0, active_sensitivity_record_count: asNumber(item.active_labels) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.labels) ?? null, active_sensitivity_record_count: asNumber(item.active_labels) ?? null };
     case "AZURE-DP-04":
-      return { readable, complete, inventory_count: asNumber(item.vaults) ?? 0, missing_protection_count: evidenceCount(item, "missing_protection"), access_policy_vault_count: evidenceCount(item, "access_policy_vaults"), open_network_count: evidenceCount(item, "open_network") };
+      return { readable, complete, inventory_count: asNumber(item.vaults) ?? null, missing_protection_count: evidenceCount(item, "missing_protection"), access_policy_vault_count: evidenceCount(item, "access_policy_vaults"), open_network_count: evidenceCount(item, "open_network") };
     case "AZURE-DP-05":
-      return { readable, complete, inventory_count: asNumber(item.storage_accounts) ?? 0, http_allowed_count: evidenceCount(item, "http_allowed"), public_blob_count: evidenceCount(item, "public_blob_access"), public_blob_unset_count: evidenceCount(item, "public_blob_unset"), weak_tls_count: evidenceCount(item, "weak_tls") };
+      return { readable, complete, inventory_count: asNumber(item.storage_accounts) ?? null, http_allowed_count: evidenceCount(item, "http_allowed"), public_blob_count: evidenceCount(item, "public_blob_access"), public_blob_unset_count: evidenceCount(item, "public_blob_unset"), weak_tls_count: evidenceCount(item, "weak_tls") };
     case "AZURE-DP-06":
-      return { readable, complete, inventory_count: asNumber(item.seen) ?? 0, mailbox_read_count: asNumber(item.mailboxes_read) ?? 0, mailbox_unreadable_count: asNumber(item.mailboxes_unreadable) ?? 0, forwarding_rule_count: evidenceCount(item, "forwarding_rules") };
+      return { readable, complete, inventory_count: asNumber(item.seen) ?? null, mailbox_read_count: asNumber(item.mailboxes_read) ?? null, mailbox_unreadable_count: asNumber(item.mailboxes_unreadable) ?? null, forwarding_rule_count: evidenceCount(item, "forwarding_rules") };
     case "AZURE-DP-08": {
       const capability = asLower(item.sharingCapability);
       return { readable, capability_present: capability !== undefined, capability, domain_allowlist: asLower(item.sharingDomainRestrictionMode) === "allowlist", external_resharing: item.isResharingByExternalUsersEnabled === true };
     }
     case "AZURE-NP-01":
-      return { readable, complete, inventory_count: asNumber(item.network_security_groups) ?? 0, exposed_rule_count: evidenceCount(item, "exposed_rules") };
+      return { readable, complete, inventory_count: asNumber(item.network_security_groups) ?? null, exposed_rule_count: evidenceCount(item, "exposed_rules") };
     case "AZURE-NP-02":
-      return { readable, complete, inventory_count: asNumber(item.assignments) ?? 0, assignment_not_do_not_enforce_count: asNumber(item.enforced) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.assignments) ?? null, assignment_not_do_not_enforce_count: asNumber(item.enforced) ?? null };
     case "AZURE-NP-03":
-      return { readable, resource_count_present: item.non_compliant_resources !== null && item.non_compliant_resources !== undefined, policy_count_present: item.non_compliant_policies !== null && item.non_compliant_policies !== undefined, noncompliant_policy_count: asNumber(item.non_compliant_policies) ?? 0 };
+      return { readable, resource_count_present: item.non_compliant_resources !== null && item.non_compliant_resources !== undefined, policy_count_present: item.non_compliant_policies !== null && item.non_compliant_policies !== undefined, noncompliant_policy_count: asNumber(item.non_compliant_policies) ?? null };
     case "AZURE-NP-04":
-      return { readable, complete, inventory_count: asNumber(item.network_security_groups) ?? 0, covered_nsg_count: asNumber(item.covered_nsgs) ?? 0, uncovered_nsg_count: evidenceCount(item, "uncovered_nsgs") };
+      return { readable, complete, inventory_count: asNumber(item.network_security_groups) ?? null, covered_nsg_count: asNumber(item.covered_nsgs) ?? null, uncovered_nsg_count: evidenceCount(item, "uncovered_nsgs") };
     default:
       throw new Error(`${id} has no Azure decision-fact projection`);
   }
