@@ -48,7 +48,10 @@ const controls: Batch4Control[] = SUMOLOGIC_CONTROLS.map((definition) => {
     owner,
     surfaces: [sourceForOwner[owner]],
     predicate: `Count complete-population Sumo Logic records that violate ${definition.title}; personal-scope fallback results remain explicitly scoped and cannot establish organization-wide compliance.`,
-    frameworks: Object.fromEntries(frameworkLabels.map(([label, key]) => [key, [definition.mappings[label]]])),
+    frameworks: Object.fromEntries(frameworkLabels.map(([label, key]) => [
+      key,
+      [definition.mappings[label as keyof typeof definition.mappings]],
+    ])),
     emptyOutcome: [2, 7, 8, 10, 11, 15, 18, 19].includes(definition.number) ? "pass" : "manual",
   };
 });

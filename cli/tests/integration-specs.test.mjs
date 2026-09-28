@@ -125,6 +125,7 @@ test("published registry entries have complete, internally linked contracts", ()
     "duo-sec-inspector",
     "elastic-sec-inspector",
     "gcp-sec-inspector",
+    "github-sec-inspector",
     "gws-inspector-go",
     "knowbe4-sec-inspector",
     "launchdarkly-sec-inspector",

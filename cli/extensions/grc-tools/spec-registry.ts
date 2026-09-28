@@ -19,6 +19,8 @@ import { registerElasticTools } from "./elastic.js";
 import { ELASTIC_SPEC } from "./elastic.spec.js";
 import { registerGcpTools } from "./gcp.js";
 import { GCP_SPEC } from "./gcp.spec.js";
+import { registerGitHubTools } from "./github.js";
+import { GITHUB_SPEC } from "./github.spec.js";
 import { registerGwsTools } from "./gws.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import type { IntegrationSpecContract } from "./spec-model.js";
@@ -133,6 +135,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/gcp.md",
     outputPath: "specs/gcp-sec-inspector.spec.md",
     registerTools: registerGcpTools,
+  },
+  {
+    contract: GITHUB_SPEC,
+    narrativePath: "specs/narratives/github.md",
+    outputPath: "specs/github-sec-inspector.spec.md",
+    registerTools: (pi) => registerGitHubTools(withIntegrationToolContracts(pi, GITHUB_SPEC)),
   },
   {
     contract: GWS_SPEC,
