@@ -2903,8 +2903,8 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const reviews = policies.filter((item) => asString(item.verdict) === "warn").length
         + count("scans_without_policy_id")
         + (evidence.caller_is_administrator === true ? 0 : 1)
-        + (statusIsIncomplete("scan_templates_status") ? 1 : 0);
-      return fact(scans, scans === 0 ? 1 : violations, reviews, !statusIsIncomplete("scan_templates_status") && evidence.caller_is_administrator === true);
+        + (statusIsIncomplete("scan_templates_status", "policies_status") ? 1 : 0);
+      return fact(scans, scans === 0 ? 1 : violations, reviews, !statusIsIncomplete("scan_templates_status", "policies_status") && evidence.caller_is_administrator === true);
     }
     case "TENABLE-02": {
       const scans = value("scan_count") ?? 0;
@@ -3572,7 +3572,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       policy_details_http_status: data.policyDetails.httpStatus,
       policy_details_requested: data.policyDetails.data.length,
       caller_is_administrator: callerIsAdministrator,
-    }));
+    }, "", { policies_status: data.policies.status }));
 
     const recurring = scans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));
     const disabledRecurring = scans.filter((scan) => !scanIsEnabled(scan) && scanIsRecurring(scan));

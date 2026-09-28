@@ -854,6 +854,16 @@ test("control 1 is manual only when the policy details read is refused or the po
   assert.ok(unlinked.summary.includes("exposes a policy_id"), unlinked.summary);
 });
 
+test("control 1 warns when policy details are readable but the policy-name inventory is denied", async () => {
+  const denied = healthyRoutes();
+  denied["GET /policies"] = { __status: 403 };
+
+  const finding = byId(await runAll(clientsFor(denied)), "TENABLE-01");
+  assert.equal(finding.status, "warn");
+  assert.equal(finding.evidence.policy_details_status, "ok");
+  assert.match(finding.summary, /policy names are unknown/);
+});
+
 test("control 11 treats the tenant-wide All Users group as broad, alongside AllUsers and AllTags", async () => {
   const allUsersGroup = healthyRoutes();
   allUsersGroup["GET /api/v3/access-control/permissions"] = {
