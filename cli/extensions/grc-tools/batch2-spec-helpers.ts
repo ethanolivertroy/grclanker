@@ -1,6 +1,7 @@
 import {
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type PortableInputType,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
 import type {
@@ -96,6 +97,37 @@ function executableRules(row: Batch2CheckRow): readonly VerdictRule[] {
   ];
 }
 
+function portableTypes(name: string): readonly PortableInputType[] {
+  if (
+    /(?:^|_)(?:count|ratio|maximum|minimum|days?|hours?|seconds|percent|length)(?:_|$)/.test(name)
+    || ["maximum_score", "score_ratio"].includes(name)
+  ) {
+    return ["number"];
+  }
+  if (
+    /(?:^|_)(?:readable|complete|present|enabled|configured|required|denied|logged)(?:_|$)/.test(name)
+    || [
+      "license_present",
+      "domain_allowlist",
+      "external_resharing",
+      "gateway_provisioned",
+      "dns_or_http_filter_present",
+      "exemptions_readable",
+      "block_unscannable_files",
+      "panos_configured",
+      "prisma_configured",
+      "external_forwarding_configured",
+      "lowercase_required",
+      "uppercase_required",
+      "numeric_required",
+      "special_required",
+    ].includes(name)
+  ) {
+    return ["boolean"];
+  }
+  return ["string"];
+}
+
 export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinition[] {
   return rows.map((row) => {
     if (row.decisionInputs === undefined) {
@@ -113,6 +145,7 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
       frameworks: row.frameworks,
       evidenceFields: [...row.surfaces, "complete_source_counts"],
       decisionInputs: inputs,
+      decisionInputTypes: Object.fromEntries(Object.keys(inputs).map((name) => [name, portableTypes(name)])),
       decisionConstants: row.constants,
       decisionRules: executable.rules,
       derivedFactRules: executable.derivedFactRules,
