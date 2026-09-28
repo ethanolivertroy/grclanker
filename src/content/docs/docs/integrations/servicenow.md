@@ -34,7 +34,7 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | `SERVICENOW_CONFIG_FILE` | YAML config file path |
 | `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE` | HTTP timeout in seconds (default 30, clamped to 1-300), retries for 429 and 5xx (default 3, clamped to 0-10), Table API page size (default 500, clamped to 1-10000) |
 
-Only the first config file found is read: `SERVICENOW_CONFIG_FILE` (or `config_file`) when set, which must exist, otherwise `./.servicenow.yaml`, otherwise `~/.servicenow-sec-inspector/config.yaml`. Its keys are `instance`, `instance_url` (or `url`, `base_url`), `auth_method`, `username` (or `user`), `password`, `client_id`, `client_secret`, `access_token` (or `token`), `refresh_token`, `timeout_seconds` (or `timeout`), `max_retries`, and `page_size`; camelCase spellings such as `instanceUrl` and `clientSecret` are also accepted.
+Only the first config file found is read: `SERVICENOW_CONFIG_FILE` (or `config_file`) when set, which must exist, otherwise `./.servicenow.yaml`, otherwise `~/.servicenow-sec-inspector/config.yaml`. Its keys are `instance` (or `instance_name`, `instanceName`), `instance_url` (or `url`, `instanceUrl`, `base_url`), `auth_method` (or `authMethod`, `auth_mode`), `username` (or `user`), `password`, `client_id` (or `clientId`), `client_secret` (or `clientSecret`), `access_token` (or `accessToken`, `token`), `refresh_token` (or `refreshToken`), `timeout_seconds` (or `timeout`; `timeoutSeconds` is not read), `max_retries` (or `maxRetries`), and `page_size` (or `pageSize`).
 
 ### Basic authentication
 
