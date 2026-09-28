@@ -19,7 +19,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "ec0a666c9bd0f3b9a37eecb051e960c8437dde50";
+const baselineRef = "97aebd46f714618e761a1b1f557b4e4037965a76";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -42,9 +42,15 @@ const testFiles = [
   "cloudflare.test.mjs",
   "paloalto.test.mjs",
   "zscaler.test.mjs",
+  "crowdstrike.test.mjs",
+  "tenable.test.mjs",
+  "qualys.test.mjs",
+  "veracode.test.mjs",
+  "knowbe4.test.mjs",
 ];
 const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
 const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
+const batch3Integrations = ["crowdstrike", "knowbe4", "qualys", "tenable", "veracode"];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -152,6 +158,8 @@ const __corpusSweepFunctions = new Set([
   "assessZoomIdentityFromSnapshot", "assessZoomCollaborationGovernanceFromSnapshot", "assessZoomMeetingSecurityFromSnapshot",
   "assessSalesforcePlatformData", "assessSalesforceIdentityData", "assessSalesforceDataProtectionData", "assessSalesforceMonitoringData",
   "assessServicenowIdentityAccessData", "assessServicenowPlatformHardeningData", "assessServicenowAccessControlData", "assessServicenowOperationsGovernanceData",
+  "assessTenableScanProgram", "assessTenableSensorCoverage", "assessTenableAccessControl", "assessTenableVulnerabilityManagement",
+  "assessKnowbe4PhishingProgram", "assessKnowbe4TrainingProgram", "assessKnowbe4UserRisk", "assessKnowbe4AccountGovernance",
 ]);
 const __corpusSweptInputs = new Set();
 function __corpusSweep(name, args, original) {
@@ -319,22 +327,21 @@ try {
   }
   run("git", ["merge-base", "--is-ancestor", baselineSha, headSha], { capture: true });
   const batchSpecificPaths = [
-    "cli/extensions/grc-tools/azure.ts",
-    "cli/extensions/grc-tools/cloudflare.ts",
-    "cli/extensions/grc-tools/gcp.ts",
-    "cli/extensions/grc-tools/oci.ts",
-    "cli/extensions/grc-tools/paloalto.ts",
-    "cli/extensions/grc-tools/zscaler.ts",
+    "cli/extensions/grc-tools/crowdstrike.ts",
+    "cli/extensions/grc-tools/tenable.ts",
+    "cli/extensions/grc-tools/qualys.ts",
+    "cli/extensions/grc-tools/veracode.ts",
+    "cli/extensions/grc-tools/knowbe4.ts",
   ];
   const batchDiff = spawnSync("git", ["diff", "--quiet", baselineSha, headSha, "--", ...batchSpecificPaths], {
     cwd: repoRoot,
     stdio: "ignore",
   });
   if (batchDiff.status === 0) {
-    throw new Error(`No batch-2 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
+    throw new Error(`No batch-3 runtime diff exists between immutable base ${baselineSha} and HEAD ${headSha}`);
   }
   if (batchDiff.status !== 1) {
-    throw new Error(`Unable to inspect batch-2 diff between ${baselineSha} and ${headSha}`);
+    throw new Error(`Unable to inspect batch-3 diff between ${baselineSha} and ${headSha}`);
   }
   run("git", ["worktree", "add", "--detach", mainWorktree, baselineRef]);
   worktreeAdded = true;
@@ -369,7 +376,7 @@ try {
     throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
   }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
-  for (const integration of batch2Integrations) {
+  for (const integration of [...batch2Integrations, ...batch3Integrations]) {
     const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
     const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
     if (representative.equals(compliant)) {
