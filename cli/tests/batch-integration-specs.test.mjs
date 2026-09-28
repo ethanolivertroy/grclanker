@@ -1277,7 +1277,7 @@ test("contracts enumerate exact surfaces, permission unlocks, framework mappings
     (count, entry) => count + entry.contract.apiSurfaces.length,
     0,
   );
-  assert.equal(publishedSurfaceCount, 414, "all runtime-owned pilot and batch surfaces are represented exactly once");
+  assert.equal(publishedSurfaceCount, 432, "all runtime-owned pilot and batch surfaces are represented exactly once");
   const slackConfig = resolveSlackConfiguration({ token: "surface-contract-token" }, {});
   const slackScimUsers = SLACK_SPEC.apiSurfaces.find((surface) => surface.id === "scim-users");
   assert.equal(slackConfig.scimBaseUrl, "https://api.slack.com/scim/v2");
