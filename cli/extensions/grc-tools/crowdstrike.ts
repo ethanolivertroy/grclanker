@@ -2284,7 +2284,9 @@ function evaluateRtrPolicies(policies: JsonRecord[]): CrowdstrikeFinding {
     crowdstrikeDecisionFacts(
       perPolicy.length,
       anyRtr ? 0 : 1,
-      anyRtr ? perPolicy.filter((item) => item.status !== "pass").length : 0,
+      anyRtr
+        ? perPolicy.filter((item) => item.rtr_enabled !== true || item.custom_scripts === true).length
+        : 0,
       { readable: true, complete: true },
     ),
   );
@@ -3030,7 +3032,17 @@ function evaluateSensorUpdate(policies: JsonRecord[], buildsByPlatform: Map<stri
       crowdstrikeDecisionFacts(
         perPolicy.length,
         perPolicy.filter((item) => item.builds.some((build) => build.mode === "off" || (build.mode === "pinned" && item.supported_builds !== undefined && (build.number === undefined || !(build.number in item.supported_builds))))).length,
-        perPolicy.filter((item) => item.status === "warn").length,
+        perPolicy.filter((item) => {
+          const failedBuild = item.builds.some((build) =>
+            build.mode === "off"
+            || (build.mode === "pinned"
+              && item.supported_builds !== undefined
+              && (build.number === undefined || !(build.number in item.supported_builds))));
+          const reviewBuild = item.builds.some((build) =>
+            build.mode === "unknown"
+            || (build.mode === "pinned" && item.supported_builds === undefined));
+          return !failedBuild && (reviewBuild || item.uninstall_protection !== "ENABLED");
+        }).length,
         { readable: true, complete: catalogErrors.every((error) => error === undefined) },
       ),
     ),
