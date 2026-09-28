@@ -33,6 +33,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
@@ -2150,6 +2151,7 @@ export async function resolveGwsConfiguration(
   args: RawConfigArgs = {},
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<GwsResolvedConfig> {
+  env = readResolverEnvironment(GWS_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const overlays: GwsConfigOverlay[] = [];
 

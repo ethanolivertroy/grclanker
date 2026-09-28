@@ -20,6 +20,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
@@ -1004,6 +1005,7 @@ export function resolveSalesforceConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): SalesforceResolvedConfig {
+  env = readResolverEnvironment(SALESFORCE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const credentialsPath = asString(input.credentials_file) ?? asString(env.SF_CREDENTIALS_FILE);
   const file = credentialsPath ? readCredentialsFile(credentialsPath) : {};

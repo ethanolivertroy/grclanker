@@ -21,6 +21,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
+import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SERVICENOW_SPEC } from "./servicenow.spec.js";
@@ -968,6 +969,7 @@ export function resolveServicenowConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   options: { cwd?: string; homeDir?: string } = {},
 ): ServicenowResolvedConfig {
+  env = readResolverEnvironment(SERVICENOW_AUTH_RESOLVER, env);
   const cwd = options.cwd ?? process.cwd();
   const homeDir = options.homeDir ?? homedir();
   const sourceChain: string[] = [];

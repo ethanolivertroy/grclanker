@@ -8,6 +8,13 @@ export interface ResolverAuthenticationContract {
   refreshRequest?: string;
 }
 
+export function readResolverEnvironment(
+  contract: ResolverAuthenticationContract,
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  return Object.fromEntries(contract.environment.map((name) => [name, environment[name]]));
+}
+
 export const OKTA_AUTH_RESOLVER = {
   modes: ["SSWS API token", "OAuth service application private-key JWT", "Prebuilt OAuth client assertion"],
   precedence: ["Explicit tool arguments", "OKTA_CLIENT_* environment variables", "Project .okta.yaml", "Home ~/.okta/okta.yaml"],

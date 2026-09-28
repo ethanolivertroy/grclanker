@@ -21,6 +21,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -2115,6 +2116,7 @@ export async function resolveOktaConfiguration(
   cwd: string = process.cwd(),
   homeDir: string = homedir(),
 ): Promise<OktaResolvedConfig> {
+  env = readResolverEnvironment(OKTA_AUTH_RESOLVER, env);
   let merged: OktaConfigOverlay = {
     authMode: "SSWS",
     scopes: [],

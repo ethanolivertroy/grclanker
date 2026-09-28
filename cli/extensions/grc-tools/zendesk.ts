@@ -22,6 +22,7 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZENDESK_SPEC } from "./zendesk.spec.js";
@@ -392,6 +393,7 @@ export function resolveZendeskConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = homedir(),
 ): ZendeskResolvedConfig {
+  env = readResolverEnvironment(ZENDESK_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const explicitConfigPath = asString(input.config_file) ?? asString(env.ZENDESK_CONFIG_FILE);
   const configPath = explicitConfigPath ?? join(homeDir, ".zendesk", "config.json");

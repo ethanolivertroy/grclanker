@@ -21,6 +21,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
@@ -899,6 +900,7 @@ export function resolveBoxConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   options: { cwd?: string; homeDir?: string } = {},
 ): BoxResolvedConfig {
+  env = readResolverEnvironment(BOX_AUTH_RESOLVER, env);
   const cwd = options.cwd ?? process.cwd();
   const homeDir = options.homeDir ?? homedir();
   const sourceChain: string[] = [];

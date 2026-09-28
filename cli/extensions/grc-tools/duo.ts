@@ -19,6 +19,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
 import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1057,6 +1058,7 @@ export function resolveDuoConfiguration(
   args: RawConfigArgs = {},
   env: NodeJS.ProcessEnv = process.env,
 ): DuoResolvedConfig {
+  env = readResolverEnvironment(DUO_AUTH_RESOLVER, env);
   let merged: DuoConfigOverlay = {};
   const sourceChain: string[] = [];
 

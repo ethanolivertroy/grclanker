@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -834,6 +835,7 @@ export function resolveZoomConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): ZoomResolvedConfig {
+  env = readResolverEnvironment(ZOOM_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const configFile = discoverConfigFile(input, env);
   const fileValues = configFile ? readConfigFile(configFile) : {};
