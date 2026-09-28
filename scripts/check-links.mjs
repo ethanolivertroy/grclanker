@@ -106,12 +106,16 @@ function linksFrom(tags) {
 
 // Mirrors Workers static assets `html_handling: auto-trailing-slash`: /file,
 // /file.html, /file/, /file/index, and /file/index.html all reach file.html,
-// and the same spellings of /folder reach folder/index.html. Anything else
-// gets the `not_found_handling: 404-page` response, so a miss is a broken link.
+// and the same spellings of /folder reach folder/index.html. When both
+// x.html and x/index.html exist, /x prefers x.html while /x/ and /x/index
+// prefer x/index.html. Anything else gets the `not_found_handling: 404-page`
+// response, so a miss is a broken link.
 export function resolveTarget(pathname, files) {
   if (files.has(pathname)) return pathname;
   const base = pathname.replace(/(\/index\.html|\/index|\.html|\/)$/, '');
-  return [`${base}.html`, `${base}/index.html`].find((candidate) => files.has(candidate));
+  const candidates = [`${base}.html`, `${base}/index.html`];
+  if (/(\/|\/index(\.html)?)$/.test(pathname)) candidates.reverse();
+  return candidates.find((candidate) => files.has(candidate));
 }
 
 function baseUrl(file) {

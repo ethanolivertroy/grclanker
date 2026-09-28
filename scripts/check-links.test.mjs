@@ -60,6 +60,38 @@ test('resolveTarget mirrors the Workers auto-trailing-slash table', () => {
   }
 });
 
+test('resolveTarget matches Workers when x.html and x/index.html both exist', () => {
+  const files = new Set(['/dual.html', '/dual/index.html']);
+  const expected = {
+    '/dual': '/dual.html',
+    '/dual.html': '/dual.html',
+    '/dual/': '/dual/index.html',
+    '/dual/index': '/dual/index.html',
+    '/dual/index.html': '/dual/index.html',
+  };
+  for (const [path, target] of Object.entries(expected)) {
+    assert.equal(resolveTarget(path, files), target, path);
+  }
+});
+
+test('fragments on colliding pages are checked against the page Workers serves', () => {
+  const problems = problemsFor({
+    'dual.html': '<h2 id="standalone">Standalone</h2>',
+    'dual/index.html': '<h2 id="folder">Folder</h2>',
+    'page/index.html': `
+      <a href="/dual#standalone">ok</a>
+      <a href="/dual.html#standalone">ok</a>
+      <a href="/dual/#folder">ok</a>
+      <a href="/dual/index#folder">ok</a>
+      <a href="/dual/index.html#folder">ok</a>
+      <a href="/dual#folder">bad</a>
+      <a href="/dual/#standalone">bad</a>`,
+  });
+  assert.equal(problems.length, 2);
+  assert.match(problems[0], /\/dual#folder \(no id="folder" on \/dual\.html\)/);
+  assert.match(problems[1], /\/dual\/#standalone \(no id="standalone" on \/dual\/index\.html\)/);
+});
+
 test('raw-text element bodies are ignored but their opening tags are checked', () => {
   const tags = parseTags(`
     <script src="/app.js">const link = '<a href="/in-script">';</script>
