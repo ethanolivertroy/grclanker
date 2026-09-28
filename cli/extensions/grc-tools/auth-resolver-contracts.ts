@@ -360,3 +360,67 @@ export const ZSCALER_AUTH_RESOLVER = {
   configFields: ["zia.client", "zpa.client", "zscaler.client"],
   refreshRequest: "POST /authenticatedSession for ZIA; POST /signin for ZPA OAuth client credentials.",
 } as const satisfies ResolverAuthenticationContract;
+
+export const CROWDSTRIKE_AUTH_RESOLVER = {
+  modes: ["Falcon OAuth 2.0 client credentials"],
+  precedence: ["Explicit tool arguments", "CS_* then FALCON_* environment aliases", "Explicit or default CrowdStrike JSON config"],
+  environment: [
+    "CS_CONFIG_FILE", "CS_CLIENT_ID", "FALCON_CLIENT_ID", "CS_CLIENT_SECRET", "FALCON_CLIENT_SECRET",
+    "CS_CLOUD", "FALCON_CLOUD", "CS_BASE_URL", "FALCON_BASE_URL", "CS_MEMBER_CID",
+    "FALCON_MEMBER_CID", "CS_TIMEOUT",
+  ],
+  configLocations: ["~/.crowdstrike/config.json", "Explicit path from config_file or CS_CONFIG_FILE"],
+  variants: ["us-1", "us-2", "eu-1", "us-gov-1", "us-gov-2", "Optional Flight Control member CID"],
+  configFields: ["client_id", "clientId", "client_secret", "clientSecret", "cloud", "region", "base_url", "baseUrl", "member_cid", "memberCid", "timeout_seconds"],
+  refreshRequest: "POST /oauth2/token with application/x-www-form-urlencoded client_id and client_secret; cache until 60 seconds before expiry and refresh once after HTTP 401.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const TENABLE_AUTH_RESOLVER = {
+  modes: ["Tenable Vulnerability Management X-ApiKeys access/secret pair", "Tenable Security Center x-apikey access/secret pair"],
+  precedence: ["Explicit tool arguments", "TENABLE_* environment variables", "Explicit or default Tenable YAML/JSON config"],
+  environment: [
+    "TENABLE_CONFIG_FILE", "TENABLE_URL", "TENABLE_BASE_URL", "TENABLE_ACCESS_KEY", "TENABLE_SECRET_KEY",
+    "TENABLE_SC_URL", "TENABLE_SC_ACCESS_KEY", "TENABLE_SC_SECRET_KEY", "TENABLE_TIMEOUT",
+  ],
+  configLocations: ["~/.tenable/config.yaml", "Explicit path from config_file or TENABLE_CONFIG_FILE"],
+  variants: ["cloud.tenable.com", "fedcloud.tenable.com", "Tenable Security Center URL", "Simultaneous VM and Security Center tenants"],
+  configFields: ["url", "base_url", "access_key", "accessKey", "secret_key", "secretKey", "sc_url", "sc_access_key", "sc_secret_key", "timeout_seconds"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const QUALYS_AUTH_RESOLVER = {
+  modes: ["HTTP Basic username/password", "Pre-issued bearer token", "Qualys gateway OAuth token exchange"],
+  precedence: ["Explicit tool arguments", "QUALYS_* environment variables", "Explicit or default Qualys key/value or INI config"],
+  environment: [
+    "QUALYS_CONFIG_FILE", "QUALYS_USERNAME", "QUALYS_USER", "QUALYS_PASSWORD", "QUALYS_TOKEN",
+    "QUALYS_ACCESS_TOKEN", "QUALYS_USE_OAUTH", "QUALYS_PLATFORM", "QUALYS_API_SERVER", "QUALYS_BASE_URL",
+    "QUALYS_API_URL", "QUALYS_GATEWAY_URL", "QUALYS_TIMEOUT", "QUALYS_MAX_RETRIES", "QUALYS_LOOKBACK_DAYS",
+  ],
+  configLocations: ["~/.qcrc", "Explicit path from config_file or QUALYS_CONFIG_FILE"],
+  variants: ["US1", "US2", "US3", "US4", "GOV1", "EU1", "EU2", "EU3", "IN1", "CA1", "AE1", "UK1", "AU1", "KSA1", "Explicit API and gateway URLs"],
+  configFields: ["username", "user", "password", "token", "use_oauth", "platform", "hostname", "base_url", "gateway_url", "timeout"],
+  refreshRequest: "POST /auth on the selected platform gateway with username, password, and token=true.",
+} as const satisfies ResolverAuthenticationContract;
+
+export const VERACODE_AUTH_RESOLVER = {
+  modes: ["VERACODE-HMAC-SHA-256 API ID and secret signing"],
+  precedence: ["Explicit tool arguments", "VERACODE_* environment variables", "Selected profile in the Veracode credentials INI file"],
+  environment: [
+    "VERACODE_API_PROFILE", "VERACODE_API_CREDENTIALS_FILE", "VERACODE_API_KEY_ID",
+    "VERACODE_API_KEY_SECRET", "VERACODE_REGION", "VERACODE_API_BASE_URL", "VERACODE_TIMEOUT",
+  ],
+  configLocations: ["~/.veracode/credentials", "Explicit path from credentials_file or VERACODE_API_CREDENTIALS_FILE"],
+  variants: ["us: api.veracode.com", "eu: api.veracode.eu", "us-fed: api.veracode.us", "Explicit same-origin API base URL"],
+  configFields: ["veracode_api_key_id", "veracode_api_key_secret"],
+} as const satisfies ResolverAuthenticationContract;
+
+export const KNOWBE4_AUTH_RESOLVER = {
+  modes: ["KnowBe4 Reporting API bearer token", "Optional independent PhishER Product API bearer token"],
+  precedence: ["Explicit tool arguments", "KNOWBE4_* environment variables", "Explicit or default KnowBe4 YAML config"],
+  environment: [
+    "KNOWBE4_CONFIG_FILE", "KNOWBE4_API_TOKEN", "KNOWBE4_REGION", "KNOWBE4_BASE_URL",
+    "KNOWBE4_PHISHER_API_TOKEN", "KNOWBE4_PHISHER_GRAPHQL_URL", "KNOWBE4_TIMEOUT", "KNOWBE4_REDACT_PII",
+  ],
+  configLocations: ["~/.knowbe4-inspector/config.yaml", "Explicit path from config_file or KNOWBE4_CONFIG_FILE"],
+  variants: ["us", "eu", "ca", "uk", "de", "Optional region-specific PhishER GraphQL endpoint"],
+  configFields: ["api_token", "region", "base_url", "phisher_api_token", "phisher_graphql_url", "timeout", "redact_pii"],
+} as const satisfies ResolverAuthenticationContract;
