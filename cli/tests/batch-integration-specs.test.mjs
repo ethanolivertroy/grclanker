@@ -61,12 +61,12 @@ const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|
 const ABSENT = Symbol("absent");
 const DEFINED = Symbol("defined");
 
-function alternativeValue(value) {
-  if (typeof value === "boolean") return !value;
-  if (typeof value === "number") return value + 1;
-  if (typeof value === "string") return `${value}__different`;
-  if (value === null) return 0;
-  return "__different";
+function alternativeValues(value) {
+  if (typeof value === "boolean") return [!value];
+  if (typeof value === "number") return [value + 1, value - 1];
+  if (typeof value === "string") return [`${value}__different`];
+  if (value === null) return [0];
+  return ["__different"];
 }
 
 function mergeAssignments(left, right) {
@@ -115,15 +115,18 @@ function comparisonWitnesses(condition, desired, constants) {
       return Object.is(left.value, right.value) === equal ? [new Map()] : [];
     }
     if (!left.known && right.known) {
-      return [new Map([[left.path, equal ? right.value : alternativeValue(right.value)]])];
+      const values = equal ? [right.value] : alternativeValues(right.value);
+      return values.map((value) => new Map([[left.path, value]]));
     }
     if (left.known && !right.known) {
-      return [new Map([[right.path, equal ? left.value : alternativeValue(left.value)]])];
+      const values = equal ? [left.value] : alternativeValues(left.value);
+      return values.map((value) => new Map([[right.path, value]]));
     }
-    return [new Map([
+    const rightValues = equal ? [0] : [1, -1];
+    return rightValues.map((value) => new Map([
       [left.path, 0],
-      [right.path, equal ? 0 : 1],
-    ])];
+      [right.path, value],
+    ]));
   }
   const comparison = condition.op === "gt" ? "gt" : "lte";
   if (left.known && right.known) {
