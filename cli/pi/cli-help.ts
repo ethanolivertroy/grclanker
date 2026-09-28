@@ -30,6 +30,7 @@ Recommended next step after install:
 
 Options:
   --help, -h                    Show this help
-  --compute <kind>              Override the compute backend for this invocation
+  --compute <kind>              Use <kind> for this investigate/audit/assess/validate or "<prompt>" run only
+                                (bare interactive mode uses the backend saved by setup --compute)
   --                            Treat all following text literally (including --compute)
 `;
