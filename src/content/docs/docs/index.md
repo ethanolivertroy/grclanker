@@ -27,6 +27,10 @@ The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. 
 - [Cursor Agent SDK](/docs/getting-started/agent-sdk/) documents schema conversion, read effects, approval-gated writers, dry runs, and local serving.
 - [Flue Runtime](/docs/getting-started/flue-runtime/) documents the bundled runner, the official CLI, local models, persistence, and credential-safe activity logs.
 
+## What's new
+
+[What's New](/docs/changelog/) lists what the next release adds on top of the `v0.0.1` bundle and how to run it from source today.
+
 ## Shipped surface
 
 - 241 domain tools and 7 compute backend tools, grouped in the [tool catalog](/docs/tools/catalog/).
@@ -43,7 +47,7 @@ Each integration guide in this documentation describes its authentication, colle
 
 The current tool families share hardening for credential-aware error scrubbing, fixed-shape config errors, incomplete collection markers, and pagination status. Runtime adapters validate schemas at their boundaries. The Cursor Agent SDK marks 199 tools as read-only and approval-gates 42 writers. Flue redacts credential-shaped activity log arguments and documents its persistence risks.
 
-Export behavior differs by integration, including whether repeated runs reuse paths. Review each integration guide before handling tenant data or preserving prior bundles.
+Evidence exporters allocate a new bundle path on each rerun instead of overwriting a prior export. Each integration guide documents its export layout and sensitive-data handling; review it before handling tenant data.
 
 ## Specs
 

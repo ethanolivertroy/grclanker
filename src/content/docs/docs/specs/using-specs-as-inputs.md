@@ -29,7 +29,7 @@ Ask an agent to compare the spec with the existing implementation before changin
 Read specs/aws-sec-inspector.spec.md, inspect the existing AWS tools, and propose an extension.
 ```
 
-grclanker does not accept a prompt as a command-line argument (`grclanker "..."` answers `Unknown command`), so start the session first and type the request.
+On a source install you can also pass the request directly: `grclanker "Read specs/aws-sec-inspector.spec.md, inspect the existing AWS tools, and propose an extension."` The `v0.0.1` release bundle answers `Unknown command` to that form, so start the session there and type the request.
 
 ## Use any agent or interface
 

@@ -25,7 +25,8 @@ These are on `main` but not in the `v0.0.1` bundle:
 - `grclanker tools`, which lists every bundled tool
 - `grclanker flue run`, which runs the same agent under the [Flue runtime](/docs/getting-started/flue-runtime/)
 - `grclanker env list`
-- `--compute <kind>` to pick a compute backend: for one run of `investigate`, `audit`, `assess`, or `validate`; with `grclanker setup --compute <kind>` to save it as the preferred backend; and as an alias for `--backend` on `env smoke-test` and `env exec`. A bare `grclanker --compute <kind>` is rejected as an unknown command.
+- `grclanker "<prompt>"` for a free-form prompt, and a subject after `investigate`, `audit`, `assess`, or `validate`
+- `--compute <kind>` to pick a compute backend: for one run of `investigate`, `audit`, `assess`, `validate`, or a `"<prompt>"`; with `grclanker setup --compute <kind>` to save it as the preferred backend; and as an alias for `--backend` on `env smoke-test` and `env exec`. A bare `grclanker --compute <kind>` is rejected as an unknown command.
 
 To use any of those now, [install from source](#install-from-source).
 

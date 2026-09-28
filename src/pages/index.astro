@@ -4,7 +4,9 @@ import { resolve } from 'node:path';
 import Base from '../layouts/Base.astro';
 import { loadSpecs } from '../lib/specs';
 
-const integrationSpecCount = loadSpecs().filter((spec) => spec.vendor !== 'grclanker').length;
+const specs = loadSpecs();
+const integrationSpecCount = specs.filter((spec) => spec.vendor !== 'grclanker').length;
+const generatedSpecCount = specs.filter((spec) => spec.status === 'generated').length;
 
 const installCommands = [
   { key: 'curl', label: 'curl', command: 'curl -fsSL https://grclanker.com/install | bash' },
@@ -21,8 +23,8 @@ const terminalExamples = [
     description: 'Resolve the exact validation record and answer with the cert, standard, and status.',
   },
   {
-    command: 'grclanker investigate',
-    description: 'Start the investigation workflow, then name a CVE, vendor, or module to trace KEV status, EPSS likelihood, and ransomware linkage.',
+    command: 'grclanker investigate "CVE-2024-3094"',
+    description: 'Start the investigation workflow with its subject filled in to trace KEV status, EPSS likelihood, and ransomware linkage.',
   },
   {
     command: 'grclanker tools aws_check_access',
@@ -99,6 +101,49 @@ const screenshotCandidates = [
 const previewImage = screenshotCandidates.find((candidate) =>
   existsSync(resolve(process.cwd(), 'public', candidate.slice(1))),
 );
+
+const whatsNew = [
+  {
+    label: '8 to 241 tools',
+    color: 'text-sapphire',
+    detail: '35 vendor integrations plus FedRAMP, SCF, and OSCAL tools, each integration with its own docs guide.',
+  },
+  {
+    label: 'Ask from the shell',
+    color: 'text-yellow',
+    detail: 'grclanker "<prompt>" and grclanker investigate <subject> pass your question straight in, with an optional --compute backend for that run.',
+  },
+  {
+    label: 'Two more runtimes',
+    color: 'text-peach',
+    detail: 'The Cursor Agent SDK serves all 241 tools with 42 approval-gated writers, and grclanker flue run drives the same agent under Flue.',
+  },
+  {
+    label: 'Remote compute',
+    color: 'text-green',
+    detail: 'Modal, RunPod Pod, and RunPod Serverless join host, sandbox-runtime, Docker, and Parallels VM backends.',
+  },
+  {
+    label: 'Specs from code',
+    color: 'text-mauve',
+    detail: `${specs.length} repository specs, ${generatedSpecCount} of them generated from the tool registry. CI fails when a generated spec drifts.`,
+  },
+  {
+    label: 'Hardened evidence',
+    color: 'text-blue',
+    detail: 'Credential scrubbing in errors and exports, no credentials on cross-origin pagination links, and exports that allocate a new bundle on rerun.',
+  },
+  {
+    label: 'Verifiable releases',
+    color: 'text-sky',
+    detail: 'Reproducible bundles for six platforms with SHA256SUMS and GitHub build provenance attestations, plus CI on every pull request.',
+  },
+  {
+    label: 'Apache-2.0',
+    color: 'text-lavender',
+    detail: 'grclanker is licensed under the Apache License 2.0, with a NOTICE file.',
+  },
+];
 ---
 
 <Base title="grclanker: Put a Clanker on Your Compliance" description="241 domain tools across 35 vendor integrations and CMVP, KEV, EPSS, FedRAMP, SCF, and OSCAL, with Pi, Cursor Agent SDK, and Flue runtime paths.">
@@ -246,9 +291,9 @@ const previewImage = screenshotCandidates.find((candidate) =>
         <div class="hero-briefing-top">
           <div>
             <h2 class="font-semibold text-sm tracking-widest uppercase text-blue">What You Ask → What It Does</h2>
-            <p class="text-subtext0 text-sm mt-1 italic">Shipped behavior, not a roadmap.</p>
+            <p class="text-subtext0 text-sm mt-1 italic">Implemented on main, not a roadmap.</p>
           </div>
-          <div class="hero-briefing-version">0.0.1 experimental</div>
+          <div class="hero-briefing-version">main // unreleased</div>
         </div>
 
         <div class="hero-briefing-grid">
@@ -277,6 +322,29 @@ const previewImage = screenshotCandidates.find((candidate) =>
               ))}
             </div>
           </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="viewscreen rounded-xl scanlines relative overflow-hidden" aria-labelledby="whats-new-heading">
+      <div class="relative z-10 p-5 md:p-6">
+        <div class="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h2 id="whats-new-heading" class="font-semibold text-sm tracking-widest uppercase text-blue">What's New Since v0.0.1</h2>
+            <p class="text-subtext0 text-sm mt-1 italic">On main now. Ships in the next release; build from source to use it today.</p>
+          </div>
+          <a href="/docs/changelog/" class="spec-action-btn spec-action-btn-primary self-start md:self-auto">
+            Full changelog
+          </a>
+        </div>
+
+        <div class="workflow-grid">
+          {whatsNew.map((item) => (
+            <div class="workflow-row">
+              <div class:list={['font-mono text-sm', item.color]}>{item.label}</div>
+              <div class="text-subtext0 text-sm mt-2 leading-relaxed">{item.detail}</div>
+            </div>
+          ))}
         </div>
       </div>
     </section>

@@ -49,7 +49,14 @@ grclanker assess
 grclanker validate
 ```
 
-Workflow commands do not take the question as an argument. Name the vendor, product, CVE, or framework in the session once it opens.
+On a source install, a workflow command also takes its subject, and a quoted prompt goes straight to the agent:
+
+```bash
+grclanker investigate "CVE-2024-3094"
+grclanker "Is CVE-2024-3400 in the CISA KEV catalog?"
+```
+
+The `v0.0.1` bundle does not take either form. There, name the vendor, product, CVE, or framework in the session once it opens.
 
 On a source install, list the full tool surface first:
 
