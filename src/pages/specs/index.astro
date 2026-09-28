@@ -4,10 +4,11 @@ import SpecCatalogSection from '../../components/SpecCatalogSection.astro';
 import { RAW_BASE, loadSpecs } from '../../lib/specs';
 
 const specs = loadSpecs();
+const generatedSpecCount = specs.filter((spec) => spec.status === 'generated').length;
 const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
 ---
 
-<Base title="Specs: grclanker" description="Browse 35 shipped GRC integrations and the repository spec for each one, or reuse a raw spec with any agent.">
+<Base title="Specs: grclanker" description="Browse 35 repository specs for shipped grclanker integrations and compute backends, or reuse a raw spec with any agent.">
   <section class="relative overflow-hidden border-b border-surface0/60">
     <div class="absolute inset-0 w-full h-full">
       <img src="/hero/holographic.webp" alt="Spec catalog cockpit display" class="w-full h-full object-cover object-center" loading="eager" />
@@ -17,10 +18,10 @@ const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
     <div class="relative z-10 max-w-content mx-auto px-6 pt-14 pb-14 md:pt-18 md:pb-18">
       <div class="max-w-3xl mx-auto text-center">
         <h1 class="font-bold text-3xl sm:text-4xl md:text-5xl text-text leading-tight hero-text-shadow">
-          35 integrations. A repository spec for each one.
+          {specs.length} specs. Each one backed by shipped tools.
         </h1>
         <p class="mx-auto mt-4 max-w-2xl text-base text-subtext1 leading-relaxed italic">
-          Inspect what shipped, or reuse the raw build plan with any agent.
+          One per vendor integration except Vanta, plus the compute backends. Inspect what shipped, or reuse the raw build plan with any agent.
         </p>
       </div>
 
@@ -58,7 +59,7 @@ const heroCommand = `curl -O ${RAW_BASE}/aws-sec-inspector.spec.md`;
         <div class="max-w-2xl">
           <h2 class="font-semibold text-sm tracking-widest uppercase text-blue mb-2">Use With Any Agent</h2>
           <p class="text-subtext1 text-sm leading-relaxed italic">
-            Each spec now has a native grclanker tool family. The raw files remain portable inputs for extensions, independent implementations, and review.
+            Each spec now has a native grclanker tool family, and {generatedSpecCount} of them are generated from it. The raw files remain portable inputs for extensions, independent implementations, and review.
           </p>
         </div>
         <a href="/docs/specs/using-specs-as-inputs" class="spec-action-btn spec-action-btn-primary self-start md:self-auto">
