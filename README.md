@@ -25,7 +25,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | i
 The installers download the newest GitHub release bundle, which today is the `v0.0.1` pre-release. That bundle registers 8 domain tools (`cmvp_*` and `kevs_*`) and supports `setup`, `env doctor`, `env smoke-test`, `env exec`, and the four workflow commands. `grclanker tools`, `grclanker env list`, `grclanker flue run`, and `--compute` are only on `main` until the next release bundle is cut.
 
 `@grclanker/cli` is not published to npm yet, so `npm install -g @grclanker/cli` and `bun install -g @grclanker/cli` do not work.
-When an installer cannot use a release bundle, it points to the source-checkout path below instead of those unpublished package-manager commands.
+If no release bundle fits your platform, use the source-checkout path below.
 
 Run `main` from a source checkout (Node 22.19 or newer):
 
