@@ -14,14 +14,15 @@ description: Produce an evidence-backed posture readout with a posture rating, t
 
 ## Start it
 
-Inside a grclanker session, send `/assess` on its own, then name the system in your next message, for example:
+Inside a grclanker session, put the subject after the command:
 
 ```text
-/assess
-Our crypto and vulnerability posture for the payments service.
+/assess Our crypto and vulnerability posture for the payments service.
 ```
 
-From the shell, `grclanker assess` opens a session that starts with the same prompt. Text typed after `/assess` on the same line is dropped in this release because the shipped prompt has no argument placeholder, so put the subject in its own message.
+From the shell, `grclanker assess "<subject>"` opens a session that starts with the same prompt and the subject filled in. Run `grclanker assess` on its own to name the system in your first message instead.
+
+In the `v0.0.1` release bundle, text after `/assess` and arguments after `grclanker assess` are dropped, so send the subject in its own message there.
 
 ## What the prompt does
 

@@ -7,16 +7,15 @@ description: Trace crypto status, KEV exposure, EPSS likelihood, and ransomware 
 
 ## Start it
 
-Inside a grclanker session, send the command on its own, then name the subject in your next message:
+Inside a grclanker session, put the subject after the command:
 
 ```text
-/investigate
-BoringCrypto
+/investigate BoringCrypto
 ```
 
-From the shell, `grclanker investigate` opens a session that starts with the same prompt.
+From the shell, `grclanker investigate "<subject>"` opens a session that starts with the same prompt and the subject filled in. Run `grclanker investigate` on its own to name the subject in your first message instead.
 
-Text typed after `/investigate` on the same line is not passed to the model in this release: the shipped prompt has no argument placeholder, so Pi sends the prompt body alone and drops the rest. Put the subject in its own message.
+In the `v0.0.1` release bundle, text after `/investigate` and arguments after `grclanker investigate` are dropped, so send the subject in its own message there.
 
 ## What the prompt asks for
 

@@ -13,14 +13,15 @@ description: Map gathered evidence to a requested framework and classify control
 
 ## Start it
 
-Inside a grclanker session, send `/audit` on its own, then describe the scope in your next message, for example:
+Inside a grclanker session, put the scope after the command:
 
 ```text
-/audit
-Map our vulnerability evidence for the payments service to FedRAMP RA-5 and SI-2.
+/audit Map our vulnerability evidence for the payments service to FedRAMP RA-5 and SI-2.
 ```
 
-From the shell, `grclanker audit` opens a session that starts with the same prompt. Text typed after `/audit` on the same line is dropped in this release because the shipped prompt has no argument placeholder, so put the scope in its own message.
+From the shell, `grclanker audit "<scope>"` opens a session that starts with the same prompt and the scope filled in. Run `grclanker audit` on its own to describe the scope in your first message instead.
+
+In the `v0.0.1` release bundle, text after `/audit` and arguments after `grclanker audit` are dropped, so send the scope in its own message there.
 
 ## What the prompt does
 
