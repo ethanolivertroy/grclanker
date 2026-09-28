@@ -4528,11 +4528,15 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
       interzone_default_logged: nullUnless(policyReadable, interzoneLogged),
       zones_without_zone_protection: nullUnless(zonesReadable, unprotectedZones.map((zone) => `${zone.host}/${zone.name}`).slice(0, 50)),
     },
-    paloaltoDecisionFacts(
-      zones.length,
-      anyZone.length,
-      (!intrazoneDenied ? 1 : 0) + unprotectedZones.length + (!interzoneLogged ? 1 : 0),
-    ),
+    {
+      evidence_readable: zonesReadable && policyReadable,
+      evidence_complete: zonesReadable && policyReadable,
+      zone_count: zones.length,
+      any_zone_allow_rule_count: anyZone.length,
+      intrazone_default_denied: intrazoneDenied,
+      interzone_default_logs_at_end: interzoneLogged,
+      zone_without_protection_profile_count: unprotectedZones.length,
+    },
   ), panosGate(snapshots, [...ZONE_XPATHS, ...POLICY_XPATHS]), "export zone protection profile assignments and the intrazone and interzone default rule settings."));
 
   const decryptionRules: Array<{ host: string; name: string; action?: string; disabled: boolean }> = [];

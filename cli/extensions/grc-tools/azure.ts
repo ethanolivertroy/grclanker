@@ -30,14 +30,24 @@ import {
 } from "./auth-resolver-contracts.js";
 import {
   AZURE_ADMIN_PORTS as ADMIN_PORTS,
+  AZURE_CREDENTIAL_EXPIRY_WARNING_DAYS as CREDENTIAL_EXPIRY_WARNING_DAYS,
+  AZURE_CREDENTIAL_LONG_LIVED_DAYS as LONG_LIVED_CREDENTIAL_DAYS,
   AZURE_GUEST_ROLE_LIMITED as GUEST_ROLE_LIMITED,
   AZURE_GUEST_ROLE_RESTRICTED as GUEST_ROLE_RESTRICTED,
   AZURE_GUEST_ROLE_SAME_AS_MEMBER as GUEST_ROLE_SAME_AS_MEMBER,
   AZURE_HIGH_PRIVILEGE_DELEGATED_SCOPES as HIGH_PRIVILEGE_DELEGATED_SCOPES,
+  AZURE_MAX_CONTRIBUTOR_ASSIGNMENTS as MAX_CONTRIBUTOR_ASSIGNMENTS,
+  AZURE_MAX_GLOBAL_ADMINS as MAX_GLOBAL_ADMINS,
+  AZURE_MAX_OWNER_ASSIGNMENTS as MAX_OWNER_ASSIGNMENTS,
+  AZURE_MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS as MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS,
+  AZURE_MFA_UNREGISTERED_WARN_RATIO as MFA_UNREGISTERED_WARN_RATIO,
   AZURE_MIN_RETENTION_DAYS as MIN_RETENTION_DAYS,
+  AZURE_PRIVILEGED_ASSIGNMENT_FAIL_ABOVE as PRIVILEGED_ASSIGNMENT_FAIL_ABOVE,
+  AZURE_PRIVILEGED_ASSIGNMENT_PASS_MAX as PRIVILEGED_ASSIGNMENT_PASS_MAX,
   AZURE_SECURE_SCORE_PASS_RATIO,
   AZURE_SECURE_SCORE_WARN_RATIO,
   AZURE_SPEC,
+  AZURE_STALE_GUEST_DAYS as STALE_GUEST_DAYS,
 } from "./azure.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -50,8 +60,6 @@ const DEFAULT_MAX_ASSIGNMENTS = 500;
 const DEFAULT_MAX_MAILBOXES = 100;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const STALE_GUEST_DAYS = 90;
-const LONG_LIVED_CREDENTIAL_DAYS = 730;
 const HIGH_PRIVILEGE_DELEGATED_SCOPE_SET = new Set<string>(HIGH_PRIVILEGE_DELEGATED_SCOPES);
 const SECURITY_DEFAULTS_ENDPOINT = "GET /v1.0/policies/identitySecurityDefaultsEnforcementPolicy";
 const MESSAGE_RULES_ENDPOINT = "GET /v1.0/users/{id}/mailFolders/inbox/messageRules";
@@ -2478,7 +2486,7 @@ function credentialSummary(now: Date, records: JsonRecord[], label: (record: Jso
         const entry = { owner: name, credentialType, endDateTime: asString(credential.endDateTime) ?? null, daysRemaining: remaining === undefined ? null : round(remaining) };
         if (remaining === undefined) missingExpiry.push(entry);
         else if (remaining < 0) expired.push(entry);
-        else if (remaining <= 30) expiring.push(entry);
+        else if (remaining <= CREDENTIAL_EXPIRY_WARNING_DAYS) expiring.push(entry);
         const start = parseIsoDate(credential.startDateTime);
         const end = parseIsoDate(credential.endDateTime);
         if (start && end && (end.getTime() - start.getTime()) / DAY_MS > LONG_LIVED_CREDENTIAL_DAYS) longLived.push(entry);
@@ -2573,7 +2581,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
   } else {
     const usersWithoutMfa = registrations.value.items.filter((item) => item.isMfaRegistered !== true);
     const ratio = registrations.value.items.length > 0 ? usersWithoutMfa.length / registrations.value.items.length : 1;
-    const status: AzureFindingStatus = registrations.value.items.length === 0 ? "manual" : usersWithoutMfa.length === 0 ? capForPartial("pass", registrations.value) : ratio <= 0.1 ? "warn" : "fail";
+    const status: AzureFindingStatus = registrations.value.items.length === 0 ? "manual" : usersWithoutMfa.length === 0 ? capForPartial("pass", registrations.value) : ratio <= MFA_UNREGISTERED_WARN_RATIO ? "warn" : "fail";
     findings.push(finding("AZURE-ID-03", 2, "MFA registration coverage", "high", status,
       registrations.value.items.length === 0
         ? "The registration report returned zero users; an empty inventory cannot demonstrate MFA coverage, so this control needs manual confirmation."
@@ -2609,7 +2617,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
   } else {
     const status: AzureFindingStatus = privilegedAssignments === 0
       ? "manual"
-      : globalAdmins > 4 || privilegedAssignments > 10 ? "fail" : membersTruncated || roles.value.truncated ? "warn" : privilegedAssignments <= 5 ? "pass" : "warn";
+      : globalAdmins > MAX_GLOBAL_ADMINS || privilegedAssignments > PRIVILEGED_ASSIGNMENT_FAIL_ABOVE ? "fail" : membersTruncated || roles.value.truncated ? "warn" : privilegedAssignments <= PRIVILEGED_ASSIGNMENT_PASS_MAX ? "pass" : "warn";
     findings.push(finding("AZURE-ID-04", 5, "Privileged directory role sprawl", "high", status,
       privilegedAssignments === 0
         ? "Zero privileged role members were returned; every tenant has at least one Global Administrator, so this needs manual confirmation of read access."
@@ -2644,7 +2652,7 @@ export async function assessAzureIdentity(client: IdentityClient): Promise<Azure
     });
     const status: AzureFindingStatus = eligibilities.value.items.length === 0 && permanentPrivileged.length === 0
       ? "manual"
-      : permanentPrivileged.length > 2 ? "fail" : permanentPrivileged.length > 0 || eligibilities.value.items.length === 0 ? "warn" : capForPartial("pass", eligibilities.value, assignmentSchedules.value);
+      : permanentPrivileged.length > MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS ? "fail" : permanentPrivileged.length > 0 || eligibilities.value.items.length === 0 ? "warn" : capForPartial("pass", eligibilities.value, assignmentSchedules.value);
     findings.push(finding("AZURE-ID-06", 5, "Privileged Identity Management eligibility", "high", status,
       status === "manual"
         ? "Zero eligible and zero permanent privileged schedules were returned; confirm PIM is onboarded before treating this as compliant."
@@ -2966,8 +2974,8 @@ export async function assessAzureSubscriptionGuardrails(
       { [evidenceKey]: matches.slice(0, 25), ...(roleAssignments.ok ? pageEvidence(roleAssignments.value) : {}) },
       { readable: true, complete: rbacPages.every((page) => !page.truncated), inventory_count: roleAssignments.ok ? roleAssignments.value.items.length : 0, matching_assignment_count: matches.length, warn_maximum: warnMax });
   };
-  findings.push(rbacFinding("AZURE-SUB-01", 17, "Owner assignments at subscription scope", "high", ownerAssignments, 2, "Owner assignments", "owner_assignments"));
-  findings.push(rbacFinding("AZURE-SUB-02", 17, "Contributor assignments at subscription scope", "medium", contributorAssignments, 5, "Contributor assignments", "contributor_assignments"));
+  findings.push(rbacFinding("AZURE-SUB-01", 17, "Owner assignments at subscription scope", "high", ownerAssignments, MAX_OWNER_ASSIGNMENTS, "Owner assignments", "owner_assignments"));
+  findings.push(rbacFinding("AZURE-SUB-02", 17, "Contributor assignments at subscription scope", "medium", contributorAssignments, MAX_CONTRIBUTOR_ASSIGNMENTS, "Contributor assignments", "contributor_assignments"));
 
   if (!securityContacts.ok) {
     findings.push(manualForError("AZURE-SUB-03", 18, "Security contacts configured", "medium", "GET Microsoft.Security/securityContacts", "Security Reader on the subscription", "the Defender for Cloud email notifications page", securityContacts, AZURE_ENDPOINT_DOCS.securityContacts, errors));

@@ -41,6 +41,16 @@ export const AZURE_ADMIN_PORTS = [22, 3389, 3306, 1433] as const;
 export const AZURE_SECURE_SCORE_PASS_RATIO = 0.75;
 export const AZURE_SECURE_SCORE_WARN_RATIO = 0.5;
 export const AZURE_MIN_RETENTION_DAYS = 90;
+export const AZURE_MFA_UNREGISTERED_WARN_RATIO = 0.1;
+export const AZURE_MAX_GLOBAL_ADMINS = 4;
+export const AZURE_PRIVILEGED_ASSIGNMENT_PASS_MAX = 5;
+export const AZURE_PRIVILEGED_ASSIGNMENT_FAIL_ABOVE = 10;
+export const AZURE_CREDENTIAL_EXPIRY_WARNING_DAYS = 30;
+export const AZURE_CREDENTIAL_LONG_LIVED_DAYS = 730;
+export const AZURE_MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS = 2;
+export const AZURE_STALE_GUEST_DAYS = 90;
+export const AZURE_MAX_OWNER_ASSIGNMENTS = 2;
+export const AZURE_MAX_CONTRIBUTOR_ASSIGNMENTS = 5;
 const surfaces = [
   restSurface("conditional-access", "/v1.0/identity/conditionalAccess/policies", "Microsoft Graph", DOCS, ["id", "displayName", "state", "conditions", "grantControls"]),
   restSurface("security-defaults", "/v1.0/policies/identitySecurityDefaultsEnforcementPolicy", "Microsoft Graph", DOCS, ["isEnabled"]),
@@ -128,23 +138,80 @@ interface AzureDecision {
   rules: readonly VerdictRule[];
 }
 
+const AZURE_INPUT_DEFINITIONS: Readonly<Record<string, string>> = {
+  readable: "Boolean collector state. True only when every Azure response and raw field required by this finding was returned and parseable; false, null, or missing means manual.",
+  complete: "Boolean collector state. True only when every required Microsoft Graph or Azure Resource Manager list exhausted continuation links; false is a lower bound and cannot support pass except for the documented AZURE-MON-06 limitation.",
+  inventory_count: "Non-negative integer count over the complete primary source inventory before any 25-record evidence display slice; zero retains the check-specific empty-inventory semantics.",
+  policy_readable: "Boolean. True only when the Conditional Access policy list was returned and parseable.",
+  policy_count: "Non-negative integer count of all Conditional Access policies before evidence display slicing.",
+  mfa_policy_count: "Count of enabled Conditional Access policies whose grant controls require MFA for the assessed user/application scope.",
+  legacy_block_policy_count: "Count of enabled Conditional Access policies that block legacy-authentication client app types.",
+  security_defaults_readable: "Boolean. True only when identitySecurityDefaultsEnforcementPolicy returned isEnabled.",
+  security_defaults_enabled: "Boolean from identitySecurityDefaultsEnforcementPolicy.isEnabled; null or missing is not affirmative evidence.",
+  without_mfa_count: "Count of userRegistrationDetails records whose isMfaRegistered field is not true.",
+  without_mfa_ratio: "Number obtained by dividing without_mfa_count by the complete user-registration inventory count; null means no denominator.",
+  global_admin_count: "Count of members in an activated directory role whose displayName or role template identifies Global Administrator.",
+  privileged_assignment_count: "Complete count of members assigned across all activated privileged directory roles before evidence slicing.",
+  expired_credential_count: "Count of application or service-principal password credentials whose endDateTime is earlier than the assessment time.",
+  expiring_credential_count: "Count of nonexpired password credentials whose endDateTime falls within the next 30 days.",
+  missing_expiry_count: "Count of password credentials whose endDateTime is absent or not a usable timestamp.",
+  long_lived_credential_count: "Count of password credentials whose startDateTime-to-endDateTime lifetime exceeds 730 days.",
+  eligible_assignment_count: "Complete count of returned PIM roleEligibilitySchedules.",
+  permanent_privileged_count: "Count of privileged roleAssignmentSchedules whose assignmentType or schedule end indicates a permanent active assignment.",
+  guest_role_id: `Lowercased authorizationPolicy.guestUserRoleId GUID. ${AZURE_GUEST_ROLE_SAME_AS_MEMBER} grants member-equivalent permissions, ${AZURE_GUEST_ROLE_LIMITED} is the default limited role, and ${AZURE_GUEST_ROLE_RESTRICTED} is the most restricted role.`,
+  allow_invites_from: "Lowercased authorizationPolicy.allowInvitesFrom enum; `everyone` fails, while `none` and `adminsandguestinviters` are the restricted accepted values.",
+  stale_guest_count: "Count of enabled Guest users whose signInActivity timestamp is at least 90 days old.",
+  unknown_activity_count: "Count of enabled Guest users whose signInActivity timestamp is absent or unusable.",
+  license_present: "Boolean. True only when subscribedSkus contains the service plan required by this check in a provisioned state.",
+  enforcing_policy_count: "Count of enabled Conditional Access policies that enforce the check-specific sign-in-risk or user-risk condition.",
+  high_risk_user_count: "Count across riskyUsers and riskDetections whose raw riskLevel is high and whose riskState is not remediated or dismissed.",
+  ownerless_application_count: "Count of application registrations whose expanded owners array is empty.",
+  risky_grant_count: `Count of oauth2PermissionGrants whose consentType is AllPrincipals and whose lowercased scope tokens intersect this exact set: ${AZURE_HIGH_PRIVILEGE_DELEGATED_SCOPES.join(", ")}.`,
+  maximum_score: "Number from secureScores.maxScore; zero, null, or missing means a score ratio cannot be established.",
+  score_ratio: "Number computed as secureScores.currentScore divided by secureScores.maxScore only when maxScore is positive.",
+  standard_plan_count: "Count of Microsoft.Security/pricings records whose properties.pricingTier is `Standard`.",
+  effective_setting_count: "Count of diagnostic settings with at least one enabled log category and a nonempty workspaceId, storageAccountId, or eventHubAuthorizationRuleId destination.",
+  destination_workspace_count: "Count of effective diagnostic settings whose properties.workspaceId is nonempty.",
+  linked_workspace_count: "Count of destination workspace IDs that resolve to a returned Log Analytics workspace.",
+  workspace_retention_at_least_minimum_count: `Count of linked workspaces whose properties.retentionInDays is at least ${AZURE_MIN_RETENTION_DAYS}.`,
+  matching_assignment_count: "Count of subscription role assignments whose joined role definition is Owner for AZURE-SUB-01 or Contributor for AZURE-SUB-02.",
+  warn_maximum: "Integer fixed threshold selected by the check: 2 for Owner assignments (AZURE-SUB-01) and 5 for Contributor assignments (AZURE-SUB-02). These checks expose no operator override.",
+  configured_contact_count: "Count of Microsoft.Security/securityContacts records whose properties.emails value is nonempty.",
+  privileged_service_principal_count: "Count of Owner or Contributor role assignments whose raw properties.principalType lowercases to `serviceprincipal`.",
+  device_count: "Complete count of returned managedDevices before evidence slicing.",
+  device_policy_with_required_settings_count: "Count of deviceCompliancePolicies containing the required password, encryption, and threat-protection settings evaluated by this check.",
+  noncompliant_device_count: "Count of managedDevices whose complianceState is explicitly noncompliant.",
+  unknown_device_count: "Count of managedDevices whose complianceState is absent or not one of the recognized compliant/noncompliant states.",
+  active_sensitivity_record_count: "Count of sensitivityLabels whose isActive is true and whose protection metadata is present.",
+  missing_protection_count: "Count of Key Vaults where enableSoftDelete or enablePurgeProtection is not true.",
+  access_policy_vault_count: "Count of Key Vaults where enableRbacAuthorization is not true and legacy access policies remain in use.",
+  open_network_count: "Count of Key Vaults whose networkAcls do not establish a default deny posture.",
+  http_allowed_count: "Count of storage accounts whose supportsHttpsTrafficOnly field is not true.",
+  public_blob_count: "Count of storage accounts whose allowBlobPublicAccess field is true.",
+  public_blob_unset_count: "Count of storage accounts whose allowBlobPublicAccess field is absent.",
+  weak_tls_count: "Count of storage accounts whose minimumTlsVersion is absent or weaker than TLS1_2.",
+  mailbox_read_count: "Count of member-user mailboxes whose inbox message rules were successfully returned.",
+  mailbox_unreadable_count: "Count of member-user mailboxes whose inbox message-rule read failed.",
+  forwarding_rule_count: "Count of enabled inbox rules whose forwarding or redirect action has at least one recipient.",
+  capability_present: "Boolean. True only when admin/sharepoint/settings returned sharingCapability.",
+  capability: "Lowercased raw admin/sharepoint/settings sharingCapability value.",
+  domain_allowlist: "Boolean. True when sharingDomainRestrictionMode lowercases to `allowlist`.",
+  external_resharing: "Boolean from isResharingByExternalUsersEnabled; only literal true triggers the warning branch.",
+  exposed_rule_count: `Count across the complete NSG inventory of enabled inbound Allow rules from any source whose TCP or all-protocol destination range contains one of ${AZURE_ADMIN_PORTS.join(", ")}.`,
+  assignment_not_do_not_enforce_count: "Count of Azure Policy assignments whose properties.enforcementMode is not `DoNotEnforce`.",
+  resource_count_present: "Boolean. True only when the policy-summary response contains results.nonCompliantResources.",
+  policy_count_present: "Boolean. True only when the policy-summary response contains results.nonCompliantPolicies.",
+  noncompliant_policy_count: "Numeric results.nonCompliantPolicies from the Azure Policy latest-state summary.",
+  covered_nsg_count: "Count of network security groups referenced by an enabled Network Watcher flow log.",
+  uncovered_nsg_count: "Count of returned network security groups not referenced by an enabled flow log.",
+};
+
 const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [name, ({
-    readable: "Boolean. True only when every Azure API response required by this finding was returned and its decision fields were present; false, null, or missing means manual.",
-    complete: "Boolean. True only when every required Azure list exhausted its continuation links; false means counts are lower bounds and cannot support pass unless the documented parent-parity limitation says otherwise.",
-    inventory_count: "Integer. Complete source-record count before any 25-item evidence presentation slice; zero retains the check-specific empty-inventory semantics.",
-    guest_role_id: `Lowercase authorizationPolicy.guestUserRoleId GUID. ${AZURE_GUEST_ROLE_SAME_AS_MEMBER} means guests have member permissions, ${AZURE_GUEST_ROLE_LIMITED} is the default limited role, and ${AZURE_GUEST_ROLE_RESTRICTED} is the most restricted role; null means the raw field was absent.`,
-    allow_invites_from: "Lowercase authorizationPolicy.allowInvitesFrom enum. `everyone` fails; `none` and `adminsandguestinviters` are restricted; null or an undocumented value cannot pass.",
-    maximum_score: "Number from secureScores.maxScore. Zero, null, or missing means no scored record and requires manual review.",
-    score_ratio: "Number computed as secureScores.currentScore divided by secureScores.maxScore only when maxScore is positive; null means the ratio is not computable.",
-    exposed_rule_count: `Integer. Complete count, across every returned NSG and every security rule before evidence slicing, of enabled inbound Allow rules from any source whose TCP/all destination range contains one of ${AZURE_ADMIN_PORTS.join(", ")}.`,
-  } as Record<string, string>)[name] ?? (
-    name.endsWith("_count") || name.endsWith("_maximum")
-      ? `Integer. Complete unsliced Azure collector value for ${name.replaceAll("_", " ")}; null or missing cannot support pass.`
-      : name.endsWith("_ratio")
-        ? `Number. Azure evidence-derived ratio for ${name.replaceAll("_", " ")}; null, missing, or a nonpositive denominator cannot support pass.`
-        : `Primitive Azure vendor field or evidence-derived boolean for ${name.replaceAll("_", " ")}; null, missing, or undocumented values cannot support pass.`
-  )]),
+  names.map((name) => {
+    const definition = AZURE_INPUT_DEFINITIONS[name];
+    if (!definition) throw new Error(`Azure decision input ${name} requires an explicit portable definition`);
+    return [name, definition];
+  }),
 );
 const ordered = (branches: {
   manual?: VerdictCondition;
@@ -193,25 +260,29 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     fail: comparePaths("gt", "without_mfa_ratio", "warning_ratio_maximum"),
     warn: any(incomplete, gt("without_mfa_count", 0)),
     pass: eq("without_mfa_count", 0),
-  }, { warning_ratio_maximum: 0.1 }),
+  }, { warning_ratio_maximum: AZURE_MFA_UNREGISTERED_WARN_RATIO }),
   "AZURE-ID-04": countDecision(["global_admin_count", "privileged_assignment_count"], {
     manual: any(unreadable, eq("privileged_assignment_count", 0)),
     fail: any(gt("global_admin_count", 4), gt("privileged_assignment_count", 10)),
     warn: any(incomplete, gt("privileged_assignment_count", 5)),
     pass: lte("privileged_assignment_count", 5),
-  }, { maximum_global_admins: 4, pass_maximum_assignments: 5, fail_above_assignments: 10 }),
+  }, {
+    maximum_global_admins: AZURE_MAX_GLOBAL_ADMINS,
+    pass_maximum_assignments: AZURE_PRIVILEGED_ASSIGNMENT_PASS_MAX,
+    fail_above_assignments: AZURE_PRIVILEGED_ASSIGNMENT_FAIL_ABOVE,
+  }),
   "AZURE-ID-05": countDecision(["expired_credential_count", "expiring_credential_count", "missing_expiry_count", "long_lived_credential_count"], {
     manual: any(unreadable, empty),
     fail: gt("expired_credential_count", 0),
     warn: any(incomplete, gt("expiring_credential_count", 0), gt("missing_expiry_count", 0), gt("long_lived_credential_count", 0)),
     pass: { op: "always" },
-  }, { expiring_days: 30, long_lived_days: 730 }),
+  }, { expiring_days: AZURE_CREDENTIAL_EXPIRY_WARNING_DAYS, long_lived_days: AZURE_CREDENTIAL_LONG_LIVED_DAYS }),
   "AZURE-ID-06": countDecision(["eligible_assignment_count", "permanent_privileged_count"], {
     manual: any(unreadable, all(eq("eligible_assignment_count", 0), eq("permanent_privileged_count", 0))),
     fail: gt("permanent_privileged_count", 2),
     warn: any(incomplete, gt("permanent_privileged_count", 0), eq("eligible_assignment_count", 0)),
     pass: { op: "always" },
-  }, { maximum_permanent_privileged_assignments: 2 }),
+  }, { maximum_permanent_privileged_assignments: AZURE_MAX_PERMANENT_PRIVILEGED_ASSIGNMENTS }),
   "AZURE-ID-07": {
     inputs: inputs("readable", "guest_role_id", "allow_invites_from"),
     constants: {
@@ -237,7 +308,7 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     fail: gt("stale_guest_count", 0),
     warn: any(incomplete, gt("unknown_activity_count", 0)),
     pass: { op: "always" },
-  }, { stale_days: 90 }),
+  }, { stale_days: AZURE_STALE_GUEST_DAYS }),
   "AZURE-ID-09": countDecision(["license_present", "enforcing_policy_count"], {
     manual: any(unreadable, ne("license_present", true)),
     fail: eq("enforcing_policy_count", 0),
@@ -261,7 +332,7 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     fail: gt("expired_credential_count", 0),
     warn: any(incomplete, gt("expiring_credential_count", 0), gt("missing_expiry_count", 0), gt("long_lived_credential_count", 0), gt("ownerless_application_count", 0)),
     pass: { op: "always" },
-  }, { expiring_days: 30, long_lived_days: 730 }),
+  }, { expiring_days: AZURE_CREDENTIAL_EXPIRY_WARNING_DAYS, long_lived_days: AZURE_CREDENTIAL_LONG_LIVED_DAYS }),
   "AZURE-ID-13": countDecision(["risky_grant_count"], {
     manual: any(unreadable, empty),
     fail: gt("risky_grant_count", 0),
@@ -303,13 +374,13 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     fail: comparePaths("gt", "matching_assignment_count", "warn_maximum"),
     warn: any(incomplete, gt("matching_assignment_count", 0)),
     pass: eq("matching_assignment_count", 0),
-  }),
+  }, { default_maximum_owner_assignments: AZURE_MAX_OWNER_ASSIGNMENTS }),
   "AZURE-SUB-02": countDecision(["matching_assignment_count", "warn_maximum"], {
     manual: any(unreadable, empty),
     fail: comparePaths("gt", "matching_assignment_count", "warn_maximum"),
     warn: any(incomplete, gt("matching_assignment_count", 0)),
     pass: eq("matching_assignment_count", 0),
-  }),
+  }, { default_maximum_contributor_assignments: AZURE_MAX_CONTRIBUTOR_ASSIGNMENTS }),
   "AZURE-SUB-03": countDecision(["configured_contact_count"], {
     manual: unreadable,
     fail: eq("configured_contact_count", 0),
@@ -408,10 +479,12 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   surfaces: sourceSurfaces,
   manualOnly: sourceSurfaces.length === 0,
   emptyOutcome,
-  decisionInputs: AZURE_DECISIONS[id]?.inputs,
+  decisionInputs: AZURE_DECISIONS[id]?.inputs ?? {},
   decisionRules: AZURE_DECISIONS[id]?.rules,
   constants: AZURE_DECISIONS[id]?.constants,
-  decision: `Evaluate ${title} from the declared raw vendor fields and complete collector cardinalities: a proved violation takes precedence, unreadable or missing dependencies return manual, incomplete evidence or review predicates warn, and pass requires complete readable evidence with no violation.`,
+  decision: sourceSurfaces.length === 0
+    ? `${id} always returns manual because no shipped Azure read surface exposes decisive evidence for ${title}.`
+    : `${id} evaluates the rendered ordered first-match predicates over these explicitly defined primitive values: ${Object.keys(AZURE_DECISIONS[id]?.inputs ?? {}).join(", ")}. The rendered constants and rule comparisons are the complete portable decision contract for ${title}.`,
 })));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 

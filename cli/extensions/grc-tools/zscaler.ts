@@ -33,11 +33,13 @@ import { errorResult, formatTable, textResult } from "./shared.js";
 import {
   ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS as DEFAULT_CERT_EXPIRY_WARN_DAYS,
   ZSCALER_DEFAULT_MAX_SUPER_ADMINS as DEFAULT_MAX_SUPER_ADMINS,
+  ZSCALER_DEFAULT_MAX_SSL_EXEMPTIONS as DEFAULT_MAX_SSL_EXEMPTIONS,
   ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS as DEFAULT_MAX_TIMEOUT_HOURS,
   ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS as DEFAULT_STALE_CONNECTOR_DAYS,
   ZSCALER_REQUIRED_ATP_FLAGS as REQUIRED_ATP_FLAGS,
   ZSCALER_REQUIRED_MALWARE_FLAGS as REQUIRED_MALWARE_FLAGS,
   ZSCALER_REQUIRED_URL_BLOCK_CATEGORIES as REQUIRED_URL_BLOCK_CATEGORIES,
+  ZSCALER_MAX_SECURITY_ALLOWLIST_URLS as MAX_SECURITY_ALLOWLIST_URLS,
   ZSCALER_SPEC,
 } from "./zscaler.spec.js";
 
@@ -2023,7 +2025,6 @@ export class ZpaApiClient implements ZpaReadClient {
 
 const MAX_SUBLOCATION_PARENTS = 100;
 const MAX_CLOUD_APP_RULE_TYPES = 25;
-const DEFAULT_MAX_SSL_EXEMPTIONS = 50;
 
 export interface ZiaPolicyData {
   urlFilteringRules: CollectedDataset<JsonRecord[]>;
@@ -2343,13 +2344,18 @@ function sslInspectionVerdict(data: ZiaPolicyData, maxExemptions: number, eviden
     location_inventory_partial: data.locations.truncated === true,
     rules: ruleSummaries(rules.data),
   };
-  const facts = zscalerDecisionFacts(
-    rules.data.length,
-    rules.data.length === 0 || decrypt.length === 0 || blanketBypass.length > 0 ? 1 : 0,
-    (exempted === undefined ? 1 : 0) + ((exempted?.length ?? 0) > maxExemptions ? 1 : 0) + (locationsWithoutScan ?? 0),
+  const facts = {
+    evidence_readable: true,
     // Parent parity: only the location inventory capped the legacy pass; SSL-rule truncation did not.
-    { complete: !data.locations.truncated },
-  );
+    evidence_complete: !data.locations.truncated,
+    rule_count: rules.data.length,
+    decrypt_rule_count: decrypt.length,
+    blanket_bypass_rule_count: blanketBypass.length,
+    exemptions_readable: exempted !== undefined,
+    exemption_count: exempted?.length ?? null,
+    maximum_exemption_count: maxExemptions,
+    location_without_ssl_scan_count: locationsWithoutScan ?? null,
+  };
   if (rules.data.length === 0) {
     return finding(4, "fail", "Empty inventory: zero SSL inspection rules exist, so encrypted traffic is not decrypted for inspection.", evidence, evidenceNote, facts);
   }
@@ -2631,11 +2637,15 @@ function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): Zsc
     allowlist_urls: allowlist ? allowlist.length : null,
     denylist_urls: denylist ? denylist.length : null,
   };
-  const facts = zscalerDecisionFacts(
-    Object.keys(atp).length + Object.keys(malware).length,
-    Object.keys(atp).length === 0 || Object.keys(malware).length === 0 || missingAtp.length > 0 || missingMalware.length > 0 ? 1 : 0,
-    (blockUnscannable === true ? 0 : 1) + ((allowlist?.length ?? 0) > 100 ? 1 : 0),
-  );
+  const facts = {
+    evidence_readable: true,
+    atp_setting_count: Object.keys(atp).length,
+    malware_setting_count: Object.keys(malware).length,
+    missing_atp_flag_count: missingAtp.length,
+    missing_malware_flag_count: missingMalware.length,
+    block_unscannable_files: blockUnscannable,
+    allowlist_url_count: allowlist?.length ?? null,
+  };
   if (Object.keys(atp).length === 0 || Object.keys(malware).length === 0) {
     return finding(25, "fail", "Empty response: the ATP or malware settings object contained no flags, so none of the required protections can be confirmed enabled.", evidence, evidenceNote, facts);
   }
@@ -2645,7 +2655,7 @@ function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): Zsc
   if (blockUnscannable !== true) {
     return finding(25, "warn", `All ${REQUIRED_ATP_FLAGS.length + REQUIRED_MALWARE_FLAGS.length} required ATP and malware protections are enabled, but blockUnscannableFiles is ${blockUnscannable === undefined ? "unreadable" : "false"}.`, evidence, evidenceNote, facts);
   }
-  if ((allowlist?.length ?? 0) > 100) {
+  if ((allowlist?.length ?? 0) > MAX_SECURITY_ALLOWLIST_URLS) {
     return finding(25, "warn", `All required protections are enabled, but ${allowlist?.length} URLs bypass security policy via the allowlist.`, evidence, evidenceNote, facts);
   }
   return finding(25, "pass", `All ${REQUIRED_ATP_FLAGS.length} required ATP protections and ${REQUIRED_MALWARE_FLAGS.length} malware protections are enabled, unscannable files are blocked, and the allowlist holds ${allowlist?.length ?? "an unreadable number of"} URLs.`, evidence, undefined, facts);

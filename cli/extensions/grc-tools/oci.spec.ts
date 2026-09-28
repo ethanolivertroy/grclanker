@@ -3,7 +3,13 @@ import {
   buildBatchOutputContract,
 } from "./batch-spec-builder.js";
 import {
+  batch2Any,
   batch2Checks,
+  batch2ComparePaths,
+  batch2Eq,
+  batch2GenericDecisionInputs,
+  batch2Ne,
+  batch2Rule,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
@@ -18,6 +24,7 @@ export const OCI_KEY_MIN_RSA_BYTES = 512;
 export const OCI_ECDSA_ACCEPTED_CURVES = ["NIST_P256", "NIST_P384", "NIST_P521"] as const;
 export const OCI_BASTION_SESSION_MAX_HOURS = 8;
 export const OCI_PAR_LONG_LIVED_DAYS = 30;
+export const OCI_MIN_PASSWORD_LENGTH = 14;
 export const OCI_SENSITIVE_PORTS = [22, 3389, 1433, 3306, 5432] as const;
 export const OCI_RUNTIME_FRAMEWORK_MAPPINGS: Readonly<Record<string, readonly string[]>> = {
   "OCI-IAM-01": ["FedRAMP IA-5", "CMMC L2 3.5.7", "SOC 2 CC6.1", "CIS OCI 1.1", "PCI-DSS 8.3.6", "STIG SRG-APP-000166", "IRAP ISM-0421", "ISMAP AM-03"],
@@ -102,6 +109,7 @@ function owner(id: string): string {
 }
 
 const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
+  "OCI-IAM-01": { minimum_password_length_required: OCI_MIN_PASSWORD_LENGTH },
   "OCI-IAM-03": { maximum_credential_age_days: OCI_KEY_ROTATION_MAX_DAYS },
   "OCI-LOG-06": { minimum_audit_retention_days: OCI_AUDIT_RETENTION_REQUIRED_DAYS },
   "OCI-GRD-01": { sensitive_ingress_ports: OCI_SENSITIVE_PORTS },
@@ -117,10 +125,10 @@ const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
     accepted_ecdsa_curves: OCI_ECDSA_ACCEPTED_CURVES,
   },
   "OCI-GRD-06": { long_lived_preauthenticated_request_days: OCI_PAR_LONG_LIVED_DAYS },
-} as const)[id as "OCI-IAM-03" | "OCI-LOG-06" | "OCI-GRD-01" | "OCI-GRD-02" | "OCI-GRD-04" | "OCI-GRD-05" | "OCI-GRD-06"];
+} as const)[id as "OCI-IAM-01" | "OCI-IAM-03" | "OCI-LOG-06" | "OCI-GRD-01" | "OCI-GRD-02" | "OCI-GRD-04" | "OCI-GRD-05" | "OCI-GRD-06"];
 
 const decisionPredicate: Readonly<Record<string, string>> = {
-  "OCI-IAM-01": "Fail when the readable authentication policy permits a password shorter than 14 characters; warn when its complexity fields do not require the runtime's upper-case, lower-case, numeric, special-character, reuse, and lockout baseline.",
+  "OCI-IAM-01": `Fail when passwordPolicy.minimumPasswordLength is below ${OCI_MIN_PASSWORD_LENGTH} or any of passwordPolicy.isLowercaseCharactersRequired, isUppercaseCharactersRequired, isNumericCharactersRequired, and isSpecialCharactersRequired is not literally true. No reuse or lockout field participates in this finding.`,
   "OCI-IAM-02": "Fail when any active console-password-capable IAM user has isMfaActivated other than true; pass only after the complete user inventory has no such user.",
   "OCI-IAM-03": `Fail when any active API key, customer secret key, or auth token has no usable timeCreated or is older than ${OCI_KEY_ROTATION_MAX_DAYS} days.`,
   "OCI-IAM-04": "Warn when an IAM policy statement grants any verb to any-user or grants manage to a broad subject or resource scope; retain the complete policy and statement counts.",
@@ -130,7 +138,7 @@ const decisionPredicate: Readonly<Record<string, string>> = {
   "OCI-LOG-02": "Pass on a complete empty open-problem inventory; fail when any unresolved Cloud Guard problem is HIGH or CRITICAL and warn for lower-risk open problems.",
   "OCI-LOG-03": "Fail when no ACTIVE responder recipe exists or no returned responder rule has details.isEnabled=true.",
   "OCI-LOG-04": "Warn when the complete audit query returns no event; pass when at least one event with eventTime is visible.",
-  "OCI-LOG-05": "Fail when no enabled ACTIVE Events rule condition covers the runtime's critical-operation event types; warn when coverage is only partial.",
+  "OCI-LOG-05": "Normalize each Events rule condition to lowercase text. A rule covers critical operations when that text contains `com.oraclecloud.identitycontrolplane`, `com.oraclecloud.virtualnetwork`, `policy`, `identity`, or `network`; fail when no enabled ACTIVE rule matches, and warn when rule collection is partial.",
   "OCI-LOG-06": `Fail when Audit config retentionPeriodDays is below ${OCI_AUDIT_RETENTION_REQUIRED_DAYS}; missing or nonnumeric retention is manual.`,
   "OCI-GRD-01": `Fail for any ingress security-list rule from 0.0.0.0/0 or ::/0 whose protocol and TCP range expose one of ports ${OCI_SENSITIVE_PORTS.join(", ")}.`,
   "OCI-GRD-02": `Fail for any ingress network-security-group rule from 0.0.0.0/0 or ::/0 whose protocol and TCP range expose one of ports ${OCI_SENSITIVE_PORTS.join(", ")}.`,
@@ -159,6 +167,32 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   } as const)[id as "OCI-IAM-05" | "OCI-LOG-02" | "OCI-LOG-04" | "OCI-LOG-05"] ?? "manual",
   violationOutcome: id === "OCI-IAM-04" || id === "OCI-GRD-03" ? "warn" : "fail",
   constants: decisionConstants(id),
+  decisionInputs: manualOnly
+    ? {}
+    : id === "OCI-IAM-01"
+      ? {
+          evidence_readable: "Boolean. True only when `oci iam authentication-policy get` returned passwordPolicy and a numeric minimumPasswordLength.",
+          minimum_password_length: "Number from passwordPolicy.minimumPasswordLength; null or missing makes the finding manual.",
+          lowercase_required: "Boolean from passwordPolicy.isLowercaseCharactersRequired; only literal true satisfies the complexity predicate.",
+          uppercase_required: "Boolean from passwordPolicy.isUppercaseCharactersRequired; only literal true satisfies the complexity predicate.",
+          numeric_required: "Boolean from passwordPolicy.isNumericCharactersRequired; only literal true satisfies the complexity predicate.",
+          special_required: "Boolean from passwordPolicy.isSpecialCharactersRequired; only literal true satisfies the complexity predicate.",
+        }
+      : batch2GenericDecisionInputs(decisionPredicate[id]),
+  decisionRules: id === "OCI-IAM-01"
+    ? [
+        batch2Rule("manual", batch2Ne("evidence_readable", true)),
+        batch2Rule("fail", batch2Any(
+          batch2ComparePaths("lt", "minimum_password_length", "minimum_password_length_required"),
+          batch2Ne("lowercase_required", true),
+          batch2Ne("uppercase_required", true),
+          batch2Ne("numeric_required", true),
+          batch2Ne("special_required", true),
+        )),
+        batch2Rule("pass", batch2Eq("evidence_readable", true)),
+        batch2Rule("manual", { op: "always" }),
+      ]
+    : undefined,
   frameworks: frameworkMappings(id),
   decision: `${decisionPredicate[id]} A proved violation takes precedence over partial collection; otherwise partial or unreadable evidence cannot pass.`,
 })));

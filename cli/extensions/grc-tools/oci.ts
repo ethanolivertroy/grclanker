@@ -37,6 +37,7 @@ import {
   OCI_KEY_MIN_AES_BYTES,
   OCI_KEY_MIN_RSA_BYTES,
   OCI_KEY_ROTATION_MAX_DAYS as KEY_ROTATION_MAX_DAYS,
+  OCI_MIN_PASSWORD_LENGTH as MIN_PASSWORD_LENGTH,
   OCI_PAR_LONG_LIVED_DAYS as PAR_LONG_LIVED_DAYS,
   OCI_RUNTIME_FRAMEWORK_MAPPINGS,
   OCI_SENSITIVE_PORTS as SENSITIVE_PORTS,
@@ -2063,7 +2064,7 @@ export async function assessOciIdentity(
   } else if (!passwordPolicy || minLength === undefined) {
     passwordStatus = "manual";
     passwordSummary = "Manual: the authentication policy response did not include passwordPolicy.minimumPasswordLength; verify the password policy in the console.";
-  } else if (minLength >= 14 && complexitySatisfied) {
+  } else if (minLength >= MIN_PASSWORD_LENGTH && complexitySatisfied) {
     passwordStatus = "pass";
     passwordSummary = `Minimum password length ${minLength} with lowercase, uppercase, numeric, and special characters required. Expiration is not exposed by the PasswordPolicy datatype (see OCI-IAM-06).`;
   } else {
@@ -2244,7 +2245,14 @@ export async function assessOciIdentity(
         authentication_policy: readEvidence("iam authentication-policy get", authPolicyRead, { password_policy: passwordPolicy ?? null }),
         source: OCI_SURFACE_DOCS.authenticationPolicy.rest,
       },
-      ociDecisionFacts(authPolicy.ok && passwordPolicy !== undefined && minLength !== undefined, true, authPolicy.items.length, minLength !== undefined && (minLength < 14 || !complexitySatisfied) ? 1 : 0),
+      {
+        evidence_readable: authPolicy.ok && passwordPolicy !== undefined && minLength !== undefined,
+        minimum_password_length: minLength,
+        lowercase_required: complexityFlags[0],
+        uppercase_required: complexityFlags[1],
+        numeric_required: complexityFlags[2],
+        special_required: complexityFlags[3],
+      },
     ),
     finding(
       "OCI-IAM-06",

@@ -118,7 +118,8 @@ export interface DerivedFactRule {
 export type VerdictOperand =
   | { kind: "value"; value: PortableValue }
   | { kind: "path"; path: string; fallback?: PortableValue }
-  | { kind: "length"; path: string };
+  | { kind: "length"; path: string }
+  | { kind: "subtract"; left: VerdictOperand; right: VerdictOperand };
 
 export type VerdictCondition =
   | { op: "always" }
@@ -346,6 +347,13 @@ function operandValue(operand: VerdictOperand, facts: VerdictFacts, item: unknow
       const value = pathValue(facts, operand.path, item);
       return Array.isArray(value) || typeof value === "string" ? value.length : undefined;
     }
+    case "subtract": {
+      const left = operandValue(operand.left, facts, item);
+      const right = operandValue(operand.right, facts, item);
+      if (typeof left !== "number" || typeof right !== "number") return undefined;
+      const result = left - right;
+      return Number.isFinite(result) ? result : undefined;
+    }
     default: {
       const unhandled: never = operand;
       return unhandled;
@@ -382,26 +390,26 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
     case "lte": {
       const left = operandValue(condition.left, facts, item);
       const right = operandValue(condition.right, facts, item);
-      if (left === null || left === undefined || right === null || right === undefined) return false;
-      if (condition.op === "gt") return Number(left) > Number(right);
-      if (condition.op === "gte") return Number(left) >= Number(right);
-      if (condition.op === "lt") return Number(left) < Number(right);
-      return Number(left) <= Number(right);
+      if (typeof left !== "number" || typeof right !== "number" || !Number.isFinite(left) || !Number.isFinite(right)) return false;
+      if (condition.op === "gt") return left > right;
+      if (condition.op === "gte") return left >= right;
+      if (condition.op === "lt") return left < right;
+      return left <= right;
     }
     case "ratio": {
       const numeratorValue = operandValue(condition.numerator, facts, item);
       const denominatorValue = operandValue(condition.denominator, facts, item);
       const thresholdValue = operandValue(condition.threshold, facts, item);
       if (
-        numeratorValue === null || numeratorValue === undefined
-        || denominatorValue === null || denominatorValue === undefined
-        || thresholdValue === null || thresholdValue === undefined
+        typeof numeratorValue !== "number"
+        || typeof denominatorValue !== "number"
+        || typeof thresholdValue !== "number"
       ) {
         return false;
       }
-      const numerator = Number(numeratorValue);
-      const denominator = Number(denominatorValue);
-      const threshold = Number(thresholdValue);
+      const numerator = numeratorValue;
+      const denominator = denominatorValue;
+      const threshold = thresholdValue;
       if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0 || !Number.isFinite(threshold)) {
         return false;
       }
