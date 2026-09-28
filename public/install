@@ -209,7 +209,7 @@ detect_target() {
       if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
         :
       elif ldd --version 2>&1 | grep -qi 'musl'; then
-        fail "Linux musl hosts are not supported by release bundles yet. Use npm install -g @grclanker/cli or bun install -g @grclanker/cli instead."
+        fail "Linux musl hosts are not supported by release bundles yet. Build from source with Node.js 22.19 or newer: https://github.com/ethanolivertroy/grclanker#install"
       fi
       ;;
     *) fail "unsupported operating system: $os" ;;
@@ -234,9 +234,11 @@ asset_extension_for_target() {
 fallback_instructions() {
   printf "\n"
   warn "Release bundle unavailable for ${1}."
-  printf "  ${DIM}Fallbacks:${R}\n"
-  printf "    npm install -g @grclanker/cli\n"
-  printf "    bun install -g @grclanker/cli\n"
+  printf "  ${DIM}Source fallback (Node.js 22.19 or newer):${R}\n"
+  printf "    git clone https://github.com/ethanolivertroy/grclanker.git\n"
+  printf "    cd grclanker\n"
+  printf "    npm install --prefix cli\n"
+  printf "    npm install --global ./cli\n"
   printf "\n"
   fail "Install aborted."
 }
@@ -470,7 +472,7 @@ printf "\n"
 printf "  ${DIM}╭$(border_h)╮${R}\n"
 row_lr "${MAUVE}${B}GRCLANKER${R} ${DIM}v${VERSION}${R}" "${LAVENDER}${TARGET}${R}"
 printf "  ${DIM}├$(border_h)┤${R}\n"
-row "${GREEN}${B}Ready.${R} Run ${INK}${B}grclanker${R} to start."
+row "${GREEN}${B}Ready.${R} Run ${INK}${B}grclanker setup${R} to start."
 row "${DIM}Installed in ${ELAPSED}s${R}"
 row ""
 row "${DIM}Workflows:${R}"
