@@ -143,7 +143,7 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
       assert.ok(spec.output.artifacts.some((artifact) => artifact.path === path), `${spec.identity.slug}: ${path}`);
     }
   }
-  assert.equal(numericConstants, 55);
+  assert.equal(numericConstants, 68);
 
   const first = await renderAllIntegrationSpecs();
   const second = await renderAllIntegrationSpecs();
