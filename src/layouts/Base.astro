@@ -174,6 +174,7 @@ const searchData = searchEnabled
             {searchEnabled && (
               <button
                 onclick="window.__openSearch && window.__openSearch()"
+                data-search-trigger
                 class="nav-action-btn nav-search-btn"
                 aria-label="Search site (press / or Cmd+K)"
               >
@@ -204,6 +205,7 @@ const searchData = searchEnabled
               <button
                 type="button"
                 onclick="window.__openSearch && window.__openSearch()"
+                data-search-trigger
                 class="nav-icon-btn"
                 aria-label="Search site"
               >
@@ -361,6 +363,33 @@ const searchData = searchEnabled
         }
       }
 
+      function isVisible(el) {
+        return !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+      }
+
+      // Focusing document.body is a no-op, so a dialog opened by a shortcut from the page
+      // would otherwise leave focus on its own hidden input or close button.
+      function restoreFocus(target, fallback) {
+        if (target && target !== document.body && target.isConnected && target.focus) {
+          target.focus();
+          if (document.activeElement === target) return;
+        }
+        if (isVisible(fallback)) {
+          fallback.focus();
+          if (document.activeElement === fallback) return;
+        }
+        var current = document.activeElement;
+        if (current && current !== document.body && current.blur) current.blur();
+      }
+
+      function getVisibleSearchTrigger() {
+        var triggers = document.querySelectorAll('[data-search-trigger]');
+        for (var i = 0; i < triggers.length; i++) {
+          if (isVisible(triggers[i])) return triggers[i];
+        }
+        return null;
+      }
+
       function getEntries() {
         if (entries) return entries;
         var el = document.getElementById('site-search-data');
@@ -443,7 +472,7 @@ const searchData = searchEnabled
         searchModal.classList.remove('open');
         setShellInert(false);
         document.body.style.overflow = '';
-        if (prevFocus && prevFocus.focus) prevFocus.focus();
+        restoreFocus(prevFocus, getVisibleSearchTrigger());
         prevFocus = null;
       }
 
@@ -467,7 +496,7 @@ const searchData = searchEnabled
         helpModal.classList.remove('open');
         setShellInert(false);
         document.body.style.overflow = '';
-        if (prevFocus && prevFocus.focus) prevFocus.focus();
+        restoreFocus(prevFocus, null);
         prevFocus = null;
       }
 
