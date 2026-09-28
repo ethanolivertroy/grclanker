@@ -67,29 +67,39 @@ test("tool catalog reflects the bundled extension registration surface", () => {
 });
 
 test("audit and assess prompts name the exact Google Workspace operator tools", () => {
-  const registered = new Set(getRegisteredToolSummaries().map((tool) => tool.name));
-  const operatorTools = [
-    ["gws_ops_investigate_alerts", "alerts"],
-    ["gws_ops_trace_admin_activity", "admin activity"],
-    ["gws_ops_review_tokens", "token activity"],
-    ["gws_ops_collect_evidence_bundle", "evidence"],
-  ];
+  const checkTool = "gws_ops_check_cli";
+  const purposeByTool = {
+    gws_ops_investigate_alerts: /\balerts?\b/i,
+    gws_ops_trace_admin_activity: /\badmin activity\b/i,
+    gws_ops_review_tokens: /\btokens?\b/i,
+    gws_ops_collect_evidence_bundle: /\bevidence\b/i,
+  };
+  const operatorTools = [checkTool, ...Object.keys(purposeByTool)];
+
+  const registeredOperatorTools = getRegisteredToolSummaries()
+    .filter((tool) => tool.name.startsWith("gws_ops_"))
+    .map((tool) => tool.name);
+  assert.deepEqual([...registeredOperatorTools].sort(), [...operatorTools].sort());
 
   for (const prompt of ["audit", "assess"]) {
-    const text = readFileSync(resolve(cliRoot, "prompts", `${prompt}.md`), "utf8");
-    assert.doesNotMatch(text, /gws_ops_\*/, `${prompt}.md must not reference the non-invokable gws_ops_* wildcard`);
+    const text = readFileSync(resolve(cliRoot, "prompts", `${prompt}.md`), "utf8").replace(/\s+/g, " ");
+    const referenced = new Set([...text.matchAll(/`(gws_ops_[^`]*)`/g)].map((match) => match[1]));
+    assert.deepEqual([...referenced].sort(), [...operatorTools].sort(), `${prompt}.md must reference exactly the registered operator tools`);
 
-    const line = text.split("\n").find((entry) => entry.includes("`gws_ops_check_cli`"));
-    assert.ok(line, `${prompt}.md must route operator work through gws_ops_check_cli`);
-    const checkIndex = line.indexOf("`gws_ops_check_cli`");
-    for (const [name, purpose] of operatorTools) {
-      assert.ok(registered.has(name), `${name} is not a registered tool`);
-      const toolIndex = line.indexOf(`\`${name}\``);
-      assert.ok(toolIndex > checkIndex, `${prompt}.md must name ${name} after gws_ops_check_cli`);
+    const checkIndex = text.indexOf(`\`${checkTool}\``);
+    for (const [name, purpose] of Object.entries(purposeByTool)) {
+      const toolIndex = text.indexOf(`\`${name}\``);
+      assert.ok(toolIndex > checkIndex, `${prompt}.md must name ${name} after ${checkTool}`);
+
+      // The description that follows a tool reference runs until the next backticked name.
       const afterTool = toolIndex + name.length + 2;
-      const nextReference = line.indexOf("`", afterTool);
-      const pairing = line.slice(afterTool, nextReference === -1 ? undefined : nextReference);
-      assert.match(pairing, new RegExp(`\\bfor\\b.*\\b${purpose}\\b`), `${prompt}.md must pair ${name} with ${purpose}`);
+      const nextReference = text.indexOf("`", afterTool);
+      const description = text.slice(afterTool, nextReference === -1 ? afterTool + 80 : Math.min(nextReference, afterTool + 80));
+      assert.match(description, purpose, `${prompt}.md must pair ${name} with its purpose`);
+      for (const [otherName, otherPurpose] of Object.entries(purposeByTool)) {
+        if (otherName === name) continue;
+        assert.doesNotMatch(description, otherPurpose, `${prompt}.md pairs ${name} with ${otherName}'s purpose`);
+      }
     }
   }
 });
