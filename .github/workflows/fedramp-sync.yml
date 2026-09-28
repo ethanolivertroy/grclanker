@@ -38,8 +38,9 @@ jobs:
       - name: Sync official FedRAMP sources
         run: npm run sync:fedramp
 
-      # PRs opened with GITHUB_TOKEN do not trigger other workflows, so the
-      # sync must pass the CLI tests and site build before the PR is opened.
+      # Workflows on PRs opened with GITHUB_TOKEN do not run automatically and
+      # may wait for approval, so the sync must pass the CLI tests and site
+      # build before the PR is opened.
       - name: Test CLI
         working-directory: cli
         run: npm run test:cli
