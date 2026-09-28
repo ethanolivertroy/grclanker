@@ -544,6 +544,7 @@ test("Cloud Guard collection wrappers preserve compliant empty problems and bare
 });
 
 test("Cloud Guard collection wrappers without items fail closed as unreadable", async () => {
+  const malformedCanary = "CANARY-CLOUD-GUARD-COLLECTION-7f3a9c1d";
   const rows = [
     { method: "listCloudGuardTargets", finding: "OCI-LOG-01", command: "cloud-guard target list" },
     { method: "listCloudGuardProblems", finding: "OCI-LOG-02", command: "cloud-guard problem list" },
@@ -560,7 +561,9 @@ test("Cloud Guard collection wrappers without items fail closed as unreadable", 
       sampleConfig(),
       (args) => {
         const command = args.slice(8, 12).join(" ");
-        if (command.startsWith(row.command)) return JSON.stringify({ data: {} });
+        if (command.startsWith(row.command)) {
+          return JSON.stringify({ data: { debug_token: malformedCanary } });
+        }
         throw new Error(`Unexpected OCI command in malformed Cloud Guard fixture: ${command}`);
       },
       { now: () => NOW },
@@ -571,6 +574,7 @@ test("Cloud Guard collection wrappers without items fail closed as unreadable", 
       assert.ok(error instanceof OciCommandError);
       assert.equal(error.stdoutShape, "unexpected-collection");
       assert.match(error.message, /neither a bare array nor an object with an items array/);
+      assert.doesNotMatch(error.message, new RegExp(malformedCanary));
       return true;
     });
 
@@ -579,6 +583,7 @@ test("Cloud Guard collection wrappers without items fail closed as unreadable", 
     assert.equal(finding.status, "manual", `${row.method}: ${finding.summary}`);
     assert.match(finding.summary, new RegExp(row.command));
     assert.ok(result.errors.some((error) => error.includes("neither a bare array nor an object with an items array")));
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(malformedCanary));
   }
 });
 
