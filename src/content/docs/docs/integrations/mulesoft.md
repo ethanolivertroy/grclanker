@@ -1,6 +1,6 @@
 ---
 title: MuleSoft Anypoint Platform
-description: Read-only security inspector for MuleSoft Anypoint Platform organizations covering identity and access, API Manager policies, runtime infrastructure, and audit logging across 25 spec controls.
+description: Read-only MuleSoft Anypoint Platform security inspector covering identity and access, API Manager policies, runtime infrastructure, and audit logging.
 ---
 
 The MuleSoft integration inspects an Anypoint Platform organization through the public Anypoint Platform APIs and reports framework-mapped findings for the 25 controls in `specs/mulesoft-sec-inspector.spec.md`. It never mutates the organization: every request is a `GET`, except the token exchange and the audit log query, which the Audit Log Query API exposes as a `POST`.

@@ -1,6 +1,6 @@
 ---
 title: "Oracle Cloud Infrastructure"
-description: "Read-only OCI security inspector: IAM, Cloud Guard, audit retention, networking, bastions, vault keys, Object Storage, IMDSv2, and volume encryption, mapped to eight frameworks."
+description: "Read-only OCI security inspector covering IAM, Cloud Guard, audit retention, networking, vault keys, Object Storage, and IMDSv2, mapped to eight frameworks."
 ---
 
 # Oracle Cloud Infrastructure (OCI)

@@ -1,6 +1,6 @@
 ---
 title: Zendesk
-description: Read-only Zendesk Support security inspection covering authentication, access control, audit logging, data protection, apps, brands, and external integrations, with an exportable audit bundle.
+description: Read-only Zendesk Support security inspector covering authentication, access control, audit logging, data protection, and integrations, with an audit bundle.
 ---
 
 The Zendesk integration inspects a Zendesk Support account through the public Support API and renders the 25 controls from `specs/zendesk-sec-inspector.spec.md` as normalized findings. Every tool is read-only: nothing is created, updated, or deleted in the account.

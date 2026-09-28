@@ -1,6 +1,6 @@
 ---
 title: Google Workspace
-description: Read-only Google Workspace compliance inspection over the Admin SDK Directory, Reports, Alert Center, and Cloud Identity Policy APIs, with a multi-framework audit bundle.
+description: Read-only Google Workspace security inspector covering identity, 2-step verification, admin roles, OAuth tokens, and Alert Center, with an audit bundle.
 ---
 
 The Google Workspace inspector (`gws_*` tools) reviews identity, privileged access, third-party OAuth integrations, and security monitoring in a Google Workspace tenant. It is read-only: every request is a GET against a documented Google API, nothing is written back to the tenant, and every verdict follows the verdict-safety rules described below.

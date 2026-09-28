@@ -1,6 +1,6 @@
 ---
 title: AWS
-description: Read-only AWS security inspector covering IAM, CloudTrail, Security Hub, GuardDuty, Config, Organizations, Identity Center, S3, EBS, RDS, KMS, VPC networking, Audit Manager, and account contacts across the 25 spec controls.
+description: Read-only AWS security inspector covering IAM, Identity Center, CloudTrail, Security Hub, GuardDuty, Config, Organizations, S3, EBS, RDS, KMS, and VPCs.
 ---
 
 The AWS integration audits one AWS account's own security configuration: how the root user and IAM principals are protected, whether logging and detection services are on, which organization guardrails exist, whether data at rest and in transit is protected by default, and whether the network edge is closed on sensitive ports. It never mutates the account: every request is a `Get`, `List`, `Describe`, or `Lookup` call against the documented AWS service APIs through the AWS SDK for JavaScript v3.
