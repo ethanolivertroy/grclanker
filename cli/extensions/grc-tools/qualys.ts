@@ -2029,8 +2029,7 @@ function guardedFinding(input: VerdictInput): QualysFinding {
   if (unreadable.length > 0) {
     const causes = unreadable.map((source) => `${source.name}${source.moduleUnavailable ? " (module unlicensed or role not permitted)" : ""}: ${shortenMessage(source.error ?? "", 120)}`);
     if (status !== "fail") status = "manual";
-    if (status === "fail") markIncomplete();
-    else decisionFacts = undefined;
+    markIncomplete();
     notes.push(`${status === "fail" ? "Additional evidence was not readable" : "Required evidence was not readable"}: ${causes.join("; ")}.`);
   }
   // A call blocked by an unreadable upstream is disclosed with the read it would have made; a call skipped because
@@ -2981,9 +2980,14 @@ export async function assessQualysScanCoverage(
     sources: [excluded, profiles],
     scope,
     manualEvidence: "export Assets > Excluded Hosts and review each excluded IP range and option profile detection exclusion search list for justification.",
-    decisionFacts: excluded.error || profiles.error || profiles.data.length === 0 && excluded.data.length === 0
-      ? {}
-      : qualysDecisionFacts(excluded.data.length + profiles.data.length, broadExclusions.length, excluded.data.length + excludedQidCount),
+    decisionFacts: {
+      qualys_c16_required_exclusion_sources_readable: !excluded.error && !profiles.error,
+      qualys_c16_exclusion_sources_complete: !excluded.error && !profiles.error && !excluded.truncated && !profiles.truncated,
+      qualys_c16_excluded_host_and_profile_count: excluded.data.length + profiles.data.length,
+      qualys_c16_broad_excluded_ip_range_count: broadExclusions.length,
+      qualys_c16_documented_exclusion_count: excluded.data.length + excludedQidCount,
+      qualys_c16_option_profile_count: profiles.error ? null : profiles.data.length,
+    },
   }));
 
   findings.push(guardedFinding({
