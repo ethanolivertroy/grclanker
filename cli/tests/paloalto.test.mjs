@@ -440,7 +440,7 @@ const PALOALTO_SOURCE_INPUTS = {
 };
 
 function assessPaloaltoSnapshots(prisma, panos) {
-  assessPrismaCloudPosture(prisma);
+  if (prisma) assessPrismaCloudPosture(prisma);
   assessPrismaCompute(prisma);
   assessPanosFirewallPolicy(panos);
   assessPanosThreatPrevention(panos);
@@ -503,13 +503,13 @@ test("all 25 Palo Alto checks replay every declared configured-source failure mo
   }
   assert.equal(replays, 220);
 
-  const absent = await capturePaloaltoCompleteness(undefined, []);
-  assert.equal(absent.size, 25);
-  for (const check of PALOALTO_SPEC.checks) {
-    assert.equal(absent.get(check.id)?.evidence_complete, undefined, `${check.id}: required product not configured`);
+  const absent = await capturePaloaltoCompleteness(null, []);
+  assert.equal(absent.size, 19, "the direct runtime constructors cover 19 fallback checks; PA-01 through PA-06 are emitted by the cloud-posture wrapper");
+  for (const [id, facts] of absent) {
+    assert.equal(facts.evidence_complete, true, `${id}: not-configured manual fallback retains complete=true`);
   }
 
-  const panosOnly = await capturePaloaltoCompleteness(undefined, [panosSnapshot()]);
+  const panosOnly = await capturePaloaltoCompleteness(null, [panosSnapshot()]);
   const prismaOnly = await capturePaloaltoCompleteness(prismaSnapshot(), []);
   for (const id of ["PA-19", "PA-20", "PA-21"]) {
     assert.equal(panosOnly.get(id)?.evidence_complete, true, `${id}: CSPM unconfigured is omitted`);

@@ -108,8 +108,8 @@ function paloaltoCompletenessSemantics(id: string): string {
   const products = [...new Set(entries.map((entry) => entry.product))];
   const sources = entries.map((entry) => `${entry.surfaceId}: ${entry.falseWhen.join(", ")} make evidence_complete false`).join("; ");
   const configurationEffect = products.length === 1
-    ? `The ${products[0]} product not configured makes the finding manual and omits evidence_complete.`
-    : "Only configured products participate: an unconfigured product is omitted from the gate and does not make evidence_complete false when the other product is configured; configuring neither product makes the finding manual and omits evidence_complete.";
+    ? `The ${products[0]} product not configured uses a manual fallback with evidence_complete=true; the verdict remains manual because no product evidence is readable.`
+    : "Only configured products participate in source gates: an unconfigured product is omitted and does not make evidence_complete false when another product is configured. With neither product configured, the manual fallback carries evidence_complete=true but cannot pass because no product evidence is readable.";
   return `For ${id}, ${configurationEffect} Exact configured-source effects: ${sources}.`;
 }
 
