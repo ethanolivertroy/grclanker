@@ -86,6 +86,7 @@ const decisionConstants = (control: number): Batch2CheckRow["constants"] => ({
   7: { default_maximum_super_administrators: ZSCALER_DEFAULT_MAX_SUPER_ADMINS },
   11: { default_stale_connector_days: ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS },
   13: { default_maximum_timeout_hours: ZSCALER_DEFAULT_MAX_TIMEOUT_HOURS },
+  21: { default_stale_service_edge_days: ZSCALER_DEFAULT_STALE_CONNECTOR_DAYS },
   24: { default_certificate_expiry_warning_days: ZSCALER_DEFAULT_CERT_EXPIRY_WARN_DAYS },
   25: {
     required_advanced_threat_protection_flags: ZSCALER_REQUIRED_ATP_FLAGS,

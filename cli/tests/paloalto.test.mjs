@@ -4584,13 +4584,13 @@ test("byte differential fixtures: Palo Alto assessments and export artifacts", {
     await runAllAssessments(createPaloaltoClients(bothProductsConfig(), mockedFetch())),
   );
 
-  const complianceAt = (passedResources) => {
+  const complianceAt = (passedResources, minCompliancePassRate = 90) => {
     const boundarySnapshot = prismaSnapshot();
     boundarySnapshot.posture = {
       summary: { passedResources, failedResources: 100 - passedResources, totalResources: 100 },
       complianceDetails: [{ name: "CIS v1.4", passedResources, failedResources: 100 - passedResources }],
     };
-    return assessPrismaCloudPosture(boundarySnapshot, { minCompliancePassRate: 90 });
+    return assessPrismaCloudPosture(boundarySnapshot, { minCompliancePassRate });
   };
   const administratorCountAt = (count, maxSuperusers = 3) => {
     const snapshot = panosSnapshot();
@@ -4609,12 +4609,17 @@ test("byte differential fixtures: Palo Alto assessments and export artifacts", {
   const hostComplianceBoundaries = [89, 90, 91].map((passRate) => assessPrismaCompute(computeSnapshot({
     complianceStats: documentedComplianceStats({ failed: 100 - passRate, total: 100 }),
   })));
+  const complianceRateBoundaries = [69, 70, 89, 90, 91].map(complianceAt);
+  const complianceRateOverrideEighty = [59, 60, 79, 80, 81].map((passRate) => complianceAt(passRate, 80));
   assert.equal(
-    superuserBoundaries.length + superuserOverrideBoundaries.length + criticalCveBoundaries.length + hostComplianceBoundaries.length,
-    11,
+    complianceRateBoundaries.length + complianceRateOverrideEighty.length
+      + superuserBoundaries.length + superuserOverrideBoundaries.length
+      + criticalCveBoundaries.length + hostComplianceBoundaries.length,
+    21,
   );
   writeByteDifferentialFixture("paloalto", "boundary", {
-    complianceRate: [69, 70, 89, 90].map(complianceAt),
+    complianceRate: complianceRateBoundaries,
+    complianceRateOverrideEighty,
     criticalCves: criticalCveBoundaries,
     hostComplianceRate: hostComplianceBoundaries,
     superusers: superuserBoundaries,

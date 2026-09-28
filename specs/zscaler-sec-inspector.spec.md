@@ -764,8 +764,7 @@ A `matches` condition performs a regular-expression search; anchors are required
 | `ZS-19` | `requiredEvidenceComplete` | true |
 | `ZS-20` | `requiredEvidenceReadable` | true |
 | `ZS-20` | `requiredEvidenceComplete` | true |
-| `ZS-21` | `requiredEvidenceReadable` | true |
-| `ZS-21` | `requiredEvidenceComplete` | true |
+| `ZS-21` | `default_stale_service_edge_days` | 30 |
 | `ZS-22` | `requiredEvidenceReadable` | true |
 | `ZS-22` | `requiredEvidenceComplete` | true |
 | `ZS-23` | `requiredEvidenceReadable` | true |

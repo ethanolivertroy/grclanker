@@ -2932,9 +2932,13 @@ test("byte differential fixtures: GCP assessments and export artifacts", { skip:
   const keyAgeOverride = await Promise.all([29, 30, 31].map((days) => serviceAccountKeyAgeAt(days, 30)));
   const logRetention = await Promise.all([89, 90, 91].map(logRetentionAt));
   const kmsRotation = await Promise.all([364, 365, 366].map(kmsRotationAt));
-  assert.equal(keyAgeDefault.length + keyAgeOverride.length + logRetention.length + kmsRotation.length, 12);
+  const serviceAccountKeys = await Promise.all([0, 1, 2].map(keysAt));
+  assert.equal(
+    serviceAccountKeys.length + keyAgeDefault.length + keyAgeOverride.length + logRetention.length + kmsRotation.length,
+    15,
+  );
   writeByteDifferentialFixture("gcp", "boundary", {
-    serviceAccountKeys: await Promise.all([0, 1, 2].map(keysAt)),
+    serviceAccountKeys,
     serviceAccountKeyAgeDays: keyAgeDefault,
     serviceAccountKeyAgeOverrideThirtyDays: keyAgeOverride,
     logRetentionDays: logRetention,

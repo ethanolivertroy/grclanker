@@ -2528,6 +2528,16 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
     fixture.securityAllowlist = readable({ whitelistUrls: Array.from({ length: count }, (_, index) => `allow-${index}.example`) });
     return assessZiaPolicyData(fixture);
   };
+  const superAdministratorsAt = (count, maxSuperAdmins = 5) => assessZiaAccessControlData(accessControlFixture({
+    adminUsers: readable(Array.from({ length: count }, (_, index) => ({
+      id: index + 1,
+      loginName: `boundary-admin-${index}@example.com`,
+      disabled: false,
+      isPasswordLoginAllowed: false,
+      adminScopeType: "ORGANIZATION",
+      role: { id: 10, name: "Super Admin" },
+    }))),
+  }), { maxSuperAdmins });
   const sslDefaultBoundaries = [49, 50, 51].map((count) => sslExemptionsAt(count));
   const sslOverrideBoundaries = [9, 10, 11].map((count) => sslExemptionsAt(count, 10));
   const allowlistBoundaries = [99, 100, 101].map(securityAllowlistAt);
@@ -2535,6 +2545,11 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
     appConnectors: readable([
       { id: "c-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
       { id: "c-2", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", appConnectorGroupName: "DC East", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
+    ]),
+  }), { staleConnectorDays });
+  const serviceEdgeAgeAt = (days, staleConnectorDays = 30) => assessZpaData(zpaFixture({
+    serviceEdges: readable([
+      { id: "se-1", enabled: true, controlChannelStatus: "ZPN_STATUS_AUTHENTICATED", lastBrokerConnectTime: NOW.getTime() - days * 24 * 60 * 60 * 1000 },
     ]),
   }), { staleConnectorDays });
   const timeoutAt = (hours, maxTimeoutHours = 24) => assessZpaData(zpaFixture({
@@ -2546,26 +2561,38 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
   }), { certExpiryWarnDays });
   const connectorDefaultBoundaries = [29, 30, 31].map((days) => connectorAgeAt(days));
   const connectorOverrideBoundaries = [9, 10, 11].map((days) => connectorAgeAt(days, 10));
+  const serviceEdgeDefaultBoundaries = [29, 30, 31].map((days) => serviceEdgeAgeAt(days));
+  const serviceEdgeOverrideBoundaries = [9, 10, 11].map((days) => serviceEdgeAgeAt(days, 10));
   const timeoutDefaultBoundaries = [23, 24, 25].map((hours) => timeoutAt(hours));
   const timeoutOverrideBoundaries = [9, 10, 11].map((hours) => timeoutAt(hours, 10));
   const certificateDefaultBoundaries = [29, 30, 31].map((days) => certificateAt(days));
   const certificateOverrideBoundaries = [9, 10, 11].map((days) => certificateAt(days, 10));
+  const configuredSuperAdministratorThresholds = [0, 1, 2].map((maxSuperAdmins) => (
+    assessZiaAccessControlData(accessControlFixture(), { maxSuperAdmins })
+  ));
+  const superAdministratorDefaultBoundaries = [4, 5, 6].map((count) => superAdministratorsAt(count));
+  const superAdministratorOverrideBoundaries = [9, 10, 11].map((count) => superAdministratorsAt(count, 10));
   assert.equal(
-    sslDefaultBoundaries.length + sslOverrideBoundaries.length + allowlistBoundaries.length
+    configuredSuperAdministratorThresholds.length
+      + superAdministratorDefaultBoundaries.length + superAdministratorOverrideBoundaries.length
+      + sslDefaultBoundaries.length + sslOverrideBoundaries.length + allowlistBoundaries.length
       + connectorDefaultBoundaries.length + connectorOverrideBoundaries.length
+      + serviceEdgeDefaultBoundaries.length + serviceEdgeOverrideBoundaries.length
       + timeoutDefaultBoundaries.length + timeoutOverrideBoundaries.length
       + certificateDefaultBoundaries.length + certificateOverrideBoundaries.length,
-    27,
+    42,
   );
   writeByteDifferentialFixture("zscaler", "boundary", {
-    superAdministrators: [0, 1, 2].map((maxSuperAdmins) => (
-      assessZiaAccessControlData(accessControlFixture(), { maxSuperAdmins })
-    )),
+    superAdministrators: configuredSuperAdministratorThresholds,
+    superAdministratorDefaultThreshold: superAdministratorDefaultBoundaries,
+    superAdministratorOverrideTen: superAdministratorOverrideBoundaries,
     sslExemptions: sslDefaultBoundaries,
     sslExemptionsOverrideTen: sslOverrideBoundaries,
     securityAllowlist: allowlistBoundaries,
     connectorAgeDays: connectorDefaultBoundaries,
     connectorAgeOverrideTenDays: connectorOverrideBoundaries,
+    serviceEdgeAgeDays: serviceEdgeDefaultBoundaries,
+    serviceEdgeAgeOverrideTenDays: serviceEdgeOverrideBoundaries,
     timeoutHours: timeoutDefaultBoundaries,
     timeoutOverrideTenHours: timeoutOverrideBoundaries,
     certificateExpiryDays: certificateDefaultBoundaries,
