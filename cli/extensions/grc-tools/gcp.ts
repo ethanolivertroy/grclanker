@@ -36,6 +36,7 @@ import {
   GCP_HTTP_BACKEND_PROTOCOLS,
   GCP_MAX_KMS_ROTATION_DAYS as MAX_KMS_ROTATION_DAYS,
   GCP_MIN_LOG_RETENTION_DAYS as MIN_LOG_RETENTION_DAYS,
+  GCP_PRIVILEGED_IAM_ROLES as PRIVILEGED_IAM_ROLES,
   GCP_SPEC,
 } from "./gcp.spec.js";
 import { REDACTED, seenVersusTotal, systemErrorCode } from "./hardening/index.js";
@@ -1097,12 +1098,7 @@ function parsePolicyBindings(value: unknown): JsonRecord[] {
 }
 
 function isOwnerLikeRole(role?: string): boolean {
-  return [
-    "roles/owner",
-    "roles/editor",
-    "roles/resourcemanager.organizationAdmin",
-    "roles/resourcemanager.folderAdmin",
-  ].includes(role ?? "");
+  return PRIVILEGED_IAM_ROLES.includes((role ?? "") as (typeof PRIVILEGED_IAM_ROLES)[number]);
 }
 
 function isDefaultServiceAccount(member: string): boolean {

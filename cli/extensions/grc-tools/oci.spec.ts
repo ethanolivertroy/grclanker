@@ -133,7 +133,7 @@ const decisionPredicate: Readonly<Record<string, string>> = {
   "OCI-IAM-02": "Fail when any active console-password-capable IAM user has isMfaActivated other than true; pass only after the complete user inventory has no such user.",
   "OCI-IAM-03": `Fail when any active API key, customer secret key, or auth token has no usable timeCreated or is older than stale_days. stale_days defaults to ${OCI_DEFAULT_CREDENTIAL_STALE_DAYS} and is clamped to 1 through 3650 days.`,
   "OCI-IAM-04": "Warn when an IAM policy statement grants any verb to any-user or grants manage to a broad subject or resource scope; retain the complete policy and statement counts.",
-  "OCI-IAM-05": "Fail when no non-root compartment exists; otherwise evaluate the complete ACTIVE compartment parent graph and warn for an unresolvable parent or a hierarchy deeper than the runtime baseline.",
+  "OCI-IAM-05": "Fail when the complete ACTIVE compartment inventory contains no non-root compartment whose compartmentId names either another returned compartment or the tenancy OCID. Pass when at least one such non-root compartment exists; maximum parent-chain depth is reported as evidence but does not change the verdict.",
   "OCI-IAM-06": "Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting.",
   "OCI-LOG-01": "Fail when the Cloud Guard configuration status is not ENABLED or no ACTIVE target exists; pass only when both reads are complete and affirmative.",
   "OCI-LOG-02": "Pass on a complete empty open-problem inventory; fail when any unresolved Cloud Guard problem is HIGH or CRITICAL and warn for lower-risk open problems.",
@@ -200,7 +200,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 
 export const OCI_RUNTIME_BEHAVIOR = [
-  "The runtime invokes documented read-only OCI CLI commands and records command failures as unreadable evidence rather than empty arrays.",
+  "The collector invokes documented read-only OCI CLI commands and records command failures as unreadable evidence rather than empty arrays.",
   "Compartment, credential, policy, bucket, key, and resource caps mark dependent checks partial; displayed records are capped independently from verdict counts.",
   "Password expiration remains manual because the classic IAM PasswordPolicy datatype does not expose that identity-domain setting.",
 ] as const;
