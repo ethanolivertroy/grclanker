@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { runComputeDoctor } from "./pi/doctor.js";
 import { runComputeExec, runComputeList, runComputeSmokeTest } from "./pi/env.js";
+import { CLI_HELP } from "./pi/cli-help.js";
 import { launchCli, runCliSetup } from "./pi/launch.js";
 import { routeCliInvocation } from "./pi/cli-routing.js";
 import { GrclankerUserError } from "./pi/setup.js";
@@ -39,36 +40,7 @@ const commands: Record<string, (compute?: ComputeBackendKind, prompt?: string) =
 };
 
 function printHelp() {
-  console.log(`
-grclanker
-
-Usage:
-  grclanker                     Interactive GRC CLI
-  grclanker setup               Configure local-first or hosted model access
-  grclanker setup --compute <k> Save <kind> as the preferred compute backend
-  grclanker env list            List every compute backend, bucket, and readiness
-  grclanker env doctor          Check compute backend availability
-  grclanker env smoke-test      Validate the selected backend end-to-end
-  grclanker env exec -- <cmd>   Run a shell command on the selected backend
-  grclanker tools               List bundled GRC and compute tools
-  grclanker flue run -m <text>  Run the same GRC agent under the Flue Framework runtime
-  grclanker investigate         Trace crypto status, KEVs, and exploitability
-  grclanker audit               Map evidence against a requested framework
-  grclanker assess              Produce a posture readout and remediation order
-  grclanker validate            Answer a narrow FIPS validation question
-  ... --compute <kind>          Run investigate/audit/assess/validate on a specific backend
-                                (interactive mode uses the backend saved by setup --compute)
-
-Install:
-  curl -fsSL https://grclanker.com/install | bash
-  powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
-
-Recommended next step after install:
-  grclanker setup
-
-Options:
-  --help, -h                    Show this help
-`);
+  console.log(CLI_HELP);
 }
 
 async function main() {
@@ -132,7 +104,7 @@ async function main() {
   }
 
   const invocation = routeCliInvocation(args, Object.keys(commands));
-  if (invocation.kind === "unknown-option") {
+  if (invocation.kind === "unknown-option" || invocation.kind === "unknown-command") {
     console.error(`Unknown command: ${invocation.command}`);
     console.error("Run 'grclanker --help' for usage.");
     process.exit(1);

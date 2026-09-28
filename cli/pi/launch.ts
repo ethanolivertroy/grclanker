@@ -16,7 +16,9 @@ import {
   resolveSkillDiscoveryMode,
 } from "./settings.js";
 import { resolveComputeBackend, type ComputeBackendKind } from "./compute.js";
+import { serializeInitialPrompt, type InitialPromptPayload } from "./prompt-envelope.js";
 import { ensureCliConfigured, runComputeSetup, runSetupWizard } from "./setup.js";
+import { readWorkflowPrompt } from "./workflow-prompt.js";
 
 function resolveExtensionEntrypoint(appRoot: string): string {
   const compiledPath = resolve(appRoot, "dist", "extensions", "grc-tools.js");
@@ -55,7 +57,7 @@ export function buildCliLaunchArgs(
   appRoot: string,
   agentDir: string,
   settings: GrclankerSettings,
-  prompt?: string,
+  initialPrompt?: InitialPromptPayload,
 ): string[] {
   const args: string[] = [];
   if (
@@ -73,15 +75,11 @@ export function buildCliLaunchArgs(
   args.push("--prompt-template", resolve(appRoot, "prompts"));
   args.push("--system-prompt", readFileSync(resolve(appRoot, ".grclanker", "SYSTEM.md"), "utf8"));
 
-  if (prompt) {
-    args.push("--", prompt);
+  if (initialPrompt) {
+    args.push(serializeInitialPrompt(initialPrompt));
   }
 
   return args;
-}
-
-export function buildWorkflowPrompt(workflow: string, subject?: string): string {
-  return subject ? `/${workflow} ${subject}` : `/${workflow}`;
 }
 
 export async function launchCli(
@@ -97,12 +95,12 @@ export async function launchCli(
     process.env[COMPUTE_BACKEND_OVERRIDE_ENV] = compute;
   }
   const settings = applyComputeBackendOverride(readGrclankerSettings(settingsPath), compute);
-  const args = buildCliLaunchArgs(
-    appRoot,
-    agentDir,
-    settings,
-    workflow ? buildWorkflowPrompt(workflow, prompt) : prompt,
-  );
+  const initialPrompt = workflow
+    ? { kind: "workflow" as const, content: readWorkflowPrompt(appRoot, workflow, prompt) }
+    : prompt
+      ? { kind: "prompt" as const, content: prompt }
+      : undefined;
+  const args = buildCliLaunchArgs(appRoot, agentDir, settings, initialPrompt);
 
   process.env.GRCLANKER_CODING_AGENT_DIR = agentDir;
   process.env.GRCLANKER_COMPUTE_BACKEND = resolveComputeBackend(settings);

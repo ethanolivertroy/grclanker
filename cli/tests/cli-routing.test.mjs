@@ -4,20 +4,24 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { expandPromptTemplate } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/prompt-templates.js";
+import { parseArgs } from "@earendil-works/pi-coding-agent";
+import { CLI_HELP } from "../dist/pi/cli-help.js";
 import { routeCliInvocation } from "../dist/pi/cli-routing.js";
-import { buildCliLaunchArgs, buildWorkflowPrompt } from "../dist/pi/launch.js";
+import { buildCliLaunchArgs } from "../dist/pi/launch.js";
+import {
+  extractInitialPrompt,
+  materializeInitialPrompt,
+  serializeInitialPrompt,
+} from "../dist/pi/prompt-envelope.js";
+import { renderWorkflowPrompt } from "../dist/pi/workflow-prompt.js";
 
 const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflows = ["assess", "audit", "investigate", "validate"];
 
-function expandWorkflow(workflow, subject) {
-  return expandPromptTemplate(
-    buildWorkflowPrompt(workflow, subject),
-    [{
-      name: workflow,
-      content: readFileSync(resolve(cliRoot, "prompts", `${workflow}.md`), "utf8"),
-    }],
+function renderWorkflow(workflow, subject) {
+  return renderWorkflowPrompt(
+    readFileSync(resolve(cliRoot, "prompts", `${workflow}.md`), "utf8"),
+    subject,
   );
 }
 
@@ -33,9 +37,14 @@ test("non-option invocations route as one free-form Pi prompt", () => {
     prompt: "Investigate CVE-2024-3094",
   });
 
-  const args = buildCliLaunchArgs(cliRoot, "/tmp/grclanker-home/agent", {}, invocation.prompt);
-  assert.deepEqual(args.slice(-2), ["--", "Investigate CVE-2024-3094"]);
-  assert.equal(args.includes("--compute"), false);
+  const args = buildCliLaunchArgs(cliRoot, "/tmp/grclanker-home/agent", {}, {
+    kind: "prompt",
+    content: invocation.prompt,
+  });
+  const parsed = parseArgs(args);
+  assert.equal(parsed.fileArgs.length, 0);
+  assert.deepEqual(parsed.messages, [args.at(-1)]);
+  assert.equal(args.at(-1).startsWith("-"), false);
 });
 
 test("workflow subjects survive both --compute forms and positions", () => {
@@ -54,10 +63,11 @@ test("workflow subjects survive both --compute forms and positions", () => {
   }
 });
 
-test("all workflow templates expand their subject through $ARGUMENTS", () => {
+test("all workflow templates render their subject through $ARGUMENTS", () => {
   for (const workflow of workflows) {
-    const prompt = expandWorkflow(workflow, "CVE-2024-3094 OpenSSL");
+    const prompt = renderWorkflow(workflow, "CVE-2024-3094 OpenSSL");
     assert.match(prompt, /Subject: CVE-2024-3094 OpenSSL/);
+    assert.equal(prompt.includes("$ARGUMENTS"), false);
   }
 });
 
@@ -72,22 +82,61 @@ test("workflow invocation preserves delimiter-protected --compute text", () => {
     command: "investigate",
     prompt: "--compute not-a-backend",
   });
-  assert.match(
-    expandWorkflow(invocation.command, invocation.prompt),
-    /Subject: --compute not-a-backend/,
-  );
+  assert.match(renderWorkflow(invocation.command, invocation.prompt), /Subject: --compute not-a-backend/);
 });
 
-test("option-like unknown commands retain the Unknown command route", () => {
+test("reserved roots, option-like commands, and workflow typos retain the Unknown command route", () => {
   assert.deepEqual(
     routeCliInvocation(["--not-a-command", "subject"], workflows),
     { kind: "unknown-option", command: "--not-a-command" },
+  );
+  assert.deepEqual(
+    routeCliInvocation(["env", "exe", "--", "hostname"], workflows),
+    { kind: "unknown-command", command: "env" },
+  );
+  assert.deepEqual(
+    routeCliInvocation(["setup", "typo"], ["setup", ...workflows]),
+    { kind: "unknown-command", command: "setup" },
+  );
+  assert.deepEqual(
+    routeCliInvocation(["invesigate", "OpenSSL"], workflows),
+    { kind: "unknown-command", command: "invesigate" },
+  );
+  assert.deepEqual(
+    routeCliInvocation(["auidt", "AWS"], workflows),
+    { kind: "unknown-command", command: "auidt" },
   );
 });
 
 test("workflow commands without a subject remain valid", () => {
   const invocation = routeCliInvocation(["investigate"], workflows);
   assert.deepEqual(invocation, { kind: "command", command: "investigate" });
-  assert.match(expandWorkflow(invocation.command), /# Vulnerability Investigation/);
-  assert.match(expandWorkflow(invocation.command), /Subject:\s*\n/);
+  assert.match(renderWorkflow(invocation.command), /# Vulnerability Investigation/);
+  assert.match(renderWorkflow(invocation.command), /Subject:\s*\n/);
+});
+
+test("initial prompt envelopes preserve literal user text and workflow precedence over piped input", () => {
+  const literal = `@evidence "quoted" O'Reilly /audit --compute=modal`;
+  const serialized = serializeInitialPrompt({ kind: "prompt", content: literal });
+  const parsed = parseArgs([serialized]);
+  assert.deepEqual(parsed.messages, [serialized]);
+  assert.deepEqual(parsed.fileArgs, []);
+
+  const freeForm = extractInitialPrompt(serialized);
+  assert.deepEqual(freeForm, { pipedInput: "", payload: { kind: "prompt", content: literal } });
+  assert.equal(materializeInitialPrompt(freeForm.payload, freeForm.pipedInput), literal);
+
+  const workflow = renderWorkflow("audit", literal);
+  const piped = extractInitialPrompt(`tenant evidence${serializeInitialPrompt({ kind: "workflow", content: workflow })}`);
+  assert.ok(piped);
+  const materialized = materializeInitialPrompt(piped.payload, piped.pipedInput);
+  assert.ok(materialized.startsWith(workflow));
+  assert.match(materialized, /## Piped input\n\ntenant evidence$/);
+  assert.equal(materialized.includes("$ARGUMENTS"), false);
+});
+
+test("help documents prompt, workflow, compute, and delimiter invocation forms", () => {
+  assert.match(CLI_HELP, /grclanker "<prompt>"/);
+  assert.match(CLI_HELP, /investigate <subject> \[--compute <kind>\]/);
+  assert.match(CLI_HELP, /Treat all following text literally/);
 });

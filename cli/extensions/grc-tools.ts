@@ -19,6 +19,7 @@ import { getComputeBackendConfigurationIssues } from "../pi/compute.js";
 import { shutdownComputeSessions } from "../pi/compute-shutdown.js";
 import { executeComputeAwareGrep } from "../pi/search-tools.js";
 import { readGrclankerSettings } from "../pi/settings.js";
+import { extractInitialPrompt, materializeInitialPrompt } from "../pi/prompt-envelope.js";
 import { registerAnsibleTools } from "./grc-tools/ansible.js";
 import { registerAwsTools } from "./grc-tools/aws.js";
 import { registerAzureTools } from "./grc-tools/azure.js";
@@ -167,6 +168,18 @@ export default function grcTools(pi: ExtensionAPI): void {
   const localLs = createLsTool(localCwd);
   const localFind = createFindTool(localCwd);
   const localGrep = createGrepTool(localCwd);
+
+  pi.on("input", async (event) => {
+    if (event.source !== "interactive") return { action: "continue" };
+
+    const initialPrompt = extractInitialPrompt(event.text);
+    if (!initialPrompt) return { action: "continue" };
+
+    await pi.sendUserMessage(
+      materializeInitialPrompt(initialPrompt.payload, initialPrompt.pipedInput),
+    );
+    return { action: "handled" };
+  });
 
   function getSettings() {
     if (!runtime.settings) {
