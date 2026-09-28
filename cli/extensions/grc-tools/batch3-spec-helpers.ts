@@ -8,6 +8,7 @@ import {
   batch2Gt,
   batch2Ne,
   batch2Not,
+  batch2Path,
   batch2Rule,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
