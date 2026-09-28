@@ -6,6 +6,7 @@
  * read-only and Admin API–first so GRC engineers can assess a tenant with one
  * audit principal.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createHmac } from "node:crypto";
 import {
   createWriteStream,
@@ -18,7 +19,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { hydrateBatchFrameworkMappings, preserveRuntimeFindingStatus, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -2530,6 +2531,18 @@ export async function collectDuoMonitoringData(
   };
 }
 
+const DUO_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordDuoDecisionFacts(id: DuoCheckId, facts: Readonly<Record<string, unknown>>): void {
+  const store = DUO_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Duo assessment`);
+  store.set(id, facts);
+}
+
+function completeDuoDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
+  return datasets.every((dataset) => Boolean(dataset) && !dataset?.error && dataset.complete !== false);
+}
+
 function buildFinding(
   id: DuoCheckId,
   status: DuoFindingStatus,
@@ -2539,7 +2552,9 @@ function buildFinding(
   options?: { severity?: DuoSeverity; manualNote?: string },
 ): DuoFinding {
   const definition = DUO_CHECKS[id];
-  status = preserveRuntimeFindingStatus(DUO_SPEC, id, status);
+  const facts = DUO_DECISION_CONTEXT.getStore()?.get(id);
+  if (!facts) throw new Error(`${id} has no runtime decision facts`);
+  status = materializeBatchCheckVerdict(DUO_SPEC, id, facts, status);
   return {
     id: definition.id,
     title: definition.title,
@@ -2926,6 +2941,32 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
     const reason = data.users.error
       ? "User inventory could not be collected."
       : "The user inventory was empty, so enrollment, inactivity, and credential adoption cannot be measured (Manual, not Pass).";
+    const unavailableFacts = {
+      readable: !data.users.error,
+      complete: completeDuoDatasets(data.users),
+    };
+    recordDuoDecisionFacts("DUO-AUTH-008", {
+      ...unavailableFacts,
+      user_count: users.length,
+      known_enrollment_count: 0,
+      bypass_user_count: 0,
+      unenrolled_user_count: 0,
+      enrollment_percent: 0,
+    });
+    recordDuoDecisionFacts("DUO-AUTH-009", {
+      ...unavailableFacts,
+      access_user_count: 0,
+      inactive_user_count: 0,
+      undated_user_count: 0,
+      inactive_percent: 0,
+    });
+    recordDuoDecisionFacts("DUO-AUTH-010", {
+      ...unavailableFacts,
+      enrolled_user_count: 0,
+      webauthn_user_count: 0,
+      deprecated_u2f_user_count: 0,
+      adoption_percent: 0,
+    });
     findings.push(
       buildFinding("DUO-AUTH-008", "Manual", reason, usersEvidence, "Grant the audit principal Grant resource - Read and confirm the tenant has enrolled users."),
       buildFinding("DUO-AUTH-009", "Manual", reason, usersEvidence, "Review user last-login activity in the Duo Admin Panel Users page."),
@@ -2952,6 +2993,15 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       ...bypassUsers.slice(0, 10).map((user) => `bypass_user=${userLabel(user)}`),
       ...unenrolledUsers.slice(0, 10).map((user) => `not_enrolled_user=${userLabel(user)}`),
     ];
+    recordDuoDecisionFacts("DUO-AUTH-008", {
+      readable: true,
+      complete: completeDuoDatasets(data.users),
+      user_count: users.length,
+      known_enrollment_count: enrollmentKnown.length,
+      bypass_user_count: bypassUsers.length,
+      unenrolled_user_count: unenrolledUsers.length,
+      enrollment_percent: enrollmentPercent,
+    });
 
     if (enrollmentKnown.length === 0) {
       findings.push(
@@ -3017,6 +3067,14 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       ...inactiveUsers.slice(0, 10).map((user) => `inactive_user=${userLabel(user)} last_login_age_days=${daysSince(user.last_login)}`),
       ...undatedUsers.slice(0, 10).map((user) => `undated_user=${userLabel(user)} last_login=null`),
     ];
+    recordDuoDecisionFacts("DUO-AUTH-009", {
+      readable: true,
+      complete: completeDuoDatasets(data.users),
+      access_user_count: accessUsers.length,
+      inactive_user_count: inactiveUsers.length,
+      undated_user_count: undatedUsers.length,
+      inactive_percent: inactiveShare,
+    });
     if (accessUsers.length === 0) {
       findings.push(
         buildFinding(
@@ -3082,6 +3140,14 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
         ? `webauthn_inventory_error=${data.webauthnCredentials.error}`
         : `webauthn_credentials_total=${credentialInventory.length} uv_capable=${uvCapable}`,
     ];
+    recordDuoDecisionFacts("DUO-AUTH-010", {
+      readable: true,
+      complete: completeDuoDatasets(data.users),
+      enrolled_user_count: enrolledUsers.length,
+      webauthn_user_count: enrolledWithWebauthn.length,
+      deprecated_u2f_user_count: u2fUsers.length,
+      adoption_percent: adoptionPercent,
+    });
     if (enrolledUsers.length === 0) {
       findings.push(
         buildFinding(
@@ -3147,6 +3213,7 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       return false;
     }
   }).length;
+  recordDuoDecisionFacts("DUO-AUTH-011", {});
   findings.push(
     buildFinding(
       "DUO-AUTH-011",
@@ -3180,6 +3247,7 @@ export function assessDuoAuthentication(
   data: DuoAuthenticationData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
+  return DUO_DECISION_CONTEXT.run(new Map(), () => {
   const findings: DuoFinding[] = [];
   const globalPolicy = getGlobalPolicyRecord(data);
   const policyUnavailable = Object.keys(getPolicySections(globalPolicy)).length === 0;
@@ -3214,6 +3282,10 @@ export function assessDuoAuthentication(
     : `admin_allowed_auth_methods.webauthn_enabled=${getBooleanish(adminMethods, "webauthn_enabled") ?? false}`;
 
   const userAuthBehavior = asString(asRecord(getPolicySections(globalPolicy).authentication_policy).user_auth_behavior)?.toLowerCase();
+  recordDuoDecisionFacts("DUO-AUTH-007", {
+    policy_readable: !policyUnavailable,
+    user_auth_behavior: userAuthBehavior,
+  });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
@@ -3266,6 +3338,13 @@ export function assessDuoAuthentication(
     );
   }
 
+  recordDuoDecisionFacts("DUO-AUTH-001", {
+    policy_readable: !policyUnavailable,
+    has_webauthn: hasWebAuthn,
+    allows_push: allowsPush,
+    requires_verified_push: requireVerifiedPush,
+    supporting_strong_method_count: strongFactorEvidence.length,
+  });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
@@ -3317,6 +3396,14 @@ export function assessDuoAuthentication(
     `authentication_methods.blocked_auth_list=${telephony.blocked.join(",") || (telephony.blockedExposed ? "empty" : "absent")}`,
     "Admin API rule: a method not in blocked_auth_list is allowed even when it is not in allowed_auth_list.",
   ];
+  recordDuoDecisionFacts("DUO-AUTH-002", {
+    policy_readable: !policyUnavailable,
+    allowed_list_exposed: telephony.allowedExposed,
+    blocked_list_exposed: telephony.blockedExposed,
+    explicitly_allowed_telephony_count: telephony.explicitlyAllowedTelephony.length,
+    blocked_telephony_count: telephony.blockedTelephony.length,
+    permitted_telephony_count: telephony.permittedTelephony.length,
+  });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
@@ -3384,6 +3471,9 @@ export function assessDuoAuthentication(
   }
 
   const newUserBehavior = asString(asRecord(getPolicySections(globalPolicy).new_user).new_user_behavior)?.toLowerCase();
+  recordDuoDecisionFacts("DUO-AUTH-003", {
+    new_user_behavior: newUserBehavior,
+  });
   if (!newUserBehavior) {
     findings.push(
       buildFinding(
@@ -3417,6 +3507,10 @@ export function assessDuoAuthentication(
   }
 
   const rememberedDays = rememberedDeviceWindowDays(globalPolicy);
+  recordDuoDecisionFacts("DUO-AUTH-004", {
+    policy_readable: !policyUnavailable,
+    remembered_device_days: rememberedDays,
+  });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
@@ -3498,6 +3592,10 @@ export function assessDuoAuthentication(
     getBooleanish(screenLock, "require_screen_lock") ? "screen_lock.require_screen_lock=true" : undefined,
     getBooleanish(diskEncryption, "require_encryption") ? "full_disk_encryption.require_encryption=true" : undefined,
   ].filter((item): item is string => Boolean(item));
+  recordDuoDecisionFacts("DUO-AUTH-005", {
+    policy_readable: !policyUnavailable,
+    trusted_endpoint_checking: trustedChecking,
+  });
   if (policyUnavailable) {
     findings.push(
       buildFinding(
@@ -3566,6 +3664,16 @@ export function assessDuoAuthentication(
     ),
   ];
   const flaggedBypassCodes = bypassReview.stale.length + bypassReview.unlimited.length;
+  recordDuoDecisionFacts("DUO-AUTH-006", {
+    readable: !data.bypassCodes.error,
+    complete: completeDuoDatasets(data.bypassCodes),
+    settings_readable: !data.settings.error,
+    bypass_code_count: bypassCount,
+    flagged_code_count: flaggedBypassCodes,
+    undated_code_count: bypassReview.undated,
+    helpdesk_bypass: helpdeskBypass,
+    helpdesk_bypass_expiration: helpdeskBypassExpiration,
+  });
 
   if (data.bypassCodes.error) {
     findings.push(
@@ -3661,12 +3769,14 @@ export function assessDuoAuthentication(
     snapshotSummary,
     text: buildAssessmentText("Duo authentication assessment", getOrganizationName(config), findings, snapshotSummary),
   };
+  });
 }
 
 export function assessDuoAdminAccess(
   data: DuoAdminAccessData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
+  return DUO_DECISION_CONTEXT.run(new Map(), () => {
   const findings: DuoFinding[] = [];
   const admins = data.admins.data;
   const activeAdmins = admins.filter((admin) => (asString(admin.status)?.toLowerCase() ?? "active") !== "disabled");
@@ -3682,6 +3792,13 @@ export function assessDuoAdminAccess(
     data.admins.error,
     "Export the Administrators list from the Duo Admin Panel with role, status, and last login.",
   );
+  recordDuoDecisionFacts("DUO-ADMIN-001", {
+    readable: !data.admins.error,
+    complete: completeDuoDatasets(data.admins),
+    admin_count: admins.length,
+    owner_count: ownerCount,
+    warning_owner_maximum: Math.max(3, Math.ceil(admins.length / 2)),
+  });
 
   if (admins.length === 0) {
     findings.push(
@@ -3735,6 +3852,11 @@ export function assessDuoAdminAccess(
   const webauthnEnabled = getBooleanish(allowed, "webauthn_enabled");
   const smsEnabled = getBooleanish(allowed, "sms_enabled");
   const voiceEnabled = getBooleanish(allowed, "voice_enabled");
+  recordDuoDecisionFacts("DUO-ADMIN-002", {
+    readable: !data.allowedAdminAuthMethods.error && Object.keys(allowed).length > 0,
+    strong_method_enabled: Boolean(verifiedPushEnabled || webauthnEnabled),
+    weak_method_enabled: Boolean(smsEnabled || voiceEnabled),
+  });
   if (data.allowedAdminAuthMethods.error || Object.keys(allowed).length === 0) {
     findings.push(
       buildFinding(
@@ -3790,6 +3912,11 @@ export function assessDuoAdminAccess(
   );
   const helpdeskBypass = asString(settings.helpdesk_bypass)?.toLowerCase();
   const helpdeskBypassExpiration = asNumber(settings.helpdesk_bypass_expiration);
+  recordDuoDecisionFacts("DUO-ADMIN-003", {
+    readable: !settingsUnavailable,
+    helpdesk_bypass: helpdeskBypass,
+    helpdesk_bypass_expiration: helpdeskBypassExpiration,
+  });
   if (settingsUnavailable) {
     findings.push(
       buildFinding(
@@ -3845,6 +3972,14 @@ export function assessDuoAdminAccess(
     ...staleAdmins.slice(0, 10).map((admin) => `${asString(admin.email) ?? asString(admin.name) ?? "unknown-admin"} last_login_age_days=${daysSince(admin.last_login) ?? "unknown"}`),
     ...undatedAdmins.slice(0, 10).map((admin) => `${asString(admin.email) ?? asString(admin.name) ?? "unknown-admin"} last_login=null`),
   ];
+  recordDuoDecisionFacts("DUO-ADMIN-004", {
+    readable: !data.admins.error,
+    complete: completeDuoDatasets(data.admins),
+    admin_count: admins.length,
+    stale_admin_count: staleAdmins.length,
+    undated_admin_count: undatedAdmins.length,
+    stale_at_least_one_third: staleAdmins.length >= Math.max(1, Math.ceil(activeAdmins.length / 3)),
+  });
   if (admins.length === 0) {
     findings.push(
       buildFinding(
@@ -3905,6 +4040,10 @@ export function assessDuoAdminAccess(
     `lockout_expire_duration=${settings.lockout_expire_duration ?? "null"}`,
     `unenrolled_user_lockout_threshold=${unenrolledLockoutDays ?? "null"}`,
   ];
+  recordDuoDecisionFacts("DUO-ADMIN-005", {
+    readable: !settingsUnavailable,
+    lockout_threshold: lockoutThresholdNumber,
+  });
   if (settingsUnavailable) {
     findings.push(
       buildFinding(
@@ -3981,6 +4120,7 @@ export function assessDuoAdminAccess(
     snapshotSummary,
     text: buildAssessmentText("Duo admin-access assessment", getOrganizationName(config), findings, snapshotSummary),
   };
+  });
 }
 
 function integrationLabel(integration: JsonRecord): string {
@@ -3994,6 +4134,13 @@ function isCriticalIntegration(integration: JsonRecord): boolean {
 
 function assessCriticalApplications(data: DuoIntegrationData, integrationsEvidence: string[]): DuoFinding {
   if (data.integrations.error) {
+    recordDuoDecisionFacts("DUO-INTEGRATIONS-005", {
+      readable: false,
+      complete: false,
+      protected_integration_count: 0,
+      tagged_integration_count: 0,
+      tagged_without_policy_count: 0,
+    });
     return buildFinding(
       "DUO-INTEGRATIONS-005",
       "Manual",
@@ -4006,6 +4153,13 @@ function assessCriticalApplications(data: DuoIntegrationData, integrationsEviden
   const protectedIntegrations = data.integrations.data.filter(integrationIsProtected);
   const tagged = protectedIntegrations.filter(isCriticalIntegration);
   const taggedWithoutPolicy = tagged.filter((integration) => !policyKey(integration));
+  recordDuoDecisionFacts("DUO-INTEGRATIONS-005", {
+    readable: true,
+    complete: completeDuoDatasets(data.integrations),
+    protected_integration_count: protectedIntegrations.length,
+    tagged_integration_count: tagged.length,
+    tagged_without_policy_count: taggedWithoutPolicy.length,
+  });
   const evidence = [
     `protected_integrations=${protectedIntegrations.length}`,
     `critical_or_high_or_regulated=${tagged.length}`,
@@ -4066,6 +4220,11 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
   const sections = getPolicySections(globalPolicy);
   const edition = asString(asRecord(data.infoSummary?.data).edition) ?? "unknown";
   if (Object.keys(sections).length === 0) {
+    recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
+      policy_readable: false,
+      edition_sections_present: false,
+      satisfied_group_count: 0,
+    });
     return buildFinding(
       "DUO-INTEGRATIONS-006",
       "Manual",
@@ -4091,6 +4250,11 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
   const hasEditionSections = [healthSource, sections.operating_systems, sections.full_disk_encryption, sections.screen_lock].some(Boolean);
 
   if (!hasEditionSections) {
+    recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
+      policy_readable: true,
+      edition_sections_present: false,
+      satisfied_group_count: 0,
+    });
     return buildFinding(
       "DUO-INTEGRATIONS-006",
       "Manual",
@@ -4129,6 +4293,11 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
     restrictedOs.length > 0,
   ];
   const satisfied = checks.filter(Boolean).length;
+  recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
+    policy_readable: true,
+    edition_sections_present: true,
+    satisfied_group_count: satisfied,
+  });
 
   if (satisfied === checks.length) {
     return buildFinding(
@@ -4169,6 +4338,13 @@ function assessSelfServicePortal(
   integrationsEvidence: string[],
 ): DuoFinding {
   if (data.integrations.error) {
+    recordDuoDecisionFacts("DUO-INTEGRATIONS-003", {
+      readable: false,
+      complete: false,
+      protected_integration_count: 0,
+      field_exposed_count: 0,
+      self_service_enabled_count: 0,
+    });
     return buildFinding(
       "DUO-INTEGRATIONS-003",
       "Manual",
@@ -4180,6 +4356,13 @@ function assessSelfServicePortal(
   const legacyFlag = getBooleanish(asRecord(data.settings.data), "global_ssp_policy_enforced");
   const legacyEvidence = `global_ssp_policy_enforced=${legacyFlag ?? "unknown"} (legacy Retrieve Settings parameter, defaults to true, not used for the verdict)`;
   if (protectedIntegrations.length === 0) {
+    recordDuoDecisionFacts("DUO-INTEGRATIONS-003", {
+      readable: true,
+      complete: completeDuoDatasets(data.integrations),
+      protected_integration_count: 0,
+      field_exposed_count: 0,
+      self_service_enabled_count: 0,
+    });
     return buildFinding(
       "DUO-INTEGRATIONS-003",
       "Partial",
@@ -4191,6 +4374,13 @@ function assessSelfServicePortal(
 
   const withField = protectedIntegrations.filter((integration) => getBooleanish(integration, "self_service_allowed") !== undefined);
   const enabled = withField.filter((integration) => getBooleanish(integration, "self_service_allowed") === true);
+  recordDuoDecisionFacts("DUO-INTEGRATIONS-003", {
+    readable: true,
+    complete: completeDuoDatasets(data.integrations),
+    protected_integration_count: protectedIntegrations.length,
+    field_exposed_count: withField.length,
+    self_service_enabled_count: enabled.length,
+  });
   const evidence = [
     `protected_integrations=${protectedIntegrations.length}`,
     `self_service_allowed=${enabled.length}`,
@@ -4244,6 +4434,7 @@ export function assessDuoIntegrations(
   data: DuoIntegrationData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
+  return DUO_DECISION_CONTEXT.run(new Map(), () => {
   const findings: DuoFinding[] = [];
   const integrations = activeIntegrations(data.integrations.data);
   const policyAttachedCount = integrations.filter((integration) => Boolean(policyKey(integration))).length;
@@ -4268,6 +4459,26 @@ export function assessDuoIntegrations(
     data.integrations.error,
     "Export the Applications list from the Duo Admin Panel with type, policy, sensitivity level, and user access.",
   );
+  const integrationsReadable = !data.integrations.error;
+  const integrationsComplete = completeDuoDatasets(data.integrations);
+  recordDuoDecisionFacts("DUO-INTEGRATIONS-001", {
+    readable: integrationsReadable,
+    complete: integrationsComplete,
+    protected_integration_count: integrations.length,
+    policy_attached_count: policyAttachedCount,
+  });
+  recordDuoDecisionFacts("DUO-INTEGRATIONS-002", {
+    readable: integrationsReadable,
+    complete: integrationsComplete,
+    applicable_integration_count: universalPromptApplicable.length,
+    universal_prompt_count: universalPromptCount,
+  });
+  recordDuoDecisionFacts("DUO-INTEGRATIONS-004", {
+    readable: integrationsReadable,
+    complete: integrationsComplete,
+    admin_api_count: adminApiIntegrations.length,
+    overprivileged_admin_api_count: overPrivilegedAdminApis.length,
+  });
 
   if (integrations.length === 0) {
     findings.push(
@@ -4433,6 +4644,7 @@ export function assessDuoIntegrations(
     snapshotSummary,
     text: buildAssessmentText("Duo integration assessment", getOrganizationName(config), findings, snapshotSummary),
   };
+  });
 }
 
 interface TravelAnomaly {
@@ -4483,6 +4695,29 @@ function detectImpossibleTravel(events: JsonRecord[]): { anomalies: TravelAnomal
 function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResolvedConfig): DuoFinding {
   const attempts = data.authenticationAttempts;
   const edition = asString(asRecord(data.infoSummary.data).edition) ?? "unknown";
+  const counts = asRecord(asRecord(attempts?.data).authentication_attempts);
+  const fraud = asNumber(counts.FRAUD) ?? 0;
+  const failure = asNumber(counts.FAILURE) ?? 0;
+  const error = asNumber(counts.ERROR) ?? 0;
+  const success = asNumber(counts.SUCCESS) ?? 0;
+  const total = fraud + failure + error + success;
+  const failureShare = percentage(failure + fraud, total);
+  const travel = data.authenticationLogs.error
+    ? { anomalies: [] as TravelAnomaly[], locatedEvents: 0 }
+    : detectImpossibleTravel(data.authenticationLogs.data);
+  const { anomalies, locatedEvents } = travel;
+  recordDuoDecisionFacts("DUO-MON-005", {
+    attempts_readable: Boolean(attempts) && !attempts?.error,
+    logs_readable: !data.authenticationLogs.error,
+    counts_present: Object.keys(counts).length > 0,
+    complete: completeDuoDatasets(attempts, data.authenticationLogs),
+    attempt_count: total,
+    event_count: data.authenticationLogs.data.length,
+    located_event_count: locatedEvents,
+    impossible_travel_count: anomalies.length,
+    fraud_count: fraud,
+    denied_percent: failureShare,
+  });
   if (!attempts || attempts.error) {
     return buildFinding(
       "DUO-MON-005",
@@ -4512,14 +4747,6 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
     );
   }
 
-  const counts = asRecord(asRecord(attempts.data).authentication_attempts);
-  const fraud = asNumber(counts.FRAUD) ?? 0;
-  const failure = asNumber(counts.FAILURE) ?? 0;
-  const error = asNumber(counts.ERROR) ?? 0;
-  const success = asNumber(counts.SUCCESS) ?? 0;
-  const total = fraud + failure + error + success;
-  const failureShare = percentage(failure + fraud, total);
-  const { anomalies, locatedEvents } = detectImpossibleTravel(data.authenticationLogs.data);
   const evidence = [
     `lookback_days=${config.lookbackDays}`,
     `attempts_success=${success}`,
@@ -4596,6 +4823,7 @@ export function assessDuoMonitoring(
   data: DuoMonitoringData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
+  return DUO_DECISION_CONTEXT.run(new Map(), () => {
   const findings: DuoFinding[] = [];
   const authLogs = data.authenticationLogs.data;
   const telephonyLogs = data.telephonyLogs.data;
@@ -4612,6 +4840,12 @@ export function assessDuoMonitoring(
     const result = `${asString(event.result) ?? ""} ${asString(event.reason) ?? ""}`.toLowerCase();
     return result.includes("fraud");
   }).length;
+  recordDuoDecisionFacts("DUO-MON-001", {
+    readable: !data.authenticationLogs.error,
+    complete: completeDuoDatasets(data.authenticationLogs),
+    event_count: authLogs.length,
+    review_event_count: bypassEvents + telephonyFactors + fraudEvents,
+  });
 
   if (data.authenticationLogs.error) {
     findings.push(
@@ -4673,6 +4907,11 @@ export function assessDuoMonitoring(
     );
   }
 
+  recordDuoDecisionFacts("DUO-MON-002", {
+    readable: !data.trustMonitorEvents.error,
+    complete: completeDuoDatasets(data.trustMonitorEvents),
+    event_count: trustMonitorEvents.length,
+  });
   if (data.trustMonitorEvents.error) {
     findings.push(
       buildFinding(
@@ -4717,6 +4956,12 @@ export function assessDuoMonitoring(
     const type = asString(event.type)?.toLowerCase() ?? "";
     return type === "sms" || type === "phone";
   }).length;
+  recordDuoDecisionFacts("DUO-MON-003", {
+    readable: !data.telephonyLogs.error && !data.infoSummary.error,
+    complete: completeDuoDatasets(data.telephonyLogs, data.infoSummary),
+    credits_remaining: creditsRemaining,
+    telephony_event_count: smsOrPhoneLogs,
+  });
   if (data.telephonyLogs.error || data.infoSummary.error) {
     findings.push(
       buildFinding(
@@ -4813,6 +5058,10 @@ export function assessDuoMonitoring(
     getBooleanish(settings, "push_activity_notification_enabled"),
     getBooleanish(settings, "email_activity_notification_enabled"),
   ].filter((value): value is boolean => value !== undefined);
+  recordDuoDecisionFacts("DUO-MON-004", {
+    readable: !data.settings.error && Object.keys(settings).length > 0,
+    enabled_notification_count: notificationSignals.filter(Boolean).length,
+  });
   if (data.settings.error || Object.keys(settings).length === 0) {
     findings.push(
       buildFinding(
@@ -4872,6 +5121,7 @@ export function assessDuoMonitoring(
     snapshotSummary,
     text: buildAssessmentText("Duo monitoring assessment", getOrganizationName(config), findings, snapshotSummary),
   };
+  });
 }
 
 function buildConfigNotes(config: DuoResolvedConfig): string[] {
