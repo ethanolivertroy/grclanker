@@ -22,7 +22,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
 import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -2101,9 +2101,6 @@ function finding(
 ): BoxFinding {
   const definition = BOX_CONTROLS[controlNumber];
   const id = findingId(controlNumber);
-  const facts = BOX_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = evaluateBatchCheckVerdict(BOX_SPEC, id, facts) as BoxFindingStatus;
   return {
     id,
     control: controlNumber,
@@ -2435,7 +2432,7 @@ export async function collectBoxIdentityData(
 }
 
 export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxIdentityOptions = {}): BoxAssessmentResult {
-  return BOX_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10_000);
   const minPasswordLength = clampNumber(options.minPasswordLength, DEFAULT_MIN_PASSWORD_LENGTH, 4, 128);
   const maxSessionHours = clampNumber(options.maxSessionHours, DEFAULT_MAX_SESSION_HOURS, 1, 24 * 365);
@@ -2900,7 +2897,7 @@ export async function collectBoxSharingData(
 }
 
 export function assessBoxSharingCollaborationData(data: BoxSharingData, options: BoxSharingOptions = {}): BoxAssessmentResult {
-  return BOX_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const staleDays = clampNumber(options.staleAllowlistDays, DEFAULT_STALE_ALLOWLIST_DAYS, 1, 3650);
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const configReadable = categoryReadable(data.configuration, "content_and_sharing");
@@ -3344,7 +3341,7 @@ function classificationOptions(template: JsonRecord): string[] {
 }
 
 export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessmentResult {
-  return BOX_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const findings: BoxFinding[] = [];
 
@@ -3567,7 +3564,7 @@ export async function collectBoxShieldData(
 }
 
 export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmentResult {
-  return BOX_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const shieldReadable = categoryReadable(data.configuration, "shield");
   const shieldUnreadableReason = categoryUnreadableReason(data.configuration, "shield");

@@ -22,7 +22,7 @@ import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
 import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -3292,6 +3292,10 @@ function completeOktaDatasets(...datasets: CollectedDataset<unknown>[]): boolean
   return datasets.every((dataset) => !dataset.error && !dataset.notCollected && dataset.truncated !== true);
 }
 
+function untruncatedOktaDatasets(...datasets: CollectedDataset<unknown>[]): boolean {
+  return datasets.every((dataset) => dataset.truncated !== true);
+}
+
 function buildFinding(
   id: keyof typeof OKTA_CHECKS,
   status: OktaFindingStatus,
@@ -3304,9 +3308,6 @@ function buildFinding(
   },
 ): OktaFinding {
   const definition = OKTA_CHECKS[id];
-  const facts = OKTA_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(OKTA_SPEC, id, facts);
   return {
     id: definition.id,
     title: definition.title,
@@ -3670,7 +3671,7 @@ export function assessOktaAuthentication(
   data: OktaAuthenticationData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const hostname = new URL(config.orgUrl).hostname;
   const isFederalTenant = FEDERAL_ORG_HOST_PATTERN.test(hostname);
@@ -3695,7 +3696,7 @@ export function assessOktaAuthentication(
     !data.authenticators.error && authenticators.length === 0 && data.orgFactors.data.length > 0;
   recordOktaDecisionFacts("OKTA-AUTH-001", {
     readable: !data.authenticators.error,
-    complete: completeOktaDatasets(data.authenticators),
+    complete: untruncatedOktaDatasets(data.authenticators, data.orgFactors),
     classic_engine: classicEngine,
     authenticator_count: authenticators.length,
     phishing_resistant_count: phishingResistantAuthenticators.length,
@@ -4072,6 +4073,7 @@ export function assessOktaAuthentication(
   recordOktaDecisionFacts("OKTA-AUTH-008", {
     idp_readable: !data.idps.error,
     authenticator_readable: !data.authenticators.error,
+    complete: untruncatedOktaDatasets(data.idps, data.authenticators),
     certificate_method_count: certIdps.length + certAuthenticators.length,
     federal_tenant: isFederalTenant,
   });
@@ -4161,7 +4163,7 @@ export function assessOktaAuthentication(
     "Set Okta Verify compliance.fips to REQUIRED, disable SMS, voice, security question, and email authenticators (or limit email to recovery), and rely on FIPS 140 validated authenticators.";
   recordOktaDecisionFacts("OKTA-AUTH-009", {
     readable: !data.authenticators.error,
-    complete: completeOktaDatasets(data.authenticators, data.orgFactors),
+    complete: untruncatedOktaDatasets(data.authenticators, data.orgFactors),
     classic_engine: classicEngine,
     authenticator_count: authenticators.length,
     federal_tenant: isFederalTenant,
@@ -4284,7 +4286,7 @@ export function assessOktaAdminAccess(
   data: OktaAdminAccessData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const privilegedUsers = data.usersWithRoleAssignments.data.map((user) => {
     const userId = asString(user.id) ?? "";
@@ -4727,7 +4729,7 @@ export function assessOktaIntegrations(
   data: OktaIntegrationData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const trustedOrigins = data.trustedOrigins.data.map((origin) => {
     const originUrl =
@@ -4896,7 +4898,7 @@ export function assessOktaIntegrations(
   const riskAwareRules = [...signOnRules, ...accessRules].filter(appUsesRiskSignal);
   recordOktaDecisionFacts("OKTA-INTEG-004", {
     policy_readable: !(data.signOnPolicies.error && data.accessPolicies.error),
-    complete: completeOktaDatasets(
+    complete: policyErrors.length === 0 && untruncatedOktaDatasets(
       data.signOnPolicies,
       data.signOnPolicyRules,
       data.accessPolicies,
@@ -5095,7 +5097,7 @@ export function assessOktaMonitoring(
   data: OktaMonitoringData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
-  return OKTA_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const activeHooks = data.eventHooks.data.filter(isActiveRecord);
   const activeStreams = data.logStreams.data.filter(isActiveRecord);
@@ -5104,7 +5106,9 @@ export function assessOktaMonitoring(
   recordOktaDecisionFacts("OKTA-MON-001", {
     streams_readable: !data.logStreams.error,
     hooks_readable: !data.eventHooks.error,
-    complete: completeOktaDatasets(data.logStreams, data.eventHooks),
+    complete: !data.logStreams.error
+      && !data.eventHooks.error
+      && untruncatedOktaDatasets(data.logStreams, data.eventHooks),
     active_stream_count: activeStreams.length,
     active_hook_count: activeHooks.length,
   });

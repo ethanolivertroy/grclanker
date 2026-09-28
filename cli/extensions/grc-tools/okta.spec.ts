@@ -121,7 +121,7 @@ const decisions: Readonly<Record<string, string>> = {
   "OKTA-AUTH-009": "for federal domains, return pass only when ACTIVE Okta Verify requires FIPS and no restricted authenticator is active, fail for a restricted authenticator or non-required FIPS, and warn when Okta Verify is absent; commercially, warn for restricted authenticators and pass otherwise.",
   "OKTA-ADMIN-001": "for a non-empty privileged-user inventory, return pass with at most two SUPER_ADMIN users, warn with three through five, and fail above five.",
   "OKTA-ADMIN-002": "return fail when any privileged account is non-ACTIVE or last signed in over 90 days ago, warn when any lacks a last-login date, and pass otherwise.",
-  "OKTA-ADMIN-003": "for detected admin-like groups, return pass when every expanded privileged group has at most 25 members, warn when any exceeds 25 or expansion is partial, and manual when no group matches the discovery pattern.",
+  "OKTA-ADMIN-003": "treat a group as admin-like when its name contains admin, administrator, privileged, help desk with zero or one intervening character, security, or access, case-insensitively; return pass when every expanded matching group has at most 25 members, warn when any exceeds 25 or expansion is partial, and manual when no group matches.",
   "OKTA-ADMIN-004": "return fail when any inspected privileged user has no ACTIVE factor, warn when every inspected user has a factor but any lacks a phishing-resistant one, and pass when every privileged user has an ACTIVE phishing-resistant factor.",
   "OKTA-ADMIN-005": "return fail when any ACTIVE user has not signed in for over 90 days or any STAGED or PROVISIONED user is older than 30 days, warn for missing last-login or suspended, locked, expired, recovery, or partial users, and pass otherwise.",
   "OKTA-ADMIN-006": "return pass only when Okta Support access is DISABLED, thirdPartyAdmin is false, and both reads complete; return warn for every other readable state and manual when support access is unavailable.",
@@ -262,7 +262,7 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-AUTH-008": {
-    inputs: input("idp_readable", "authenticator_readable", "certificate_method_count", "federal_tenant"),
+    inputs: input("idp_readable", "authenticator_readable", "complete", "certificate_method_count", "federal_tenant"),
     rules: ordered({
       manual: any(
         all(eq("idp_readable", false), eq("authenticator_readable", false)),
@@ -270,7 +270,11 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
         all(eq("certificate_method_count", 0), eq("federal_tenant", false)),
       ),
       fail: all(eq("certificate_method_count", 0), eq("federal_tenant", true)),
-      warn: any(eq("idp_readable", false), eq("authenticator_readable", false)),
+      warn: any(
+        eq("idp_readable", false),
+        eq("authenticator_readable", false),
+        all(incomplete, gt("certificate_method_count", 0)),
+      ),
       pass: gt("certificate_method_count", 0),
     }),
   },
@@ -354,7 +358,7 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     rules: ordered({
       manual: unavailable,
       fail: gt("insecure_active_count", 0),
-      warn: incomplete,
+      warn: all(incomplete, gt("active_origin_count", 0)),
       info: eq("active_origin_count", 0),
       pass: { op: "always" },
       failFirst: true,

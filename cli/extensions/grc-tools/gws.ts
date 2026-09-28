@@ -34,7 +34,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { GWS_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { REDACTED, systemErrorCode } from "./hardening/index.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1116,6 +1116,10 @@ function completeGwsDatasets(...datasets: Array<CollectedDataset<unknown> | unde
   );
 }
 
+function untruncatedGwsDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
+  return datasets.every((dataset) => dataset !== undefined && dataset.truncated !== true);
+}
+
 function buildFinding(
   definitionId: string,
   status: GwsFindingStatus,
@@ -1128,7 +1132,6 @@ function buildFinding(
   if (!definition) throw new Error(`Unknown GWS check definition: ${definitionId}`);
   const facts = GWS_DECISION_CONTEXT.getStore()?.get(definitionId);
   if (!facts) throw new Error(`${definitionId} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(GWS_SPEC, definitionId, facts);
   const finding: GwsFinding = {
     id: definition.id,
     title: definition.title,
@@ -2961,7 +2964,7 @@ export function assessGwsIdentity(
   data: GwsIdentityData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const users = data.users.data;
   const roles = data.roles.data;
   const roleAssignments = data.roleAssignments.data;
@@ -3246,7 +3249,7 @@ export function assessGwsAdminAccess(
   data: GwsAdminAccessData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const users = data.users.data;
   const roles = data.roles.data;
   const roleAssignments = data.roleAssignments.data;
@@ -3291,7 +3294,7 @@ export function assessGwsAdminAccess(
   });
   recordGwsDecisionFacts("GWS-ADMIN-005", {
     readable: !data.roleAssignments.error,
-    complete: directoryComplete,
+    complete: untruncatedGwsDatasets(data.users, data.roles, data.roleAssignments),
     assignment_count: roleAssignments.length,
     group_assignment_count: privileged.groupAssignmentCount,
   });
@@ -3524,7 +3527,7 @@ export function assessGwsIntegrations(
   data: GwsIntegrationData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const privileged = getPrivilegedUsers(data.users.data, data.roles.data, data.roleAssignments.data);
   const privilegedIds = new Set(privileged.privilegedUsers.map((user) => asString(user.id)).filter((value): value is string => Boolean(value)));
   const allTokens = data.tokenInventory.data;
@@ -3562,6 +3565,7 @@ export function assessGwsIntegrations(
     && privileged.unresolvedAssignments === 0;
   const tokenReadsComplete = failed === 0
     && sampled >= population
+    && data.users.truncated !== true
     && sampleDependency.notes.length === 0;
   recordGwsDecisionFacts("GWS-INTEG-001", {
     users_readable: !data.users.error,
@@ -3572,7 +3576,7 @@ export function assessGwsIntegrations(
   });
   recordGwsDecisionFacts("GWS-INTEG-002", {
     directory_readable: !directoryProblem,
-    complete: integrationDirectoryComplete && tokenReadsComplete && privilegedSampled,
+    complete: integrationDirectoryComplete && failed === 0 && privilegedSampled,
     privileged_user_count: privileged.privilegedUsers.length,
     token_count: allTokens.length,
     failed_read_count: failed,
@@ -3847,7 +3851,7 @@ export function assessGwsMonitoring(
   data: GwsMonitoringData,
   config: GwsResolvedConfig,
 ): GwsAssessmentResult {
-  return GWS_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(GWS_DECISION_CONTEXT, GWS_SPEC, () => {
   const suspiciousLogins = countMatchingEvents(data.loginActivities.data, SUSPICIOUS_LOGIN_NAMES);
   const alerts = bucketAlerts(data.alerts.data);
   const loginStatus = sourceStatus(activitiesEndpoint("login"), data.loginActivities);

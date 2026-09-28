@@ -22,7 +22,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { YAMLError, parse as parseYaml } from "yaml";
 import { readResolverEnvironment, SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { SERVICENOW_SPEC } from "./servicenow.spec.js";
 
@@ -1743,15 +1743,12 @@ function gatedPrincipals(principals: Record<string, unknown[] | number> | undefi
 function finding(controlNumber: number, evaluation: Evaluation): ServicenowFinding {
   const definition = SERVICENOW_CONTROLS[controlNumber];
   const id = findingId(controlNumber);
-  const facts = SERVICENOW_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  const status = evaluateBatchCheckVerdict(SERVICENOW_SPEC, id, facts) as ServicenowFindingStatus;
   return {
     id,
     control: controlNumber,
     title: definition.title,
     severity: definition.severity,
-    status,
+    status: evaluation.status,
     summary: evaluation.summary,
     evidence: evaluation.evidence,
     mappings: mappingsForControl(controlNumber),
@@ -2743,7 +2740,7 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
 }
 
 export function assessServicenowIdentityAccessData(data: ServicenowIdentityData): ServicenowAssessmentResult {
-  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowIdentityAccessDataWithDecisionContext(data));
+  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowIdentityAccessDataWithDecisionContext(data));
 }
 
 export async function assessServicenowIdentityAccess(
@@ -3146,7 +3143,7 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
 }
 
 export function assessServicenowPlatformHardeningData(data: ServicenowHardeningData): ServicenowAssessmentResult {
-  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowPlatformHardeningDataWithDecisionContext(data));
+  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowPlatformHardeningDataWithDecisionContext(data));
 }
 
 export async function assessServicenowPlatformHardening(
@@ -3424,7 +3421,7 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
 }
 
 export function assessServicenowAccessControlData(data: ServicenowAccessControlData): ServicenowAssessmentResult {
-  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowAccessControlDataWithDecisionContext(data));
+  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowAccessControlDataWithDecisionContext(data));
 }
 
 export async function assessServicenowAccessControl(
@@ -3805,7 +3802,7 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
 }
 
 export function assessServicenowOperationsGovernanceData(data: ServicenowOperationsData): ServicenowAssessmentResult {
-  return SERVICENOW_DECISION_CONTEXT.run(new Map(), () => assessServicenowOperationsGovernanceDataWithDecisionContext(data));
+  return runBatchVerdictContext(SERVICENOW_DECISION_CONTEXT, SERVICENOW_SPEC, () => assessServicenowOperationsGovernanceDataWithDecisionContext(data));
 }
 
 export async function assessServicenowOperationsGovernance(

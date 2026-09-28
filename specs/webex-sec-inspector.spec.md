@@ -381,9 +381,19 @@ These notes explain intent only. The ordered rule table is normative.
 | `WEBEX-MTG-06` | high | `webex_assess_meeting_hybrid_security` | `meeting-sites`, `meeting-common-settings`, `meetings`, `meeting-preferences`, `me` | `sites`, `denied_sites`, `site_coverage_complete`, `site_list_status`, `citation`, `token_type`, `meetings_seen`, `meetings_truncated`, `meetings_status`, `sampled_allow_join_without_lobby`, `sampled_without_password`, `personal_meeting_room_auto_lock`, `meeting_preferences_status`, `token_probe_status`, `meetings_citation` | Every readable site reports requireStrongPassword=true and passwordCriteria.minLength at least 8; site coverage and all secondary evidence are complete. | Strong passwords are required but minLength is absent or below 8, or otherwise-passing evidence has partial site or secondary coverage. | Any readable site reports requireStrongPassword=false. | No site common settings are readable or any site omits requireStrongPassword; collect each site's Control Hub Common Settings > Security page. |
 | `WEBEX-MTG-07` | low | `webex_assess_meeting_hybrid_security` | `meeting-common-settings` | `citation` | No automatic pass is emitted. | No automatic warn is emitted unless supporting inventory is partial. | No automatic fail is emitted. | Export the Control Hub meeting settings page for virtual backgrounds; no field is exposed by meeting preferences, common settings, or session types. |
 
+### Primitive decision inputs
+
+Every primitive is read from the named vendor surface or collector state before evidence lists are rendered or capped. Null and missing retain unavailable semantics; they are not empty inventories, false values, or zero counts.
+
+| Finding | Input | Portable definition |
+|---|---|---|
+| None |  |  |
+
 ### Ordered decision rules
 
 Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+A `matches` condition performs a regular-expression search; anchors are required for whole-value matching, and an `i` flag requests case-insensitive matching. A `ratio` condition divides the numerator by the denominator, applies the declared scale, and rounds to the declared decimal places by choosing the nearest value with exact half cases rounded toward positive infinity; a zero, null, or missing denominator does not match.
 
 | Finding | Order | Outcome | First-match condition | Explanatory note |
 |---|---|---|---|---|

@@ -148,7 +148,7 @@ const SALESFORCE_EXECUTABLE_DECISIONS: Readonly<Record<string, SalesforceExecuta
     rules: [
       rule("manual", any(ne("settings_readable", true), ne("profiles_readable", true), eq("profile_count", 0), eq("admin_profile_count", 0), ne("profile_metadata_readable", true), eq("resolved_profile_count", 0))),
       rule("fail", all(eq("profiles_with_ranges_count", 0), eq("org_range_count", 0))),
-      rule("pass", all({ op: "eq", left: path("profiles_with_ranges_count"), right: path("resolved_profile_count") }, eq("profile_complete", true), eq("enforce_every_request", true), gt("org_range_count", 0))),
+      rule("pass", all({ op: "eq", left: path("profiles_with_ranges_count"), right: path("resolved_profile_count") }, eq("profile_complete", true), eq("enforce_every_request", true))),
       rule("warn", { op: "always" }),
     ],
   },
@@ -261,7 +261,12 @@ const SALESFORCE_EXECUTABLE_DECISIONS: Readonly<Record<string, SalesforceExecuta
   },
   "SF-20": {
     inputs: input("settings_readable", "both_present", "get_enabled", "post_enabled"),
-    rules: [rule("manual", any(ne("settings_readable", true), ne("both_present", true))), rule("pass", all(eq("get_enabled", true), eq("post_enabled", true))), rule("fail", { op: "always" })],
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("pass", all(eq("get_enabled", true), eq("post_enabled", true))),
+      rule("fail", any(eq("get_enabled", false), eq("post_enabled", false))),
+      rule("manual", { op: "always" }),
+    ],
   },
 };
 

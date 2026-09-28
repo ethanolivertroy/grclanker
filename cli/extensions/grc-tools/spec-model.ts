@@ -154,7 +154,7 @@ export interface CheckContract {
   owningTool: string;
   sourceSurfaceIds: readonly string[];
   evidenceFields: readonly string[];
-  evidenceFieldDescriptions?: Readonly<Record<string, string>>;
+  evidenceFieldDefinitions?: Readonly<Record<string, string>>;
   derivedFacts: Readonly<Record<string, string>>;
   derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   criteria: VerdictCriteria;

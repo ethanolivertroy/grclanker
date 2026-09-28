@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { DUO_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
-import { hydrateBatchFrameworkMappings, materializeBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -2554,9 +2554,6 @@ function buildFinding(
   options?: { severity?: DuoSeverity; manualNote?: string },
 ): DuoFinding {
   const definition = DUO_CHECKS[id];
-  const facts = DUO_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(DUO_SPEC, id, facts);
   return {
     id: definition.id,
     title: definition.title,
@@ -3245,7 +3242,7 @@ export function assessDuoAuthentication(
   data: DuoAuthenticationData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
-  return DUO_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
   const findings: DuoFinding[] = [];
   const globalPolicy = getGlobalPolicyRecord(data);
   const policyUnavailable = Object.keys(getPolicySections(globalPolicy)).length === 0;
@@ -3773,7 +3770,7 @@ export function assessDuoAdminAccess(
   data: DuoAdminAccessData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
-  return DUO_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
   const findings: DuoFinding[] = [];
   const admins = data.admins.data;
   const activeAdmins = admins.filter((admin) => (asString(admin.status)?.toLowerCase() ?? "active") !== "disabled");
@@ -4450,7 +4447,7 @@ export function assessDuoIntegrations(
   data: DuoIntegrationData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
-  return DUO_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
   const findings: DuoFinding[] = [];
   const integrations = activeIntegrations(data.integrations.data);
   const policyAttachedCount = integrations.filter((integration) => Boolean(policyKey(integration))).length;
@@ -4839,7 +4836,7 @@ export function assessDuoMonitoring(
   data: DuoMonitoringData,
   config: DuoResolvedConfig,
 ): DuoAssessmentResult {
-  return DUO_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(DUO_DECISION_CONTEXT, DUO_SPEC, () => {
   const findings: DuoFinding[] = [];
   const authLogs = data.authenticationLogs.data;
   const telephonyLogs = data.telephonyLogs.data;

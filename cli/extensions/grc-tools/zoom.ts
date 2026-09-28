@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { readResolverEnvironment, ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { evaluateBatchCheckVerdict, hydrateBatchFrameworkMappings, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { ConfigFileError, readJsonConfig } from "./hardening/index.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { ZOOM_SPEC } from "./zoom.spec.js";
@@ -1538,9 +1538,6 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): ZoomFinding {
-  const facts = ZOOM_DECISION_CONTEXT.getStore()?.get(id);
-  if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = evaluateBatchCheckVerdict(ZOOM_SPEC, id, facts) as ZoomFindingStatus;
   return { id, title, severity, status, summary, controls, evidence, mappings: controlMappings(controls) };
 }
 
@@ -1623,7 +1620,7 @@ export function assessZoomIdentityFromSnapshot(
   snapshot: ZoomSnapshot,
   options: ZoomIdentityOptions = {},
 ): ZoomAssessmentResult {
-  return ZOOM_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(ZOOM_DECISION_CONTEXT, ZOOM_SPEC, () => {
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 5000);
   const maxInactivity = clampNumber(options.maxSessionInactivityMinutes, DEFAULT_MAX_SESSION_INACTIVITY_MINUTES, 1, 100000);
   const findings: ZoomFinding[] = [];
@@ -2029,7 +2026,7 @@ export function assessZoomCollaborationGovernanceFromSnapshot(
   snapshot: ZoomSnapshot,
   options: ZoomCollaborationOptions = {},
 ): ZoomAssessmentResult {
-  return ZOOM_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(ZOOM_DECISION_CONTEXT, ZOOM_SPEC, () => {
   const maxRetention = clampNumber(options.maxRecordingRetentionDays, DEFAULT_MAX_RECORDING_RETENTION_DAYS, 1, 3650);
   const bundle = snapshot.settings;
   const settingsSurface = settingsUnreadable(bundle);
@@ -2511,7 +2508,7 @@ export function assessZoomMeetingSecurityFromSnapshot(
   snapshot: ZoomSnapshot,
   _options: ZoomMeetingSecurityOptions = {},
 ): ZoomAssessmentResult {
-  return ZOOM_DECISION_CONTEXT.run(new Map(), () => {
+  return runBatchVerdictContext(ZOOM_DECISION_CONTEXT, ZOOM_SPEC, () => {
   const bundle = snapshot.settings;
   const findings: ZoomFinding[] = [];
 
