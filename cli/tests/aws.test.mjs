@@ -38,6 +38,7 @@ import {
   maskAccessKeyId,
   normalizePolicyDocument,
   paginateAwsList,
+  parsePortList,
   permissiveNaclEntries,
   redactCarrierText,
   redactErrorText,
@@ -1246,6 +1247,25 @@ test("registered AWS region and port list arguments stay schema-shaped through p
   }
 });
 
+test("registered AWS optional list inputs map null, empty, and whitespace-only values to defaults before validation", () => {
+  const cases = [
+    ["aws_assess_data_protection", ["regions"]],
+    ["aws_assess_network_security", ["regions", "sensitive_ports"]],
+    ["aws_export_audit_bundle", ["regions", "sensitive_ports"]],
+  ];
+  for (const [name, fields] of cases) {
+    const tool = registeredAwsTool(name);
+    for (const value of [null, "", " \t "]) {
+      const input = Object.fromEntries(fields.map((field) => [field, value]));
+      const { prepared, validated } = prepareAndValidateAwsTool(tool, input);
+      for (const field of fields) {
+        assert.equal(prepared[field], undefined, `${name} prepares ${field}=${JSON.stringify(value)} as the default`);
+        assert.equal(validated[field], undefined, `${name} validates ${field}=${JSON.stringify(value)} as the default`);
+      }
+    }
+  }
+});
+
 test("registered AWS tools enforce integer ports from 0 through 65535 without changing the schema-shaped string", () => {
   for (const name of ["aws_assess_network_security", "aws_export_audit_bundle"]) {
     const tool = registeredAwsTool(name);
@@ -1257,6 +1277,20 @@ test("registered AWS tools enforce integer ports from 0 through 65535 without ch
         `${name} rejects ${sensitive_ports}`,
       );
     }
+  }
+});
+
+test("parsePortList rejects malformed direct inputs instead of coercing them into ports", () => {
+  assert.deepEqual(parsePortList("0,22, 443,65535"), [0, 22, 443, 65535]);
+  for (const value of ["22,", ",22", "22,,443", "1e2", "+22", "022", "22.0", "22 443", 22, ["22"]]) {
+    assert.throws(
+      () => parsePortList(value),
+      /sensitive_ports must contain only comma-separated integer ports from 0 through 65535/,
+      `rejects ${JSON.stringify(value)}`,
+    );
+  }
+  for (const value of [undefined, null, "", " \t "]) {
+    assert.equal(parsePortList(value), undefined, `${JSON.stringify(value)} uses defaults`);
   }
 });
 

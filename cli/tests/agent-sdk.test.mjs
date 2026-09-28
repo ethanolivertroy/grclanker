@@ -24,7 +24,7 @@ import {
   WORKFLOW_NAMES,
   workflowSkillConfig,
 } from "../dist/agent-sdk/lib/skills.js";
-import { buildSdkToolConfig, executeGrcTool, grclankerToolConfig } from "../dist/agent-sdk/lib/tools.js";
+import { buildSdkToolConfig, executeGrcTool, grclankerToolConfig, prepareGrcToolArguments } from "../dist/agent-sdk/lib/tools.js";
 import { clearFedrampCachesForTests } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/extensions/grc-tools/shared.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -285,6 +285,24 @@ test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and t
   assert.equal(rejected.isError, true);
   assert.match(rejected.content[0].text, /limit: must be number/);
   assert.equal(calls.length, 2);
+});
+
+test("Agent SDK preserves AWS optional list defaults across preparation and validation", () => {
+  const cases = [
+    ["aws_assess_data_protection", ["regions"]],
+    ["aws_assess_network_security", ["regions", "sensitive_ports"]],
+    ["aws_export_audit_bundle", ["regions", "sensitive_ports"]],
+  ];
+  for (const [name, fields] of cases) {
+    const tool = getRegisteredGrcTool(name);
+    for (const value of [null, "", " \t "]) {
+      const input = Object.fromEntries(fields.map((field) => [field, value]));
+      const prepared = prepareGrcToolArguments(tool, `sdk-${name}`, input);
+      for (const field of fields) {
+        assert.equal(prepared[field], undefined, `${name} maps ${field}=${JSON.stringify(value)} to its default`);
+      }
+    }
+  }
 });
 
 test("executeGrcTool returns error envelopes for invalid arguments and thrown errors", async () => {

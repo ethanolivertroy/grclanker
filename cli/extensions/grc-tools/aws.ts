@@ -4422,9 +4422,16 @@ export async function assessAwsDataProtection(
   };
 }
 
-function parsePortList(value: unknown): number[] | undefined {
-  const text = asString(value);
+export function parsePortList(value: unknown): number[] | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`sensitive_ports must contain only comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT}`);
+  }
+  const text = value.trim();
   if (!text) return undefined;
+  if (!NETWORK_PORT_LIST_REGEX.test(text)) {
+    throw new Error(`sensitive_ports must contain only comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT}`);
+  }
   const ports = text.split(",").map((item) => Number(item.trim()));
   if (ports.some((port) => !Number.isInteger(port) || port < MIN_NETWORK_PORT || port > MAX_NETWORK_PORT)) {
     throw new Error(`sensitive_ports must contain only comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT}`);
@@ -4432,11 +4439,23 @@ function parsePortList(value: unknown): number[] | undefined {
   return [...new Set(ports)];
 }
 
-function preservePortList(value: unknown): string | undefined {
-  if (typeof value === "string" && !NETWORK_PORT_LIST_REGEX.test(value)) {
-    throw new Error(`sensitive_ports must contain only comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT}`);
+function preserveOptionalListString(value: unknown): string | undefined {
+  if (value === null) return undefined;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    // Flue's model-facing string gate coerces JSON null to the literal "null"
+    // before prepareArguments runs, so treat that representation as absent too.
+    if (!trimmed || trimmed.toLowerCase() === "null") return undefined;
   }
   return value as string | undefined;
+}
+
+function preservePortList(value: unknown): string | undefined {
+  const preserved = preserveOptionalListString(value);
+  if (typeof preserved === "string" && !NETWORK_PORT_LIST_REGEX.test(preserved)) {
+    throw new Error(`sensitive_ports must contain only comma-separated integer ports from ${MIN_NETWORK_PORT} through ${MAX_NETWORK_PORT}`);
+  }
+  return preserved;
 }
 
 function protocolCoversPorts(protocol: string | undefined): "all" | "ports" | "none" {
@@ -5112,7 +5131,7 @@ function normalizeScopeArgs(args: unknown): ScopeArgs {
   const value = asObject(args) ?? {};
   return {
     ...normalizeCheckAccessArgs(args),
-    regions: value.regions as string | undefined,
+    regions: preserveOptionalListString(value.regions),
     region_limit: asNumber(value.region_limit),
   };
 }
@@ -5165,7 +5184,7 @@ function normalizeExportAuditBundleArgs(args: unknown): ExportAuditBundleToolArg
     lookback_days: asNumber(value.lookback_days),
     policy_limit: asNumber(value.policy_limit),
     max_findings: asNumber(value.max_findings),
-    regions: value.regions as string | undefined,
+    regions: preserveOptionalListString(value.regions),
     region_limit: asNumber(value.region_limit),
     bucket_limit: asNumber(value.bucket_limit),
     key_limit: asNumber(value.key_limit),
