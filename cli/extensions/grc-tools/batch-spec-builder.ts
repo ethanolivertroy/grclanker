@@ -154,6 +154,8 @@ export function buildBatchOutputContract(definition: BatchOutputDefinition): Exp
       finding: ["id", "title", "severity", "status", "summary", "evidence", "framework mappings"],
       collection_marker: ["collected", "status", "endpoint", "error"],
       bundle_result: ["outputDir", "zipPath", "fileCount", "findingCount", "errorCount"],
+      assessment: ["title or category", "summary", "findings", "errors when collection was partial"],
+      pagination_state: ["items or rows seen", "reported total when available", "pages", "truncated", "stop reason"],
     },
     jsonFormatting: definition.jsonFormatting ?? "UTF-8 JSON with two-space indentation and a trailing newline.",
   };
@@ -206,7 +208,8 @@ function factEquals(check: BatchCheckDefinition, suffix: string, value: Portable
 }
 
 function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
-  const manualOnly = /^always return manual\b/i.test(check.decision);
+  const manualOnly = /^always return manual\b/i.test(check.decision)
+    && !/\b(?:pass|warn|fail)\b/i.test(check.decision.replace(/^always return manual\b/i, ""));
   const outcomes = {
     fail: check.outcomes?.fail ?? (!manualOnly && /\bfail\b/i.test(check.decision)),
     warn: check.outcomes?.warn ?? (!manualOnly && /\bwarn\b/i.test(check.decision)),

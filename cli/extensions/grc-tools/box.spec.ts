@@ -63,7 +63,7 @@ const decisions = [
   "return pass when at least one enabled information barrier has a visible segment, and warn when barriers or segments are incomplete, enabled barriers have no visible segment, no barrier is enabled, or no barrier exists.",
   "return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption.",
   "return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum.",
-  "return pass when the complete user inventory has no co-admin and manual when any co-admin exists because individual co-admin permissions are not exposed.",
+  "return pass when the complete user inventory has no co-admin, warn when user evidence is partial, and manual when any co-admin exists because individual co-admin permissions are not exposed.",
   "always return manual because app creation events and Shield integration lists do not expose the app approval policy.",
   "return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms.",
   "return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight.",

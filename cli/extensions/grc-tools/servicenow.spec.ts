@@ -98,7 +98,7 @@ const decisions = [
   "return pass when the inactivity timeout is positive and at or below the configured threshold, warn when it exceeds the threshold, fail when disabled, and manual when the property is absent or unreadable.",
   "return pass when the password policy meets minimum and maximum length, character-class, and strength requirements, warn when only some fields miss the baseline, fail for a weak preset or multiple gaps, and manual when decisive fields are absent.",
   "return pass when an active multi-factor criterion covers every required privileged role, fail when no active criterion exists, warn for incomplete role coverage, and manual when criteria or role evidence is unavailable.",
-  "return pass when an active SSO or LDAP integration is visible and privileged local-account exceptions are bounded, warn for disabled or partial integration evidence, and manual when integration policy cannot be read.",
+  "return pass when an active SSO or LDAP integration is visible with enabled redirect policy and valid dated certificates, fail when complete evidence has no active external identity provider or an active certificate is expired, warn for weak redirect policy or near-expiry and undated certificates, and manual when integration evidence is unreadable or partial.",
   "return pass when an active customer encryption module or encrypted field evidence is visible, warn when only platform-default encryption is evident, fail when readable evidence explicitly disables encryption, and manual when the licensed encryption surface is unavailable.",
   "return pass when system auditing is enabled and the complete lookback contains records, warn when the readable window is empty or partial, fail when auditing is explicitly disabled, and manual when properties or audit rows are unavailable.",
   "return fail when any sensitive table has an active permissive ACL without role, condition, or script restrictions, warn for incomplete table or ACL evidence, and pass when every inspected sensitive table is explicitly protected.",
@@ -106,11 +106,11 @@ const decisions = [
   "return pass when all documented baseline hardening properties are secure, fail when any critical property is explicitly insecure, and warn when noncritical settings are weak or evidence is partial.",
   "return fail when an active integration user has administrator-equivalent roles, warn for broad non-admin roles, stale users, or partial assignments, and pass when complete evidence shows least-privileged integration identities.",
   "return pass when complete update-set evidence shows recent completed sets with no unresolved preview or commit errors, warn for in-progress, stale, failed, or partial sets, and manual when update-set tables are unavailable.",
-  "return pass when debug and diagnostic properties are disabled, fail when any is enabled, and manual when no decisive debug property is readable.",
+  "return pass when debug and diagnostic properties are disabled, fail when any is enabled, warn when the property inventory is partial, and manual when no decisive debug property is readable.",
   "return pass when the complete IP access-control inventory contains active restrictive ranges, fail when an explicit allow-all rule exists, warn when no rule exists or coverage is partial, and manual when the table is unavailable.",
   "return pass when documented outbound email TLS and security properties are enabled, fail when TLS is explicitly disabled, warn for weaker optional settings, and manual when decisive properties are absent.",
   "return pass when every active MID Server is validated, recent, and uses a non-administrator service identity, fail for administrator identities or failed validation, warn for stale, down, or partial records, and manual when the MID inventory is unavailable.",
-  "return pass when the complete plugin inventory contains only active licensed plugins required by the instance, warn for inactive, unlicensed, or partial plugin evidence, and manual when licensing or intended-use evidence cannot be inferred from the API.",
+  "return fail when a complete plugin inventory is missing a required baseline security plugin or a visible required plugin is inactive, and manual when the inventory is empty, partial around a missing baseline plugin, or all required plugins are active because licensing and intended use cannot be inferred from the API.",
 ] as const;
 const checks: BatchCheckDefinition[] = titles.map((title, index) => {
   const control = index + 1;
