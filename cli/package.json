@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hackIDLE/grclanker.git"
+    "url": "git+https://github.com/ethanolivertroy/grclanker.git"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -80,7 +80,7 @@
     "extensions",
     "flue",
     "prompts",
-    "scripts",
+    "scripts/patch-embedded-pi.mjs",
     "skills",
     ".grclanker"
   ],
