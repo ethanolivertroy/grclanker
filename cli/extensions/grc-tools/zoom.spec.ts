@@ -113,7 +113,43 @@ const not = (condition: VerdictCondition): VerdictCondition => ({ op: "not", con
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
-const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from complete collector state before evidence samples are capped.`]));
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
+  const counts: Readonly<Record<string, string>> = {
+    relaxing_group_count: "groups whose override weakens the required account setting", unreadable_group_setting_count: "failed or denied group-setting reads",
+    count: "records evaluated by the check", bad_count: "records matching the adjacent prohibited predicate", unknown_count: "records whose required state is unknown",
+    admin_role_count: "administrator roles", uncovered_admin_role_count: "administrator roles not covered by the required setting", admin_count: "users assigned administrator roles",
+    region_count: "enabled data-center regions",
+  };
+  const booleans: Readonly<Record<string, string>> = {
+    readable: "the check's required Zoom response was returned", complete: "all check-specific pages and child reads completed",
+    settings_readable: "the required account settings category was returned", setting_present: "the named account setting exists",
+    roles_readable: "roles and members were returned", roles_complete: "all role and member pages completed", member_read_denied: "a role-member read was denied",
+    client_setting_present: "the desktop timeout exists", web_setting_present: "the web timeout exists", cloud_recording_present: "cloud recording exists",
+    cloud_recording_value: "cloud recording is enabled", auto_delete_present: "automatic deletion exists", auto_delete_value: "automatic deletion is enabled",
+    phone_readable: "Zoom Phone settings were returned", auto_call_present: "automatic call recording exists", ad_hoc_present: "ad-hoc recording exists",
+    auto_call_enable: "automatic call recording is enabled", ad_hoc_enable: "ad-hoc recording is enabled",
+    add_policy_present: "the external-contact add policy exists", chat_policy_present: "the external-chat policy exists",
+    add_policy_enabled: "adding external contacts is enabled", chat_policy_enabled: "external chat is enabled",
+    screen_setting_present: "screen sharing exists", screen_setting_value: "screen sharing is enabled", share_setting_present: "participant sharing scope exists",
+    e2ee_setting_present: "end-to-end encryption exists", e2ee_setting_value: "end-to-end encryption is enabled",
+    personal_meeting_value: "personal meeting IDs are enabled", scheduled_setting_present: "scheduled-meeting PMI exists",
+    scheduled_setting_value: "scheduled meetings may use PMI", instant_setting_present: "instant-meeting PMI exists", instant_setting_value: "instant meetings may use PMI",
+    group_list_truncated: "the group list stopped before exhaustion", legacy_setting_present: "the legacy disclaimer setting exists", legacy_setting_value: "the legacy disclaimer is enabled",
+  };
+  const raw: Readonly<Record<string, string>> = {
+    setting_value: "Raw account setting before classification.", lock_value: "Raw account-setting lock state.", group_list_state: "Collector state for the group inventory.",
+    max_admins: "Maximum accepted administrator count.", client_minutes: "Desktop timeout converted to minutes.", web_minutes: "Web timeout converted to minutes.",
+    max_minutes: "Maximum accepted timeout in minutes.", retention_days: "Configured recording retention days.", max_retention_days: "Maximum accepted retention days.",
+    auto_call_lock: "Raw automatic-recording lock state.", ad_hoc_lock: "Raw ad-hoc-recording lock state.", add_policy_selected_option: "Raw external-contact add scope.",
+    chat_policy_selected_option: "Raw external-chat scope.", add_policy_lock: "Raw add-policy lock.", chat_policy_lock: "Raw chat-policy lock.",
+    share_setting_value: "Raw participant sharing scope.", encryption_type_value: "Raw default encryption type.", scheduled_lock_value: "Raw scheduled-PMI lock.",
+    instant_lock_value: "Raw instant-PMI lock.", disclaimer_option: "Raw recording-disclaimer participant option.",
+  };
+  const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Zoom inventory at the verdict point.`
+    : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+  if (!definition) throw new Error(`Zoom primitive ${name} lacks an explicit portable definition`);
+  return [name, definition];
+}));
 const groupInputs = ["relaxing_group_count", "group_list_state", "unreadable_group_setting_count", "group_list_truncated"] as const;
 const groupEvidenceIncomplete = any(
   gt("relaxing_group_count", 0),
@@ -215,8 +251,8 @@ const ZOOM_EXECUTABLE_DECISIONS: Readonly<Record<string, ZoomExecutableDecision>
         ne("phone_readable", true),
         ne("auto_call_present", true),
         ne("ad_hoc_present", true),
-        not(defined("auto_call_enable")),
-        not(defined("ad_hoc_enable")),
+        not(any(eq("auto_call_enable", true), eq("auto_call_enable", false))),
+        not(any(eq("ad_hoc_enable", true), eq("ad_hoc_enable", false))),
       )),
       rule("warn", any(ne("auto_call_lock", true), ne("ad_hoc_lock", true))),
       rule("pass", { op: "always" }),
@@ -242,8 +278,8 @@ const ZOOM_EXECUTABLE_DECISIONS: Readonly<Record<string, ZoomExecutableDecision>
         ne("settings_readable", true),
         ne("add_policy_present", true),
         ne("chat_policy_present", true),
-        not(defined("add_policy_enabled")),
-        not(defined("chat_policy_enabled")),
+        not(any(eq("add_policy_enabled", true), eq("add_policy_enabled", false))),
+        not(any(eq("chat_policy_enabled", true), eq("chat_policy_enabled", false))),
         all(eq("add_policy_enabled", true), not(defined("add_policy_selected_option"))),
         all(eq("chat_policy_enabled", true), not(defined("chat_policy_selected_option"))),
       )),

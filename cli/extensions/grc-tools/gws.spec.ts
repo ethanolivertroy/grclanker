@@ -136,7 +136,32 @@ const ordered = (branches: {
   rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
 ];
 const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} computed from the complete declared source inventories.`]),
+  names.map((name) => {
+    const counts: Readonly<Record<string, string>> = {
+      active_user_count: "non-suspended users", privileged_user_count: "distinct privileged users", two_step_required_user_count: "users for whom two-step verification is enforced",
+      dormant_user_count: "active users beyond the dormancy threshold", unknown_login_count: "active users without a parseable last login",
+      super_admin_count: "super administrators", super_admin_without_two_step_count: "super administrators without enforced two-step verification",
+      two_step_policy_count: "two-step policies", effective_policy_count: "effective two-step policies", policy_disallowing_enrollment_count: "effective policies disallowing enrollment",
+      suspended_privileged_count: "suspended privileged users", delegated_admin_count: "delegated administrators", event_count: "audit events in the requested lookback",
+      assignment_count: "administrative role assignments", group_assignment_count: "group-based role assignments", sampled_user_count: "users selected for per-user token reads",
+      failed_read_count: "sampled users whose token read failed or was denied", token_count: "third-party OAuth grants from successful token reads",
+      privileged_token_count: "OAuth grants held by privileged users", high_risk_token_count: "grants carrying a documented high-risk scope",
+      alert_count: "Alert Center alerts", open_alert_count: "alerts not marked closed", suspicious_login_count: "events matching the suspicious-login event set",
+    };
+    const booleans: Readonly<Record<string, string>> = {
+      readable: "the check's required Workspace response was collected and parseable",
+      complete: "all check-specific pages and required per-user reads completed without truncation or denied child reads",
+      directory_readable: "directory users and role assignments were returned and parseable",
+      users_readable: "directory users were returned and parseable",
+    };
+    const definition = counts[name]
+      ? `Non-negative cardinality of ${counts[name]} in the complete Workspace collector inventory available at the verdict point.`
+      : booleans[name]
+        ? `Boolean true exactly when ${booleans[name]}.`
+        : undefined;
+    if (!definition) throw new Error(`Google Workspace primitive ${name} lacks an explicit portable definition`);
+    return [name, definition];
+  }),
 );
 const unreadable = ne("readable", true);
 const incomplete = ne("complete", true);
@@ -185,7 +210,7 @@ const GWS_EXECUTABLE_DECISIONS: Readonly<Record<string, GwsExecutableDecision>> 
     }),
   },
   "GWS-ID-005": {
-    inputs: input("readable", "complete", "policy_count", "two_step_policy_count", "effective_policy_count", "policy_disallowing_enrollment_count"),
+    inputs: input("readable", "complete", "two_step_policy_count", "effective_policy_count", "policy_disallowing_enrollment_count"),
     rules: ordered({
       manual: any(unreadable, eq("two_step_policy_count", 0)),
       fail: eq("effective_policy_count", 0),
@@ -251,8 +276,9 @@ const GWS_EXECUTABLE_DECISIONS: Readonly<Record<string, GwsExecutableDecision>> 
         eq("sampled_user_count", 0),
         { op: "eq", left: path("failed_read_count"), right: path("sampled_user_count") },
       )),
-      rule("warn", any(incomplete, gt("failed_read_count", 0))),
+      rule("warn", gt("failed_read_count", 0)),
       rule("manual", eq("token_count", 0)),
+      rule("warn", incomplete),
       rule("pass", gt("token_count", 0)),
       rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
     ],

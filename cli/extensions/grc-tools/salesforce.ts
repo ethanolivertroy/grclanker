@@ -2412,7 +2412,6 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   const csrfPost = metadataBoolean(session.enableCSRFOnPost);
   recordSalesforceDecisionFacts(20, {
     settings_readable: settingsReadable,
-    both_present: csrfGet !== undefined && csrfPost !== undefined,
     get_enabled: csrfGet,
     post_enabled: csrfPost,
   });

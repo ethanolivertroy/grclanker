@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type PortableInputType,
 } from "./batch-spec-builder.js";
 import { BOX_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
@@ -82,6 +83,7 @@ const decisions = [
 
 interface BoxExecutableDecision {
   inputs: Readonly<Record<string, string>>;
+  inputTypes?: Readonly<Record<string, readonly PortableInputType[]>>;
   constants?: Readonly<Record<string, PortableValue>>;
   rules: readonly VerdictRule[];
 }
@@ -137,12 +139,45 @@ const ordered = (branches: {
   rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
 ];
 const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [
-    name,
-    name === "external_collaboration_setting_value"
-      ? "Raw Box enterprise_configuration.content_and_sharing.external_collaboration_status value, retained without translating it to an outcome."
-      : `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete collector state before evidence samples are capped.`,
-  ]),
+  names.map((name) => {
+    const counts: Readonly<Record<string, string>> = {
+      unused_setting_count: "returned configuration keys not mapped to an enforced setting", user_count: "enterprise users", admin_count: "administrators",
+      exempt_privileged_count: "privileged MFA exemptions", exempt_user_count: "user MFA exemptions", allowlist_entry_count: "collaboration allowlist entries",
+      public_domain_count: "public consumer-mail domains", stale_entry_count: "allowlist entries beyond the review age", undated_entry_count: "allowlist entries without dates",
+      exempt_target_count: "allowlist exemption targets", pin_count: "device pinners", classification_count: "security-classification options",
+      active_policy_count: "active retention policies", assigned_policy_count: "active retention policies with assignments", shield_rule_count: "Shield access-policy rules",
+      enabled_with_segments_count: "enabled barriers with at least two segments", event_count: "events in the requested lookback", privileged_user_count: "administrators and co-administrators",
+      coadmin_count: "co-administrators", enabled_managed_term_count: "enabled managed terms", complexity_rule_count: "enabled password character-class requirements",
+      active_user_count: "active human users", inactive_user_count: "active users without successful lookback activity", anomaly_rule_count: "Shield anomaly rules",
+      anomaly_event_count: "Shield alert or block events", access_event_count: "ordinary content-access events",
+    };
+    const booleans: Readonly<Record<string, string>> = {
+      readable: "the check's required Box response was collected and parseable", complete: "all check-specific pages and child reads completed",
+      settings_readable: "the relevant enterprise configuration category was present and parseable", sso_required: "enterprise sign-in requires SSO", sso_testing: "SSO remains in testing mode",
+      users_readable: "the enterprise user inventory was returned and parseable", mfa_required: "enterprise configuration requires MFA", users_truncated: "the user inventory stopped before exhaustion",
+      allowlist_readable: "allowlist entries were returned and parseable", config_readable: "collaboration configuration was returned and parseable",
+      exempt_targets_readable: "allowlist exemption targets were returned and parseable", expiration_enabled: "shared-link expiration is enabled",
+      public_expiration_enabled: "public-link expiration is enabled", watermarking_enabled: "watermarking is enabled", policies_readable: "retention policies were returned and parseable",
+      assignments_readable: "retention assignments were returned and parseable", barriers_readable: "information barriers were returned and parseable",
+      segments_readable: "barrier segments were returned and parseable", events_readable: "enterprise events were returned and parseable",
+      terms_readable: "terms-of-service records were returned and parseable", weak_password_prevention: "weak-password prevention is enabled",
+      custom_session_enabled: "custom group session duration is enabled", events_truncated: "event pagination stopped before exhaustion",
+      shield_settings_readable: "Shield settings were returned and parseable", configuration_readable: "enterprise configuration was returned and parseable",
+      events_complete: "the event stream covered the lookback without truncation",
+    };
+    const raw: Readonly<Record<string, string>> = {
+      external_collaboration_setting_value: "Raw Box external_collaboration_status value, retained without outcome translation.",
+      shared_link_default_access: "Raw normalized default shared-link access.", shared_link_access: "Raw normalized maximum shared-link access.",
+      max_admins: "Operator maximum accepted administrator count.", minimum_length: "Configured minimum password length in characters.",
+      required_minimum_length: "Preferred minimum password length in characters.", session_duration_value: "Raw enterprise session-duration string before unit parsing.",
+      session_hours: "Enterprise session duration converted to hours only for a recognized unit.", custom_session_duration_value: "Raw custom session-duration string before unit parsing.",
+      custom_session_hours: "Custom session duration converted to hours only for a recognized unit.", max_session_hours: "Maximum accepted session duration in hours.",
+    };
+    const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Box inventory at the verdict point.`
+      : booleans[name] ? `Boolean true exactly when ${booleans[name]}.` : raw[name];
+    if (!definition) throw new Error(`Box primitive ${name} lacks an explicit portable definition`);
+    return [name, definition];
+  }),
 );
 const manual = (): BoxExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
 
@@ -309,7 +344,7 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     }),
   },
   "BOX-13": {
-    inputs: input("policies_readable", "assignments_readable", "complete", "active_policy_count", "assigned_policy_count"),
+    inputs: input("policies_readable", "assignments_readable", "complete", "assigned_policy_count"),
     rules: ordered({
       manual: ne("policies_readable", true),
       warn: any(ne("complete", true), ne("assignments_readable", true), eq("assigned_policy_count", 0)),
@@ -325,7 +360,7 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     }),
   },
   "BOX-15": {
-    inputs: input("barriers_readable", "segments_readable", "complete", "barrier_count", "enabled_barrier_count", "enabled_with_segments_count"),
+    inputs: input("barriers_readable", "segments_readable", "enabled_with_segments_count"),
     rules: [
       rule("manual", ne("barriers_readable", true)),
       rule("warn", ne("segments_readable", true)),
@@ -364,7 +399,7 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
   },
   "BOX-19": manual(),
   "BOX-20": {
-    inputs: input("terms_readable", "managed_term_count", "enabled_managed_term_count"),
+    inputs: input("terms_readable", "enabled_managed_term_count"),
     rules: ordered({
       manual: ne("terms_readable", true),
       fail: eq("enabled_managed_term_count", 0),
@@ -401,6 +436,7 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
   },
   "BOX-22": {
     inputs: input("settings_readable", "unused_setting_count", "session_duration_value", "session_hours", "custom_session_enabled", "custom_session_duration_value", "custom_session_hours", "max_session_hours"),
+    inputTypes: { session_duration_value: ["string"], custom_session_duration_value: ["string"] },
     rules: [
       rule("manual", ne("settings_readable", true)),
       rule("warn", any(
@@ -464,6 +500,7 @@ const checks: BatchCheckDefinition[] = controls.map((title, index) => {
     surfaces: BOX_CHECK_SURFACES[control],
     evidenceFields: [...BOX_CHECK_SURFACES[control], "complete_source_counts"],
     decisionInputs: decision.inputs,
+    decisionInputTypes: decision.inputTypes,
     decisionConstants: decision.constants,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,

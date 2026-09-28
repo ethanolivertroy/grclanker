@@ -2722,7 +2722,10 @@ function finalizeFindings(findings: ZendeskFinding[], currentUser: ZendeskSnapsh
   for (const item of findings) {
     const facts = factsByCheck.get(item.id);
     if (!facts) throw new Error(`${item.id} has no runtime decision facts`);
-    factsByCheck.set(item.id, { ...facts, credential_is_admin: credentialIsAdmin });
+    const check = ZENDESK_SPEC.checks.find((candidate) => candidate.id === item.id);
+    factsByCheck.set(item.id, check?.evidenceFields.includes("credential_is_admin")
+      ? { ...facts, credential_is_admin: credentialIsAdmin }
+      : facts);
   }
   const capped = reason
     ? findings.map((item): ZendeskFinding => item.status === "pass"
@@ -3726,7 +3729,6 @@ async function assessZendeskDataProtectionWithDecisionContext(
   recordZendeskDecisionFacts(20, {
     readable: suspendedSnap.status === "ok",
     complete: suspendedSnap.status === "ok" && !isTruncated(suspendedSnap),
-    ticket_count: suspended.length,
     stale_count: buckets.stale.length,
     undated_count: buckets.undated.length,
   });

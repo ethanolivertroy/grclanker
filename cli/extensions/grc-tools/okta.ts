@@ -3784,7 +3784,8 @@ export function assessOktaAuthentication(
   const adminPolicyCount = adminPolicies.length;
   recordOktaDecisionFacts("OKTA-AUTH-002", {
     policy_inventory_readable: !(data.signOnPolicies.error && data.accessPolicies.error),
-    complete: completeOktaDatasets(...policyDatasets, data.authenticators, data.mfaPolicies),
+    complete: completeOktaDatasets(...policyDatasets, data.authenticators)
+      && untruncatedOktaDatasets(data.mfaPolicies),
     admin_policy_count: adminPolicyCount,
     admin_mfa_rule_count: adminMfaRules.length,
     strong_authenticator_count: strongAuthenticators.length,
