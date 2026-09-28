@@ -63,7 +63,7 @@ const rows: readonly Row[] = [
   ["GCP-DATA-04", 16, "Customer-managed encryption keys", "medium", ["projects", "storage", "compute"], "manual", "warn"],
   ["GCP-DATA-05", 17, "Cloud DNS DNSSEC", "medium", ["projects", "dns"], "manual"],
   ["GCP-DATA-06", 20, "API key restrictions", "high", ["projects", "api-keys"], "pass"],
-  ["GCP-DATA-07", 21, "VPC Service Controls perimeters", "medium", ["organization", "access-context-manager"], "manual", "warn"],
+  ["GCP-DATA-07", 21, "VPC Service Controls perimeters", "medium", ["organization", "access-context-manager"], "fail", "warn"],
   ["GCP-NET-01", 4, "Firewall rules open to the internet on administrative ports", "high", ["projects", "compute"], "manual"],
   ["GCP-NET-02", 9, "VPC flow logs", "medium", ["projects", "compute"], "manual"],
   ["GCP-NET-03", 22, "Private Google Access", "low", ["projects", "compute"], "manual", "warn"],

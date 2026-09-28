@@ -3,7 +3,13 @@ import {
   buildBatchOutputContract,
 } from "./batch-spec-builder.js";
 import {
+  batch2All,
+  batch2Any,
   batch2Checks,
+  batch2Eq,
+  batch2Gt,
+  batch2Ne,
+  batch2Rule,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
@@ -66,8 +72,38 @@ const severities: readonly Batch2CheckRow["severity"][] = [
   "high", "medium", "medium", "medium", "high",
 ];
 
+const completePassRules = [
+  batch2Rule("warn", batch2Any(
+    batch2Ne("evidence_complete", true),
+    batch2Gt("review_count", 0),
+  )),
+  batch2Rule("pass", batch2All(
+    batch2Eq("evidence_readable", true),
+    batch2Eq("evidence_complete", true),
+    batch2Eq("violation_count", 0),
+    batch2Eq("review_count", 0),
+  )),
+  batch2Rule("manual", { op: "always" }),
+] as const;
+
 const checks = batch2Checks(titles.map((title, index) => {
   const control = index + 1;
+  const decisionRules = control === 10
+    ? [
+        batch2Rule("manual", batch2Ne("evidence_readable", true)),
+        batch2Rule("fail", batch2Gt("violation_count", 0)),
+        ...completePassRules,
+      ]
+    : control === 19
+      ? [
+          batch2Rule("manual", batch2Any(
+            batch2Ne("evidence_readable", true),
+            batch2Eq("inventory_count", 0),
+          )),
+          batch2Rule("fail", batch2Gt("violation_count", 0)),
+          ...completePassRules,
+        ]
+      : undefined;
   return {
     id: `PA-${String(control).padStart(2, "0")}`,
     control,
@@ -76,6 +112,7 @@ const checks = batch2Checks(titles.map((title, index) => {
     owner: owner(control),
     surfaces: sourceSurfaces(control),
     emptyOutcome: "manual" as const,
+    decisionRules,
     decision: `Evaluate ${title} from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation.`,
   };
 }));
