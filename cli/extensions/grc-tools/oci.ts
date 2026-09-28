@@ -24,7 +24,7 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
-import { evaluateBatchCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { evaluateBatchRuntimeCheckVerdict, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import {
   OCI_AUTH_RESOLVER,
   readResolverEnvironment,
@@ -666,7 +666,7 @@ function finding(
   evidence?: JsonRecord,
   decisionFacts?: Readonly<Record<string, unknown>>,
 ): OciFinding {
-  const status = evaluateBatchCheckVerdict(OCI_SPEC, id, decisionFacts ?? {}) as OciFindingStatus;
+  const status = evaluateBatchRuntimeCheckVerdict(OCI_SPEC, id, decisionFacts ?? {}) as OciFindingStatus;
   return {
     id,
     title,

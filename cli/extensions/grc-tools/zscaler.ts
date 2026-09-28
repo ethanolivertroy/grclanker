@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import {
-  evaluateBatchCheckVerdict,
+  evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
@@ -1228,7 +1228,7 @@ function finding(
     control: controlNumber,
     title: definition.title,
     severity: definition.severity,
-    status: evaluateBatchCheckVerdict(ZSCALER_SPEC, id, decisionFacts ?? {}) as ZscalerFindingStatus,
+    status: evaluateBatchRuntimeCheckVerdict(ZSCALER_SPEC, id, decisionFacts ?? {}) as ZscalerFindingStatus,
     summary,
     evidence,
     mappings: mappingsForControl(controlNumber),
@@ -1316,7 +1316,7 @@ function capForUnreadableAll(item: ZscalerFinding, dependencies: InventoryDepend
     Object.defineProperty(result, ZSCALER_DECISION_FACTS, { value: facts });
     return result;
   }
-  const status = evaluateBatchCheckVerdict(ZSCALER_SPEC, item.id, { ...facts, evidence_complete: false }) as ZscalerFindingStatus;
+  const status = evaluateBatchRuntimeCheckVerdict(ZSCALER_SPEC, item.id, { ...facts, evidence_complete: false }) as ZscalerFindingStatus;
   const causes = unreadable.map((dependency) => `${dependency.inventory} inventory could not be read (${unreadableCause(dependency)})`);
   const consequence = status === "warn" ? ", so this verdict is capped at warn" : "";
   const result = {

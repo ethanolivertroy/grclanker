@@ -654,6 +654,18 @@ export function evaluateBatchCheckVerdict(
   return evaluateCheckVerdict(checkContract(spec, checkId), rawFacts);
 }
 
+export function evaluateBatchRuntimeCheckVerdict(
+  spec: IntegrationSpecContract,
+  checkId: string,
+  collectedFacts: Readonly<Record<string, unknown>>,
+): EvaluatedFindingStatus {
+  const check = checkContract(spec, checkId);
+  const declaredFacts = Object.fromEntries(
+    Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
+  );
+  return evaluateCheckVerdict(check, declaredFacts);
+}
+
 export function assertBatchCheckVerdict<T extends string>(
   spec: IntegrationSpecContract,
   checkId: string,

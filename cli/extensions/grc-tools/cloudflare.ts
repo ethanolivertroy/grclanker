@@ -20,7 +20,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import {
-  evaluateBatchCheckVerdict,
+  evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
@@ -1779,7 +1779,7 @@ function finding(
   evidence?: JsonRecord,
   decisionFacts?: Readonly<Record<string, unknown>>,
 ): CloudflareFinding {
-  const status = evaluateBatchCheckVerdict(CLOUDFLARE_SPEC, id, decisionFacts ?? {}) as CloudflareFindingStatus;
+  const status = evaluateBatchRuntimeCheckVerdict(CLOUDFLARE_SPEC, id, decisionFacts ?? {}) as CloudflareFindingStatus;
   return {
     id,
     title,

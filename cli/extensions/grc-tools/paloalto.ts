@@ -23,7 +23,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import {
-  evaluateBatchCheckVerdict,
+  evaluateBatchRuntimeCheckVerdict,
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
@@ -3527,7 +3527,7 @@ function gate(result: PaloaltoFinding, gateInfo: EvidenceGate, evidenceInstructi
   if (gateInfo.unreadable.length > 0) {
     const gated = {
       ...result,
-      status: evaluateBatchCheckVerdict(PALOALTO_SPEC, result.id, { ...facts, evidence_readable: false, evidence_complete: false }) as PaloaltoStatus,
+      status: evaluateBatchRuntimeCheckVerdict(PALOALTO_SPEC, result.id, { ...facts, evidence_readable: false, evidence_complete: false }) as PaloaltoStatus,
       summary: `Evidence unavailable (${gateInfo.unreadable.join("; ")}), so the verdict cannot be derived from the API. Manual evidence required: ${evidenceInstruction}`,
       evidence: { ...(result.evidence ?? {}), unreadable_sources: gateInfo.unreadable, manual_evidence: evidenceInstruction },
     };
@@ -3538,7 +3538,7 @@ function gate(result: PaloaltoFinding, gateInfo: EvidenceGate, evidenceInstructi
     const unevaluable = gateInfo.unevaluable && Object.keys(gateInfo.unevaluable).length > 0 ? { unevaluable_records: gateInfo.unevaluable } : {};
     const gated = {
       ...result,
-      status: evaluateBatchCheckVerdict(PALOALTO_SPEC, result.id, { ...facts, evidence_complete: false }) as PaloaltoStatus,
+      status: evaluateBatchRuntimeCheckVerdict(PALOALTO_SPEC, result.id, { ...facts, evidence_complete: false }) as PaloaltoStatus,
       summary: `${result.summary} Partial inventory: ${gateInfo.partial.join("; ")}.`,
       evidence: { ...(result.evidence ?? {}), partial_inventory: gateInfo.partial, ...unevaluable },
     };
@@ -3736,7 +3736,7 @@ function finding(
     control,
     title: definition?.title ?? `Control ${control}`,
     severity,
-    status: evaluateBatchCheckVerdict(PALOALTO_SPEC, id, decisionFacts ?? {}) as PaloaltoStatus,
+    status: evaluateBatchRuntimeCheckVerdict(PALOALTO_SPEC, id, decisionFacts ?? {}) as PaloaltoStatus,
     summary,
     evidence,
     mappings: controlMappings(control),
