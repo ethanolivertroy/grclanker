@@ -37,7 +37,7 @@ vanta_export_audit {"audit_id":"audit_123"}
 
 ## Export layout
 
-The default output root is `./export/vanta`. The audit directory name is deterministic: customer, framework, and the first eight characters of the audit ID. Re-exporting the same audit to the same root reuses that directory and replaces the paired zip. Choose a different `output_dir` or move the completed package first when prior exports must be preserved.
+The default output root is `./export/vanta`. The base audit directory name is deterministic: customer, framework, and the first eight characters of the audit ID. Each export atomically claims the first available directory, adding a unique numeric suffix such as `_1` or `_2` when needed. The paired zip is created exclusively, so sequential or concurrent exports do not reuse or overwrite prior packages.
 
 An export contains:
 
