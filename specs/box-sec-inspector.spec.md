@@ -2,424 +2,1138 @@
 slug: "box-sec-inspector"
 name: "Box Security Inspector"
 vendor: "Box"
-category: "saas-collaboration"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
-legacy_repo: "https://github.com/hackIDLE/box-sec-inspector"
-reference_docs: "https://developer.box.com/reference/"
+category: "collaboration-and-content"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# Box Enterprise Security Inspector: Architecture Specification
-
-## 1. Overview
-
-**box-sec-inspector** is a security compliance inspection tool for Box Enterprise environments. It audits authentication policies, external collaboration settings, sharing controls, data governance (retention, legal hold, classification), device trust, Shield smart access policies, and admin role assignments via the Box REST API. The tool produces structured findings mapped to major compliance frameworks, enabling security teams to identify misconfigurations, enforce data protection policies, and maintain continuous compliance posture.
-
-Written in Go with a hybrid CLI/TUI architecture, it supports both automated pipeline execution (JSON/SARIF output) and interactive exploration of findings.
-
-### grclanker implementation
-
-The shipped implementation lives in grclanker as native TypeScript tools (`cli/extensions/grc-tools/box.ts`) rather than the standalone Go binary described in sections 7 through 9. It is read-only, uses `fetch` and `node:crypto` (no Box SDK), and registers:
-
-- `box_check_access`: token exchange plus a probe of 15 read surfaces.
-- `box_assess_identity_access`: controls 1, 2, 3, 17, 18, 21, 22, 23, 24.
-- `box_assess_sharing_collaboration`: controls 4, 5, 6, 7, 8, 9, 19, 20.
-- `box_assess_data_governance`: controls 10, 11, 12, 13.
-- `box_assess_shield_monitoring`: controls 14, 15, 16, 25.
-- `box_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified matrix, one report per framework in section 5, and a zip archive.
-
-The integration guide is `src/content/docs/docs/integrations/box.md`; regression coverage is `cli/tests/box.test.mjs`; the live smoke is `npm --prefix cli run test:box:live`.
-
-## 2. APIs & SDKs
-
-### Box REST API (Content API v2.0)
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /2.0/users` | List enterprise users, roles, status |
-| `GET /2.0/users/{id}` | User details, login, 2FA status |
-| `GET /2.0/groups` | Enterprise groups and membership |
-| `GET /2.0/groups/{id}/memberships` | Group membership details |
-| `GET /2.0/events?stream_type=admin_logs` | Enterprise event stream (audit) |
-| `GET /2.0/events?stream_type=admin_logs_streaming` | Real-time admin event stream |
-| `GET /2.0/device_pins` | Device trust/pinned devices |
-| `GET /2.0/device_pins/{id}` | Device pin details |
-| `GET /2.0/retention_policies` | Data retention policies |
-| `GET /2.0/retention_policies/{id}` | Retention policy details |
-| `GET /2.0/retention_policies/{id}/assignments` | Retention policy assignments |
-| `GET /2.0/legal_hold_policies` | Legal hold policies |
-| `GET /2.0/legal_hold_policies/{id}` | Legal hold policy details |
-| `GET /2.0/legal_hold_policies/{id}/assignments` | Legal hold assignments |
-| `GET /2.0/shield_information_barriers` | Shield information barriers |
-| `GET /2.0/shield_information_barrier_segments` | Shield barrier segments |
-| `GET /2.0/collaboration_whitelist_entries` | External collaboration allowlist |
-| `GET /2.0/collaboration_whitelist_exempt_targets` | Collaboration exemptions |
-| `GET /2.0/enterprises/{id}` | Enterprise settings |
-| `GET /2.0/folders/{id}` | Folder details and shared link settings |
-| `GET /2.0/folders/{id}/collaborations` | Folder collaboration audit |
-| `GET /2.0/metadata_templates/enterprise` | Classification labels/templates |
-| `GET /2.0/terms_of_services` | Custom terms of service |
-| `GET /2.0/invites` | Pending enterprise invitations |
-
-**Base URL:** `https://api.box.com`
-**Upload URL:** `https://upload.box.com`
-
-### Box Events API (for Audit)
-
-Key event types for security auditing:
-- `LOGIN` / `FAILED_LOGIN`: Authentication events
-- `ADD_LOGIN_ACTIVITY_DEVICE` / `REMOVE_LOGIN_ACTIVITY_DEVICE`: Device trust events
-- `CHANGE_ADMIN_ROLE`: Admin role changes
-- `SHARE` / `UNSHARE` / `COLLABORATION_INVITE`: Sharing events
-- `DOWNLOAD` / `PREVIEW`: Content access events
-- `POLICY_VIOLATION`: Shield policy violations
-- `CONTENT_ACCESS`: Access to sensitive content
-
-### SDKs and Libraries
-
-| Name | Language | Notes |
-|------|----------|-------|
-| `box-go-sdk` | Go | Community Go SDK |
-| `boxsdk` | Python | Official Python SDK (box-python-sdk) |
-| `box-java-sdk` | Java | Official Java SDK |
-| `box-node-sdk` | Node.js | Official Node.js SDK |
-| Box CLI | Node.js | Official CLI tool |
-| Terraform Provider (community) | HCL | Limited Box resource coverage |
-
-## 3. Authentication
-
-### JWT (Server Authentication), recommended
-
-```json
-{
-  "boxAppSettings": {
-    "clientID": "...",
-    "clientSecret": "...",
-    "appAuth": {
-      "publicKeyID": "...",
-      "privateKey": "-----BEGIN ENCRYPTED PRIVATE KEY-----\n...",
-      "passphrase": "..."
-    }
-  },
-  "enterpriseID": "12345"
-}
-```
-
-- Service account with enterprise-level access
-- No user interaction required; ideal for automated scanning
-- Requires Admin Console app authorization
-
-### OAuth 2.0 (User Authentication)
-
-```
-Authorization: Bearer <access-token>
-```
-
-- User-level access with OAuth 2.0 flow
-- Requires user with Co-Admin or Admin role
-- Token refresh handled automatically
-
-### Client Credentials Grant (CCG)
-
-```
-POST https://api.box.com/oauth2/token
-grant_type=client_credentials
-client_id=<client_id>
-client_secret=<client_secret>
-box_subject_type=enterprise
-box_subject_id=<enterprise_id>
-```
-
-- Server-to-server without JWT key management
-- Simpler setup than JWT
-
-### Required Scopes/Permissions
-
-| Permission | Purpose |
-|------------|---------|
-| `Manage Enterprise Properties` | Read enterprise settings |
-| `Manage Users` | Enumerate users, roles, status |
-| `Manage Groups` | Group and membership audit |
-| `Manage Retention Policies` | Retention and legal hold review |
-| `Manage Enterprise Events` | Enterprise event stream access |
-| `Manage Device Pins` | Device trust audit |
-| `Manage Shield` | Shield information barriers |
-| `Manage Collaboration Allowlist` | External collaboration settings |
-
-### Configuration
-
-```bash
-export BOX_JWT_CONFIG_PATH="/path/to/box_config.json"
-# Or for CCG:
-export BOX_CLIENT_ID="your-client-id"
-export BOX_CLIENT_SECRET="your-client-secret"
-export BOX_ENTERPRISE_ID="12345"
-```
-
-Alternatively, configure via `~/.box-sec-inspector/config.yaml` or CLI flags.
-
-## 4. Security Controls
-
-1. **SSO Enforcement**: Verify external SSO is configured and enforced for all users (not optional or disabled).
-2. **2FA for Admins**: Confirm two-factor authentication is required for all admin and co-admin accounts.
-3. **2FA for All Users**: Check if 2FA is enforced enterprise-wide, not just for admins.
-4. **External Collaboration Restrictions**: Verify external collaboration is restricted to allowlisted domains only.
-5. **Collaboration Allowlist Audit**: Review the external collaboration allowlist for stale or overly broad domain entries.
-6. **Sharing Link Policies**: Ensure shared links default to "People in this company" or more restrictive; detect "Open" default links.
-7. **Shared Link Expiration**: Verify shared links have mandatory expiration dates configured.
-8. **Shared Link Password Policy**: Check if password protection is required for externally shared links.
-9. **Watermarking Enabled**: Verify watermarking is enabled for sensitive content to deter unauthorized distribution.
-10. **Device Trust/Pins**: Audit device pin configuration; ensure only approved devices can access enterprise content.
-11. **Classification Labels**: Verify classification labels are defined and applied to sensitive content.
-12. **Retention Policies**: Confirm retention policies exist and are assigned to appropriate folders/metadata for compliance.
-13. **Legal Hold Policies**: Verify legal hold policies are properly configured and assigned for litigation readiness.
-14. **Shield Smart Access Policies**: Audit Box Shield policies for anomaly detection, smart access rules, and threat detection.
-15. **Shield Information Barriers**: Verify information barrier segments prevent unauthorized data flow between groups.
-16. **Enterprise Event Streaming**: Confirm enterprise event streaming is active for audit trail and SIEM integration.
-17. **Admin Role Minimization**: Detect excessive Admin/Co-Admin role assignments; ensure least-privilege.
-18. **Co-Admin Permission Scoping**: Verify co-admin roles have appropriately scoped permissions (not full admin equivalent).
-19. **App Approval Process**: Check that custom/third-party app access requires admin approval (not open by default).
-20. **Custom Terms of Service**: Verify custom ToS is configured and required for users before accessing content.
-21. **Password Policy Strength**: Validate enterprise password policy meets minimum complexity and length requirements.
-22. **Session Duration Limits**: Confirm session timeout and maximum session duration are appropriately configured.
-23. **IP Allowlisting**: Verify IP-based access restrictions are configured for the enterprise.
-24. **Inactive User Detection**: Identify user accounts that have not logged in within 90 days.
-25. **Content Access Monitoring**: Verify Shield or event monitoring is configured for sensitive content access patterns.
-
-## 5. Compliance Framework Mappings
-
-| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---|---------|---------|------|-------|-----|---------|------|------|-------|
-| 1 | SSO Enforcement | IA-2 | AC.L2-3.1.1 | CC6.1 | 1.1 | 8.3.1 | SRG-APP-000148 | ISM-1557 | CPS-04 |
-| 2 | 2FA for Admins | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.1 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
-| 3 | 2FA for All Users | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.2 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
-| 4 | External Collab Restrictions | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.1 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
-| 5 | Collab Allowlist Audit | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.2 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
-| 6 | Sharing Link Policies | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.3 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 7 | Shared Link Expiration | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.4 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 8 | Shared Link Password | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.5 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 9 | Watermarking | SC-28 | SC.L2-3.13.16 | CC6.7 | 3.1 | 3.4 | SRG-APP-000231 | ISM-0457 | CPS-09 |
-| 10 | Device Trust/Pins | IA-3 | IA.L2-3.5.1 | CC6.1 | 1.2 | 2.4 | SRG-APP-000158 | ISM-1482 | CPS-04 |
-| 11 | Classification Labels | MP-4 | MP.L2-3.8.5 | CC6.7 | 3.2 | 9.6.1 | SRG-APP-000231 | ISM-0272 | CPS-09 |
-| 12 | Retention Policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.1 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
-| 13 | Legal Hold Policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.2 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
-| 14 | Shield Smart Access | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.6 | 7.2.1 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 15 | Information Barriers | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.7 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
-| 16 | Event Streaming | AU-2 | AU.L2-3.3.1 | CC7.2 | 8.3 | 10.2.1 | SRG-APP-000089 | ISM-0580 | CPS-10 |
-| 17 | Admin Role Minimization | AC-6(5) | AC.L2-3.1.5 | CC6.3 | 6.8 | 7.2.2 | SRG-APP-000340 | ISM-1507 | CPS-07 |
-| 18 | Co-Admin Scoping | AC-6 | AC.L2-3.1.5 | CC6.3 | 6.9 | 7.2.2 | SRG-APP-000340 | ISM-0432 | CPS-07 |
-| 19 | App Approval Process | CM-7(5) | CM.L2-3.4.8 | CC8.1 | 10.1 | 6.3.2 | SRG-APP-000386 | ISM-1490 | CPS-12 |
-| 20 | Custom Terms of Service | PS-6 | AT.L2-3.2.1 | CC1.4 | 11.1 | 12.6.1 | SRG-APP-000516 | ISM-0252 | CPS-13 |
-| 21 | Password Policy Strength | IA-5(1) | IA.L2-3.5.7 | CC6.1 | 5.1 | 8.3.6 | SRG-APP-000166 | ISM-0421 | CPS-05 |
-| 22 | Session Duration | AC-11 | AC.L2-3.1.10 | CC6.1 | 7.1 | 8.2.8 | SRG-APP-000190 | ISM-0853 | CPS-08 |
-| 23 | IP Allowlisting | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.1 | 1.3.2 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 24 | Inactive User Detection | AC-2(3) | AC.L2-3.1.1 | CC6.2 | 7.2 | 8.1.4 | SRG-APP-000025 | ISM-1404 | CPS-07 |
-| 25 | Content Access Monitoring | AU-6 | AU.L2-3.3.5 | CC7.2 | 8.4 | 10.6.1 | SRG-APP-000108 | ISM-0580 | CPS-10 |
-
-## 6. Existing Tools
-
-| Tool | Type | Limitations |
-|------|------|-------------|
-| Box Admin Console | Built-in | Manual configuration review, no automated compliance reporting |
-| Box Shield | Built-in | Threat detection and smart access, but no comprehensive config posture assessment |
-| Box Governance | Add-on | Retention and legal hold management, not security configuration auditing |
-| Box CLI | CLI | Management operations, no security assessment capability |
-| Box Reports (Admin) | Reporting | Usage analytics, not security posture analysis |
-| Custom Event Stream Scripts | Custom | No structured compliance mapping or standardized output |
-
-**Gap:** No existing tool provides automated security posture assessment of Box Enterprise configurations, including Shield policies, collaboration restrictions, device trust, and data governance settings, mapped to compliance frameworks. box-sec-inspector fills this gap.
-
-## 7. Architecture
-
-```
-box-sec-inspector/
-├── cmd/
-│   └── box-sec-inspector/
-│       └── main.go                 # Entrypoint, CLI bootstrap
-├── internal/
-│   ├── analyzers/
-│   │   ├── analyzer.go             # Analyzer interface and registry
-│   │   ├── sso.go                  # SSO enforcement checks
-│   │   ├── mfa.go                  # 2FA for admins and all users
-│   │   ├── collaboration.go        # External collab restrictions, allowlist
-│   │   ├── sharing.go              # Shared link policies, expiration, passwords
-│   │   ├── watermark.go            # Watermarking configuration
-│   │   ├── devices.go              # Device trust/pin audit
-│   │   ├── classification.go       # Classification label audit
-│   │   ├── retention.go            # Retention and legal hold policies
-│   │   ├── shield.go               # Shield smart access and info barriers
-│   │   ├── events.go               # Enterprise event streaming checks
-│   │   ├── admins.go               # Admin role minimization and scoping
-│   │   ├── apps.go                 # App approval process audit
-│   │   ├── tos.go                  # Terms of service configuration
-│   │   ├── password.go             # Password policy strength
-│   │   ├── sessions.go             # Session duration and timeout
-│   │   ├── network.go              # IP allowlisting
-│   │   └── users.go                # Inactive user detection
-│   ├── client/
-│   │   ├── client.go               # Box API client
-│   │   ├── jwt.go                  # JWT authentication
-│   │   ├── oauth.go                # OAuth 2.0 authentication
-│   │   ├── ccg.go                  # Client Credentials Grant auth
-│   │   ├── ratelimit.go            # Rate limiter (10 req/sec per user)
-│   │   └── pagination.go           # Marker-based pagination handler
-│   ├── config/
-│   │   ├── config.go               # Configuration loading and validation
-│   │   └── redact.go               # Credential redaction for logging
-│   ├── models/
-│   │   ├── user.go                 # User, group, role models
-│   │   ├── policy.go               # Retention, legal hold, Shield models
-│   │   ├── collaboration.go        # Collaboration and sharing models
-│   │   ├── device.go               # Device pin model
-│   │   ├── event.go                # Enterprise event model
-│   │   └── finding.go              # Finding severity/status model
-│   ├── reporters/
-│   │   ├── reporter.go             # Reporter interface
-│   │   ├── json.go                 # JSON output
-│   │   ├── sarif.go                # SARIF 2.1.0 output
-│   │   ├── csv.go                  # CSV output
-│   │   ├── table.go                # Terminal table output
-│   │   └── html.go                 # HTML report with charts
-│   └── tui/
-│       ├── app.go                  # Bubble Tea TUI application
-│       ├── views.go                # Finding detail views
-│       └── styles.go               # Lip Gloss styling
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── spec.md
-└── README.md
-```
-
-### Key Design Decisions
-
-- **Multi-auth support**: JWT (recommended for automation), OAuth 2.0 (interactive), and CCG (simplified server-to-server)
-- **Enterprise event analysis**: Leverages the enterprise event stream for historical security event correlation
-- **Rate limiting**: Box enforces 10 API calls per second per user; built-in token bucket rate limiter
-- **Marker-based pagination**: All list endpoints use marker pagination; client handles transparently
-- **Shield-aware**: Dedicated analyzers for Box Shield features (smart access, information barriers, threat detection)
-
-## 8. CLI Interface
-
-```
-box-sec-inspector [command] [flags]
-
-Commands:
-  scan        Run all or selected security analyzers
-  list        List available analyzers and their descriptions
-  version     Print version information
-
-Scan Flags:
-  --jwt-config string      Path to Box JWT config file (env: BOX_JWT_CONFIG_PATH)
-  --client-id string       Box app client ID (env: BOX_CLIENT_ID)
-  --client-secret string   Box app client secret (env: BOX_CLIENT_SECRET)
-  --enterprise-id string   Box enterprise ID (env: BOX_ENTERPRISE_ID)
-  --auth-method string     Auth method: jwt, ccg, oauth (default "jwt")
-  --analyzers strings      Run specific analyzers (comma-separated)
-  --exclude strings        Exclude specific analyzers
-  --severity string        Minimum severity to report: critical,high,medium,low,info
-  --format string          Output format: table,json,sarif,csv,html (default "table")
-  --output string          Output file path (default: stdout)
-  --tui                    Launch interactive TUI
-  --no-color               Disable colored output
-  --config string          Path to config file (default "~/.box-sec-inspector/config.yaml")
-  --event-window duration  Event stream lookback window (default 30d)
-  --timeout duration       API request timeout (default 30s)
-  --verbose                Enable verbose logging
-```
-
-### Usage Examples
-
-```bash
-# Full scan with JWT auth
-box-sec-inspector scan --jwt-config /path/to/box_config.json
-
-# Scan with Client Credentials Grant
-box-sec-inspector scan --auth-method ccg
-
-# Collaboration and sharing checks only
-box-sec-inspector scan --analyzers collaboration,sharing
-
-# Generate SARIF for CI/CD pipeline
-box-sec-inspector scan --format sarif --output results.sarif
-
-# JSON output for SIEM integration
-box-sec-inspector scan --format json --output results.json
-
-# Interactive TUI
-box-sec-inspector scan --tui
-
-# List available analyzers
-box-sec-inspector list
-```
-
-## 9. Build Sequence
-
-```bash
-# Prerequisites
-go 1.22+
-
-# Clone and build
-git clone https://github.com/hackIDLE/box-sec-inspector.git
-cd box-sec-inspector
-go mod download
-go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \
-  -o bin/box-sec-inspector ./cmd/box-sec-inspector/
-
-# Run tests
-go test ./...
-
-# Build Docker image
-docker build -t box-sec-inspector .
-
-# Run via Docker
-docker run --rm \
-  -v /path/to/box_config.json:/config/box_config.json:ro \
-  -e BOX_JWT_CONFIG_PATH=/config/box_config.json \
-  box-sec-inspector scan --format json
-```
-
-### Makefile Targets
-
-```
-make build       # Build binary
-make test        # Run tests
-make lint        # Run golangci-lint
-make docker      # Build Docker image
-make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
-```
-
-## 10. Status
-
-Implemented in grclanker (TypeScript) as of 2026-09-21. All 25 controls in section 4 produce a finding with the eight framework mappings from section 5.
-
-### What shipped
-
-- Authentication: JWT (RS256, RS384, or RS512 assertion signed with `node:crypto`, `kid` from `publicKeyID`), Client Credentials Grant (`box_subject_type` `enterprise` or `user`), and OAuth 2.0 access tokens with refresh-token renewal on 401. Configuration precedence is tool arguments, then `BOX_*` environment variables, then `~/.box-sec-inspector/config.yaml` (or `BOX_CONFIG_PATH`). Secrets are redacted from error messages.
-- Client: marker pagination (`usemarker`/`marker`), offset pagination for `GET /groups`, `stream_position` paging for `admin_logs` events, `retry-after` aware retry on 429 and exponential backoff on 5xx, per-request timeouts, and memoized reads within a run.
-- Tools: `box_check_access`, `box_assess_identity_access`, `box_assess_sharing_collaboration`, `box_assess_data_governance`, `box_assess_shield_monitoring`, `box_export_audit_bundle` (see the grclanker implementation subsection in section 1).
-- Automated verdicts (`pass`, `warn`, or `fail`) for controls 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 24, and 25. Controls 8, 19, and 23 are always `manual`; controls 10 and 18 are `manual` whenever device pins or co-admins exist. Every `manual` finding names the Admin Console evidence to collect.
-- Verdict safety: absent data never produces `fail`. Configuration categories that Box returns as `null`, an unreadable user list (controls 2, 3, 17, 18, 24), and settings missing from a readable category produce `manual` or `warn` with the reason. Configuration items with `is_used: false` are treated as not enforced and never support `pass`; the finding reports the item's `is_used` state and reported value in its evidence. An empty user inventory (zero users, or no `admin` account) and a truncated list (the API still offered a `next_marker`, an offset below `total_count`, or a `next_stream_position` when the cap was reached) are reported as `warn` for every finding whose `pass` would rest on the absence of a record (controls 2, 3, 5, 17, 18, 24, 25); truncation is recorded per assessment (`truncated`), in the bundle summary (`truncated_datasets`), and per snapshot in `core_data/collection_status.json`.
-- Tests: mocked coverage for configuration precedence, JWT and CCG token exchange, marker and offset pagination, retry and redaction, OAuth refresh, access check (healthy and limited), every assessment with passing and failing fixtures, and the export bundle (layout, zip, `_errors.log`, output path safety). Live smoke: `npm --prefix cli run test:box:live`.
-
-### Deviations from this spec, following the official Box documentation
-
-- Rate limit: Box documents 1000 API requests per minute per user (not 10 per second). The client honors `retry-after` on 429 and backs off exponentially on 5xx instead of using a fixed token bucket.
-- Device pins: the documented endpoint is `GET /2.0/enterprises/{enterprise_id}/device_pinners`, not `GET /2.0/device_pins`.
-- Legal hold assignments: the documented endpoint is `GET /2.0/legal_hold_policy_assignments?policy_id=...`, not a nested `/legal_hold_policies/{id}/assignments` path.
-- Enterprise settings: `GET /2.0/enterprises/{id}` does not return security settings. Posture values (SSO, MFA, password, session, sharing, watermarking, Shield rules) come from `GET /2.0/enterprise_configurations/{enterprise_id}?categories=security,content_and_sharing,user_settings,shield` with the `box-version: 2025.0` header, and IP and integration lists from `GET /2.0/shield_lists` (also `2025.0`).
-- Classification labels: read from the enterprise security classification template `GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema` in addition to `GET /2.0/metadata_templates/enterprise`.
-- Inactive users: the user object has no last login field, so control 24 correlates `admin_logs` activity events (`LOGIN`, `ADMIN_LOGIN`, `DOWNLOAD`, `UPLOAD`, and similar) with active managed users inside the lookback window. `FAILED_LOGIN` events are collected as evidence but do not count as activity.
-- Event types: `POLICY_VIOLATION` and `CONTENT_ACCESS` are not valid `event_type` filters; the implementation uses the documented `SHIELD_*`, `CONTENT_WORKFLOW_*`, `FILE_MARKED_MALICIOUS`, `DEVICE_TRUST_CHECK_FAILED`, `DOWNLOAD`, and `PREVIEW` types.
-- Users: `is_exempt_from_login_verification` (true means the user is exempt from 2-step verification) is the per-user MFA signal; there is no per-user "2FA status" field.
-- Enterprise ID: for OAuth tokens without `BOX_ENTERPRISE_ID`, the ID is discovered from `GET /2.0/users/me?fields=enterprise`.
-
-### What remains
-
-- The API does not expose the open shared link password requirement (control 8), the app approval policy (control 19), enterprise IP allowlisting (control 23), the device trust enforcement policy (control 10), or co-admin permission sets (control 18); these stay manual until Box exposes them.
-- Folder-level sampling (`GET /folders/{id}` and `/collaborations`) for watermark and classification application is not automated; the findings list the sampling step as manual evidence.
-- SARIF, CSV, and HTML reporters and the interactive TUI from sections 7 and 8 are not part of the grclanker implementation; the audit bundle provides JSON and Markdown outputs instead.
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
+
+# Box Security Inspector
+
+Portable contract for the shipped Box identity, sharing, governance, Shield, and monitoring assessments.
+
+## Purpose
+
+Audit Box enterprise identity, sharing, governance, retention, legal-hold, Shield, and event-monitoring posture with read-only Content API evidence.
+
+## Design guidance
+
+Treat settings marked unused by Box as unenforced, not compliant. Keep marker, offset, and event-stream completion semantics separate. Preserve Admin Console review where individual delegated permissions or policy details are not exposed by the API.
+
+## Shared integration contract
+
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
+
+## Known runtime gaps
+
+- Enterprise configuration categories can be returned but marked unused by Box; unused security settings never pass and render warning or manual evidence.
+- Marker, offset, and event-stream walkers keep distinct completion rules, including repeated markers, empty pages, server totals, item caps, and stream-position exits.
+- Five policy areas remain partly or wholly manual because the Box Content API does not expose a decisive read field; the runtime names Admin Console evidence.
+- CSV, HTML, SARIF, TUI output, and several policy reads remain absent.
+
+## Tools
+
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `box_check_access` | Validate read-only Box Content API access across the current principal, enterprise configuration, users, groups, enterprise events, device pins, retention and legal hold policies, Shield barriers and lists, collaboration allowlist, metadata and classification templates, and terms of service. Supports JWT, Client Credentials Grant, and OAuth 2.0 tokens. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_identity_access` | Assess Box identity and access controls: SSO enforcement, 2FA for admins and all users, admin role minimization, co-admin scoping, password policy strength, session duration, IP allowlisting, and inactive user detection (spec controls 1, 2, 3, 17, 18, 21, 22, 23, 24). | `BOX-01`, `BOX-02`, `BOX-03`, `BOX-17`, `BOX-18`, `BOX-21`, `BOX-22`, `BOX-23`, `BOX-24` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_sharing_collaboration` | Assess Box sharing and collaboration controls: external collaboration restrictions, allowlist audit, shared link defaults, expiration, password requirements, watermarking, app approval, and custom terms of service (spec controls 4, 5, 6, 7, 8, 9, 19, 20). | `BOX-04`, `BOX-05`, `BOX-06`, `BOX-07`, `BOX-08`, `BOX-09`, `BOX-19`, `BOX-20` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_data_governance` | Assess Box data governance controls: device trust and pins, classification labels, retention policies, and legal hold policies (spec controls 10, 11, 12, 13). | `BOX-10`, `BOX-11`, `BOX-12`, `BOX-13` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_assess_shield_monitoring` | Assess Box Shield and monitoring controls: Shield smart access and threat detection rules, information barriers, enterprise event streaming, and content access monitoring (spec controls 14, 15, 16, 25). | `BOX-14`, `BOX-15`, `BOX-16`, `BOX-25` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `box_export_audit_bundle` | Export a Box audit package covering all 25 spec controls with raw API snapshots (core_data/), normalized findings (analysis/), executive summary, unified compliance matrix, per-framework reports for FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP (compliance/), a quick reference, an error log for partial collection, and a zip archive. | `BOX-01`, `BOX-02`, `BOX-03`, `BOX-04`, `BOX-05`, `BOX-06`, `BOX-07`, `BOX-08`, `BOX-09`, `BOX-10`, `BOX-11`, `BOX-12`, `BOX-13`, `BOX-14`, `BOX-15`, `BOX-16`, `BOX-17`, `BOX-18`, `BOX-19`, `BOX-20`, `BOX-21`, `BOX-22`, `BOX-23`, `BOX-24`, `BOX-25` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
+
+### Parameters
+
+#### `box_check_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+
+#### `box_assess_identity_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+| `user_limit` | number | no | Maximum enterprise users to inspect. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable admin plus co-admin accounts before warning. Defaults to 10. |
+| `min_password_length` | number | no | Minimum password length expected for a passing result. Defaults to 12. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+
+#### `box_assess_sharing_collaboration`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+| `stale_allowlist_days` | number | no | Age in days after which a collaboration allowlist entry is flagged for review. Defaults to 365. |
+| `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
+
+#### `box_assess_data_governance`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
+
+#### `box_assess_shield_monitoring`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+
+#### `box_export_audit_bundle`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `auth_method` | string | no | Box auth method: jwt, ccg, or oauth. Defaults to BOX_AUTH_METHOD or is inferred from the credentials provided. |
+| `jwt_config_path` | string | no | Path to the Box JWT app config JSON downloaded from the Developer Console. Defaults to BOX_JWT_CONFIG_PATH. |
+| `jwt_passphrase` | string | no | Passphrase for the encrypted JWT private key when it is not stored in the config file. Defaults to BOX_JWT_PASSPHRASE. |
+| `client_id` | string | no | Box app client ID. Defaults to BOX_CLIENT_ID or the JWT config file. |
+| `client_secret` | string | no | Box app client secret. Defaults to BOX_CLIENT_SECRET or the JWT config file. |
+| `enterprise_id` | string | no | Box enterprise ID. Defaults to BOX_ENTERPRISE_ID, the JWT config file, or the authenticated user's enterprise. |
+| `subject_type` | string | no | Token subject type for JWT and CCG: enterprise (service account, default) or user. Defaults to BOX_SUBJECT_TYPE. |
+| `subject_id` | string | no | Token subject ID for JWT and CCG when subject_type is user. Defaults to BOX_SUBJECT_ID. |
+| `access_token` | string | no | Pre-issued OAuth 2.0 access token. Defaults to BOX_ACCESS_TOKEN (also BOX_TOKEN or BOX_DEVELOPER_TOKEN). |
+| `refresh_token` | string | no | OAuth 2.0 refresh token used with client_id and client_secret to renew the access token. Defaults to BOX_REFRESH_TOKEN. |
+| `config_path` | string | no | Path to a YAML config file. Defaults to BOX_CONFIG_PATH or ~/.box-sec-inspector/config.yaml. |
+| `base_url` | string | no | Box Content API base URL. Defaults to https://api.box.com/2.0. |
+| `token_url` | string | no | Box OAuth 2.0 token endpoint. Defaults to https://api.box.com/oauth2/token. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_retries` | number | no | Retries for 429 and 5xx responses with backoff. Defaults to 3. |
+| `event_limit` | number | no | Maximum enterprise events to sample from the admin_logs stream. Defaults to 2000. |
+| `lookback_days` | number | no | Event lookback window in days. Defaults to 90. |
+| `user_limit` | number | no | Maximum enterprise users to inspect. Defaults to 1000. |
+| `max_admins` | number | no | Maximum acceptable admin plus co-admin accounts before warning. Defaults to 10. |
+| `min_password_length` | number | no | Minimum password length expected for a passing result. Defaults to 12. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+| `stale_allowlist_days` | number | no | Age in days after which a collaboration allowlist entry is flagged for review. Defaults to 365. |
+| `list_limit` | number | no | Maximum records to inspect per paginated list (collaboration allowlist entries and exempt users, device pins, policies, and assignments). A list that hits the cap while Box reports more records is marked truncated and downgrades dependent findings to warn. Defaults to 500. |
+| `output_dir` | string | no | Output root. Defaults to ./export/box. |
+
+
+## Authentication
+
+Supported modes:
+
+- JWT server authentication
+- Client Credentials Grant
+- OAuth refresh token
+- Explicit access token
+
+Credential precedence, highest first:
+
+1. Explicit tool arguments
+2. BOX_* environment variables
+3. Explicit or default inspector YAML config
+
+Environment variables: `BOX_AUTH_METHOD`, `BOX_JWT_CONFIG_PATH`, `BOX_JWT_PASSPHRASE`, `BOX_JWT_ALGORITHM`, `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, `BOX_ENTERPRISE_ID`, `BOX_SUBJECT_TYPE`, `BOX_SUBJECT_ID`, `BOX_ACCESS_TOKEN`, `BOX_TOKEN`, `BOX_DEVELOPER_TOKEN`, `BOX_REFRESH_TOKEN`, `BOX_API_BASE_URL`, `BOX_BASE_URL`, `BOX_TOKEN_URL`, `BOX_TIMEOUT`, `BOX_MAX_RETRIES`, `BOX_CONFIG_PATH`
+
+Configuration locations: Explicit path from config_path or BOX_CONFIG_PATH, ~/.box-sec-inspector/config.yaml
+
+Credential and deployment variants: Enterprise or user subject, JWT RS256, RS384, or RS512 assertion
+
+Configuration fields: `auth_method`, `authMethod`, `auth_mode`, `jwt_config_path`, `jwt_config`, `jwtConfigPath`, `jwt_passphrase`, `passphrase`, `jwt_algorithm`, `jwtAlgorithm`, `client_id`, `clientId`, `clientID`, `client_secret`, `clientSecret`, `enterprise_id`, `enterpriseId`, `enterpriseID`, `subject_type`, `subjectType`, `subject_id`, `subjectId`, `user_id`, `access_token`, `accessToken`, `token`, `developer_token`, `refresh_token`, `refreshToken`, `base_url`, `baseUrl`, `api_base_url`, `token_url`, `tokenUrl`, `timeout_seconds`, `timeout`, `max_retries`, `maxRetries`
+
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
+
+Credential refresh: POST https://api.box.com/oauth2/token using the selected JWT, client_credentials, or refresh_token grant.
+
+## Permissions
+
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| role | `Box application scopes and enterprise authorization for users, groups, events, governance, and enterprise configuration` | `current-user`, `enterprise-configuration`, `users`, `groups`, `events`, `device-pinners`, `retention-policies`, `retention-assignments`, `legal-hold-policies`, `legal-hold-assignments`, `shield-barriers`, `shield-barrier-segments`, `shield-lists`, `allowlist-entries`, `allowlist-exempt-targets`, `metadata-templates`, `classification-template`, `terms-of-service` |  |
+| license | `Box Governance entitlement` | `retention-policies`, `retention-assignments`, `legal-hold-policies`, `legal-hold-assignments` |  |
+| license | `Box Shield entitlement` | `shield-barriers`, `shield-barrier-segments`, `shield-lists` |  |
+
+## API surfaces
+
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `current-user` | HTTP | `GET /2.0/users/me` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `enterprise-configuration` | HTTP | `GET /2.0/enterprise_configurations/{enterpriseId}` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `users` | HTTP | `GET /2.0/users` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `groups` | HTTP | `GET /2.0/groups` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `events` | HTTP | `GET /2.0/events` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `device-pinners` | HTTP | `GET /2.0/enterprises/{enterpriseId}/device_pinners` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `retention-policies` | HTTP | `GET /2.0/retention_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `retention-assignments` | HTTP | `GET /2.0/retention_policies/{policyId}/assignments` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `legal-hold-policies` | HTTP | `GET /2.0/legal_hold_policies` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `legal-hold-assignments` | HTTP | `GET /2.0/legal_hold_policy_assignments` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `shield-barriers` | HTTP | `GET /2.0/shield_information_barriers` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `shield-barrier-segments` | HTTP | `GET /2.0/shield_information_barrier_segments` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `shield-lists` | HTTP | `GET /2.0/shield_lists` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `allowlist-entries` | HTTP | `GET /2.0/collaboration_whitelist_entries` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `allowlist-exempt-targets` | HTTP | `GET /2.0/collaboration_whitelist_exempt_targets` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `metadata-templates` | HTTP | `GET /2.0/metadata_templates/enterprise` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `classification-template` | HTTP | `GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+| `terms-of-service` | HTTP | `GET /2.0/terms_of_services` | Box Content API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected fields consumed by the corresponding runtime assessment` | [Official documentation](https://developer.box.com/reference/) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `current-user` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `current-user` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `current-user` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `enterprise-configuration` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `enterprise-configuration` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `enterprise-configuration` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `users` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `groups` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `groups` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `groups` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `events` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `events` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `events` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `device-pinners` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `device-pinners` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `device-pinners` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `retention-policies` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `retention-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `retention-policies` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `retention-assignments` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `retention-assignments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `retention-assignments` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `legal-hold-policies` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `legal-hold-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `legal-hold-policies` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `legal-hold-assignments` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `legal-hold-assignments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `legal-hold-assignments` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `shield-barriers` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `shield-barriers` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `shield-barriers` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `shield-barrier-segments` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `shield-barrier-segments` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `shield-barrier-segments` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `shield-lists` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `shield-lists` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `shield-lists` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `allowlist-entries` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `allowlist-entries` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `allowlist-entries` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `allowlist-exempt-targets` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `allowlist-exempt-targets` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `allowlist-exempt-targets` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `metadata-templates` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `metadata-templates` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `metadata-templates` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `classification-template` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `classification-template` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `classification-template` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `terms-of-service` | client | Use the configured Box Content API origin; never follow a server link to a different origin. | yes |
+| `terms-of-service` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `terms-of-service` | response | A JSON object or list containing only the documented projected fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+
+## Pagination
+
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `users`, `device-pinners`, `retention-policies`, `retention-assignments`, `legal-hold-policies`, `legal-hold-assignments`, `shield-barriers`, `shield-barrier-segments`, `allowlist-entries`, `allowlist-exempt-targets`, `metadata-templates` | `next_marker` | 1000 | caller limit | none | Completion requires next_marker exhaustion; a cap with a remaining marker is incomplete. | No next_marker; Configured record cap; Repeated marker; Empty page with marker |
+| `groups` | `offset`, `limit`, `total_count` | 1000 | caller limit | none | total_count is authoritative; seen below total is incomplete. | Seen reaches total; Configured cap; Offset fails to advance; Empty page before total |
+| `events` | `next_stream_position`, `stream_position` | 500 | caller limit | none | The event stream has no total; the walker requires an empty page and advancing stream positions. | Empty page; Configured event cap; Repeated position; Fresh position adds no unseen event; Page budget |
+| `shield-lists`, `terms-of-service`, `current-user`, `enterprise-configuration`, `classification-template` | None | service default | caller limit | none | Single request; a successful response is complete. | Single response |
+
+## Rate limits
+
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Box Security Inspector | Box rate limits vary by endpoint, user, and enterprise | `Retry-After`, `X-Rate-Limit-Limit`, `X-Rate-Limit-Remaining` | 429, 500, 502, 503, 504 | Honor Retry-After up to 60 seconds and retry three times with bounded exponential delay. |
+
+## Checks
+
+### Control coverage
+
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | SSO enforcement | BOX-01 | Evaluate the ordered first-match rules for BOX-01 below. |
+| 2 | 2FA for admins | BOX-02 | Evaluate the ordered first-match rules for BOX-02 below. |
+| 3 | 2FA for all users | BOX-03 | Evaluate the ordered first-match rules for BOX-03 below. |
+| 4 | External collaboration restrictions | BOX-04 | Evaluate the ordered first-match rules for BOX-04 below. |
+| 5 | Collaboration allowlist audit | BOX-05 | Evaluate the ordered first-match rules for BOX-05 below. |
+| 6 | Sharing link policies | BOX-06 | Evaluate the ordered first-match rules for BOX-06 below. |
+| 7 | Shared link expiration | BOX-07 | Evaluate the ordered first-match rules for BOX-07 below. |
+| 8 | Shared link password policy | BOX-08 | Evaluate the ordered first-match rules for BOX-08 below. |
+| 9 | Watermarking enabled | BOX-09 | Evaluate the ordered first-match rules for BOX-09 below. |
+| 10 | Device trust and pins | BOX-10 | Evaluate the ordered first-match rules for BOX-10 below. |
+| 11 | Classification labels | BOX-11 | Evaluate the ordered first-match rules for BOX-11 below. |
+| 12 | Retention policies | BOX-12 | Evaluate the ordered first-match rules for BOX-12 below. |
+| 13 | Legal hold policies | BOX-13 | Evaluate the ordered first-match rules for BOX-13 below. |
+| 14 | Shield smart access policies | BOX-14 | Evaluate the ordered first-match rules for BOX-14 below. |
+| 15 | Shield information barriers | BOX-15 | Evaluate the ordered first-match rules for BOX-15 below. |
+| 16 | Enterprise event streaming | BOX-16 | Evaluate the ordered first-match rules for BOX-16 below. |
+| 17 | Admin role minimization | BOX-17 | Evaluate the ordered first-match rules for BOX-17 below. |
+| 18 | Co-admin permission scoping | BOX-18 | Evaluate the ordered first-match rules for BOX-18 below. |
+| 19 | App approval process | BOX-19 | Evaluate the ordered first-match rules for BOX-19 below. |
+| 20 | Custom terms of service | BOX-20 | Evaluate the ordered first-match rules for BOX-20 below. |
+| 21 | Password policy strength | BOX-21 | Evaluate the ordered first-match rules for BOX-21 below. |
+| 22 | Session duration limits | BOX-22 | Evaluate the ordered first-match rules for BOX-22 below. |
+| 23 | IP allowlisting | BOX-23 | Evaluate the ordered first-match rules for BOX-23 below. |
+| 24 | Inactive user detection | BOX-24 | Evaluate the ordered first-match rules for BOX-24 below. |
+| 25 | Content access monitoring | BOX-25 | Evaluate the ordered first-match rules for BOX-25 below. |
+
+### Finding notes
+
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `BOX-01` | critical | `box_assess_identity_access` | `enterprise-configuration` | `settings_readable`, `unused_setting_count`, `sso_required`, `sso_testing` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | The required evidence for SSO enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-02` | critical | `box_assess_identity_access` | `enterprise-configuration`, `users` | `settings_readable`, `users_readable`, `unused_setting_count`, `mfa_required`, `sso_required`, `user_count`, `admin_count`, `users_truncated`, `exempt_privileged_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | The required evidence for 2FA for admins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-03` | high | `box_assess_identity_access` | `enterprise-configuration`, `users` | `settings_readable`, `users_readable`, `unused_setting_count`, `mfa_required`, `sso_required`, `user_count`, `admin_count`, `users_truncated`, `exempt_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | The required evidence for 2FA for all users is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-04` | high | `box_assess_sharing_collaboration` | `enterprise-configuration`, `allowlist-entries` | `settings_readable`, `allowlist_readable`, `unused_setting_count`, `external_collaboration_setting_value`, `allowlist_entry_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | The required evidence for External collaboration restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-05` | medium | `box_assess_sharing_collaboration` | `enterprise-configuration`, `allowlist-entries`, `allowlist-exempt-targets` | `allowlist_readable`, `config_readable`, `exempt_targets_readable`, `complete`, `external_collaboration_setting_value`, `allowlist_entry_count`, `public_domain_count`, `stale_entry_count`, `undated_entry_count`, `exempt_target_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions attached to a non-empty allowlist, or an empty allowlist while allowlist-only mode is selected; pass when complete entries are recent non-public domains without exemptions, and also pass when no allowlist is required and the allowlist is empty regardless of exempt-target rows. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions attached to a non-empty allowlist, or an empty allowlist while allowlist-only mode is selected; pass when complete entries are recent non-public domains without exemptions, and also pass when no allowlist is required and the allowlist is empty regardless of exempt-target rows. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions attached to a non-empty allowlist, or an empty allowlist while allowlist-only mode is selected; pass when complete entries are recent non-public domains without exemptions, and also pass when no allowlist is required and the allowlist is empty regardless of exempt-target rows. | The required evidence for Collaboration allowlist audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-06` | high | `box_assess_sharing_collaboration` | `enterprise-configuration` | `settings_readable`, `unused_setting_count`, `shared_link_default_access`, `shared_link_access` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | The required evidence for Sharing link policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-07` | medium | `box_assess_sharing_collaboration` | `enterprise-configuration` | `settings_readable`, `unused_setting_count`, `expiration_enabled`, `public_expiration_enabled` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | The required evidence for Shared link expiration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-08` | medium | `box_assess_sharing_collaboration` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | The required evidence for Shared link password policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-09` | medium | `box_assess_sharing_collaboration` | `enterprise-configuration` | `settings_readable`, `unused_setting_count`, `watermarking_enabled` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | The required evidence for Watermarking enabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-10` | medium | `box_assess_data_governance` | `device-pinners` | `readable`, `complete`, `pin_count` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | The required evidence for Device trust and pins is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-11` | medium | `box_assess_data_governance` | `classification-template`, `metadata-templates` | `readable`, `classification_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | The required evidence for Classification labels is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-12` | medium | `box_assess_data_governance` | `retention-policies`, `retention-assignments` | `policies_readable`, `assignments_readable`, `complete`, `active_policy_count`, `assigned_policy_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | The required evidence for Retention policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-13` | medium | `box_assess_data_governance` | `legal-hold-policies`, `legal-hold-assignments` | `policies_readable`, `assignments_readable`, `complete`, `assigned_policy_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | The required evidence for Legal hold policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-14` | high | `box_assess_shield_monitoring` | `enterprise-configuration`, `shield-lists` | `settings_readable`, `shield_rule_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | The required evidence for Shield smart access policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-15` | medium | `box_assess_shield_monitoring` | `shield-barriers`, `shield-barrier-segments` | `barriers_readable`, `segments_readable`, `enabled_with_segments_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one enabled information barrier has a visible segment, including a lower-bound segment listing that stopped after proving one; return warn when no visible segment is proved, barriers or required segment reads are unreadable, no barrier is enabled, or no barrier exists. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one enabled information barrier has a visible segment, including a lower-bound segment listing that stopped after proving one; return warn when no visible segment is proved, barriers or required segment reads are unreadable, no barrier is enabled, or no barrier exists. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one enabled information barrier has a visible segment, including a lower-bound segment listing that stopped after proving one; return warn when no visible segment is proved, barriers or required segment reads are unreadable, no barrier is enabled, or no barrier exists. | The required evidence for Shield information barriers is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-16` | high | `box_assess_shield_monitoring` | `events` | `events_readable`, `event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | The required evidence for Enterprise event streaming is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-17` | high | `box_assess_identity_access` | `users` | `users_readable`, `users_truncated`, `user_count`, `admin_count`, `privileged_user_count`, `max_admins` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | The required evidence for Admin role minimization is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-18` | medium | `box_assess_identity_access` | `users` | `users_readable`, `users_truncated`, `user_count`, `admin_count`, `coadmin_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete user inventory has no co-admin, warn when user evidence is partial, and manual when any co-admin exists because individual co-admin permissions are not exposed. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete user inventory has no co-admin, warn when user evidence is partial, and manual when any co-admin exists because individual co-admin permissions are not exposed. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete user inventory has no co-admin, warn when user evidence is partial, and manual when any co-admin exists because individual co-admin permissions are not exposed. | The required evidence for Co-admin permission scoping is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-19` | medium | `box_assess_sharing_collaboration` | `events`, `shield-lists` | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | The required evidence for App approval process is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-20` | medium | `box_assess_sharing_collaboration` | `terms-of-service` | `terms_readable`, `enabled_managed_term_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | The required evidence for Custom terms of service is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-21` | high | `box_assess_identity_access` | `enterprise-configuration` | `settings_readable`, `unused_setting_count`, `minimum_length`, `required_minimum_length`, `weak_password_prevention`, `complexity_rule_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | The required evidence for Password policy strength is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-22` | medium | `box_assess_identity_access` | `enterprise-configuration` | `settings_readable`, `unused_setting_count`, `session_duration_value`, `session_hours`, `custom_session_enabled`, `custom_session_duration_value`, `custom_session_hours`, `max_session_hours` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | The required evidence for Session duration limits is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-23` | medium | `box_assess_identity_access` | `shield-lists` | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | The required evidence for IP allowlisting is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-24` | medium | `box_assess_identity_access` | `users`, `events` | `users_readable`, `events_readable`, `users_truncated`, `user_count`, `admin_count`, `events_truncated`, `active_user_count`, `inactive_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | The required evidence for Inactive user detection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `BOX-25` | high | `box_assess_shield_monitoring` | `shield-lists`, `events` | `shield_settings_readable`, `configuration_readable`, `events_readable`, `events_complete`, `anomaly_rule_count`, `anomaly_event_count`, `access_event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | The required evidence for Content access monitoring is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+
+### Primitive decision inputs
+
+Every primitive is read from the named vendor surface or collector state before evidence lists are rendered or capped. Null and missing retain unavailable semantics; they are not empty inventories, false values, or zero counts.
+
+| Finding | Input | Portable definition |
+|---|---|---|
+| `BOX-01` | `settings_readable` | Semantic owner: `BOX-01.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_01_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-01` | `unused_setting_count` | Semantic owner: `BOX-01.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_01_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-01` | `sso_required` | Semantic owner: `BOX-01.sso_required`. Type/domain: boolean. Compared literal domain: false, true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_01_branch_03_matches`, `box_01_branch_04_matches`, `box_01_branch_05_matches`. Portable meaning: Boolean true exactly when enterprise sign-in requires SSO. |
+| `BOX-01` | `sso_testing` | Semantic owner: `BOX-01.sso_testing`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_01_branch_04_matches`, `box_01_branch_05_matches`. Portable meaning: Boolean true exactly when SSO remains in testing mode. |
+| `BOX-02` | `settings_readable` | Semantic owner: `BOX-02.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-02` | `users_readable` | Semantic owner: `BOX-02.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_01_matches`. Portable meaning: Boolean true exactly when the enterprise user inventory was returned and parseable. |
+| `BOX-02` | `unused_setting_count` | Semantic owner: `BOX-02.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-02` | `mfa_required` | Semantic owner: `BOX-02.mfa_required`. Type/domain: boolean. Compared literal domain: false, true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_03_matches`, `box_02_branch_04_matches`, `box_02_branch_05_matches`. Portable meaning: Boolean true exactly when enterprise configuration requires MFA. |
+| `BOX-02` | `sso_required` | Semantic owner: `BOX-02.sso_required`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_03_matches`. Portable meaning: Boolean true exactly when enterprise sign-in requires SSO. |
+| `BOX-02` | `user_count` | Semantic owner: `BOX-02.user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_04_matches`, `box_02_branch_05_matches`. Portable meaning: Non-negative cardinality of enterprise users in the complete Box inventory at the verdict point. |
+| `BOX-02` | `admin_count` | Semantic owner: `BOX-02.admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_04_matches`, `box_02_branch_05_matches`. Portable meaning: Non-negative cardinality of administrators in the complete Box inventory at the verdict point. |
+| `BOX-02` | `users_truncated` | Semantic owner: `BOX-02.users_truncated`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_04_matches`, `box_02_branch_05_matches`. Portable meaning: Boolean true exactly when the user inventory stopped before exhaustion. |
+| `BOX-02` | `exempt_privileged_count` | Semantic owner: `BOX-02.exempt_privileged_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_02_branch_03_matches`, `box_02_branch_05_matches`. Portable meaning: Non-negative cardinality of privileged MFA exemptions in the complete Box inventory at the verdict point. |
+| `BOX-03` | `settings_readable` | Semantic owner: `BOX-03.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-03` | `users_readable` | Semantic owner: `BOX-03.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_01_matches`. Portable meaning: Boolean true exactly when the enterprise user inventory was returned and parseable. |
+| `BOX-03` | `unused_setting_count` | Semantic owner: `BOX-03.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-03` | `mfa_required` | Semantic owner: `BOX-03.mfa_required`. Type/domain: boolean. Compared literal domain: false, true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_03_matches`, `box_03_branch_04_matches`, `box_03_branch_05_matches`. Portable meaning: Boolean true exactly when enterprise configuration requires MFA. |
+| `BOX-03` | `sso_required` | Semantic owner: `BOX-03.sso_required`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_03_matches`. Portable meaning: Boolean true exactly when enterprise sign-in requires SSO. |
+| `BOX-03` | `user_count` | Semantic owner: `BOX-03.user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_04_matches`, `box_03_branch_05_matches`. Portable meaning: Non-negative cardinality of enterprise users in the complete Box inventory at the verdict point. |
+| `BOX-03` | `admin_count` | Semantic owner: `BOX-03.admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_04_matches`, `box_03_branch_05_matches`. Portable meaning: Non-negative cardinality of administrators in the complete Box inventory at the verdict point. |
+| `BOX-03` | `users_truncated` | Semantic owner: `BOX-03.users_truncated`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_04_matches`, `box_03_branch_05_matches`. Portable meaning: Boolean true exactly when the user inventory stopped before exhaustion. |
+| `BOX-03` | `exempt_user_count` | Semantic owner: `BOX-03.exempt_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_03_branch_04_matches`, `box_03_branch_05_matches`. Portable meaning: Non-negative cardinality of user MFA exemptions in the complete Box inventory at the verdict point. |
+| `BOX-04` | `settings_readable` | Semantic owner: `BOX-04.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_04_branch_01_matches`, `box_04_branch_04_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-04` | `allowlist_readable` | Semantic owner: `BOX-04.allowlist_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_04_branch_01_matches`, `box_04_branch_04_matches`. Portable meaning: Boolean true exactly when allowlist entries were returned and parseable. |
+| `BOX-04` | `unused_setting_count` | Semantic owner: `BOX-04.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_04_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-04` | `external_collaboration_setting_value` | Semantic owner: `BOX-04.external_collaboration_setting_value`. Type/domain: string. Compared literal domain: "enable_external_collaboration", "limit_collaboration_to_allowlisted_domains", "limit_collaboration_to_users_within_enterprise". Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_04_branch_03_matches`, `box_04_branch_04_matches`, `box_04_branch_05_matches`. Portable meaning: Raw Box external_collaboration_status value, retained without outcome translation. |
+| `BOX-04` | `allowlist_entry_count` | Semantic owner: `BOX-04.allowlist_entry_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_04_branch_01_matches`, `box_04_branch_04_matches`, `box_04_branch_05_matches`. Portable meaning: Non-negative cardinality of collaboration allowlist entries in the complete Box inventory at the verdict point. |
+| `BOX-05` | `allowlist_readable` | Semantic owner: `BOX-05.allowlist_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_01_matches`. Portable meaning: Boolean true exactly when allowlist entries were returned and parseable. |
+| `BOX-05` | `config_readable` | Semantic owner: `BOX-05.config_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: Boolean true exactly when collaboration configuration was returned and parseable. |
+| `BOX-05` | `exempt_targets_readable` | Semantic owner: `BOX-05.exempt_targets_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: Boolean true exactly when allowlist exemption targets were returned and parseable. |
+| `BOX-05` | `complete` | Semantic owner: `BOX-05.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: For BOX-05, true only when allowlist entries and exempt targets are readable and untruncated; enterprise configuration readability is tracked separately. Exact source-state effects: `allowlist-entries`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `allowlist-exempt-targets`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: true only when allowlist entries and exempt targets are readable and untruncated; enterprise configuration readability is tracked separately. |
+| `BOX-05` | `external_collaboration_setting_value` | Semantic owner: `BOX-05.external_collaboration_setting_value`. Type/domain: string. Compared literal domain: "limit_collaboration_to_allowlisted_domains". Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: Raw Box external_collaboration_status value, retained without outcome translation. |
+| `BOX-05` | `allowlist_entry_count` | Semantic owner: `BOX-05.allowlist_entry_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: Non-negative cardinality of collaboration allowlist entries in the complete Box inventory at the verdict point. |
+| `BOX-05` | `public_domain_count` | Semantic owner: `BOX-05.public_domain_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_02_matches`. Portable meaning: Non-negative cardinality of public consumer-mail domains in the complete Box inventory at the verdict point. |
+| `BOX-05` | `stale_entry_count` | Semantic owner: `BOX-05.stale_entry_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: Non-negative cardinality of allowlist entries beyond the review age in the complete Box inventory at the verdict point. |
+| `BOX-05` | `undated_entry_count` | Semantic owner: `BOX-05.undated_entry_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: Non-negative cardinality of allowlist entries without dates in the complete Box inventory at the verdict point. |
+| `BOX-05` | `exempt_target_count` | Semantic owner: `BOX-05.exempt_target_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/collaboration_whitelist_entries` (allowlist-entries), `GET /2.0/collaboration_whitelist_exempt_targets` (allowlist-exempt-targets). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_05_branch_03_matches`. Portable meaning: Non-negative cardinality of allowlist exemption targets in the complete Box inventory at the verdict point. |
+| `BOX-06` | `settings_readable` | Semantic owner: `BOX-06.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_06_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-06` | `unused_setting_count` | Semantic owner: `BOX-06.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_06_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-06` | `shared_link_default_access` | Semantic owner: `BOX-06.shared_link_default_access`. Type/domain: string. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_06_branch_03_matches`, `box_06_branch_04_matches`, `box_06_branch_05_matches`. Portable meaning: Raw normalized default shared-link access. |
+| `BOX-06` | `shared_link_access` | Semantic owner: `BOX-06.shared_link_access`. Type/domain: string. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_06_branch_04_matches`, `box_06_branch_05_matches`. Portable meaning: Raw normalized maximum shared-link access. |
+| `BOX-07` | `settings_readable` | Semantic owner: `BOX-07.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_07_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-07` | `unused_setting_count` | Semantic owner: `BOX-07.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_07_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-07` | `expiration_enabled` | Semantic owner: `BOX-07.expiration_enabled`. Type/domain: boolean. Compared literal domain: false, true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_07_branch_03_matches`, `box_07_branch_05_matches`. Portable meaning: Boolean true exactly when shared-link expiration is enabled. |
+| `BOX-07` | `public_expiration_enabled` | Semantic owner: `BOX-07.public_expiration_enabled`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_07_branch_04_matches`. Portable meaning: Boolean true exactly when public-link expiration is enabled. |
+| `BOX-09` | `settings_readable` | Semantic owner: `BOX-09.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_09_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-09` | `unused_setting_count` | Semantic owner: `BOX-09.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_09_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-09` | `watermarking_enabled` | Semantic owner: `BOX-09.watermarking_enabled`. Type/domain: boolean. Compared literal domain: false, true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_09_branch_03_matches`, `box_09_branch_04_matches`. Portable meaning: Boolean true exactly when watermarking is enabled. |
+| `BOX-10` | `readable` | Semantic owner: `BOX-10.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprises/{enterpriseId}/device_pinners` (device-pinners). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_10_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Box response was collected and parseable. |
+| `BOX-10` | `complete` | Semantic owner: `BOX-10.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprises/{enterpriseId}/device_pinners` (device-pinners). Completeness/sample semantics: For BOX-10, true only when the device-pinner inventory is readable and untruncated. Exact source-state effects: `device-pinners`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_10_branch_01_matches`, `box_10_branch_02_matches`. Portable meaning: true only when the device-pinner inventory is readable and untruncated. |
+| `BOX-10` | `pin_count` | Semantic owner: `BOX-10.pin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprises/{enterpriseId}/device_pinners` (device-pinners). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_10_branch_01_matches`, `box_10_branch_02_matches`. Portable meaning: Non-negative cardinality of device pinners in the complete Box inventory at the verdict point. |
+| `BOX-11` | `readable` | Semantic owner: `BOX-11.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema` (classification-template), `GET /2.0/metadata_templates/enterprise` (metadata-templates). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_11_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Box response was collected and parseable. |
+| `BOX-11` | `classification_count` | Semantic owner: `BOX-11.classification_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/metadata_templates/enterprise/securityClassification-6VMVochwUWo/schema` (classification-template), `GET /2.0/metadata_templates/enterprise` (metadata-templates). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_11_branch_02_matches`, `box_11_branch_03_matches`. Portable meaning: Non-negative cardinality of security-classification options in the complete Box inventory at the verdict point. |
+| `BOX-12` | `policies_readable` | Semantic owner: `BOX-12.policies_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/retention_policies` (retention-policies), `GET /2.0/retention_policies/{policyId}/assignments` (retention-assignments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_12_branch_01_matches`. Portable meaning: Boolean true exactly when retention policies were returned and parseable. |
+| `BOX-12` | `assignments_readable` | Semantic owner: `BOX-12.assignments_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/retention_policies` (retention-policies), `GET /2.0/retention_policies/{policyId}/assignments` (retention-assignments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_12_branch_03_matches`. Portable meaning: Boolean true exactly when retention assignments were returned and parseable. |
+| `BOX-12` | `complete` | Semantic owner: `BOX-12.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/retention_policies` (retention-policies). Completeness/sample semantics: For BOX-12, true when the retention-policy inventory is untruncated; policy or assignment read errors and assignment truncation do not themselves change this fact. Exact source-state effects: `retention-policies`: false on truncated; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_12_branch_02_matches`, `box_12_branch_03_matches`. Portable meaning: true when the retention-policy inventory is untruncated; policy or assignment read errors and assignment truncation do not themselves change this fact. |
+| `BOX-12` | `active_policy_count` | Semantic owner: `BOX-12.active_policy_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/retention_policies` (retention-policies), `GET /2.0/retention_policies/{policyId}/assignments` (retention-assignments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_12_branch_02_matches`. Portable meaning: Non-negative cardinality of active retention policies in the complete Box inventory at the verdict point. |
+| `BOX-12` | `assigned_policy_count` | Semantic owner: `BOX-12.assigned_policy_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/retention_policies` (retention-policies), `GET /2.0/retention_policies/{policyId}/assignments` (retention-assignments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_12_branch_03_matches`, `box_12_branch_04_matches`. Portable meaning: Non-negative cardinality of active retention policies with assignments in the complete Box inventory at the verdict point. |
+| `BOX-13` | `policies_readable` | Semantic owner: `BOX-13.policies_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/legal_hold_policies` (legal-hold-policies), `GET /2.0/legal_hold_policy_assignments` (legal-hold-assignments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_13_branch_01_matches`. Portable meaning: Boolean true exactly when retention policies were returned and parseable. |
+| `BOX-13` | `assignments_readable` | Semantic owner: `BOX-13.assignments_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/legal_hold_policies` (legal-hold-policies), `GET /2.0/legal_hold_policy_assignments` (legal-hold-assignments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_13_branch_02_matches`. Portable meaning: Boolean true exactly when retention assignments were returned and parseable. |
+| `BOX-13` | `complete` | Semantic owner: `BOX-13.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/legal_hold_policies` (legal-hold-policies). Completeness/sample semantics: For BOX-13, true when the legal-hold policy inventory is untruncated; policy or assignment read errors and assignment truncation do not themselves change this fact. Exact source-state effects: `legal-hold-policies`: false on truncated; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_13_branch_02_matches`. Portable meaning: true when the legal-hold policy inventory is untruncated; policy or assignment read errors and assignment truncation do not themselves change this fact. |
+| `BOX-13` | `assigned_policy_count` | Semantic owner: `BOX-13.assigned_policy_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/legal_hold_policies` (legal-hold-policies), `GET /2.0/legal_hold_policy_assignments` (legal-hold-assignments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_13_branch_02_matches`, `box_13_branch_03_matches`. Portable meaning: Non-negative cardinality of active or applying legal-hold policies for which either the policy's assignment_counts fields or the legal-hold assignment inventory proves at least one custodian or content assignment. |
+| `BOX-14` | `settings_readable` | Semantic owner: `BOX-14.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/shield_lists` (shield-lists). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_14_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-14` | `shield_rule_count` | Semantic owner: `BOX-14.shield_rule_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration), `GET /2.0/shield_lists` (shield-lists). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_14_branch_02_matches`, `box_14_branch_03_matches`. Portable meaning: Non-negative cardinality of Shield access-policy rules in the complete Box inventory at the verdict point. |
+| `BOX-15` | `barriers_readable` | Semantic owner: `BOX-15.barriers_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/shield_information_barriers` (shield-barriers), `GET /2.0/shield_information_barrier_segments` (shield-barrier-segments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_15_branch_01_matches`. Portable meaning: Boolean true exactly when information barriers were returned and parseable. |
+| `BOX-15` | `segments_readable` | Semantic owner: `BOX-15.segments_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/shield_information_barriers` (shield-barriers), `GET /2.0/shield_information_barrier_segments` (shield-barrier-segments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_15_branch_02_matches`. Portable meaning: Boolean true exactly when barrier segments were returned and parseable. |
+| `BOX-15` | `enabled_with_segments_count` | Semantic owner: `BOX-15.enabled_with_segments_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/shield_information_barriers` (shield-barriers), `GET /2.0/shield_information_barrier_segments` (shield-barrier-segments). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_15_branch_03_matches`. Portable meaning: Non-negative cardinality of enabled barriers with at least two segments in the complete Box inventory at the verdict point. |
+| `BOX-16` | `events_readable` | Semantic owner: `BOX-16.events_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_16_branch_01_matches`. Portable meaning: Boolean true exactly when enterprise events were returned and parseable. |
+| `BOX-16` | `event_count` | Semantic owner: `BOX-16.event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_16_branch_02_matches`, `box_16_branch_03_matches`. Portable meaning: Non-negative cardinality of events in the requested lookback in the complete Box inventory at the verdict point. |
+| `BOX-17` | `users_readable` | Semantic owner: `BOX-17.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_17_branch_01_matches`. Portable meaning: Boolean true exactly when the enterprise user inventory was returned and parseable. |
+| `BOX-17` | `users_truncated` | Semantic owner: `BOX-17.users_truncated`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_17_branch_02_matches`. Portable meaning: Boolean true exactly when the user inventory stopped before exhaustion. |
+| `BOX-17` | `user_count` | Semantic owner: `BOX-17.user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_17_branch_02_matches`. Portable meaning: Non-negative cardinality of enterprise users in the complete Box inventory at the verdict point. |
+| `BOX-17` | `admin_count` | Semantic owner: `BOX-17.admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_17_branch_02_matches`. Portable meaning: Non-negative cardinality of administrators in the complete Box inventory at the verdict point. |
+| `BOX-17` | `privileged_user_count` | Semantic owner: `BOX-17.privileged_user_count`. Type/domain: number. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_17_branch_02_matches`, `box_17_branch_03_matches`. Portable meaning: Non-negative cardinality of administrators and co-administrators in the complete Box inventory at the verdict point. |
+| `BOX-17` | `max_admins` | Semantic owner: `BOX-17.max_admins`. Type/domain: number. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_17_branch_02_matches`, `box_17_branch_03_matches`. Portable meaning: Operator maximum accepted administrator count. |
+| `BOX-18` | `users_readable` | Semantic owner: `BOX-18.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_18_branch_01_matches`. Portable meaning: Boolean true exactly when the enterprise user inventory was returned and parseable. |
+| `BOX-18` | `users_truncated` | Semantic owner: `BOX-18.users_truncated`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_18_branch_02_matches`. Portable meaning: Boolean true exactly when the user inventory stopped before exhaustion. |
+| `BOX-18` | `user_count` | Semantic owner: `BOX-18.user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_18_branch_02_matches`. Portable meaning: Non-negative cardinality of enterprise users in the complete Box inventory at the verdict point. |
+| `BOX-18` | `admin_count` | Semantic owner: `BOX-18.admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_18_branch_02_matches`. Portable meaning: Non-negative cardinality of administrators in the complete Box inventory at the verdict point. |
+| `BOX-18` | `coadmin_count` | Semantic owner: `BOX-18.coadmin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_18_branch_01_matches`, `box_18_branch_03_matches`. Portable meaning: Non-negative cardinality of co-administrators in the complete Box inventory at the verdict point. |
+| `BOX-20` | `terms_readable` | Semantic owner: `BOX-20.terms_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/terms_of_services` (terms-of-service). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_20_branch_01_matches`. Portable meaning: Boolean true exactly when terms-of-service records were returned and parseable. |
+| `BOX-20` | `enabled_managed_term_count` | Semantic owner: `BOX-20.enabled_managed_term_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/terms_of_services` (terms-of-service). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_20_branch_02_matches`, `box_20_branch_03_matches`. Portable meaning: Non-negative cardinality of enabled managed terms in the complete Box inventory at the verdict point. |
+| `BOX-21` | `settings_readable` | Semantic owner: `BOX-21.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_21_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-21` | `unused_setting_count` | Semantic owner: `BOX-21.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_21_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-21` | `minimum_length` | Semantic owner: `BOX-21.minimum_length`. Type/domain: number. Compared literal domain: 8. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_21_branch_03_matches`, `box_21_branch_04_matches`, `box_21_branch_05_matches`, `box_21_branch_06_matches`. Portable meaning: Configured minimum password length in characters. |
+| `BOX-21` | `required_minimum_length` | Semantic owner: `BOX-21.required_minimum_length`. Type/domain: number. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_21_branch_04_matches`, `box_21_branch_05_matches`. Portable meaning: Preferred minimum password length in characters. |
+| `BOX-21` | `weak_password_prevention` | Semantic owner: `BOX-21.weak_password_prevention`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_21_branch_04_matches`, `box_21_branch_05_matches`, `box_21_branch_07_matches`. Portable meaning: Boolean true exactly when weak-password prevention is enabled. |
+| `BOX-21` | `complexity_rule_count` | Semantic owner: `BOX-21.complexity_rule_count`. Type/domain: number. Compared literal domain: 2. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_21_branch_04_matches`, `box_21_branch_05_matches`, `box_21_branch_07_matches`. Portable meaning: Non-negative cardinality of enabled password character-class requirements in the complete Box inventory at the verdict point. |
+| `BOX-22` | `settings_readable` | Semantic owner: `BOX-22.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_01_matches`. Portable meaning: Boolean true exactly when the relevant enterprise configuration category was present and parseable. |
+| `BOX-22` | `unused_setting_count` | Semantic owner: `BOX-22.unused_setting_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_02_matches`. Portable meaning: Non-negative cardinality of returned configuration keys not mapped to an enforced setting in the complete Box inventory at the verdict point. |
+| `BOX-22` | `session_duration_value` | Semantic owner: `BOX-22.session_duration_value`. Type/domain: string. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_02_matches`. Portable meaning: Raw enterprise session-duration string before unit parsing. |
+| `BOX-22` | `session_hours` | Semantic owner: `BOX-22.session_hours`. Type/domain: number. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_02_matches`, `box_22_branch_03_matches`. Portable meaning: Enterprise session duration converted to hours only for a recognized unit. |
+| `BOX-22` | `custom_session_enabled` | Semantic owner: `BOX-22.custom_session_enabled`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_04_matches`. Portable meaning: Boolean true exactly when custom group session duration is enabled. |
+| `BOX-22` | `custom_session_duration_value` | Semantic owner: `BOX-22.custom_session_duration_value`. Type/domain: string. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_05_matches`. Portable meaning: Raw custom session-duration string before unit parsing. |
+| `BOX-22` | `custom_session_hours` | Semantic owner: `BOX-22.custom_session_hours`. Type/domain: number. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_05_matches`, `box_22_branch_06_matches`, `box_22_branch_07_matches`. Portable meaning: Custom session duration converted to hours only for a recognized unit. |
+| `BOX-22` | `max_session_hours` | Semantic owner: `BOX-22.max_session_hours`. Type/domain: number. Source/owner: Box collector projection from `GET /2.0/enterprise_configurations/{enterpriseId}` (enterprise-configuration). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_22_branch_03_matches`, `box_22_branch_06_matches`, `box_22_branch_07_matches`. Portable meaning: Maximum accepted session duration in hours. |
+| `BOX-24` | `users_readable` | Semantic owner: `BOX-24.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_01_matches`. Portable meaning: Boolean true exactly when the enterprise user inventory was returned and parseable. |
+| `BOX-24` | `events_readable` | Semantic owner: `BOX-24.events_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_01_matches`. Portable meaning: Boolean true exactly when enterprise events were returned and parseable. |
+| `BOX-24` | `users_truncated` | Semantic owner: `BOX-24.users_truncated`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_02_matches`. Portable meaning: Boolean true exactly when the user inventory stopped before exhaustion. |
+| `BOX-24` | `user_count` | Semantic owner: `BOX-24.user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_02_matches`. Portable meaning: Non-negative cardinality of enterprise users in the complete Box inventory at the verdict point. |
+| `BOX-24` | `admin_count` | Semantic owner: `BOX-24.admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_02_matches`. Portable meaning: Non-negative cardinality of administrators in the complete Box inventory at the verdict point. |
+| `BOX-24` | `events_truncated` | Semantic owner: `BOX-24.events_truncated`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_02_matches`. Portable meaning: Boolean true exactly when event pagination stopped before exhaustion. |
+| `BOX-24` | `active_user_count` | Semantic owner: `BOX-24.active_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_02_matches`, `box_24_branch_04_matches`. Portable meaning: Non-negative cardinality of active human users in the complete Box inventory at the verdict point. |
+| `BOX-24` | `inactive_user_count` | Semantic owner: `BOX-24.inactive_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/users` (users), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_24_branch_03_matches`, `box_24_branch_04_matches`, `box_24_branch_05_matches`. Portable meaning: Non-negative cardinality of active users without successful lookback activity in the complete Box inventory at the verdict point. |
+| `BOX-25` | `shield_settings_readable` | Semantic owner: `BOX-25.shield_settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/shield_lists` (shield-lists), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_25_branch_01_matches`, `box_25_branch_04_matches`. Portable meaning: Boolean true exactly when Shield settings were returned and parseable. |
+| `BOX-25` | `configuration_readable` | Semantic owner: `BOX-25.configuration_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/shield_lists` (shield-lists), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_25_branch_02_matches`. Portable meaning: Boolean true exactly when enterprise configuration was returned and parseable. |
+| `BOX-25` | `events_readable` | Semantic owner: `BOX-25.events_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/shield_lists` (shield-lists), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_25_branch_01_matches`, `box_25_branch_02_matches`. Portable meaning: Boolean true exactly when enterprise events were returned and parseable. |
+| `BOX-25` | `events_complete` | Semantic owner: `BOX-25.events_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Box collector projection from `GET /2.0/events` (events). Completeness/sample semantics: For BOX-25, true only when the enterprise-event inventory is readable and untruncated; Shield-list and enterprise-configuration reads do not contribute. Exact source-state effects: `events`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_25_branch_04_matches`. Portable meaning: true only when the enterprise-event inventory is readable and untruncated; Shield-list and enterprise-configuration reads do not contribute. |
+| `BOX-25` | `anomaly_rule_count` | Semantic owner: `BOX-25.anomaly_rule_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/shield_lists` (shield-lists), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_25_branch_03_matches`. Portable meaning: Non-negative cardinality of Shield anomaly rules in the complete Box inventory at the verdict point. |
+| `BOX-25` | `anomaly_event_count` | Semantic owner: `BOX-25.anomaly_event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/shield_lists` (shield-lists), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_25_branch_03_matches`. Portable meaning: Non-negative cardinality of Shield alert or block events in the complete Box inventory at the verdict point. |
+| `BOX-25` | `access_event_count` | Semantic owner: `BOX-25.access_event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Box collector projection from `GET /2.0/shield_lists` (shield-lists), `GET /2.0/events` (events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `box_25_branch_04_matches`. Portable meaning: Non-negative cardinality of ordinary content-access events in the complete Box inventory at the verdict point. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+A `matches` condition performs a regular-expression search; anchors are required for whole-value matching, and an `i` flag requests case-insensitive matching. A `ratio` condition divides the numerator by the denominator, applies the declared scale, and rounds to the declared decimal places by choosing the nearest value with exact half cases rounded toward positive infinity; a zero, null, or missing denominator does not match.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `BOX-01` | 1 | manual | `box_01_branch_01_matches` equals true |  |
+| `BOX-01` | 2 | warn | `box_01_branch_02_matches` equals true |  |
+| `BOX-01` | 3 | fail | `box_01_branch_03_matches` equals true |  |
+| `BOX-01` | 4 | warn | `box_01_branch_04_matches` equals true |  |
+| `BOX-01` | 5 | pass | `box_01_branch_05_matches` equals true |  |
+| `BOX-01` | 6 | manual | `box_01_branch_06_matches` equals true |  |
+| `BOX-02` | 1 | manual | `box_02_branch_01_matches` equals true |  |
+| `BOX-02` | 2 | warn | `box_02_branch_02_matches` equals true |  |
+| `BOX-02` | 3 | fail | `box_02_branch_03_matches` equals true |  |
+| `BOX-02` | 4 | warn | `box_02_branch_04_matches` equals true |  |
+| `BOX-02` | 5 | pass | `box_02_branch_05_matches` equals true |  |
+| `BOX-02` | 6 | manual | `box_02_branch_06_matches` equals true |  |
+| `BOX-03` | 1 | manual | `box_03_branch_01_matches` equals true |  |
+| `BOX-03` | 2 | warn | `box_03_branch_02_matches` equals true |  |
+| `BOX-03` | 3 | fail | `box_03_branch_03_matches` equals true |  |
+| `BOX-03` | 4 | warn | `box_03_branch_04_matches` equals true |  |
+| `BOX-03` | 5 | pass | `box_03_branch_05_matches` equals true |  |
+| `BOX-03` | 6 | manual | `box_03_branch_06_matches` equals true |  |
+| `BOX-04` | 1 | manual | `box_04_branch_01_matches` equals true |  |
+| `BOX-04` | 2 | warn | `box_04_branch_02_matches` equals true |  |
+| `BOX-04` | 3 | fail | `box_04_branch_03_matches` equals true |  |
+| `BOX-04` | 4 | warn | `box_04_branch_04_matches` equals true |  |
+| `BOX-04` | 5 | pass | `box_04_branch_05_matches` equals true |  |
+| `BOX-04` | 6 | manual | `box_04_branch_06_matches` equals true |  |
+| `BOX-05` | 1 | manual | `box_05_branch_01_matches` equals true |  |
+| `BOX-05` | 2 | fail | `box_05_branch_02_matches` equals true |  |
+| `BOX-05` | 3 | warn | `box_05_branch_03_matches` equals true |  |
+| `BOX-05` | 4 | pass | `box_05_branch_04_matches` equals true |  |
+| `BOX-06` | 1 | manual | `box_06_branch_01_matches` equals true |  |
+| `BOX-06` | 2 | warn | `box_06_branch_02_matches` equals true |  |
+| `BOX-06` | 3 | fail | `box_06_branch_03_matches` equals true |  |
+| `BOX-06` | 4 | warn | `box_06_branch_04_matches` equals true |  |
+| `BOX-06` | 5 | pass | `box_06_branch_05_matches` equals true |  |
+| `BOX-06` | 6 | manual | `box_06_branch_06_matches` equals true |  |
+| `BOX-07` | 1 | manual | `box_07_branch_01_matches` equals true |  |
+| `BOX-07` | 2 | warn | `box_07_branch_02_matches` equals true |  |
+| `BOX-07` | 3 | pass | `box_07_branch_03_matches` equals true |  |
+| `BOX-07` | 4 | warn | `box_07_branch_04_matches` equals true |  |
+| `BOX-07` | 5 | fail | `box_07_branch_05_matches` equals true |  |
+| `BOX-07` | 6 | warn | `box_07_branch_06_matches` equals true |  |
+| `BOX-08` | 1 | manual | `box_08_branch_01_matches` equals true |  |
+| `BOX-09` | 1 | manual | `box_09_branch_01_matches` equals true |  |
+| `BOX-09` | 2 | warn | `box_09_branch_02_matches` equals true |  |
+| `BOX-09` | 3 | pass | `box_09_branch_03_matches` equals true |  |
+| `BOX-09` | 4 | fail | `box_09_branch_04_matches` equals true |  |
+| `BOX-09` | 5 | warn | `box_09_branch_05_matches` equals true |  |
+| `BOX-10` | 1 | manual | `box_10_branch_01_matches` equals true |  |
+| `BOX-10` | 2 | warn | `box_10_branch_02_matches` equals true |  |
+| `BOX-10` | 3 | manual | `box_10_branch_03_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-11` | 1 | manual | `box_11_branch_01_matches` equals true |  |
+| `BOX-11` | 2 | fail | `box_11_branch_02_matches` equals true |  |
+| `BOX-11` | 3 | pass | `box_11_branch_03_matches` equals true |  |
+| `BOX-11` | 4 | manual | `box_11_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-12` | 1 | manual | `box_12_branch_01_matches` equals true |  |
+| `BOX-12` | 2 | fail | `box_12_branch_02_matches` equals true |  |
+| `BOX-12` | 3 | warn | `box_12_branch_03_matches` equals true |  |
+| `BOX-12` | 4 | pass | `box_12_branch_04_matches` equals true |  |
+| `BOX-12` | 5 | manual | `box_12_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-13` | 1 | manual | `box_13_branch_01_matches` equals true |  |
+| `BOX-13` | 2 | warn | `box_13_branch_02_matches` equals true |  |
+| `BOX-13` | 3 | pass | `box_13_branch_03_matches` equals true |  |
+| `BOX-13` | 4 | manual | `box_13_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-14` | 1 | manual | `box_14_branch_01_matches` equals true |  |
+| `BOX-14` | 2 | fail | `box_14_branch_02_matches` equals true |  |
+| `BOX-14` | 3 | pass | `box_14_branch_03_matches` equals true |  |
+| `BOX-14` | 4 | manual | `box_14_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-15` | 1 | manual | `box_15_branch_01_matches` equals true |  |
+| `BOX-15` | 2 | warn | `box_15_branch_02_matches` equals true |  |
+| `BOX-15` | 3 | pass | `box_15_branch_03_matches` equals true |  |
+| `BOX-15` | 4 | warn | `box_15_branch_04_matches` equals true |  |
+| `BOX-16` | 1 | manual | `box_16_branch_01_matches` equals true |  |
+| `BOX-16` | 2 | warn | `box_16_branch_02_matches` equals true |  |
+| `BOX-16` | 3 | pass | `box_16_branch_03_matches` equals true |  |
+| `BOX-16` | 4 | manual | `box_16_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-17` | 1 | manual | `box_17_branch_01_matches` equals true |  |
+| `BOX-17` | 2 | warn | `box_17_branch_02_matches` equals true |  |
+| `BOX-17` | 3 | pass | `box_17_branch_03_matches` equals true |  |
+| `BOX-17` | 4 | manual | `box_17_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-18` | 1 | manual | `box_18_branch_01_matches` equals true |  |
+| `BOX-18` | 2 | warn | `box_18_branch_02_matches` equals true |  |
+| `BOX-18` | 3 | pass | `box_18_branch_03_matches` equals true |  |
+| `BOX-18` | 4 | manual | `box_18_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-19` | 1 | manual | `box_19_branch_01_matches` equals true |  |
+| `BOX-20` | 1 | manual | `box_20_branch_01_matches` equals true |  |
+| `BOX-20` | 2 | fail | `box_20_branch_02_matches` equals true |  |
+| `BOX-20` | 3 | pass | `box_20_branch_03_matches` equals true |  |
+| `BOX-20` | 4 | manual | `box_20_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `BOX-21` | 1 | manual | `box_21_branch_01_matches` equals true |  |
+| `BOX-21` | 2 | warn | `box_21_branch_02_matches` equals true |  |
+| `BOX-21` | 3 | warn | `box_21_branch_03_matches` equals true |  |
+| `BOX-21` | 4 | pass | `box_21_branch_04_matches` equals true |  |
+| `BOX-21` | 5 | warn | `box_21_branch_05_matches` equals true |  |
+| `BOX-21` | 6 | fail | `box_21_branch_06_matches` equals true |  |
+| `BOX-21` | 7 | warn | `box_21_branch_07_matches` equals true |  |
+| `BOX-21` | 8 | manual | `box_21_branch_08_matches` equals true |  |
+| `BOX-22` | 1 | manual | `box_22_branch_01_matches` equals true |  |
+| `BOX-22` | 2 | warn | `box_22_branch_02_matches` equals true |  |
+| `BOX-22` | 3 | fail | `box_22_branch_03_matches` equals true |  |
+| `BOX-22` | 4 | pass | `box_22_branch_04_matches` equals true |  |
+| `BOX-22` | 5 | warn | `box_22_branch_05_matches` equals true |  |
+| `BOX-22` | 6 | pass | `box_22_branch_06_matches` equals true |  |
+| `BOX-22` | 7 | fail | `box_22_branch_07_matches` equals true |  |
+| `BOX-22` | 8 | manual | `box_22_branch_08_matches` equals true |  |
+| `BOX-23` | 1 | manual | `box_23_branch_01_matches` equals true |  |
+| `BOX-24` | 1 | manual | `box_24_branch_01_matches` equals true |  |
+| `BOX-24` | 2 | warn | `box_24_branch_02_matches` equals true |  |
+| `BOX-24` | 3 | pass | `box_24_branch_03_matches` equals true |  |
+| `BOX-24` | 4 | fail | `box_24_branch_04_matches` equals true |  |
+| `BOX-24` | 5 | warn | `box_24_branch_05_matches` equals true |  |
+| `BOX-24` | 6 | manual | `box_24_branch_06_matches` equals true |  |
+| `BOX-25` | 1 | manual | `box_25_branch_01_matches` equals true |  |
+| `BOX-25` | 2 | warn | `box_25_branch_02_matches` equals true |  |
+| `BOX-25` | 3 | pass | `box_25_branch_03_matches` equals true |  |
+| `BOX-25` | 4 | warn | `box_25_branch_04_matches` equals true |  |
+| `BOX-25` | 5 | fail | `box_25_branch_05_matches` equals true |  |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `BOX-01` | `box_01_branch_01_matches` | BOX-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `settings_readable` does not equal true. |
+| `BOX-01` | `box_01_branch_02_matches` | BOX-01 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-01` | `box_01_branch_03_matches` | BOX-01 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: `sso_required` equals false. |
+| `BOX-01` | `box_01_branch_04_matches` | BOX-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`sso_required` does not equal true; `sso_testing` equals true). |
+| `BOX-01` | `box_01_branch_05_matches` | BOX-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`sso_required` equals true; `sso_testing` does not equal true). |
+| `BOX-01` | `box_01_branch_06_matches` | BOX-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-02` | `box_02_branch_01_matches` | BOX-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`settings_readable` does not equal true; `users_readable` does not equal true). |
+| `BOX-02` | `box_02_branch_02_matches` | BOX-02 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-02` | `box_02_branch_03_matches` | BOX-02 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: any of (all of (`mfa_required` equals true; `exempt_privileged_count` is greater than 0); all of (`mfa_required` equals false; `sso_required` does not equal true)). |
+| `BOX-02` | `box_02_branch_04_matches` | BOX-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`mfa_required` does not equal true; `users_truncated` equals true; `user_count` equals 0; `admin_count` equals 0). |
+| `BOX-02` | `box_02_branch_05_matches` | BOX-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`mfa_required` equals true; `exempt_privileged_count` equals 0; `users_truncated` does not equal true; `user_count` is greater than 0; `admin_count` is greater than 0). |
+| `BOX-02` | `box_02_branch_06_matches` | BOX-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-03` | `box_03_branch_01_matches` | BOX-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`settings_readable` does not equal true; `users_readable` does not equal true). |
+| `BOX-03` | `box_03_branch_02_matches` | BOX-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-03` | `box_03_branch_03_matches` | BOX-03 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`mfa_required` equals false; `sso_required` does not equal true). |
+| `BOX-03` | `box_03_branch_04_matches` | BOX-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`mfa_required` does not equal true; `exempt_user_count` is greater than 0; `users_truncated` equals true; `user_count` equals 0; `admin_count` equals 0). |
+| `BOX-03` | `box_03_branch_05_matches` | BOX-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`mfa_required` equals true; `exempt_user_count` equals 0; `users_truncated` does not equal true; `user_count` is greater than 0; `admin_count` is greater than 0). |
+| `BOX-03` | `box_03_branch_06_matches` | BOX-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-04` | `box_04_branch_01_matches` | BOX-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: all of (`settings_readable` does not equal true; any of (`allowlist_readable` does not equal true; `allowlist_entry_count` equals 0)). |
+| `BOX-04` | `box_04_branch_02_matches` | BOX-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-04` | `box_04_branch_03_matches` | BOX-04 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: `external_collaboration_setting_value` equals "enable_external_collaboration". |
+| `BOX-04` | `box_04_branch_04_matches` | BOX-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`settings_readable` does not equal true; `allowlist_readable` does not equal true; all of (`external_collaboration_setting_value` equals "limit_collaboration_to_allowlisted_domains"; `allowlist_entry_count` equals 0); all of (`external_collaboration_setting_value` does not equal "limit_collaboration_to_users_within_enterprise"; `external_collaboration_setting_value` does not equal "limit_collaboration_to_allowlisted_domains")). |
+| `BOX-04` | `box_04_branch_05_matches` | BOX-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: any of (`external_collaboration_setting_value` equals "limit_collaboration_to_users_within_enterprise"; all of (`external_collaboration_setting_value` equals "limit_collaboration_to_allowlisted_domains"; `allowlist_entry_count` is greater than 0)). |
+| `BOX-04` | `box_04_branch_06_matches` | BOX-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-05` | `box_05_branch_01_matches` | BOX-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `allowlist_readable` does not equal true. |
+| `BOX-05` | `box_05_branch_02_matches` | BOX-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `public_domain_count` is greater than 0. |
+| `BOX-05` | `box_05_branch_03_matches` | BOX-05 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `config_readable` does not equal true; `exempt_targets_readable` does not equal true; all of (`allowlist_entry_count` equals 0; `external_collaboration_setting_value` equals "limit_collaboration_to_allowlisted_domains"); `stale_entry_count` is greater than 0; `undated_entry_count` is greater than 0; all of (`allowlist_entry_count` is greater than 0; `exempt_target_count` is greater than 0)). |
+| `BOX-05` | `box_05_branch_04_matches` | BOX-05 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-06` | `box_06_branch_01_matches` | BOX-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `settings_readable` does not equal true. |
+| `BOX-06` | `box_06_branch_02_matches` | BOX-06 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-06` | `box_06_branch_03_matches` | BOX-06 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: `shared_link_default_access` matches portable regular expression `open\|public\|anyone` with flags `i`. |
+| `BOX-06` | `box_06_branch_04_matches` | BOX-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (not (`shared_link_default_access` matches portable regular expression `company\|collaborators\|enterprise\|people_in\|invited` with flags `i`); `shared_link_access` matches portable regular expression `open\|public\|anyone` with flags `i`). |
+| `BOX-06` | `box_06_branch_05_matches` | BOX-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`shared_link_default_access` matches portable regular expression `company\|collaborators\|enterprise\|people_in\|invited` with flags `i`; not (`shared_link_access` matches portable regular expression `open\|public\|anyone` with flags `i`)). |
+| `BOX-06` | `box_06_branch_06_matches` | BOX-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-07` | `box_07_branch_01_matches` | BOX-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `settings_readable` does not equal true. |
+| `BOX-07` | `box_07_branch_02_matches` | BOX-07 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-07` | `box_07_branch_03_matches` | BOX-07 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `expiration_enabled` equals true. |
+| `BOX-07` | `box_07_branch_04_matches` | BOX-07 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: `public_expiration_enabled` equals true. |
+| `BOX-07` | `box_07_branch_05_matches` | BOX-07 ordered branch 5 (fail) is true exactly when its portable evidence condition matches. Computed as: `expiration_enabled` equals false. |
+| `BOX-07` | `box_07_branch_06_matches` | BOX-07 ordered branch 6 (warn) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-08` | `box_08_branch_01_matches` | BOX-08 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-09` | `box_09_branch_01_matches` | BOX-09 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `settings_readable` does not equal true. |
+| `BOX-09` | `box_09_branch_02_matches` | BOX-09 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-09` | `box_09_branch_03_matches` | BOX-09 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `watermarking_enabled` equals true. |
+| `BOX-09` | `box_09_branch_04_matches` | BOX-09 ordered branch 4 (fail) is true exactly when its portable evidence condition matches. Computed as: `watermarking_enabled` equals false. |
+| `BOX-09` | `box_09_branch_05_matches` | BOX-09 ordered branch 5 (warn) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-10` | `box_10_branch_01_matches` | BOX-10 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `pin_count` is greater than 0; all of (`complete` does not equal true; `pin_count` equals 0)). |
+| `BOX-10` | `box_10_branch_02_matches` | BOX-10 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`complete` equals true; `pin_count` equals 0). |
+| `BOX-10` | `box_10_branch_03_matches` | BOX-10 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-11` | `box_11_branch_01_matches` | BOX-11 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `BOX-11` | `box_11_branch_02_matches` | BOX-11 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `classification_count` equals 0. |
+| `BOX-11` | `box_11_branch_03_matches` | BOX-11 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `classification_count` is greater than 0. |
+| `BOX-11` | `box_11_branch_04_matches` | BOX-11 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-12` | `box_12_branch_01_matches` | BOX-12 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `policies_readable` does not equal true. |
+| `BOX-12` | `box_12_branch_02_matches` | BOX-12 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`complete` equals true; `active_policy_count` equals 0). |
+| `BOX-12` | `box_12_branch_03_matches` | BOX-12 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `assignments_readable` does not equal true; `assigned_policy_count` equals 0). |
+| `BOX-12` | `box_12_branch_04_matches` | BOX-12 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `assigned_policy_count` is greater than 0. |
+| `BOX-12` | `box_12_branch_05_matches` | BOX-12 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-13` | `box_13_branch_01_matches` | BOX-13 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `policies_readable` does not equal true. |
+| `BOX-13` | `box_13_branch_02_matches` | BOX-13 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `assignments_readable` does not equal true; `assigned_policy_count` equals 0). |
+| `BOX-13` | `box_13_branch_03_matches` | BOX-13 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `assigned_policy_count` is greater than 0. |
+| `BOX-13` | `box_13_branch_04_matches` | BOX-13 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-14` | `box_14_branch_01_matches` | BOX-14 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `settings_readable` does not equal true. |
+| `BOX-14` | `box_14_branch_02_matches` | BOX-14 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `shield_rule_count` equals 0. |
+| `BOX-14` | `box_14_branch_03_matches` | BOX-14 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `shield_rule_count` is greater than 0. |
+| `BOX-14` | `box_14_branch_04_matches` | BOX-14 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-15` | `box_15_branch_01_matches` | BOX-15 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `barriers_readable` does not equal true. |
+| `BOX-15` | `box_15_branch_02_matches` | BOX-15 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `segments_readable` does not equal true. |
+| `BOX-15` | `box_15_branch_03_matches` | BOX-15 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `enabled_with_segments_count` is greater than 0. |
+| `BOX-15` | `box_15_branch_04_matches` | BOX-15 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-16` | `box_16_branch_01_matches` | BOX-16 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `events_readable` does not equal true. |
+| `BOX-16` | `box_16_branch_02_matches` | BOX-16 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `event_count` equals 0. |
+| `BOX-16` | `box_16_branch_03_matches` | BOX-16 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `event_count` is greater than 0. |
+| `BOX-16` | `box_16_branch_04_matches` | BOX-16 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-17` | `box_17_branch_01_matches` | BOX-17 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `BOX-17` | `box_17_branch_02_matches` | BOX-17 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`users_truncated` equals true; `user_count` equals 0; `admin_count` equals 0; `privileged_user_count` is greater than `max_admins`). |
+| `BOX-17` | `box_17_branch_03_matches` | BOX-17 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `privileged_user_count` is at most `max_admins`. |
+| `BOX-17` | `box_17_branch_04_matches` | BOX-17 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-18` | `box_18_branch_01_matches` | BOX-18 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`users_readable` does not equal true; `coadmin_count` is greater than 0). |
+| `BOX-18` | `box_18_branch_02_matches` | BOX-18 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`users_truncated` equals true; `user_count` equals 0; `admin_count` equals 0). |
+| `BOX-18` | `box_18_branch_03_matches` | BOX-18 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `coadmin_count` equals 0. |
+| `BOX-18` | `box_18_branch_04_matches` | BOX-18 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-19` | `box_19_branch_01_matches` | BOX-19 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-20` | `box_20_branch_01_matches` | BOX-20 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `terms_readable` does not equal true. |
+| `BOX-20` | `box_20_branch_02_matches` | BOX-20 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `enabled_managed_term_count` equals 0. |
+| `BOX-20` | `box_20_branch_03_matches` | BOX-20 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `enabled_managed_term_count` is greater than 0. |
+| `BOX-20` | `box_20_branch_04_matches` | BOX-20 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-21` | `box_21_branch_01_matches` | BOX-21 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `settings_readable` does not equal true. |
+| `BOX-21` | `box_21_branch_02_matches` | BOX-21 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `unused_setting_count` is greater than 0. |
+| `BOX-21` | `box_21_branch_03_matches` | BOX-21 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: not (`minimum_length` is present and non-null). |
+| `BOX-21` | `box_21_branch_04_matches` | BOX-21 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`minimum_length` is at least `required_minimum_length`; `weak_password_prevention` equals true; `complexity_rule_count` is at least 2). |
+| `BOX-21` | `box_21_branch_05_matches` | BOX-21 ordered branch 5 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (not (`minimum_length` is present and non-null); all of (`minimum_length` is at least 8; any of (`minimum_length` is less than `required_minimum_length`; `weak_password_prevention` does not equal true; `complexity_rule_count` is less than 2))). |
+| `BOX-21` | `box_21_branch_06_matches` | BOX-21 ordered branch 6 (fail) is true exactly when its portable evidence condition matches. Computed as: `minimum_length` is less than 8. |
+| `BOX-21` | `box_21_branch_07_matches` | BOX-21 ordered branch 7 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`weak_password_prevention` does not equal true; `complexity_rule_count` is less than 2). |
+| `BOX-21` | `box_21_branch_08_matches` | BOX-21 ordered branch 8 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-22` | `box_22_branch_01_matches` | BOX-22 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `settings_readable` does not equal true. |
+| `BOX-22` | `box_22_branch_02_matches` | BOX-22 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`unused_setting_count` is greater than 0; not (`session_duration_value` is present and non-null); not (`session_hours` is present and non-null)). |
+| `BOX-22` | `box_22_branch_03_matches` | BOX-22 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: `session_hours` is greater than `max_session_hours`. |
+| `BOX-22` | `box_22_branch_04_matches` | BOX-22 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `custom_session_enabled` does not equal true. |
+| `BOX-22` | `box_22_branch_05_matches` | BOX-22 ordered branch 5 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (not (`custom_session_duration_value` is present and non-null); not (`custom_session_hours` is present and non-null)). |
+| `BOX-22` | `box_22_branch_06_matches` | BOX-22 ordered branch 6 (pass) is true exactly when its portable evidence condition matches. Computed as: `custom_session_hours` is at most `max_session_hours`. |
+| `BOX-22` | `box_22_branch_07_matches` | BOX-22 ordered branch 7 (fail) is true exactly when its portable evidence condition matches. Computed as: `custom_session_hours` is greater than `max_session_hours`. |
+| `BOX-22` | `box_22_branch_08_matches` | BOX-22 ordered branch 8 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-23` | `box_23_branch_01_matches` | BOX-23 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-24` | `box_24_branch_01_matches` | BOX-24 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`users_readable` does not equal true; `events_readable` does not equal true). |
+| `BOX-24` | `box_24_branch_02_matches` | BOX-24 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`users_truncated` equals true; `user_count` equals 0; `admin_count` equals 0; `events_truncated` equals true; `active_user_count` equals 0). |
+| `BOX-24` | `box_24_branch_03_matches` | BOX-24 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `inactive_user_count` equals 0. |
+| `BOX-24` | `box_24_branch_04_matches` | BOX-24 ordered branch 4 (fail) is true exactly when its portable evidence condition matches. Computed as: `inactive_user_count` divided by `active_user_count` is greater than 0.25; a missing, nonnumeric, or nonpositive denominator does not match. |
+| `BOX-24` | `box_24_branch_05_matches` | BOX-24 ordered branch 5 (warn) is true exactly when its portable evidence condition matches. Computed as: `inactive_user_count` is greater than 0. |
+| `BOX-24` | `box_24_branch_06_matches` | BOX-24 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `BOX-25` | `box_25_branch_01_matches` | BOX-25 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: all of (`shield_settings_readable` does not equal true; `events_readable` does not equal true). |
+| `BOX-25` | `box_25_branch_02_matches` | BOX-25 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`configuration_readable` does not equal true; `events_readable` does not equal true). |
+| `BOX-25` | `box_25_branch_03_matches` | BOX-25 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: any of (`anomaly_rule_count` is greater than 0; `anomaly_event_count` is greater than 0). |
+| `BOX-25` | `box_25_branch_04_matches` | BOX-25 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`shield_settings_readable` does not equal true; `access_event_count` is greater than 0; `events_complete` does not equal true). |
+| `BOX-25` | `box_25_branch_05_matches` | BOX-25 ordered branch 5 (fail) is true exactly when its portable evidence condition matches. Computed as: always. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `BOX-01` | `requiredEvidenceReadable` | true |
+| `BOX-01` | `requiredEvidenceComplete` | true |
+| `BOX-02` | `requiredEvidenceReadable` | true |
+| `BOX-02` | `requiredEvidenceComplete` | true |
+| `BOX-03` | `requiredEvidenceReadable` | true |
+| `BOX-03` | `requiredEvidenceComplete` | true |
+| `BOX-04` | `requiredEvidenceReadable` | true |
+| `BOX-04` | `requiredEvidenceComplete` | true |
+| `BOX-05` | `requiredEvidenceReadable` | true |
+| `BOX-05` | `requiredEvidenceComplete` | true |
+| `BOX-06` | `requiredEvidenceReadable` | true |
+| `BOX-06` | `requiredEvidenceComplete` | true |
+| `BOX-07` | `requiredEvidenceReadable` | true |
+| `BOX-07` | `requiredEvidenceComplete` | true |
+| `BOX-08` | `requiredEvidenceReadable` | true |
+| `BOX-08` | `requiredEvidenceComplete` | true |
+| `BOX-09` | `requiredEvidenceReadable` | true |
+| `BOX-09` | `requiredEvidenceComplete` | true |
+| `BOX-10` | `requiredEvidenceReadable` | true |
+| `BOX-10` | `requiredEvidenceComplete` | true |
+| `BOX-11` | `requiredEvidenceReadable` | true |
+| `BOX-11` | `requiredEvidenceComplete` | true |
+| `BOX-12` | `requiredEvidenceReadable` | true |
+| `BOX-12` | `requiredEvidenceComplete` | true |
+| `BOX-13` | `requiredEvidenceReadable` | true |
+| `BOX-13` | `requiredEvidenceComplete` | true |
+| `BOX-14` | `requiredEvidenceReadable` | true |
+| `BOX-14` | `requiredEvidenceComplete` | true |
+| `BOX-15` | `requiredEvidenceReadable` | true |
+| `BOX-15` | `requiredEvidenceComplete` | true |
+| `BOX-16` | `requiredEvidenceReadable` | true |
+| `BOX-16` | `requiredEvidenceComplete` | true |
+| `BOX-17` | `requiredEvidenceReadable` | true |
+| `BOX-17` | `requiredEvidenceComplete` | true |
+| `BOX-18` | `requiredEvidenceReadable` | true |
+| `BOX-18` | `requiredEvidenceComplete` | true |
+| `BOX-19` | `requiredEvidenceReadable` | true |
+| `BOX-19` | `requiredEvidenceComplete` | true |
+| `BOX-20` | `requiredEvidenceReadable` | true |
+| `BOX-20` | `requiredEvidenceComplete` | true |
+| `BOX-21` | `absolute_minimum_length` | 8 |
+| `BOX-22` | `requiredEvidenceReadable` | true |
+| `BOX-22` | `requiredEvidenceComplete` | true |
+| `BOX-23` | `requiredEvidenceReadable` | true |
+| `BOX-23` | `requiredEvidenceComplete` | true |
+| `BOX-24` | `failure_ratio` | 0.25 |
+| `BOX-25` | `requiredEvidenceReadable` | true |
+| `BOX-25` | `requiredEvidenceComplete` | true |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `BOX-01` | compliant | All required source reads are complete and this derivation returns pass: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when enterprise SSO is required and not in testing mode, warn when it is required but testing, unused, or not exposed, and fail when it is explicitly not required. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-02` | compliant | All required source reads are complete and this derivation returns pass: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when enterprise MFA is required but any admin or co-admin is exempt, pass when MFA is required and the complete privileged inventory has no exemption, warn for unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when both MFA and required SSO are disabled. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-03` | compliant | All required source reads are complete and this derivation returns pass: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when enterprise MFA is required and the complete user inventory has no non-privileged exemption, warn for any exemption, unused or unknown settings, an incomplete inventory, or required SSO with Box-native MFA disabled, and fail when neither MFA nor required SSO is enforced. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-04` | compliant | All required source reads are complete and this derivation returns pass: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when external collaboration is enterprise-only or allowlist-only with at least one readable entry, fail when unrestricted, and warn for unused, unknown, empty, unreadable, or truncated-before-first-entry allowlist evidence. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-05` | compliant | All required source reads are complete and this derivation returns pass: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions attached to a non-empty allowlist, or an empty allowlist while allowlist-only mode is selected; pass when complete entries are recent non-public domains without exemptions, and also pass when no allowlist is required and the allowlist is empty regardless of exempt-target rows. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any allowlist entry is a public consumer email domain, warn for truncation, stale or undated entries, exemptions attached to a non-empty allowlist, or an empty allowlist while allowlist-only mode is selected; pass when complete entries are recent non-public domains without exemptions, and also pass when no allowlist is required and the allowlist is empty regardless of exempt-target rows. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-06` | compliant | All required source reads are complete and this derivation returns pass: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when shared links default to open access, pass when the default is restricted and open links are not offered, and warn when the default is restricted but open links remain available or the setting is unused or unrecognized. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-07` | compliant | All required source reads are complete and this derivation returns pass: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-07` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when mandatory expiration is enabled for all shared links, warn when only public links expire or the setting is unused or absent, and fail when mandatory expiration is explicitly disabled. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-08` | compliant | All required source reads are complete and this derivation returns pass: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-08` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because the enterprise configuration API does not expose whether passwords are required for open shared links. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-09` | compliant | All required source reads are complete and this derivation returns pass: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-09` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when enterprise watermarking is enabled, fail when explicitly disabled, and warn when the flag is unused or absent. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-10` | compliant | All required source reads are complete and this derivation returns pass: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-10` | noncompliant | A complete source read satisfies the fail branch of this derivation: return warn when the complete device-pin inventory is empty and manual when pins exist because the API does not expose whether unpinned devices are blocked; a read that truncates before its first pin is also manual. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-10` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-10` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-11` | compliant | All required source reads are complete and this derivation returns pass: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-11` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the classification template defines at least one label and fail when a readable template or a 404 proves that it defines none. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-11` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-11` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-12` | compliant | All required source reads are complete and this derivation returns pass: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-12` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when a complete retention-policy inventory has at least one active policy with visible assignments, warn when active policies lack assignments or any relevant inventory is truncated, and fail when a complete inventory has no active policy. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-12` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-12` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-13` | compliant | All required source reads are complete and this derivation returns pass: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-13` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when a complete legal-hold inventory has at least one active or applying policy with visible assignments, and warn when policies or assignments are incomplete, active holds lack assignments, no hold is active, or no hold exists. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-13` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-13` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-14` | compliant | All required source reads are complete and this derivation returns pass: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-14` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when at least one Shield smart-access or threat-detection rule is configured and fail when a readable complete Shield configuration has none. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-14` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-14` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-15` | compliant | All required source reads are complete and this derivation returns pass: return pass when at least one enabled information barrier has a visible segment, including a lower-bound segment listing that stopped after proving one; return warn when no visible segment is proved, barriers or required segment reads are unreadable, no barrier is enabled, or no barrier exists. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-15` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when at least one enabled information barrier has a visible segment, including a lower-bound segment listing that stopped after proving one; return warn when no visible segment is proved, barriers or required segment reads are unreadable, no barrier is enabled, or no barrier exists. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-15` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-15` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-16` | compliant | All required source reads are complete and this derivation returns pass: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-16` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the readable enterprise admin event stream contains at least one event in the lookback and warn when it contains none; this verdict proves stream readability only and does not prove SIEM consumption. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-16` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-16` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-17` | compliant | All required source reads are complete and this derivation returns pass: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-17` | noncompliant | A complete source read satisfies the fail branch of this derivation: return warn when the complete count of admins plus co-admins exceeds the configured maximum and pass when it is at or below that maximum. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-17` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-17` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-18` | compliant | All required source reads are complete and this derivation returns pass: return pass when the complete user inventory has no co-admin, warn when user evidence is partial, and manual when any co-admin exists because individual co-admin permissions are not exposed. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-18` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the complete user inventory has no co-admin, warn when user evidence is partial, and manual when any co-admin exists because individual co-admin permissions are not exposed. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-18` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-18` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-19` | compliant | All required source reads are complete and this derivation returns pass: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-19` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because app creation events and Shield integration lists do not expose the app approval policy. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-19` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-19` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-20` | compliant | All required source reads are complete and this derivation returns pass: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-20` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when at least one managed-user custom terms record is enabled, fail when managed-user terms exist but are disabled, and fail when a complete terms inventory has no managed-user terms. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-20` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-20` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-21` | compliant | All required source reads are complete and this derivation returns pass: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-21` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when minimum password length meets the configured target, weak-password prevention is enabled, and at least two of uppercase, numeric, and special-character minima are positive; warn when length is at least eight but any target is missed or the setting is unused or absent, and fail below eight. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-21` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-21` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-22` | compliant | All required source reads are complete and this derivation returns pass: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-22` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when the base session duration or an enabled custom group duration exceeds the configured maximum, pass when every applicable duration is at or below it, and warn when a duration is unused, absent, or cannot be normalized. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-22` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-22` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-23` | compliant | All required source reads are complete and this derivation returns pass: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-23` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because Shield IP lists do not expose whether enterprise sign-in or access-policy IP restrictions are enforced. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-23` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-23` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-24` | compliant | All required source reads are complete and this derivation returns pass: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-24` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when every active human user has a successful activity event in the lookback, fail when more than 25 percent lack one, and warn when at most 25 percent lack one, no active human user exists, or user or event coverage is incomplete. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-24` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-24` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `BOX-25` | compliant | All required source reads are complete and this derivation returns pass: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `BOX-25` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when at least one Shield anomaly rule or Shield alert or block event exists, warn when one required source is unavailable, only ordinary access events exist, or the event window is incomplete, and fail when complete readable evidence has no anomaly rule, alert, block, or content-access event. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `BOX-25` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `BOX-25` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | SSO enforcement | IA-2 | AC.L2-3.1.1 | CC6.1 | 1.1 | 8.3.1 | SRG-APP-000148 | ISM-1557 | CPS-04 |
+| 2 | 2FA for admins | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.1 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
+| 3 | 2FA for all users | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.2 | 8.4.2 | SRG-APP-000149 | ISM-1401 | CPS-06 |
+| 4 | External collaboration restrictions | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.1 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
+| 5 | Collaboration allowlist audit | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.2 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
+| 6 | Sharing link policies | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.3 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 7 | Shared link expiration | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.4 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 8 | Shared link password policy | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.5 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 9 | Watermarking enabled | SC-28 | SC.L2-3.13.16 | CC6.7 | 3.1 | 3.4 | SRG-APP-000231 | ISM-0457 | CPS-09 |
+| 10 | Device trust and pins | IA-3 | IA.L2-3.5.1 | CC6.1 | 1.2 | 2.4 | SRG-APP-000158 | ISM-1482 | CPS-04 |
+| 11 | Classification labels | MP-4 | MP.L2-3.8.5 | CC6.7 | 3.2 | 9.6.1 | SRG-APP-000231 | ISM-0272 | CPS-09 |
+| 12 | Retention policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.1 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
+| 13 | Legal hold policies | AU-11 | AU.L2-3.3.1 | CC7.4 | 8.2 | 3.1 | SRG-APP-000515 | ISM-0859 | CPS-10 |
+| 14 | Shield smart access policies | AC-3 | AC.L2-3.1.2 | CC6.3 | 6.6 | 7.2.1 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 15 | Shield information barriers | AC-4 | AC.L2-3.1.3 | CC6.6 | 6.7 | 7.2.3 | SRG-APP-000039 | ISM-1148 | CPS-11 |
+| 16 | Enterprise event streaming | AU-2 | AU.L2-3.3.1 | CC7.2 | 8.3 | 10.2.1 | SRG-APP-000089 | ISM-0580 | CPS-10 |
+| 17 | Admin role minimization | AC-6(5) | AC.L2-3.1.5 | CC6.3 | 6.8 | 7.2.2 | SRG-APP-000340 | ISM-1507 | CPS-07 |
+| 18 | Co-admin permission scoping | AC-6 | AC.L2-3.1.5 | CC6.3 | 6.9 | 7.2.2 | SRG-APP-000340 | ISM-0432 | CPS-07 |
+| 19 | App approval process | CM-7(5) | CM.L2-3.4.8 | CC8.1 | 10.1 | 6.3.2 | SRG-APP-000386 | ISM-1490 | CPS-12 |
+| 20 | Custom terms of service | PS-6 | AT.L2-3.2.1 | CC1.4 | 11.1 | 12.6.1 | SRG-APP-000516 | ISM-0252 | CPS-13 |
+| 21 | Password policy strength | IA-5(1) | IA.L2-3.5.7 | CC6.1 | 5.1 | 8.3.6 | SRG-APP-000166 | ISM-0421 | CPS-05 |
+| 22 | Session duration limits | AC-11 | AC.L2-3.1.10 | CC6.1 | 7.1 | 8.2.8 | SRG-APP-000190 | ISM-0853 | CPS-08 |
+| 23 | IP allowlisting | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.1 | 1.3.2 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 24 | Inactive user detection | AC-2(3) | AC.L2-3.1.1 | CC6.2 | 7.2 | 8.1.4 | SRG-APP-000025 | ISM-1404 | CPS-07 |
+| 25 | Content access monitoring | AU-6 | AU.L2-3.3.5 | CC7.2 | 8.4 | 10.6.1 | SRG-APP-000108 | ISM-0580 | CPS-10 |
+
+## Collection states
+
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
+
+## Integration-specific scrubbing
+
+Shared contract version: 1.1.
+
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
+
+Sensitive fields and values: client_secret, private_key, passphrase, access_token, refresh_token, authorization, login
+
+Credential formats: Box OAuth access and refresh tokens, JWT private keys and passphrases, signed JWT assertions
+
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
+
+Integration-specific rules:
+
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `current-user` | `projected fields consumed by the corresponding runtime assessment` |
+| `enterprise-configuration` | `projected fields consumed by the corresponding runtime assessment` |
+| `users` | `projected fields consumed by the corresponding runtime assessment` |
+| `groups` | `projected fields consumed by the corresponding runtime assessment` |
+| `events` | `projected fields consumed by the corresponding runtime assessment` |
+| `device-pinners` | `projected fields consumed by the corresponding runtime assessment` |
+| `retention-policies` | `projected fields consumed by the corresponding runtime assessment` |
+| `retention-assignments` | `projected fields consumed by the corresponding runtime assessment` |
+| `legal-hold-policies` | `projected fields consumed by the corresponding runtime assessment` |
+| `legal-hold-assignments` | `projected fields consumed by the corresponding runtime assessment` |
+| `shield-barriers` | `projected fields consumed by the corresponding runtime assessment` |
+| `shield-barrier-segments` | `projected fields consumed by the corresponding runtime assessment` |
+| `shield-lists` | `projected fields consumed by the corresponding runtime assessment` |
+| `allowlist-entries` | `projected fields consumed by the corresponding runtime assessment` |
+| `allowlist-exempt-targets` | `projected fields consumed by the corresponding runtime assessment` |
+| `metadata-templates` | `projected fields consumed by the corresponding runtime assessment` |
+| `classification-template` | `projected fields consumed by the corresponding runtime assessment` |
+| `terms-of-service` | `projected fields consumed by the corresponding runtime assessment` |
+
+## Export layout
+
+Required paths:
+
+- `core_data/access_check.json`
+- `core_data/enterprise_configuration.json`
+- `core_data/current_user.json`
+- `core_data/users.json`
+- `core_data/groups.json`
+- `core_data/enterprise_events_activity.json`
+- `core_data/enterprise_events_sharing.json`
+- `core_data/enterprise_events_shield.json`
+- `core_data/device_pinners.json`
+- `core_data/classification_template.json`
+- `core_data/metadata_templates.json`
+- `core_data/retention_policies.json`
+- `core_data/retention_policy_assignments.json`
+- `core_data/legal_hold_policies.json`
+- `core_data/legal_hold_policy_assignments.json`
+- `core_data/shield_information_barriers.json`
+- `core_data/shield_information_barrier_segments.json`
+- `core_data/shield_lists.json`
+- `core_data/collaboration_allowlist_entries.json`
+- `core_data/collaboration_allowlist_exempt_targets.json`
+- `core_data/terms_of_services.json`
+- `core_data/collection_status.json`
+- `analysis/identity_access.json`
+- `analysis/sharing_collaboration.json`
+- `analysis/data_governance.json`
+- `analysis/shield_monitoring.json`
+- `analysis/findings.json`
+- `analysis/summary.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis/cis_compliance_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/stig_compliance_checklist.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
+- `QUICK_REFERENCE.md`
+- `metadata.json`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `core_data/access_check.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_configuration.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/current_user.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/users.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/groups.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_events_activity.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_events_sharing.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/enterprise_events_shield.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/device_pinners.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/classification_template.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/metadata_templates.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/retention_policies.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/retention_policy_assignments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/legal_hold_policies.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/legal_hold_policy_assignments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/shield_information_barriers.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/shield_information_barrier_segments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/shield_lists.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/collaboration_allowlist_entries.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/collaboration_allowlist_exempt_targets.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/terms_of_services.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/collection_status.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity_access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/sharing_collaboration.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/data_governance.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/shield_monitoring.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/summary.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis/cis_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `framework mappings`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+
+#### bundle_result
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+#### assessment
+
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
+
+#### pagination_state
+
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
+
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
+
+Overwrite policy: Allocate a new <enterprise>-audit-bundle directory and numeric suffix without overwriting either directory or archive.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create <allocated-directory>.zip beside the allocated enterprise audit directory.

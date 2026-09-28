@@ -2,366 +2,1131 @@
 slug: "slack-sec-inspector"
 name: "Slack Security Inspector"
 vendor: "Slack"
-category: "saas-collaboration"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+category: "collaboration"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# slack-sec-inspector
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-## 1. Overview
+# Slack Security Inspector
 
-A security compliance inspection tool for **Slack Enterprise Grid** that audits workspace and organization-level security configurations against industry compliance frameworks. The tool connects to Slack's management and audit APIs to evaluate SSO enforcement, MFA policies, data loss prevention settings, external sharing controls, app management, session policies, and audit log configurations. Results are output as structured compliance reports mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP controls.
+Portable contract for the shipped Slack Enterprise Grid identity, administration, app, channel, and monitoring assessments.
 
-### grclanker implementation
+## Purpose
 
-The shipped implementation lives in `cli/extensions/grc-tools/slack.ts` as six native tools plus an exporter: `slack_check_access`, `slack_assess_identity`, `slack_assess_admin_access`, `slack_assess_integrations`, `slack_assess_channel_governance`, `slack_assess_monitoring`, and `slack_export_audit_bundle`. Every method, argument, and response field is listed in the `SLACK_METHODS` table with its reference page, and the integration guide (`src/content/docs/docs/integrations/slack.md`) maps each of the 25 controls to a finding id.
+Provide a read-only Enterprise Grid assessment across identity, administration, applications, channel governance, SCIM lifecycle, and audit monitoring.
 
-## 2. APIs & SDKs
+## Design guidance
 
-### Slack APIs
+Model Slack's Web, Admin, SCIM, and Audit Logs APIs as separate evidence domains with separate scopes and plan gates. Do not infer private organization settings from unrelated public fields; preserve manual review where Slack offers no read method.
 
-| API | Base URL | Purpose |
-|-----|----------|---------|
-| **Web API** | `https://slack.com/api/` | Core workspace and user management methods |
-| **SCIM API** | `https://api.slack.com/scim/v2/` | User and group provisioning (Enterprise Grid) |
-| **Audit Logs API** | `https://api.slack.com/audit/v1/logs` | Organization-level audit event retrieval (Enterprise Grid) |
-| **Admin API** | `https://slack.com/api/admin.*` | Enterprise administration methods |
-| **Discovery API** | `https://slack.com/api/discovery.*` | DLP and eDiscovery content access (Enterprise Grid) |
+## Shared integration contract
 
-### Key API Methods
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-**Admin API (admin.* methods):**
-- `admin.teams.settings.info` - Workspace-level security settings
-- `admin.teams.settings.setDiscoverability` - Control workspace discoverability
-- `admin.users.session.list` / `admin.users.session.invalidate` - Session management
-- `admin.users.session.setSettings` - Session duration and idle timeout policies
-- `admin.conversations.setConversationPrefs` - Channel posting restrictions
-- `admin.conversations.restrictAccess.addGroup` - IDP group channel restrictions
-- `admin.apps.approve` / `admin.apps.restrict` - App management
-- `admin.apps.approved.list` / `admin.apps.restricted.list` - App audit
-- `admin.emoji.add` / `admin.emoji.list` - Custom emoji management
-- `admin.teams.admins.list` - Admin role enumeration
-- `admin.users.list` - User management with deactivation status
-- `admin.usergroups.addTeams` - IDP group workspace assignment
-- `admin.barriers.create` / `admin.barriers.list` - Information barriers
+## Known runtime gaps
 
-**SCIM API:**
-- `GET /Users` - List provisioned users with attributes
-- `GET /Groups` - List provisioned groups
-- `PATCH /Users/{id}` - Update user provisioning attributes
-- `GET /ServiceProviderConfig` - SCIM endpoint capabilities
+- Eight controls remain manual because the public read APIs do not expose a decisive setting; the runtime names the exact Admin Console or SIEM evidence instead of calling write endpoints.
+- Cross-inventory findings require every dependent workspace, admin, channel, SCIM, or audit inventory to be complete before pass; partial secondary reads demote the dependent result.
+- SCIM, Web API, Admin API, and Audit Logs pagination use different cursor locations and preserve stalled cursors, page caps, item caps, and unknown totals as incomplete evidence.
+- Discovery DLP details, guest expiry, several workspace restrictions, and standalone reporters remain unavailable.
+- SLACK-ID-04 preserves the runtime's username-first SCIM matcher: when SCIM userName is a Slack handle, the primary email is not consulted, so a lifecycle mismatch may remain unmatched.
 
-**Audit Logs API:**
-- `GET /audit/v1/logs` - Retrieve audit events with action-based filtering
-- `GET /audit/v1/schemas` - Available audit event schemas
-- Supported actions: `user_login`, `user_logout`, `file_downloaded`, `app_installed`, `role_change_to_admin`, `pref_sso_setting_changed`, `pref_two_factor_auth_changed`, etc.
+## Tools
 
-**Discovery API:**
-- `discovery.enterprise.info` - Organization-level DLP settings
-- `discovery.conversations.list` - Enumerate conversations for DLP scanning
-- `discovery.conversations.history` - Retrieve message content for DLP
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `slack_check_access` | Validate read-only Slack Enterprise Grid API access and show which Web API, Admin API, SCIM, and Audit Logs surfaces are readable with the configured user, bot, and SCIM tokens. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_identity` | Assess Slack MFA enrollment (has_2fa), guest inventory, SCIM provisioning coverage, user lifecycle alignment, and deactivated user visibility. | `SLACK-ID-01`, `SLACK-ID-02`, `SLACK-ID-03`, `SLACK-ID-04`, `SLACK-ID-05` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_admin_access` | Assess Slack workspace admin inventory, SSO coverage (has_sso), session duration, idle timeout, discoverability, mobile session controls, email domain restrictions, custom emoji governance, and analytics access. | `SLACK-ADMIN-01`, `SLACK-ADMIN-02`, `SLACK-ADMIN-03`, `SLACK-ADMIN-04`, `SLACK-ADMIN-05`, `SLACK-ADMIN-06`, `SLACK-ADMIN-07`, `SLACK-ADMIN-08`, `SLACK-ADMIN-09` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_integrations` | Assess Slack approved and restricted app inventories, internal and sensitive-scope apps, information barriers, DLP and Discovery evidence, file upload restrictions (team.preferences.list), and token rotation. | `SLACK-APP-01`, `SLACK-APP-02`, `SLACK-APP-03`, `SLACK-APP-04`, `SLACK-APP-05`, `SLACK-APP-06`, `SLACK-APP-07` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_channel_governance` | Assess Slack Connect exposure, posting restrictions on general and org default channels, channel retention overrides, external email ingestion, and link preview settings. | `SLACK-CHAN-01`, `SLACK-CHAN-02`, `SLACK-CHAN-03`, `SLACK-CHAN-04`, `SLACK-CHAN-05` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_assess_monitoring` | Assess Slack Audit Logs API access, event recency, security administration events, schema visibility, external sharing monitoring, and SIEM streaming evidence. | `SLACK-MON-01`, `SLACK-MON-02`, `SLACK-MON-03`, `SLACK-MON-04`, `SLACK-MON-05`, `SLACK-MON-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `slack_export_audit_bundle` | Export a Slack audit bundle with core_data snapshots, analysis JSON, per-framework compliance reports, QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive named after the allocated directory. | `SLACK-ID-01`, `SLACK-ID-02`, `SLACK-ID-03`, `SLACK-ID-04`, `SLACK-ID-05`, `SLACK-ADMIN-01`, `SLACK-ADMIN-02`, `SLACK-ADMIN-03`, `SLACK-ADMIN-04`, `SLACK-ADMIN-05`, `SLACK-ADMIN-06`, `SLACK-ADMIN-07`, `SLACK-ADMIN-08`, `SLACK-ADMIN-09`, `SLACK-APP-01`, `SLACK-APP-02`, `SLACK-APP-03`, `SLACK-APP-04`, `SLACK-APP-05`, `SLACK-APP-06`, `SLACK-APP-07`, `SLACK-CHAN-01`, `SLACK-CHAN-02`, `SLACK-CHAN-03`, `SLACK-CHAN-04`, `SLACK-CHAN-05`, `SLACK-MON-01`, `SLACK-MON-02`, `SLACK-MON-03`, `SLACK-MON-04`, `SLACK-MON-05`, `SLACK-MON-06` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
 
-### SDKs
+### Parameters
 
-| SDK | Language | Package |
-|-----|----------|---------|
-| **slack_sdk** | Python | `pip install slack_sdk` (official, Slack Technologies) |
-| **slack-bolt** | Python | `pip install slack-bolt` (app framework) |
-| **Slack CLI** | CLI | `slack` CLI tool for Slack platform apps |
-| **node-slack-sdk** | Node.js | `@slack/web-api` (official) |
+#### `slack_check_access`
 
-## 3. Authentication
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
 
-### Token Types
+#### `slack_assess_identity`
 
-| Token | Prefix | Scope |
-|-------|--------|-------|
-| **Bot Token** | `xoxb-` | Workspace-level bot permissions |
-| **User Token** | `xoxp-` | User-level API access; required for admin.* methods |
-| **Org-Level Token** | `xoxp-` | Enterprise Grid org-level admin token |
-| **SCIM Token** | Bearer | SCIM provisioning API access |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `user_limit` | number | no | Maximum users to read. Defaults to 1000. |
+| `skip_scim` | boolean | no | Skip SCIM provisioning checks. Defaults to false. |
 
-### Required OAuth Scopes
+#### `slack_assess_admin_access`
 
-For a comprehensive security audit, the following scopes are required on an **org-level user token**:
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `workspace_limit` | number | no | Maximum workspaces to read. Defaults to 50. |
+| `user_limit` | number | no | Maximum org users to read from admin.users.list. Defaults to 1000. |
+| `max_workspace_admins` | number | no | Maximum expected admins per workspace. Defaults to 5. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+| `session_sample` | number | no | Maximum users whose session settings are sampled. Defaults to 100. |
 
-- `admin.teams:read` - Read workspace settings
-- `admin.users:read` - List users and session info
-- `admin.users.session:read` - Read session settings
-- `admin.conversations:read` - Read conversation preferences
-- `admin.apps:read` - Read approved/restricted apps
-- `admin.barriers:read` - Read information barriers
-- `admin.roles:read` - Read admin role assignments
-- `auditlogs:read` - Read audit log events (Enterprise Grid)
-- `discovery:read` - Read DLP/eDiscovery data (Enterprise Grid)
-- `users:read` - Basic user enumeration
-- `team:read` - Workspace info
+#### `slack_assess_integrations`
 
-### SCIM Authentication
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `app_limit` | number | no | Maximum approved/restricted apps to read. Defaults to 500. |
+| `workspace_limit` | number | no | Maximum workspaces to read when scoping team.preferences.list. Defaults to 50. |
 
-SCIM API uses a separate bearer token issued from the Enterprise Grid admin dashboard under **Settings > Authentication > SCIM Provisioning**.
+#### `slack_assess_channel_governance`
 
-### Configuration
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `channel_limit` | number | no | Maximum active channels to sample for prefs and retention. Defaults to 40. |
+| `min_retention_days` | number | no | Minimum acceptable custom retention in days. Defaults to 365. |
 
-```
-SLACK_USER_TOKEN=xoxp-...
-SLACK_SCIM_TOKEN=...
-SLACK_ORG_ID=E0123456789
-```
+#### `slack_assess_monitoring`
 
-## 4. Security Controls
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `days` | number | no | Audit log lookback window in days. Defaults to 30. |
+| `audit_limit` | number | no | Maximum audit events to read (1-9999). Defaults to 200. |
 
-1. **SSO enforcement** - Verify SAML SSO is required for all users (not optional) via org-level authentication policy
-2. **Two-factor authentication** - Confirm 2FA is mandated org-wide; enumerate users without 2FA enrolled
-3. **Session duration limits** - Validate maximum session duration is set (recommended: 24h or less)
-4. **Session idle timeout** - Ensure idle session timeout is configured (recommended: 30 minutes or less)
-5. **Mobile session controls** - Verify mobile app session duration and jailbreak/root detection policies
-6. **File upload restrictions** - Check whether file uploads are restricted by type or disabled for external channels
-7. **External sharing controls** - Audit whether Slack Connect (external organizations) channels are permitted and which workspaces allow them
-8. **Information barriers** - Verify information barriers are configured between restricted groups (e.g., compliance walls)
-9. **App management policy** - Confirm app installation requires admin approval; enumerate approved and restricted apps
-10. **Custom app restrictions** - Verify that only approved custom integrations and bots are permitted
-11. **DLP policy configuration** - Check that Discovery API is enabled and DLP scanning is active for sensitive content patterns
-12. **Channel retention policies** - Audit message and file retention settings per workspace; verify compliance-required retention periods
-13. **Audit log streaming** - Confirm audit logs are being streamed to an external SIEM (Amazon S3, Splunk, etc.)
-14. **Admin role inventory** - Enumerate all org admins, workspace admins, and owners; flag excessive admin privileges
-15. **Guest account controls** - Audit single-channel and multi-channel guest accounts; verify guest expiration policies
-16. **Email domain restrictions** - Verify workspace signup is restricted to approved email domains
-17. **Workspace discoverability** - Ensure workspace discoverability is set appropriately (not open to all org members if sensitive)
-18. **Channel posting restrictions** - Audit channels where posting is restricted to admins or specific groups
-19. **Custom emoji restrictions** - Verify whether custom emoji uploads are restricted to admins
-20. **External email ingestion** - Check whether email-to-channel forwarding is enabled and restricted
-21. **Link previews and URL unfurling** - Audit whether link previews expose sensitive content in channels
-22. **SCIM provisioning status** - Verify SCIM provisioning is active and user lifecycle management is automated
-23. **Deactivated user audit** - Enumerate deactivated users and verify timely deprovisioning matches HR/IdP records
-24. **Workspace analytics access** - Verify analytics export access is restricted to authorized admins
-25. **Token rotation and revocation** - Audit API token age and ensure legacy tokens are revoked
+#### `slack_export_audit_bundle`
 
-## 5. Compliance Framework Mappings
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `token` | string | no | Slack org-level user token. Defaults to SLACK_USER_TOKEN, then the config file. |
+| `bot_token` | string | no | Slack bot token for bot-capable methods (auth.test, users.list). Defaults to SLACK_BOT_TOKEN. |
+| `scim_token` | string | no | Slack SCIM bearer token. Defaults to SLACK_SCIM_TOKEN. |
+| `org_id` | string | no | Slack Enterprise Grid org ID. Defaults to SLACK_ORG_ID or SLACK_ENTERPRISE_ID. |
+| `timeout_seconds` | number | no | Request timeout in seconds. Defaults to 30. |
+| `output_dir` | string | no | Output root. Defaults to ./export/slack. |
+| `user_limit` | number | no | Maximum users to read. Defaults to 1000. |
+| `workspace_limit` | number | no | Maximum workspaces to read. Defaults to 50. |
+| `app_limit` | number | no | Maximum approved/restricted apps to read. Defaults to 500. |
+| `audit_limit` | number | no | Maximum audit events to read. Defaults to 200. |
+| `channel_limit` | number | no | Maximum channels to sample. Defaults to 40. |
+| `days` | number | no | Audit log lookback window in days. Defaults to 30. |
+| `max_workspace_admins` | number | no | Maximum expected admins per workspace. Defaults to 5. |
+| `max_session_hours` | number | no | Maximum acceptable session duration in hours. Defaults to 24. |
+| `min_retention_days` | number | no | Minimum acceptable custom retention in days. Defaults to 365. |
+| `skip_scim` | boolean | no | Skip SCIM provisioning checks. Defaults to false. |
 
-| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---|---------|---------|------|-------|-----|---------|------|------|-------|
+
+## Authentication
+
+Supported modes:
+
+- User OAuth token
+- Bot OAuth token
+- SCIM bearer token
+
+Credential precedence, highest first:
+
+1. Explicit tool arguments
+2. SLACK_* environment variables
+3. Slack JSON config file
+
+Environment variables: `SLACK_CONFIG_FILE`, `SLACK_USER_TOKEN`, `SLACK_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_SCIM_TOKEN`, `SLACK_ORG_ID`, `SLACK_ENTERPRISE_ID`, `SLACK_WEB_API_BASE_URL`, `SLACK_SCIM_BASE_URL`, `SLACK_AUDIT_BASE_URL`, `SLACK_TIMEOUT`
+
+Configuration locations: ~/.config/grclanker/slack.json, Explicit path from SLACK_CONFIG_FILE
+
+Credential and deployment variants: Enterprise Grid org token plus optional bot and SCIM credentials
+
+Configuration fields: `user_token`, `token`, `bot_token`, `scim_token`, `org_id`
+
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
+
+## Permissions
+
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| oauth-scope | `users:read` | `users` |  |
+| oauth-scope | `admin.teams:read` | `workspaces`, `workspace-settings`, `workspace-admins`, `team-preferences` |  |
+| oauth-scope | `admin.users:read` | `admin-users`, `session-settings` |  |
+| oauth-scope | `admin.apps:read` | `approved-apps`, `restricted-apps` |  |
+| oauth-scope | `admin.barriers:read` | `barriers` |  |
+| oauth-scope | `admin.conversations:read` | `channels`, `channel-preferences`, `channel-retention` |  |
+| oauth-scope | `admin.emoji:read` | `emoji` |  |
+| oauth-scope | `admin.analytics:read` | `analytics-export` |  |
+| oauth-scope | `auditlogs:read` | `audit-logs`, `audit-schemas` |  |
+| license | `SCIM API entitlement with a read-capable SCIM token` | `scim-users` |  |
+| plan | `Enterprise Grid for org-level Admin and Audit Logs APIs` | `workspaces`, `workspace-settings`, `workspace-admins`, `admin-users`, `session-settings`, `approved-apps`, `restricted-apps`, `barriers`, `channels`, `channel-preferences`, `channel-retention`, `emoji`, `analytics-export`, `audit-logs`, `audit-schemas` |  |
+
+## API surfaces
+
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `auth-test` | HTTP | `POST /api/auth.test` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/auth.test) |
+| `users` | HTTP | `GET /api/users.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/users.list) |
+| `workspaces` | HTTP | `POST /api/admin.teams.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.teams.list) |
+| `workspace-settings` | HTTP | `POST /api/admin.teams.settings.info` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.teams.settings.info) |
+| `workspace-admins` | HTTP | `GET /api/admin.teams.admins.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.teams.admins.list) |
+| `admin-users` | HTTP | `POST /api/admin.users.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.users.list) |
+| `session-settings` | HTTP | `POST /api/admin.users.session.getSettings` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.users.session.getSettings) |
+| `approved-apps` | HTTP | `GET /api/admin.apps.approved.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.apps.approved.list) |
+| `restricted-apps` | HTTP | `GET /api/admin.apps.restricted.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.apps.restricted.list) |
+| `barriers` | HTTP | `GET /api/admin.barriers.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.barriers.list) |
+| `channels` | HTTP | `POST /api/admin.conversations.search` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.conversations.search) |
+| `channel-preferences` | HTTP | `POST /api/admin.conversations.getConversationPrefs` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.conversations.getConversationPrefs) |
+| `channel-retention` | HTTP | `POST /api/admin.conversations.getCustomRetention` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.conversations.getCustomRetention) |
+| `emoji` | HTTP | `GET /api/admin.emoji.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.emoji.list) |
+| `analytics-export` | HTTP | `GET /api/admin.analytics.getFile` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/admin.analytics.getFile) |
+| `team-preferences` | HTTP | `POST /api/team.preferences.list` | Slack Web/Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://api.slack.com/methods/team.preferences.list) |
+| `scim-users` | HTTP | `GET /scim/v2/Users` | Slack SCIM API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://docs.slack.dev/admins/scim-api/) |
+| `audit-logs` | HTTP | `GET /audit/v1/logs` | Slack Audit Logs API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://docs.slack.dev/admins/audit-logs-api/) |
+| `audit-schemas` | HTTP | `GET /audit/v1/schemas` | Slack Audit Logs API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `projected response fields consumed by the corresponding runtime assessment` | [Official documentation](https://docs.slack.dev/admins/audit-logs-api/) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `auth-test` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `auth-test` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `auth-test` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `users` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `workspaces` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `workspaces` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `workspaces` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `workspace-settings` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `workspace-settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `workspace-settings` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `workspace-admins` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `workspace-admins` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `workspace-admins` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `admin-users` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `admin-users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `admin-users` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `session-settings` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `session-settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `session-settings` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `approved-apps` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `approved-apps` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `approved-apps` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `restricted-apps` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `restricted-apps` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `restricted-apps` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `barriers` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `barriers` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `barriers` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `channels` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `channels` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `channels` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `channel-preferences` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `channel-preferences` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `channel-preferences` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `channel-retention` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `channel-retention` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `channel-retention` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `emoji` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `emoji` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `emoji` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `analytics-export` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `analytics-export` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `analytics-export` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `team-preferences` | client | Use the configured Slack Web/Admin API origin; never follow a server link to a different origin. | yes |
+| `team-preferences` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `team-preferences` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `scim-users` | client | Use the configured Slack SCIM API origin; never follow a server link to a different origin. | yes |
+| `scim-users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `scim-users` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `audit-logs` | client | Use the configured Slack Audit Logs API origin; never follow a server link to a different origin. | yes |
+| `audit-logs` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `audit-logs` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+| `audit-schemas` | client | Use the configured Slack Audit Logs API origin; never follow a server link to a different origin. | yes |
+| `audit-schemas` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `audit-schemas` | response | A JSON object or list containing only the documented projected response fields consumed by the corresponding runtime assessment members consumed by verdicts. | yes |
+
+## Pagination
+
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `users`, `workspaces`, `workspace-admins`, `admin-users`, `approved-apps`, `restricted-apps`, `barriers`, `channels`, `emoji`, `audit-logs`, `audit-schemas` | `response_metadata.next_cursor`, `next_cursor` | service default | caller limit | 50 | Completion requires an empty cursor; item and page caps, repeated cursors, and a page adding no records remain partial. | Empty cursor; Caller item cap; 50-page cap; Repeated cursor; Page adds no records while cursor remains |
+| `scim-users` | `startIndex`, `itemsPerPage`, `totalResults` | 100 | caller limit | 50 | totalResults is authoritative and must be reached; missing or inconsistent totals are partial. | Seen reaches totalResults; Caller item cap; 50-page cap; Non-advancing startIndex; Empty page before total |
+
+## Rate limits
+
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Slack Security Inspector | Method-specific Slack rate tiers | `Retry-After` | 429, 500, 502, 503, 504 | Honor Retry-After up to the runtime bound and retry 429 responses twice; exhausted reads stay explicit. |
+
+## Checks
+
+### Control coverage
+
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | SSO enforcement | SLACK-ADMIN-02 | Evaluate the ordered first-match rules for SLACK-ADMIN-02 below. |
+| 2 | MFA enrollment | SLACK-ID-01 | Evaluate the ordered first-match rules for SLACK-ID-01 below. |
+| 3 | Session duration limits | SLACK-ADMIN-03 | Evaluate the ordered first-match rules for SLACK-ADMIN-03 below. |
+| 4 | Session idle timeout | SLACK-ADMIN-04 | Evaluate the ordered first-match rules for SLACK-ADMIN-04 below. |
+| 5 | Mobile session controls | SLACK-ADMIN-06 | Evaluate the ordered first-match rules for SLACK-ADMIN-06 below. |
+| 6 | File upload restrictions | SLACK-APP-06 | Evaluate the ordered first-match rules for SLACK-APP-06 below. |
+| 7 | External sharing monitoring | SLACK-CHAN-01, SLACK-MON-05 | Evaluate the ordered first-match rules for SLACK-CHAN-01, SLACK-MON-05 below. |
+| 8 | Information barriers | SLACK-APP-04 | Evaluate the ordered first-match rules for SLACK-APP-04 below. |
+| 9 | Restricted app policy | SLACK-APP-01, SLACK-APP-02 | Evaluate the ordered first-match rules for SLACK-APP-01, SLACK-APP-02 below. |
+| 10 | Custom and sensitive-scope apps | SLACK-APP-03 | Evaluate the ordered first-match rules for SLACK-APP-03 below. |
+| 11 | DLP and Discovery evidence | SLACK-APP-05 | Evaluate the ordered first-match rules for SLACK-APP-05 below. |
+| 12 | Channel retention overrides | SLACK-CHAN-03 | Evaluate the ordered first-match rules for SLACK-CHAN-03 below. |
+| 13 | SIEM streaming evidence | SLACK-MON-01, SLACK-MON-02, SLACK-MON-03, SLACK-MON-04, SLACK-MON-06 | Evaluate the ordered first-match rules for SLACK-MON-01, SLACK-MON-02, SLACK-MON-03, SLACK-MON-04, SLACK-MON-06 below. |
+| 14 | Workspace admin inventory | SLACK-ADMIN-01 | Evaluate the ordered first-match rules for SLACK-ADMIN-01 below. |
+| 15 | Guest account inventory | SLACK-ID-02 | Evaluate the ordered first-match rules for SLACK-ID-02 below. |
+| 16 | Email domain restrictions | SLACK-ADMIN-07 | Evaluate the ordered first-match rules for SLACK-ADMIN-07 below. |
+| 17 | Workspace discoverability | SLACK-ADMIN-05 | Evaluate the ordered first-match rules for SLACK-ADMIN-05 below. |
+| 18 | Channel posting restrictions | SLACK-CHAN-02 | Evaluate the ordered first-match rules for SLACK-CHAN-02 below. |
+| 19 | Custom emoji governance | SLACK-ADMIN-08 | Evaluate the ordered first-match rules for SLACK-ADMIN-08 below. |
+| 20 | External email ingestion | SLACK-CHAN-04 | Evaluate the ordered first-match rules for SLACK-CHAN-04 below. |
+| 21 | Link previews and URL unfurling | SLACK-CHAN-05 | Evaluate the ordered first-match rules for SLACK-CHAN-05 below. |
+| 22 | SCIM provisioning coverage | SLACK-ID-03 | Evaluate the ordered first-match rules for SLACK-ID-03 below. |
+| 23 | Deactivated user visibility | SLACK-ID-04, SLACK-ID-05 | Evaluate the ordered first-match rules for SLACK-ID-04, SLACK-ID-05 below. |
+| 24 | Workspace analytics access | SLACK-ADMIN-09 | Evaluate the ordered first-match rules for SLACK-ADMIN-09 below. |
+| 25 | Token rotation and revocation | SLACK-APP-07 | Evaluate the ordered first-match rules for SLACK-APP-07 below. |
+
+### Finding notes
+
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `SLACK-ID-01` | critical | `slack_assess_identity` | `users` | `users_readable`, `users_complete`, `active_user_count`, `without_mfa_count`, `unknown_mfa_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any active human user has has_2fa=false, pass when every active human in a complete non-empty inventory has has_2fa=true, and warn for empty, unknown, or partial enrollment evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any active human user has has_2fa=false, pass when every active human in a complete non-empty inventory has has_2fa=true, and warn for empty, unknown, or partial enrollment evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any active human user has has_2fa=false, pass when every active human in a complete non-empty inventory has has_2fa=true, and warn for empty, unknown, or partial enrollment evidence. | The required evidence for MFA enrollment is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-02` | medium | `slack_assess_identity` | `users` | `users_readable`, `users_complete`, `active_user_count`, `guest_count` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when any active guest exists or the inventory is empty or partial, and pass only when a complete non-empty human inventory contains no active guest. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when any active guest exists or the inventory is empty or partial, and pass only when a complete non-empty human inventory contains no active guest. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when any active guest exists or the inventory is empty or partial, and pass only when a complete non-empty human inventory contains no active guest. | The required evidence for Guest account inventory is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-03` | high | `slack_assess_identity` | `scim-users` | `scim_readable`, `scim_complete`, `scim_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when readable SCIM configuration has zero users, pass when the complete SCIM user inventory is non-empty, and warn when that non-empty inventory is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when readable SCIM configuration has zero users, pass when the complete SCIM user inventory is non-empty, and warn when that non-empty inventory is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when readable SCIM configuration has zero users, pass when the complete SCIM user inventory is non-empty, and warn when that non-empty inventory is partial. | The required evidence for SCIM provisioning coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-04` | high | `slack_assess_identity` | `users`, `scim-users` | `users_readable`, `scim_readable`, `complete`, `scim_user_count`, `mismatch_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any SCIM-active user is deactivated in Slack, pass when complete non-empty SCIM and Slack inventories have no mismatch, and warn for partial or empty comparison evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any SCIM-active user is deactivated in Slack, pass when complete non-empty SCIM and Slack inventories have no mismatch, and warn for partial or empty comparison evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any SCIM-active user is deactivated in Slack, pass when complete non-empty SCIM and Slack inventories have no mismatch, and warn for partial or empty comparison evidence. | The required evidence for User lifecycle alignment is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ID-05` | info | `slack_assess_identity` | `users` | `users_readable`, `users_complete`, `human_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete non-empty human inventory exposes deactivated users for review, and warn when the inventory is empty or partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete non-empty human inventory exposes deactivated users for review, and warn when the inventory is empty or partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete non-empty human inventory exposes deactivated users for review, and warn when the inventory is empty or partial. | The required evidence for Deactivated user visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-01` | high | `slack_assess_admin_access` | `workspaces`, `workspace-admins` | `teams_readable`, `admin_inventory_count`, `complete`, `excessive_admin_workspace_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any workspace exceeds the configured administrator maximum, pass when every workspace and admin list is complete and within it, and warn for partial coverage. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any workspace exceeds the configured administrator maximum, pass when every workspace and admin list is complete and within it, and warn for partial coverage. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any workspace exceeds the configured administrator maximum, pass when every workspace and admin list is complete and within it, and warn for partial coverage. | The required evidence for Workspace admin inventory is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-02` | critical | `slack_assess_admin_access` | `admin-users` | `users_readable`, `users_complete`, `active_user_count`, `without_sso_count`, `unknown_sso_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any active organization user has has_sso=false, pass when every active user in a complete non-empty inventory has has_sso=true, and warn for empty, unknown, or partial SSO evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any active organization user has has_sso=false, pass when every active user in a complete non-empty inventory has has_sso=true, and warn for empty, unknown, or partial SSO evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any active organization user has has_sso=false, pass when every active user in a complete non-empty inventory has has_sso=true, and warn for empty, unknown, or partial SSO evidence. | The required evidence for SSO enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-03` | high | `slack_assess_admin_access` | `admin-users`, `session-settings` | `session_readable`, `complete`, `duration_count`, `overlong_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any sampled user session exceeds the configured hour maximum, pass when every active user has an explicit duration within it, warn for inherited defaults or sampled or partial coverage, and manual when no duration can be read. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any sampled user session exceeds the configured hour maximum, pass when every active user has an explicit duration within it, warn for inherited defaults or sampled or partial coverage, and manual when no duration can be read. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any sampled user session exceeds the configured hour maximum, pass when every active user has an explicit duration within it, warn for inherited defaults or sampled or partial coverage, and manual when no duration can be read. | The required evidence for Session duration limits is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-04` | medium | `slack_assess_admin_access` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because Slack exposes session duration but no idle-timeout setting. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because Slack exposes session duration but no idle-timeout setting. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because Slack exposes session duration but no idle-timeout setting. | The required evidence for Session idle timeout is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-05` | medium | `slack_assess_admin_access` | `workspaces`, `workspace-settings` | `teams_readable`, `teams_complete`, `workspace_count`, `open_count`, `unknown_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | The required evidence for Workspace discoverability is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-06` | medium | `slack_assess_admin_access` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | The required evidence for Mobile session controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-07` | high | `slack_assess_admin_access` | `workspaces`, `workspace-settings` | `teams_readable`, `teams_complete`, `domain_count`, `unrestricted_count`, `settings_error_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | The required evidence for Email domain restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-08` | low | `slack_assess_admin_access` | `emoji`, `admin-users`, `workspaces`, `workspace-admins` | `emoji_readable`, `emoji_complete`, `emoji_count`, `admin_user_count`, `every_admin_list_unreadable`, `roster_complete`, `non_admin_upload_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | The required evidence for Custom emoji governance is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-09` | medium | `slack_assess_admin_access` | `analytics-export` | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | The required evidence for Workspace analytics access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-01` | high | `slack_assess_integrations` | `approved-apps` | `approved_readable`, `approved_complete`, `approved_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | The required evidence for Approved app inventory is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-02` | medium | `slack_assess_integrations` | `restricted-apps` | `restricted_readable`, `restricted_complete`, `restricted_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | The required evidence for Restricted app policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-03` | medium | `slack_assess_integrations` | `approved-apps` | `approved_readable`, `approved_complete`, `approved_count`, `flagged_count` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | The required evidence for Custom and sensitive-scope apps is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-04` | high | `slack_assess_integrations` | `barriers` | `barrier_readable`, `barrier_complete`, `barrier_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | The required evidence for Information barriers is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-05` | medium | `slack_assess_integrations` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | The required evidence for DLP and Discovery evidence is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-06` | medium | `slack_assess_integrations` | `auth-test`, `workspaces`, `team-preferences` | `preferences_readable`, `setting_value`, `coverage_complete` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | The required evidence for File upload restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-07` | medium | `slack_assess_integrations` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | The required evidence for Token rotation and revocation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-01` | high | `slack_assess_channel_governance` | `channels` | `external_readable`, `external_complete`, `external_count` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | The required evidence for Slack Connect exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-02` | medium | `slack_assess_channel_governance` | `channels`, `channel-preferences` | `channels_readable`, `channel_count`, `announcement_channel_count`, `preference_count`, `complete`, `unrestricted_count`, `unknown_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | The required evidence for Channel posting restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-03` | medium | `slack_assess_channel_governance` | `channels`, `channel-retention` | `channels_readable`, `retention_record_count`, `complete`, `short_retention_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | The required evidence for Channel retention overrides is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-04` | medium | `slack_assess_channel_governance` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | The required evidence for External email ingestion is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-05` | medium | `slack_assess_channel_governance` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because admin team settings expose no link-preview or URL-unfurl control. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because admin team settings expose no link-preview or URL-unfurl control. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because admin team settings expose no link-preview or URL-unfurl control. | The required evidence for Link previews and URL unfurling is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-01` | critical | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `audit_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | The required evidence for Audit Logs API access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-02` | high | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `latest_age_days` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | The required evidence for Audit log recency is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-03` | medium | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `security_event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | The required evidence for Security event visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-04` | low | `slack_assess_monitoring` | `audit-schemas` | `schema_readable`, `schema_complete`, `schema_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | The required evidence for Audit schema visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-05` | medium | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `external_event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | The required evidence for External sharing monitoring is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-06` | medium | `slack_assess_monitoring` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the pull-based Audit Logs API does not report SIEM streaming or export destinations. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the pull-based Audit Logs API does not report SIEM streaming or export destinations. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the pull-based Audit Logs API does not report SIEM streaming or export destinations. | The required evidence for SIEM streaming evidence is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+
+### Primitive decision inputs
+
+Every primitive is read from the named vendor surface or collector state before evidence lists are rendered or capped. Null and missing retain unavailable semantics; they are not empty inventories, false values, or zero counts.
+
+| Finding | Input | Portable definition |
+|---|---|---|
+| `SLACK-ID-01` | `users_readable` | Semantic owner: `SLACK-ID-01.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_01_branch_01_matches`. Portable meaning: Boolean true exactly when user rosters were returned. |
+| `SLACK-ID-01` | `users_complete` | Semantic owner: `SLACK-ID-01.users_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: For SLACK-ID-01, true only when users.list is readable and its cursor is exhausted without a page or item cap. Exact source-state effects: `users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_01_branch_03_matches`. Portable meaning: true only when users.list is readable and its cursor is exhausted without a page or item cap. |
+| `SLACK-ID-01` | `active_user_count` | Semantic owner: `SLACK-ID-01.active_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_01_branch_03_matches`, `slack_id_01_branch_04_matches`. Portable meaning: Non-negative cardinality of active human users in the complete Slack inventory at the verdict point. |
+| `SLACK-ID-01` | `without_mfa_count` | Semantic owner: `SLACK-ID-01.without_mfa_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_01_branch_02_matches`. Portable meaning: Non-negative cardinality of active human users with MFA disabled in the complete Slack inventory at the verdict point. |
+| `SLACK-ID-01` | `unknown_mfa_count` | Semantic owner: `SLACK-ID-01.unknown_mfa_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_01_branch_03_matches`. Portable meaning: Non-negative cardinality of active human users without known MFA state in the complete Slack inventory at the verdict point. |
+| `SLACK-ID-02` | `users_readable` | Semantic owner: `SLACK-ID-02.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_02_branch_01_matches`. Portable meaning: Boolean true exactly when user rosters were returned. |
+| `SLACK-ID-02` | `users_complete` | Semantic owner: `SLACK-ID-02.users_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: For SLACK-ID-02, true only when users.list is readable and its cursor is exhausted without a page or item cap. Exact source-state effects: `users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_02_branch_02_matches`. Portable meaning: true only when users.list is readable and its cursor is exhausted without a page or item cap. |
+| `SLACK-ID-02` | `active_user_count` | Semantic owner: `SLACK-ID-02.active_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_02_branch_02_matches`, `slack_id_02_branch_03_matches`. Portable meaning: Non-negative cardinality of active human users in the complete Slack inventory at the verdict point. |
+| `SLACK-ID-02` | `guest_count` | Semantic owner: `SLACK-ID-02.guest_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_02_branch_02_matches`, `slack_id_02_branch_03_matches`. Portable meaning: Non-negative cardinality of active guest users in the complete Slack inventory at the verdict point. |
+| `SLACK-ID-03` | `scim_readable` | Semantic owner: `SLACK-ID-03.scim_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_03_branch_01_matches`. Portable meaning: Boolean true exactly when SCIM users were returned. |
+| `SLACK-ID-03` | `scim_complete` | Semantic owner: `SLACK-ID-03.scim_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: For SLACK-ID-03, true only when SCIM /Users is readable and its cursor is exhausted without a page or item cap. Exact source-state effects: `scim-users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_03_branch_03_matches`. Portable meaning: true only when SCIM /Users is readable and its cursor is exhausted without a page or item cap. |
+| `SLACK-ID-03` | `scim_count` | Semantic owner: `SLACK-ID-03.scim_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_03_branch_02_matches`, `slack_id_03_branch_04_matches`. Portable meaning: Non-negative cardinality of SCIM user records in the complete Slack inventory at the verdict point. |
+| `SLACK-ID-04` | `users_readable` | Semantic owner: `SLACK-ID-04.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users), `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_04_branch_01_matches`. Portable meaning: Boolean true exactly when user rosters were returned. |
+| `SLACK-ID-04` | `scim_readable` | Semantic owner: `SLACK-ID-04.scim_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users), `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_04_branch_01_matches`. Portable meaning: Boolean true exactly when SCIM users were returned. |
+| `SLACK-ID-04` | `complete` | Semantic owner: `SLACK-ID-04.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users), `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: For SLACK-ID-04, true only when both users.list and SCIM /Users are readable and completely paged. Exact source-state effects: `users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `scim-users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_04_branch_03_matches`. Portable meaning: true only when both users.list and SCIM /Users are readable and completely paged. |
+| `SLACK-ID-04` | `scim_user_count` | Semantic owner: `SLACK-ID-04.scim_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users), `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_04_branch_03_matches`, `slack_id_04_branch_04_matches`. Portable meaning: Non-negative cardinality of active users represented in SCIM in the complete Slack inventory at the verdict point. |
+| `SLACK-ID-04` | `mismatch_count` | Semantic owner: `SLACK-ID-04.mismatch_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users), `GET /scim/v2/Users` (scim-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_04_branch_02_matches`. Portable meaning: Non-negative cardinality of SCIM user records whose `active` field is not false and whose normalized `userName` equals the normalized email of a deactivated Slack user; only when `userName` is absent does the comparison use the SCIM record's normalized primary email instead. |
+| `SLACK-ID-05` | `users_readable` | Semantic owner: `SLACK-ID-05.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_05_branch_01_matches`. Portable meaning: Boolean true exactly when user rosters were returned. |
+| `SLACK-ID-05` | `users_complete` | Semantic owner: `SLACK-ID-05.users_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: For SLACK-ID-05, true only when users.list is readable and its cursor is exhausted without a page or item cap. Exact source-state effects: `users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_05_branch_02_matches`. Portable meaning: true only when users.list is readable and its cursor is exhausted without a page or item cap. |
+| `SLACK-ID-05` | `human_user_count` | Semantic owner: `SLACK-ID-05.human_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/users.list` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_id_05_branch_02_matches`, `slack_id_05_branch_03_matches`. Portable meaning: Non-negative cardinality of non-bot users in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-01` | `teams_readable` | Semantic owner: `SLACK-ADMIN-01.teams_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_01_branch_01_matches`. Portable meaning: Boolean true exactly when Grid workspaces were returned. |
+| `SLACK-ADMIN-01` | `admin_inventory_count` | Semantic owner: `SLACK-ADMIN-01.admin_inventory_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_01_branch_01_matches`, `slack_admin_01_branch_04_matches`. Portable meaning: Non-negative cardinality of administrator assignments across readable workspaces in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-01` | `complete` | Semantic owner: `SLACK-ADMIN-01.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: For SLACK-ADMIN-01, true only when the workspace list is completely paged and every listed workspace has a readable, completely paged administrator roster. Exact source-state effects: `workspaces`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `workspace-admins`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_01_branch_03_matches`. Portable meaning: true only when the workspace list is completely paged and every listed workspace has a readable, completely paged administrator roster. |
+| `SLACK-ADMIN-01` | `excessive_admin_workspace_count` | Semantic owner: `SLACK-ADMIN-01.excessive_admin_workspace_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_01_branch_02_matches`. Portable meaning: Non-negative cardinality of workspaces above the administrator threshold in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-02` | `users_readable` | Semantic owner: `SLACK-ADMIN-02.users_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_02_branch_01_matches`. Portable meaning: Boolean true exactly when user rosters were returned. |
+| `SLACK-ADMIN-02` | `users_complete` | Semantic owner: `SLACK-ADMIN-02.users_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users). Completeness/sample semantics: For SLACK-ADMIN-02, true only when admin.users.list is readable and its cursor is exhausted without a page or item cap. Exact source-state effects: `admin-users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_02_branch_03_matches`. Portable meaning: true only when admin.users.list is readable and its cursor is exhausted without a page or item cap. |
+| `SLACK-ADMIN-02` | `active_user_count` | Semantic owner: `SLACK-ADMIN-02.active_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_02_branch_03_matches`, `slack_admin_02_branch_04_matches`. Portable meaning: Non-negative cardinality of active human users in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-02` | `without_sso_count` | Semantic owner: `SLACK-ADMIN-02.without_sso_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_02_branch_02_matches`. Portable meaning: Non-negative cardinality of active organization users with SSO disabled in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-02` | `unknown_sso_count` | Semantic owner: `SLACK-ADMIN-02.unknown_sso_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_02_branch_03_matches`. Portable meaning: Non-negative cardinality of active organization users without known SSO state in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-03` | `session_readable` | Semantic owner: `SLACK-ADMIN-03.session_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users), `POST /api/admin.users.session.getSettings` (session-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_03_branch_01_matches`. Portable meaning: Boolean true exactly when session controls were returned. |
+| `SLACK-ADMIN-03` | `complete` | Semantic owner: `SLACK-ADMIN-03.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users), `POST /api/admin.users.session.getSettings` (session-settings). Completeness/sample semantics: For SLACK-ADMIN-03, true only when admin.users.list is completely paged and every active organization user has a successful explicit session-settings response. Exact source-state effects: `admin-users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `session-settings`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_03_branch_03_matches`. Portable meaning: true only when admin.users.list is completely paged and every active organization user has a successful explicit session-settings response. |
+| `SLACK-ADMIN-03` | `duration_count` | Semantic owner: `SLACK-ADMIN-03.duration_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users), `POST /api/admin.users.session.getSettings` (session-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_03_branch_01_matches`, `slack_admin_03_branch_04_matches`. Portable meaning: Non-negative cardinality of readable session durations in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-03` | `overlong_count` | Semantic owner: `SLACK-ADMIN-03.overlong_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users), `POST /api/admin.users.session.getSettings` (session-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_03_branch_02_matches`. Portable meaning: Non-negative cardinality of session durations above the maximum in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-05` | `teams_readable` | Semantic owner: `SLACK-ADMIN-05.teams_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_05_branch_01_matches`. Portable meaning: Boolean true exactly when Grid workspaces were returned. |
+| `SLACK-ADMIN-05` | `teams_complete` | Semantic owner: `SLACK-ADMIN-05.teams_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces). Completeness/sample semantics: For SLACK-ADMIN-05, true only when admin.teams.list is readable and completely paged; workspace-settings failures do not change this fact. Exact source-state effects: `workspaces`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_05_branch_03_matches`. Portable meaning: true only when admin.teams.list is readable and completely paged; workspace-settings failures do not change this fact. |
+| `SLACK-ADMIN-05` | `workspace_count` | Semantic owner: `SLACK-ADMIN-05.workspace_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_05_branch_01_matches`, `slack_admin_05_branch_04_matches`. Portable meaning: Non-negative cardinality of Grid workspaces in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-05` | `open_count` | Semantic owner: `SLACK-ADMIN-05.open_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_05_branch_02_matches`. Portable meaning: Non-negative cardinality of Slack Grid workspaces whose normalized `discoverability` value from admin.teams.list equals `open`. |
+| `SLACK-ADMIN-05` | `unknown_count` | Semantic owner: `SLACK-ADMIN-05.unknown_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_05_branch_03_matches`. Portable meaning: Non-negative cardinality of records whose required classification is unknown in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-07` | `teams_readable` | Semantic owner: `SLACK-ADMIN-07.teams_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_07_branch_01_matches`. Portable meaning: Boolean true exactly when Grid workspaces were returned. |
+| `SLACK-ADMIN-07` | `teams_complete` | Semantic owner: `SLACK-ADMIN-07.teams_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces). Completeness/sample semantics: For SLACK-ADMIN-07, true only when admin.teams.list is readable and completely paged; workspace-settings failures are counted separately and do not change this fact. Exact source-state effects: `workspaces`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_07_branch_03_matches`. Portable meaning: true only when admin.teams.list is readable and completely paged; workspace-settings failures are counted separately and do not change this fact. |
+| `SLACK-ADMIN-07` | `domain_count` | Semantic owner: `SLACK-ADMIN-07.domain_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_07_branch_01_matches`, `slack_admin_07_branch_04_matches`. Portable meaning: Non-negative cardinality of distinct verified or allowed domains in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-07` | `unrestricted_count` | Semantic owner: `SLACK-ADMIN-07.unrestricted_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_07_branch_02_matches`. Portable meaning: Non-negative cardinality of readable admin.teams.settings.info responses whose trimmed `team.email_domain` value is an empty string. |
+| `SLACK-ADMIN-07` | `settings_error_count` | Semantic owner: `SLACK-ADMIN-07.settings_error_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/admin.teams.settings.info` (workspace-settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_07_branch_03_matches`. Portable meaning: Non-negative cardinality of workspace preference reads that failed in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-08` | `emoji_readable` | Semantic owner: `SLACK-ADMIN-08.emoji_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.emoji.list` (emoji), `POST /api/admin.users.list` (admin-users), `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_08_branch_01_matches`. Portable meaning: Boolean true exactly when custom emoji were returned. |
+| `SLACK-ADMIN-08` | `emoji_complete` | Semantic owner: `SLACK-ADMIN-08.emoji_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.emoji.list` (emoji). Completeness/sample semantics: For SLACK-ADMIN-08, true only when admin.emoji.list is readable and completely paged. Exact source-state effects: `emoji`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_08_branch_03_matches`. Portable meaning: true only when admin.emoji.list is readable and completely paged. |
+| `SLACK-ADMIN-08` | `emoji_count` | Semantic owner: `SLACK-ADMIN-08.emoji_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.emoji.list` (emoji), `POST /api/admin.users.list` (admin-users), `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_08_branch_01_matches`, `slack_admin_08_branch_04_matches`. Portable meaning: Non-negative cardinality of custom emoji in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-08` | `admin_user_count` | Semantic owner: `SLACK-ADMIN-08.admin_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.emoji.list` (emoji), `POST /api/admin.users.list` (admin-users), `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_08_branch_01_matches`. Portable meaning: Non-negative cardinality of active owners and administrators in the complete Slack inventory at the verdict point. |
+| `SLACK-ADMIN-08` | `every_admin_list_unreadable` | Semantic owner: `SLACK-ADMIN-08.every_admin_list_unreadable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.emoji.list` (emoji), `POST /api/admin.users.list` (admin-users), `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_08_branch_01_matches`. Portable meaning: Boolean true exactly when no workspace admin roster was readable. |
+| `SLACK-ADMIN-08` | `roster_complete` | Semantic owner: `SLACK-ADMIN-08.roster_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.users.list` (admin-users), `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: For SLACK-ADMIN-08, true only when the organization-user roster and workspace list are readable and completely paged and every listed workspace has a readable, completely paged administrator roster. Exact source-state effects: `admin-users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `workspaces`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `workspace-admins`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_08_branch_03_matches`. Portable meaning: true only when the organization-user roster and workspace list are readable and completely paged and every listed workspace has a readable, completely paged administrator roster. |
+| `SLACK-ADMIN-08` | `non_admin_upload_count` | Semantic owner: `SLACK-ADMIN-08.non_admin_upload_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.emoji.list` (emoji), `POST /api/admin.users.list` (admin-users), `POST /api/admin.teams.list` (workspaces), `GET /api/admin.teams.admins.list` (workspace-admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_admin_08_branch_02_matches`. Portable meaning: Non-negative cardinality of uploads by non-administrators in the complete Slack inventory at the verdict point. |
+| `SLACK-APP-01` | `approved_readable` | Semantic owner: `SLACK-APP-01.approved_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.apps.approved.list` (approved-apps). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_01_branch_01_matches`. Portable meaning: Boolean true exactly when approved applications were returned. |
+| `SLACK-APP-01` | `approved_complete` | Semantic owner: `SLACK-APP-01.approved_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.apps.approved.list` (approved-apps). Completeness/sample semantics: For SLACK-APP-01, true only when the approved-app inventory is readable and completely paged. Exact source-state effects: `approved-apps`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_01_branch_03_matches`. Portable meaning: true only when the approved-app inventory is readable and completely paged. |
+| `SLACK-APP-01` | `approved_count` | Semantic owner: `SLACK-APP-01.approved_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.apps.approved.list` (approved-apps). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_01_branch_02_matches`, `slack_app_01_branch_04_matches`. Portable meaning: Non-negative cardinality of approved applications in the complete Slack inventory at the verdict point. |
+| `SLACK-APP-02` | `restricted_readable` | Semantic owner: `SLACK-APP-02.restricted_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.apps.restricted.list` (restricted-apps). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_02_branch_01_matches`. Portable meaning: Boolean true exactly when restricted applications were returned. |
+| `SLACK-APP-02` | `restricted_complete` | Semantic owner: `SLACK-APP-02.restricted_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.apps.restricted.list` (restricted-apps). Completeness/sample semantics: For SLACK-APP-02, true only when the restricted-app inventory is readable and completely paged. Exact source-state effects: `restricted-apps`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_02_branch_03_matches`. Portable meaning: true only when the restricted-app inventory is readable and completely paged. |
+| `SLACK-APP-02` | `restricted_count` | Semantic owner: `SLACK-APP-02.restricted_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.apps.restricted.list` (restricted-apps). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_02_branch_02_matches`, `slack_app_02_branch_04_matches`. Portable meaning: Non-negative cardinality of restricted applications in the complete Slack inventory at the verdict point. |
+| `SLACK-APP-03` | `approved_readable` | Semantic owner: `SLACK-APP-03.approved_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.apps.approved.list` (approved-apps). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_03_branch_01_matches`. Portable meaning: Boolean true exactly when approved applications were returned. |
+| `SLACK-APP-03` | `approved_complete` | Semantic owner: `SLACK-APP-03.approved_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.apps.approved.list` (approved-apps). Completeness/sample semantics: For SLACK-APP-03, true only when the approved-app inventory is readable and completely paged. Exact source-state effects: `approved-apps`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_03_branch_02_matches`. Portable meaning: true only when the approved-app inventory is readable and completely paged. |
+| `SLACK-APP-03` | `approved_count` | Semantic owner: `SLACK-APP-03.approved_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.apps.approved.list` (approved-apps). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_03_branch_02_matches`, `slack_app_03_branch_03_matches`. Portable meaning: Non-negative cardinality of approved applications in the complete Slack inventory at the verdict point. |
+| `SLACK-APP-03` | `flagged_count` | Semantic owner: `SLACK-APP-03.flagged_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.apps.approved.list` (approved-apps). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_03_branch_02_matches`, `slack_app_03_branch_03_matches`. Portable meaning: Non-negative cardinality of distinct approved-app names for which the app is internal, is outside the Slack Marketplace, or has at least one scope whose `is_sensitive` field is true. |
+| `SLACK-APP-04` | `barrier_readable` | Semantic owner: `SLACK-APP-04.barrier_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.barriers.list` (barriers). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_04_branch_01_matches`. Portable meaning: Boolean true exactly when information barriers were returned. |
+| `SLACK-APP-04` | `barrier_complete` | Semantic owner: `SLACK-APP-04.barrier_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /api/admin.barriers.list` (barriers). Completeness/sample semantics: For SLACK-APP-04, true only when the information-barrier inventory is readable and completely paged. Exact source-state effects: `barriers`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_04_branch_03_matches`. Portable meaning: true only when the information-barrier inventory is readable and completely paged. |
+| `SLACK-APP-04` | `barrier_count` | Semantic owner: `SLACK-APP-04.barrier_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /api/admin.barriers.list` (barriers). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_04_branch_02_matches`, `slack_app_04_branch_04_matches`. Portable meaning: Non-negative cardinality of information barriers in the complete Slack inventory at the verdict point. |
+| `SLACK-APP-06` | `preferences_readable` | Semantic owner: `SLACK-APP-06.preferences_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/auth.test` (auth-test), `POST /api/admin.teams.list` (workspaces), `POST /api/team.preferences.list` (team-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_06_branch_01_matches`. Portable meaning: Boolean true exactly when workspace preferences were returned. |
+| `SLACK-APP-06` | `setting_value` | Semantic owner: `SLACK-APP-06.setting_value`. Type/domain: string. Compared literal domain: "allow_all", "disallow_all", "type:owner,type:admin", "type:regular". Source/owner: Slack collector projection from `POST /api/auth.test` (auth-test), `POST /api/admin.teams.list` (workspaces), `POST /api/team.preferences.list` (team-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_06_branch_01_matches`, `slack_app_06_branch_02_matches`, `slack_app_06_branch_03_matches`, `slack_app_06_branch_04_matches`. Portable meaning: Raw Slack preference value retained without outcome translation. |
+| `SLACK-APP-06` | `coverage_complete` | Semantic owner: `SLACK-APP-06.coverage_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.teams.list` (workspaces), `POST /api/auth.test` (auth-test). Completeness/sample semantics: For SLACK-APP-06, true only when admin.teams.list is readable, completely paged, and returns no more than one workspace while auth.test is readable and returns a non-empty team_id; team.preferences.list readability does not change this fact. Exact source-state effects: `workspaces`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `auth-test`: false on error, denied, not-collected, missing-required-field; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_app_06_branch_03_matches`. Portable meaning: true only when admin.teams.list is readable, completely paged, and returns no more than one workspace while auth.test is readable and returns a non-empty team_id; team.preferences.list readability does not change this fact. |
+| `SLACK-CHAN-01` | `external_readable` | Semantic owner: `SLACK-CHAN-01.external_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_01_branch_01_matches`. Portable meaning: Boolean true exactly when external-collaboration records were returned. |
+| `SLACK-CHAN-01` | `external_complete` | Semantic owner: `SLACK-CHAN-01.external_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels). Completeness/sample semantics: For SLACK-CHAN-01, true only when the external-shared-channel search is readable and completely paged. Exact source-state effects: `channels`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_01_branch_03_matches`. Portable meaning: true only when the external-shared-channel search is readable and completely paged. |
+| `SLACK-CHAN-01` | `external_count` | Semantic owner: `SLACK-CHAN-01.external_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_01_branch_02_matches`, `slack_chan_01_branch_04_matches`. Portable meaning: Non-negative cardinality of external organizations or externally shared channels in the complete Slack inventory at the verdict point. |
+| `SLACK-CHAN-02` | `channels_readable` | Semantic owner: `SLACK-CHAN-02.channels_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getConversationPrefs` (channel-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_02_branch_01_matches`. Portable meaning: Boolean true exactly when channels were returned. |
+| `SLACK-CHAN-02` | `channel_count` | Semantic owner: `SLACK-CHAN-02.channel_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getConversationPrefs` (channel-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_02_branch_01_matches`. Portable meaning: Non-negative cardinality of channels in the complete Slack inventory at the verdict point. |
+| `SLACK-CHAN-02` | `announcement_channel_count` | Semantic owner: `SLACK-CHAN-02.announcement_channel_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getConversationPrefs` (channel-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_02_branch_01_matches`. Portable meaning: Non-negative cardinality of announcement-only channels in the complete Slack inventory at the verdict point. |
+| `SLACK-CHAN-02` | `preference_count` | Semantic owner: `SLACK-CHAN-02.preference_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getConversationPrefs` (channel-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_02_branch_01_matches`. Portable meaning: Non-negative cardinality of announcement-channel records with a successful admin.conversations.getConversationPrefs response. |
+| `SLACK-CHAN-02` | `complete` | Semantic owner: `SLACK-CHAN-02.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getConversationPrefs` (channel-preferences). Completeness/sample semantics: For SLACK-CHAN-02, true only when the channel search is completely paged, every announcement channel is classifiable, and every required conversation-preferences read succeeds. Exact source-state effects: `channels`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `channel-preferences`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_02_branch_03_matches`. Portable meaning: true only when the channel search is completely paged, every announcement channel is classifiable, and every required conversation-preferences read succeeds. |
+| `SLACK-CHAN-02` | `unrestricted_count` | Semantic owner: `SLACK-CHAN-02.unrestricted_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getConversationPrefs` (channel-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_02_branch_02_matches`, `slack_chan_02_branch_04_matches`. Portable meaning: Non-negative cardinality of announcement-channel preference records whose posting-restriction classifier returns false. |
+| `SLACK-CHAN-02` | `unknown_count` | Semantic owner: `SLACK-CHAN-02.unknown_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getConversationPrefs` (channel-preferences). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_02_branch_03_matches`. Portable meaning: Non-negative cardinality of records whose required classification is unknown in the complete Slack inventory at the verdict point. |
+| `SLACK-CHAN-03` | `channels_readable` | Semantic owner: `SLACK-CHAN-03.channels_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getCustomRetention` (channel-retention). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_03_branch_01_matches`. Portable meaning: Boolean true exactly when channels were returned. |
+| `SLACK-CHAN-03` | `retention_record_count` | Semantic owner: `SLACK-CHAN-03.retention_record_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getCustomRetention` (channel-retention). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_03_branch_01_matches`. Portable meaning: Non-negative cardinality of retention preference records in the complete Slack inventory at the verdict point. |
+| `SLACK-CHAN-03` | `complete` | Semantic owner: `SLACK-CHAN-03.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getCustomRetention` (channel-retention). Completeness/sample semantics: For SLACK-CHAN-03, true only when the channel search is completely paged and every required custom-retention read succeeds. Exact source-state effects: `channels`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `channel-retention`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_03_branch_03_matches`. Portable meaning: true only when the channel search is completely paged and every required custom-retention read succeeds. |
+| `SLACK-CHAN-03` | `short_retention_count` | Semantic owner: `SLACK-CHAN-03.short_retention_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `POST /api/admin.conversations.search` (channels), `POST /api/admin.conversations.getCustomRetention` (channel-retention). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_chan_03_branch_02_matches`, `slack_chan_03_branch_04_matches`. Portable meaning: Non-negative cardinality of retention values below the minimum in the complete Slack inventory at the verdict point. |
+| `SLACK-MON-01` | `audit_readable` | Semantic owner: `SLACK-MON-01.audit_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_01_branch_01_matches`. Portable meaning: Boolean true exactly when audit events were returned. |
+| `SLACK-MON-01` | `audit_complete` | Semantic owner: `SLACK-MON-01.audit_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: For SLACK-MON-01, true only when the audit-log lookback is readable and completely paged within its configured limit. Exact source-state effects: `audit-logs`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_01_branch_03_matches`. Portable meaning: true only when the audit-log lookback is readable and completely paged within its configured limit. |
+| `SLACK-MON-01` | `audit_count` | Semantic owner: `SLACK-MON-01.audit_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_01_branch_02_matches`, `slack_mon_01_branch_04_matches`. Portable meaning: Non-negative cardinality of audit events in the lookback in the complete Slack inventory at the verdict point. |
+| `SLACK-MON-02` | `audit_readable` | Semantic owner: `SLACK-MON-02.audit_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_02_branch_01_matches`. Portable meaning: Boolean true exactly when audit events were returned. |
+| `SLACK-MON-02` | `audit_complete` | Semantic owner: `SLACK-MON-02.audit_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: For SLACK-MON-02, true only when the audit-log lookback is readable and completely paged within its configured limit. Exact source-state effects: `audit-logs`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_02_branch_03_matches`. Portable meaning: true only when the audit-log lookback is readable and completely paged within its configured limit. |
+| `SLACK-MON-02` | `latest_age_days` | Semantic owner: `SLACK-MON-02.latest_age_days`. Type/domain: number. Compared literal domain: 1. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_02_branch_02_matches`, `slack_mon_02_branch_03_matches`, `slack_mon_02_branch_04_matches`. Portable meaning: Age in whole days of the newest relevant audit event. |
+| `SLACK-MON-03` | `audit_readable` | Semantic owner: `SLACK-MON-03.audit_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_03_branch_01_matches`. Portable meaning: Boolean true exactly when audit events were returned. |
+| `SLACK-MON-03` | `audit_complete` | Semantic owner: `SLACK-MON-03.audit_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: For SLACK-MON-03, true only when the audit-log lookback is readable and completely paged within its configured limit. Exact source-state effects: `audit-logs`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_03_branch_02_matches`. Portable meaning: true only when the audit-log lookback is readable and completely paged within its configured limit. |
+| `SLACK-MON-03` | `security_event_count` | Semantic owner: `SLACK-MON-03.security_event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_03_branch_02_matches`, `slack_mon_03_branch_03_matches`. Portable meaning: Non-negative cardinality of events in the security action set in the complete Slack inventory at the verdict point. |
+| `SLACK-MON-04` | `schema_readable` | Semantic owner: `SLACK-MON-04.schema_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/schemas` (audit-schemas). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_04_branch_01_matches`. Portable meaning: Boolean true exactly when audit schemas were returned. |
+| `SLACK-MON-04` | `schema_complete` | Semantic owner: `SLACK-MON-04.schema_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/schemas` (audit-schemas). Completeness/sample semantics: For SLACK-MON-04, true only when the audit-schema inventory is readable and completely paged. Exact source-state effects: `audit-schemas`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_04_branch_03_matches`. Portable meaning: true only when the audit-schema inventory is readable and completely paged. |
+| `SLACK-MON-04` | `schema_count` | Semantic owner: `SLACK-MON-04.schema_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /audit/v1/schemas` (audit-schemas). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_04_branch_02_matches`, `slack_mon_04_branch_04_matches`. Portable meaning: Non-negative cardinality of audit schemas in the complete Slack inventory at the verdict point. |
+| `SLACK-MON-05` | `audit_readable` | Semantic owner: `SLACK-MON-05.audit_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_05_branch_01_matches`. Portable meaning: Boolean true exactly when audit events were returned. |
+| `SLACK-MON-05` | `audit_complete` | Semantic owner: `SLACK-MON-05.audit_complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: For SLACK-MON-05, true only when the audit-log lookback is readable and completely paged within its configured limit. Exact source-state effects: `audit-logs`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_05_branch_02_matches`. Portable meaning: true only when the audit-log lookback is readable and completely paged within its configured limit. |
+| `SLACK-MON-05` | `external_event_count` | Semantic owner: `SLACK-MON-05.external_event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Slack collector projection from `GET /audit/v1/logs` (audit-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `slack_mon_05_branch_02_matches`, `slack_mon_05_branch_03_matches`. Portable meaning: Non-negative cardinality of external-collaboration audit events in the complete Slack inventory at the verdict point. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+A `matches` condition performs a regular-expression search; anchors are required for whole-value matching, and an `i` flag requests case-insensitive matching. A `ratio` condition divides the numerator by the denominator, applies the declared scale, and rounds to the declared decimal places by choosing the nearest value with exact half cases rounded toward positive infinity; a zero, null, or missing denominator does not match.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `SLACK-ID-01` | 1 | manual | `slack_id_01_branch_01_matches` equals true |  |
+| `SLACK-ID-01` | 2 | fail | `slack_id_01_branch_02_matches` equals true |  |
+| `SLACK-ID-01` | 3 | warn | `slack_id_01_branch_03_matches` equals true |  |
+| `SLACK-ID-01` | 4 | pass | `slack_id_01_branch_04_matches` equals true |  |
+| `SLACK-ID-01` | 5 | manual | `slack_id_01_branch_05_matches` equals true |  |
+| `SLACK-ID-02` | 1 | manual | `slack_id_02_branch_01_matches` equals true |  |
+| `SLACK-ID-02` | 2 | warn | `slack_id_02_branch_02_matches` equals true |  |
+| `SLACK-ID-02` | 3 | pass | `slack_id_02_branch_03_matches` equals true |  |
+| `SLACK-ID-02` | 4 | manual | `slack_id_02_branch_04_matches` equals true |  |
+| `SLACK-ID-03` | 1 | manual | `slack_id_03_branch_01_matches` equals true |  |
+| `SLACK-ID-03` | 2 | fail | `slack_id_03_branch_02_matches` equals true |  |
+| `SLACK-ID-03` | 3 | warn | `slack_id_03_branch_03_matches` equals true |  |
+| `SLACK-ID-03` | 4 | pass | `slack_id_03_branch_04_matches` equals true |  |
+| `SLACK-ID-03` | 5 | manual | `slack_id_03_branch_05_matches` equals true |  |
+| `SLACK-ID-04` | 1 | manual | `slack_id_04_branch_01_matches` equals true |  |
+| `SLACK-ID-04` | 2 | fail | `slack_id_04_branch_02_matches` equals true |  |
+| `SLACK-ID-04` | 3 | warn | `slack_id_04_branch_03_matches` equals true |  |
+| `SLACK-ID-04` | 4 | pass | `slack_id_04_branch_04_matches` equals true |  |
+| `SLACK-ID-04` | 5 | manual | `slack_id_04_branch_05_matches` equals true |  |
+| `SLACK-ID-05` | 1 | manual | `slack_id_05_branch_01_matches` equals true |  |
+| `SLACK-ID-05` | 2 | warn | `slack_id_05_branch_02_matches` equals true |  |
+| `SLACK-ID-05` | 3 | pass | `slack_id_05_branch_03_matches` equals true |  |
+| `SLACK-ID-05` | 4 | manual | `slack_id_05_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-01` | 1 | manual | `slack_admin_01_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-01` | 2 | fail | `slack_admin_01_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-01` | 3 | warn | `slack_admin_01_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-01` | 4 | pass | `slack_admin_01_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-01` | 5 | manual | `slack_admin_01_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-02` | 1 | manual | `slack_admin_02_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-02` | 2 | fail | `slack_admin_02_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-02` | 3 | warn | `slack_admin_02_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-02` | 4 | pass | `slack_admin_02_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-02` | 5 | manual | `slack_admin_02_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-03` | 1 | manual | `slack_admin_03_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-03` | 2 | fail | `slack_admin_03_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-03` | 3 | warn | `slack_admin_03_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-03` | 4 | pass | `slack_admin_03_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-03` | 5 | manual | `slack_admin_03_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-04` | 1 | manual | `slack_admin_04_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-05` | 1 | manual | `slack_admin_05_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-05` | 2 | fail | `slack_admin_05_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-05` | 3 | warn | `slack_admin_05_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-05` | 4 | pass | `slack_admin_05_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-05` | 5 | manual | `slack_admin_05_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-06` | 1 | manual | `slack_admin_06_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-07` | 1 | manual | `slack_admin_07_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-07` | 2 | fail | `slack_admin_07_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-07` | 3 | warn | `slack_admin_07_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-07` | 4 | pass | `slack_admin_07_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-07` | 5 | manual | `slack_admin_07_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-08` | 1 | manual | `slack_admin_08_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-08` | 2 | fail | `slack_admin_08_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-08` | 3 | warn | `slack_admin_08_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-08` | 4 | pass | `slack_admin_08_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-08` | 5 | manual | `slack_admin_08_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-09` | 1 | manual | `slack_admin_09_branch_01_matches` equals true |  |
+| `SLACK-APP-01` | 1 | manual | `slack_app_01_branch_01_matches` equals true |  |
+| `SLACK-APP-01` | 2 | warn | `slack_app_01_branch_02_matches` equals true |  |
+| `SLACK-APP-01` | 3 | warn | `slack_app_01_branch_03_matches` equals true |  |
+| `SLACK-APP-01` | 4 | pass | `slack_app_01_branch_04_matches` equals true |  |
+| `SLACK-APP-01` | 5 | manual | `slack_app_01_branch_05_matches` equals true |  |
+| `SLACK-APP-02` | 1 | manual | `slack_app_02_branch_01_matches` equals true |  |
+| `SLACK-APP-02` | 2 | warn | `slack_app_02_branch_02_matches` equals true |  |
+| `SLACK-APP-02` | 3 | warn | `slack_app_02_branch_03_matches` equals true |  |
+| `SLACK-APP-02` | 4 | pass | `slack_app_02_branch_04_matches` equals true |  |
+| `SLACK-APP-02` | 5 | manual | `slack_app_02_branch_05_matches` equals true |  |
+| `SLACK-APP-03` | 1 | manual | `slack_app_03_branch_01_matches` equals true |  |
+| `SLACK-APP-03` | 2 | warn | `slack_app_03_branch_02_matches` equals true |  |
+| `SLACK-APP-03` | 3 | pass | `slack_app_03_branch_03_matches` equals true |  |
+| `SLACK-APP-03` | 4 | manual | `slack_app_03_branch_04_matches` equals true |  |
+| `SLACK-APP-04` | 1 | manual | `slack_app_04_branch_01_matches` equals true |  |
+| `SLACK-APP-04` | 2 | warn | `slack_app_04_branch_02_matches` equals true |  |
+| `SLACK-APP-04` | 3 | warn | `slack_app_04_branch_03_matches` equals true |  |
+| `SLACK-APP-04` | 4 | pass | `slack_app_04_branch_04_matches` equals true |  |
+| `SLACK-APP-04` | 5 | manual | `slack_app_04_branch_05_matches` equals true |  |
+| `SLACK-APP-05` | 1 | manual | `slack_app_05_branch_01_matches` equals true |  |
+| `SLACK-APP-06` | 1 | manual | `slack_app_06_branch_01_matches` equals true |  |
+| `SLACK-APP-06` | 2 | fail | `slack_app_06_branch_02_matches` equals true |  |
+| `SLACK-APP-06` | 3 | warn | `slack_app_06_branch_03_matches` equals true |  |
+| `SLACK-APP-06` | 4 | pass | `slack_app_06_branch_04_matches` equals true |  |
+| `SLACK-APP-06` | 5 | manual | `slack_app_06_branch_05_matches` equals true |  |
+| `SLACK-APP-07` | 1 | manual | `slack_app_07_branch_01_matches` equals true |  |
+| `SLACK-CHAN-01` | 1 | manual | `slack_chan_01_branch_01_matches` equals true |  |
+| `SLACK-CHAN-01` | 2 | warn | `slack_chan_01_branch_02_matches` equals true |  |
+| `SLACK-CHAN-01` | 3 | warn | `slack_chan_01_branch_03_matches` equals true |  |
+| `SLACK-CHAN-01` | 4 | pass | `slack_chan_01_branch_04_matches` equals true |  |
+| `SLACK-CHAN-01` | 5 | manual | `slack_chan_01_branch_05_matches` equals true |  |
+| `SLACK-CHAN-02` | 1 | manual | `slack_chan_02_branch_01_matches` equals true |  |
+| `SLACK-CHAN-02` | 2 | fail | `slack_chan_02_branch_02_matches` equals true |  |
+| `SLACK-CHAN-02` | 3 | warn | `slack_chan_02_branch_03_matches` equals true |  |
+| `SLACK-CHAN-02` | 4 | pass | `slack_chan_02_branch_04_matches` equals true |  |
+| `SLACK-CHAN-02` | 5 | manual | `slack_chan_02_branch_05_matches` equals true |  |
+| `SLACK-CHAN-03` | 1 | manual | `slack_chan_03_branch_01_matches` equals true |  |
+| `SLACK-CHAN-03` | 2 | fail | `slack_chan_03_branch_02_matches` equals true |  |
+| `SLACK-CHAN-03` | 3 | warn | `slack_chan_03_branch_03_matches` equals true |  |
+| `SLACK-CHAN-03` | 4 | pass | `slack_chan_03_branch_04_matches` equals true |  |
+| `SLACK-CHAN-03` | 5 | manual | `slack_chan_03_branch_05_matches` equals true |  |
+| `SLACK-CHAN-04` | 1 | manual | `slack_chan_04_branch_01_matches` equals true |  |
+| `SLACK-CHAN-05` | 1 | manual | `slack_chan_05_branch_01_matches` equals true |  |
+| `SLACK-MON-01` | 1 | manual | `slack_mon_01_branch_01_matches` equals true |  |
+| `SLACK-MON-01` | 2 | fail | `slack_mon_01_branch_02_matches` equals true |  |
+| `SLACK-MON-01` | 3 | warn | `slack_mon_01_branch_03_matches` equals true |  |
+| `SLACK-MON-01` | 4 | pass | `slack_mon_01_branch_04_matches` equals true |  |
+| `SLACK-MON-01` | 5 | manual | `slack_mon_01_branch_05_matches` equals true |  |
+| `SLACK-MON-02` | 1 | manual | `slack_mon_02_branch_01_matches` equals true |  |
+| `SLACK-MON-02` | 2 | fail | `slack_mon_02_branch_02_matches` equals true |  |
+| `SLACK-MON-02` | 3 | warn | `slack_mon_02_branch_03_matches` equals true |  |
+| `SLACK-MON-02` | 4 | pass | `slack_mon_02_branch_04_matches` equals true |  |
+| `SLACK-MON-02` | 5 | manual | `slack_mon_02_branch_05_matches` equals true |  |
+| `SLACK-MON-03` | 1 | manual | `slack_mon_03_branch_01_matches` equals true |  |
+| `SLACK-MON-03` | 2 | warn | `slack_mon_03_branch_02_matches` equals true |  |
+| `SLACK-MON-03` | 3 | pass | `slack_mon_03_branch_03_matches` equals true |  |
+| `SLACK-MON-03` | 4 | manual | `slack_mon_03_branch_04_matches` equals true |  |
+| `SLACK-MON-04` | 1 | manual | `slack_mon_04_branch_01_matches` equals true |  |
+| `SLACK-MON-04` | 2 | warn | `slack_mon_04_branch_02_matches` equals true |  |
+| `SLACK-MON-04` | 3 | warn | `slack_mon_04_branch_03_matches` equals true |  |
+| `SLACK-MON-04` | 4 | pass | `slack_mon_04_branch_04_matches` equals true |  |
+| `SLACK-MON-04` | 5 | manual | `slack_mon_04_branch_05_matches` equals true |  |
+| `SLACK-MON-05` | 1 | manual | `slack_mon_05_branch_01_matches` equals true |  |
+| `SLACK-MON-05` | 2 | warn | `slack_mon_05_branch_02_matches` equals true |  |
+| `SLACK-MON-05` | 3 | pass | `slack_mon_05_branch_03_matches` equals true |  |
+| `SLACK-MON-05` | 4 | manual | `slack_mon_05_branch_04_matches` equals true |  |
+| `SLACK-MON-06` | 1 | manual | `slack_mon_06_branch_01_matches` equals true |  |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `SLACK-ID-01` | `slack_id_01_branch_01_matches` | SLACK-ID-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ID-01` | `slack_id_01_branch_02_matches` | SLACK-ID-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `without_mfa_count` is greater than 0. |
+| `SLACK-ID-01` | `slack_id_01_branch_03_matches` | SLACK-ID-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`active_user_count` equals 0; `unknown_mfa_count` is greater than 0; `users_complete` does not equal true). |
+| `SLACK-ID-01` | `slack_id_01_branch_04_matches` | SLACK-ID-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `active_user_count` is greater than 0. |
+| `SLACK-ID-01` | `slack_id_01_branch_05_matches` | SLACK-ID-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-02` | `slack_id_02_branch_01_matches` | SLACK-ID-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ID-02` | `slack_id_02_branch_02_matches` | SLACK-ID-02 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`guest_count` is greater than 0; `active_user_count` equals 0; `users_complete` does not equal true). |
+| `SLACK-ID-02` | `slack_id_02_branch_03_matches` | SLACK-ID-02 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`active_user_count` is greater than 0; `guest_count` equals 0). |
+| `SLACK-ID-02` | `slack_id_02_branch_04_matches` | SLACK-ID-02 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-03` | `slack_id_03_branch_01_matches` | SLACK-ID-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `scim_readable` does not equal true. |
+| `SLACK-ID-03` | `slack_id_03_branch_02_matches` | SLACK-ID-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `scim_count` equals 0. |
+| `SLACK-ID-03` | `slack_id_03_branch_03_matches` | SLACK-ID-03 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `scim_complete` does not equal true. |
+| `SLACK-ID-03` | `slack_id_03_branch_04_matches` | SLACK-ID-03 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `scim_count` is greater than 0. |
+| `SLACK-ID-03` | `slack_id_03_branch_05_matches` | SLACK-ID-03 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-04` | `slack_id_04_branch_01_matches` | SLACK-ID-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`users_readable` does not equal true; `scim_readable` does not equal true). |
+| `SLACK-ID-04` | `slack_id_04_branch_02_matches` | SLACK-ID-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `mismatch_count` is greater than 0. |
+| `SLACK-ID-04` | `slack_id_04_branch_03_matches` | SLACK-ID-04 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `scim_user_count` equals 0). |
+| `SLACK-ID-04` | `slack_id_04_branch_04_matches` | SLACK-ID-04 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `scim_user_count` is greater than 0. |
+| `SLACK-ID-04` | `slack_id_04_branch_05_matches` | SLACK-ID-04 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-05` | `slack_id_05_branch_01_matches` | SLACK-ID-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ID-05` | `slack_id_05_branch_02_matches` | SLACK-ID-05 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`users_complete` does not equal true; `human_user_count` equals 0). |
+| `SLACK-ID-05` | `slack_id_05_branch_03_matches` | SLACK-ID-05 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `human_user_count` is greater than 0. |
+| `SLACK-ID-05` | `slack_id_05_branch_04_matches` | SLACK-ID-05 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_01_matches` | SLACK-ADMIN-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`teams_readable` does not equal true; `admin_inventory_count` equals 0). |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_02_matches` | SLACK-ADMIN-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `excessive_admin_workspace_count` is greater than 0. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_03_matches` | SLACK-ADMIN-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_04_matches` | SLACK-ADMIN-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `admin_inventory_count` is greater than 0. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_05_matches` | SLACK-ADMIN-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_01_matches` | SLACK-ADMIN-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_02_matches` | SLACK-ADMIN-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `without_sso_count` is greater than 0. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_03_matches` | SLACK-ADMIN-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`active_user_count` equals 0; `unknown_sso_count` is greater than 0; `users_complete` does not equal true). |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_04_matches` | SLACK-ADMIN-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `active_user_count` is greater than 0. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_05_matches` | SLACK-ADMIN-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_01_matches` | SLACK-ADMIN-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`session_readable` does not equal true; `duration_count` equals 0). |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_02_matches` | SLACK-ADMIN-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `overlong_count` is greater than 0. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_03_matches` | SLACK-ADMIN-03 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_04_matches` | SLACK-ADMIN-03 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `duration_count` is greater than 0. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_05_matches` | SLACK-ADMIN-03 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-04` | `slack_admin_04_branch_01_matches` | SLACK-ADMIN-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_01_matches` | SLACK-ADMIN-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`teams_readable` does not equal true; `workspace_count` equals 0). |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_02_matches` | SLACK-ADMIN-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `open_count` is greater than 0. |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_03_matches` | SLACK-ADMIN-05 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`unknown_count` is greater than 0; `teams_complete` does not equal true). |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_04_matches` | SLACK-ADMIN-05 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `workspace_count` is greater than 0. |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_05_matches` | SLACK-ADMIN-05 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-06` | `slack_admin_06_branch_01_matches` | SLACK-ADMIN-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_01_matches` | SLACK-ADMIN-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`teams_readable` does not equal true; `domain_count` equals 0). |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_02_matches` | SLACK-ADMIN-07 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `unrestricted_count` is greater than 0. |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_03_matches` | SLACK-ADMIN-07 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`settings_error_count` is greater than 0; `teams_complete` does not equal true). |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_04_matches` | SLACK-ADMIN-07 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `domain_count` is greater than 0. |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_05_matches` | SLACK-ADMIN-07 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_01_matches` | SLACK-ADMIN-08 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`emoji_readable` does not equal true; `emoji_count` equals 0; `admin_user_count` equals 0; `every_admin_list_unreadable` equals true). |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_02_matches` | SLACK-ADMIN-08 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `non_admin_upload_count` is greater than 0. |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_03_matches` | SLACK-ADMIN-08 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`roster_complete` does not equal true; `emoji_complete` does not equal true). |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_04_matches` | SLACK-ADMIN-08 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `emoji_count` is greater than 0. |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_05_matches` | SLACK-ADMIN-08 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-09` | `slack_admin_09_branch_01_matches` | SLACK-ADMIN-09 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-01` | `slack_app_01_branch_01_matches` | SLACK-APP-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `approved_readable` does not equal true. |
+| `SLACK-APP-01` | `slack_app_01_branch_02_matches` | SLACK-APP-01 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `approved_count` equals 0. |
+| `SLACK-APP-01` | `slack_app_01_branch_03_matches` | SLACK-APP-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `approved_complete` does not equal true. |
+| `SLACK-APP-01` | `slack_app_01_branch_04_matches` | SLACK-APP-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `approved_count` is greater than 0. |
+| `SLACK-APP-01` | `slack_app_01_branch_05_matches` | SLACK-APP-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-02` | `slack_app_02_branch_01_matches` | SLACK-APP-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `restricted_readable` does not equal true. |
+| `SLACK-APP-02` | `slack_app_02_branch_02_matches` | SLACK-APP-02 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `restricted_count` equals 0. |
+| `SLACK-APP-02` | `slack_app_02_branch_03_matches` | SLACK-APP-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `restricted_complete` does not equal true. |
+| `SLACK-APP-02` | `slack_app_02_branch_04_matches` | SLACK-APP-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `restricted_count` is greater than 0. |
+| `SLACK-APP-02` | `slack_app_02_branch_05_matches` | SLACK-APP-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-03` | `slack_app_03_branch_01_matches` | SLACK-APP-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `approved_readable` does not equal true. |
+| `SLACK-APP-03` | `slack_app_03_branch_02_matches` | SLACK-APP-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`approved_count` equals 0; `flagged_count` is greater than 0; `approved_complete` does not equal true). |
+| `SLACK-APP-03` | `slack_app_03_branch_03_matches` | SLACK-APP-03 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`approved_count` is greater than 0; `flagged_count` equals 0). |
+| `SLACK-APP-03` | `slack_app_03_branch_04_matches` | SLACK-APP-03 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-04` | `slack_app_04_branch_01_matches` | SLACK-APP-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `barrier_readable` does not equal true. |
+| `SLACK-APP-04` | `slack_app_04_branch_02_matches` | SLACK-APP-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `barrier_count` equals 0. |
+| `SLACK-APP-04` | `slack_app_04_branch_03_matches` | SLACK-APP-04 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `barrier_complete` does not equal true. |
+| `SLACK-APP-04` | `slack_app_04_branch_04_matches` | SLACK-APP-04 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `barrier_count` is greater than 0. |
+| `SLACK-APP-04` | `slack_app_04_branch_05_matches` | SLACK-APP-04 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-05` | `slack_app_05_branch_01_matches` | SLACK-APP-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-06` | `slack_app_06_branch_01_matches` | SLACK-APP-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`preferences_readable` does not equal true; not (`setting_value` is present and non-null)). |
+| `SLACK-APP-06` | `slack_app_06_branch_02_matches` | SLACK-APP-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `setting_value` equals "allow_all". |
+| `SLACK-APP-06` | `slack_app_06_branch_03_matches` | SLACK-APP-06 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`setting_value` equals "type:regular"; `coverage_complete` does not equal true; all of (`setting_value` does not equal "disallow_all"; `setting_value` does not equal "type:owner,type:admin")). |
+| `SLACK-APP-06` | `slack_app_06_branch_04_matches` | SLACK-APP-06 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: any of (`setting_value` equals "disallow_all"; `setting_value` equals "type:owner,type:admin"). |
+| `SLACK-APP-06` | `slack_app_06_branch_05_matches` | SLACK-APP-06 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-07` | `slack_app_07_branch_01_matches` | SLACK-APP-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_01_matches` | SLACK-CHAN-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `external_readable` does not equal true. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_02_matches` | SLACK-CHAN-01 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `external_count` is greater than 0. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_03_matches` | SLACK-CHAN-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `external_complete` does not equal true. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_04_matches` | SLACK-CHAN-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `external_count` equals 0. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_05_matches` | SLACK-CHAN-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_01_matches` | SLACK-CHAN-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`channels_readable` does not equal true; `channel_count` equals 0; `announcement_channel_count` equals 0; `preference_count` equals 0). |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_02_matches` | SLACK-CHAN-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `unrestricted_count` is greater than 0. |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_03_matches` | SLACK-CHAN-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`unknown_count` is greater than 0; `complete` does not equal true). |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_04_matches` | SLACK-CHAN-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `unrestricted_count` equals 0. |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_05_matches` | SLACK-CHAN-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_01_matches` | SLACK-CHAN-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`channels_readable` does not equal true; `retention_record_count` equals 0). |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_02_matches` | SLACK-CHAN-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `short_retention_count` is greater than 0. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_03_matches` | SLACK-CHAN-03 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_04_matches` | SLACK-CHAN-03 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `short_retention_count` equals 0. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_05_matches` | SLACK-CHAN-03 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-04` | `slack_chan_04_branch_01_matches` | SLACK-CHAN-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-05` | `slack_chan_05_branch_01_matches` | SLACK-CHAN-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-01` | `slack_mon_01_branch_01_matches` | SLACK-MON-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-01` | `slack_mon_01_branch_02_matches` | SLACK-MON-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `audit_count` equals 0. |
+| `SLACK-MON-01` | `slack_mon_01_branch_03_matches` | SLACK-MON-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `audit_complete` does not equal true. |
+| `SLACK-MON-01` | `slack_mon_01_branch_04_matches` | SLACK-MON-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `audit_count` is greater than 0. |
+| `SLACK-MON-01` | `slack_mon_01_branch_05_matches` | SLACK-MON-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-02` | `slack_mon_02_branch_01_matches` | SLACK-MON-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-02` | `slack_mon_02_branch_02_matches` | SLACK-MON-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `latest_age_days` is greater than 1. |
+| `SLACK-MON-02` | `slack_mon_02_branch_03_matches` | SLACK-MON-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (not (`latest_age_days` is present and non-null); `audit_complete` does not equal true). |
+| `SLACK-MON-02` | `slack_mon_02_branch_04_matches` | SLACK-MON-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `latest_age_days` is at most 1. |
+| `SLACK-MON-02` | `slack_mon_02_branch_05_matches` | SLACK-MON-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-03` | `slack_mon_03_branch_01_matches` | SLACK-MON-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-03` | `slack_mon_03_branch_02_matches` | SLACK-MON-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`security_event_count` equals 0; `audit_complete` does not equal true). |
+| `SLACK-MON-03` | `slack_mon_03_branch_03_matches` | SLACK-MON-03 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `security_event_count` is greater than 0. |
+| `SLACK-MON-03` | `slack_mon_03_branch_04_matches` | SLACK-MON-03 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-04` | `slack_mon_04_branch_01_matches` | SLACK-MON-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `schema_readable` does not equal true. |
+| `SLACK-MON-04` | `slack_mon_04_branch_02_matches` | SLACK-MON-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `schema_count` equals 0. |
+| `SLACK-MON-04` | `slack_mon_04_branch_03_matches` | SLACK-MON-04 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `schema_complete` does not equal true. |
+| `SLACK-MON-04` | `slack_mon_04_branch_04_matches` | SLACK-MON-04 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `schema_count` is greater than 0. |
+| `SLACK-MON-04` | `slack_mon_04_branch_05_matches` | SLACK-MON-04 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-05` | `slack_mon_05_branch_01_matches` | SLACK-MON-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-05` | `slack_mon_05_branch_02_matches` | SLACK-MON-05 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`external_event_count` equals 0; `audit_complete` does not equal true). |
+| `SLACK-MON-05` | `slack_mon_05_branch_03_matches` | SLACK-MON-05 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `external_event_count` is greater than 0. |
+| `SLACK-MON-05` | `slack_mon_05_branch_04_matches` | SLACK-MON-05 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-06` | `slack_mon_06_branch_01_matches` | SLACK-MON-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `SLACK-ID-01` | `requiredEvidenceReadable` | true |
+| `SLACK-ID-01` | `requiredEvidenceComplete` | true |
+| `SLACK-ID-02` | `requiredEvidenceReadable` | true |
+| `SLACK-ID-02` | `requiredEvidenceComplete` | true |
+| `SLACK-ID-03` | `requiredEvidenceReadable` | true |
+| `SLACK-ID-03` | `requiredEvidenceComplete` | true |
+| `SLACK-ID-04` | `requiredEvidenceReadable` | true |
+| `SLACK-ID-04` | `requiredEvidenceComplete` | true |
+| `SLACK-ID-05` | `requiredEvidenceReadable` | true |
+| `SLACK-ID-05` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-01` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-01` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-02` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-02` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-03` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-03` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-04` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-04` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-05` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-05` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-06` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-06` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-07` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-07` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-08` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-08` | `requiredEvidenceComplete` | true |
+| `SLACK-ADMIN-09` | `requiredEvidenceReadable` | true |
+| `SLACK-ADMIN-09` | `requiredEvidenceComplete` | true |
+| `SLACK-APP-01` | `requiredEvidenceReadable` | true |
+| `SLACK-APP-01` | `requiredEvidenceComplete` | true |
+| `SLACK-APP-02` | `requiredEvidenceReadable` | true |
+| `SLACK-APP-02` | `requiredEvidenceComplete` | true |
+| `SLACK-APP-03` | `requiredEvidenceReadable` | true |
+| `SLACK-APP-03` | `requiredEvidenceComplete` | true |
+| `SLACK-APP-04` | `requiredEvidenceReadable` | true |
+| `SLACK-APP-04` | `requiredEvidenceComplete` | true |
+| `SLACK-APP-05` | `requiredEvidenceReadable` | true |
+| `SLACK-APP-05` | `requiredEvidenceComplete` | true |
+| `SLACK-APP-06` | `requiredEvidenceReadable` | true |
+| `SLACK-APP-06` | `requiredEvidenceComplete` | true |
+| `SLACK-APP-07` | `requiredEvidenceReadable` | true |
+| `SLACK-APP-07` | `requiredEvidenceComplete` | true |
+| `SLACK-CHAN-01` | `requiredEvidenceReadable` | true |
+| `SLACK-CHAN-01` | `requiredEvidenceComplete` | true |
+| `SLACK-CHAN-02` | `requiredEvidenceReadable` | true |
+| `SLACK-CHAN-02` | `requiredEvidenceComplete` | true |
+| `SLACK-CHAN-03` | `requiredEvidenceReadable` | true |
+| `SLACK-CHAN-03` | `requiredEvidenceComplete` | true |
+| `SLACK-CHAN-04` | `requiredEvidenceReadable` | true |
+| `SLACK-CHAN-04` | `requiredEvidenceComplete` | true |
+| `SLACK-CHAN-05` | `requiredEvidenceReadable` | true |
+| `SLACK-CHAN-05` | `requiredEvidenceComplete` | true |
+| `SLACK-MON-01` | `requiredEvidenceReadable` | true |
+| `SLACK-MON-01` | `requiredEvidenceComplete` | true |
+| `SLACK-MON-02` | `requiredEvidenceReadable` | true |
+| `SLACK-MON-02` | `requiredEvidenceComplete` | true |
+| `SLACK-MON-03` | `requiredEvidenceReadable` | true |
+| `SLACK-MON-03` | `requiredEvidenceComplete` | true |
+| `SLACK-MON-04` | `requiredEvidenceReadable` | true |
+| `SLACK-MON-04` | `requiredEvidenceComplete` | true |
+| `SLACK-MON-05` | `requiredEvidenceReadable` | true |
+| `SLACK-MON-05` | `requiredEvidenceComplete` | true |
+| `SLACK-MON-06` | `requiredEvidenceReadable` | true |
+| `SLACK-MON-06` | `requiredEvidenceComplete` | true |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `SLACK-ID-01` | compliant | All required source reads are complete and this derivation returns pass: return fail when any active human user has has_2fa=false, pass when every active human in a complete non-empty inventory has has_2fa=true, and warn for empty, unknown, or partial enrollment evidence. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any active human user has has_2fa=false, pass when every active human in a complete non-empty inventory has has_2fa=true, and warn for empty, unknown, or partial enrollment evidence. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-02` | compliant | All required source reads are complete and this derivation returns pass: return warn when any active guest exists or the inventory is empty or partial, and pass only when a complete non-empty human inventory contains no active guest. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: return warn when any active guest exists or the inventory is empty or partial, and pass only when a complete non-empty human inventory contains no active guest. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-03` | compliant | All required source reads are complete and this derivation returns pass: return fail when readable SCIM configuration has zero users, pass when the complete SCIM user inventory is non-empty, and warn when that non-empty inventory is partial. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when readable SCIM configuration has zero users, pass when the complete SCIM user inventory is non-empty, and warn when that non-empty inventory is partial. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-04` | compliant | All required source reads are complete and this derivation returns pass: return fail when any SCIM-active user is deactivated in Slack, pass when complete non-empty SCIM and Slack inventories have no mismatch, and warn for partial or empty comparison evidence. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any SCIM-active user is deactivated in Slack, pass when complete non-empty SCIM and Slack inventories have no mismatch, and warn for partial or empty comparison evidence. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ID-05` | compliant | All required source reads are complete and this derivation returns pass: return pass when a complete non-empty human inventory exposes deactivated users for review, and warn when the inventory is empty or partial. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ID-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when a complete non-empty human inventory exposes deactivated users for review, and warn when the inventory is empty or partial. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ID-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ID-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-01` | compliant | All required source reads are complete and this derivation returns pass: return fail when any workspace exceeds the configured administrator maximum, pass when every workspace and admin list is complete and within it, and warn for partial coverage. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any workspace exceeds the configured administrator maximum, pass when every workspace and admin list is complete and within it, and warn for partial coverage. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-02` | compliant | All required source reads are complete and this derivation returns pass: return fail when any active organization user has has_sso=false, pass when every active user in a complete non-empty inventory has has_sso=true, and warn for empty, unknown, or partial SSO evidence. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any active organization user has has_sso=false, pass when every active user in a complete non-empty inventory has has_sso=true, and warn for empty, unknown, or partial SSO evidence. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-03` | compliant | All required source reads are complete and this derivation returns pass: return fail when any sampled user session exceeds the configured hour maximum, pass when every active user has an explicit duration within it, warn for inherited defaults or sampled or partial coverage, and manual when no duration can be read. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any sampled user session exceeds the configured hour maximum, pass when every active user has an explicit duration within it, warn for inherited defaults or sampled or partial coverage, and manual when no duration can be read. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-04` | compliant | All required source reads are complete and this derivation returns pass: always return manual because Slack exposes session duration but no idle-timeout setting. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because Slack exposes session duration but no idle-timeout setting. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-05` | compliant | All required source reads are complete and this derivation returns pass: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-06` | compliant | All required source reads are complete and this derivation returns pass: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-07` | compliant | All required source reads are complete and this derivation returns pass: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-07` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-08` | compliant | All required source reads are complete and this derivation returns pass: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-08` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-ADMIN-09` | compliant | All required source reads are complete and this derivation returns pass: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-ADMIN-09` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-ADMIN-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-ADMIN-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-01` | compliant | All required source reads are complete and this derivation returns pass: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-02` | compliant | All required source reads are complete and this derivation returns pass: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-03` | compliant | All required source reads are complete and this derivation returns pass: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-04` | compliant | All required source reads are complete and this derivation returns pass: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-05` | compliant | All required source reads are complete and this derivation returns pass: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-06` | compliant | All required source reads are complete and this derivation returns pass: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-APP-07` | compliant | All required source reads are complete and this derivation returns pass: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-APP-07` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-APP-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-APP-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-01` | compliant | All required source reads are complete and this derivation returns pass: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-02` | compliant | All required source reads are complete and this derivation returns pass: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-03` | compliant | All required source reads are complete and this derivation returns pass: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-04` | compliant | All required source reads are complete and this derivation returns pass: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-CHAN-05` | compliant | All required source reads are complete and this derivation returns pass: always return manual because admin team settings expose no link-preview or URL-unfurl control. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-CHAN-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because admin team settings expose no link-preview or URL-unfurl control. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-CHAN-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-CHAN-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-01` | compliant | All required source reads are complete and this derivation returns pass: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-02` | compliant | All required source reads are complete and this derivation returns pass: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-03` | compliant | All required source reads are complete and this derivation returns pass: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-04` | compliant | All required source reads are complete and this derivation returns pass: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-05` | compliant | All required source reads are complete and this derivation returns pass: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `SLACK-MON-06` | compliant | All required source reads are complete and this derivation returns pass: always return manual because the pull-based Audit Logs API does not report SIEM streaming or export destinations. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `SLACK-MON-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because the pull-based Audit Logs API does not report SIEM streaming or export destinations. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `SLACK-MON-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `SLACK-MON-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
 | 1 | SSO enforcement | IA-2(1) | 3.5.3 | CC6.1 | 16.2 | 8.4.1 | SRG-APP-000149 | ISM-1546 | CPS.AT-1 |
-| 2 | Two-factor authentication | IA-2(6) | 3.5.3 | CC6.1 | 16.3 | 8.4.2 | SRG-APP-000150 | ISM-1504 | CPS.AT-2 |
+| 2 | MFA enrollment | IA-2(6) | 3.5.3 | CC6.1 | 16.3 | 8.4.2 | SRG-APP-000150 | ISM-1504 | CPS.AT-2 |
 | 3 | Session duration limits | AC-12 | 3.1.10 | CC6.1 | 16.4 | 8.2.8 | SRG-APP-000295 | ISM-1164 | CPS.AC-7 |
 | 4 | Session idle timeout | AC-11 | 3.1.11 | CC6.1 | 16.5 | 8.2.8 | SRG-APP-000190 | ISM-1164 | CPS.AC-7 |
 | 5 | Mobile session controls | AC-19 | 3.1.18 | CC6.7 | - | 8.2.8 | SRG-APP-000394 | ISM-1082 | CPS.MP-1 |
 | 6 | File upload restrictions | SC-7 | 3.13.6 | CC6.6 | - | 1.3.2 | SRG-APP-000001 | ISM-0331 | CPS.SC-7 |
-| 7 | External sharing controls | AC-21 | 3.1.20 | CC6.6 | - | 7.1.2 | SRG-APP-000378 | ISM-0661 | CPS.AC-4 |
+| 7 | External sharing monitoring | AC-21 | 3.1.20 | CC6.6 | - | 7.1.2 | SRG-APP-000378 | ISM-0661 | CPS.AC-4 |
 | 8 | Information barriers | AC-4 | 3.1.3 | CC6.6 | - | 7.1.1 | SRG-APP-000039 | ISM-1528 | CPS.AC-4 |
-| 9 | App management policy | CM-7 | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000141 | ISM-1624 | CPS.CM-7 |
-| 10 | Custom app restrictions | CM-7(4) | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000386 | ISM-1624 | CPS.CM-7 |
-| 11 | DLP policy configuration | SC-7(8) | 3.13.6 | CC6.7 | - | - | SRG-APP-000400 | ISM-0261 | CPS.SC-7 |
-| 12 | Channel retention policies | AU-11 | 3.3.1 | CC7.2 | - | 10.7.1 | SRG-APP-000515 | ISM-0859 | CPS.AU-11 |
-| 13 | Audit log streaming | AU-6(3) | 3.3.5 | CC7.2 | 8.2 | 10.5.1 | SRG-APP-000516 | ISM-0580 | CPS.AU-6 |
-| 14 | Admin role inventory | AC-6(5) | 3.1.5 | CC6.3 | 16.8 | 7.1.1 | SRG-APP-000340 | ISM-1507 | CPS.AC-6 |
-| 15 | Guest account controls | AC-2(2) | 3.1.1 | CC6.2 | 16.7 | 7.1.2 | SRG-APP-000024 | ISM-0415 | CPS.AC-2 |
+| 9 | Restricted app policy | CM-7 | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000141 | ISM-1624 | CPS.CM-7 |
+| 10 | Custom and sensitive-scope apps | CM-7(4) | 3.4.8 | CC6.8 | 2.7 | 6.3.2 | SRG-APP-000386 | ISM-1624 | CPS.CM-7 |
+| 11 | DLP and Discovery evidence | SC-7(8) | 3.13.6 | CC6.7 | - | - | SRG-APP-000400 | ISM-0261 | CPS.SC-7 |
+| 12 | Channel retention overrides | AU-11 | 3.3.1 | CC7.2 | - | 10.7.1 | SRG-APP-000515 | ISM-0859 | CPS.AU-11 |
+| 13 | SIEM streaming evidence | AU-6(3) | 3.3.5 | CC7.2 | 8.2 | 10.5.1 | SRG-APP-000516 | ISM-0580 | CPS.AU-6 |
+| 14 | Workspace admin inventory | AC-6(5) | 3.1.5 | CC6.3 | 16.8 | 7.1.1 | SRG-APP-000340 | ISM-1507 | CPS.AC-6 |
+| 15 | Guest account inventory | AC-2(2) | 3.1.1 | CC6.2 | 16.7 | 7.1.2 | SRG-APP-000024 | ISM-0415 | CPS.AC-2 |
 | 16 | Email domain restrictions | IA-5 | 3.5.7 | CC6.1 | - | 8.3.1 | SRG-APP-000173 | ISM-1557 | CPS.IA-5 |
 | 17 | Workspace discoverability | AC-3 | 3.1.1 | CC6.1 | - | 7.1.1 | SRG-APP-000033 | ISM-0432 | CPS.AC-3 |
 | 18 | Channel posting restrictions | AC-3(7) | 3.1.2 | CC6.1 | - | 7.1.1 | SRG-APP-000033 | ISM-0405 | CPS.AC-3 |
-| 19 | Custom emoji restrictions | CM-5 | 3.4.5 | CC8.1 | - | - | SRG-APP-000380 | ISM-1624 | CPS.CM-5 |
+| 19 | Custom emoji governance | CM-5 | 3.4.5 | CC8.1 | - | - | SRG-APP-000380 | ISM-1624 | CPS.CM-5 |
 | 20 | External email ingestion | SC-7(4) | 3.13.6 | CC6.6 | - | 1.3.2 | SRG-APP-000001 | ISM-0264 | CPS.SC-7 |
 | 21 | Link previews and URL unfurling | SC-7 | 3.13.1 | CC6.6 | - | - | SRG-APP-000001 | ISM-0260 | CPS.SC-7 |
-| 22 | SCIM provisioning status | AC-2(1) | 3.1.1 | CC6.2 | - | 7.1.1 | SRG-APP-000023 | ISM-1594 | CPS.AC-2 |
-| 23 | Deactivated user audit | AC-2(3) | 3.1.12 | CC6.2 | 16.9 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
+| 22 | SCIM provisioning coverage | AC-2(1) | 3.1.1 | CC6.2 | - | 7.1.1 | SRG-APP-000023 | ISM-1594 | CPS.AC-2 |
+| 23 | Deactivated user visibility | AC-2(3) | 3.1.12 | CC6.2 | 16.9 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
 | 24 | Workspace analytics access | AC-6(9) | 3.1.7 | CC6.3 | - | 7.1.2 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
 | 25 | Token rotation and revocation | IA-5(1) | 3.5.10 | CC6.1 | - | 8.6.3 | SRG-APP-000175 | ISM-1557 | CPS.IA-5 |
 
-## 6. Existing Tools
+## Collection states
 
-| Tool | Description | Limitations |
-|------|-------------|-------------|
-| **Slack Enterprise Audit Dashboard** | Built-in admin analytics and audit log viewer | No automated compliance mapping; manual review only |
-| **Slack SIEM Integrations** (Splunk, Datadog) | Audit log forwarding and alerting | Focused on detection, not configuration compliance |
-| **Resmo** | SaaS security posture management with Slack integration | Commercial; limited to their predefined checks |
-| **Nudge Security** | SaaS discovery and governance | Focused on shadow IT, not deep config audit |
-| **AppOmni** | SaaS security posture management | Commercial; expensive enterprise pricing |
-| **Valence Security** | SaaS security remediation | Commercial; focused on remediation workflows |
-| **ScoutSuite** | Multi-cloud security auditing | Cloud-focused, no Slack support |
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
 
-**Gap:** No open-source tool performs comprehensive Slack Enterprise security configuration auditing with multi-framework compliance mapping. Existing tools are either commercial SaaS platforms, focused on log analysis rather than configuration posture, or lack the depth of controls covered here.
+## Integration-specific scrubbing
 
-## 7. Architecture
+Shared contract version: 1.1.
 
-```
-slack-sec-inspector/
-├── cmd/
-│   └── slack-sec-inspector/
-│       └── main.go                  # CLI entrypoint
-├── internal/
-│   ├── client/
-│   │   ├── slack.go                 # Slack Web API client wrapper
-│   │   ├── scim.go                  # SCIM API client
-│   │   ├── audit.go                 # Audit Logs API client
-│   │   └── ratelimit.go            # Tier-aware rate limiter (Tier 1-4)
-│   ├── analyzers/
-│   │   ├── sso.go                   # Control 1: SSO enforcement
-│   │   ├── mfa.go                   # Control 2: Two-factor authentication
-│   │   ├── sessions.go              # Controls 3-5: Session policies
-│   │   ├── fileuploads.go           # Control 6: File upload restrictions
-│   │   ├── externalsharing.go       # Controls 7, 20: External sharing and email ingestion
-│   │   ├── barriers.go              # Control 8: Information barriers
-│   │   ├── apps.go                  # Controls 9-10: App management
-│   │   ├── dlp.go                   # Control 11: DLP policy configuration
-│   │   ├── retention.go             # Control 12: Channel retention policies
-│   │   ├── auditlogs.go            # Control 13: Audit log streaming
-│   │   ├── adminroles.go           # Control 14: Admin role inventory
-│   │   ├── guests.go               # Control 15: Guest account controls
-│   │   ├── domains.go              # Control 16: Email domain restrictions
-│   │   ├── discoverability.go      # Control 17: Workspace discoverability
-│   │   ├── channels.go             # Control 18: Channel posting restrictions
-│   │   ├── emoji.go                # Control 19: Custom emoji restrictions
-│   │   ├── urlpreviews.go          # Control 21: Link previews
-│   │   ├── scim.go                 # Control 22: SCIM provisioning status
-│   │   ├── users.go                # Control 23: Deactivated user audit
-│   │   ├── analytics.go            # Control 24: Workspace analytics access
-│   │   └── tokens.go               # Control 25: Token rotation and revocation
-│   ├── reporters/
-│   │   ├── json.go                  # JSON output reporter
-│   │   ├── csv.go                   # CSV output reporter
-│   │   ├── markdown.go              # Markdown report with compliance matrix
-│   │   ├── html.go                  # HTML dashboard report
-│   │   └── sarif.go                 # SARIF format for CI/CD integration
-│   ├── compliance/
-│   │   ├── mapper.go                # Maps findings to framework controls
-│   │   ├── fedramp.go               # FedRAMP control definitions
-│   │   ├── cmmc.go                  # CMMC control definitions
-│   │   ├── soc2.go                  # SOC 2 trust criteria
-│   │   ├── cis.go                   # CIS Benchmark references
-│   │   ├── pcidss.go                # PCI-DSS requirements
-│   │   ├── stig.go                  # DISA STIG rules
-│   │   ├── irap.go                  # IRAP ISM controls
-│   │   └── ismap.go                 # ISMAP control references
-│   ├── models/
-│   │   ├── finding.go               # Finding severity, evidence, remediation
-│   │   ├── control.go               # Security control definition
-│   │   └── report.go                # Aggregate report model
-│   └── tui/
-│       ├── app.go                   # Bubble Tea TUI application
-│       ├── views/
-│       │   ├── dashboard.go         # Summary dashboard view
-│       │   ├── controls.go          # Control detail drill-down
-│       │   └── compliance.go        # Framework compliance matrix view
-│       └── components/
-│           ├── table.go             # Sortable findings table
-│           ├── progress.go          # Scan progress indicator
-│           └── severity.go          # Severity badge rendering
-├── pkg/
-│   └── version/
-│       └── version.go               # Build version info
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── .goreleaser.yaml
-└── spec.md
-```
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
 
-### Key Dependencies
+Sensitive fields and values: token, scimToken, authorization, cookie, webhook_url
 
-| Package | Purpose |
-|---------|---------|
-| `github.com/slack-go/slack` | Go Slack API client |
-| `github.com/spf13/cobra` | CLI framework |
-| `github.com/charmbracelet/bubbletea` | Terminal UI framework |
-| `github.com/charmbracelet/lipgloss` | TUI styling |
+Credential formats: xoxb, xoxp, xoxe, and xapp token families, SCIM bearer tokens, webhook path secrets
 
-## 8. CLI Interface
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
 
-```
-slack-sec-inspector [command] [flags]
+Integration-specific rules:
 
-Commands:
-  scan          Run security compliance scan against Slack org
-  report        Generate compliance report from scan results
-  version       Print version information
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
 
-Global Flags:
-  --token string        Slack user token (xoxp-...) [$SLACK_USER_TOKEN]
-  --scim-token string   SCIM bearer token [$SLACK_SCIM_TOKEN]
-  --org-id string       Enterprise Grid organization ID [$SLACK_ORG_ID]
-  --output string       Output format: json, csv, markdown, html, sarif (default "json")
-  --output-dir string   Directory for report output (default "./results")
-  --severity string     Minimum severity to report: critical, high, medium, low, info (default "low")
-  --controls string     Comma-separated list of control numbers to run (default: all)
-  --quiet               Suppress progress output
-  --no-color            Disable colored output
-  --tui                 Launch interactive terminal UI
+Projected fields by surface:
 
-Scan Flags:
-  --workspace string    Limit scan to specific workspace ID
-  --skip-scim           Skip SCIM provisioning checks
-  --skip-discovery      Skip Discovery API (DLP) checks
-  --skip-audit-logs     Skip Audit Logs API checks
-  --parallel int        Number of parallel API calls (default 4)
-  --timeout duration    API call timeout (default 30s)
+| Surface | Allowed fields |
+|---|---|
+| `auth-test` | `projected response fields consumed by the corresponding runtime assessment` |
+| `users` | `projected response fields consumed by the corresponding runtime assessment` |
+| `workspaces` | `projected response fields consumed by the corresponding runtime assessment` |
+| `workspace-settings` | `projected response fields consumed by the corresponding runtime assessment` |
+| `workspace-admins` | `projected response fields consumed by the corresponding runtime assessment` |
+| `admin-users` | `projected response fields consumed by the corresponding runtime assessment` |
+| `session-settings` | `projected response fields consumed by the corresponding runtime assessment` |
+| `approved-apps` | `projected response fields consumed by the corresponding runtime assessment` |
+| `restricted-apps` | `projected response fields consumed by the corresponding runtime assessment` |
+| `barriers` | `projected response fields consumed by the corresponding runtime assessment` |
+| `channels` | `projected response fields consumed by the corresponding runtime assessment` |
+| `channel-preferences` | `projected response fields consumed by the corresponding runtime assessment` |
+| `channel-retention` | `projected response fields consumed by the corresponding runtime assessment` |
+| `emoji` | `projected response fields consumed by the corresponding runtime assessment` |
+| `analytics-export` | `projected response fields consumed by the corresponding runtime assessment` |
+| `team-preferences` | `projected response fields consumed by the corresponding runtime assessment` |
+| `scim-users` | `projected response fields consumed by the corresponding runtime assessment` |
+| `audit-logs` | `projected response fields consumed by the corresponding runtime assessment` |
+| `audit-schemas` | `projected response fields consumed by the corresponding runtime assessment` |
 
-Examples:
-  # Full org-level scan with JSON output
-  slack-sec-inspector scan --token xoxp-... --scim-token ... --org-id E01234
+## Export layout
 
-  # Scan specific controls with markdown report
-  slack-sec-inspector scan --controls 1,2,3,14 --output markdown
+Required paths:
 
-  # Interactive TUI mode
-  slack-sec-inspector scan --tui
+- `README.md`
+- `QUICK_REFERENCE.md`
+- `metadata.json`
+- `core_data/access.json`
+- `core_data/identity.json`
+- `core_data/admin-access.json`
+- `core_data/integrations.json`
+- `core_data/channel-governance.json`
+- `core_data/monitoring.json`
+- `analysis/identity.json`
+- `analysis/admin-access.json`
+- `analysis/integrations.json`
+- `analysis/channel-governance.json`
+- `analysis/monitoring.json`
+- `reports/identity.md`
+- `reports/admin-access.md`
+- `reports/integrations.md`
+- `reports/channel-governance.md`
+- `reports/monitoring.md`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp.md`
+- `compliance/cmmc.md`
+- `compliance/soc-2.md`
+- `compliance/cis.md`
+- `compliance/pci-dss.md`
+- `compliance/stig.md`
+- `compliance/irap.md`
+- `compliance/ismap.md`
 
-  # Generate SARIF for CI/CD pipeline
-  slack-sec-inspector scan --output sarif --severity high
-```
+Conditional paths:
 
-## 9. Build Sequence
+- `_errors.log`
 
-```bash
-# 1. Initialize module
-go mod init github.com/hackIDLE/slack-sec-inspector
+### Artifact schemas
 
-# 2. Add dependencies
-go get github.com/slack-go/slack
-go get github.com/spf13/cobra
-go get github.com/charmbracelet/bubbletea
-go get github.com/charmbracelet/lipgloss
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `README.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/identity.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/admin-access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/integrations.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/channel-governance.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/monitoring.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/admin-access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/integrations.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/channel-governance.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/monitoring.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `reports/identity.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `reports/admin-access.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `reports/integrations.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `reports/channel-governance.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `reports/monitoring.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc-2.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci-dss.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/stig.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 
-# 3. Build
-go build -ldflags "-X pkg/version.Version=$(git describe --tags)" \
-  -o bin/slack-sec-inspector ./cmd/slack-sec-inspector/
+### Record schemas
 
-# 4. Test
-go test ./...
+#### finding
 
-# 5. Lint
-golangci-lint run
+- `id`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `framework mappings`
 
-# 6. Docker
-docker build -t slack-sec-inspector .
+#### collection_marker
 
-# 7. Release
-goreleaser release --snapshot
-```
+- `collected`
+- `status`
+- `endpoint`
+- `error`
 
-## 10. Status
+#### bundle_result
 
-Implemented in grclanker (TypeScript) on 2026-09-21. 25 of 25 controls are represented by findings: 17 are automated from documented read methods and 8 are manual by design because no public reference page exposes the setting (controls 4, 5, 11, 13, 20, 21, 24, 25). Control 6 is automated from `team.preferences.list` `disable_file_uploads` (`disallow_all` and `type:owner,type:admin` pass, `type:regular` warns, `allow_all` fails). Verdicts follow eight safety rules: unreadable or forbidden methods render manual with the cause, empty inventories never pass by default, plan or scope gaps render manual naming the plan, undated items are bucketed, partial inventories are flagged with seen and total counts, enabling flags must be read, pagination runs to completion or downgrades the verdict, and export reruns allocate `-2`, `-3` directories. Two hygiene rules apply on top: every API response is redacted at collection time (credential-named fields keep their name with a `[REDACTED]` value; Slack token shapes, `hooks.slack.com` URLs, bearer headers, and credential query parameters are scrubbed from strings, including JSON error bodies; every error string passes through one scrub, `redactErrorText`, when it is created, which also replaces header- and assignment-style credentials such as cookie, authorization, API key, and session id values; a non-JSON error body such as an HTML gateway page is never quoted and is described by content type and length instead) and every bundle file is scrubbed again on write; and every pagination exit other than an exhausted cursor (item cap, page cap of 50 requests, a cursor that returns an empty page, a missing SCIM `totalResults`, an audit page ending with `next_cursor`) is reported as truncated with the reason so dependent findings warn instead of pass. A corollary to the first rule applies to findings that compare inventories: when any inventory a verdict depends on is unreadable (`SLACK-ADMIN-08` and the admin roster from `admin.teams.admins.list`, `SLACK-APP-06` and `auth.test`, `SLACK-CHAN-02` and per-channel `admin.conversations.getConversationPrefs`), the finding demotes below pass, names the endpoint and the workspace or channel id, and renders derived counts and lists as `null` beside a status field rather than `0`, `[]`, or a placeholder.
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
 
-### Deviations from this spec
+#### assessment
 
-- `admin.teams.settings.info` documents only `id`, `name`, `domain`, `email_domain`, `icon`, `enterprise_id`, `enterprise_name`, and `default_channels`; SSO, session, idle, discoverability, and file settings listed in section 2 are not readable there. Discoverability is read from `admin.teams.list`, SSO coverage from `admin.users.list` `has_sso`, and session duration from `admin.users.session.getSettings`.
-- `admin.teams.admins.list` returns `admin_ids`, and the app inventories return `approved_apps` and `restricted_apps` with nested `app` objects; the implementation follows the documented shapes.
-- `admin.enterprise.info` and `discovery.enterprise.info` are not documented methods and are not called. The Discovery API in sections 2 and 3 has no public reference page (no `discovery.*` method appears in https://docs.slack.dev/reference/methods), so control 11 is manual and the `discovery:read` scope is not requested.
-- Audit Logs action names follow https://docs.slack.dev/reference/audit-logs-api/methods-actions-reference: `pref.sso_setting_changed`, `pref.two_factor_auth_changed`, and the `external_shared_channel_*` family; no other action strings are matched.
-- `admin.analytics.getFile` succeeds with a gzipped newline-delimited JSON file (`Content-type: application/gzip`) rather than an `ok:true` JSON body; the probe treats that header as success without downloading the file and treats `ok:false` JSON as the failure path.
-- `admin.conversations.getConversationPrefs` documents `who_can_post.type` values such as `admins`; the implementation accepts `admin`, `admins`, `owner`, and `owners`.
-- `team.preferences.list` reads the token's workspace only; when the org has more than one workspace or the workspace inventory is partial, a passing control 6 verdict is downgraded to warn.
-- The configuration file is not defined by this spec; the implementation reads `SLACK_CONFIG_FILE` or `~/.config/grclanker/slack.json` with `user_token`, `bot_token`, `scim_token`, and `org_id`.
-- `SLACK_BOT_TOKEN` is accepted for the three methods whose reference pages list bot tokens (`auth.test`, `users.list`, `team.preferences.list`).
-- The Go architecture, TUI, `--controls`, CSV, HTML, and SARIF outputs in sections 7 and 8 are not part of the CLI surface; results are Markdown and JSON in the export bundle.
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
 
-### Remaining work
+#### pagination_state
 
-- IDP group channel restrictions via `admin.conversations.restrictAccess.listGroups`.
-- Guest expiration dates via `admin.users.list only_guests=true`.
-- Discovery API DLP content checks (`discovery.conversations.*`) cannot be implemented until Slack publishes a reference page for the Discovery API.
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
+
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
+
+Overwrite policy: Allocate slack-audit-<UTC timestamp> and add a numeric suffix when either the directory or paired archive exists.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create <allocated-directory>.zip beside the allocated Slack audit directory.

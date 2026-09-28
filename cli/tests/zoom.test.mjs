@@ -33,6 +33,14 @@ import {
   resolveZoomConfiguration,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/zoom.js";
+import { ZOOM_SPEC } from "../dist/extensions/grc-tools/zoom.spec.js";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -1009,6 +1017,7 @@ test("checkZoomAccess reports readable Zoom audit surfaces per documented option
 test("exportZoomAuditBundle writes the shared layout, one report per framework, and never overwrites a prior bundle", async () => {
   const base = createTempBase("grclanker-zoom-export-");
   const first = await exportZoomAuditBundle(compliantClient(), sampleConfig(), base, { now: NOW });
+  assertBundlePathsMatchSpec(assert, first.outputDir, ZOOM_SPEC);
   assert.ok(existsSync(first.outputDir));
   assert.ok(existsSync(first.zipPath));
   assert.equal(basename(first.zipPath), `${basename(first.outputDir)}.zip`);
@@ -1803,4 +1812,55 @@ test("error-body walk: every surface the collectors call, failing in three body 
     }
   }
   assert.equal(walked.length, surfaces.length * Object.keys(ERROR_BODY_SHAPES).length);
+});
+
+test("byte differential fixtures: Zoom assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const representative = await runAllAssessments(compliantClient({
+    async getAccountSettings(option) {
+      const settings = compliantSettings(option);
+      if (option !== "meeting_security") return settings;
+      return {
+        ...settings,
+        meeting_security: { ...settings.meeting_security, waiting_room: false },
+      };
+    },
+  }));
+  writeByteDifferentialFixture("zoom", "representative", representative);
+
+  const denied = await runAllAssessments(deniedClient());
+  writeByteDifferentialFixture("zoom", "denied", denied);
+
+  const missingNull = await runAllAssessments(emptyClient());
+  writeByteDifferentialFixture("zoom", "missing-null", missingNull);
+
+  const partial = await runAllAssessments(partialClient());
+  writeByteDifferentialFixture("zoom", "partial", partial);
+
+  const compliant = await runAllAssessments(compliantClient());
+  writeByteDifferentialFixture("zoom", "compliant", compliant);
+
+  const boundary = await runAllAssessments(compliantClient({
+    async getAccountSettings(option) {
+      const settings = compliantSettings(option);
+      if (option !== "security") return settings;
+      return {
+        ...settings,
+        security: {
+          ...settings.security,
+          sign_again_period_for_inactivity_on_client: 120,
+          sign_again_period_for_inactivity_on_web: 120,
+        },
+      };
+    },
+  }));
+  writeByteDifferentialFixture("zoom", "boundary", boundary);
+
+  const exportRoot = prepareByteDifferentialExportRoot("zoom");
+  const exported = await exportZoomAuditBundle(
+    compliantClient(),
+    sampleConfig(),
+    exportRoot,
+    { now: NOW },
+  );
+  writeByteDifferentialFixture("zoom", "export", snapshotExportBundle(exported));
 });

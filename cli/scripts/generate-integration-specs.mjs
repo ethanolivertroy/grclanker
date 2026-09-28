@@ -13,7 +13,12 @@ import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-r
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 export const repoRoot = resolve(scriptDir, "../..");
 export const sharedContractPath = resolve(repoRoot, "specs/integration-contract.md");
+export const llmsPath = resolve(repoRoot, "public/llms.txt");
 const generatedMarker = "<!-- generated integration spec -->";
+const llmsCatalogStart = "<!-- generated integration registry start -->";
+const llmsCatalogEnd = "<!-- generated integration registry end -->";
+const canonicalRepository = "ethanolivertroy/grclanker";
+const canonicalCloneLine = `- Clone all specs: git clone https://github.com/${canonicalRepository}.git`;
 const reservedHeading = /^#{1,6}\s+(?:Tools|Authentication|API surfaces|Checks|Pagination|Hardening|Export layout)\b/im;
 const frameworkColumns = [
   ["fedramp", "FedRAMP"],
@@ -102,7 +107,7 @@ function renderAuthentication(spec) {
     "",
     `Environment variables: ${listCell(auth.environmentVariables)}`,
     "",
-    `Configuration locations: ${auth.configLocations.join(", ")}`,
+    `Configuration locations: ${auth.configLocations.join(", ") || "(none)"}`,
     "",
     `Credential and deployment variants: ${auth.variants.join(", ")}`,
     "",
@@ -190,7 +195,15 @@ function renderChecks(spec) {
   const exampleRows = spec.checks.flatMap((check) => check.criteria.examples
     .map((example) => `| \`${check.id}\` | ${example.kind} | ${escapeCell(example.input)} | ${example.expected} | ${escapeCell(example.reason)} |`));
   const derivedRows = spec.checks.flatMap((check) => Object.entries(check.derivedFacts)
-    .map(([name, derivation]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(derivation)} |`));
+    .map(([name, derivation]) => {
+      const executable = check.derivedFactRules?.[name];
+      const rendered = executable
+        ? `${derivation} Computed as: ${renderVerdictCondition(executable.condition)}.`
+        : derivation;
+      return `| \`${check.id}\` | \`${name}\` | ${escapeCell(rendered)} |`;
+    }));
+  const primitiveRows = spec.checks.flatMap((check) => Object.entries(check.evidenceFieldDefinitions ?? {})
+    .map(([name, definition]) => `| \`${check.id}\` | \`${name}\` | ${escapeCell(definition)} |`));
   return [
     "## Checks",
     "",
@@ -214,9 +227,19 @@ function renderChecks(spec) {
     "|---|---|---|---|---|---|---|---|---|",
     ...spec.checks.map((check) => `| \`${check.id}\` | ${check.severity} | \`${check.owningTool}\` | ${listCell(check.sourceSurfaceIds)} | ${listCell(check.evidenceFields)} | ${escapeCell(check.criteria.pass)} | ${escapeCell(check.criteria.warn)} | ${escapeCell(check.criteria.fail)} | ${escapeCell(check.criteria.manual)} |`),
     "",
+    "### Primitive decision inputs",
+    "",
+    "Every primitive is read from the named vendor surface or collector state before evidence lists are rendered or capped. Null and missing retain unavailable semantics; they are not empty inventories, false values, or zero counts.",
+    "",
+    "| Finding | Input | Portable definition |",
+    "|---|---|---|",
+    ...(primitiveRows.length > 0 ? primitiveRows : ["| None |  |  |"]),
+    "",
     "### Ordered decision rules",
     "",
     "Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.",
+    "",
+    "A `matches` condition performs a regular-expression search; anchors are required for whole-value matching, and an `i` flag requests case-insensitive matching. A `ratio` condition divides the numerator by the denominator, applies the declared scale, and rounds to the declared decimal places by choosing the nearest value with exact half cases rounded toward positive infinity; a zero, null, or missing denominator does not match.",
     "",
     "| Finding | Order | Outcome | First-match condition | Explanatory note |",
     "|---|---|---|---|---|",
@@ -429,7 +452,21 @@ export function renderSharedContract() {
 
 export function validateDecisionInputs(contract) {
   for (const check of contract.checks) {
-    const declared = new Set([...check.evidenceFields, ...Object.keys(check.derivedFacts)]);
+    const available = new Set([...check.evidenceFields, ...Object.keys(check.criteria.constants)]);
+    for (const [name, derivation] of Object.entries(check.derivedFactRules ?? {})) {
+      if (!(name in check.derivedFacts)) {
+        throw new Error(`${check.id} executable derivation ${name} has no declared derived-fact description`);
+      }
+      for (const path of verdictConditionPaths(derivation.condition)) {
+        if (path === "$" || path.startsWith("$.")) continue;
+        const root = path.split(".")[0];
+        if (!available.has(root)) {
+          throw new Error(`${check.id} derived input ${name} references undeclared or forward decision input ${root}`);
+        }
+      }
+      available.add(name);
+    }
+    const declared = new Set([...available, ...Object.keys(check.derivedFacts)]);
     for (const [index, rule] of check.criteria.rules.entries()) {
       for (const path of verdictConditionPaths(rule.condition)) {
         if (path === "$" || path.startsWith("$.")) continue;
@@ -440,6 +477,67 @@ export function validateDecisionInputs(contract) {
       }
     }
   }
+}
+
+function markdownSectionBounds(document, heading) {
+  const headingPattern = new RegExp(`^## ${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*\\r?$`, "m");
+  const match = headingPattern.exec(document);
+  if (!match) throw new Error(`public/llms.txt is missing the ## ${heading} section`);
+  const headingEnd = match.index + match[0].length;
+  const contentStart = document.indexOf("\n", headingEnd);
+  if (contentStart < 0) return { start: match.index, contentStart: document.length, end: document.length };
+  const nextHeadingPattern = /^## [^\n]+\r?$/gm;
+  nextHeadingPattern.lastIndex = contentStart + 1;
+  const next = nextHeadingPattern.exec(document);
+  return {
+    start: match.index,
+    contentStart: contentStart + 1,
+    end: next?.index ?? document.length,
+  };
+}
+
+function removeGeneratedCatalog(document) {
+  const start = document.indexOf(llmsCatalogStart);
+  if (start < 0) return document;
+  const endMarker = document.indexOf(llmsCatalogEnd, start);
+  if (endMarker < 0) throw new Error("public/llms.txt has an unterminated generated integration registry");
+  let removalStart = start;
+  let removalEnd = endMarker + llmsCatalogEnd.length;
+  if (document.slice(0, removalStart).endsWith("\r\n\r\n")) removalStart -= 2;
+  else if (document.slice(0, removalStart).endsWith("\n\n")) removalStart -= 1;
+  if (document.startsWith("\r\n", removalEnd)) removalEnd += 2;
+  else if (document.startsWith("\n", removalEnd)) removalEnd += 1;
+  return `${document.slice(0, removalStart)}${document.slice(removalEnd)}`;
+}
+
+export function renderLlmsCatalog(llms) {
+  const generatedCatalog = [
+    llmsCatalogStart,
+    "### Generated portable contracts",
+    "",
+    ...PUBLISHED_INTEGRATION_SPECS.map((entry) =>
+      `- [${entry.contract.identity.displayName}](https://raw.githubusercontent.com/${canonicalRepository}/main/${entry.outputPath}): ${entry.contract.identity.summary}`),
+    llmsCatalogEnd,
+  ].join("\n");
+  const publishedPaths = new Set(PUBLISHED_INTEGRATION_SPECS.map((entry) => entry.outputPath));
+  const catalogLine = /^- \[[^\]]+\]\(https?:\/\/[^)]+\/(specs\/[^)]+\.spec\.md)\):.*(?:\r?\n|$)/gm;
+  let updated = removeGeneratedCatalog(llms);
+  const specs = markdownSectionBounds(updated, "Specs");
+  const specsBody = updated.slice(specs.contentStart, specs.end).replace(catalogLine, (line, path) =>
+    publishedPaths.has(path) ? "" : line);
+  updated = `${updated.slice(0, specs.contentStart)}${specsBody}${updated.slice(specs.end)}`;
+
+  const cloneLinePattern = /^- Clone all specs: git clone https:\/\/github\.com\/[^/\s]+\/grclanker\.git[ \t]*$/gm;
+  const cloneMatches = [...updated.matchAll(cloneLinePattern)];
+  if (cloneMatches.length !== 1) {
+    throw new Error(`public/llms.txt must contain exactly one Clone all specs line; found ${cloneMatches.length}`);
+  }
+  updated = updated.replace(cloneLinePattern, canonicalCloneLine);
+
+  const updatedSpecs = markdownSectionBounds(updated, "Specs");
+  const specsPrefix = updated.slice(0, updatedSpecs.end).replace(/[ \t\r\n]+$/, "");
+  const afterSpecs = updated.slice(updatedSpecs.end);
+  return `${specsPrefix}\n\n${generatedCatalog}\n\n${afterSpecs}`;
 }
 
 export async function renderAllIntegrationSpecs() {
@@ -456,6 +554,8 @@ export async function renderAllIntegrationSpecs() {
     validateDecisionInputs(entry.contract);
     outputs.set(resolve(repoRoot, entry.outputPath), renderIntegrationSpec(entry, narrative, tools));
   }
+  const llms = await readFile(llmsPath, "utf8");
+  outputs.set(llmsPath, renderLlmsCatalog(llms));
   return outputs;
 }
 

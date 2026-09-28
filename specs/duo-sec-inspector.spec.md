@@ -1,385 +1,1077 @@
 ---
 slug: "duo-sec-inspector"
 name: "Duo Security Inspector"
-vendor: "Cisco"
-category: "identity-access-management"
-language: "typescript"
-status: "implemented"
-version: "1.1"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
-legacy_repo: "https://github.com/hackIDLE/duo-sec-inspector"
-reference_docs: "https://duo.com/docs/adminapi"
+vendor: "Cisco Duo"
+category: "identity-and-access"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# duo-sec-inspector
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-## 1. Overview
+# Duo Security Inspector
 
-A read-only Duo compliance inspection surface for **grclanker** that audits MFA configuration, policy posture, privileged administration, integration hygiene, Trust Monitor coverage, and audit telemetry through the Duo Admin API. The implementation intentionally stays Admin API–first so GRC engineers can assess a tenant with one read-only audit principal instead of juggling multiple application types on day one.
+Portable contract for the shipped Duo authentication, administrator, protected-application, and monitoring assessments.
 
-The current tool family is:
+## Purpose
 
-- `duo_check_access`
-- `duo_assess_authentication`
-- `duo_assess_admin_access`
-- `duo_assess_integrations`
-- `duo_assess_monitoring`
-- `duo_export_audit_bundle`
+Audit Duo tenant authentication, administrator, protected-application, and security-monitoring posture through read-only Admin API evidence.
 
-## 2. APIs & SDKs
+## Design guidance
 
-### Duo APIs
+Keep edition and permission gaps explicit. A missing policy, denied inventory, or incomplete log window is not proof of a secure state. Retain manual Admin Panel instructions where the public API does not expose a decisive setting.
 
-| API | Base URL | Purpose |
-|-----|----------|---------|
-| **Admin API** | `https://{api-hostname}/admin/v1/` | User, integration, policy, and log management |
-| **Auth API** | `https://{api-hostname}/auth/v1/` | Authentication verification and status |
-| **Accounts API** | `https://{api-hostname}/accounts/v1/` | MSP child account management |
+## Shared integration contract
 
-### Admin API Endpoints
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-**User Management:**
-- `GET /admin/v1/users` — List all users with enrollment status, MFA devices, groups
-- `GET /admin/v1/users/{user_id}` — Individual user detail
-- `GET /admin/v1/users/{user_id}/bypass_codes` — List active bypass codes for a user
-- `GET /admin/v1/users/{user_id}/tokens` — Hardware token associations
-- `GET /admin/v1/users/{user_id}/webauthncredentials` — WebAuthn/FIDO2 credentials
-- `GET /admin/v1/users/{user_id}/u2ftokens` — U2F security key tokens
-
-**Integration Management:**
-- `GET /admin/v1/integrations` — List all protected applications/integrations
-- `GET /admin/v1/integrations/{integration_key}` — Integration detail with policy settings
-- `GET /admin/v1/policies/v2` — List all authentication policies
-- `GET /admin/v1/policies/v2/{policy_key}` — Policy detail (MFA methods, device health, etc.)
-
-**Logging and Monitoring:**
-- `GET /admin/v1/logs/authentication` — Authentication log events (success, failure, fraud)
-- `GET /admin/v1/logs/administrator` — Admin action audit log
-- `GET /admin/v1/logs/telephony` — Telephony (SMS/call) usage log
-- `GET /admin/v1/logs/offline_enrollment` — Offline access enrollment events
-- `GET /admin/v2/trust_monitor/events` — Trust Monitor risk-based alerts
-
-**Administrative:**
-- `GET /admin/v1/admins` — List administrator accounts and roles
-- `GET /admin/v1/info/summary` — Account summary (users, integrations, telephony credits)
-- `GET /admin/v1/info/authentication_attempts` — Authentication attempt statistics
-- `GET /admin/v1/settings` — Global Duo account settings
-- `GET /admin/v1/tokens` — Hardware OTP tokens inventory
-- `GET /admin/v1/groups` — User groups for policy assignment
-
-### Auth API Endpoints
-
-- `POST /auth/v1/check` — Verify API connectivity and credentials
-- `POST /auth/v1/enroll_status` — Check enrollment status for a user
-- `POST /auth/v1/preauth` — Pre-authentication check (devices, capabilities)
-- `POST /auth/v1/auth` — Perform authentication (push, passcode, phone, SMS)
-
-### Accounts API Endpoints (MSP)
-
-- `POST /accounts/v1/account/list` — List child accounts
-- `POST /accounts/v1/account/create` — Create child account
-
-### SDKs
-
-| SDK | Language | Package |
-|-----|----------|---------|
-| **duo_client** | Python | `pip install duo_client` (official, Cisco/Duo) |
-| **duo_client_golang** | Go | `github.com/duosecurity/duo_client_golang` (official) |
-| **duo_api_java** | Java | Official Java client |
-| **duo_api_csharp** | C# | Official .NET client |
-
-## 3. Authentication
-
-### Signed Requests
-
-The current grclanker implementation follows the official Duo Admin API and Duo Node client signing model:
-
-- Standard Admin API endpoints use HMAC-SHA512 request signing over the canonical v2 string.
-- Newer Admin API v3 integration endpoints use the current v5 canonical form and signature path.
-
-Each request includes:
-
-- **Integration Key (ikey)** — Identifies the application/API client
-- **Secret Key (skey)** — Used to sign requests (never transmitted)
-- **API Hostname** — Account-specific hostname (`api-XXXXXXXX.duosecurity.com`)
-
-The standard canonical string is computed over: `{date}\n{method}\n{host}\n{path}\n{params}` and sent as HTTP Basic Auth where username = `ikey` and password = the derived HMAC-SHA512 signature. For newer v3 integration endpoints, grclanker uses the current v5 canonical form from the official Duo client behavior.
-
-### Required Permissions
-
-The Admin API integration must have the following permissions:
-
-- **Grant read information** — Read users, integrations, policies
-- **Grant read log** — Read authentication and admin logs
-- **Grant settings** — Read global settings
-- **Grant read resource** — Read bypass codes, tokens, WebAuthn credentials
-
-### Configuration
-
-```
-DUO_IKEY=DIXXXXXXXXXXXXXXXXXX
-DUO_SKEY=YourSecretKeyHere
-DUO_API_HOST=api-XXXXXXXX.duosecurity.com
-```
-
-## 4. Security Controls
-
-1. **Global MFA policy** — Verify the global policy enforces MFA (not "bypass" or "allow without MFA") and uses phishing-resistant methods (push with Verified Duo Push, WebAuthn/FIDO2)
-2. **User enrollment completeness** — Enumerate all users and flag those with status "bypass" or "not enrolled"; calculate enrollment percentage
-3. **Bypass code audit** — List all active bypass codes across users; flag codes older than 24 hours or with unlimited uses
-4. **Inactive user detection** — Identify users who have not authenticated in 90+ days; flag for access review
-5. **Admin role review** — Enumerate all administrator accounts; flag excessive "Owner" roles and verify least privilege
-6. **Trusted endpoint policy** — Verify Duo Device Health Application or Trusted Endpoints policy is enforced (managed devices required)
-7. **Device health requirements** — Audit device health policy: OS version requirements, firewall enabled, disk encryption, screen lock
-8. **Remembered devices policy** — Verify remembered devices duration is within acceptable limits (or disabled for high-security integrations)
-9. **Authentication method restrictions** — Verify deprecated methods (SMS, phone callback) are disabled; only push/WebAuthn/hardware token allowed
-10. **New user policy** — Verify the new user policy requires enrollment (not "allow access without MFA")
-11. **User lockout policy** — Confirm account lockout is enabled after failed authentication attempts (recommended: 10 or fewer)
-12. **Integration policy assignments** — Verify each protected application/integration has an explicit policy assigned (not relying only on global policy)
-13. **Unprotected application detection** — Compare known critical applications against Duo integrations to find applications lacking MFA protection
-14. **Trust Monitor configuration** — Verify Trust Monitor is enabled and alerts are being reviewed; audit unresolved alert count
-15. **Authentication log anomalies** — Analyze authentication logs for patterns: fraud reports, denied logins, geographically impossible travel
-16. **Telephony credit monitoring** — Check remaining telephony credits and usage trends; flag low credit balance
-17. **U2F/WebAuthn credential inventory** — Audit FIDO2/WebAuthn and U2F token registrations; verify phishing-resistant method adoption rate
-18. **Offline access configuration** — Verify offline access (Duo MFA for Windows/macOS logon when offline) is configured securely with reactivation limits
-19. **Self-service portal policy** — Audit whether users can add/remove devices without admin approval
-20. **API permission audit** — Enumerate all Admin API integrations and their permission levels; flag overly permissive API access
-
-## 5. Compliance Framework Mappings
-
-| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---|---------|---------|------|-------|-----|---------|------|------|-------|
-| 1 | Global MFA policy | IA-2(1) | 3.5.3 | CC6.1 | 6.3 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.AT-2 |
-| 2 | User enrollment completeness | IA-2(2) | 3.5.3 | CC6.1 | 6.3 | 8.4.1 | SRG-APP-000150 | ISM-1504 | CPS.AT-2 |
-| 3 | Bypass code audit | IA-5(1) | 3.5.10 | CC6.1 | — | 8.6.3 | SRG-APP-000175 | ISM-1557 | CPS.IA-5 |
-| 4 | Inactive user detection | AC-2(3) | 3.1.12 | CC6.2 | 5.3 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
-| 5 | Admin role review | AC-6(5) | 3.1.5 | CC6.3 | 6.5 | 7.1.1 | SRG-APP-000340 | ISM-1507 | CPS.AC-6 |
-| 6 | Trusted endpoint policy | CM-8(3) | 3.4.1 | CC6.7 | — | 2.4 | SRG-APP-000383 | ISM-1599 | CPS.CM-8 |
-| 7 | Device health requirements | CM-6 | 3.4.2 | CC6.7 | — | 2.2.1 | SRG-APP-000384 | ISM-1082 | CPS.CM-6 |
-| 8 | Remembered devices policy | AC-12 | 3.1.10 | CC6.1 | — | 8.2.8 | SRG-APP-000295 | ISM-1164 | CPS.AC-7 |
-| 9 | Auth method restrictions | IA-2(6) | 3.5.3 | CC6.1 | 6.4 | 8.4.3 | SRG-APP-000156 | ISM-1515 | CPS.IA-2 |
-| 10 | New user policy | AC-2(2) | 3.1.1 | CC6.2 | — | 8.2.1 | SRG-APP-000024 | ISM-0415 | CPS.AC-2 |
-| 11 | User lockout policy | AC-7 | 3.1.8 | CC6.1 | 5.4 | 8.3.4 | SRG-APP-000065 | ISM-1403 | CPS.AC-7 |
-| 12 | Integration policy assignments | CM-2 | 3.4.1 | CC6.8 | — | 2.2.1 | SRG-APP-000386 | ISM-1624 | CPS.CM-2 |
-| 13 | Unprotected app detection | CM-8 | 3.4.1 | CC6.1 | — | 2.4 | SRG-APP-000383 | ISM-1599 | CPS.CM-8 |
-| 14 | Trust Monitor configuration | SI-4 | 3.14.6 | CC7.2 | — | 10.6.1 | SRG-APP-000516 | ISM-0580 | CPS.SI-4 |
-| 15 | Auth log anomalies | AU-6 | 3.3.5 | CC7.2 | — | 10.6.1 | SRG-APP-000516 | ISM-0109 | CPS.AU-6 |
-| 16 | Telephony credit monitoring | SA-9 | 3.13.2 | CC9.1 | — | — | SRG-APP-000516 | ISM-0888 | CPS.SA-9 |
-| 17 | U2F/WebAuthn inventory | IA-2(12) | 3.5.3 | CC6.1 | 6.4 | 8.4.3 | SRG-APP-000395 | ISM-1515 | CPS.IA-2 |
-| 18 | Offline access configuration | IA-2(11) | 3.5.3 | CC6.1 | — | 8.4.1 | SRG-APP-000394 | ISM-1504 | CPS.IA-2 |
-| 19 | Self-service portal policy | AC-2(1) | 3.1.1 | CC6.2 | — | 8.2.4 | SRG-APP-000023 | ISM-1594 | CPS.AC-2 |
-| 20 | API permission audit | AC-6(10) | 3.1.7 | CC6.3 | — | 7.1.2 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
-
-## 6. Existing Tools
-
-| Tool | Description | Limitations |
-|------|-------------|-------------|
-| **Duo Admin Panel** | Built-in web dashboard for configuration and reporting | Manual review; no automated compliance mapping |
-| **Duo Trust Monitor** | Built-in anomaly detection for authentication events | Detection-focused, not configuration compliance |
-| **Cisco SecureX** | Integrated security platform with Duo telemetry | Requires SecureX license; limited config audit depth |
-| **Duo Device Insight** | Endpoint visibility and device posture | Focused on device inventory, not policy compliance |
-| **CISA MFA Guidance** | Federal MFA implementation guidance | Reference only, no tooling |
-| **CrowdStrike Falcon Identity** | Identity threat detection and response | Commercial; detection-focused, not Duo-specific config audit |
-
-**Current state:** grclanker now ships a native TypeScript Duo assessment surface with read-only access checks, focused posture assessments, and audit-bundle export. The remaining gap is real-tenant smoke validation and future deeper vendor-specific expansion, not the absence of an open-source Duo posture tool.
-
-## 7. Architecture
-
-The current implementation lives in grclanker as native TypeScript under `cli/extensions/grc-tools/duo.ts`, with tests in `cli/tests/duo.test.mjs` and an optional smoke path in `cli/scripts/duo-live-smoke.mjs`.
-
-The legacy tree below is preserved as historical design context from the original standalone concept:
-
-```
-duo-sec-inspector/
-├── cmd/
-│   └── duo-sec-inspector/
-│       └── main.go                  # CLI entrypoint
-├── internal/
-│   ├── client/
-│   │   ├── admin.go                 # Admin API client with HMAC-SHA1 signing
-│   │   ├── auth.go                  # Auth API client
-│   │   ├── accounts.go              # Accounts API client (MSP)
-│   │   └── ratelimit.go             # Rate limiter (Duo: 20 req/sec for most endpoints)
-│   ├── analyzers/
-│   │   ├── globalpolicy.go          # Control 1: Global MFA policy
-│   │   ├── enrollment.go            # Control 2: User enrollment completeness
-│   │   ├── bypasscodes.go           # Control 3: Bypass code audit
-│   │   ├── inactive.go              # Control 4: Inactive user detection
-│   │   ├── adminroles.go            # Control 5: Admin role review
-│   │   ├── trustedendpoints.go      # Control 6: Trusted endpoint policy
-│   │   ├── devicehealth.go          # Control 7: Device health requirements
-│   │   ├── remembered.go            # Control 8: Remembered devices policy
-│   │   ├── authmethods.go           # Control 9: Authentication method restrictions
-│   │   ├── newuserpolicy.go         # Control 10: New user policy
-│   │   ├── lockout.go               # Control 11: User lockout policy
-│   │   ├── integrations.go          # Controls 12-13: Integration policy and unprotected apps
-│   │   ├── trustmonitor.go          # Control 14: Trust Monitor configuration
-│   │   ├── authlogs.go              # Control 15: Authentication log anomalies
-│   │   ├── telephony.go             # Control 16: Telephony credit monitoring
-│   │   ├── webauthn.go              # Control 17: U2F/WebAuthn inventory
-│   │   ├── offlineaccess.go         # Control 18: Offline access configuration
-│   │   ├── selfservice.go           # Control 19: Self-service portal policy
-│   │   └── apipermissions.go        # Control 20: API permission audit
-│   ├── reporters/
-│   │   ├── json.go                  # JSON output reporter
-│   │   ├── csv.go                   # CSV output reporter
-│   │   ├── markdown.go              # Markdown report with compliance matrix
-│   │   ├── html.go                  # HTML dashboard report
-│   │   └── sarif.go                 # SARIF format for CI/CD integration
-│   ├── compliance/
-│   │   ├── mapper.go                # Maps findings to framework controls
-│   │   ├── fedramp.go               # FedRAMP control definitions
-│   │   ├── cmmc.go                  # CMMC control definitions
-│   │   ├── soc2.go                  # SOC 2 trust criteria
-│   │   ├── cis.go                   # CIS Benchmark references
-│   │   ├── pcidss.go                # PCI-DSS requirements
-│   │   ├── stig.go                  # DISA STIG rules
-│   │   ├── irap.go                  # IRAP ISM controls
-│   │   └── ismap.go                 # ISMAP control references
-│   ├── models/
-│   │   ├── finding.go               # Finding severity, evidence, remediation
-│   │   ├── control.go               # Security control definition
-│   │   └── report.go                # Aggregate report model
-│   └── tui/
-│       ├── app.go                   # Bubble Tea TUI application
-│       ├── views/
-│       │   ├── dashboard.go         # Summary dashboard view
-│       │   ├── controls.go          # Control detail drill-down
-│       │   └── compliance.go        # Framework compliance matrix view
-│       └── components/
-│           ├── table.go             # Sortable findings table
-│           ├── progress.go          # Scan progress indicator
-│           └── severity.go          # Severity badge rendering
-├── pkg/
-│   └── version/
-│       └── version.go               # Build version info
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── .goreleaser.yaml
-└── spec.md
-```
-
-### Key Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `github.com/duosecurity/duo_client_golang` | Official Duo API client and signing reference |
-| `github.com/spf13/cobra` | CLI framework |
-| `github.com/charmbracelet/bubbletea` | Terminal UI framework |
-| `github.com/charmbracelet/lipgloss` | TUI styling |
-
-## 8. CLI Interface
-
-```
-duo-sec-inspector [command] [flags]
-
-Commands:
-  scan          Run security compliance scan against Duo account
-  report        Generate compliance report from scan results
-  version       Print version information
-
-Global Flags:
-  --ikey string         Duo integration key [$DUO_IKEY]
-  --skey string         Duo secret key [$DUO_SKEY]
-  --api-host string     Duo API hostname [$DUO_API_HOST]
-  --output string       Output format: json, csv, markdown, html, sarif (default "json")
-  --output-dir string   Directory for report output (default "./results")
-  --severity string     Minimum severity to report: critical, high, medium, low, info (default "low")
-  --controls string     Comma-separated list of control numbers to run (default: all)
-  --quiet               Suppress progress output
-  --no-color            Disable colored output
-  --tui                 Launch interactive terminal UI
-
-Scan Flags:
-  --skip-auth-logs      Skip authentication log analysis (faster scan)
-  --skip-trust-monitor  Skip Trust Monitor event retrieval
-  --log-days int        Days of authentication logs to analyze (default 30)
-  --parallel int        Number of parallel API calls (default 4)
-  --timeout duration    API call timeout (default 30s)
-
-Examples:
-  # Full Duo account scan with JSON output
-  duo-sec-inspector scan --ikey DIXX... --skey ... --api-host api-XXXX.duosecurity.com
-
-  # Scan MFA policy controls only
-  duo-sec-inspector scan --controls 1,2,9,10,11 --output markdown
-
-  # Interactive TUI mode
-  duo-sec-inspector scan --tui
-
-  # CI/CD pipeline with SARIF output, high severity only
-  duo-sec-inspector scan --output sarif --severity high
-```
-
-## 9. Build Sequence
-
-```bash
-# 1. Initialize module
-go mod init github.com/hackIDLE/duo-sec-inspector
-
-# 2. Add dependencies
-go get github.com/duosecurity/duo_client_golang
-go get github.com/spf13/cobra
-go get github.com/charmbracelet/bubbletea
-go get github.com/charmbracelet/lipgloss
-
-# 3. Build
-go build -ldflags "-X pkg/version.Version=$(git describe --tags)" \
-  -o bin/duo-sec-inspector ./cmd/duo-sec-inspector/
-
-# 4. Test
-go test ./...
-
-# 5. Lint
-golangci-lint run
-
-# 6. Docker
-docker build -t duo-sec-inspector .
-
-# 7. Release
-goreleaser release --snapshot
-```
-
-## 10. Status
-
-Implemented in grclanker as a native TypeScript tool family. The standalone Go CLI described in sections 7 through 9 was never built; those sections remain as historical design context.
-
-### grclanker implementation
-
-- Source: `cli/extensions/grc-tools/duo.ts` (tools `duo_check_access`, `duo_assess_authentication`, `duo_assess_admin_access`, `duo_assess_integrations`, `duo_assess_monitoring`, `duo_export_audit_bundle`)
-- Tests: `cli/tests/duo.test.mjs` (mocked Admin API coverage, verdict-safety fixtures, bundle layout)
-- Live smoke: `cli/scripts/duo-live-smoke.mjs` via `npm --prefix cli run test:duo:live`
-- Integration guide: `src/content/docs/docs/integrations/duo.md`
-- Scope: Admin API read endpoints only. The Auth API and Accounts API listed in section 2 are not used.
-
-Control coverage (20 of 20 controls have a finding; 18 are automated, control 18 is Manual by design, control 7 and the travel half of control 15 are automated only on editions that expose the fields):
-
-| # | Control | Finding | Status |
-|---|---------|---------|--------|
-| 1 | Global MFA policy | DUO-AUTH-007, DUO-AUTH-001 | Automated |
-| 2 | User enrollment completeness | DUO-AUTH-008 | Automated |
-| 3 | Bypass code audit | DUO-AUTH-006 | Automated |
-| 4 | Inactive user detection | DUO-AUTH-009 | Automated |
-| 5 | Admin role review | DUO-ADMIN-001 | Automated |
-| 6 | Trusted endpoint policy | DUO-AUTH-005 | Automated |
-| 7 | Device health requirements | DUO-INTEGRATIONS-006 | Automated (Advantage and Premier), Manual otherwise |
-| 8 | Remembered devices policy | DUO-AUTH-004 | Automated |
-| 9 | Authentication method restrictions | DUO-AUTH-002 | Automated |
-| 10 | New user policy | DUO-AUTH-003 | Automated |
-| 11 | User lockout policy | DUO-ADMIN-005 | Automated |
-| 12 | Integration policy assignments | DUO-INTEGRATIONS-001 | Automated |
-| 13 | Unprotected application detection | DUO-INTEGRATIONS-005 | Automated when applications are tagged, Manual otherwise |
-| 14 | Trust Monitor configuration | DUO-MON-002 | Automated where available |
-| 15 | Authentication log anomalies | DUO-MON-005, DUO-MON-001 | Automated (travel analysis needs access device location) |
-| 16 | Telephony credit monitoring | DUO-MON-003 | Automated |
-| 17 | U2F/WebAuthn credential inventory | DUO-AUTH-010 | Automated |
-| 18 | Offline access configuration | DUO-AUTH-011 | Manual (no documented policy section) |
-| 19 | Self-service portal policy | DUO-INTEGRATIONS-003 | Automated |
-| 20 | API permission audit | DUO-INTEGRATIONS-004 | Automated |
-
-Verdict rules: forbidden or errored calls render Manual with the endpoint, permission, and evidence to collect; empty inventories never pass by default; undated records are never counted fresh; incomplete paging caps a finding at Partial with seen and total counts; re-running the export never overwrites a prior bundle.
-
-Deferred: Auth API and Accounts API modes, telephony credit trend analysis, and Trust Monitor triage depth.
+## Known runtime gaps
+
+- Duo edition and endpoint availability gaps are explicit manual findings; a denied Admin API surface never becomes an empty compliant inventory.
+- The Admin API offset walker records cap, repeated offset, empty-page, missing-total, and total-mismatch exits as incomplete evidence.
+- Trust Monitor analysis is limited to the fields returned by the shipped Admin API collector and does not implement the deeper trend analysis described by the historical design.
+- Auth API and Accounts API authentication modes, richer Trust Monitor analysis, and trend reporting are not shipped.
+- DUO-AUTH-010 derives its verdict completeness from the user inventory only. WebAuthn credential source errors, denials, or truncation do not make that fact incomplete, so a readable user inventory can retain Pass despite incomplete WebAuthn source evidence; changing that behavior requires a separate runtime fix.
+
+## Tools
+
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `duo_check_access` | Validate Duo Admin API access for a read-only audit principal and report which core GRC surfaces are readable. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `duo_assess_authentication` | Evaluate Duo global MFA policy, factor strength, bypass-code hygiene, remembered devices, and trusted endpoint posture. | `DUO-AUTH-001`, `DUO-AUTH-002`, `DUO-AUTH-003`, `DUO-AUTH-004`, `DUO-AUTH-005`, `DUO-AUTH-006`, `DUO-AUTH-007`, `DUO-AUTH-008`, `DUO-AUTH-009`, `DUO-AUTH-010`, `DUO-AUTH-011` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `duo_assess_admin_access` | Review Duo privileged administrators, owner concentration, admin MFA methods, help-desk bypass governance, and stale privileged accounts. | `DUO-ADMIN-001`, `DUO-ADMIN-002`, `DUO-ADMIN-003`, `DUO-ADMIN-004`, `DUO-ADMIN-005` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `duo_assess_integrations` | Review Duo protected application inventory, explicit policy attachment, Universal Prompt adoption, self-service posture, and Admin API least privilege. | `DUO-INTEGRATIONS-001`, `DUO-INTEGRATIONS-002`, `DUO-INTEGRATIONS-003`, `DUO-INTEGRATIONS-004`, `DUO-INTEGRATIONS-005`, `DUO-INTEGRATIONS-006` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `duo_assess_monitoring` | Review Duo authentication telemetry, Trust Monitor coverage, telephony reliance, credits, and notification posture. | `DUO-MON-001`, `DUO-MON-002`, `DUO-MON-003`, `DUO-MON-004`, `DUO-MON-005` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `duo_export_audit_bundle` | Export a multi-framework Duo audit package with raw API data, normalized findings, markdown reports, and a zip archive. | `DUO-AUTH-001`, `DUO-AUTH-002`, `DUO-AUTH-003`, `DUO-AUTH-004`, `DUO-AUTH-005`, `DUO-AUTH-006`, `DUO-AUTH-007`, `DUO-AUTH-008`, `DUO-AUTH-009`, `DUO-AUTH-010`, `DUO-AUTH-011`, `DUO-ADMIN-001`, `DUO-ADMIN-002`, `DUO-ADMIN-003`, `DUO-ADMIN-004`, `DUO-ADMIN-005`, `DUO-INTEGRATIONS-001`, `DUO-INTEGRATIONS-002`, `DUO-INTEGRATIONS-003`, `DUO-INTEGRATIONS-004`, `DUO-INTEGRATIONS-005`, `DUO-INTEGRATIONS-006`, `DUO-MON-001`, `DUO-MON-002`, `DUO-MON-003`, `DUO-MON-004`, `DUO-MON-005` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
+
+### Parameters
+
+#### `duo_check_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_host` | string | no | Optional Duo Admin API hostname, like api-XXXXXXXX.duosecurity.com. Falls back to DUO_API_HOST. |
+| `ikey` | string | no | Optional Duo Admin API integration key. Falls back to DUO_IKEY. |
+| `skey` | string | no | Optional Duo Admin API secret key. Falls back to DUO_SKEY. |
+| `lookback_days` | integer | no | Optional Duo log lookback window in days for monitoring-focused collection. Defaults to 30. |
+
+#### `duo_assess_authentication`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_host` | string | no | Optional Duo Admin API hostname, like api-XXXXXXXX.duosecurity.com. Falls back to DUO_API_HOST. |
+| `ikey` | string | no | Optional Duo Admin API integration key. Falls back to DUO_IKEY. |
+| `skey` | string | no | Optional Duo Admin API secret key. Falls back to DUO_SKEY. |
+| `lookback_days` | integer | no | Optional Duo log lookback window in days for monitoring-focused collection. Defaults to 30. |
+
+#### `duo_assess_admin_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_host` | string | no | Optional Duo Admin API hostname, like api-XXXXXXXX.duosecurity.com. Falls back to DUO_API_HOST. |
+| `ikey` | string | no | Optional Duo Admin API integration key. Falls back to DUO_IKEY. |
+| `skey` | string | no | Optional Duo Admin API secret key. Falls back to DUO_SKEY. |
+| `lookback_days` | integer | no | Optional Duo log lookback window in days for monitoring-focused collection. Defaults to 30. |
+
+#### `duo_assess_integrations`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_host` | string | no | Optional Duo Admin API hostname, like api-XXXXXXXX.duosecurity.com. Falls back to DUO_API_HOST. |
+| `ikey` | string | no | Optional Duo Admin API integration key. Falls back to DUO_IKEY. |
+| `skey` | string | no | Optional Duo Admin API secret key. Falls back to DUO_SKEY. |
+| `lookback_days` | integer | no | Optional Duo log lookback window in days for monitoring-focused collection. Defaults to 30. |
+
+#### `duo_assess_monitoring`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_host` | string | no | Optional Duo Admin API hostname, like api-XXXXXXXX.duosecurity.com. Falls back to DUO_API_HOST. |
+| `ikey` | string | no | Optional Duo Admin API integration key. Falls back to DUO_IKEY. |
+| `skey` | string | no | Optional Duo Admin API secret key. Falls back to DUO_SKEY. |
+| `lookback_days` | integer | no | Optional Duo log lookback window in days for monitoring-focused collection. Defaults to 30. |
+
+#### `duo_export_audit_bundle`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_host` | string | no | Optional Duo Admin API hostname, like api-XXXXXXXX.duosecurity.com. Falls back to DUO_API_HOST. |
+| `ikey` | string | no | Optional Duo Admin API integration key. Falls back to DUO_IKEY. |
+| `skey` | string | no | Optional Duo Admin API secret key. Falls back to DUO_SKEY. |
+| `lookback_days` | integer | no | Optional Duo log lookback window in days for monitoring-focused collection. Defaults to 30. |
+| `output_dir` | string | no | Optional output root. Defaults to ./export/duo. |
+
+
+## Authentication
+
+Supported modes:
+
+- Duo Admin API HMAC integration key and secret key
+
+Credential precedence, highest first:
+
+1. Explicit tool arguments
+2. DUO_* environment variables
+
+Environment variables: `DUO_API_HOST`, `DUO_IKEY`, `DUO_SKEY`, `DUO_LOOKBACK_DAYS`
+
+Configuration locations: (none)
+
+Credential and deployment variants: Commercial and FedRAMP Duo API hostnames selected by api_host
+
+Configuration fields: None
+
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
+
+## Permissions
+
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| role | `Grant resource - Read` | `global-policy`, `policies`, `users`, `bypass-codes`, `webauthn-credentials`, `integrations`, `offline-enrollment-logs` |  |
+| role | `Grant administrators - Read` | `admins`, `admin-auth-methods` |  |
+| role | `Grant settings` | `settings` |  |
+| role | `Grant read log` | `authentication-logs`, `activity-logs`, `telephony-logs`, `offline-enrollment-logs`, `trust-monitor-events` |  |
+| role | `Grant read information` | `info-summary`, `authentication-attempts` |  |
+
+## API surfaces
+
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `settings` | HTTP | `GET /admin/v1/settings` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `helpdesk_bypass`, `user_lockout`, `notifications` | [Official documentation](https://duo.com/docs/adminapi) |
+| `info-summary` | HTTP | `GET /admin/v1/info/summary` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `telephony_credits_remaining`, `user_count`, `integration_count` | [Official documentation](https://duo.com/docs/adminapi) |
+| `authentication-attempts` | HTTP | `GET /admin/v1/info/authentication_attempts` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `count`, `result`, `reason` | [Official documentation](https://duo.com/docs/adminapi) |
+| `admin-auth-methods` | HTTP | `GET /admin/v1/admins/allowed_auth_methods` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `webauthn`, `duo_push`, `sms`, `phone` | [Official documentation](https://duo.com/docs/adminapi) |
+| `global-policy` | HTTP | `GET /admin/v2/policies/global` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `authentication_methods`, `new_user_policy`, `remembered_devices`, `trusted_endpoints`, `device_health` | [Official documentation](https://duo.com/docs/adminapi) |
+| `policies` | HTTP | `GET /admin/v2/policies` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `policy_id`, `name`, `authentication_methods`, `remembered_devices`, `device_health` | [Official documentation](https://duo.com/docs/adminapi) |
+| `users` | HTTP | `GET /admin/v1/users` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `user_id`, `username`, `status`, `last_login`, `is_enrolled` | [Official documentation](https://duo.com/docs/adminapi) |
+| `bypass-codes` | HTTP | `GET /admin/v1/bypass_codes` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `user_id`, `created`, `expires`, `remaining_uses` | [Official documentation](https://duo.com/docs/adminapi) |
+| `webauthn-credentials` | HTTP | `GET /admin/v1/webauthncredentials` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `user_id`, `credential_name`, `date_added` | [Official documentation](https://duo.com/docs/adminapi) |
+| `admins` | HTTP | `GET /admin/v1/admins` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `admin_id`, `name`, `role`, `status`, `last_login` | [Official documentation](https://duo.com/docs/adminapi) |
+| `integrations` | HTTP | `GET /admin/v3/integrations` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `integration_key`, `name`, `type`, `policy`, `prompt_type`, `permissions` | [Official documentation](https://duo.com/docs/adminapi) |
+| `authentication-logs` | HTTP | `GET /admin/v2/logs/authentication` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `timestamp`, `result`, `reason`, `factor`, `access_device`, `location` | [Official documentation](https://duo.com/docs/adminapi) |
+| `activity-logs` | HTTP | `GET /admin/v2/logs/activity` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `timestamp`, `action`, `username`, `description` | [Official documentation](https://duo.com/docs/adminapi) |
+| `telephony-logs` | HTTP | `GET /admin/v2/logs/telephony` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `timestamp`, `type`, `context`, `credits` | [Official documentation](https://duo.com/docs/adminapi) |
+| `offline-enrollment-logs` | HTTP | `GET /admin/v1/logs/offline_enrollment` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `timestamp`, `username`, `action`, `application` | [Official documentation](https://duo.com/docs/adminapi) |
+| `trust-monitor-events` | HTTP | `GET /admin/v1/trust_monitor/events` | Duo Admin API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `type`, `timestamp`, `risk`, `location` | [Official documentation](https://duo.com/docs/adminapi) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `settings` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `settings` | response | A JSON object or list containing only the documented helpdesk_bypass, user_lockout, notifications members consumed by verdicts. | yes |
+| `info-summary` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `info-summary` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `info-summary` | response | A JSON object or list containing only the documented telephony_credits_remaining, user_count, integration_count members consumed by verdicts. | yes |
+| `authentication-attempts` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `authentication-attempts` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `authentication-attempts` | response | A JSON object or list containing only the documented count, result, reason members consumed by verdicts. | yes |
+| `admin-auth-methods` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `admin-auth-methods` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `admin-auth-methods` | response | A JSON object or list containing only the documented webauthn, duo_push, sms, phone members consumed by verdicts. | yes |
+| `global-policy` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `global-policy` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `global-policy` | response | A JSON object or list containing only the documented authentication_methods, new_user_policy, remembered_devices, trusted_endpoints, device_health members consumed by verdicts. | yes |
+| `policies` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `policies` | response | A JSON object or list containing only the documented policy_id, name, authentication_methods, remembered_devices, device_health members consumed by verdicts. | yes |
+| `users` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `users` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `users` | response | A JSON object or list containing only the documented user_id, username, status, last_login, is_enrolled members consumed by verdicts. | yes |
+| `bypass-codes` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `bypass-codes` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `bypass-codes` | response | A JSON object or list containing only the documented user_id, created, expires, remaining_uses members consumed by verdicts. | yes |
+| `webauthn-credentials` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `webauthn-credentials` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `webauthn-credentials` | response | A JSON object or list containing only the documented user_id, credential_name, date_added members consumed by verdicts. | yes |
+| `admins` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `admins` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `admins` | response | A JSON object or list containing only the documented admin_id, name, role, status, last_login members consumed by verdicts. | yes |
+| `integrations` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `integrations` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `integrations` | response | A JSON object or list containing only the documented integration_key, name, type, policy, prompt_type, permissions members consumed by verdicts. | yes |
+| `authentication-logs` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `authentication-logs` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `authentication-logs` | response | A JSON object or list containing only the documented timestamp, result, reason, factor, access_device, location members consumed by verdicts. | yes |
+| `activity-logs` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `activity-logs` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `activity-logs` | response | A JSON object or list containing only the documented timestamp, action, username, description members consumed by verdicts. | yes |
+| `telephony-logs` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `telephony-logs` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `telephony-logs` | response | A JSON object or list containing only the documented timestamp, type, context, credits members consumed by verdicts. | yes |
+| `offline-enrollment-logs` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `offline-enrollment-logs` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `offline-enrollment-logs` | response | A JSON object or list containing only the documented timestamp, username, action, application members consumed by verdicts. | yes |
+| `trust-monitor-events` | client | Use the configured Duo Admin API origin; never follow a server link to a different origin. | yes |
+| `trust-monitor-events` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `trust-monitor-events` | response | A JSON object or list containing only the documented id, type, timestamp, risk, location members consumed by verdicts. | yes |
+
+## Pagination
+
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `policies`, `users`, `bypass-codes`, `webauthn-credentials`, `admins`, `integrations` | `offset`, `metadata.next_offset`, `metadata.total_objects` | 100 | caller limit | 1000 | metadata.total_objects is authoritative when present; seen records below that total are incomplete. | Total reached; No next_offset; Page cap; Repeated offset; Empty page with offset; Missing or inconsistent total |
+| `authentication-logs`, `activity-logs`, `telephony-logs`, `trust-monitor-events` | `metadata.next_offset` | 200 | 400 | 1000 | Log walks are complete only when next_offset is absent before the caller record cap. | No next_offset; 400-record cap; Repeated offset; Empty page with offset; Page cap |
+| `offline-enrollment-logs` | `mintime`, `timestamp` | 1000 | 5000 | 5 | Advance mintime from the latest event; the 5,000-record cap leaves the dataset incomplete. | Short page; 5,000-record cap; Timestamp fails to advance |
+
+## Rate limits
+
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Duo Security Inspector | Duo applies integration- and endpoint-specific limits | `Retry-After`, `X-RateLimit-Remaining` | 429, 500, 502, 503, 504 | Honor bounded Retry-After, otherwise use bounded exponential retry and surface exhaustion. |
+
+## Checks
+
+### Control coverage
+
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | Phishing-resistant authentication methods | DUO-AUTH-001 | Evaluate the ordered first-match rules for DUO-AUTH-001 below. |
+| 2 | Deprecated authentication methods restricted | DUO-AUTH-002 | Evaluate the ordered first-match rules for DUO-AUTH-002 below. |
+| 3 | New user enrollment policy | DUO-AUTH-003 | Evaluate the ordered first-match rules for DUO-AUTH-003 below. |
+| 4 | Remembered devices posture | DUO-AUTH-004 | Evaluate the ordered first-match rules for DUO-AUTH-004 below. |
+| 5 | Trusted endpoints and device health | DUO-AUTH-005 | Evaluate the ordered first-match rules for DUO-AUTH-005 below. |
+| 6 | Bypass code hygiene | DUO-AUTH-006 | Evaluate the ordered first-match rules for DUO-AUTH-006 below. |
+| 7 | Global MFA enforcement mode | DUO-AUTH-007 | Evaluate the ordered first-match rules for DUO-AUTH-007 below. |
+| 8 | User enrollment completeness | DUO-AUTH-008 | Evaluate the ordered first-match rules for DUO-AUTH-008 below. |
+| 9 | Inactive user detection | DUO-AUTH-009 | Evaluate the ordered first-match rules for DUO-AUTH-009 below. |
+| 10 | WebAuthn and U2F credential adoption | DUO-AUTH-010 | Evaluate the ordered first-match rules for DUO-AUTH-010 below. |
+| 11 | Offline access configuration | DUO-AUTH-011 | Evaluate the ordered first-match rules for DUO-AUTH-011 below. |
+| 12 | Owner and privileged admin concentration | DUO-ADMIN-001 | Evaluate the ordered first-match rules for DUO-ADMIN-001 below. |
+| 13 | Administrator authentication strength | DUO-ADMIN-002 | Evaluate the ordered first-match rules for DUO-ADMIN-002 below. |
+| 14 | Help desk bypass governance | DUO-ADMIN-003 | Evaluate the ordered first-match rules for DUO-ADMIN-003 below. |
+| 15 | Stale privileged administrator review | DUO-ADMIN-004 | Evaluate the ordered first-match rules for DUO-ADMIN-004 below. |
+| 16 | User lockout policy | DUO-ADMIN-005 | Evaluate the ordered first-match rules for DUO-ADMIN-005 below. |
+| 17 | Protected integrations have explicit policy coverage | DUO-INTEGRATIONS-001 | Evaluate the ordered first-match rules for DUO-INTEGRATIONS-001 below. |
+| 18 | Universal Prompt adoption | DUO-INTEGRATIONS-002 | Evaluate the ordered first-match rules for DUO-INTEGRATIONS-002 below. |
+| 19 | Self-service portal governance | DUO-INTEGRATIONS-003 | Evaluate the ordered first-match rules for DUO-INTEGRATIONS-003 below. |
+| 20 | Administrative API integration permissions | DUO-INTEGRATIONS-004 | Evaluate the ordered first-match rules for DUO-INTEGRATIONS-004 below. |
+| 21 | Critical application protection coverage | DUO-INTEGRATIONS-005 | Evaluate the ordered first-match rules for DUO-INTEGRATIONS-005 below. |
+| 22 | Device health requirements depth | DUO-INTEGRATIONS-006 | Evaluate the ordered first-match rules for DUO-INTEGRATIONS-006 below. |
+| 23 | Authentication log visibility and factor hygiene | DUO-MON-001 | Evaluate the ordered first-match rules for DUO-MON-001 below. |
+| 24 | Trust Monitor coverage | DUO-MON-002 | Evaluate the ordered first-match rules for DUO-MON-002 below. |
+| 25 | Telephony reliance and credit headroom | DUO-MON-003 | Evaluate the ordered first-match rules for DUO-MON-003 below. |
+| 26 | Administrative and fraud notifications | DUO-MON-004 | Evaluate the ordered first-match rules for DUO-MON-004 below. |
+| 27 | Authentication outcome and travel anomalies | DUO-MON-005 | Evaluate the ordered first-match rules for DUO-MON-005 below. |
+
+### Finding notes
+
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `DUO-AUTH-001` | medium | `duo_assess_authentication` | `global-policy` | `policy_readable`, `has_webauthn`, `allows_push`, `requires_verified_push`, `supporting_strong_method_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the global policy allows WebAuthn or requires Verified Duo Push, warn when only ordinary Duo Push or supporting administrator hardening exists, and fail when neither phishing-resistant option is present. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the global policy allows WebAuthn or requires Verified Duo Push, warn when only ordinary Duo Push or supporting administrator hardening exists, and fail when neither phishing-resistant option is present. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the global policy allows WebAuthn or requires Verified Duo Push, warn when only ordinary Duo Push or supporting administrator hardening exists, and fail when neither phishing-resistant option is present. | The required evidence for Phishing-resistant authentication methods is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-002` | medium | `duo_assess_authentication` | `global-policy` | `policy_readable`, `allowed_list_exposed`, `blocked_list_exposed`, `explicitly_allowed_telephony_count`, `blocked_telephony_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass only when both SMS and phone callback are explicitly blocked, fail when neither is blocked, warn when only one is blocked or telephony is explicitly allowed alongside a partial block, and manual when the allow and block lists are absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass only when both SMS and phone callback are explicitly blocked, fail when neither is blocked, warn when only one is blocked or telephony is explicitly allowed alongside a partial block, and manual when the allow and block lists are absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass only when both SMS and phone callback are explicitly blocked, fail when neither is blocked, warn when only one is blocked or telephony is explicitly allowed alongside a partial block, and manual when the allow and block lists are absent. | The required evidence for Deprecated authentication methods restricted is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-003` | medium | `duo_assess_authentication` | `global-policy` | `new_user_behavior` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for new_user_behavior=enroll, fail for no-mfa, warn for any other readable behavior, and manual when the value is absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for new_user_behavior=enroll, fail for no-mfa, warn for any other readable behavior, and manual when the value is absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for new_user_behavior=enroll, fail for no-mfa, warn for any other readable behavior, and manual when the value is absent. | The required evidence for New user enrollment policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-004` | medium | `duo_assess_authentication` | `global-policy` | `policy_readable`, `remembered_device_days` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when remembered devices are disabled or last at most 14 days, warn for 15 through 30 days, fail above 30 days, and manual when the duration cannot be normalized. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when remembered devices are disabled or last at most 14 days, warn for 15 through 30 days, fail above 30 days, and manual when the duration cannot be normalized. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when remembered devices are disabled or last at most 14 days, warn for 15 through 30 days, fail above 30 days, and manual when the duration cannot be normalized. | The required evidence for Remembered devices posture is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-005` | medium | `duo_assess_authentication` | `global-policy` | `policy_readable`, `trusted_endpoint_checking` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for trusted_endpoint_checking=require-trusted, warn for allow-all, and fail for any other readable configuration. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for trusted_endpoint_checking=require-trusted, warn for allow-all, and fail for any other readable configuration. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for trusted_endpoint_checking=require-trusted, warn for allow-all, and fail for any other readable configuration. | The required evidence for Trusted endpoints and device health is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-006` | high | `duo_assess_authentication` | `bypass-codes`, `settings` | `readable`, `complete`, `settings_readable`, `bypass_code_count`, `flagged_code_count`, `undated_code_count`, `helpdesk_bypass`, `helpdesk_bypass_expiration` | Complete readable evidence satisfies the compliant branch of this derivation: return pass only for an empty bypass-code inventory with readable help-desk limits, fail when any unexpired code is older than 24 hours, has unlimited uses, lacks expiration, or help-desk issuance is unlimited, and warn for every other non-empty or undated inventory. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass only for an empty bypass-code inventory with readable help-desk limits, fail when any unexpired code is older than 24 hours, has unlimited uses, lacks expiration, or help-desk issuance is unlimited, and warn for every other non-empty or undated inventory. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass only for an empty bypass-code inventory with readable help-desk limits, fail when any unexpired code is older than 24 hours, has unlimited uses, lacks expiration, or help-desk issuance is unlimited, and warn for every other non-empty or undated inventory. | The required evidence for Bypass code hygiene is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-007` | high | `duo_assess_authentication` | `global-policy` | `policy_readable`, `user_auth_behavior` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for user_auth_behavior=enforce, fail for bypass, warn for another readable value such as deny, and manual when the authentication policy or value is absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for user_auth_behavior=enforce, fail for bypass, warn for another readable value such as deny, and manual when the authentication policy or value is absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for user_auth_behavior=enforce, fail for bypass, warn for another readable value such as deny, and manual when the authentication policy or value is absent. | The required evidence for Global MFA enforcement mode is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-008` | medium | `duo_assess_authentication` | `users` | `readable`, `complete`, `user_count`, `known_enrollment_count`, `enrolled_user_count`, `bypass_user_count`, `unenrolled_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: for users with known enrollment state, return pass when all active users are enrolled and none has bypass status, warn when at least 90 percent are enrolled with no bypass users, and fail otherwise. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for users with known enrollment state, return pass when all active users are enrolled and none has bypass status, warn when at least 90 percent are enrolled with no bypass users, and fail otherwise. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for users with known enrollment state, return pass when all active users are enrolled and none has bypass status, warn when at least 90 percent are enrolled with no bypass users, and fail otherwise. | The required evidence for User enrollment completeness is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-009` | medium | `duo_assess_authentication` | `users` | `readable`, `complete`, `access_user_count`, `inactive_user_count`, `undated_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty active-or-bypass population, return pass when every last-login date is present and no login is older than 90 days, warn when dates are missing or at most 10 percent are stale, and fail when more than 10 percent are stale. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty active-or-bypass population, return pass when every last-login date is present and no login is older than 90 days, warn when dates are missing or at most 10 percent are stale, and fail when more than 10 percent are stale. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty active-or-bypass population, return pass when every last-login date is present and no login is older than 90 days, warn when dates are missing or at most 10 percent are stale, and fail when more than 10 percent are stale. | The required evidence for Inactive user detection is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-010` | medium | `duo_assess_authentication` | `users`, `webauthn-credentials` | `readable`, `complete`, `enrolled_user_count`, `webauthn_user_count`, `deprecated_u2f_user_count` | Complete readable evidence satisfies the compliant branch of this derivation: for enrolled users, return pass when at least 75 percent have WebAuthn and none has deprecated U2F, warn when any user has WebAuthn but that bar is not met, and fail when none has WebAuthn. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for enrolled users, return pass when at least 75 percent have WebAuthn and none has deprecated U2F, warn when any user has WebAuthn but that bar is not met, and fail when none has WebAuthn. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for enrolled users, return pass when at least 75 percent have WebAuthn and none has deprecated U2F, warn when any user has WebAuthn but that bar is not met, and fail when none has WebAuthn. | The required evidence for WebAuthn and U2F credential adoption is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-AUTH-011` | medium | `duo_assess_authentication` | `global-policy`, `offline-enrollment-logs` | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the Admin API exposes offline-enrollment events but not the offline-access policy limits. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the Admin API exposes offline-enrollment events but not the offline-access policy limits. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the Admin API exposes offline-enrollment events but not the offline-access policy limits. | The required evidence for Offline access configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-ADMIN-001` | high | `duo_assess_admin_access` | `admins` | `readable`, `complete`, `admin_count`, `owner_count` | Complete readable evidence satisfies the compliant branch of this derivation: for a non-empty administrator inventory, return pass with at most two active owners, warn when owners are at most the greater of three or half of all administrators, and fail above that bound. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for a non-empty administrator inventory, return pass with at most two active owners, warn when owners are at most the greater of three or half of all administrators, and fail above that bound. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for a non-empty administrator inventory, return pass with at most two active owners, warn when owners are at most the greater of three or half of all administrators, and fail above that bound. | The required evidence for Owner and privileged admin concentration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-ADMIN-002` | medium | `duo_assess_admin_access` | `admin-auth-methods`, `global-policy` | `readable`, `verified_push_enabled`, `webauthn_enabled`, `sms_enabled`, `voice_enabled` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when WebAuthn or Verified Duo Push is enabled and SMS and voice are disabled, warn when a strong method is enabled alongside SMS or voice, and fail when neither strong method is enabled. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when WebAuthn or Verified Duo Push is enabled and SMS and voice are disabled, warn when a strong method is enabled alongside SMS or voice, and fail when neither strong method is enabled. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when WebAuthn or Verified Duo Push is enabled and SMS and voice are disabled, warn when a strong method is enabled alongside SMS or voice, and fail when neither strong method is enabled. | The required evidence for Administrator authentication strength is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-ADMIN-003` | high | `duo_assess_admin_access` | `settings` | `readable`, `helpdesk_bypass`, `helpdesk_bypass_expiration` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for helpdesk_bypass=deny, warn for limit with a positive expiration, and fail for every other readable setting. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for helpdesk_bypass=deny, warn for limit with a positive expiration, and fail for every other readable setting. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for helpdesk_bypass=deny, warn for limit with a positive expiration, and fail for every other readable setting. | The required evidence for Help desk bypass governance is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-ADMIN-004` | high | `duo_assess_admin_access` | `admins` | `readable`, `complete`, `admin_count`, `active_admin_count`, `stale_admin_count`, `undated_admin_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every active administrator has a parseable last login no older than 90 days, warn for missing dates or a smaller stale set, and fail when stale administrators are at least one third of active administrators. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every active administrator has a parseable last login no older than 90 days, warn for missing dates or a smaller stale set, and fail when stale administrators are at least one third of active administrators. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every active administrator has a parseable last login no older than 90 days, warn for missing dates or a smaller stale set, and fail when stale administrators are at least one third of active administrators. | The required evidence for Stale privileged administrator review is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-ADMIN-005` | medium | `duo_assess_admin_access` | `settings` | `readable`, `lockout_threshold` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the numeric lockout threshold is zero or negative, pass from one through ten failed attempts, warn above ten, and manual when the threshold is absent or nonnumeric. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the numeric lockout threshold is zero or negative, pass from one through ten failed attempts, warn above ten, and manual when the threshold is absent or nonnumeric. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the numeric lockout threshold is zero or negative, pass from one through ten failed attempts, warn above ten, and manual when the threshold is absent or nonnumeric. | The required evidence for User lockout policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-INTEGRATIONS-001` | medium | `duo_assess_integrations` | `integrations` | `readable`, `complete`, `protected_integration_count`, `policy_attached_count` | Complete readable evidence satisfies the compliant branch of this derivation: for non-empty active protected integrations, return pass when every integration has a policy key, warn when only some do, and fail when none do; an empty readable inventory is warn. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for non-empty active protected integrations, return pass when every integration has a policy key, warn when only some do, and fail when none do; an empty readable inventory is warn. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for non-empty active protected integrations, return pass when every integration has a policy key, warn when only some do, and fail when none do; an empty readable inventory is warn. | The required evidence for Protected integrations have explicit policy coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-INTEGRATIONS-002` | medium | `duo_assess_integrations` | `integrations` | `readable`, `complete`, `applicable_integration_count`, `universal_prompt_count` | Complete readable evidence satisfies the compliant branch of this derivation: for integrations exposing prompt posture, return pass when all use Universal Prompt, warn when only some do, and fail when none do. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for integrations exposing prompt posture, return pass when all use Universal Prompt, warn when only some do, and fail when none do. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for integrations exposing prompt posture, return pass when all use Universal Prompt, warn when only some do, and fail when none do. | The required evidence for Universal Prompt adoption is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-INTEGRATIONS-003` | medium | `duo_assess_integrations` | `integrations` | `readable`, `complete`, `protected_integration_count`, `field_exposed_count`, `self_service_enabled_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when every protected integration exposing self_service_allowed disables it, warn when only some disable it or the protected inventory is empty, fail when all exposed values enable it, and manual when no integration exposes the field. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when every protected integration exposing self_service_allowed disables it, warn when only some disable it or the protected inventory is empty, fail when all exposed values enable it, and manual when no integration exposes the field. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when every protected integration exposing self_service_allowed disables it, warn when only some disable it or the protected inventory is empty, fail when all exposed values enable it, and manual when no integration exposes the field. | The required evidence for Self-service portal governance is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-INTEGRATIONS-004` | high | `duo_assess_integrations` | `integrations` | `readable`, `complete`, `admin_api_count`, `overprivileged_admin_api_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when all visible Admin API integrations omit write, settings, integration-management, and permission-management grants, warn when only some are overprivileged or the inventory omits the audit integration, and fail when all are overprivileged. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when all visible Admin API integrations omit write, settings, integration-management, and permission-management grants, warn when only some are overprivileged or the inventory omits the audit integration, and fail when all are overprivileged. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when all visible Admin API integrations omit write, settings, integration-management, and permission-management grants, warn when only some are overprivileged or the inventory omits the audit integration, and fail when all are overprivileged. | The required evidence for Administrative API integration permissions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-INTEGRATIONS-005` | high | `duo_assess_integrations` | `integrations` | `readable`, `complete`, `protected_integration_count`, `tagged_integration_count`, `tagged_without_policy_count` | Complete readable evidence satisfies the compliant branch of this derivation: for protected applications tagged Critical, High, or regulated, return pass when each has an explicit policy, warn when only some do, fail when none do, and manual when no protected application has usable criticality tags. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: for protected applications tagged Critical, High, or regulated, return pass when each has an explicit policy, warn when only some do, fail when none do, and manual when no protected application has usable criticality tags. | Complete readable evidence satisfies the violation branch, which has first-match precedence: for protected applications tagged Critical, High, or regulated, return pass when each has an explicit policy, warn when only some do, fail when none do, and manual when no protected application has usable criticality tags. | The required evidence for Critical application protection coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-INTEGRATIONS-006` | medium | `duo_assess_integrations` | `global-policy` | `policy_readable`, `edition_sections_present`, `duo_desktop_platform_count`, `encryption_platform_count`, `full_disk_encryption_required`, `firewall_platform_count`, `system_password_platform_count`, `screen_lock_required`, `restricted_os_count` | Complete readable evidence satisfies the compliant branch of this derivation: evaluate five groups: Duo Desktop, encryption, firewall, system-password or screen-lock, and operating-system restrictions; return pass for all five, fail for none, warn for one through four, and manual when the tenant edition exposes no device-health sections. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: evaluate five groups: Duo Desktop, encryption, firewall, system-password or screen-lock, and operating-system restrictions; return pass for all five, fail for none, warn for one through four, and manual when the tenant edition exposes no device-health sections. | Complete readable evidence satisfies the violation branch, which has first-match precedence: evaluate five groups: Duo Desktop, encryption, firewall, system-password or screen-lock, and operating-system restrictions; return pass for all five, fail for none, warn for one through four, and manual when the tenant edition exposes no device-health sections. | The required evidence for Device health requirements depth is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-MON-001` | medium | `duo_assess_monitoring` | `authentication-logs` | `readable`, `complete`, `event_count`, `review_event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for a non-empty authentication-log window with no bypass, SMS, phone, or fraud events; warn when the window is empty or any such event exists. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for a non-empty authentication-log window with no bypass, SMS, phone, or fraud events; warn when the window is empty or any such event exists. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for a non-empty authentication-log window with no bypass, SMS, phone, or fraud events; warn when the window is empty or any such event exists. | The required evidence for Authentication log visibility and factor hygiene is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-MON-002` | medium | `duo_assess_monitoring` | `trust-monitor-events` | `readable`, `complete`, `event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the Trust Monitor window contains events and warn when its complete window is empty. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the Trust Monitor window contains events and warn when its complete window is empty. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the Trust Monitor window contains events and warn when its complete window is empty. | The required evidence for Trust Monitor coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-MON-003` | medium | `duo_assess_monitoring` | `info-summary`, `telephony-logs` | `readable`, `complete`, `credits_remaining`, `telephony_event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when telephony use exists and credits are below 25, warn when telephony use exists or credits are below 100, pass otherwise, and manual when credits or logs are unreadable. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when telephony use exists and credits are below 25, warn when telephony use exists or credits are below 100, pass otherwise, and manual when credits or logs are unreadable. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when telephony use exists and credits are below 25, warn when telephony use exists or credits are below 100, pass otherwise, and manual when credits or logs are unreadable. | The required evidence for Telephony reliance and credit headroom is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-MON-004` | medium | `duo_assess_monitoring` | `settings` | `readable`, `enabled_notification_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when any fraud-email, push-activity, or email-activity notification is enabled and warn when all readable notification signals are false or absent. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when any fraud-email, push-activity, or email-activity notification is enabled and warn when all readable notification signals are false or absent. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when any fraud-email, push-activity, or email-activity notification is enabled and warn when all readable notification signals are false or absent. | The required evidence for Administrative and fraud notifications is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `DUO-MON-005` | medium | `duo_assess_monitoring` | `authentication-attempts`, `authentication-logs` | `attempts_readable`, `logs_readable`, `counts_present`, `complete`, `attempt_count`, `denied_attempt_count`, `event_count`, `located_event_count`, `impossible_travel_count`, `fraud_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail for any successful country change within 60 minutes, warn for fraud or a denied-attempt share above 20 percent, pass otherwise, manual when counts or all location fields are absent, and warn when both summary and event windows are empty. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail for any successful country change within 60 minutes, warn for fraud or a denied-attempt share above 20 percent, pass otherwise, manual when counts or all location fields are absent, and warn when both summary and event windows are empty. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail for any successful country change within 60 minutes, warn for fraud or a denied-attempt share above 20 percent, pass otherwise, manual when counts or all location fields are absent, and warn when both summary and event windows are empty. | The required evidence for Authentication outcome and travel anomalies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+
+### Primitive decision inputs
+
+Every primitive is read from the named vendor surface or collector state before evidence lists are rendered or capped. Null and missing retain unavailable semantics; they are not empty inventories, false values, or zero counts.
+
+| Finding | Input | Portable definition |
+|---|---|---|
+| `DUO-AUTH-001` | `policy_readable` | Semantic owner: `DUO-AUTH-001.policy_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_001_branch_01_matches`. Portable meaning: Boolean true exactly when Duo policies were returned. |
+| `DUO-AUTH-001` | `has_webauthn` | Semantic owner: `DUO-AUTH-001.has_webauthn`. Type/domain: boolean. Compared literal domain: false, true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_001_branch_02_matches`, `duo_auth_001_branch_03_matches`, `duo_auth_001_branch_04_matches`. Portable meaning: Boolean true exactly when WebAuthn is enabled. |
+| `DUO-AUTH-001` | `allows_push` | Semantic owner: `DUO-AUTH-001.allows_push`. Type/domain: boolean. Compared literal domain: false, true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_001_branch_02_matches`, `duo_auth_001_branch_03_matches`, `duo_auth_001_branch_04_matches`. Portable meaning: Boolean true exactly when push is enabled. |
+| `DUO-AUTH-001` | `requires_verified_push` | Semantic owner: `DUO-AUTH-001.requires_verified_push`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_001_branch_03_matches`, `duo_auth_001_branch_04_matches`. Portable meaning: Boolean true exactly when verified push is required. |
+| `DUO-AUTH-001` | `supporting_strong_method_count` | Semantic owner: `DUO-AUTH-001.supporting_strong_method_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_001_branch_02_matches`, `duo_auth_001_branch_03_matches`. Portable meaning: Non-negative cardinality of enabled strong methods in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-002` | `policy_readable` | Semantic owner: `DUO-AUTH-002.policy_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_002_branch_01_matches`. Portable meaning: Boolean true exactly when Duo policies were returned. |
+| `DUO-AUTH-002` | `allowed_list_exposed` | Semantic owner: `DUO-AUTH-002.allowed_list_exposed`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_002_branch_01_matches`. Portable meaning: Boolean true exactly when the telephony allowed-country list is visible. |
+| `DUO-AUTH-002` | `blocked_list_exposed` | Semantic owner: `DUO-AUTH-002.blocked_list_exposed`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_002_branch_01_matches`. Portable meaning: Boolean true exactly when the blocked-country list is visible. |
+| `DUO-AUTH-002` | `explicitly_allowed_telephony_count` | Semantic owner: `DUO-AUTH-002.explicitly_allowed_telephony_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_002_branch_01_matches`, `duo_auth_002_branch_02_matches`, `duo_auth_002_branch_03_matches`. Portable meaning: Non-negative cardinality of explicitly allowed telephony events in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-002` | `blocked_telephony_count` | Semantic owner: `DUO-AUTH-002.blocked_telephony_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_002_branch_02_matches`, `duo_auth_002_branch_03_matches`, `duo_auth_002_branch_04_matches`. Portable meaning: Non-negative cardinality of blocked telephony events in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-003` | `new_user_behavior` | Semantic owner: `DUO-AUTH-003.new_user_behavior`. Type/domain: string. Compared literal domain: "enroll", "no-mfa". Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_003_branch_01_matches`, `duo_auth_003_branch_02_matches`, `duo_auth_003_branch_03_matches`, `duo_auth_003_branch_04_matches`. Portable meaning: Raw Duo new-user behavior. |
+| `DUO-AUTH-004` | `policy_readable` | Semantic owner: `DUO-AUTH-004.policy_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_004_branch_01_matches`. Portable meaning: Boolean true exactly when Duo policies were returned. |
+| `DUO-AUTH-004` | `remembered_device_days` | Semantic owner: `DUO-AUTH-004.remembered_device_days`. Type/domain: number. Compared literal domain: 14, 30. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_004_branch_01_matches`, `duo_auth_004_branch_02_matches`, `duo_auth_004_branch_03_matches`, `duo_auth_004_branch_04_matches`. Portable meaning: Configured remembered-device duration in days. |
+| `DUO-AUTH-005` | `policy_readable` | Semantic owner: `DUO-AUTH-005.policy_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_005_branch_01_matches`. Portable meaning: Boolean true exactly when Duo policies were returned. |
+| `DUO-AUTH-005` | `trusted_endpoint_checking` | Semantic owner: `DUO-AUTH-005.trusted_endpoint_checking`. Type/domain: string. Compared literal domain: "allow-all", "require-trusted". Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_005_branch_02_matches`, `duo_auth_005_branch_03_matches`, `duo_auth_005_branch_04_matches`. Portable meaning: Boolean true exactly when trusted-endpoint checking is enabled. |
+| `DUO-AUTH-006` | `readable` | Semantic owner: `DUO-AUTH-006.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes), `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-AUTH-006` | `complete` | Semantic owner: `DUO-AUTH-006.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes). Completeness/sample semantics: For DUO-AUTH-006, true only when the bypass-code inventory is readable and its authoritative total is exhausted; Settings readability is a separate fact and does not contribute. Exact source-state effects: `bypass-codes`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_03_matches`, `duo_auth_006_branch_06_matches`. Portable meaning: true only when the bypass-code inventory is readable and its authoritative total is exhausted; Settings readability is a separate fact and does not contribute. |
+| `DUO-AUTH-006` | `settings_readable` | Semantic owner: `DUO-AUTH-006.settings_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes), `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_02_matches`, `duo_auth_006_branch_06_matches`. Portable meaning: Boolean true exactly when Duo authentication settings were returned. |
+| `DUO-AUTH-006` | `bypass_code_count` | Semantic owner: `DUO-AUTH-006.bypass_code_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes), `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_02_matches`, `duo_auth_006_branch_03_matches`, `duo_auth_006_branch_04_matches`, `duo_auth_006_branch_06_matches`. Portable meaning: Non-negative cardinality of bypass-code issuance events in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-006` | `flagged_code_count` | Semantic owner: `DUO-AUTH-006.flagged_code_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes), `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_05_matches`. Portable meaning: Non-negative cardinality of active or long-lived bypass codes in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-006` | `undated_code_count` | Semantic owner: `DUO-AUTH-006.undated_code_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes), `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_06_matches`. Portable meaning: Non-negative cardinality of bypass codes without issuance dates in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-006` | `helpdesk_bypass` | Semantic owner: `DUO-AUTH-006.helpdesk_bypass`. Type/domain: string. Compared literal domain: "allow", "limit". Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes), `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_05_matches`. Portable meaning: Boolean true exactly when help-desk administrators may issue bypass codes. |
+| `DUO-AUTH-006` | `helpdesk_bypass_expiration` | Semantic owner: `DUO-AUTH-006.helpdesk_bypass_expiration`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/bypass_codes` (bypass-codes), `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_006_branch_05_matches`. Portable meaning: Raw Duo help-desk bypass expiration setting. |
+| `DUO-AUTH-007` | `policy_readable` | Semantic owner: `DUO-AUTH-007.policy_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_007_branch_01_matches`. Portable meaning: Boolean true exactly when Duo policies were returned. |
+| `DUO-AUTH-007` | `user_auth_behavior` | Semantic owner: `DUO-AUTH-007.user_auth_behavior`. Type/domain: string. Compared literal domain: "bypass", "enforce". Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_007_branch_01_matches`, `duo_auth_007_branch_02_matches`, `duo_auth_007_branch_03_matches`, `duo_auth_007_branch_04_matches`. Portable meaning: Raw Duo user-authentication behavior. |
+| `DUO-AUTH-008` | `readable` | Semantic owner: `DUO-AUTH-008.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_008_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-AUTH-008` | `complete` | Semantic owner: `DUO-AUTH-008.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: For DUO-AUTH-008, true only when the user inventory is readable and its authoritative total is exhausted. Exact source-state effects: `users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_008_branch_03_matches`. Portable meaning: true only when the user inventory is readable and its authoritative total is exhausted. |
+| `DUO-AUTH-008` | `user_count` | Semantic owner: `DUO-AUTH-008.user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_008_branch_01_matches`. Portable meaning: Non-negative cardinality of Duo users in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-008` | `known_enrollment_count` | Semantic owner: `DUO-AUTH-008.known_enrollment_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_008_branch_01_matches`, `duo_auth_008_branch_02_matches`. Portable meaning: Non-negative cardinality of users with established enrollment state in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-008` | `enrolled_user_count` | Semantic owner: `DUO-AUTH-008.enrolled_user_count`. Type/domain: number. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_008_branch_02_matches`. Portable meaning: Non-negative cardinality of users with an enrolled device or method in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-008` | `bypass_user_count` | Semantic owner: `DUO-AUTH-008.bypass_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_008_branch_02_matches`, `duo_auth_008_branch_04_matches`. Portable meaning: Non-negative cardinality of users receiving bypass codes in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-008` | `unenrolled_user_count` | Semantic owner: `DUO-AUTH-008.unenrolled_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_008_branch_02_matches`, `duo_auth_008_branch_03_matches`, `duo_auth_008_branch_04_matches`. Portable meaning: Non-negative cardinality of users without an enrolled method in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-009` | `readable` | Semantic owner: `DUO-AUTH-009.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_009_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-AUTH-009` | `complete` | Semantic owner: `DUO-AUTH-009.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: For DUO-AUTH-009, true only when the user inventory is readable and its authoritative total is exhausted. Exact source-state effects: `users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_009_branch_03_matches`. Portable meaning: true only when the user inventory is readable and its authoritative total is exhausted. |
+| `DUO-AUTH-009` | `access_user_count` | Semantic owner: `DUO-AUTH-009.access_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_009_branch_01_matches`, `duo_auth_009_branch_02_matches`. Portable meaning: Non-negative cardinality of users observed in access activity in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-009` | `inactive_user_count` | Semantic owner: `DUO-AUTH-009.inactive_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_009_branch_02_matches`, `duo_auth_009_branch_03_matches`, `duo_auth_009_branch_04_matches`. Portable meaning: Non-negative cardinality of users beyond the inactivity threshold in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-009` | `undated_user_count` | Semantic owner: `DUO-AUTH-009.undated_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_009_branch_03_matches`, `duo_auth_009_branch_04_matches`. Portable meaning: Non-negative cardinality of users without parseable last login in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-010` | `readable` | Semantic owner: `DUO-AUTH-010.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users), `GET /admin/v1/webauthncredentials` (webauthn-credentials). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_010_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-AUTH-010` | `complete` | Semantic owner: `DUO-AUTH-010.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users). Completeness/sample semantics: For DUO-AUTH-010, true only when the user inventory is readable and its authoritative total is exhausted; WebAuthn credential evidence contributes enrollment counts but never changes this completeness fact. Exact source-state effects: `users`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_010_branch_03_matches`. Portable meaning: true only when the user inventory is readable and its authoritative total is exhausted; WebAuthn credential evidence contributes enrollment counts but never changes this completeness fact. |
+| `DUO-AUTH-010` | `enrolled_user_count` | Semantic owner: `DUO-AUTH-010.enrolled_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users), `GET /admin/v1/webauthncredentials` (webauthn-credentials). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_010_branch_01_matches`, `duo_auth_010_branch_03_matches`, `duo_auth_010_branch_04_matches`. Portable meaning: Non-negative cardinality of users with an enrolled device or method in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-010` | `webauthn_user_count` | Semantic owner: `DUO-AUTH-010.webauthn_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users), `GET /admin/v1/webauthncredentials` (webauthn-credentials). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_010_branch_02_matches`, `duo_auth_010_branch_03_matches`, `duo_auth_010_branch_04_matches`. Portable meaning: Non-negative cardinality of WebAuthn-enrolled users in the complete Duo inventory at the verdict point. |
+| `DUO-AUTH-010` | `deprecated_u2f_user_count` | Semantic owner: `DUO-AUTH-010.deprecated_u2f_user_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/users` (users), `GET /admin/v1/webauthncredentials` (webauthn-credentials). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_auth_010_branch_03_matches`, `duo_auth_010_branch_04_matches`. Portable meaning: Non-negative cardinality of deprecated-U2F-only users in the complete Duo inventory at the verdict point. |
+| `DUO-ADMIN-001` | `readable` | Semantic owner: `DUO-ADMIN-001.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_001_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-ADMIN-001` | `complete` | Semantic owner: `DUO-ADMIN-001.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: For DUO-ADMIN-001, true only when the administrator inventory is readable and its authoritative total is exhausted. Exact source-state effects: `admins`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_001_branch_03_matches`. Portable meaning: true only when the administrator inventory is readable and its authoritative total is exhausted. |
+| `DUO-ADMIN-001` | `admin_count` | Semantic owner: `DUO-ADMIN-001.admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_001_branch_01_matches`, `duo_admin_001_branch_02_matches`. Portable meaning: Non-negative cardinality of administrators in the complete Duo inventory at the verdict point. |
+| `DUO-ADMIN-001` | `owner_count` | Semantic owner: `DUO-ADMIN-001.owner_count`. Type/domain: number. Compared literal domain: 2, 3. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_001_branch_02_matches`, `duo_admin_001_branch_03_matches`, `duo_admin_001_branch_04_matches`. Portable meaning: Non-negative cardinality of Owner administrators in the complete Duo inventory at the verdict point. |
+| `DUO-ADMIN-002` | `readable` | Semantic owner: `DUO-ADMIN-002.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins/allowed_auth_methods` (admin-auth-methods), `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_002_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-ADMIN-002` | `verified_push_enabled` | Semantic owner: `DUO-ADMIN-002.verified_push_enabled`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins/allowed_auth_methods` (admin-auth-methods), `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_002_branch_02_matches`. Portable meaning: Boolean true exactly when verified push is enabled in policy. |
+| `DUO-ADMIN-002` | `webauthn_enabled` | Semantic owner: `DUO-ADMIN-002.webauthn_enabled`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins/allowed_auth_methods` (admin-auth-methods), `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_002_branch_02_matches`. Portable meaning: Boolean true exactly when WebAuthn is enabled in policy. |
+| `DUO-ADMIN-002` | `sms_enabled` | Semantic owner: `DUO-ADMIN-002.sms_enabled`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins/allowed_auth_methods` (admin-auth-methods), `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_002_branch_03_matches`, `duo_admin_002_branch_04_matches`. Portable meaning: Boolean true exactly when SMS authentication is enabled. |
+| `DUO-ADMIN-002` | `voice_enabled` | Semantic owner: `DUO-ADMIN-002.voice_enabled`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins/allowed_auth_methods` (admin-auth-methods), `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_002_branch_03_matches`, `duo_admin_002_branch_04_matches`. Portable meaning: Boolean true exactly when voice authentication is enabled. |
+| `DUO-ADMIN-003` | `readable` | Semantic owner: `DUO-ADMIN-003.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_003_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-ADMIN-003` | `helpdesk_bypass` | Semantic owner: `DUO-ADMIN-003.helpdesk_bypass`. Type/domain: string. Compared literal domain: "deny", "limit". Source/owner: Cisco Duo collector projection from `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_003_branch_02_matches`, `duo_admin_003_branch_03_matches`, `duo_admin_003_branch_04_matches`. Portable meaning: Boolean true exactly when help-desk administrators may issue bypass codes. |
+| `DUO-ADMIN-003` | `helpdesk_bypass_expiration` | Semantic owner: `DUO-ADMIN-003.helpdesk_bypass_expiration`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_003_branch_02_matches`, `duo_admin_003_branch_03_matches`. Portable meaning: Raw Duo help-desk bypass expiration setting. |
+| `DUO-ADMIN-004` | `readable` | Semantic owner: `DUO-ADMIN-004.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_004_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-ADMIN-004` | `complete` | Semantic owner: `DUO-ADMIN-004.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: For DUO-ADMIN-004, true only when the administrator inventory is readable and its authoritative total is exhausted. Exact source-state effects: `admins`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_004_branch_03_matches`. Portable meaning: true only when the administrator inventory is readable and its authoritative total is exhausted. |
+| `DUO-ADMIN-004` | `admin_count` | Semantic owner: `DUO-ADMIN-004.admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_004_branch_01_matches`. Portable meaning: Non-negative cardinality of administrators in the complete Duo inventory at the verdict point. |
+| `DUO-ADMIN-004` | `active_admin_count` | Semantic owner: `DUO-ADMIN-004.active_admin_count`. Type/domain: number. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_004_branch_02_matches`. Portable meaning: Non-negative cardinality of active administrators in the complete Duo inventory at the verdict point. |
+| `DUO-ADMIN-004` | `stale_admin_count` | Semantic owner: `DUO-ADMIN-004.stale_admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_004_branch_02_matches`, `duo_admin_004_branch_03_matches`, `duo_admin_004_branch_04_matches`. Portable meaning: Non-negative cardinality of stale active administrators in the complete Duo inventory at the verdict point. |
+| `DUO-ADMIN-004` | `undated_admin_count` | Semantic owner: `DUO-ADMIN-004.undated_admin_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/admins` (admins). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_004_branch_03_matches`, `duo_admin_004_branch_04_matches`. Portable meaning: Non-negative cardinality of administrators without last login in the complete Duo inventory at the verdict point. |
+| `DUO-ADMIN-005` | `readable` | Semantic owner: `DUO-ADMIN-005.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_005_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-ADMIN-005` | `lockout_threshold` | Semantic owner: `DUO-ADMIN-005.lockout_threshold`. Type/domain: number. Compared literal domain: 0, 10. Source/owner: Cisco Duo collector projection from `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_admin_005_branch_01_matches`, `duo_admin_005_branch_02_matches`, `duo_admin_005_branch_03_matches`, `duo_admin_005_branch_04_matches`. Portable meaning: Configured failed-attempt lockout threshold. |
+| `DUO-INTEGRATIONS-001` | `readable` | Semantic owner: `DUO-INTEGRATIONS-001.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_001_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-INTEGRATIONS-001` | `complete` | Semantic owner: `DUO-INTEGRATIONS-001.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: For DUO-INTEGRATIONS-001, true only when the integration inventory is readable and its authoritative total is exhausted. Exact source-state effects: `integrations`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_001_branch_03_matches`. Portable meaning: true only when the integration inventory is readable and its authoritative total is exhausted. |
+| `DUO-INTEGRATIONS-001` | `protected_integration_count` | Semantic owner: `DUO-INTEGRATIONS-001.protected_integration_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_001_branch_02_matches`, `duo_integrations_001_branch_03_matches`, `duo_integrations_001_branch_04_matches`. Portable meaning: Non-negative cardinality of Duo-protected integrations in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-001` | `policy_attached_count` | Semantic owner: `DUO-INTEGRATIONS-001.policy_attached_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_001_branch_02_matches`, `duo_integrations_001_branch_03_matches`, `duo_integrations_001_branch_04_matches`. Portable meaning: Non-negative cardinality of integrations with explicit policies in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-002` | `readable` | Semantic owner: `DUO-INTEGRATIONS-002.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_002_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-INTEGRATIONS-002` | `complete` | Semantic owner: `DUO-INTEGRATIONS-002.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: For DUO-INTEGRATIONS-002, true only when the integration inventory is readable and its authoritative total is exhausted. Exact source-state effects: `integrations`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_002_branch_03_matches`. Portable meaning: true only when the integration inventory is readable and its authoritative total is exhausted. |
+| `DUO-INTEGRATIONS-002` | `applicable_integration_count` | Semantic owner: `DUO-INTEGRATIONS-002.applicable_integration_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_002_branch_01_matches`, `duo_integrations_002_branch_03_matches`, `duo_integrations_002_branch_04_matches`. Portable meaning: Non-negative cardinality of policy-capable integrations in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-002` | `universal_prompt_count` | Semantic owner: `DUO-INTEGRATIONS-002.universal_prompt_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_002_branch_02_matches`, `duo_integrations_002_branch_03_matches`, `duo_integrations_002_branch_04_matches`. Portable meaning: Non-negative cardinality of Universal Prompt integrations in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-003` | `readable` | Semantic owner: `DUO-INTEGRATIONS-003.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_003_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-INTEGRATIONS-003` | `complete` | Semantic owner: `DUO-INTEGRATIONS-003.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: For DUO-INTEGRATIONS-003, true only when the integration inventory is readable and its authoritative total is exhausted. Exact source-state effects: `integrations`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_003_branch_03_matches`. Portable meaning: true only when the integration inventory is readable and its authoritative total is exhausted. |
+| `DUO-INTEGRATIONS-003` | `protected_integration_count` | Semantic owner: `DUO-INTEGRATIONS-003.protected_integration_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_003_branch_01_matches`, `duo_integrations_003_branch_03_matches`. Portable meaning: Non-negative cardinality of Duo-protected integrations in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-003` | `field_exposed_count` | Semantic owner: `DUO-INTEGRATIONS-003.field_exposed_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_003_branch_01_matches`, `duo_integrations_003_branch_02_matches`, `duo_integrations_003_branch_04_matches`. Portable meaning: Non-negative cardinality of edition fields exposed by the tenant in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-003` | `self_service_enabled_count` | Semantic owner: `DUO-INTEGRATIONS-003.self_service_enabled_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_003_branch_02_matches`, `duo_integrations_003_branch_03_matches`, `duo_integrations_003_branch_04_matches`. Portable meaning: Non-negative cardinality of policies permitting self-service device management in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-004` | `readable` | Semantic owner: `DUO-INTEGRATIONS-004.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_004_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-INTEGRATIONS-004` | `complete` | Semantic owner: `DUO-INTEGRATIONS-004.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: For DUO-INTEGRATIONS-004, true only when the integration inventory is readable and its authoritative total is exhausted. Exact source-state effects: `integrations`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_004_branch_03_matches`. Portable meaning: true only when the integration inventory is readable and its authoritative total is exhausted. |
+| `DUO-INTEGRATIONS-004` | `admin_api_count` | Semantic owner: `DUO-INTEGRATIONS-004.admin_api_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_004_branch_02_matches`, `duo_integrations_004_branch_03_matches`, `duo_integrations_004_branch_04_matches`. Portable meaning: Non-negative cardinality of Admin API applications in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-004` | `overprivileged_admin_api_count` | Semantic owner: `DUO-INTEGRATIONS-004.overprivileged_admin_api_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_004_branch_02_matches`, `duo_integrations_004_branch_03_matches`, `duo_integrations_004_branch_04_matches`. Portable meaning: Non-negative cardinality of Admin API applications broader than read-only in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-005` | `readable` | Semantic owner: `DUO-INTEGRATIONS-005.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_005_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-INTEGRATIONS-005` | `complete` | Semantic owner: `DUO-INTEGRATIONS-005.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: For DUO-INTEGRATIONS-005, true only when the integration inventory is readable and its authoritative total is exhausted. Exact source-state effects: `integrations`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_005_branch_03_matches`. Portable meaning: true only when the integration inventory is readable and its authoritative total is exhausted. |
+| `DUO-INTEGRATIONS-005` | `protected_integration_count` | Semantic owner: `DUO-INTEGRATIONS-005.protected_integration_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_005_branch_01_matches`. Portable meaning: Non-negative cardinality of Duo-protected integrations in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-005` | `tagged_integration_count` | Semantic owner: `DUO-INTEGRATIONS-005.tagged_integration_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_005_branch_01_matches`, `duo_integrations_005_branch_02_matches`. Portable meaning: Non-negative cardinality of integrations included by the governance tag in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-005` | `tagged_without_policy_count` | Semantic owner: `DUO-INTEGRATIONS-005.tagged_without_policy_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v3/integrations` (integrations). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_005_branch_02_matches`, `duo_integrations_005_branch_03_matches`, `duo_integrations_005_branch_04_matches`. Portable meaning: Non-negative cardinality of tagged integrations without policy in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-006` | `policy_readable` | Semantic owner: `DUO-INTEGRATIONS-006.policy_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_01_matches`. Portable meaning: Boolean true exactly when Duo policies were returned. |
+| `DUO-INTEGRATIONS-006` | `edition_sections_present` | Semantic owner: `DUO-INTEGRATIONS-006.edition_sections_present`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_01_matches`. Portable meaning: Boolean true exactly when all required edition sections are present. |
+| `DUO-INTEGRATIONS-006` | `duo_desktop_platform_count` | Semantic owner: `DUO-INTEGRATIONS-006.duo_desktop_platform_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_02_matches`, `duo_integrations_006_branch_03_matches`, `duo_integrations_006_branch_04_matches`. Portable meaning: Non-negative cardinality of platform policies requiring Duo Desktop in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-006` | `encryption_platform_count` | Semantic owner: `DUO-INTEGRATIONS-006.encryption_platform_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_02_matches`, `duo_integrations_006_branch_03_matches`, `duo_integrations_006_branch_04_matches`. Portable meaning: Non-negative cardinality of platform policies requiring disk encryption in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-006` | `full_disk_encryption_required` | Semantic owner: `DUO-INTEGRATIONS-006.full_disk_encryption_required`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_02_matches`, `duo_integrations_006_branch_03_matches`, `duo_integrations_006_branch_04_matches`. Portable meaning: Boolean true exactly when endpoint policy requires disk encryption. |
+| `DUO-INTEGRATIONS-006` | `firewall_platform_count` | Semantic owner: `DUO-INTEGRATIONS-006.firewall_platform_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_02_matches`, `duo_integrations_006_branch_03_matches`, `duo_integrations_006_branch_04_matches`. Portable meaning: Non-negative cardinality of platform policies requiring a firewall in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-006` | `system_password_platform_count` | Semantic owner: `DUO-INTEGRATIONS-006.system_password_platform_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_02_matches`, `duo_integrations_006_branch_03_matches`, `duo_integrations_006_branch_04_matches`. Portable meaning: Non-negative cardinality of platform policies requiring a system password in the complete Duo inventory at the verdict point. |
+| `DUO-INTEGRATIONS-006` | `screen_lock_required` | Semantic owner: `DUO-INTEGRATIONS-006.screen_lock_required`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_02_matches`, `duo_integrations_006_branch_03_matches`, `duo_integrations_006_branch_04_matches`. Portable meaning: Boolean true exactly when endpoint policy requires screen lock. |
+| `DUO-INTEGRATIONS-006` | `restricted_os_count` | Semantic owner: `DUO-INTEGRATIONS-006.restricted_os_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/policies/global` (global-policy). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_integrations_006_branch_02_matches`, `duo_integrations_006_branch_03_matches`, `duo_integrations_006_branch_04_matches`. Portable meaning: Non-negative cardinality of OS rules restricting unsupported versions in the complete Duo inventory at the verdict point. |
+| `DUO-MON-001` | `readable` | Semantic owner: `DUO-MON-001.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_001_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-MON-001` | `complete` | Semantic owner: `DUO-MON-001.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: For DUO-MON-001, true only when the authentication-log inventory is readable and its authoritative total is exhausted. Exact source-state effects: `authentication-logs`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_001_branch_02_matches`. Portable meaning: true only when the authentication-log inventory is readable and its authoritative total is exhausted. |
+| `DUO-MON-001` | `event_count` | Semantic owner: `DUO-MON-001.event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_001_branch_02_matches`, `duo_mon_001_branch_03_matches`. Portable meaning: Non-negative cardinality of required Duo events in the complete Duo inventory at the verdict point. |
+| `DUO-MON-001` | `review_event_count` | Semantic owner: `DUO-MON-001.review_event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_001_branch_02_matches`, `duo_mon_001_branch_03_matches`. Portable meaning: Non-negative cardinality of events matching the check's review predicate in the complete Duo inventory at the verdict point. |
+| `DUO-MON-002` | `readable` | Semantic owner: `DUO-MON-002.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/trust_monitor/events` (trust-monitor-events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_002_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-MON-002` | `complete` | Semantic owner: `DUO-MON-002.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/trust_monitor/events` (trust-monitor-events). Completeness/sample semantics: For DUO-MON-002, true only when the Trust Monitor event inventory is readable and its authoritative total is exhausted. Exact source-state effects: `trust-monitor-events`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_002_branch_02_matches`. Portable meaning: true only when the Trust Monitor event inventory is readable and its authoritative total is exhausted. |
+| `DUO-MON-002` | `event_count` | Semantic owner: `DUO-MON-002.event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/trust_monitor/events` (trust-monitor-events). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_002_branch_02_matches`, `duo_mon_002_branch_03_matches`. Portable meaning: Non-negative cardinality of required Duo events in the complete Duo inventory at the verdict point. |
+| `DUO-MON-003` | `readable` | Semantic owner: `DUO-MON-003.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/summary` (info-summary), `GET /admin/v2/logs/telephony` (telephony-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_003_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-MON-003` | `complete` | Semantic owner: `DUO-MON-003.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v2/logs/telephony` (telephony-logs), `GET /admin/v1/info/summary` (info-summary). Completeness/sample semantics: For DUO-MON-003, true only when both telephony logs and the information summary are readable and complete. Exact source-state effects: `telephony-logs`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `info-summary`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_003_branch_03_matches`. Portable meaning: true only when both telephony logs and the information summary are readable and complete. |
+| `DUO-MON-003` | `credits_remaining` | Semantic owner: `DUO-MON-003.credits_remaining`. Type/domain: number. Compared literal domain: 100, 25. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/summary` (info-summary), `GET /admin/v2/logs/telephony` (telephony-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_003_branch_01_matches`, `duo_mon_003_branch_02_matches`, `duo_mon_003_branch_03_matches`, `duo_mon_003_branch_04_matches`. Portable meaning: Current non-negative telephony-credit balance, or null when unavailable. |
+| `DUO-MON-003` | `telephony_event_count` | Semantic owner: `DUO-MON-003.telephony_event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/summary` (info-summary), `GET /admin/v2/logs/telephony` (telephony-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_003_branch_02_matches`, `duo_mon_003_branch_03_matches`. Portable meaning: Non-negative cardinality of SMS or voice events in the complete Duo inventory at the verdict point. |
+| `DUO-MON-004` | `readable` | Semantic owner: `DUO-MON-004.readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_004_branch_01_matches`. Portable meaning: Boolean true exactly when the check's required Duo response was collected and parseable. |
+| `DUO-MON-004` | `enabled_notification_count` | Semantic owner: `DUO-MON-004.enabled_notification_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/settings` (settings). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_004_branch_02_matches`, `duo_mon_004_branch_03_matches`. Portable meaning: Non-negative cardinality of enabled administrator notifications in the complete Duo inventory at the verdict point. |
+| `DUO-MON-005` | `attempts_readable` | Semantic owner: `DUO-MON-005.attempts_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_01_matches`. Portable meaning: Boolean true exactly when authentication attempts were returned. |
+| `DUO-MON-005` | `logs_readable` | Semantic owner: `DUO-MON-005.logs_readable`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_01_matches`. Portable meaning: Boolean true exactly when the required Duo log was returned. |
+| `DUO-MON-005` | `counts_present` | Semantic owner: `DUO-MON-005.counts_present`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_01_matches`. Portable meaning: Boolean true exactly when edition licensed and consumed counts are numeric. |
+| `DUO-MON-005` | `complete` | Semantic owner: `DUO-MON-005.complete`. Type/domain: boolean. Compared literal domain: true. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: For DUO-MON-005, true only when both the authentication-attempt aggregate and authentication-log inventory are readable and complete. Exact source-state effects: `authentication-attempts`: false on truncated, error, denied, not-collected; other failure modes do not change this fact; `authentication-logs`: false on truncated, error, denied, not-collected; other failure modes do not change this fact. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_06_matches`. Portable meaning: true only when both the authentication-attempt aggregate and authentication-log inventory are readable and complete. |
+| `DUO-MON-005` | `attempt_count` | Semantic owner: `DUO-MON-005.attempt_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_02_matches`, `duo_mon_005_branch_05_matches`. Portable meaning: Non-negative cardinality of authentication attempts in the complete Duo inventory at the verdict point. |
+| `DUO-MON-005` | `denied_attempt_count` | Semantic owner: `DUO-MON-005.denied_attempt_count`. Type/domain: number. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_05_matches`. Portable meaning: Non-negative cardinality of denied attempts in the complete Duo inventory at the verdict point. |
+| `DUO-MON-005` | `event_count` | Semantic owner: `DUO-MON-005.event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_02_matches`. Portable meaning: Non-negative cardinality of required Duo events in the complete Duo inventory at the verdict point. |
+| `DUO-MON-005` | `located_event_count` | Semantic owner: `DUO-MON-005.located_event_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_04_matches`. Portable meaning: Non-negative cardinality of events with geographic location in the complete Duo inventory at the verdict point. |
+| `DUO-MON-005` | `impossible_travel_count` | Semantic owner: `DUO-MON-005.impossible_travel_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_03_matches`. Portable meaning: Non-negative cardinality of impossible-travel attempts in the complete Duo inventory at the verdict point. |
+| `DUO-MON-005` | `fraud_count` | Semantic owner: `DUO-MON-005.fraud_count`. Type/domain: number. Compared literal domain: 0. Source/owner: Cisco Duo collector projection from `GET /admin/v1/info/authentication_attempts` (authentication-attempts), `GET /admin/v2/logs/authentication` (authentication-logs). Completeness/sample semantics: The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule. It feeds executable derived facts `duo_mon_005_branch_05_matches`. Portable meaning: Non-negative cardinality of fraud-marked attempts in the complete Duo inventory at the verdict point. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+A `matches` condition performs a regular-expression search; anchors are required for whole-value matching, and an `i` flag requests case-insensitive matching. A `ratio` condition divides the numerator by the denominator, applies the declared scale, and rounds to the declared decimal places by choosing the nearest value with exact half cases rounded toward positive infinity; a zero, null, or missing denominator does not match.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `DUO-AUTH-001` | 1 | manual | `duo_auth_001_branch_01_matches` equals true |  |
+| `DUO-AUTH-001` | 2 | fail | `duo_auth_001_branch_02_matches` equals true |  |
+| `DUO-AUTH-001` | 3 | warn | `duo_auth_001_branch_03_matches` equals true |  |
+| `DUO-AUTH-001` | 4 | pass | `duo_auth_001_branch_04_matches` equals true |  |
+| `DUO-AUTH-001` | 5 | manual | `duo_auth_001_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-002` | 1 | manual | `duo_auth_002_branch_01_matches` equals true |  |
+| `DUO-AUTH-002` | 2 | fail | `duo_auth_002_branch_02_matches` equals true |  |
+| `DUO-AUTH-002` | 3 | warn | `duo_auth_002_branch_03_matches` equals true |  |
+| `DUO-AUTH-002` | 4 | pass | `duo_auth_002_branch_04_matches` equals true |  |
+| `DUO-AUTH-002` | 5 | manual | `duo_auth_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-003` | 1 | manual | `duo_auth_003_branch_01_matches` equals true |  |
+| `DUO-AUTH-003` | 2 | fail | `duo_auth_003_branch_02_matches` equals true |  |
+| `DUO-AUTH-003` | 3 | warn | `duo_auth_003_branch_03_matches` equals true |  |
+| `DUO-AUTH-003` | 4 | pass | `duo_auth_003_branch_04_matches` equals true |  |
+| `DUO-AUTH-003` | 5 | manual | `duo_auth_003_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-004` | 1 | manual | `duo_auth_004_branch_01_matches` equals true |  |
+| `DUO-AUTH-004` | 2 | fail | `duo_auth_004_branch_02_matches` equals true |  |
+| `DUO-AUTH-004` | 3 | warn | `duo_auth_004_branch_03_matches` equals true |  |
+| `DUO-AUTH-004` | 4 | pass | `duo_auth_004_branch_04_matches` equals true |  |
+| `DUO-AUTH-004` | 5 | manual | `duo_auth_004_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-005` | 1 | manual | `duo_auth_005_branch_01_matches` equals true |  |
+| `DUO-AUTH-005` | 2 | fail | `duo_auth_005_branch_02_matches` equals true |  |
+| `DUO-AUTH-005` | 3 | warn | `duo_auth_005_branch_03_matches` equals true |  |
+| `DUO-AUTH-005` | 4 | pass | `duo_auth_005_branch_04_matches` equals true |  |
+| `DUO-AUTH-005` | 5 | manual | `duo_auth_005_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-006` | 1 | manual | `duo_auth_006_branch_01_matches` equals true |  |
+| `DUO-AUTH-006` | 2 | warn | `duo_auth_006_branch_02_matches` equals true |  |
+| `DUO-AUTH-006` | 3 | warn | `duo_auth_006_branch_03_matches` equals true |  |
+| `DUO-AUTH-006` | 4 | pass | `duo_auth_006_branch_04_matches` equals true |  |
+| `DUO-AUTH-006` | 5 | fail | `duo_auth_006_branch_05_matches` equals true |  |
+| `DUO-AUTH-006` | 6 | warn | `duo_auth_006_branch_06_matches` equals true |  |
+| `DUO-AUTH-006` | 7 | manual | `duo_auth_006_branch_07_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-007` | 1 | manual | `duo_auth_007_branch_01_matches` equals true |  |
+| `DUO-AUTH-007` | 2 | fail | `duo_auth_007_branch_02_matches` equals true |  |
+| `DUO-AUTH-007` | 3 | warn | `duo_auth_007_branch_03_matches` equals true |  |
+| `DUO-AUTH-007` | 4 | pass | `duo_auth_007_branch_04_matches` equals true |  |
+| `DUO-AUTH-007` | 5 | manual | `duo_auth_007_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-008` | 1 | manual | `duo_auth_008_branch_01_matches` equals true |  |
+| `DUO-AUTH-008` | 2 | fail | `duo_auth_008_branch_02_matches` equals true |  |
+| `DUO-AUTH-008` | 3 | warn | `duo_auth_008_branch_03_matches` equals true |  |
+| `DUO-AUTH-008` | 4 | pass | `duo_auth_008_branch_04_matches` equals true |  |
+| `DUO-AUTH-008` | 5 | manual | `duo_auth_008_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-009` | 1 | manual | `duo_auth_009_branch_01_matches` equals true |  |
+| `DUO-AUTH-009` | 2 | fail | `duo_auth_009_branch_02_matches` equals true |  |
+| `DUO-AUTH-009` | 3 | warn | `duo_auth_009_branch_03_matches` equals true |  |
+| `DUO-AUTH-009` | 4 | pass | `duo_auth_009_branch_04_matches` equals true |  |
+| `DUO-AUTH-009` | 5 | manual | `duo_auth_009_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-010` | 1 | manual | `duo_auth_010_branch_01_matches` equals true |  |
+| `DUO-AUTH-010` | 2 | fail | `duo_auth_010_branch_02_matches` equals true |  |
+| `DUO-AUTH-010` | 3 | warn | `duo_auth_010_branch_03_matches` equals true |  |
+| `DUO-AUTH-010` | 4 | pass | `duo_auth_010_branch_04_matches` equals true |  |
+| `DUO-AUTH-010` | 5 | manual | `duo_auth_010_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-AUTH-011` | 1 | manual | `duo_auth_011_branch_01_matches` equals true |  |
+| `DUO-ADMIN-001` | 1 | manual | `duo_admin_001_branch_01_matches` equals true |  |
+| `DUO-ADMIN-001` | 2 | fail | `duo_admin_001_branch_02_matches` equals true |  |
+| `DUO-ADMIN-001` | 3 | warn | `duo_admin_001_branch_03_matches` equals true |  |
+| `DUO-ADMIN-001` | 4 | pass | `duo_admin_001_branch_04_matches` equals true |  |
+| `DUO-ADMIN-001` | 5 | manual | `duo_admin_001_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-ADMIN-002` | 1 | manual | `duo_admin_002_branch_01_matches` equals true |  |
+| `DUO-ADMIN-002` | 2 | fail | `duo_admin_002_branch_02_matches` equals true |  |
+| `DUO-ADMIN-002` | 3 | warn | `duo_admin_002_branch_03_matches` equals true |  |
+| `DUO-ADMIN-002` | 4 | pass | `duo_admin_002_branch_04_matches` equals true |  |
+| `DUO-ADMIN-002` | 5 | manual | `duo_admin_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-ADMIN-003` | 1 | manual | `duo_admin_003_branch_01_matches` equals true |  |
+| `DUO-ADMIN-003` | 2 | fail | `duo_admin_003_branch_02_matches` equals true |  |
+| `DUO-ADMIN-003` | 3 | warn | `duo_admin_003_branch_03_matches` equals true |  |
+| `DUO-ADMIN-003` | 4 | pass | `duo_admin_003_branch_04_matches` equals true |  |
+| `DUO-ADMIN-003` | 5 | manual | `duo_admin_003_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-ADMIN-004` | 1 | manual | `duo_admin_004_branch_01_matches` equals true |  |
+| `DUO-ADMIN-004` | 2 | fail | `duo_admin_004_branch_02_matches` equals true |  |
+| `DUO-ADMIN-004` | 3 | warn | `duo_admin_004_branch_03_matches` equals true |  |
+| `DUO-ADMIN-004` | 4 | pass | `duo_admin_004_branch_04_matches` equals true |  |
+| `DUO-ADMIN-004` | 5 | manual | `duo_admin_004_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-ADMIN-005` | 1 | manual | `duo_admin_005_branch_01_matches` equals true |  |
+| `DUO-ADMIN-005` | 2 | fail | `duo_admin_005_branch_02_matches` equals true |  |
+| `DUO-ADMIN-005` | 3 | warn | `duo_admin_005_branch_03_matches` equals true |  |
+| `DUO-ADMIN-005` | 4 | pass | `duo_admin_005_branch_04_matches` equals true |  |
+| `DUO-ADMIN-005` | 5 | manual | `duo_admin_005_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-INTEGRATIONS-001` | 1 | manual | `duo_integrations_001_branch_01_matches` equals true |  |
+| `DUO-INTEGRATIONS-001` | 2 | fail | `duo_integrations_001_branch_02_matches` equals true |  |
+| `DUO-INTEGRATIONS-001` | 3 | warn | `duo_integrations_001_branch_03_matches` equals true |  |
+| `DUO-INTEGRATIONS-001` | 4 | pass | `duo_integrations_001_branch_04_matches` equals true |  |
+| `DUO-INTEGRATIONS-001` | 5 | manual | `duo_integrations_001_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-INTEGRATIONS-002` | 1 | manual | `duo_integrations_002_branch_01_matches` equals true |  |
+| `DUO-INTEGRATIONS-002` | 2 | fail | `duo_integrations_002_branch_02_matches` equals true |  |
+| `DUO-INTEGRATIONS-002` | 3 | warn | `duo_integrations_002_branch_03_matches` equals true |  |
+| `DUO-INTEGRATIONS-002` | 4 | pass | `duo_integrations_002_branch_04_matches` equals true |  |
+| `DUO-INTEGRATIONS-002` | 5 | manual | `duo_integrations_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-INTEGRATIONS-003` | 1 | manual | `duo_integrations_003_branch_01_matches` equals true |  |
+| `DUO-INTEGRATIONS-003` | 2 | fail | `duo_integrations_003_branch_02_matches` equals true |  |
+| `DUO-INTEGRATIONS-003` | 3 | warn | `duo_integrations_003_branch_03_matches` equals true |  |
+| `DUO-INTEGRATIONS-003` | 4 | pass | `duo_integrations_003_branch_04_matches` equals true |  |
+| `DUO-INTEGRATIONS-003` | 5 | manual | `duo_integrations_003_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-INTEGRATIONS-004` | 1 | manual | `duo_integrations_004_branch_01_matches` equals true |  |
+| `DUO-INTEGRATIONS-004` | 2 | fail | `duo_integrations_004_branch_02_matches` equals true |  |
+| `DUO-INTEGRATIONS-004` | 3 | warn | `duo_integrations_004_branch_03_matches` equals true |  |
+| `DUO-INTEGRATIONS-004` | 4 | pass | `duo_integrations_004_branch_04_matches` equals true |  |
+| `DUO-INTEGRATIONS-004` | 5 | manual | `duo_integrations_004_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-INTEGRATIONS-005` | 1 | manual | `duo_integrations_005_branch_01_matches` equals true |  |
+| `DUO-INTEGRATIONS-005` | 2 | fail | `duo_integrations_005_branch_02_matches` equals true |  |
+| `DUO-INTEGRATIONS-005` | 3 | warn | `duo_integrations_005_branch_03_matches` equals true |  |
+| `DUO-INTEGRATIONS-005` | 4 | pass | `duo_integrations_005_branch_04_matches` equals true |  |
+| `DUO-INTEGRATIONS-005` | 5 | manual | `duo_integrations_005_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-INTEGRATIONS-006` | 1 | manual | `duo_integrations_006_branch_01_matches` equals true |  |
+| `DUO-INTEGRATIONS-006` | 2 | fail | `duo_integrations_006_branch_02_matches` equals true |  |
+| `DUO-INTEGRATIONS-006` | 3 | warn | `duo_integrations_006_branch_03_matches` equals true |  |
+| `DUO-INTEGRATIONS-006` | 4 | pass | `duo_integrations_006_branch_04_matches` equals true |  |
+| `DUO-INTEGRATIONS-006` | 5 | manual | `duo_integrations_006_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-MON-001` | 1 | manual | `duo_mon_001_branch_01_matches` equals true |  |
+| `DUO-MON-001` | 2 | warn | `duo_mon_001_branch_02_matches` equals true |  |
+| `DUO-MON-001` | 3 | pass | `duo_mon_001_branch_03_matches` equals true |  |
+| `DUO-MON-001` | 4 | manual | `duo_mon_001_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-MON-002` | 1 | manual | `duo_mon_002_branch_01_matches` equals true |  |
+| `DUO-MON-002` | 2 | warn | `duo_mon_002_branch_02_matches` equals true |  |
+| `DUO-MON-002` | 3 | pass | `duo_mon_002_branch_03_matches` equals true |  |
+| `DUO-MON-002` | 4 | manual | `duo_mon_002_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-MON-003` | 1 | manual | `duo_mon_003_branch_01_matches` equals true |  |
+| `DUO-MON-003` | 2 | fail | `duo_mon_003_branch_02_matches` equals true |  |
+| `DUO-MON-003` | 3 | warn | `duo_mon_003_branch_03_matches` equals true |  |
+| `DUO-MON-003` | 4 | pass | `duo_mon_003_branch_04_matches` equals true |  |
+| `DUO-MON-003` | 5 | manual | `duo_mon_003_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-MON-004` | 1 | manual | `duo_mon_004_branch_01_matches` equals true |  |
+| `DUO-MON-004` | 2 | warn | `duo_mon_004_branch_02_matches` equals true |  |
+| `DUO-MON-004` | 3 | pass | `duo_mon_004_branch_03_matches` equals true |  |
+| `DUO-MON-004` | 4 | manual | `duo_mon_004_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `DUO-MON-005` | 1 | manual | `duo_mon_005_branch_01_matches` equals true |  |
+| `DUO-MON-005` | 2 | warn | `duo_mon_005_branch_02_matches` equals true |  |
+| `DUO-MON-005` | 3 | fail | `duo_mon_005_branch_03_matches` equals true |  |
+| `DUO-MON-005` | 4 | manual | `duo_mon_005_branch_04_matches` equals true |  |
+| `DUO-MON-005` | 5 | warn | `duo_mon_005_branch_05_matches` equals true |  |
+| `DUO-MON-005` | 6 | warn | `duo_mon_005_branch_06_matches` equals true |  |
+| `DUO-MON-005` | 7 | pass | `duo_mon_005_branch_07_matches` equals true |  |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `DUO-AUTH-001` | `duo_auth_001_branch_01_matches` | DUO-AUTH-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `policy_readable` does not equal true. |
+| `DUO-AUTH-001` | `duo_auth_001_branch_02_matches` | DUO-AUTH-001 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`has_webauthn` equals false; `allows_push` equals false; `supporting_strong_method_count` equals 0). |
+| `DUO-AUTH-001` | `duo_auth_001_branch_03_matches` | DUO-AUTH-001 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`has_webauthn` equals false; not (all of (`allows_push` equals true; `requires_verified_push` equals true)); any of (`allows_push` equals true; `supporting_strong_method_count` is greater than 0)). |
+| `DUO-AUTH-001` | `duo_auth_001_branch_04_matches` | DUO-AUTH-001 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: any of (`has_webauthn` equals true; all of (`allows_push` equals true; `requires_verified_push` equals true)). |
+| `DUO-AUTH-001` | `duo_auth_001_branch_05_matches` | DUO-AUTH-001 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-002` | `duo_auth_002_branch_01_matches` | DUO-AUTH-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`policy_readable` does not equal true; all of (`allowed_list_exposed` does not equal true; `blocked_list_exposed` does not equal true); all of (`blocked_list_exposed` does not equal true; `explicitly_allowed_telephony_count` equals 0)). |
+| `DUO-AUTH-002` | `duo_auth_002_branch_02_matches` | DUO-AUTH-002 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (any of (`explicitly_allowed_telephony_count` is greater than 0; `blocked_telephony_count` is less than `telephony_method_count`); `blocked_telephony_count` equals 0). |
+| `DUO-AUTH-002` | `duo_auth_002_branch_03_matches` | DUO-AUTH-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`explicitly_allowed_telephony_count` is greater than 0; `blocked_telephony_count` is less than `telephony_method_count`). |
+| `DUO-AUTH-002` | `duo_auth_002_branch_04_matches` | DUO-AUTH-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `blocked_telephony_count` equals `telephony_method_count`. |
+| `DUO-AUTH-002` | `duo_auth_002_branch_05_matches` | DUO-AUTH-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-003` | `duo_auth_003_branch_01_matches` | DUO-AUTH-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: not (`new_user_behavior` is present and non-null). |
+| `DUO-AUTH-003` | `duo_auth_003_branch_02_matches` | DUO-AUTH-003 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `new_user_behavior` equals "no-mfa". |
+| `DUO-AUTH-003` | `duo_auth_003_branch_03_matches` | DUO-AUTH-003 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `new_user_behavior` does not equal "enroll". |
+| `DUO-AUTH-003` | `duo_auth_003_branch_04_matches` | DUO-AUTH-003 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `new_user_behavior` equals "enroll". |
+| `DUO-AUTH-003` | `duo_auth_003_branch_05_matches` | DUO-AUTH-003 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-004` | `duo_auth_004_branch_01_matches` | DUO-AUTH-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`policy_readable` does not equal true; not (`remembered_device_days` is present and non-null)). |
+| `DUO-AUTH-004` | `duo_auth_004_branch_02_matches` | DUO-AUTH-004 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `remembered_device_days` is greater than 30. |
+| `DUO-AUTH-004` | `duo_auth_004_branch_03_matches` | DUO-AUTH-004 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `remembered_device_days` is greater than 14. |
+| `DUO-AUTH-004` | `duo_auth_004_branch_04_matches` | DUO-AUTH-004 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `remembered_device_days` is at most 14. |
+| `DUO-AUTH-004` | `duo_auth_004_branch_05_matches` | DUO-AUTH-004 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-005` | `duo_auth_005_branch_01_matches` | DUO-AUTH-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `policy_readable` does not equal true. |
+| `DUO-AUTH-005` | `duo_auth_005_branch_02_matches` | DUO-AUTH-005 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`trusted_endpoint_checking` does not equal "require-trusted"; `trusted_endpoint_checking` does not equal "allow-all"). |
+| `DUO-AUTH-005` | `duo_auth_005_branch_03_matches` | DUO-AUTH-005 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `trusted_endpoint_checking` equals "allow-all". |
+| `DUO-AUTH-005` | `duo_auth_005_branch_04_matches` | DUO-AUTH-005 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `trusted_endpoint_checking` equals "require-trusted". |
+| `DUO-AUTH-005` | `duo_auth_005_branch_05_matches` | DUO-AUTH-005 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-006` | `duo_auth_006_branch_01_matches` | DUO-AUTH-006 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-AUTH-006` | `duo_auth_006_branch_02_matches` | DUO-AUTH-006 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`bypass_code_count` equals 0; `settings_readable` does not equal true). |
+| `DUO-AUTH-006` | `duo_auth_006_branch_03_matches` | DUO-AUTH-006 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`bypass_code_count` equals 0; `complete` does not equal true). |
+| `DUO-AUTH-006` | `duo_auth_006_branch_04_matches` | DUO-AUTH-006 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `bypass_code_count` equals 0. |
+| `DUO-AUTH-006` | `duo_auth_006_branch_05_matches` | DUO-AUTH-006 ordered branch 5 (fail) is true exactly when its portable evidence condition matches. Computed as: any of (`flagged_code_count` is greater than 0; `helpdesk_bypass` equals "allow"; all of (`helpdesk_bypass` equals "limit"; `helpdesk_bypass_expiration` is at most 0)). |
+| `DUO-AUTH-006` | `duo_auth_006_branch_06_matches` | DUO-AUTH-006 ordered branch 6 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `settings_readable` does not equal true; `bypass_code_count` is greater than 0; `undated_code_count` is greater than 0). |
+| `DUO-AUTH-006` | `duo_auth_006_branch_07_matches` | DUO-AUTH-006 ordered branch 7 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-007` | `duo_auth_007_branch_01_matches` | DUO-AUTH-007 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`policy_readable` does not equal true; not (`user_auth_behavior` is present and non-null)). |
+| `DUO-AUTH-007` | `duo_auth_007_branch_02_matches` | DUO-AUTH-007 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `user_auth_behavior` equals "bypass". |
+| `DUO-AUTH-007` | `duo_auth_007_branch_03_matches` | DUO-AUTH-007 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `user_auth_behavior` does not equal "enforce". |
+| `DUO-AUTH-007` | `duo_auth_007_branch_04_matches` | DUO-AUTH-007 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `user_auth_behavior` equals "enforce". |
+| `DUO-AUTH-007` | `duo_auth_007_branch_05_matches` | DUO-AUTH-007 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-008` | `duo_auth_008_branch_01_matches` | DUO-AUTH-008 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `user_count` equals 0; `known_enrollment_count` equals 0). |
+| `DUO-AUTH-008` | `duo_auth_008_branch_02_matches` | DUO-AUTH-008 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: any of (`bypass_user_count` is greater than 0; all of (`unenrolled_user_count` is greater than 0; `enrolled_user_count` divided by `known_enrollment_count`, multiplied by 100, rounded to 1 decimal place(s) is less than 90; a missing, nonnumeric, or nonpositive denominator does not match)). |
+| `DUO-AUTH-008` | `duo_auth_008_branch_03_matches` | DUO-AUTH-008 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `unenrolled_user_count` is greater than 0). |
+| `DUO-AUTH-008` | `duo_auth_008_branch_04_matches` | DUO-AUTH-008 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`bypass_user_count` equals 0; `unenrolled_user_count` equals 0). |
+| `DUO-AUTH-008` | `duo_auth_008_branch_05_matches` | DUO-AUTH-008 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-009` | `duo_auth_009_branch_01_matches` | DUO-AUTH-009 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `access_user_count` equals 0). |
+| `DUO-AUTH-009` | `duo_auth_009_branch_02_matches` | DUO-AUTH-009 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `inactive_user_count` divided by `access_user_count`, multiplied by 100, rounded to 1 decimal place(s) is greater than 10; a missing, nonnumeric, or nonpositive denominator does not match. |
+| `DUO-AUTH-009` | `duo_auth_009_branch_03_matches` | DUO-AUTH-009 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `inactive_user_count` is greater than 0; `undated_user_count` is greater than 0). |
+| `DUO-AUTH-009` | `duo_auth_009_branch_04_matches` | DUO-AUTH-009 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`inactive_user_count` equals 0; `undated_user_count` equals 0). |
+| `DUO-AUTH-009` | `duo_auth_009_branch_05_matches` | DUO-AUTH-009 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-010` | `duo_auth_010_branch_01_matches` | DUO-AUTH-010 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `enrolled_user_count` equals 0). |
+| `DUO-AUTH-010` | `duo_auth_010_branch_02_matches` | DUO-AUTH-010 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `webauthn_user_count` equals 0. |
+| `DUO-AUTH-010` | `duo_auth_010_branch_03_matches` | DUO-AUTH-010 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `webauthn_user_count` divided by `enrolled_user_count`, multiplied by 100, rounded to 1 decimal place(s) is less than 75; a missing, nonnumeric, or nonpositive denominator does not match; `deprecated_u2f_user_count` is greater than 0). |
+| `DUO-AUTH-010` | `duo_auth_010_branch_04_matches` | DUO-AUTH-010 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`webauthn_user_count` divided by `enrolled_user_count`, multiplied by 100, rounded to 1 decimal place(s) is at least 75; a missing, nonnumeric, or nonpositive denominator does not match; `deprecated_u2f_user_count` equals 0). |
+| `DUO-AUTH-010` | `duo_auth_010_branch_05_matches` | DUO-AUTH-010 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-AUTH-011` | `duo_auth_011_branch_01_matches` | DUO-AUTH-011 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-ADMIN-001` | `duo_admin_001_branch_01_matches` | DUO-ADMIN-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `admin_count` equals 0). |
+| `DUO-ADMIN-001` | `duo_admin_001_branch_02_matches` | DUO-ADMIN-001 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`owner_count` is greater than 3; `owner_count` divided by `admin_count` is greater than 0.5; a missing, nonnumeric, or nonpositive denominator does not match). |
+| `DUO-ADMIN-001` | `duo_admin_001_branch_03_matches` | DUO-ADMIN-001 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `owner_count` is greater than 2). |
+| `DUO-ADMIN-001` | `duo_admin_001_branch_04_matches` | DUO-ADMIN-001 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `owner_count` is at most 2. |
+| `DUO-ADMIN-001` | `duo_admin_001_branch_05_matches` | DUO-ADMIN-001 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-ADMIN-002` | `duo_admin_002_branch_01_matches` | DUO-ADMIN-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-ADMIN-002` | `duo_admin_002_branch_02_matches` | DUO-ADMIN-002 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`verified_push_enabled` does not equal true; `webauthn_enabled` does not equal true). |
+| `DUO-ADMIN-002` | `duo_admin_002_branch_03_matches` | DUO-ADMIN-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`sms_enabled` equals true; `voice_enabled` equals true). |
+| `DUO-ADMIN-002` | `duo_admin_002_branch_04_matches` | DUO-ADMIN-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`sms_enabled` does not equal true; `voice_enabled` does not equal true). |
+| `DUO-ADMIN-002` | `duo_admin_002_branch_05_matches` | DUO-ADMIN-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-ADMIN-003` | `duo_admin_003_branch_01_matches` | DUO-ADMIN-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-ADMIN-003` | `duo_admin_003_branch_02_matches` | DUO-ADMIN-003 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`helpdesk_bypass` does not equal "deny"; not (all of (`helpdesk_bypass` equals "limit"; `helpdesk_bypass_expiration` is greater than 0))). |
+| `DUO-ADMIN-003` | `duo_admin_003_branch_03_matches` | DUO-ADMIN-003 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`helpdesk_bypass` equals "limit"; `helpdesk_bypass_expiration` is greater than 0). |
+| `DUO-ADMIN-003` | `duo_admin_003_branch_04_matches` | DUO-ADMIN-003 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `helpdesk_bypass` equals "deny". |
+| `DUO-ADMIN-003` | `duo_admin_003_branch_05_matches` | DUO-ADMIN-003 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-ADMIN-004` | `duo_admin_004_branch_01_matches` | DUO-ADMIN-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `admin_count` equals 0). |
+| `DUO-ADMIN-004` | `duo_admin_004_branch_02_matches` | DUO-ADMIN-004 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `stale_admin_count` divided by `active_admin_count` is at least 0.3333333333333333; a missing, nonnumeric, or nonpositive denominator does not match. |
+| `DUO-ADMIN-004` | `duo_admin_004_branch_03_matches` | DUO-ADMIN-004 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `stale_admin_count` is greater than 0; `undated_admin_count` is greater than 0). |
+| `DUO-ADMIN-004` | `duo_admin_004_branch_04_matches` | DUO-ADMIN-004 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`stale_admin_count` equals 0; `undated_admin_count` equals 0). |
+| `DUO-ADMIN-004` | `duo_admin_004_branch_05_matches` | DUO-ADMIN-004 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-ADMIN-005` | `duo_admin_005_branch_01_matches` | DUO-ADMIN-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; not (`lockout_threshold` is present and non-null)). |
+| `DUO-ADMIN-005` | `duo_admin_005_branch_02_matches` | DUO-ADMIN-005 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `lockout_threshold` is at most 0. |
+| `DUO-ADMIN-005` | `duo_admin_005_branch_03_matches` | DUO-ADMIN-005 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `lockout_threshold` is greater than 10. |
+| `DUO-ADMIN-005` | `duo_admin_005_branch_04_matches` | DUO-ADMIN-005 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`lockout_threshold` is greater than 0; `lockout_threshold` is at most 10). |
+| `DUO-ADMIN-005` | `duo_admin_005_branch_05_matches` | DUO-ADMIN-005 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-INTEGRATIONS-001` | `duo_integrations_001_branch_01_matches` | DUO-INTEGRATIONS-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-INTEGRATIONS-001` | `duo_integrations_001_branch_02_matches` | DUO-INTEGRATIONS-001 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`protected_integration_count` is greater than 0; `policy_attached_count` equals 0). |
+| `DUO-INTEGRATIONS-001` | `duo_integrations_001_branch_03_matches` | DUO-INTEGRATIONS-001 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `protected_integration_count` equals 0; `policy_attached_count` is less than `protected_integration_count`). |
+| `DUO-INTEGRATIONS-001` | `duo_integrations_001_branch_04_matches` | DUO-INTEGRATIONS-001 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `policy_attached_count` equals `protected_integration_count`. |
+| `DUO-INTEGRATIONS-001` | `duo_integrations_001_branch_05_matches` | DUO-INTEGRATIONS-001 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-INTEGRATIONS-002` | `duo_integrations_002_branch_01_matches` | DUO-INTEGRATIONS-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `applicable_integration_count` equals 0). |
+| `DUO-INTEGRATIONS-002` | `duo_integrations_002_branch_02_matches` | DUO-INTEGRATIONS-002 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `universal_prompt_count` equals 0. |
+| `DUO-INTEGRATIONS-002` | `duo_integrations_002_branch_03_matches` | DUO-INTEGRATIONS-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `universal_prompt_count` is less than `applicable_integration_count`). |
+| `DUO-INTEGRATIONS-002` | `duo_integrations_002_branch_04_matches` | DUO-INTEGRATIONS-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `universal_prompt_count` equals `applicable_integration_count`. |
+| `DUO-INTEGRATIONS-002` | `duo_integrations_002_branch_05_matches` | DUO-INTEGRATIONS-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-INTEGRATIONS-003` | `duo_integrations_003_branch_01_matches` | DUO-INTEGRATIONS-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; all of (`protected_integration_count` is greater than 0; `field_exposed_count` equals 0)). |
+| `DUO-INTEGRATIONS-003` | `duo_integrations_003_branch_02_matches` | DUO-INTEGRATIONS-003 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`field_exposed_count` is greater than 0; `self_service_enabled_count` equals `field_exposed_count`). |
+| `DUO-INTEGRATIONS-003` | `duo_integrations_003_branch_03_matches` | DUO-INTEGRATIONS-003 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `protected_integration_count` equals 0; `self_service_enabled_count` is greater than 0). |
+| `DUO-INTEGRATIONS-003` | `duo_integrations_003_branch_04_matches` | DUO-INTEGRATIONS-003 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`field_exposed_count` is greater than 0; `self_service_enabled_count` equals 0). |
+| `DUO-INTEGRATIONS-003` | `duo_integrations_003_branch_05_matches` | DUO-INTEGRATIONS-003 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-INTEGRATIONS-004` | `duo_integrations_004_branch_01_matches` | DUO-INTEGRATIONS-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-INTEGRATIONS-004` | `duo_integrations_004_branch_02_matches` | DUO-INTEGRATIONS-004 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`admin_api_count` is greater than 0; `overprivileged_admin_api_count` equals `admin_api_count`). |
+| `DUO-INTEGRATIONS-004` | `duo_integrations_004_branch_03_matches` | DUO-INTEGRATIONS-004 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `admin_api_count` equals 0; `overprivileged_admin_api_count` is greater than 0). |
+| `DUO-INTEGRATIONS-004` | `duo_integrations_004_branch_04_matches` | DUO-INTEGRATIONS-004 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`admin_api_count` is greater than 0; `overprivileged_admin_api_count` equals 0). |
+| `DUO-INTEGRATIONS-004` | `duo_integrations_004_branch_05_matches` | DUO-INTEGRATIONS-004 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-INTEGRATIONS-005` | `duo_integrations_005_branch_01_matches` | DUO-INTEGRATIONS-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; `protected_integration_count` equals 0; `tagged_integration_count` equals 0). |
+| `DUO-INTEGRATIONS-005` | `duo_integrations_005_branch_02_matches` | DUO-INTEGRATIONS-005 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `tagged_without_policy_count` equals `tagged_integration_count`. |
+| `DUO-INTEGRATIONS-005` | `duo_integrations_005_branch_03_matches` | DUO-INTEGRATIONS-005 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `tagged_without_policy_count` is greater than 0). |
+| `DUO-INTEGRATIONS-005` | `duo_integrations_005_branch_04_matches` | DUO-INTEGRATIONS-005 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `tagged_without_policy_count` equals 0. |
+| `DUO-INTEGRATIONS-005` | `duo_integrations_005_branch_05_matches` | DUO-INTEGRATIONS-005 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-INTEGRATIONS-006` | `duo_integrations_006_branch_01_matches` | DUO-INTEGRATIONS-006 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`policy_readable` does not equal true; `edition_sections_present` does not equal true). |
+| `DUO-INTEGRATIONS-006` | `duo_integrations_006_branch_02_matches` | DUO-INTEGRATIONS-006 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`duo_desktop_platform_count` equals 0; `encryption_platform_count` equals 0; `full_disk_encryption_required` does not equal true; `firewall_platform_count` equals 0; `system_password_platform_count` equals 0; `screen_lock_required` does not equal true; `restricted_os_count` equals 0). |
+| `DUO-INTEGRATIONS-006` | `duo_integrations_006_branch_03_matches` | DUO-INTEGRATIONS-006 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`duo_desktop_platform_count` equals 0; all of (`encryption_platform_count` equals 0; `full_disk_encryption_required` does not equal true); `firewall_platform_count` equals 0; all of (`system_password_platform_count` equals 0; `screen_lock_required` does not equal true); `restricted_os_count` equals 0). |
+| `DUO-INTEGRATIONS-006` | `duo_integrations_006_branch_04_matches` | DUO-INTEGRATIONS-006 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`duo_desktop_platform_count` is greater than 0; any of (`encryption_platform_count` is greater than 0; `full_disk_encryption_required` equals true); `firewall_platform_count` is greater than 0; any of (`system_password_platform_count` is greater than 0; `screen_lock_required` equals true); `restricted_os_count` is greater than 0). |
+| `DUO-INTEGRATIONS-006` | `duo_integrations_006_branch_05_matches` | DUO-INTEGRATIONS-006 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-MON-001` | `duo_mon_001_branch_01_matches` | DUO-MON-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-MON-001` | `duo_mon_001_branch_02_matches` | DUO-MON-001 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `event_count` equals 0; `review_event_count` is greater than 0). |
+| `DUO-MON-001` | `duo_mon_001_branch_03_matches` | DUO-MON-001 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`event_count` is greater than 0; `review_event_count` equals 0). |
+| `DUO-MON-001` | `duo_mon_001_branch_04_matches` | DUO-MON-001 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-MON-002` | `duo_mon_002_branch_01_matches` | DUO-MON-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-MON-002` | `duo_mon_002_branch_02_matches` | DUO-MON-002 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `event_count` equals 0). |
+| `DUO-MON-002` | `duo_mon_002_branch_03_matches` | DUO-MON-002 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `event_count` is greater than 0. |
+| `DUO-MON-002` | `duo_mon_002_branch_04_matches` | DUO-MON-002 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-MON-003` | `duo_mon_003_branch_01_matches` | DUO-MON-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; not (`credits_remaining` is present and non-null)). |
+| `DUO-MON-003` | `duo_mon_003_branch_02_matches` | DUO-MON-003 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`telephony_event_count` is greater than 0; `credits_remaining` is less than 25). |
+| `DUO-MON-003` | `duo_mon_003_branch_03_matches` | DUO-MON-003 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `telephony_event_count` is greater than 0; `credits_remaining` is less than 100). |
+| `DUO-MON-003` | `duo_mon_003_branch_04_matches` | DUO-MON-003 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `credits_remaining` is at least 100. |
+| `DUO-MON-003` | `duo_mon_003_branch_05_matches` | DUO-MON-003 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-MON-004` | `duo_mon_004_branch_01_matches` | DUO-MON-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `readable` does not equal true. |
+| `DUO-MON-004` | `duo_mon_004_branch_02_matches` | DUO-MON-004 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `enabled_notification_count` equals 0. |
+| `DUO-MON-004` | `duo_mon_004_branch_03_matches` | DUO-MON-004 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `enabled_notification_count` is greater than 0. |
+| `DUO-MON-004` | `duo_mon_004_branch_04_matches` | DUO-MON-004 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `DUO-MON-005` | `duo_mon_005_branch_01_matches` | DUO-MON-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`attempts_readable` does not equal true; `logs_readable` does not equal true; `counts_present` does not equal true). |
+| `DUO-MON-005` | `duo_mon_005_branch_02_matches` | DUO-MON-005 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`attempt_count` equals 0; `event_count` equals 0). |
+| `DUO-MON-005` | `duo_mon_005_branch_03_matches` | DUO-MON-005 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: `impossible_travel_count` is greater than 0. |
+| `DUO-MON-005` | `duo_mon_005_branch_04_matches` | DUO-MON-005 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: `located_event_count` equals 0. |
+| `DUO-MON-005` | `duo_mon_005_branch_05_matches` | DUO-MON-005 ordered branch 5 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`fraud_count` is greater than 0; `denied_attempt_count` divided by `attempt_count`, multiplied by 100, rounded to 1 decimal place(s) is greater than 20; a missing, nonnumeric, or nonpositive denominator does not match). |
+| `DUO-MON-005` | `duo_mon_005_branch_06_matches` | DUO-MON-005 ordered branch 6 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `DUO-MON-005` | `duo_mon_005_branch_07_matches` | DUO-MON-005 ordered branch 7 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `DUO-AUTH-001` | `requiredEvidenceReadable` | true |
+| `DUO-AUTH-001` | `requiredEvidenceComplete` | true |
+| `DUO-AUTH-002` | `telephony_method_count` | 2 |
+| `DUO-AUTH-003` | `requiredEvidenceReadable` | true |
+| `DUO-AUTH-003` | `requiredEvidenceComplete` | true |
+| `DUO-AUTH-004` | `pass_maximum_days` | 14 |
+| `DUO-AUTH-004` | `warn_maximum_days` | 30 |
+| `DUO-AUTH-005` | `requiredEvidenceReadable` | true |
+| `DUO-AUTH-005` | `requiredEvidenceComplete` | true |
+| `DUO-AUTH-006` | `maximum_age_hours` | 24 |
+| `DUO-AUTH-007` | `requiredEvidenceReadable` | true |
+| `DUO-AUTH-007` | `requiredEvidenceComplete` | true |
+| `DUO-AUTH-008` | `warning_minimum_percent` | 90 |
+| `DUO-AUTH-009` | `inactive_days` | 90 |
+| `DUO-AUTH-009` | `failure_percent` | 10 |
+| `DUO-AUTH-010` | `pass_minimum_percent` | 75 |
+| `DUO-AUTH-011` | `requiredEvidenceReadable` | true |
+| `DUO-AUTH-011` | `requiredEvidenceComplete` | true |
+| `DUO-ADMIN-001` | `pass_maximum` | 2 |
+| `DUO-ADMIN-002` | `requiredEvidenceReadable` | true |
+| `DUO-ADMIN-002` | `requiredEvidenceComplete` | true |
+| `DUO-ADMIN-003` | `requiredEvidenceReadable` | true |
+| `DUO-ADMIN-003` | `requiredEvidenceComplete` | true |
+| `DUO-ADMIN-004` | `inactive_days` | 90 |
+| `DUO-ADMIN-005` | `pass_maximum` | 10 |
+| `DUO-INTEGRATIONS-001` | `requiredEvidenceReadable` | true |
+| `DUO-INTEGRATIONS-001` | `requiredEvidenceComplete` | true |
+| `DUO-INTEGRATIONS-002` | `requiredEvidenceReadable` | true |
+| `DUO-INTEGRATIONS-002` | `requiredEvidenceComplete` | true |
+| `DUO-INTEGRATIONS-003` | `requiredEvidenceReadable` | true |
+| `DUO-INTEGRATIONS-003` | `requiredEvidenceComplete` | true |
+| `DUO-INTEGRATIONS-004` | `requiredEvidenceReadable` | true |
+| `DUO-INTEGRATIONS-004` | `requiredEvidenceComplete` | true |
+| `DUO-INTEGRATIONS-005` | `requiredEvidenceReadable` | true |
+| `DUO-INTEGRATIONS-005` | `requiredEvidenceComplete` | true |
+| `DUO-INTEGRATIONS-006` | `requirement_group_count` | 5 |
+| `DUO-MON-001` | `requiredEvidenceReadable` | true |
+| `DUO-MON-001` | `requiredEvidenceComplete` | true |
+| `DUO-MON-002` | `requiredEvidenceReadable` | true |
+| `DUO-MON-002` | `requiredEvidenceComplete` | true |
+| `DUO-MON-003` | `critical_credit_floor` | 25 |
+| `DUO-MON-003` | `warning_credit_floor` | 100 |
+| `DUO-MON-004` | `requiredEvidenceReadable` | true |
+| `DUO-MON-004` | `requiredEvidenceComplete` | true |
+| `DUO-MON-005` | `travel_window_minutes` | 60 |
+| `DUO-MON-005` | `denied_warning_percent` | 20 |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `DUO-AUTH-001` | compliant | All required source reads are complete and this derivation returns pass: return pass when the global policy allows WebAuthn or requires Verified Duo Push, warn when only ordinary Duo Push or supporting administrator hardening exists, and fail when neither phishing-resistant option is present. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-001` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the global policy allows WebAuthn or requires Verified Duo Push, warn when only ordinary Duo Push or supporting administrator hardening exists, and fail when neither phishing-resistant option is present. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-001` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-001` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-002` | compliant | All required source reads are complete and this derivation returns pass: return pass only when both SMS and phone callback are explicitly blocked, fail when neither is blocked, warn when only one is blocked or telephony is explicitly allowed alongside a partial block, and manual when the allow and block lists are absent. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-002` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass only when both SMS and phone callback are explicitly blocked, fail when neither is blocked, warn when only one is blocked or telephony is explicitly allowed alongside a partial block, and manual when the allow and block lists are absent. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-002` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-002` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-003` | compliant | All required source reads are complete and this derivation returns pass: return pass for new_user_behavior=enroll, fail for no-mfa, warn for any other readable behavior, and manual when the value is absent. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-003` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass for new_user_behavior=enroll, fail for no-mfa, warn for any other readable behavior, and manual when the value is absent. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-003` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-003` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-004` | compliant | All required source reads are complete and this derivation returns pass: return pass when remembered devices are disabled or last at most 14 days, warn for 15 through 30 days, fail above 30 days, and manual when the duration cannot be normalized. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-004` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when remembered devices are disabled or last at most 14 days, warn for 15 through 30 days, fail above 30 days, and manual when the duration cannot be normalized. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-004` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-004` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-005` | compliant | All required source reads are complete and this derivation returns pass: return pass for trusted_endpoint_checking=require-trusted, warn for allow-all, and fail for any other readable configuration. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-005` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass for trusted_endpoint_checking=require-trusted, warn for allow-all, and fail for any other readable configuration. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-005` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-005` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-006` | compliant | All required source reads are complete and this derivation returns pass: return pass only for an empty bypass-code inventory with readable help-desk limits, fail when any unexpired code is older than 24 hours, has unlimited uses, lacks expiration, or help-desk issuance is unlimited, and warn for every other non-empty or undated inventory. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-006` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass only for an empty bypass-code inventory with readable help-desk limits, fail when any unexpired code is older than 24 hours, has unlimited uses, lacks expiration, or help-desk issuance is unlimited, and warn for every other non-empty or undated inventory. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-006` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-006` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-007` | compliant | All required source reads are complete and this derivation returns pass: return pass for user_auth_behavior=enforce, fail for bypass, warn for another readable value such as deny, and manual when the authentication policy or value is absent. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-007` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass for user_auth_behavior=enforce, fail for bypass, warn for another readable value such as deny, and manual when the authentication policy or value is absent. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-007` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-007` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-008` | compliant | All required source reads are complete and this derivation returns pass: for users with known enrollment state, return pass when all active users are enrolled and none has bypass status, warn when at least 90 percent are enrolled with no bypass users, and fail otherwise. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-008` | noncompliant | A complete source read satisfies the fail branch of this derivation: for users with known enrollment state, return pass when all active users are enrolled and none has bypass status, warn when at least 90 percent are enrolled with no bypass users, and fail otherwise. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-008` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-008` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-009` | compliant | All required source reads are complete and this derivation returns pass: for a non-empty active-or-bypass population, return pass when every last-login date is present and no login is older than 90 days, warn when dates are missing or at most 10 percent are stale, and fail when more than 10 percent are stale. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-009` | noncompliant | A complete source read satisfies the fail branch of this derivation: for a non-empty active-or-bypass population, return pass when every last-login date is present and no login is older than 90 days, warn when dates are missing or at most 10 percent are stale, and fail when more than 10 percent are stale. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-009` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-009` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-010` | compliant | All required source reads are complete and this derivation returns pass: for enrolled users, return pass when at least 75 percent have WebAuthn and none has deprecated U2F, warn when any user has WebAuthn but that bar is not met, and fail when none has WebAuthn. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-010` | noncompliant | A complete source read satisfies the fail branch of this derivation: for enrolled users, return pass when at least 75 percent have WebAuthn and none has deprecated U2F, warn when any user has WebAuthn but that bar is not met, and fail when none has WebAuthn. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-010` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-010` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-AUTH-011` | compliant | All required source reads are complete and this derivation returns pass: always return manual because the Admin API exposes offline-enrollment events but not the offline-access policy limits. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-AUTH-011` | noncompliant | A complete source read satisfies the fail branch of this derivation: always return manual because the Admin API exposes offline-enrollment events but not the offline-access policy limits. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-AUTH-011` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-AUTH-011` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-ADMIN-001` | compliant | All required source reads are complete and this derivation returns pass: for a non-empty administrator inventory, return pass with at most two active owners, warn when owners are at most the greater of three or half of all administrators, and fail above that bound. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-ADMIN-001` | noncompliant | A complete source read satisfies the fail branch of this derivation: for a non-empty administrator inventory, return pass with at most two active owners, warn when owners are at most the greater of three or half of all administrators, and fail above that bound. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-ADMIN-001` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-ADMIN-001` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-ADMIN-002` | compliant | All required source reads are complete and this derivation returns pass: return pass when WebAuthn or Verified Duo Push is enabled and SMS and voice are disabled, warn when a strong method is enabled alongside SMS or voice, and fail when neither strong method is enabled. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-ADMIN-002` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when WebAuthn or Verified Duo Push is enabled and SMS and voice are disabled, warn when a strong method is enabled alongside SMS or voice, and fail when neither strong method is enabled. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-ADMIN-002` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-ADMIN-002` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-ADMIN-003` | compliant | All required source reads are complete and this derivation returns pass: return pass for helpdesk_bypass=deny, warn for limit with a positive expiration, and fail for every other readable setting. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-ADMIN-003` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass for helpdesk_bypass=deny, warn for limit with a positive expiration, and fail for every other readable setting. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-ADMIN-003` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-ADMIN-003` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-ADMIN-004` | compliant | All required source reads are complete and this derivation returns pass: return pass when every active administrator has a parseable last login no older than 90 days, warn for missing dates or a smaller stale set, and fail when stale administrators are at least one third of active administrators. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-ADMIN-004` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when every active administrator has a parseable last login no older than 90 days, warn for missing dates or a smaller stale set, and fail when stale administrators are at least one third of active administrators. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-ADMIN-004` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-ADMIN-004` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-ADMIN-005` | compliant | All required source reads are complete and this derivation returns pass: return fail when the numeric lockout threshold is zero or negative, pass from one through ten failed attempts, warn above ten, and manual when the threshold is absent or nonnumeric. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-ADMIN-005` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when the numeric lockout threshold is zero or negative, pass from one through ten failed attempts, warn above ten, and manual when the threshold is absent or nonnumeric. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-ADMIN-005` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-ADMIN-005` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-INTEGRATIONS-001` | compliant | All required source reads are complete and this derivation returns pass: for non-empty active protected integrations, return pass when every integration has a policy key, warn when only some do, and fail when none do; an empty readable inventory is warn. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-INTEGRATIONS-001` | noncompliant | A complete source read satisfies the fail branch of this derivation: for non-empty active protected integrations, return pass when every integration has a policy key, warn when only some do, and fail when none do; an empty readable inventory is warn. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-INTEGRATIONS-001` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-INTEGRATIONS-001` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-INTEGRATIONS-002` | compliant | All required source reads are complete and this derivation returns pass: for integrations exposing prompt posture, return pass when all use Universal Prompt, warn when only some do, and fail when none do. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-INTEGRATIONS-002` | noncompliant | A complete source read satisfies the fail branch of this derivation: for integrations exposing prompt posture, return pass when all use Universal Prompt, warn when only some do, and fail when none do. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-INTEGRATIONS-002` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-INTEGRATIONS-002` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-INTEGRATIONS-003` | compliant | All required source reads are complete and this derivation returns pass: return pass when every protected integration exposing self_service_allowed disables it, warn when only some disable it or the protected inventory is empty, fail when all exposed values enable it, and manual when no integration exposes the field. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-INTEGRATIONS-003` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when every protected integration exposing self_service_allowed disables it, warn when only some disable it or the protected inventory is empty, fail when all exposed values enable it, and manual when no integration exposes the field. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-INTEGRATIONS-003` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-INTEGRATIONS-003` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-INTEGRATIONS-004` | compliant | All required source reads are complete and this derivation returns pass: return pass when all visible Admin API integrations omit write, settings, integration-management, and permission-management grants, warn when only some are overprivileged or the inventory omits the audit integration, and fail when all are overprivileged. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-INTEGRATIONS-004` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when all visible Admin API integrations omit write, settings, integration-management, and permission-management grants, warn when only some are overprivileged or the inventory omits the audit integration, and fail when all are overprivileged. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-INTEGRATIONS-004` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-INTEGRATIONS-004` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-INTEGRATIONS-005` | compliant | All required source reads are complete and this derivation returns pass: for protected applications tagged Critical, High, or regulated, return pass when each has an explicit policy, warn when only some do, fail when none do, and manual when no protected application has usable criticality tags. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-INTEGRATIONS-005` | noncompliant | A complete source read satisfies the fail branch of this derivation: for protected applications tagged Critical, High, or regulated, return pass when each has an explicit policy, warn when only some do, fail when none do, and manual when no protected application has usable criticality tags. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-INTEGRATIONS-005` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-INTEGRATIONS-005` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-INTEGRATIONS-006` | compliant | All required source reads are complete and this derivation returns pass: evaluate five groups: Duo Desktop, encryption, firewall, system-password or screen-lock, and operating-system restrictions; return pass for all five, fail for none, warn for one through four, and manual when the tenant edition exposes no device-health sections. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-INTEGRATIONS-006` | noncompliant | A complete source read satisfies the fail branch of this derivation: evaluate five groups: Duo Desktop, encryption, firewall, system-password or screen-lock, and operating-system restrictions; return pass for all five, fail for none, warn for one through four, and manual when the tenant edition exposes no device-health sections. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-INTEGRATIONS-006` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-INTEGRATIONS-006` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-MON-001` | compliant | All required source reads are complete and this derivation returns pass: return pass for a non-empty authentication-log window with no bypass, SMS, phone, or fraud events; warn when the window is empty or any such event exists. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-MON-001` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass for a non-empty authentication-log window with no bypass, SMS, phone, or fraud events; warn when the window is empty or any such event exists. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-MON-001` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-MON-001` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-MON-002` | compliant | All required source reads are complete and this derivation returns pass: return pass when the Trust Monitor window contains events and warn when its complete window is empty. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-MON-002` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when the Trust Monitor window contains events and warn when its complete window is empty. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-MON-002` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-MON-002` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-MON-003` | compliant | All required source reads are complete and this derivation returns pass: return fail when telephony use exists and credits are below 25, warn when telephony use exists or credits are below 100, pass otherwise, and manual when credits or logs are unreadable. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-MON-003` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail when telephony use exists and credits are below 25, warn when telephony use exists or credits are below 100, pass otherwise, and manual when credits or logs are unreadable. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-MON-003` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-MON-003` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-MON-004` | compliant | All required source reads are complete and this derivation returns pass: return pass when any fraud-email, push-activity, or email-activity notification is enabled and warn when all readable notification signals are false or absent. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-MON-004` | noncompliant | A complete source read satisfies the fail branch of this derivation: return pass when any fraud-email, push-activity, or email-activity notification is enabled and warn when all readable notification signals are false or absent. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-MON-004` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-MON-004` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `DUO-MON-005` | compliant | All required source reads are complete and this derivation returns pass: return fail for any successful country change within 60 minutes, warn for fraud or a denied-attempt share above 20 percent, pass otherwise, manual when counts or all location fields are absent, and warn when both summary and event windows are empty. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `DUO-MON-005` | noncompliant | A complete source read satisfies the fail branch of this derivation: return fail for any successful country change within 60 minutes, warn for fraud or a denied-attempt share above 20 percent, pass otherwise, manual when counts or all location fields are absent, and warn when both summary and event windows are empty. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `DUO-MON-005` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `DUO-MON-005` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | Phishing-resistant authentication methods | IA-2(1), IA-2(11) | 3.5.3 | CC6.1 | 6.3 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.AT-2 |
+| 2 | Deprecated authentication methods restricted | IA-2(6) | 3.5.3 | CC6.1 | 6.4 | 8.4.3 | SRG-APP-000156 | ISM-1515 | CPS.IA-2 |
+| 3 | New user enrollment policy | AC-2(2) | 3.1.1 | CC6.2 | 5.3 | 8.2.1 | SRG-APP-000024 | ISM-0415 | CPS.AC-2 |
+| 4 | Remembered devices posture | AC-12 | 3.1.10 | CC6.1 | 5.4 | 8.2.8 | SRG-APP-000295 | ISM-1164 | CPS.AC-7 |
+| 5 | Trusted endpoints and device health | CM-6, CM-8(3) | 3.4.1, 3.4.2 | CC6.7 | 4.1 | 2.2.1 | SRG-APP-000383, SRG-APP-000384 | ISM-1082, ISM-1599 | CPS.CM-6, CPS.CM-8 |
+| 6 | Bypass code hygiene | IA-5(1) | 3.5.10 | CC6.1 | 6.6 | 8.6.3 | SRG-APP-000175 | ISM-1557 | CPS.IA-5 |
+| 7 | Global MFA enforcement mode | IA-2(1) | 3.5.3 | CC6.1 | 6.3 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.AT-2 |
+| 8 | User enrollment completeness | IA-2(2) | 3.5.3 | CC6.1 | 6.3 | 8.4.1 | SRG-APP-000150 | ISM-1504 | CPS.AT-2 |
+| 9 | Inactive user detection | AC-2(3) | 3.1.12 | CC6.2 | 5.3 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
+| 10 | WebAuthn and U2F credential adoption | IA-2(12) | 3.5.3 | CC6.1 | 6.4 | 8.4.3 | SRG-APP-000395 | ISM-1515 | CPS.IA-2 |
+| 11 | Offline access configuration | IA-2(11) | 3.5.3 | CC6.1 | - | 8.4.1 | SRG-APP-000394 | ISM-1504 | CPS.IA-2 |
+| 12 | Owner and privileged admin concentration | AC-6(5) | 3.1.5 | CC6.3 | 4.3 | 7.1.1 | SRG-APP-000340 | ISM-1507 | CPS.AC-6 |
+| 13 | Administrator authentication strength | IA-2(1), IA-2(11) | 3.5.3 | CC6.1 | 6.4 | 8.4.2 | SRG-APP-000149 | ISM-1504 | CPS.AT-2 |
+| 14 | Help desk bypass governance | AC-6(10) | 3.1.7 | CC6.3 | 6.7 | 7.2.1 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
+| 15 | Stale privileged administrator review | AC-2(3) | 3.1.12 | CC6.2 | 5.3 | 8.1.4 | SRG-APP-000025 | ISM-1591 | CPS.AC-2 |
+| 16 | User lockout policy | AC-7 | 3.1.8 | CC6.1 | 5.4 | 8.3.4 | SRG-APP-000065 | ISM-1403 | CPS.AC-7 |
+| 17 | Protected integrations have explicit policy coverage | CM-2, CM-8 | 3.4.1 | CC6.8 | 4.5 | 2.2.1 | SRG-APP-000386 | ISM-1624 | CPS.CM-2 |
+| 18 | Universal Prompt adoption | IA-2(1) | 3.5.3 | CC6.1 | 6.4 | 8.4.2 | SRG-APP-000149 | ISM-1515 | CPS.IA-2 |
+| 19 | Self-service portal governance | AC-2(1) | 3.1.1 | CC6.2 | 5.3 | 8.2.4 | SRG-APP-000023 | ISM-1594 | CPS.AC-2 |
+| 20 | Administrative API integration permissions | AC-6(10) | 3.1.7 | CC6.3 | 4.3 | 7.2.1 | SRG-APP-000343 | ISM-0988 | CPS.AC-6 |
+| 21 | Critical application protection coverage | CM-8 | 3.4.1 | CC6.1 | - | 2.4 | SRG-APP-000383 | ISM-1599 | CPS.CM-8 |
+| 22 | Device health requirements depth | CM-6 | 3.4.2 | CC6.7 | - | 2.2.1 | SRG-APP-000384 | ISM-1082 | CPS.CM-6 |
+| 23 | Authentication log visibility and factor hygiene | AU-6, SI-4 | 3.3.5, 3.14.6 | CC7.2 | 8.2 | 10.6.1 | SRG-APP-000516 | ISM-0109 | CPS.AU-6 |
+| 24 | Trust Monitor coverage | SI-4 | 3.14.6 | CC7.2 | 8.7 | 10.6.1 | SRG-APP-000516 | ISM-0580 | CPS.SI-4 |
+| 25 | Telephony reliance and credit headroom | SA-9 | 3.13.2 | CC9.1 | 13.1 | - | SRG-APP-000516 | ISM-0888 | CPS.SA-9 |
+| 26 | Administrative and fraud notifications | AU-5, AU-6 | 3.3.6 | CC7.2 | 8.8 | 10.7.2 | SRG-APP-000516 | ISM-0109 | CPS.AU-6 |
+| 27 | Authentication outcome and travel anomalies | AU-6 | 3.3.5 | CC7.2 | - | 10.6.1 | SRG-APP-000516 | ISM-0109 | CPS.AU-6 |
+
+## Collection states
+
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
+
+## Integration-specific scrubbing
+
+Shared contract version: 1.1.
+
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
+
+Sensitive fields and values: skey, integration_key, authorization, cookie, bypass_code
+
+Credential formats: Duo integration keys, Duo secret keys, HMAC Authorization signatures
+
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
+
+Integration-specific rules:
+
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `settings` | `helpdesk_bypass`, `user_lockout`, `notifications` |
+| `info-summary` | `telephony_credits_remaining`, `user_count`, `integration_count` |
+| `authentication-attempts` | `count`, `result`, `reason` |
+| `admin-auth-methods` | `webauthn`, `duo_push`, `sms`, `phone` |
+| `global-policy` | `authentication_methods`, `new_user_policy`, `remembered_devices`, `trusted_endpoints`, `device_health` |
+| `policies` | `policy_id`, `name`, `authentication_methods`, `remembered_devices`, `device_health` |
+| `users` | `user_id`, `username`, `status`, `last_login`, `is_enrolled` |
+| `bypass-codes` | `user_id`, `created`, `expires`, `remaining_uses` |
+| `webauthn-credentials` | `user_id`, `credential_name`, `date_added` |
+| `admins` | `admin_id`, `name`, `role`, `status`, `last_login` |
+| `integrations` | `integration_key`, `name`, `type`, `policy`, `prompt_type`, `permissions` |
+| `authentication-logs` | `timestamp`, `result`, `reason`, `factor`, `access_device`, `location` |
+| `activity-logs` | `timestamp`, `action`, `username`, `description` |
+| `telephony-logs` | `timestamp`, `type`, `context`, `credits` |
+| `offline-enrollment-logs` | `timestamp`, `username`, `action`, `application` |
+| `trust-monitor-events` | `id`, `type`, `timestamp`, `risk`, `location` |
+
+## Export layout
+
+Required paths:
+
+- `QUICK_REFERENCE.md`
+- `config.json`
+- `core_data/settings.json`
+- `core_data/policies.json`
+- `core_data/global_policy.json`
+- `core_data/users.json`
+- `core_data/bypass_codes.json`
+- `core_data/webauthn_credentials.json`
+- `core_data/admin_allowed_auth_methods.json`
+- `core_data/authentication_logs.json`
+- `core_data/offline_enrollment_logs.json`
+- `core_data/admins.json`
+- `core_data/activity_logs.json`
+- `core_data/integrations.json`
+- `core_data/info_summary.json`
+- `core_data/telephony_logs.json`
+- `core_data/trust_monitor_events.json`
+- `core_data/authentication_attempts.json`
+- `core_data/collection_status.json`
+- `analysis/authentication.json`
+- `analysis/admin_access.json`
+- `analysis/integrations.json`
+- `analysis/monitoring.json`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis/cis_compliance_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/stig_compliance_checklist.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `config.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/settings.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/policies.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/global_policy.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/users.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/bypass_codes.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/webauthn_credentials.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/admin_allowed_auth_methods.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/authentication_logs.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/offline_enrollment_logs.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/admins.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/activity_logs.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/integrations.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/info_summary.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/telephony_logs.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/trust_monitor_events.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/authentication_attempts.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/collection_status.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/authentication.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/admin_access.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/integrations.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/monitoring.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis/cis_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `framework mappings`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+
+#### bundle_result
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+#### assessment
+
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
+
+#### pagination_state
+
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
+
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
+
+Overwrite policy: Allocate a timestamped <api-host> directory and add a numeric suffix if that directory already exists; allocate the archive independently without overwriting.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create a zip named from the allocated directory beside it; if that zip exists, add an independent numeric suffix.

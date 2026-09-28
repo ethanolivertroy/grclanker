@@ -95,18 +95,24 @@ export interface VerdictCriteria {
   warn: string;
   fail: string;
   manual: string;
+  info?: string;
   constants: Readonly<Record<string, PortableValue>>;
   examples: readonly CriterionExample[];
   rules: readonly VerdictRule[];
 }
 
-export type EvaluatedFindingStatus = "pass" | "warn" | "fail" | "manual";
+export type EvaluatedFindingStatus = "pass" | "warn" | "fail" | "manual" | "info";
 export type VerdictFacts = Readonly<Record<string, unknown>>;
 
 export interface VerdictRule {
   status: EvaluatedFindingStatus;
   condition: VerdictCondition;
   note?: string;
+}
+
+export interface DerivedFactRule {
+  description: string;
+  condition: VerdictCondition;
 }
 
 export type VerdictOperand =
@@ -119,13 +125,23 @@ export type VerdictCondition =
   | { op: "and" | "or"; conditions: readonly VerdictCondition[] }
   | { op: "not"; condition: VerdictCondition }
   | { op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte"; left: VerdictOperand; right: VerdictOperand }
+  | {
+      op: "ratio";
+      numerator: VerdictOperand;
+      denominator: VerdictOperand;
+      comparator: "gt" | "gte" | "lt" | "lte";
+      threshold: VerdictOperand;
+      scale?: number;
+      roundDigits?: number;
+    }
+  | { op: "matches"; operand: VerdictOperand; pattern: string; flags?: string }
   | { op: "defined" | "null"; operand: VerdictOperand }
   | { op: "some" | "every"; path: string; condition: VerdictCondition };
 
 export interface CriterionExample {
   kind: CriterionExampleKind;
   input: string;
-  expected: "pass" | "warn" | "fail" | "manual";
+  expected: EvaluatedFindingStatus;
   reason: string;
 }
 
@@ -137,8 +153,28 @@ export interface CheckContract {
   owningTool: string;
   sourceSurfaceIds: readonly string[];
   evidenceFields: readonly string[];
+  evidenceFieldDefinitions?: Readonly<Record<string, string>>;
+  completeness?: Readonly<Record<string, CompletenessContract>>;
   derivedFacts: Readonly<Record<string, string>>;
+  derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   criteria: VerdictCriteria;
+}
+
+export type CompletenessFailureMode =
+  | "truncated"
+  | "error"
+  | "denied"
+  | "not-collected"
+  | "missing-required-field";
+
+export interface CompletenessSourceContract {
+  surfaceId: string;
+  falseWhen: readonly CompletenessFailureMode[];
+}
+
+export interface CompletenessContract {
+  sources: readonly CompletenessSourceContract[];
+  semantics: string;
 }
 
 export interface ControlContract {
@@ -271,6 +307,22 @@ export function evaluateVerdictCriteria(criteria: VerdictCriteria, facts: Verdic
   throw new Error("No verdict criterion matched the supplied facts");
 }
 
+export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFacts): EvaluatedFindingStatus {
+  const declaredRawInputs = new Set(check.evidenceFields);
+  const undeclared = Object.keys(rawFacts).filter((name) => !declaredRawInputs.has(name));
+  if (undeclared.length > 0) {
+    throw new Error(`${check.id} received undeclared decision input(s): ${undeclared.sort().join(", ")}`);
+  }
+  const facts: Record<string, unknown> = {
+    ...check.criteria.constants,
+    ...rawFacts,
+  };
+  for (const [name, derivation] of Object.entries(check.derivedFactRules ?? {})) {
+    facts[name] = evaluateVerdictCondition(derivation.condition, facts);
+  }
+  return evaluateVerdictCriteria(check.criteria, facts);
+}
+
 function pathValue(root: unknown, path: string, item: unknown): unknown {
   const fromItem = path === "$" || path.startsWith("$.");
   const segments = (fromItem ? path.slice(1).replace(/^\./, "") : path).split(".").filter(Boolean);
@@ -320,6 +372,10 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
       return operandValue(condition.left, facts, item) === operandValue(condition.right, facts, item);
     case "ne":
       return operandValue(condition.left, facts, item) !== operandValue(condition.right, facts, item);
+    case "matches": {
+      const candidate = operandValue(condition.operand, facts, item);
+      return typeof candidate === "string" && new RegExp(condition.pattern, condition.flags).test(candidate);
+    }
     case "gt":
     case "gte":
     case "lt":
@@ -331,6 +387,32 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
       if (condition.op === "gte") return Number(left) >= Number(right);
       if (condition.op === "lt") return Number(left) < Number(right);
       return Number(left) <= Number(right);
+    }
+    case "ratio": {
+      const numeratorValue = operandValue(condition.numerator, facts, item);
+      const denominatorValue = operandValue(condition.denominator, facts, item);
+      const thresholdValue = operandValue(condition.threshold, facts, item);
+      if (
+        numeratorValue === null || numeratorValue === undefined
+        || denominatorValue === null || denominatorValue === undefined
+        || thresholdValue === null || thresholdValue === undefined
+      ) {
+        return false;
+      }
+      const numerator = Number(numeratorValue);
+      const denominator = Number(denominatorValue);
+      const threshold = Number(thresholdValue);
+      if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0 || !Number.isFinite(threshold)) {
+        return false;
+      }
+      const scaledRatio = (numerator / denominator) * (condition.scale ?? 1);
+      const ratio = condition.roundDigits === undefined
+        ? scaledRatio
+        : Math.round(scaledRatio * (10 ** condition.roundDigits)) / (10 ** condition.roundDigits);
+      if (condition.comparator === "gt") return ratio > threshold;
+      if (condition.comparator === "gte") return ratio >= threshold;
+      if (condition.comparator === "lt") return ratio < threshold;
+      return ratio <= threshold;
     }
     case "some":
     case "every": {
@@ -384,6 +466,8 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
       return `${renderOperand(condition.left)} equals ${renderOperand(condition.right)}`;
     case "ne":
       return `${renderOperand(condition.left)} does not equal ${renderOperand(condition.right)}`;
+    case "matches":
+      return `${renderOperand(condition.operand)} matches portable regular expression \`${condition.pattern}\`${condition.flags ? ` with flags \`${condition.flags}\`` : ""}`;
     case "gt":
       return `${renderOperand(condition.left)} is greater than ${renderOperand(condition.right)}`;
     case "gte":
@@ -392,6 +476,20 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
       return `${renderOperand(condition.left)} is less than ${renderOperand(condition.right)}`;
     case "lte":
       return `${renderOperand(condition.left)} is at most ${renderOperand(condition.right)}`;
+    case "ratio":
+      return `${renderOperand(condition.numerator)} divided by ${renderOperand(condition.denominator)}${
+        condition.scale === undefined ? "" : `, multiplied by ${condition.scale}`
+      }${
+        condition.roundDigits === undefined ? "" : `, rounded to ${condition.roundDigits} decimal place(s)`
+      } is ${
+        condition.comparator === "gt"
+          ? "greater than"
+          : condition.comparator === "gte"
+            ? "at least"
+            : condition.comparator === "lt"
+              ? "less than"
+              : "at most"
+      } ${renderOperand(condition.threshold)}; a missing, nonnumeric, or nonpositive denominator does not match`;
     case "some":
       return `some item in \`${condition.path}\` satisfies (${renderVerdictCondition(condition.condition)})`;
     case "every":
@@ -419,6 +517,8 @@ export function verdictConditionPaths(condition: VerdictCondition): string[] {
     case "defined":
     case "null":
       return operandPaths(condition.operand);
+    case "matches":
+      return operandPaths(condition.operand);
     case "eq":
     case "ne":
     case "gt":
@@ -426,6 +526,12 @@ export function verdictConditionPaths(condition: VerdictCondition): string[] {
     case "lt":
     case "lte":
       return [...operandPaths(condition.left), ...operandPaths(condition.right)];
+    case "ratio":
+      return [
+        ...operandPaths(condition.numerator),
+        ...operandPaths(condition.denominator),
+        ...operandPaths(condition.threshold),
+      ];
     case "some":
     case "every":
       return [condition.path, ...verdictConditionPaths(condition.condition)];

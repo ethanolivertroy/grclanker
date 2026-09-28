@@ -40,8 +40,16 @@ import {
   resolveSecureOutputPath,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/box.js";
+import { BOX_SPEC } from "../dist/extensions/grc-tools/box.spec.js";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
 import { assertCookieAttributeCarriersScrubbed } from "./helpers/cookie-attribute-carriers.mjs";
 import { scrubAlterations } from "./helpers/scrub-survival.mjs";
@@ -2025,6 +2033,21 @@ test("assessBoxSharingCollaboration passes with restricted collaboration, links,
   assert.deepEqual(result.errors, []);
 });
 
+test("BOX-05 keeps the legacy pass when the allowlist is empty even when exempt users exist", async () => {
+  const configuration = hardenedConfiguration();
+  configuration.content_and_sharing.external_collaboration_status = item("limit_collaboration_to_users_within_enterprise");
+  const result = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    configuration,
+    allowlistEntries: [],
+    exemptTargets: [{ id: "exempt-1", type: "collaboration_whitelist_exempt_target", user: { id: "member-1", type: "user" } }],
+  }));
+  const finding = findingById(result, "BOX-05");
+  assert.equal(finding.status, "pass");
+  assert.equal(finding.summary, "No collaboration allowlist entries exist to audit.");
+  assert.equal(finding.evidence.exempt_targets, 1);
+});
+
 test("assessBoxSharingCollaboration fails open collaboration, public allowlist domains, open links, and missing terms", async () => {
   const result = await assessBoxSharingCollaboration(createStubClient(weakFixture()), { staleAllowlistDays: 365 });
   assertStatuses(result, {
@@ -2214,6 +2237,7 @@ test("assessBoxShieldMonitoring fails when Shield rules and monitoring signals a
 test("exportBoxAuditBundle writes core data, analysis, compliance reports, and a zip archive", async () => {
   const base = createTempBase("grclanker-box-export-");
   const result = await exportBoxAuditBundle(createStubClient(hardenedFixture()), sampleConfig(), base);
+  assertBundlePathsMatchSpec(assert, result.outputDir, BOX_SPEC);
 
   assert.ok(existsSync(result.outputDir));
   assert.ok(result.outputDir.startsWith(base));
@@ -3419,4 +3443,119 @@ test("round 7b: resolveBoxConfiguration keeps env-provided credentials and confi
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("byte differential fixtures: Box assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  writeByteDifferentialFixture(
+    "box",
+    "representative",
+    await runAllBoxAssessments(createStubClient(weakFixture())),
+  );
+
+  const deniedSource = hardenedFixture();
+  const deniedRoutes = Object.fromEntries(
+    Object.keys(boxRoutes(deniedSource)).map((route) => [route, boxDenyRoute()]),
+  );
+  writeByteDifferentialFixture(
+    "box",
+    "denied",
+    await runAllBoxAssessments(httpBox(deniedSource, { routes: deniedRoutes }).client),
+  );
+
+  const missing = {
+    ...hardenedFixture(),
+    configuration: {
+      id: "123456",
+      type: "enterprise_configuration",
+      security: null,
+      user_settings: null,
+      content_and_sharing: null,
+    },
+    users: [],
+    events: [],
+    devicePinners: [],
+    classificationTemplate: {},
+    metadataTemplates: [],
+    retentionPolicies: [],
+    retentionAssignments: [],
+    legalHoldPolicies: [],
+    legalHoldAssignments: [],
+    barriers: [],
+    barrierSegments: [],
+    shieldLists: [],
+    allowlistEntries: [],
+    exemptTargets: [],
+    termsOfServices: [],
+    groups: [],
+  };
+  writeByteDifferentialFixture(
+    "box",
+    "missing-null",
+    await runAllBoxAssessments(createStubClient(missing)),
+  );
+
+  const partialSource = hardenedFixture();
+  const partialBase = createStubClient(partialSource);
+  const partialClient = createStubClient(partialSource, {
+    listUsers: truncatedList(partialSource.users),
+    listEnterpriseEvents: async (options) => {
+      const result = await partialBase.listEnterpriseEvents(options);
+      return page(result.items, true);
+    },
+    listCollaborationAllowlistEntries: truncatedList(partialSource.allowlistEntries),
+    listMetadataTemplates: truncatedList(partialSource.metadataTemplates),
+    listRetentionPolicies: truncatedList(partialSource.retentionPolicies),
+  });
+  writeByteDifferentialFixture(
+    "box",
+    "partial",
+    await runAllBoxAssessments(partialClient),
+  );
+
+  writeByteDifferentialFixture(
+    "box",
+    "compliant",
+    await runAllBoxAssessments(createStubClient(hardenedFixture())),
+  );
+
+  const inactiveAt = async (inactiveUsers) => {
+    const users = [
+      user("boundary-admin", { role: "admin" }),
+      ...Array.from({ length: 99 }, (_, index) => user(`boundary-member-${index}`)),
+    ];
+    const activeCount = users.length - inactiveUsers;
+    const events = users.slice(0, activeCount).map((entry, index) => loginEvent(entry.id, index === 0 ? "ADMIN_LOGIN" : "LOGIN"));
+    return assessBoxIdentityAccess(createStubClient({ ...hardenedFixture(), users, events }));
+  };
+  const passwordAt = async (minimumLength) => {
+    const fixture = hardenedFixture();
+    fixture.configuration.security.password_min_length = item(minimumLength);
+    return assessBoxIdentityAccess(createStubClient(fixture), { minPasswordLength: 12 });
+  };
+  const sessionAt = async (hours) => {
+    const fixture = hardenedFixture();
+    fixture.configuration.security.session_duration = item(`${hours} hours`);
+    return assessBoxIdentityAccess(createStubClient(fixture), { maxSessionHours: 24 });
+  };
+  writeByteDifferentialFixture("box", "boundary", {
+    inactivePercent: [
+      await inactiveAt(25),
+      await inactiveAt(26),
+    ],
+    passwordLength: [
+      await passwordAt(7),
+      await passwordAt(8),
+      await passwordAt(11),
+      await passwordAt(12),
+    ],
+    sessionHours: [
+      await sessionAt(24),
+      await sessionAt(25),
+    ],
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("box");
+  const routed = httpBox(hardenedFixture());
+  const exported = await exportBoxAuditBundle(routed.client, routed.config, exportRoot);
+  writeByteDifferentialFixture("box", "export", snapshotExportBundle(exported));
 });

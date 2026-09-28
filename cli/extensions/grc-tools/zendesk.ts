@@ -6,6 +6,7 @@
  * reference cannot verify are emitted as manual findings that name the
  * Admin Center evidence a reviewer must collect.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -21,7 +22,10 @@ import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
+import { readResolverEnvironment, ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { ZENDESK_SPEC } from "./zendesk.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -213,6 +217,20 @@ const CONTROL_MAPPINGS: Record<number, string[]> = {
   25: ["FedRAMP AC-4", "CMMC AC.L2-3.1.3", "SOC 2 CC6.6", "CIS 13.4", "PCI-DSS 1.3.4", "DISA STIG SRG-APP-000039", "IRAP ISM-1284", "ISMAP 8.1.3"],
 };
 
+hydrateBatchFrameworkMappings(ZENDESK_SPEC, Object.fromEntries(Object.entries(CONTROL_MAPPINGS).map(([number, mappings]) => [
+  `ZD-${number.padStart(2, "0")}`,
+  {
+    fedramp: [mappings[0].replace(/^FedRAMP /, "")],
+    cmmc: [mappings[1].replace(/^CMMC /, "")],
+    soc2: [mappings[2].replace(/^SOC 2 /, "")],
+    cis: [mappings[3].replace(/^CIS /, "")],
+    pci_dss: [mappings[4].replace(/^PCI-DSS /, "")],
+    disa_stig: [mappings[5].replace(/^DISA STIG /, "")],
+    irap: [mappings[6].replace(/^IRAP /, "")],
+    ismap: [mappings[7].replace(/^ISMAP /, "")],
+  },
+])));
+
 const FRAMEWORK_REPORTS: Array<{ slug: string; title: string; prefix: string }> = [
   { slug: "fedramp", title: "FedRAMP / NIST 800-53 Compliance Report", prefix: "FedRAMP " },
   { slug: "cmmc", title: "CMMC Compliance Report", prefix: "CMMC " },
@@ -375,6 +393,7 @@ export function resolveZendeskConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   homeDir: string = homedir(),
 ): ZendeskResolvedConfig {
+  env = readResolverEnvironment(ZENDESK_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const explicitConfigPath = asString(input.config_file) ?? asString(env.ZENDESK_CONFIG_FILE);
   const configPath = explicitConfigPath ?? join(homeDir, ".zendesk", "config.json");
@@ -2356,8 +2375,9 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
 ): ZendeskFinding {
+  const id = `ZD-${String(control).padStart(2, "0")}`;
   return {
-    id: `ZD-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title,
     severity,
@@ -2366,6 +2386,15 @@ function finding(
     evidence,
     mappings: CONTROL_MAPPINGS[control] ?? [],
   };
+}
+
+const ZENDESK_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordZendeskDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>): void {
+  const id = `ZD-${String(control).padStart(2, "0")}`;
+  const store = ZENDESK_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Zendesk assessment`);
+  store.set(id, facts);
 }
 
 function manualFinding(
@@ -2466,7 +2495,7 @@ function incompleteCause(name: string, snap: ZendeskSnapshot<unknown>): string {
 function capForIncomplete(item: ZendeskFinding, secondaries: Array<[string, ZendeskSnapshot<unknown>]>): ZendeskFinding {
   const unreadable = secondaries.filter(([, snap]) => snap.status !== "ok");
   const truncated = secondaries.filter(([, snap]) => truncationReasonOf(snap) !== undefined);
-  if (item.status !== "pass" || (unreadable.length === 0 && truncated.length === 0)) return item;
+  if ((unreadable.length === 0 && truncated.length === 0) || (item.status !== "pass" && item.status !== "warn")) return item;
   const causes = [
     ...(unreadable.length > 0 ? [`Verdict capped at warn because a secondary inventory could not be read: ${unreadable.map(([name, snap]) => incompleteCause(name, snap)).join(" ")}`] : []),
     ...(truncated.length > 0 ? [`Verdict capped at warn because a secondary inventory was truncated: ${truncated.map(([name, snap]) => incompleteCause(name, snap)).join(" ")}`] : []),
@@ -2687,6 +2716,17 @@ function roleCeilingReason(currentUser: ZendeskSnapshot<JsonRecord>): string | u
 
 function finalizeFindings(findings: ZendeskFinding[], currentUser: ZendeskSnapshot<JsonRecord>): ZendeskFinding[] {
   const reason = roleCeilingReason(currentUser);
+  const factsByCheck = ZENDESK_DECISION_CONTEXT.getStore();
+  if (!factsByCheck) throw new Error("Zendesk findings were finalized outside an assessment");
+  const credentialIsAdmin = reason === undefined;
+  for (const item of findings) {
+    const facts = factsByCheck.get(item.id);
+    if (!facts) throw new Error(`${item.id} has no runtime decision facts`);
+    const check = ZENDESK_SPEC.checks.find((candidate) => candidate.id === item.id);
+    factsByCheck.set(item.id, check?.evidenceFields.includes("credential_is_admin")
+      ? { ...facts, credential_is_admin: credentialIsAdmin }
+      : facts);
+  }
   const capped = reason
     ? findings.map((item): ZendeskFinding => item.status === "pass"
       ? {
@@ -2726,12 +2766,19 @@ function authenticationEvidence(auth: JsonRecord): JsonRecord {
 function assessSsoEnforcement(securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, adminCenterAuth: string): ZendeskFinding {
   const title = "SSO enforcement enabled";
   const instruction = `capture ${adminCenterAuth} showing single sign-on enabled and Zendesk password sign-in disabled for team members.`;
-  if (securitySnap.status !== "ok") {
-    return manualFinding(1, title, "critical", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
-  }
   const enforceSso = asBoolean(agentAuth.enforce_sso);
   const zendeskLogin = asBoolean(agentAuth.zendesk_login);
   const methods = ssoMethods(agentAuth);
+  recordZendeskDecisionFacts(1, {
+    readable: securitySnap.status === "ok",
+    fields_present: enforceSso !== undefined && zendeskLogin !== undefined,
+    enforce_sso: enforceSso,
+    zendesk_login: zendeskLogin,
+    sso_method_count: methods.length,
+  });
+  if (securitySnap.status !== "ok") {
+    return manualFinding(1, title, "critical", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
+  }
   const bypassName = asString(agentAuth.remote_bypass_name) ?? (asNumber(agentAuth.remote_bypass) === 1 ? "owner" : asNumber(agentAuth.remote_bypass) === 2 ? "admins" : "unknown");
   const evidence: JsonRecord = {
     ...authenticationEvidence(agentAuth),
@@ -2771,6 +2818,19 @@ function assessAgentTwoFactor(
   const requirementInstruction = `capture ${adminCenterAuth} showing two-factor authentication required for team members.`;
   const enforce = securitySnap.status === "ok" ? asBoolean(agentAuth.two_factor_enforce) : undefined;
   const enforceSso = securitySnap.status === "ok" ? asBoolean(agentAuth.enforce_sso) : undefined;
+  const withoutTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === false);
+  const unknownTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === undefined);
+  recordZendeskDecisionFacts(2, {
+    team_readable: teamSnap.status === "ok",
+    team_count: teamMembers.length,
+    security_readable: securitySnap.status === "ok",
+    two_factor_enforce_present: enforce !== undefined,
+    two_factor_enforce_value: enforce,
+    enforce_sso_value: enforceSso,
+    without_two_factor_count: withoutTwoFactor.length,
+    unknown_two_factor_count: unknownTwoFactor.length,
+    complete: !isTruncated(teamSnap),
+  });
   const enforcementText = securitySnap.status === "ok"
     ? `security_settings.authentication.agent.two_factor_enforce=${enforce ?? "absent"}.`
     : snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap);
@@ -2780,8 +2840,6 @@ function assessAgentTwoFactor(
   if (teamMembers.length === 0) {
     return manualFinding(2, title, "critical", `Zero active agents or admins were visible although every Zendesk account has at least one admin, so the credential sees only a partial population.${truncationNote("team member", teamSnap)} ${enforcementText}`, `use an admin credential and ${requirementInstruction}`, { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap), two_factor_enforce: enforce ?? null, security_settings_status: securitySnap.status });
   }
-  const withoutTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === false);
-  const unknownTwoFactor = teamMembers.filter((user) => asBoolean(user.two_factor_auth_enabled) === undefined);
   const truncated = isTruncated(teamSnap);
   const enrolled = teamMembers.length - withoutTwoFactor.length - unknownTwoFactor.length;
   const perUser = `${enrolled}/${teamMembers.length} seen team members report two_factor_auth_enabled=true`;
@@ -2835,10 +2893,16 @@ function customPasswordGaps(password: JsonRecord): string[] {
 function assessPasswordPolicy(securitySnap: ZendeskSnapshot<JsonRecord>, agentAuth: JsonRecord, agentPassword: JsonRecord): ZendeskFinding {
   const title = "Password policy meets complexity requirements";
   const instruction = "capture Admin Center > Account > Security > Team member authentication > Password level (Recommended, High, Medium, Low, or Custom) and the custom policy details.";
+  const policyName = asString(agentAuth.security_policy_name)?.toLowerCase();
+  const customGaps = policyName === "custom" ? customPasswordGaps(agentPassword) : [];
+  recordZendeskDecisionFacts(3, {
+    readable: securitySnap.status === "ok",
+    security_policy_name: policyName,
+    custom_gap_count: customGaps.length,
+  });
   if (securitySnap.status !== "ok") {
     return manualFinding(3, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
   }
-  const policyName = asString(agentAuth.security_policy_name)?.toLowerCase();
   const evidence: JsonRecord = {
     ...authenticationEvidence(agentAuth),
     password: {
@@ -2863,7 +2927,7 @@ function assessPasswordPolicy(securitySnap: ZendeskSnapshot<JsonRecord>, agentAu
     return finding(3, title, "high", "pass", `${label}, the level Zendesk documents as its strongest preset.${ssoNote}`, evidence);
   }
   if (policyName === "custom") {
-    const gaps = customPasswordGaps(agentPassword);
+    const gaps = customGaps;
     return gaps.length === 0
       ? finding(3, title, "high", "pass", `${label} and the documented policy fields meet the baseline (12+ characters, numbers and special characters, mixed case, lockout after at most 10 failed attempts, email local part disallowed, history of at least 5 or unlimited).${ssoNote}`, evidence)
       : finding(3, title, "high", "warn", `${label} but ${gaps.length} policy fields fall short of the baseline: ${gaps.join("; ")}.${ssoNote}`, evidence);
@@ -2877,11 +2941,17 @@ function assessPasswordPolicy(securitySnap: ZendeskSnapshot<JsonRecord>, agentAu
 function assessIpRestrictions(securitySnap: ZendeskSnapshot<JsonRecord>, ipSettings: JsonRecord): ZendeskFinding {
   const title = "IP restrictions configured for agent access";
   const instruction = "capture Admin Center > Account > Security > Advanced > IP restrictions showing the allowed ranges and whether customers are exempt.";
+  const enabled = asBoolean(ipSettings.ip_restriction_enabled);
+  const ranges = (asString(ipSettings.ip_ranges) ?? "").split(/\s+/).filter(Boolean);
+  recordZendeskDecisionFacts(4, {
+    readable: securitySnap.status === "ok",
+    enabled_present: enabled !== undefined,
+    enabled,
+    range_count: ranges.length,
+  });
   if (securitySnap.status !== "ok") {
     return manualFinding(4, title, "high", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
   }
-  const enabled = asBoolean(ipSettings.ip_restriction_enabled);
-  const ranges = (asString(ipSettings.ip_ranges) ?? "").split(/\s+/).filter(Boolean);
   const agentsOnly = asBoolean(ipSettings.enable_agent_ip_restrictions);
   const evidence: JsonRecord = {
     ip_restriction_enabled: enabled ?? null,
@@ -2907,15 +2977,23 @@ function assessIpRestrictions(securitySnap: ZendeskSnapshot<JsonRecord>, ipSetti
 function assessSessionTimeout(securitySnap: ZendeskSnapshot<JsonRecord>, security: JsonRecord, thresholdMinutes: number): ZendeskFinding {
   const title = "Session timeout configured and reasonable";
   const instruction = "capture Admin Center > Account > Security > Advanced > Authentication showing the team member, end user, and mobile app session expiration values.";
+  const agentTimeout = asNumber(security.agent_session_timeout);
+  const mobileAccess = asBoolean(security.mobile_app_access);
+  const mobileTimeout = asNumber(security.mobile_app_session_timeout);
+  recordZendeskDecisionFacts(5, {
+    readable: securitySnap.status === "ok",
+    agent_session_timeout: agentTimeout,
+    mobile_app_access: mobileAccess,
+    mobile_app_session_timeout: mobileTimeout,
+    threshold_minutes: thresholdMinutes,
+    severe_threshold_minutes: thresholdMinutes * 3,
+  });
   if (securitySnap.status !== "ok") {
     return manualFinding(5, title, "medium", snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap), instruction);
   }
-  const agentTimeout = asNumber(security.agent_session_timeout);
   const endUserTimeout = asNumber(security.end_user_session_timeout);
   const maxDurationEnabled = asBoolean(security.maximum_session_duration_enabled);
   const maxDuration = asNumber(security.maximum_session_duration);
-  const mobileAccess = asBoolean(security.mobile_app_access);
-  const mobileTimeout = asNumber(security.mobile_app_session_timeout);
   const evidence: JsonRecord = {
     agent_session_timeout: agentTimeout ?? null,
     end_user_session_timeout: endUserTimeout ?? null,
@@ -2963,13 +3041,22 @@ function assessEndUserAuthentication(
       : "";
   const baseEvidence: JsonRecord = { api_password_access_end_users: passwordApiAccess ?? null, account_settings_status: settingsSnap.status, security_settings_status: securitySnap.status };
   const cap = (item: ZendeskFinding): ZendeskFinding => capForIncomplete(item, [["Account settings (/account/settings)", settingsSnap]]);
-  if (securitySnap.status !== "ok") {
-    return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
-  }
   const zendeskLogin = asBoolean(endUserAuth.zendesk_login);
   const enforceSso = asBoolean(endUserAuth.enforce_sso);
   const methods = ssoMethods(endUserAuth);
   const policyName = asString(endUserAuth.security_policy_name)?.toLowerCase();
+  recordZendeskDecisionFacts(21, {
+    security_readable: securitySnap.status === "ok",
+    fields_present: zendeskLogin !== undefined && enforceSso !== undefined,
+    enforce_sso: enforceSso,
+    zendesk_login: zendeskLogin,
+    sso_method_count: methods.length,
+    security_policy_name: policyName,
+    account_settings_complete: settingsSnap.status === "ok",
+  });
+  if (securitySnap.status !== "ok") {
+    return manualFinding(21, title, "high", `${snapshotCause(SECURITY_SETTINGS_SOURCE, securitySnap)}${apiNote}`, `capture Admin Center > Account > Security > End user authentication and ${anonymousInstruction}`, baseEvidence);
+  }
   const evidence: JsonRecord = {
     ...authenticationEvidence(endUserAuth),
     facebook_login: asBoolean(endUserAuth.facebook_login) ?? null,
@@ -2997,7 +3084,7 @@ function assessEndUserAuthentication(
   return finding(21, title, "high", "fail", `authentication.end_user.zendesk_login=false, enforce_sso=false, and no SSO method is enabled, so end users have no way to sign in and every end user interaction is anonymous.${apiNote}${manualPortion}`, evidence);
 }
 
-export async function assessZendeskAuthentication(
+async function assessZendeskAuthenticationWithDecisionContext(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
@@ -3047,6 +3134,13 @@ export async function assessZendeskAuthentication(
     errors: snapshotErrors(entries),
     snapshots: snapshotsForBundle(entries),
   };
+}
+
+export async function assessZendeskAuthentication(
+  client: ZendeskReadClient,
+  options: ZendeskAssessmentOptions = {},
+): Promise<ZendeskAssessmentResult> {
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskAuthenticationWithDecisionContext(client, options));
 }
 
 interface ApiTokenEventSummary {
@@ -3106,6 +3200,13 @@ function assessApiTokens(
   const apiTokenAccess = asBoolean(asObject(settingsSnap.data?.api)?.api_token_access);
   const events = listSnapshotItems(tokenLogsSnap);
   const summary = summarizeApiTokenEvents(events, staleDays, now);
+  recordZendeskDecisionFacts(13, {
+    settings_readable: settingsSnap.status === "ok",
+    api_token_access: apiTokenAccess,
+    token_history_readable: tokenLogsSnap.status === "ok",
+    token_history_complete: tokenLogsSnap.status === "ok" && !isTruncated(tokenLogsSnap),
+    outstanding_token_count: summary.outstanding.length,
+  });
   const tokenLogSource = "Audit log token events (/audit_logs?filter[source_type]=apitoken, Enterprise plan and admin role)";
   const evidence: JsonRecord = {
     api_token_access: apiTokenAccess ?? null,
@@ -3155,7 +3256,7 @@ function assessApiTokens(
   );
 }
 
-export async function assessZendeskAccessControl(
+async function assessZendeskAccessControlWithDecisionContext(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
@@ -3176,6 +3277,40 @@ export async function assessZendeskAccessControl(
   const admins = teamMembers.filter((user) => asString(user.role) === "admin");
   const agents = teamMembers.filter((user) => asString(user.role) === "agent");
   const findings: ZendeskFinding[] = [];
+  const customRoles = listSnapshotItems(rolesSnap);
+  const adminEquivalent = customRoles
+    .map((role) => ({ name: asString(role.name) ?? asString(role.id) ?? "role", members: asNumber(role.team_member_count) ?? 0, reasons: customRoleIsAdminEquivalent(role) }))
+    .filter((role) => role.reasons.length > 0);
+  const unrestrictedAgents = agents.filter((user) => asBoolean(user.restricted_agent) === false);
+  const adminLoginBuckets = partitionByDate(admins, "last_login_at", resolved.staleDays, now);
+  const groups = listSnapshotItems(groupsSnap).filter((group) => asBoolean(group.deleted) !== true);
+  const memberships = listSnapshotItems(membershipsSnap);
+
+  recordZendeskDecisionFacts(6, {
+    team_readable: teamSnap.status === "ok",
+    team_count: teamMembers.length,
+    roles_readable: rolesSnap.status === "ok",
+    complete: !isTruncated(teamSnap) && !isTruncated(rolesSnap),
+    populated_admin_equivalent_count: adminEquivalent.filter((role) => role.members > 0).length,
+    unassigned_admin_equivalent_count: adminEquivalent.filter((role) => role.members <= 0).length,
+    agent_count: agents.length,
+    unrestricted_agent_count: unrestrictedAgents.length,
+  });
+  recordZendeskDecisionFacts(7, {
+    team_readable: teamSnap.status === "ok",
+    admin_count: admins.length,
+    admin_threshold: resolved.adminThreshold,
+    stale_admin_count: adminLoginBuckets.stale.length,
+    undated_admin_count: adminLoginBuckets.undated.length,
+    complete: !isTruncated(teamSnap),
+  });
+  recordZendeskDecisionFacts(8, {
+    groups_readable: groupsSnap.status === "ok",
+    memberships_readable: membershipsSnap.status === "ok",
+    group_count: groups.length,
+    membership_count: memberships.length,
+    complete: !isTruncated(groupsSnap) && !isTruncated(membershipsSnap),
+  });
 
   const leastPrivilegeTitle = "Agent roles follow least privilege";
   if (teamSnap.status !== "ok") {
@@ -3183,11 +3318,6 @@ export async function assessZendeskAccessControl(
   } else if (teamMembers.length === 0) {
     findings.push(manualFinding(6, leastPrivilegeTitle, "critical", `Zero active team members were visible, which indicates a partial view of the account.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the team member and role lists from Admin Center.", { seen_team_members: countOrNull(0, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
-    const customRoles = listSnapshotItems(rolesSnap);
-    const adminEquivalent = customRoles
-      .map((role) => ({ name: asString(role.name) ?? asString(role.id) ?? "role", members: asNumber(role.team_member_count) ?? 0, reasons: customRoleIsAdminEquivalent(role) }))
-      .filter((role) => role.reasons.length > 0);
-    const unrestrictedAgents = agents.filter((user) => asBoolean(user.restricted_agent) === false);
     const evidence: JsonRecord = {
       seen_team_members: teamMembers.length,
       admins: countOrNull(admins.length, teamSnap),
@@ -3218,7 +3348,7 @@ export async function assessZendeskAccessControl(
   } else if (admins.length === 0) {
     findings.push(manualFinding(7, adminTitle, "high", `Zero admins were visible although every account has at least one admin (account owner), so the inventory is partial.${truncationNote("team member", teamSnap)}`, "use an admin credential and export the Administrator list from Admin Center.", { seen_admins: countOrNull(0, teamSnap), seen_team_members: countOrNull(teamMembers.length, teamSnap), inventory_truncated: truncationOrNull(teamSnap) }));
   } else {
-    const loginBuckets = partitionByDate(admins, "last_login_at", resolved.staleDays, now);
+    const loginBuckets = adminLoginBuckets;
     const evidence: JsonRecord = {
       seen_admins: admins.length,
       admin_threshold: resolved.adminThreshold,
@@ -3239,8 +3369,6 @@ export async function assessZendeskAccessControl(
   }
 
   const groupsTitle = "Group-based access controls configured";
-  const groups = listSnapshotItems(groupsSnap).filter((group) => asBoolean(group.deleted) !== true);
-  const memberships = listSnapshotItems(membershipsSnap);
   if (groupsSnap.status !== "ok" || membershipsSnap.status !== "ok") {
     findings.push(manualFinding(8, groupsTitle, "medium", `${snapshotCause("Groups", groupsSnap)} ${snapshotCause("Group memberships", membershipsSnap)}`, "capture Admin Center > People > Team > Groups with member counts."));
   } else if (groups.length === 0) {
@@ -3266,17 +3394,32 @@ export async function assessZendeskAccessControl(
   findings.push(assessApiTokens(settingsSnap, tokenLogsSnap, config, resolved.staleDays, now));
 
   const oauthTitle = "OAuth application permissions are scoped";
+  const clients = listSnapshotItems(clientsSnap);
+  const tokens = listSnapshotItems(tokensSnap);
+  const unscoped = clients.filter((item) => !asString(item.scope));
+  const publicClients = clients.filter((item) => asString(item.kind) === "public");
+  const insecureRedirects = clients.filter((item) => asArray(item.redirect_uri).some((uri) => urlScheme(uri) === "http" && !/^(localhost|127\.0\.0\.1)$/.test(urlHost(uri)?.split(":")[0] ?? "")));
+  const privilegedTokens = tokens.filter((token) => asArray(token.scopes).some((scope) => /write|impersonate/i.test(asString(scope) ?? "")));
+  const nonExpiringTokens = tokens.filter((token) => !asString(token.expires_at));
+  const usage = partitionByDate(tokens, "used_at", resolved.staleDays, now);
+  recordZendeskDecisionFacts(14, {
+    clients_readable: clientsSnap.status === "ok",
+    clients_complete: clientsSnap.status === "ok" && !isTruncated(clientsSnap),
+    client_count: clients.length,
+    unscoped_count: unscoped.length,
+    insecure_redirect_count: insecureRedirects.length,
+    tokens_readable: tokensSnap.status === "ok",
+    tokens_complete: tokensSnap.status === "ok" && !isTruncated(tokensSnap),
+    token_count: tokens.length,
+    public_client_count: publicClients.length,
+    privileged_token_count: privilegedTokens.length,
+    non_expiring_token_count: nonExpiringTokens.length,
+    stale_token_count: usage.stale.length,
+    undated_token_count: usage.undated.length,
+  });
   if (clientsSnap.status !== "ok") {
     findings.push(manualFinding(14, oauthTitle, "high", snapshotCause("OAuth clients (/oauth/clients, admin only)", clientsSnap), "capture Admin Center > Apps and integrations > APIs > OAuth clients with each client's scopes, kind, and redirect URLs."));
   } else {
-    const clients = listSnapshotItems(clientsSnap);
-    const tokens = listSnapshotItems(tokensSnap);
-    const unscoped = clients.filter((item) => !asString(item.scope));
-    const publicClients = clients.filter((item) => asString(item.kind) === "public");
-    const insecureRedirects = clients.filter((item) => asArray(item.redirect_uri).some((uri) => urlScheme(uri) === "http" && !/^(localhost|127\.0\.0\.1)$/.test(urlHost(uri)?.split(":")[0] ?? "")));
-    const privilegedTokens = tokens.filter((token) => asArray(token.scopes).some((scope) => /write|impersonate/i.test(asString(scope) ?? "")));
-    const nonExpiringTokens = tokens.filter((token) => !asString(token.expires_at));
-    const usage = partitionByDate(tokens, "used_at", resolved.staleDays, now);
     const tokenSource = "OAuth tokens (/oauth/tokens?all=true, admin only)";
     const clientLabel = (item: JsonRecord): string => asString(item.name) ?? asString(item.identifier) ?? "client";
     const evidence: JsonRecord = {
@@ -3347,6 +3490,13 @@ export async function assessZendeskAccessControl(
   };
 }
 
+export async function assessZendeskAccessControl(
+  client: ZendeskReadClient,
+  options: ZendeskAssessmentOptions = {},
+): Promise<ZendeskAssessmentResult> {
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskAccessControlWithDecisionContext(client, options));
+}
+
 function describeConditions(list: unknown): string[] {
   return asRecordArray(list).map((condition) => {
     const value = condition.value;
@@ -3402,14 +3552,23 @@ function assessDeletionPolicies(
     custom_roles_status: rolesSnap.status,
   };
   const cap = (item: ZendeskFinding): ZendeskFinding => capForIncomplete(item, [[settingsSource, settingsSnap], [rolesSource, rolesSnap]]);
-  if (deletionSnap.status !== "ok") {
-    return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
-  }
   const schedules = listSnapshotItems(deletionSnap);
   const active = schedules.filter((schedule) => asBoolean(schedule.active) === true);
   const activeByObject = Object.fromEntries(DELETION_SCHEDULE_OBJECTS.map((object) => [object, active.filter((schedule) => asString(schedule.object) === object).length]));
-  const otherActive = active.filter((schedule) => !DELETION_SCHEDULE_OBJECTS.includes(asString(schedule.object) ?? "")).length;
   const activeWithoutConditions = active.filter((schedule) => !scheduleHasConditions(schedule)).length;
+  recordZendeskDecisionFacts(12, {
+    readable: deletionSnap.status === "ok",
+    complete: deletionSnap.status === "ok" && !isTruncated(deletionSnap),
+    schedule_count: schedules.length,
+    active_count: active.length,
+    active_ticket_count: activeByObject["zen:ticket"] ?? 0,
+    active_without_conditions_count: activeWithoutConditions,
+    secondary_complete: settingsSnap.status === "ok" && rolesSnap.status === "ok" && !isTruncated(rolesSnap),
+  });
+  if (deletionSnap.status !== "ok") {
+    return manualFinding(12, title, "high", `${snapshotCause("Deletion schedules (/deletion_schedules, admin only)", deletionSnap)}${context}`, instruction, baseEvidence);
+  }
+  const otherActive = active.filter((schedule) => !DELETION_SCHEDULE_OBJECTS.includes(asString(schedule.object) ?? "")).length;
   const defaults = schedules.filter((schedule) => asBoolean(schedule.default) === true).length;
   const evidence: JsonRecord = {
     ...baseEvidence,
@@ -3446,7 +3605,7 @@ function assessDeletionPolicies(
   return cap(finding(12, title, "high", "pass", `${active.length} active deletion schedule(s) read to completion (${byObjectText}; ${defaults} default); ticket retention is enforced by ${ticketSchedules} conditioned schedule(s).${context}`, evidence));
 }
 
-export async function assessZendeskDataProtection(
+async function assessZendeskDataProtectionWithDecisionContext(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
@@ -3474,6 +3633,12 @@ export async function assessZendeskDataProtection(
   // the cap. The sample is cut short when paging stopped before it filled (a stalled cursor
   // or a refused next link), and only then is the read incomplete for this finding.
   const sampleCutShort = isTruncated(auditSnap) && auditEntries.length < DEFAULT_AUDIT_LOG_SAMPLE;
+  recordZendeskDecisionFacts(9, {
+    readable: auditSnap.status === "ok",
+    entry_count: auditEntries.length,
+    truncated: isTruncated(auditSnap),
+    sample_size: DEFAULT_AUDIT_LOG_SAMPLE,
+  });
   if (auditSnap.status !== "ok") {
     findings.push(manualFinding(9, auditTitle, "high", `${snapshotCause("Audit logs (/audit_logs, Enterprise plan and admin role)", auditSnap)} This is a plan or permission limitation, not a pass.`, "capture Admin Center > Account > Audit log showing recent entries, or record that the plan does not include the audit log.", { audit_log_status: auditSnap.status }));
   } else if (auditEntries.length === 0) {
@@ -3495,11 +3660,17 @@ export async function assessZendeskDataProtection(
   }
 
   const retentionTitle = "Audit log retention meets compliance requirements";
+  const oldest = oldestSnap.data;
+  const oldestAge = oldest ? ageInDays(oldest.created_at, now) : undefined;
+  recordZendeskDecisionFacts(10, {
+    readable: oldestSnap.status === "ok",
+    dateable: oldest !== undefined && oldestAge !== undefined,
+    oldest_age_days: oldestAge,
+    required_retention_days: resolved.retentionDays,
+  });
   if (oldestSnap.status !== "ok") {
     findings.push(manualFinding(10, retentionTitle, "medium", snapshotCause("Audit logs (oldest record lookup)", oldestSnap), "record the audit log retention statement from Zendesk documentation (records are kept indefinitely on Enterprise) and capture the oldest visible entry in Admin Center > Account > Audit log."));
   } else {
-    const oldest = oldestSnap.data;
-    const oldestAge = oldest ? ageInDays(oldest.created_at, now) : undefined;
     const evidence: JsonRecord = { oldest_entry: asString(oldest?.created_at) ?? null, oldest_entry_age_days: oldestAge ?? null, required_retention_days: resolved.retentionDays };
     if (!oldest || oldestAge === undefined) {
       findings.push(manualFinding(10, retentionTitle, "medium", "The oldest audit log entry could not be dated (missing created_at or empty log).", "capture the oldest entry in Admin Center > Account > Audit log.", evidence));
@@ -3510,6 +3681,7 @@ export async function assessZendeskDataProtection(
     }
   }
 
+  recordZendeskDecisionFacts(11, {});
   findings.push(manualFinding(11, "HIPAA compliance mode enabled (if applicable)", "critical", "Neither the published Account Settings reference nor the Security Settings reference exposes a HIPAA or Advanced Data Privacy and Protection field.", "capture Admin Center > Account > Security > Advanced showing the HIPAA-enabled configuration (or the executed BAA) if the account processes PHI; otherwise record not applicable.", { settings_readable: settingsSnap.status === "ok" }));
 
   findings.push(assessDeletionPolicies(deletionSnap, settingsSnap, tickets, rolesSnap));
@@ -3518,6 +3690,12 @@ export async function assessZendeskDataProtection(
   const privateAttachments = asBoolean(tickets.private_attachments);
   const cdnHosts = asRecordArray(asObject(settings.cdn)?.hosts).map((host) => asString(host.url)).filter((url): url is string => Boolean(url));
   const insecureCdnHosts = cdnHosts.filter((url) => urlScheme(url) !== "https");
+  recordZendeskDecisionFacts(18, {
+    readable: settingsSnap.status === "ok",
+    flag_present: privateAttachments !== undefined,
+    private_attachments: privateAttachments,
+    insecure_cdn_count: insecureCdnHosts.length,
+  });
   const cdnEvidence: JsonRecord = { private_attachments: privateAttachments ?? null, cdn_hosts: cdnHosts, insecure_cdn_hosts: insecureCdnHosts };
   if (settingsSnap.status !== "ok") {
     findings.push(manualFinding(18, cdnTitle, "medium", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Objects and rules > Tickets > Settings > Attachments showing 'Require authentication to download'."));
@@ -3533,6 +3711,7 @@ export async function assessZendeskDataProtection(
 
   const attachmentTitle = "File attachment restrictions configured";
   const attachmentSize = asNumber(limits.attachment_size);
+  recordZendeskDecisionFacts(19, {});
   findings.push(manualFinding(
     19,
     attachmentTitle,
@@ -3545,11 +3724,17 @@ export async function assessZendeskDataProtection(
   ));
 
   const suspendedTitle = "Suspended ticket handling automated";
+  const suspended = listSnapshotItems(suspendedSnap);
+  const buckets = partitionByDate(suspended, "created_at", resolved.suspendedTicketAgeDays, now);
+  recordZendeskDecisionFacts(20, {
+    readable: suspendedSnap.status === "ok",
+    complete: suspendedSnap.status === "ok" && !isTruncated(suspendedSnap),
+    stale_count: buckets.stale.length,
+    undated_count: buckets.undated.length,
+  });
   if (suspendedSnap.status !== "ok") {
     findings.push(manualFinding(20, suspendedTitle, "low", snapshotCause("Suspended tickets (/suspended_tickets, admin or manage_suspended_tickets permission)", suspendedSnap), "capture the Suspended tickets view in Support showing the queue size and oldest item, and the automation that recovers or deletes them."));
   } else {
-    const suspended = listSnapshotItems(suspendedSnap);
-    const buckets = partitionByDate(suspended, "created_at", resolved.suspendedTicketAgeDays, now);
     const evidence: JsonRecord = {
       seen_suspended_tickets: countOrNull(suspended.length, suspendedSnap),
       older_than_threshold: countOrNull(buckets.stale.length, suspendedSnap),
@@ -3602,7 +3787,14 @@ export async function assessZendeskDataProtection(
   };
 }
 
-export async function assessZendeskIntegrations(
+export async function assessZendeskDataProtection(
+  client: ZendeskReadClient,
+  options: ZendeskAssessmentOptions = {},
+): Promise<ZendeskAssessmentResult> {
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskDataProtectionWithDecisionContext(client, options));
+}
+
+async function assessZendeskIntegrationsWithDecisionContext(
   client: ZendeskReadClient,
   options: ZendeskAssessmentOptions = {},
 ): Promise<ZendeskAssessmentResult> {
@@ -3624,13 +3816,19 @@ export async function assessZendeskIntegrations(
   const ownedApps = listSnapshotItems(ownedSnap);
   const ownedIds = new Set(ownedApps.map((app) => asString(app.id)).filter(Boolean));
   const installationName = (item: JsonRecord): string => asString(asObject(item.settings)?.title) ?? asString(asObject(item.settings)?.name) ?? `app ${asString(item.app_id) ?? "unknown"}`;
+  const marketplace = installations.filter((item) => !ownedIds.has(asString(item.app_id) ?? ""));
+  const enabled = marketplace.filter((item) => asBoolean(item.enabled) !== false);
+  recordZendeskDecisionFacts(15, {
+    installations_readable: installationsSnap.status === "ok",
+    installations_complete: installationsSnap.status === "ok" && !isTruncated(installationsSnap),
+    installation_count: installations.length,
+    owned_apps_complete: ownedSnap.status === "ok" && !isTruncated(ownedSnap),
+  });
 
   const marketplaceTitle = "Marketplace apps reviewed for permissions";
   if (installationsSnap.status !== "ok") {
     findings.push(manualFinding(15, marketplaceTitle, "medium", snapshotCause("App installations (/apps/installations)", installationsSnap), "capture Admin Center > Apps and integrations > Zendesk Support apps > Currently installed with each app's permissions and role or group restrictions."));
   } else {
-    const marketplace = installations.filter((item) => !ownedIds.has(asString(item.app_id) ?? ""));
-    const enabled = marketplace.filter((item) => asBoolean(item.enabled) !== false);
     // Marketplace apps are the installations not matched to an owned app, so the split
     // rests on both inventories: it is not asserted while either is incomplete.
     const evidence: JsonRecord = {
@@ -3659,10 +3857,16 @@ export async function assessZendeskIntegrations(
   }
 
   const customAppTitle = "Private/custom apps have appropriate scope";
+  const retired = ownedApps.filter((app) => asBoolean(app.deprecated) === true || asBoolean(app.obsolete) === true);
+  recordZendeskDecisionFacts(16, {
+    readable: ownedSnap.status === "ok",
+    complete: ownedSnap.status === "ok" && !isTruncated(ownedSnap),
+    owned_app_count: ownedApps.length,
+    retired_count: retired.length,
+  });
   if (ownedSnap.status !== "ok") {
     findings.push(manualFinding(16, customAppTitle, "medium", snapshotCause("Owned apps (/apps/owned, admin or manage apps permission)", ownedSnap), "capture the private apps list in Admin Center > Apps and integrations > Zendesk Support apps > Private apps with their manifests."));
   } else {
-    const retired = ownedApps.filter((app) => asBoolean(app.deprecated) === true || asBoolean(app.obsolete) === true);
     const evidence: JsonRecord = {
       owned_apps: countOrNull(ownedApps.length, ownedSnap),
       deprecated_or_obsolete_count: countOrNull(retired.length, ownedSnap),
@@ -3683,6 +3887,11 @@ export async function assessZendeskIntegrations(
 
   const sandboxTitle = "Sandbox environment used for testing";
   const sandbox = asBoolean(asObject(settingsSnap.data?.active_features)?.sandbox);
+  recordZendeskDecisionFacts(17, {
+    readable: settingsSnap.status === "ok",
+    flag_present: sandbox !== undefined,
+    sandbox_enabled: sandbox,
+  });
   if (settingsSnap.status !== "ok") {
     findings.push(manualFinding(17, sandboxTitle, "low", snapshotCause("Account settings", settingsSnap), "capture Admin Center > Account > Sandbox showing the provisioned sandbox."));
   } else if (sandbox === true) {
@@ -3695,12 +3904,19 @@ export async function assessZendeskIntegrations(
 
   const brandTitle = "Brand security settings consistent across brands";
   const currentRole = asString(currentUserSnap.data?.role);
+  const brands = listSnapshotItems(brandsSnap).filter((brand) => asBoolean(brand.is_deleted) !== true);
+  const activeBrands = brands.filter((brand) => asBoolean(brand.active) !== false);
+  const states = [...new Set(activeBrands.map((brand) => asString(brand.help_center_state) ?? "unknown"))];
+  recordZendeskDecisionFacts(22, {
+    readable: brandsSnap.status === "ok",
+    brand_count: brands.length,
+    admin_view: currentRole === "admin",
+    complete: brandsSnap.status === "ok" && !isTruncated(brandsSnap),
+    inconsistent_state_count: states.length > 1 || states.includes("unknown") ? 1 : 0,
+  });
   if (brandsSnap.status !== "ok") {
     findings.push(manualFinding(22, brandTitle, "medium", snapshotCause("Brands (/brands)", brandsSnap), "capture Admin Center > Account > Brand management showing each brand's help center state and host mapping."));
   } else {
-    const brands = listSnapshotItems(brandsSnap).filter((brand) => asBoolean(brand.is_deleted) !== true);
-    const activeBrands = brands.filter((brand) => asBoolean(brand.active) !== false);
-    const states = [...new Set(activeBrands.map((brand) => asString(brand.help_center_state) ?? "unknown"))];
     const evidence: JsonRecord = {
       brands: countOrNull(brands.length, brandsSnap),
       active_brands: countOrNull(activeBrands.length, brandsSnap),
@@ -3724,12 +3940,18 @@ export async function assessZendeskIntegrations(
   }
 
   const sharingTitle = "External sharing agreements reviewed";
+  const agreements = listSnapshotItems(sharingSnap);
+  const active = agreements.filter((item) => ["accepted", "pending"].includes(asString(item.status) ?? ""));
+  const broken = agreements.filter((item) => ["failed", "ssl_error", "configuration_error"].includes(asString(item.status) ?? ""));
+  recordZendeskDecisionFacts(23, {
+    readable: sharingSnap.status === "ok",
+    complete: sharingSnap.status === "ok" && !isTruncated(sharingSnap),
+    agreement_count: agreements.length,
+    broken_count: broken.length,
+  });
   if (sharingSnap.status !== "ok") {
     findings.push(manualFinding(23, sharingTitle, "medium", snapshotCause("Sharing agreements (/sharing_agreements)", sharingSnap), "capture Admin Center > Objects and rules > Tickets > Ticket sharing showing every agreement and its status."));
   } else {
-    const agreements = listSnapshotItems(sharingSnap);
-    const active = agreements.filter((item) => ["accepted", "pending"].includes(asString(item.status) ?? ""));
-    const broken = agreements.filter((item) => ["failed", "ssl_error", "configuration_error"].includes(asString(item.status) ?? ""));
     const evidence: JsonRecord = {
       sharing_agreements: countOrNull(agreements.length, sharingSnap),
       active_agreements_count: countOrNull(active.length, sharingSnap),
@@ -3753,15 +3975,21 @@ export async function assessZendeskIntegrations(
   const httpsTitle = "External notification targets use HTTPS";
   const targets = listSnapshotItems(targetsSnap);
   const webhooks = listSnapshotItems(webhooksSnap);
+  const activeTargets = targets.filter((target) => asBoolean(target.active) !== false);
+  const urlTargets = activeTargets.filter((target) => asString(target.target_url));
+  const insecureTargets = urlTargets.filter((target) => urlScheme(target.target_url) !== "https");
+  const activeWebhooks = webhooks.filter((hook) => asString(hook.status) === "active");
+  const insecureWebhooks = activeWebhooks.filter((hook) => urlScheme(hook.endpoint) !== "https");
+  const unauthenticatedWebhooks = activeWebhooks.filter((hook) => !asObject(hook.authentication) && !asObject(hook.signing_secret));
+  recordZendeskDecisionFacts(24, {
+    any_readable: targetsSnap.status === "ok" || webhooksSnap.status === "ok",
+    complete: targetsSnap.status === "ok" && webhooksSnap.status === "ok" && !isTruncated(targetsSnap) && !isTruncated(webhooksSnap),
+    insecure_count: insecureTargets.length + insecureWebhooks.length,
+    unauthenticated_webhook_count: unauthenticatedWebhooks.length,
+  });
   if (targetsSnap.status !== "ok" && webhooksSnap.status !== "ok") {
     findings.push(manualFinding(24, httpsTitle, "high", `${snapshotCause("Targets", targetsSnap)} ${snapshotCause("Webhooks", webhooksSnap)}`, "capture Admin Center > Apps and integrations > Webhooks and Targets showing every destination URL and authentication method."));
   } else {
-    const activeTargets = targets.filter((target) => asBoolean(target.active) !== false);
-    const urlTargets = activeTargets.filter((target) => asString(target.target_url));
-    const insecureTargets = urlTargets.filter((target) => urlScheme(target.target_url) !== "https");
-    const activeWebhooks = webhooks.filter((hook) => asString(hook.status) === "active");
-    const insecureWebhooks = activeWebhooks.filter((hook) => urlScheme(hook.endpoint) !== "https");
-    const unauthenticatedWebhooks = activeWebhooks.filter((hook) => !asObject(hook.authentication) && !asObject(hook.signing_secret));
     const destinationsTruncated = isTruncated(targetsSnap) || isTruncated(webhooksSnap);
     const truncationNotes = `${truncationNote("target", targetsSnap)}${truncationNote("webhook", webhooksSnap)}`;
     const targetText = targetsSnap.status === "ok" ? `${insecureTargets.length} active targets` : "an unread target inventory";
@@ -3794,6 +4022,14 @@ export async function assessZendeskIntegrations(
 
   const exfilTitle = "Triggers/automations do not send data to external URLs";
   if (triggersSnap.status !== "ok" || automationsSnap.status !== "ok") {
+    recordZendeskDecisionFacts(25, {
+      rules_readable: false,
+      rule_count: 0,
+      rules_complete: false,
+      insecure_destination_count: 0,
+      external_action_count: 0,
+      destination_sources_complete: false,
+    });
     findings.push(manualFinding(25, exfilTitle, "high", `${snapshotCause("Triggers", triggersSnap)} ${snapshotCause("Automations", automationsSnap)}`, "export the trigger and automation lists from Admin Center > Objects and rules and record every 'Notify webhook', 'Notify target', and 'Share ticket' action."));
   } else {
     const rules = [
@@ -3821,6 +4057,14 @@ export async function assessZendeskIntegrations(
     const insecure = external.filter((item) => urlScheme(item.destination) === "http");
     const unresolved = external.filter((item) => item.unresolved);
     const truncated = isTruncated(triggersSnap) || isTruncated(automationsSnap);
+    recordZendeskDecisionFacts(25, {
+      rules_readable: true,
+      rule_count: rules.length,
+      rules_complete: !truncated,
+      insecure_destination_count: insecure.length,
+      external_action_count: external.length,
+      destination_sources_complete: targetsSnap.status === "ok" && webhooksSnap.status === "ok" && !isTruncated(targetsSnap) && !isTruncated(webhooksSnap),
+    });
     const destinationSources: Array<[string, ZendeskSnapshot<unknown>]> = [["Targets (/targets, used to resolve notification_target destinations)", targetsSnap], ["Webhooks (/webhooks, used to resolve notification_webhook destinations)", webhooksSnap]];
     const unresolvedNote = unresolved.length > 0
       ? ` ${unresolved.length} destination(s) could not be resolved to a URL, so their scheme was not checked:${targetsSnap.status !== "ok" ? ` ${snapshotCause("targets", targetsSnap)}` : ""}${webhooksSnap.status !== "ok" ? ` ${snapshotCause("webhooks", webhooksSnap)}` : ""}${isTruncated(targetsSnap) || isTruncated(webhooksSnap) ? " The target or webhook inventory was truncated." : ""}`
@@ -3895,6 +4139,13 @@ export async function assessZendeskIntegrations(
     errors: snapshotErrors(entries),
     snapshots: snapshotsForBundle(entries),
   };
+}
+
+export async function assessZendeskIntegrations(
+  client: ZendeskReadClient,
+  options: ZendeskAssessmentOptions = {},
+): Promise<ZendeskAssessmentResult> {
+  return runBatchVerdictContext(ZENDESK_DECISION_CONTEXT, ZENDESK_SPEC, () => assessZendeskIntegrationsWithDecisionContext(client, options));
 }
 
 function ensurePrivateDir(pathname: string): void {
@@ -4296,6 +4547,7 @@ function registerAssessmentTool(
 }
 
 export function registerZendeskTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, ZENDESK_SPEC);
   pi.registerTool({
     name: "zendesk_check_access",
     label: "Check Zendesk audit access",

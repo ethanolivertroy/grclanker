@@ -17,7 +17,13 @@ import {
   SHARED_PAGINATION_STOP_KINDS,
   SHARED_REDACTION_RULES,
 } from "../dist/extensions/grc-tools/hardening/contract.js";
-import { checkContract, collectDefinedGrcTools, evaluateVerdictCriteria, renderVerdictCondition } from "../dist/extensions/grc-tools/spec-model.js";
+import {
+  checkContract,
+  collectDefinedGrcTools,
+  evaluateCheckVerdict,
+  evaluateVerdictCriteria,
+  renderVerdictCondition,
+} from "../dist/extensions/grc-tools/spec-model.js";
 import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-registry.js";
 import { redactSecrets, resolveWebexConfiguration } from "../dist/extensions/grc-tools/webex.js";
 import {
@@ -31,6 +37,7 @@ import {
   checkIntegrationSpecs,
   repoRoot,
   renderAllIntegrationSpecs,
+  renderLlmsCatalog,
   validateDecisionInputs,
 } from "../scripts/generate-integration-specs.mjs";
 
@@ -47,6 +54,61 @@ const expectedPaginationStops = [
   "rejected_next_link",
 ];
 
+function sectionBounds(markdown, heading) {
+  const match = new RegExp(`^## ${heading}$`, "m").exec(markdown);
+  assert.ok(match, `missing ## ${heading}`);
+  const next = /^## .+$/gm;
+  next.lastIndex = match.index + match[0].length;
+  return { start: match.index, end: next.exec(markdown)?.index ?? markdown.length };
+}
+
+test("check evaluator derives facts from declared raw evidence and rejects undeclared inputs", () => {
+  const check = {
+    id: "TEST-01",
+    controlNumbers: [1],
+    title: "Synthetic decision",
+    severity: "medium",
+    owningTool: "test",
+    sourceSurfaceIds: [],
+    evidenceFields: ["readable", "complete", "violation_count"],
+    derivedFacts: {
+      has_violation: "At least one complete-record violation exists.",
+    },
+    derivedFactRules: {
+      has_violation: {
+        description: "At least one complete-record violation exists.",
+        condition: {
+          op: "gt",
+          left: { kind: "path", path: "violation_count" },
+          right: { kind: "value", value: 0 },
+        },
+      },
+    },
+    criteria: {
+      pass: "Readable complete evidence has no violations.",
+      warn: "Evidence is partial.",
+      fail: "At least one violation exists.",
+      manual: "Evidence is unreadable.",
+      constants: {},
+      examples: [],
+      rules: [
+        { status: "fail", condition: { op: "eq", left: { kind: "path", path: "has_violation" }, right: { kind: "value", value: true } } },
+        { status: "manual", condition: { op: "ne", left: { kind: "path", path: "readable" }, right: { kind: "value", value: true } } },
+        { status: "warn", condition: { op: "ne", left: { kind: "path", path: "complete" }, right: { kind: "value", value: true } } },
+        { status: "pass", condition: { op: "always" } },
+      ],
+    },
+  };
+  assert.equal(evaluateCheckVerdict(check, { readable: true, complete: true, violation_count: 0 }), "pass");
+  assert.equal(evaluateCheckVerdict(check, { readable: true, complete: false, violation_count: 0 }), "warn");
+  assert.equal(evaluateCheckVerdict(check, { readable: false, complete: true, violation_count: 0 }), "manual");
+  assert.equal(evaluateCheckVerdict(check, { readable: false, complete: false, violation_count: 1 }), "fail");
+  assert.throws(
+    () => evaluateCheckVerdict(check, { readable: true, complete: true, violation_count: 0, selected_status: "pass" }),
+    /TEST-01 received undeclared decision input.*selected_status/,
+  );
+});
+
 test("generated integration specs are current", async () => {
   assert.deepEqual(await checkIntegrationSpecs(), []);
 });
@@ -54,7 +116,16 @@ test("generated integration specs are current", async () => {
 test("published registry entries have complete, internally linked contracts", () => {
   assert.deepEqual(PUBLISHED_INTEGRATION_SPECS.map((entry) => entry.contract.identity.slug), [
     "aws-sec-inspector",
+    "box-sec-inspector",
+    "duo-sec-inspector",
+    "gws-inspector-go",
+    "okta-sec-inspector",
+    "salesforce-sec-inspector",
+    "servicenow-sec-inspector",
+    "slack-sec-inspector",
     "webex-sec-inspector",
+    "zendesk-sec-inspector",
+    "zoom-sec-inspector",
   ]);
 
   for (const entry of PUBLISHED_INTEGRATION_SPECS) {
@@ -366,6 +437,101 @@ test("every generated pilot spec has one registry owner and llms.txt lists every
 
   const llms = await readFile(resolve(repoRoot, "public/llms.txt"), "utf8");
   const listed = [...llms.matchAll(/\/specs\/([^)\s]+\.spec\.md)\)/g)].map((match) => match[1]).sort();
+  assert.equal(listed.length, new Set(listed).size, "llms.txt contains no duplicate spec catalog entries");
   assert.deepEqual([...new Set(listed)], names);
   assert.doesNotMatch(llms, /Each spec describes a Go CLI/);
+});
+
+test("llms catalog generation owns only the Specs block and canonical clone line", async () => {
+  const oldCatalog = [
+    "<!-- generated integration registry start -->",
+    "### Generated portable contracts",
+    "",
+    "- [Old generated entry](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/okta-sec-inspector.spec.md): stale",
+    "<!-- generated integration registry end -->",
+  ].join("\n");
+  const input = [
+    "# grclanker",
+    "",
+    "> Custom introduction from a docs-only change.",
+    "",
+    "Custom explanatory prose must survive byte-for-byte.",
+    "",
+    "## Specs",
+    "",
+    "A hand-maintained Specs introduction.",
+    "",
+    "- [Manual integration](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/manual.spec.md): keep this exact line",
+    "- [Stale generated Okta](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/okta-sec-inspector.spec.md): replace this line",
+    "",
+    "## Docs",
+    "",
+    "- [Documentation](https://grclanker.com/docs/): Preserve this custom docs prose.",
+    "",
+    "## Source",
+    "",
+    "- [Website](https://grclanker.com/): Preserve this custom source prose.",
+    "- [Repository](https://github.com/ethanolivertroy/grclanker): Preserve this repository link.",
+    "- Clone all specs: git clone https://github.com/hackIDLE/grclanker.git",
+    "",
+    oldCatalog,
+    "",
+  ].join("\n");
+
+  const output = renderLlmsCatalog(input);
+  assert.equal(renderLlmsCatalog(output), output, "catalog regeneration is idempotent");
+
+  const inputSpecs = sectionBounds(input, "Specs");
+  const outputSpecs = sectionBounds(output, "Specs");
+  const outputDocs = sectionBounds(output, "Docs");
+  const outputSource = sectionBounds(output, "Source");
+  const generatedStart = output.indexOf("<!-- generated integration registry start -->");
+  const generatedEnd = output.indexOf("<!-- generated integration registry end -->");
+  assert.ok(generatedStart >= outputSpecs.start && generatedEnd < outputSpecs.end, "generated catalog is inside Specs");
+  assert.ok(generatedEnd < outputDocs.start, "generated catalog is never beneath Docs or Source");
+
+  const generatedCatalog = output.slice(generatedStart, generatedEnd);
+  assert.doesNotMatch(generatedCatalog, /hackIDLE\/grclanker/);
+  assert.match(generatedCatalog, /raw\.githubusercontent\.com\/ethanolivertroy\/grclanker\/main\/specs\//);
+  assert.equal(
+    output.match(/^- Clone all specs:.*$/gm)?.[0],
+    "- Clone all specs: git clone https://github.com/ethanolivertroy/grclanker.git",
+  );
+  assert.doesNotMatch(output.slice(outputSource.start, outputSource.end), /hackIDLE\/grclanker/);
+
+  assert.equal(output.slice(0, outputSpecs.start), input.slice(0, inputSpecs.start), "introduction bytes are preserved");
+  assert.equal(
+    output.slice(outputDocs.start, outputDocs.end),
+    input.slice(sectionBounds(input, "Docs").start, sectionBounds(input, "Docs").end),
+    "Docs section bytes are preserved",
+  );
+  const expectedSource = input
+    .slice(sectionBounds(input, "Source").start)
+    .replace("- Clone all specs: git clone https://github.com/hackIDLE/grclanker.git", "- Clone all specs: git clone https://github.com/ethanolivertroy/grclanker.git")
+    .replace(`\n\n${oldCatalog}\n`, "\n");
+  assert.equal(output.slice(outputSource.start), expectedSource, "Source bytes change only for the clone URL and removed misplaced catalog");
+  assert.match(output.slice(outputSpecs.start, outputSpecs.end), /Manual integration/);
+  assert.doesNotMatch(output.slice(outputSpecs.start, outputSpecs.end), /Stale generated Okta/);
+});
+
+test("rendered llms catalog keeps every generated spec URL inside Specs", async () => {
+  const outputs = await renderAllIntegrationSpecs();
+  const llms = outputs.get(resolve(repoRoot, "public/llms.txt"));
+  assert.ok(llms);
+  const specs = sectionBounds(llms, "Specs");
+  const source = sectionBounds(llms, "Source");
+  const generatedLines = llms.split("\n").filter((line) =>
+    line.includes("raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/")
+    && PUBLISHED_INTEGRATION_SPECS.some((entry) => line.includes(`/${entry.outputPath})`)));
+  assert.equal(generatedLines.length, PUBLISHED_INTEGRATION_SPECS.length);
+  for (const line of generatedLines) {
+    const offset = llms.indexOf(line);
+    assert.ok(offset >= specs.start && offset < specs.end, `${line} belongs to Specs`);
+    assert.doesNotMatch(line, /hackIDLE\/grclanker/);
+  }
+  assert.equal(
+    llms.slice(source.start, source.end).match(/^- Clone all specs:.*$/gm)?.[0],
+    "- Clone all specs: git clone https://github.com/ethanolivertroy/grclanker.git",
+  );
+  assert.doesNotMatch(llms.slice(source.start, source.end), /generated integration registry/);
 });

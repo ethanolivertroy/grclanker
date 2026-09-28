@@ -6,6 +6,18 @@ import { join } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
 import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
+import { SLACK_SPEC } from "../dist/extensions/grc-tools/slack.spec.js";
+import {
+  captureBatchDecisionFacts,
+  evaluateBatchCheckVerdict,
+} from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 import {
   SLACK_DOCUMENTED_ERROR_CODES,
   SLACK_EXTERNAL_SHARING_AUDIT_ACTIONS,
@@ -35,6 +47,7 @@ import {
   vendorErrorCode,
 } from "../dist/extensions/grc-tools/slack.js";
 
+const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const EMPTY_ENV = { SLACK_CONFIG_FILE: "" };
 
@@ -111,6 +124,15 @@ function byId(result, id) {
 
 function statuses(result) {
   return Object.fromEntries(result.findings.map((item) => [item.id, item.status]));
+}
+
+async function captureSlackFacts(checkId, callback) {
+  const { result, captures } = await captureBatchDecisionFacts(callback);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].integration, SLACK_SPEC.identity.slug);
+  const facts = captures[0].checks.get(checkId);
+  assert.ok(facts, `${checkId}: captured runtime facts`);
+  return { result, facts };
 }
 
 const deniedFixture = () => jsonResponse({ ok: false, error: "missing_scope" });
@@ -435,6 +457,122 @@ test("fixture (d): a compliant Enterprise Grid org passes every automatable cont
   assert.equal(new Set(all.map((item) => item.control)).size, SLACK_SPEC_CONTROLS.length);
   assert.ok(all.every((item) => item.mappings.length > 0));
   assert.ok(results.every((result) => result.errors.length === 0));
+});
+
+portableContractTest("MFA and SSO population primitives count every active user, including non-administrators", async () => {
+  const identity = await captureSlackFacts("SLACK-ID-01", () => assessSlackIdentity(makeClient((request) => {
+    if (request.pathname === "/api/users.list") {
+      return {
+        ok: true,
+        members: compliantUsers.map((user) => user.id === "W2" ? { ...user, has_2fa: false } : user),
+        response_metadata: { next_cursor: "" },
+      };
+    }
+    return compliantFixture(request);
+  })));
+  assert.equal(identity.facts.active_user_count, 2);
+  assert.equal(identity.facts.without_mfa_count, 1);
+  assert.equal(byId(identity.result, "SLACK-ID-01").status, "fail");
+  const mfaDefinition = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ID-01").evidenceFieldDefinitions.without_mfa_count;
+  assert.match(mfaDefinition, /active human users with MFA disabled/);
+  assert.doesNotMatch(mfaDefinition, /administrators with MFA disabled/);
+
+  const admin = await captureSlackFacts("SLACK-ADMIN-02", () => assessSlackAdminAccess(makeClient((request) => {
+    if (request.pathname === "/api/admin.users.list") {
+      const response = compliantFixture(request);
+      return {
+        ...response,
+        users: response.users.map((user) => user.id === "W2" ? { ...user, has_sso: false } : user),
+      };
+    }
+    return compliantFixture(request);
+  })));
+  assert.equal(admin.facts.active_user_count, 2);
+  assert.equal(admin.facts.without_sso_count, 1);
+  assert.equal(byId(admin.result, "SLACK-ADMIN-02").status, "fail");
+  const ssoDefinition = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ADMIN-02").evidenceFieldDefinitions.without_sso_count;
+  assert.match(ssoDefinition, /active organization users with SSO disabled/);
+  assert.doesNotMatch(ssoDefinition, /administrators with SSO disabled/);
+});
+
+portableContractTest("SLACK-ID-04 matches SCIM userName first and falls back to primary email only when absent", async () => {
+  const variants = [
+    ["Slack handle", "gone", 0, "pass"],
+    ["email-shaped userName", "gone@example.com", 1, "fail"],
+    ["absent userName", undefined, 1, "fail"],
+  ];
+  for (const [label, userName, expectedCount, expectedVerdict] of variants) {
+    const { result, facts } = await captureSlackFacts("SLACK-ID-04", () => assessSlackIdentity(makeClient((request) => {
+      if (request.pathname === "/scim/v2/Users") {
+        return {
+          totalResults: 1,
+          itemsPerPage: 1,
+          startIndex: 1,
+          Resources: [{
+            id: "S-gone",
+            ...(userName === undefined ? {} : { userName }),
+            active: true,
+            emails: [{ value: "gone@example.com", primary: true }],
+          }],
+        };
+      }
+      return compliantFixture(request);
+    })));
+    const finding = byId(result, "SLACK-ID-04");
+    assert.equal(facts.mismatch_count, expectedCount, `${label}: captured runtime count`);
+    assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-ID-04", facts), expectedVerdict, `${label}: portable verdict`);
+    assert.equal(finding.status, expectedVerdict, `${label}: runtime verdict`);
+    assert.equal(
+      finding.summary,
+      expectedCount === 0
+        ? "No SCIM-active user matched a deactivated Slack user across 1 SCIM users and 1 deactivated Slack users."
+        : "1 SCIM-active users are deactivated in Slack; reconcile IdP and Slack lifecycle state.",
+      `${label}: runtime wording`,
+    );
+  }
+  const definition = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ID-04").evidenceFieldDefinitions.mismatch_count;
+  assert.match(definition, /normalized `userName` equals the normalized email of a deactivated Slack user/);
+  assert.match(definition, /only when `userName` is absent.*normalized primary email instead/);
+  assert.doesNotMatch(definition, /whose primary email equals/);
+});
+
+portableContractTest("SLACK-APP-06 coverage completeness follows all three auth.test identity-gap variants", async () => {
+  const variants = [
+    ["HTTP 500", () => jsonResponse({ ok: false, error: "server_error" }, 500)],
+    ["ok:false", () => ({ ok: false, error: "missing_scope" })],
+    ["missing team_id", (request) => {
+      const response = compliantFixture(request);
+      const { team_id: _teamId, ...withoutTeamId } = response;
+      return withoutTeamId;
+    }],
+  ];
+  for (const [label, authResponse] of variants) {
+    const { result, facts } = await captureSlackFacts("SLACK-APP-06", () =>
+      assessSlackIntegrations(makeClient((request) =>
+        request.pathname === "/api/auth.test" ? authResponse(request) : compliantFixture(request))));
+    assert.equal(facts.coverage_complete, false, label);
+    const finding = byId(result, "SLACK-APP-06");
+    assert.equal(finding.status, "warn", label);
+    assert.match(finding.summary, /workspace the preference applies to could not be identified/, label);
+  }
+  const contract = SLACK_SPEC.checks.find((check) => check.id === "SLACK-APP-06").completeness.coverage_complete;
+  assert.deepEqual(contract.sources.map((source) => source.surfaceId), ["workspaces", "auth-test"]);
+  assert.deepEqual(
+    contract.sources.find((source) => source.surfaceId === "auth-test").falseWhen,
+    ["error", "denied", "not-collected", "missing-required-field"],
+  );
+});
+
+portableContractTest("SLACK-ADMIN-08 roster completeness includes a truncated workspace list", async () => {
+  const { result, facts } = await captureSlackFacts("SLACK-ADMIN-08", () =>
+    assessSlackAdminAccess(makeClient(partialFixture)));
+  assert.equal(facts.roster_complete, false);
+  const finding = byId(result, "SLACK-ADMIN-08");
+  assert.equal(finding.status, "warn");
+  assert.match(finding.summary, /incomplete admin roster/);
+  const contract = SLACK_SPEC.checks.find((check) => check.id === "SLACK-ADMIN-08").completeness.roster_complete;
+  assert.deepEqual(contract.sources.map((source) => source.surfaceId), ["admin-users", "workspaces", "workspace-admins"]);
+  assert.ok(contract.sources.find((source) => source.surfaceId === "workspaces").falseWhen.includes("truncated"));
 });
 
 test("verdict rules: failing evidence, undated entries, and stale audit logs are graded correctly", async () => {
@@ -1433,6 +1571,7 @@ test("exportSlackAuditBundle writes the shared layout and never overwrites a pri
   const config = resolveSlackConfiguration({ token: "xoxp-test", scim_token: "scim-test", org_id: "E1" }, EMPTY_ENV);
 
   const first = await exportSlackAuditBundle(client, config, base);
+  assertBundlePathsMatchSpec(assert, first.outputDir, SLACK_SPEC);
   assert.ok(existsSync(first.outputDir));
   assert.equal(first.zipPath, `${first.outputDir}.zip`);
   assert.ok(existsSync(first.zipPath));
@@ -2089,4 +2228,56 @@ test("vendor-code vocabulary: a 32-hex credential returned as the error value re
     if (previous === undefined) delete process.env.SLACK_CONFIG_FILE;
     else process.env.SLACK_CONFIG_FILE = previous;
   }
+});
+
+test("byte differential fixtures: Slack assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const representative = await runAll(makeClient((request) => {
+    if (request.pathname === "/api/team.preferences.list") {
+      return { ...compliantFixture(request), disable_file_uploads: "type:admin" };
+    }
+    return compliantFixture(request);
+  }));
+  writeByteDifferentialFixture("slack", "representative", representative);
+
+  const denied = await runAll(makeClient((request) => (
+    request.pathname === "/api/auth.test" ? { ok: true, team_id: "T1" } : deniedFixture()
+  )));
+  writeByteDifferentialFixture("slack", "denied", denied);
+
+  const missingNull = await runAll(makeClient(emptyFixture));
+  writeByteDifferentialFixture("slack", "missing-null", missingNull);
+
+  const partial = await runAll(
+    makeClient(partialFixture),
+    { userLimit: 3, workspaceLimit: 1, appLimit: 1 },
+  );
+  writeByteDifferentialFixture("slack", "partial", partial);
+
+  const compliant = await runAll(makeClient(compliantFixture));
+  writeByteDifferentialFixture("slack", "compliant", compliant);
+
+  const boundary = await runAll(makeClient((request) => {
+    if (request.pathname === "/api/admin.users.session.getSettings") {
+      const userIds = (request.params.get("user_ids") ?? "").split(",").filter(Boolean);
+      return {
+        ok: true,
+        session_settings: userIds.map((userId) => ({
+          user_id: userId,
+          desktop_app_browser_quit: true,
+          duration: 24 * 60 * 60,
+        })),
+        no_settings_applied: [],
+      };
+    }
+    return compliantFixture(request);
+  }), { maxSessionHours: 24 });
+  writeByteDifferentialFixture("slack", "boundary", boundary);
+
+  const config = resolveSlackConfiguration(
+    { token: "xoxp-test", scim_token: "scim-test", org_id: "E1" },
+    EMPTY_ENV,
+  );
+  const exportRoot = prepareByteDifferentialExportRoot("slack");
+  const exported = await exportSlackAuditBundle(makeClient(compliantFixture), config, exportRoot);
+  writeByteDifferentialFixture("slack", "export", snapshotExportBundle(exported));
 });

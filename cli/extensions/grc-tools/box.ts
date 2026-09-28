@@ -5,6 +5,7 @@
  * specs/box-sec-inspector.spec.md: identity and access, sharing and
  * collaboration, data governance, and Shield plus monitoring posture.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createPrivateKey, createSign, randomBytes } from "node:crypto";
 import {
   createWriteStream,
@@ -20,6 +21,9 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parse as parseYaml, YAMLError } from "yaml";
+import { BOX_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { BOX_SPEC } from "./box.spec.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
@@ -405,6 +409,19 @@ const BOX_CONTROLS: Record<number, ControlDefinition> = {
   24: control("Inactive user detection", "medium", "identity_access", ["AC-2(3)", "AC.L2-3.1.1", "CC6.2", "7.2", "8.1.4", "SRG-APP-000025", "ISM-1404", "CPS-07"]),
   25: control("Content access monitoring", "high", "shield_monitoring", ["AU-6", "AU.L2-3.3.5", "CC7.2", "8.4", "10.6.1", "SRG-APP-000108", "ISM-0580", "CPS-10"]),
 };
+
+hydrateBatchFrameworkMappings(BOX_SPEC, Object.fromEntries(
+  Object.entries(BOX_CONTROLS).map(([number, definition]) => [`BOX-${number.padStart(2, "0")}`, {
+    fedramp: [definition.mappings["FedRAMP"]],
+    cmmc: [definition.mappings.CMMC],
+    soc2: [definition.mappings["SOC 2"]],
+    cis: [definition.mappings.CIS],
+    pci_dss: [definition.mappings["PCI-DSS"]],
+    disa_stig: [definition.mappings.STIG],
+    irap: [definition.mappings.IRAP],
+    ismap: [definition.mappings.ISMAP],
+  }]),
+));
 
 const FRAMEWORK_ORDER: BoxFramework[] = ["FedRAMP", "CMMC", "SOC 2", "CIS", "PCI-DSS", "STIG", "IRAP", "ISMAP"];
 
@@ -883,6 +900,7 @@ export function resolveBoxConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   options: { cwd?: string; homeDir?: string } = {},
 ): BoxResolvedConfig {
+  env = readResolverEnvironment(BOX_AUTH_RESOLVER, env);
   const cwd = options.cwd ?? process.cwd();
   const homeDir = options.homeDir ?? homedir();
   const sourceChain: string[] = [];
@@ -2082,8 +2100,9 @@ function finding(
   manualEvidence?: string,
 ): BoxFinding {
   const definition = BOX_CONTROLS[controlNumber];
+  const id = findingId(controlNumber);
   return {
-    id: findingId(controlNumber),
+    id,
     control: controlNumber,
     title: definition.title,
     severity: definition.severity,
@@ -2093,6 +2112,24 @@ function finding(
     mappings: mappingsForControl(controlNumber),
     manualEvidence,
   };
+}
+
+const BOX_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordBoxDecisionFacts(controlNumber: number, facts: Readonly<Record<string, unknown>>): void {
+  const id = findingId(controlNumber);
+  const store = BOX_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Box assessment`);
+  store.set(id, facts);
+}
+
+function completeBoxDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
+  return datasets.every((dataset) =>
+    dataset !== undefined
+    && !dataset.error
+    && dataset.truncated !== true
+    && dataset.notRequested !== true
+  );
 }
 
 interface ConfigSetting {
@@ -2395,6 +2432,7 @@ export async function collectBoxIdentityData(
 }
 
 export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxIdentityOptions = {}): BoxAssessmentResult {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10_000);
   const minPasswordLength = clampNumber(options.minPasswordLength, DEFAULT_MIN_PASSWORD_LENGTH, 4, 128);
   const maxSessionHours = clampNumber(options.maxSessionHours, DEFAULT_MAX_SESSION_HOURS, 1, 24 * 365);
@@ -2438,6 +2476,12 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...settingsEvidence(userSettingsReadable, ssoSettings, ssoUnused),
   };
   const ssoManualEvidence = "Admin Console > Enterprise Settings > User Settings > Configure Single Sign On (SSO): confirm SSO is set to Required, not Enabled (optional) or Test mode, and record the identity provider.";
+  recordBoxDecisionFacts(1, {
+    settings_readable: userSettingsReadable,
+    unused_setting_count: Object.keys(ssoUnused).length,
+    sso_required: ssoRequired,
+    sso_testing: ssoTesting,
+  });
   findings.push(
     !userSettingsReadable
       ? finding(1, "manual", `Enterprise SSO configuration could not be read because ${categoryUnreadableReason(data.configuration, "user_settings")}.`, { ...ssoEvidence, config_error: data.configuration.error ?? null }, ssoManualEvidence)
@@ -2470,6 +2514,17 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...inventoryEvidence,
   };
   const adminMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all managed users, and open each admin and co-admin user record to confirm the 'Exempt from 2-step verification' option is not set.";
+  recordBoxDecisionFacts(2, {
+    settings_readable: securityReadable,
+    users_readable: usersReadable,
+    unused_setting_count: Object.keys(mfaUnused).length,
+    mfa_required: mfaRequired,
+    sso_required: ssoRequired,
+    user_count: users.length,
+    admin_count: admins.length,
+    users_truncated: usersTruncated,
+    exempt_privileged_count: exemptPrivileged.length,
+  });
   findings.push(
     !securityReadable && !usersReadable
       ? adminMfaUnreadableFinding(data)
@@ -2502,6 +2557,17 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...inventoryEvidence,
   };
   const userMfaManualEvidence = "Admin Console > Enterprise Settings > Security > 2-Step Verification: confirm 2-step verification is required for all users, including external collaborators.";
+  recordBoxDecisionFacts(3, {
+    settings_readable: securityReadable,
+    users_readable: usersReadable,
+    unused_setting_count: Object.keys(mfaUnused).length,
+    mfa_required: mfaRequired,
+    sso_required: ssoRequired,
+    user_count: users.length,
+    admin_count: admins.length,
+    users_truncated: usersTruncated,
+    exempt_user_count: exemptUsers.length,
+  });
   findings.push(
     !securityReadable && !usersReadable
       ? finding(3, "manual", `Neither enterprise MFA settings (${categoryUnreadableReason(data.configuration, "security")}) nor enterprise users (${unreadableReason(data.users)}) could be read.`, { ...userMfaEvidence, users_error: data.users.error ?? null }, userMfaManualEvidence)
@@ -2536,6 +2602,14 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     admin_role_change_events: observedCount([data.events], adminRoleChanges.length),
     ...inventoryEvidence,
   };
+  recordBoxDecisionFacts(17, {
+    users_readable: usersReadable,
+    users_truncated: usersTruncated,
+    user_count: users.length,
+    admin_count: admins.length,
+    privileged_user_count: privileged.length,
+    max_admins: maxAdmins,
+  });
   findings.push(
     !usersReadable
       ? finding(17, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, { users_error: data.users.error ?? null }, "Admin Console > Users & Groups: filter by Admin and Co-Admin roles, export the list, and confirm each assignment is justified.")
@@ -2546,6 +2620,13 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
           : finding(17, "pass", `${admins.length} admin and ${coAdmins.length} co-admin accounts fall within the configured threshold of ${maxAdmins}.`, adminCountEvidence),
   );
 
+  recordBoxDecisionFacts(18, {
+    users_readable: usersReadable,
+    users_truncated: usersTruncated,
+    user_count: users.length,
+    admin_count: admins.length,
+    coadmin_count: coAdmins.length,
+  });
   findings.push(
     !usersReadable
       ? finding(18, "manual", `Enterprise users could not be listed because ${unreadableReason(data.users)}.`, undefined, "Admin Console > Users & Groups: open each co-admin and review the co-admin permission set under Edit User Access Permissions.")
@@ -2589,6 +2670,14 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   };
   const passwordManualEvidence = "Admin Console > Enterprise Settings > Security > Password Requirements: record minimum length, character class rules, weak password prevention, reset frequency, and reuse limits.";
   const complexityCount = [passwordUppercase, passwordNumeric, passwordSpecial].filter((value) => (value ?? 0) > 0).length;
+  recordBoxDecisionFacts(21, {
+    settings_readable: securityReadable,
+    unused_setting_count: Object.keys(passwordUnused).length,
+    minimum_length: passwordMinLength,
+    required_minimum_length: minPasswordLength,
+    weak_password_prevention: weakPasswordPrevention,
+    complexity_rule_count: complexityCount,
+  });
   findings.push(
     !securityReadable
       ? finding(21, "manual", `Enterprise password settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, passwordManualEvidence)
@@ -2619,6 +2708,16 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     max_session_hours: maxSessionHours,
   };
   const sessionManualEvidence = "Admin Console > Enterprise Settings > Security > Session Duration: record the inactivity timeout and any custom group durations.";
+  recordBoxDecisionFacts(22, {
+    settings_readable: securityReadable,
+    unused_setting_count: Object.keys(sessionUnused).length,
+    session_duration_value: sessionDuration,
+    session_hours: sessionHours,
+    custom_session_enabled: customSessionEnabled,
+    custom_session_duration_value: customSessionValue,
+    custom_session_hours: customSessionHours,
+    max_session_hours: maxSessionHours,
+  });
   findings.push(
     !securityReadable
       ? finding(22, "manual", `Enterprise session settings could not be read because ${categoryUnreadableReason(data.configuration, "security")}.`, undefined, sessionManualEvidence)
@@ -2640,6 +2739,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
   );
 
   const ipLists = data.shieldLists.data.filter((list) => shieldListContentType(list) === "ip");
+  recordBoxDecisionFacts(23, {});
   findings.push(
     finding(
       23,
@@ -2690,6 +2790,16 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
     ...inventoryEvidence,
   };
   const inactivityManualEvidence = `Admin Console > Reports > User Activity (or the Users report with last login): identify users with no login in the last ${data.lookbackDays} days and confirm deactivation decisions.`;
+  recordBoxDecisionFacts(24, {
+    users_readable: usersReadable,
+    events_readable: eventsReadable,
+    users_truncated: usersTruncated,
+    user_count: users.length,
+    admin_count: admins.length,
+    events_truncated: eventsTruncated,
+    active_user_count: activeUsers.length,
+    inactive_user_count: inactiveCandidates.length,
+  });
   findings.push(
     !usersReadable || !eventsReadable
       ? finding(24, "manual", `Inactive users could not be derived because ${!usersReadable ? `users were unreadable (${unreadableReason(data.users)})` : `enterprise events were unreadable (${unreadableReason(data.events)})`}.`, { lookback_days: data.lookbackDays }, inactivityManualEvidence)
@@ -2738,6 +2848,7 @@ export function assessBoxIdentityAccessData(data: BoxIdentityData, options: BoxI
       ...datasetTruncations("enterprise_events", data.events, "event_limit"),
     ],
   };
+  });
 }
 
 function adminMfaUnreadableFinding(data: BoxIdentityData): BoxFinding {
@@ -2786,6 +2897,7 @@ export async function collectBoxSharingData(
 }
 
 export function assessBoxSharingCollaborationData(data: BoxSharingData, options: BoxSharingOptions = {}): BoxAssessmentResult {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const staleDays = clampNumber(options.staleAllowlistDays, DEFAULT_STALE_ALLOWLIST_DAYS, 1, 3650);
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const configReadable = categoryReadable(data.configuration, "content_and_sharing");
@@ -2818,6 +2930,13 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
   const allowlistUnreadable = unreadableInventory("collaboration_allowlist_entries", data.allowlistEntries, "the permitted external domains were not checked");
   const exemptTargetsUnreadable = unreadableInventory("collaboration_allowlist_exempt_targets", data.exemptTargets, "users exempt from the domain restriction were not checked");
   const collaborationConfigUnreadable = unreadableInventory("enterprise_configuration (content_and_sharing)", data.configuration, "the external collaboration mode that decides whether an empty allowlist is compliant was not checked");
+  recordBoxDecisionFacts(4, {
+    settings_readable: configReadable,
+    allowlist_readable: allowlistReadable,
+    unused_setting_count: Object.keys(externalUnused).length,
+    external_collaboration_setting_value: externalStatus,
+    allowlist_entry_count: entries.length,
+  });
   findings.push(capForUnreadableInventories(
     !configReadable
       ? allowlistReadable && entries.length > 0
@@ -2881,6 +3000,18 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...(undatedEntries.length > 0 ? [`${undatedEntries.length} allowlist entries have a missing or unparseable created_at (a documented CollaborationAllowlistEntry field), so their age cannot be assessed`] : []),
     ...(exemptTargets.length > 0 ? [`${exemptTargets.length} users are exempt from domain restrictions`] : []),
   ];
+  recordBoxDecisionFacts(5, {
+    allowlist_readable: allowlistReadable,
+    config_readable: !data.configuration.error,
+    exempt_targets_readable: !data.exemptTargets.error,
+    complete: completeBoxDatasets(data.allowlistEntries, data.exemptTargets),
+    allowlist_entry_count: entries.length,
+    public_domain_count: publicDomainEntries.length,
+    stale_entry_count: staleEntries.length,
+    undated_entry_count: undatedEntries.length,
+    exempt_target_count: exemptTargets.length,
+    external_collaboration_setting_value: externalStatus,
+  });
   findings.push(capForUnreadableInventories(
     !allowlistReadable
       ? finding(5, "manual", `The collaboration allowlist could not be read because ${unreadableReason(data.allowlistEntries)}.`, allowlistEvidence, allowlistManualEvidence)
@@ -2909,6 +3040,12 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...settingsEvidence(configReadable, linkSettings, linkUnused),
   };
   const linkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: record the default link access level and whether open (public) links are permitted.";
+  recordBoxDecisionFacts(6, {
+    settings_readable: configReadable,
+    unused_setting_count: Object.keys(linkUnused).length,
+    shared_link_default_access: sharedLinkDefault,
+    shared_link_access: sharedLinkAllowed,
+  });
   findings.push(
     !configReadable
       ? finding(6, "manual", `Shared link settings could not be read because ${configUnreadableReason}.`, undefined, linkManualEvidence)
@@ -2944,6 +3081,12 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...settingsEvidence(configReadable, expirationSettings, unusedSettings(expirationSettings)),
   };
   const expirationManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Shared Links: confirm automatic expiration is enabled and record the day count.";
+  recordBoxDecisionFacts(7, {
+    settings_readable: configReadable,
+    unused_setting_count: Object.keys(expirationUnused).length,
+    expiration_enabled: expirationEnabled,
+    public_expiration_enabled: publicExpirationEnabled,
+  });
   findings.push(
     !configReadable
       ? finding(7, "manual", `Shared link expiration settings could not be read because ${configUnreadableReason}.`, undefined, expirationManualEvidence)
@@ -2958,6 +3101,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
             : finding(7, "warn", "Enterprise settings did not expose is_shared_links_expiration_enabled, so shared link expiration cannot be confirmed from the API.", expirationEvidence, expirationManualEvidence),
   );
 
+  recordBoxDecisionFacts(8, {});
   findings.push(
     finding(
       8,
@@ -2983,6 +3127,11 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     ...settingsEvidence(configReadable, watermarkSettings, watermarkUnused),
   };
   const watermarkManualEvidence = "Admin Console > Enterprise Settings > Content & Sharing > Watermarking: confirm watermarking is enabled and which folders or classifications apply it.";
+  recordBoxDecisionFacts(9, {
+    settings_readable: configReadable,
+    unused_setting_count: Object.keys(watermarkUnused).length,
+    watermarking_enabled: watermarkingEnabled,
+  });
   findings.push(
     !configReadable
       ? finding(9, "manual", `Watermarking settings could not be read because ${configUnreadableReason}.`, undefined, watermarkManualEvidence)
@@ -2997,6 +3146,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
 
   const appEvents = events.filter((event) => /^(ENTERPRISE_APP_AUTHORIZATION_UPDATE|APPLICATION_CREATED|APPLICATION_PUBLIC_KEY_ADDED)$/.test(eventType(event)));
   const integrationLists = data.shieldLists.data.filter((list) => shieldListContentType(list) === "integration");
+  recordBoxDecisionFacts(19, {});
   findings.push(
     finding(
       19,
@@ -3020,6 +3170,10 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
     external_terms: whenRead(data.termsOfServices, externalTerms.map((terms) => ({ id: asString(terms.id), status: asString(terms.status) }))),
     terms_accept_events: observedCount([data.events], events.filter((event) => eventType(event) === "TERMS_OF_SERVICE_ACCEPT").length),
   };
+  recordBoxDecisionFacts(20, {
+    terms_readable: !data.termsOfServices.error,
+    enabled_managed_term_count: enabledManaged.length,
+  });
   findings.push(
     data.termsOfServices.error
       ? finding(20, "manual", `Terms of service could not be read because ${unreadableReason(data.termsOfServices)}.`, tosEvidence, "Admin Console > Enterprise Settings > Custom Setup > Custom Terms of Service: confirm terms are enabled for managed users and record the last modification date.")
@@ -3066,6 +3220,7 @@ export function assessBoxSharingCollaborationData(data: BoxSharingData, options:
       ...datasetTruncations("enterprise_events", data.events, "event_limit"),
     ],
   };
+  });
 }
 
 export async function assessBoxSharingCollaboration(
@@ -3185,6 +3340,7 @@ function classificationOptions(template: JsonRecord): string[] {
 }
 
 export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessmentResult {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const findings: BoxFinding[] = [];
 
@@ -3199,6 +3355,11 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     is_box_sync_restricted_for_new_users: configBool(configuration, "user_settings", "is_box_sync_restricted_for_new_users") ?? null,
   };
   const deviceManualEvidence = "Admin Console > Enterprise Settings > Device Trust: record whether device pinning is enforced for Box Drive, Box Sync, and mobile apps, and export the pinned device list.";
+  recordBoxDecisionFacts(10, {
+    readable: !data.devicePinners.error,
+    complete: completeBoxDatasets(data.devicePinners),
+    pin_count: pins.length,
+  });
   findings.push(
     data.devicePinners.error
       ? finding(10, "manual", `Device pins could not be read because ${unreadableReason(data.devicePinners)}.`, deviceEvidence, deviceManualEvidence)
@@ -3219,6 +3380,10 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
     metadata_templates_truncated: whenRead(data.metadataTemplates, data.metadataTemplates.truncated === true),
     classification_error: data.classificationTemplate.error ?? null,
   };
+  recordBoxDecisionFacts(11, {
+    readable: classificationReadable,
+    classification_count: classifications.length,
+  });
   findings.push(
     data.classificationTemplate.error && data.classificationTemplate.statusCode !== 404
       ? finding(11, "manual", `The classification template could not be read because ${unreadableReason(data.classificationTemplate)}.`, classificationEvidence, "Admin Console > Enterprise Settings > Classification: record the defined labels and confirm sensitive folders carry a classification.")
@@ -3253,6 +3418,13 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   // pass, while the total behind the stop is unknown; the counts it states are lower bounds carried with the exit.
   const retentionTruncationNote = listingTruncationNote("retention policy", data.retentionPolicies);
   const retentionRemedy = truncationRemedy(data.retentionPolicies, "list_limit");
+  recordBoxDecisionFacts(12, {
+    policies_readable: !data.retentionPolicies.error,
+    assignments_readable: !data.retentionAssignments.error,
+    complete: !retentionTruncated,
+    active_policy_count: activeRetention.length,
+    assigned_policy_count: assignedRetention.length,
+  });
   findings.push(capForUnreadableInventories(
     data.retentionPolicies.error
       ? finding(12, "manual", `Retention policies could not be read because ${unreadableReason(data.retentionPolicies)}; this endpoint requires Box Governance and the manage_data_retention scope.`, retentionEvidence, retentionManualEvidence)
@@ -3289,6 +3461,12 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
   const holdManualEvidence = "Admin Console > Governance > Legal Holds: record each policy, its custodians or folders, and confirm the legal team's hold process is documented.";
   const holdTruncationNote = listingTruncationNote("legal hold policy", data.legalHoldPolicies);
   const holdRemedy = truncationRemedy(data.legalHoldPolicies, "list_limit");
+  recordBoxDecisionFacts(13, {
+    policies_readable: !data.legalHoldPolicies.error,
+    assignments_readable: !data.legalHoldAssignments.error,
+    complete: !holdsTruncated,
+    assigned_policy_count: assignedHolds.length,
+  });
   findings.push(capForUnreadableInventories(
     data.legalHoldPolicies.error
       ? finding(13, "manual", `Legal hold policies could not be read because ${unreadableReason(data.legalHoldPolicies)}; this endpoint requires Box Governance and the manage_legal_holds scope.`, holdEvidence, holdManualEvidence)
@@ -3342,6 +3520,7 @@ export function assessBoxDataGovernanceData(data: BoxGovernanceData): BoxAssessm
       ...datasetTruncations("legal_hold_policy_assignments", data.legalHoldAssignments, "list_limit"),
     ],
   };
+  });
 }
 
 function countEventTypesBy(items: JsonRecord[], keyOf: (item: JsonRecord) => string): Record<string, number> {
@@ -3383,6 +3562,7 @@ export async function collectBoxShieldData(
 }
 
 export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmentResult {
+  return runBatchVerdictContext(BOX_DECISION_CONTEXT, BOX_SPEC, () => {
   const configuration = data.configuration.error ? undefined : data.configuration.data;
   const shieldReadable = categoryReadable(data.configuration, "shield");
   const shieldUnreadableReason = categoryUnreadableReason(data.configuration, "shield");
@@ -3401,6 +3581,10 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     sampled_events: whenRead(data.events, events.length),
     events_truncated: whenRead(data.events, data.events.truncated === true),
   };
+  recordBoxDecisionFacts(14, {
+    settings_readable: shieldReadable,
+    shield_rule_count: shieldRules.length,
+  });
   findings.push(
     !shieldReadable
       ? finding(14, "manual", `Shield rule configuration could not be read because ${shieldUnreadableReason}; Box Shield licensing and the manage_enterprise_properties scope are required.`, ruleEvidence, "Admin Console > Shield > Access Policies and Threat Detection Rules: record each policy, its scope (classification, user, group), and the enabled anomaly detectors.")
@@ -3433,6 +3617,11 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const enabledWithSegments = enabledBarriers.filter((barrier) => (childList(data.barrierSegments.data, asString(barrier.id))?.length ?? 0) > 0);
   const segmentTruncationNote = `the segment listing ${truncationClause(data.barrierSegments, datasetRecordCount(data.barrierSegments.data) ?? 0, "segments", "Box reported more segments (a next_marker remained)")}`;
   const barrierManualEvidence = "Admin Console > Shield > Information Barriers: record each barrier, its segments, and the restrictions between segments, or confirm barriers are not required for this enterprise.";
+  recordBoxDecisionFacts(15, {
+    barriers_readable: !data.barriers.error,
+    segments_readable: !data.barrierSegments.error,
+    enabled_with_segments_count: enabledWithSegments.length,
+  });
   findings.push(capForUnreadableInventories(
     data.barriers.error
       ? finding(15, "manual", `Shield information barriers could not be read because ${unreadableReason(data.barriers)}.`, barrierEvidence, barrierManualEvidence)
@@ -3462,6 +3651,10 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
     siem_consumption_verified: false,
   };
   const streamManualEvidence = "Admin Console > Reports and Box Shield > SIEM integrations, or the Events API consumer configuration: record which SIEM or log pipeline polls the enterprise event stream (service account and stream_position checkpoint), confirm it is receiving events, and record how alerting is configured.";
+  recordBoxDecisionFacts(16, {
+    events_readable: eventsReadable,
+    event_count: events.length,
+  });
   findings.push(
     !eventsReadable
       ? finding(16, "manual", `The enterprise event stream could not be read because ${unreadableReason(data.events)}; the admin_logs stream requires an admin or co-admin with report permissions or the manage_enterprise_properties scope.`, streamEvidence, streamManualEvidence)
@@ -3486,6 +3679,15 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
   const monitoringManualEvidence = "Admin Console > Shield > Threat Detection: confirm anomalous download, session, and location detection rules are enabled and alerts route to the security team.";
   const shieldConfigUnreadable = unreadableInventory("enterprise_configuration (shield)", data.configuration, "the configured Shield anomaly detection rules were not checked");
   const monitoringEventsUnreadable = unreadableInventory("enterprise_events", data.events, "Shield alert and block events were not checked");
+  recordBoxDecisionFacts(25, {
+    shield_settings_readable: shieldReadable,
+    configuration_readable: !data.configuration.error,
+    events_readable: eventsReadable,
+    events_complete: completeBoxDatasets(data.events),
+    anomaly_rule_count: anomalyRules.length,
+    anomaly_event_count: anomalyEvents.length,
+    access_event_count: accessEvents.length,
+  });
   findings.push(capForUnreadableInventories(
     !eventsReadable && !shieldReadable
       ? finding(25, "manual", "Neither enterprise events nor Shield rules could be read, so content access monitoring cannot be confirmed from the API.", monitoringEvidence, monitoringManualEvidence)
@@ -3533,6 +3735,7 @@ export function assessBoxShieldMonitoringData(data: BoxShieldData): BoxAssessmen
       ...datasetTruncations("enterprise_events", data.events, "event_limit"),
     ],
   };
+  });
 }
 
 export async function assessBoxShieldMonitoring(
@@ -4204,6 +4407,7 @@ function runTool<TArgs extends AuthArgs>(
 }
 
 export function registerBoxTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, BOX_SPEC);
   pi.registerTool({
     name: "box_check_access",
     label: "Check Box audit access",

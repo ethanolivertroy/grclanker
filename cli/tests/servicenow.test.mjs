@@ -33,8 +33,9 @@ import {
   resolveSecureOutputPath,
   resolveServicenowConfiguration,
 } from "../dist/extensions/grc-tools/servicenow.js";
+import { SERVICENOW_SPEC } from "../dist/extensions/grc-tools/servicenow.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
-import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
+import { assertBundlePathsMatchSpec, assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
 import { assertFragmentsAbsent, assertPlantedValuesWellFormed } from "./helpers/planted-values.mjs";
@@ -42,7 +43,18 @@ import { CONFIGURED_SECRET_CANARIES, assertTextFieldCarriers, carrierSuffix, inj
 import { assertDeepCanariesWellFormed, assertDeepNesting, deepFields, plantingFetch } from "./helpers/deep-nesting.mjs";
 import { ESCAPE_CANARIES, ESCAPE_CANARY_PLANTED_VALUES, escapeBoundaryTrace } from "./helpers/escape-boundary.mjs";
 import { assertScrubBoundary } from "./helpers/scrub-boundary-matrix.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
+import {
+  captureBatchDecisionFacts,
+  evaluateBatchCheckVerdict,
+} from "../dist/extensions/grc-tools/batch-spec-builder.js";
 
+const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const FIXED_NOW = new Date("2026-09-21T00:00:00Z");
 const RECENT_LOGIN = "2026-09-20 08:15:00";
 const STALE_LOGIN = "2026-01-05 08:15:00";
@@ -463,6 +475,15 @@ function findingsById(result) {
   return new Map(result.findings.map((item) => [item.id, item]));
 }
 
+async function captureServicenowFacts(checkId, callback) {
+  const { result, captures } = await captureBatchDecisionFacts(callback);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].integration, SERVICENOW_SPEC.identity.slug);
+  const facts = captures[0].checks.get(checkId);
+  assert.ok(facts, `${checkId}: captured runtime facts`);
+  return { result, facts };
+}
+
 function assertNoPass(result, label) {
   const passing = result.findings.filter((item) => item.status === "pass").map((item) => item.id);
   assert.deepEqual(passing, [], `${label}: expected no passing findings but saw ${passing.join(", ")}`);
@@ -783,6 +804,75 @@ test("assessServicenowIdentityAccess passes a healthy identity fixture with fram
   assert.ok(byId.get("SNOW-07").mappings.includes("PCI-DSS 8.4.2"));
   assert.deepEqual(result.errors, []);
   assert.equal(result.summary.admin_users, 1);
+});
+
+portableContractTest("SNOW-08 counts an active non-IdP integration TLS certificate across the unfiltered inventory", async () => {
+  const fixture = healthyFixture();
+  fixture.tables.sys_certificate.push({
+    sys_id: "cert-integration-tls",
+    name: "Payroll integration TLS client certificate",
+    type: "cert",
+    expires: "2026-10-01 00:00:00",
+    active: "true",
+  });
+  const { result, facts } = await captureServicenowFacts("SNOW-08", () => {
+    const { fetchImpl } = fixtureFetch(fixture);
+    return assessServicenowIdentityAccess(createClient(fetchImpl));
+  });
+  const finding = findingsById(result).get("SNOW-08");
+  assert.equal(facts.concern_count, 1, "captured runtime count includes the non-IdP certificate");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-08", facts), "warn");
+  assert.equal(finding.status, "warn");
+  assert.equal(
+    finding.summary,
+    "1 active SSO providers and 0 active LDAP servers are configured, but: 1 certificates expire within 30 days (Payroll integration TLS client certificate).",
+  );
+  const definition = SERVICENOW_SPEC.checks.find((check) => check.id === "SNOW-08").evidenceFieldDefinitions.concern_count;
+  assert.match(definition, /all records returned by the unfiltered `sys_certificate` inventory/);
+  assert.doesNotMatch(definition, /identity-provider certificate concerns/);
+});
+
+portableContractTest("SNOW-14 counts privileged assignments only when they belong to integration users", async () => {
+  const humanAdminOnly = healthyFixture();
+  const humanAdmin = await captureServicenowFacts("SNOW-14", () => {
+    const { fetchImpl } = fixtureFetch(humanAdminOnly);
+    return assessServicenowIdentityAccess(createClient(fetchImpl));
+  });
+  const humanAdminFinding = findingsById(humanAdmin.result).get("SNOW-14");
+  assert.equal(humanAdmin.facts.integration_user_count, 1);
+  assert.equal(humanAdmin.facts.privileged_assignment_count, 0, "the human administrator assignment is excluded");
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-14", humanAdmin.facts), "pass");
+  assert.equal(humanAdminFinding.status, "pass");
+  assert.equal(
+    humanAdminFinding.summary,
+    "1 integration accounts are flagged web service or internal integration users and none hold a privileged role.",
+  );
+
+  const privilegedIntegration = healthyFixture();
+  const integrationUser = privilegedIntegration.tables.sys_user.find((row) => row.user_name === "svc.integration");
+  assert.ok(integrationUser);
+  privilegedIntegration.tables.sys_user_has_role.push(
+    roleAssignment("uhr-integration-user-admin", integrationUser, "user_admin"),
+  );
+  const integrationAssignment = await captureServicenowFacts("SNOW-14", () => {
+    const { fetchImpl } = fixtureFetch(privilegedIntegration);
+    return assessServicenowIdentityAccess(createClient(fetchImpl));
+  });
+  const integrationFinding = findingsById(integrationAssignment.result).get("SNOW-14");
+  assert.equal(integrationAssignment.facts.integration_user_count, 1);
+  assert.equal(integrationAssignment.facts.admin_integration_count, 0);
+  assert.equal(integrationAssignment.facts.privileged_assignment_count, 1);
+  assert.equal(evaluateBatchCheckVerdict(SERVICENOW_SPEC, "SNOW-14", integrationAssignment.facts), "warn");
+  assert.equal(integrationFinding.status, "warn");
+  assert.equal(
+    integrationFinding.summary,
+    "1 integration accounts exist and none hold admin, but 1 privileged assignments (admin, security_admin, user_admin, impersonator, maint) belong to integration accounts.",
+  );
+
+  const definition = SERVICENOW_SPEC.checks.find((check) => check.id === "SNOW-14").evidenceFieldDefinitions.privileged_assignment_count;
+  assert.match(definition, /privileged role assignments held by integration users/);
+  assert.match(definition, /`user\.web_service_access_only` or `user\.internal_integration_user` field is true/);
+  assert.doesNotMatch(definition, /active privileged role assignments in the complete ServiceNow inventory/);
 });
 
 test("assessServicenowIdentityAccess fails weak identity controls and buckets users without login dates", async () => {
@@ -1290,6 +1380,7 @@ test("exportServicenowAuditBundle writes core data, analysis, compliance reports
   const { fetchImpl } = fixtureFetch(healthyFixture());
   const config = sampleConfig();
   const result = await exportServicenowAuditBundle(createClient(fetchImpl), config, base);
+  assertBundlePathsMatchSpec(assert, result.outputDir, SERVICENOW_SPEC);
 
   assert.equal(basename(result.outputDir), "dev12345-audit-bundle");
   assert.equal(result.zipPath, join(base, "dev12345-audit-bundle.zip"));
@@ -2953,4 +3044,21 @@ test("reviewer B round 4 verdict SNOW-02 (ruled code, not sentence): a positive 
   const healthy = findingsById(await assessServicenowAccessControl(createClient(fixtureFetch(healthyFixture()).fetchImpl))).get("SNOW-02");
   assert.equal(healthy.status, "pass", healthy.summary);
   assert.equal(healthy.evidence.public_page_count, 0, "a complete sys_public read beside visible ACLs states its zero");
+});
+
+test("byte differential fixtures: ServiceNow assessments and export", { skip: !byteDifferentialEnabled }, async () => {
+  const clientFor = (fixture, options = {}) => createClient(fixtureFetch(fixture, options).fetchImpl);
+  writeByteDifferentialFixture("servicenow", "representative", {
+    access: await checkServicenowAccess(clientFor(healthyFixture())),
+    assessments: await runAllAssessments(clientFor(healthyFixture())),
+  });
+  writeByteDifferentialFixture("servicenow", "boundary", await runAllAssessments(clientFor(failingFixture())));
+  writeByteDifferentialFixture("servicenow", "denied", await runAllAssessments(clientFor(healthyFixture(), { forbidAll: true })));
+  writeByteDifferentialFixture("servicenow", "partial", await runAllAssessments(clientFor(healthyFixture(), { inflateTotal: 25 })));
+  writeByteDifferentialFixture("servicenow", "missing-null", await runAllAssessments(clientFor(emptyFixture())));
+  writeByteDifferentialFixture("servicenow", "compliant", await runAllAssessments(clientFor(healthyFixture())));
+
+  const outputRoot = prepareByteDifferentialExportRoot("servicenow");
+  const exported = await exportServicenowAuditBundle(clientFor(healthyFixture()), sampleConfig(), outputRoot);
+  writeByteDifferentialFixture("servicenow", "export", snapshotExportBundle(exported));
 });

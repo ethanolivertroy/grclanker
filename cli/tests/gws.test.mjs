@@ -39,7 +39,17 @@ import {
   resolveSecureOutputPath,
   runGwsAccessCheck,
 } from "../dist/extensions/grc-tools/gws.js";
+import { GWS_SPEC } from "../dist/extensions/grc-tools/gws.spec.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
+const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOGIN = new Date(Date.now() - 2 * DAY_MS).toISOString();
 const OLD_LOGIN = new Date(Date.now() - 400 * DAY_MS).toISOString();
@@ -51,6 +61,15 @@ function createTempBase(prefix) {
 
 function dataset(data, error) {
   return error ? { data, error } : { data };
+}
+
+async function captureGwsFacts(checkId, callback) {
+  const { result, captures } = await captureBatchDecisionFacts(callback);
+  assert.equal(captures.length, 1);
+  assert.equal(captures[0].integration, GWS_SPEC.identity.slug);
+  const facts = captures[0].checks.get(checkId);
+  assert.ok(facts, `${checkId}: captured runtime facts`);
+  return { result, facts };
 }
 
 function jsonResponse(body, status = 200) {
@@ -813,6 +832,145 @@ test("verdict rule 2: empty inventories never pass and each summary states how e
   assert.match(findingById(integrations, "GWS-INTEG-001").summary, /could not be demonstrated/);
 });
 
+test("GWS-INTEG-001 keeps the legacy Partial finding when readable users yield no tokens and one token read fails", () => {
+  const finding = findingById(assessGwsIntegrations({
+    users: dataset(createUsers().slice(0, 3)),
+    roles: dataset(createRoles()),
+    roleAssignments: dataset(createRoleAssignments()),
+    tokenInventory: {
+      data: [],
+      seen: 3,
+      total: 3,
+      failed: 1,
+      error: "one@example.com: 403 Forbidden",
+      truncated: false,
+    },
+    tokenActivities: dataset(createTokenActivities()),
+  }, createSampleConfig()), "GWS-INTEG-001");
+  assert.equal(finding.status, "Partial");
+  assert.equal(finding.summary, "Third-party token inventory was only partially readable.");
+  assert.ok(finding.evidence.includes("Per-user token reads that failed: 1"));
+});
+
+portableContractTest("portable completeness contracts match the four truncation-only directory permission cases", async () => {
+  const cases = [
+    ["users", "403"],
+    ["users", "500"],
+    ["roles", "403"],
+    ["roles", "500"],
+  ];
+  for (const [sourceName, failureKind] of cases) {
+    const { result, facts } = await captureGwsFacts("GWS-ADMIN-005", async () => {
+      const collected = await collectGwsAuditData(createFakeCollector(denyOverrides(sourceName, failureKind)));
+      return assessGwsAdminAccess(collected.adminAccess, createSampleConfig());
+    });
+    assert.equal(facts.complete, true, `${sourceName}/${failureKind}: runtime complete ignores read failure`);
+    const surfaceId = sourceName === "users" ? "directory-users" : "roles";
+    const contract = GWS_SPEC.checks.find((check) => check.id === "GWS-ADMIN-005").completeness.complete;
+    const source = contract.sources.find((entry) => entry.surfaceId === surfaceId);
+    assert.ok(source);
+    assert.deepEqual(source.falseWhen, ["truncated"]);
+    assert.equal(findingById(result, "GWS-ADMIN-005").status, "Manual");
+  }
+});
+
+portableContractTest("GWS-MON-002 primitive facts and contract both use login activity reports, never Alert Center alerts", async () => {
+  const { result, facts } = await captureGwsFacts("GWS-MON-002", () => assessGwsMonitoring({
+    loginActivities: dataset([], "403 Forbidden: login activity report"),
+    adminActivities: dataset(createAdminActivities()),
+    tokenActivities: dataset(createTokenActivities()),
+    alerts: dataset(createAlerts()),
+  }, createSampleConfig()));
+  assert.equal(facts.readable, false);
+  assert.equal(facts.complete, false);
+  assert.equal(facts.event_count, 0);
+  assert.equal(findingById(result, "GWS-MON-002").status, "Manual");
+  const check = GWS_SPEC.checks.find((entry) => entry.id === "GWS-MON-002");
+  assert.deepEqual(check.sourceSurfaceIds, ["login-activities"]);
+  assert.deepEqual(check.completeness.complete.sources.map((source) => source.surfaceId), ["login-activities"]);
+  for (const name of ["readable", "complete", "event_count", "suspicious_login_count"]) {
+    assert.match(check.evidenceFieldDefinitions[name], /login-activities/);
+    assert.doesNotMatch(check.evidenceFieldDefinitions[name], /Alert Center API/);
+  }
+});
+
+portableContractTest("GWS integration completeness contracts match 212 recorded role-read divergences and four collector failure shapes", async () => {
+  const lowScopeTokens = async (userKey) => (createTokens()[userKey] ?? [])
+    .map((token) => ({ ...token, scopes: ["https://www.googleapis.com/auth/calendar"] }));
+  const cases = [
+    ...Array.from({ length: 204 }, (_, index) => ({ id: "GWS-INTEG-001", index })),
+    ...Array.from({ length: 8 }, (_, index) => ({ id: "GWS-INTEG-003", index })),
+  ];
+  let targetedCases = 0;
+  for (const testCase of cases) {
+    const source = testCase.index % 2 === 0 ? "roles" : "role-assignments";
+    const status = testCase.index % 4 < 2 ? 403 : 500;
+    if (testCase.index < 4 && testCase.id === "GWS-INTEG-001") targetedCases += 1;
+    const fail = async () => {
+      throw new GwsApiError(
+        status,
+        status === 403
+          ? "403 Forbidden (status PERMISSION_DENIED, reason insufficientPermissions)"
+          : "500 Internal Server Error",
+        `https://admin.googleapis.com/${source}`,
+      );
+    };
+    const overrides = source === "roles" ? { collectRoles: fail } : { collectRoleAssignments: fail };
+    const { result, facts } = await captureGwsFacts(testCase.id, async () => {
+      const collected = await collectGwsAuditData(createFakeCollector({ ...overrides, listUserTokens: lowScopeTokens }));
+      return assessGwsIntegrations(collected.integrations, createSampleConfig());
+    });
+    assert.equal(facts.complete, false, `${testCase.id} ${source} HTTP ${status}`);
+    const finding = findingById(result, testCase.id);
+    assert.equal(finding.status, "Partial", `${testCase.id} ${source} HTTP ${status}`);
+    assert.match(finding.summary, /Partial|limited set/, `${testCase.id} ${source} HTTP ${status}`);
+    const contract = GWS_SPEC.checks.find((check) => check.id === testCase.id).completeness.complete;
+    const sourceContract = contract.sources.find((entry) => entry.surfaceId === source);
+    assert.ok(sourceContract, `${testCase.id}: ${source} is a declared completeness source`);
+    assert.ok(sourceContract.falseWhen.includes(status === 403 ? "denied" : "error"));
+  }
+  assert.equal(cases.filter((entry) => entry.id === "GWS-INTEG-001").length, 204);
+  assert.equal(cases.filter((entry) => entry.id === "GWS-INTEG-003").length, 8);
+  assert.equal(targetedCases, 4);
+});
+
+portableContractTest("GWS-INTEG-002 ignores token sampling truncation when every privileged user was sampled", async () => {
+  const users = [
+    ...createUsers(),
+    ...Array.from({ length: 60 }, (_, index) => ({
+      id: `u-extra-${index}`,
+      primaryEmail: `extra-${index}@example.com`,
+      isAdmin: false,
+      isDelegatedAdmin: false,
+      suspended: false,
+      archived: false,
+      isEnforcedIn2Sv: true,
+      isEnrolledIn2Sv: true,
+      lastLoginTime: RECENT_LOGIN,
+    })),
+  ];
+  const { result, facts } = await captureGwsFacts("GWS-INTEG-002", async () => {
+    const collected = await collectGwsAuditData(createFakeCollector({
+      collectUsers: async () => collection(users),
+      listUserTokens: async (userKey) => userKey === "user@example.com"
+        ? createTokens()[userKey]
+        : [],
+    }));
+    assert.equal(collected.integrations.tokenInventory.seen, 50);
+    assert.equal(collected.integrations.tokenInventory.total, 64);
+    assert.equal(collected.integrations.tokenInventory.truncated, true);
+    return assessGwsIntegrations(collected.integrations, createSampleConfig());
+  });
+  assert.equal(facts.complete, true);
+  assert.equal(findingById(result, "GWS-INTEG-002").status, "Pass");
+  const tokenSource = GWS_SPEC.checks
+    .find((check) => check.id === "GWS-INTEG-002")
+    .completeness.complete.sources
+    .find((source) => source.surfaceId === "user-tokens");
+  assert.ok(tokenSource);
+  assert.equal(tokenSource.falseWhen.includes("truncated"), false);
+});
+
 test("verdict rule 2 (by intent): an empty sub-population inside a non-empty inventory may pass and says so", () => {
   const config = createSampleConfig();
   const admin = assessGwsAdminAccess({
@@ -1076,6 +1234,7 @@ test("exportGwsAuditBundle writes the shared bundle layout and a zip named after
   const base = createTempBase("grclanker-gws-export-");
   const config = createSampleConfig();
   const result = await exportGwsAuditBundle(createFakeCollector(), config, base);
+  assertBundlePathsMatchSpec(assert, result.outputDir, GWS_SPEC);
 
   assert.ok(existsSync(result.outputDir));
   assert.equal(basename(result.outputDir), "example.com-gws-audit");
@@ -2544,4 +2703,120 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   symlinkSync(outside, symlinkParent);
 
   assert.throws(() => resolveSecureOutputPath(base, "symlink-parent/file.txt"), /symlinked parent directory/);
+});
+
+test("byte differential fixtures: GWS assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const config = createSampleConfig();
+  const assessmentsFor = async (collector) => assessAll(await collectGwsAuditData(collector), config);
+
+  writeByteDifferentialFixture("gws", "representative", await assessmentsFor(createFakeCollector()));
+
+  const deny = async () => {
+    throw new GwsApiError(
+      403,
+      "403 Forbidden: Request had insufficient authentication scopes.",
+      "https://admin.googleapis.com/denied",
+    );
+  };
+  writeByteDifferentialFixture("gws", "denied", await assessmentsFor(createFakeCollector({
+    collectUsers: deny,
+    collectRoles: deny,
+    collectRoleAssignments: deny,
+    collectActivities: deny,
+    collectAlerts: deny,
+    collectTwoStepPolicies: deny,
+    listUserTokens: deny,
+  })));
+
+  const absent = async () => null;
+  writeByteDifferentialFixture("gws", "missing-null", await assessmentsFor(createFakeCollector({
+    collectUsers: absent,
+    collectRoles: absent,
+    collectRoleAssignments: absent,
+    collectActivities: absent,
+    collectAlerts: absent,
+    collectTwoStepPolicies: absent,
+    listUserTokens: absent,
+  })));
+
+  const compliantUsers = createUsers()
+    .filter((user) => user.id !== "u-dormant")
+    .map((user) => ({ ...user, isEnforcedIn2Sv: true }));
+  const truncated = (items) => collection(items, { truncated: true, pages: 3 });
+  const partialCollector = createFakeCollector({
+    collectUsers: async () => truncated(compliantUsers),
+    collectRoleAssignments: async () => truncated([createRoleAssignments()[0]]),
+    collectActivities: async (applicationName) => {
+      if (applicationName === "login") return truncated([activity("login", "user@example.com", ["login_success"])]);
+      if (applicationName === "admin") return truncated(createAdminActivities());
+      return truncated(createTokenActivities());
+    },
+    collectAlerts: deny,
+    collectTwoStepPolicies: async () => truncated(createTwoStepPolicies()),
+    listUserTokens: async (userKey) => {
+      if (userKey === "super@example.com") return deny();
+      return userKey === "user@example.com" ? createTokens()[userKey] : [];
+    },
+  });
+  writeByteDifferentialFixture("gws", "partial", await assessmentsFor(partialCollector));
+
+  const compliant = createFakeCollector({
+    collectUsers: async () => collection([
+      { ...createUsers()[0] },
+      { ...createUsers()[1], isEnforcedIn2Sv: true },
+      { ...createUsers()[2] },
+      { ...createUsers()[3], isEnforcedIn2Sv: true, isEnrolledIn2Sv: true, lastLoginTime: RECENT_LOGIN },
+    ]),
+    collectRoleAssignments: async () => collection([
+      { roleAssignmentId: "ra-0", roleId: "1", assignedTo: "u-super", assigneeType: "USER", scopeType: "CUSTOMER" },
+      { roleAssignmentId: "ra-1", roleId: "2", assignedTo: "u-delegated", assigneeType: "USER", scopeType: "CUSTOMER" },
+    ]),
+    collectActivities: async (applicationName) => {
+      if (applicationName === "login") return collection([activity("login", "user@example.com", ["login_success"])]);
+      if (applicationName === "admin") return collection(createAdminActivities());
+      return collection(createTokenActivities());
+    },
+    collectAlerts: async () => collection([createAlerts()[1]]),
+    listUserTokens: async (userKey) => (userKey === "user@example.com" ? createTokens()[userKey] : []),
+  });
+  writeByteDifferentialFixture("gws", "compliant", await assessmentsFor(compliant));
+
+  const identityAt = (required, total) => {
+    const users = Array.from({ length: total }, (_, index) => ({
+      id: `boundary-${required}-${total}-${index}`,
+      primaryEmail: `boundary-${index}@example.com`,
+      isAdmin: false,
+      isDelegatedAdmin: false,
+      suspended: false,
+      archived: false,
+      isEnforcedIn2Sv: index < required,
+      isEnrolledIn2Sv: index < required,
+      lastLoginTime: RECENT_LOGIN,
+    }));
+    return assessGwsIdentity({
+      users: dataset(users),
+      roles: dataset(createRoles()),
+      roleAssignments: dataset([]),
+      loginActivities: dataset(createLoginActivities()),
+      twoStepPolicies: dataset(createTwoStepPolicies()),
+    }, config);
+  };
+  const monitoringAt = (openAlerts) => assessGwsMonitoring({
+    loginActivities: dataset(createLoginActivities()),
+    adminActivities: dataset(createAdminActivities()),
+    tokenActivities: dataset(createTokenActivities()),
+    alerts: dataset(Array.from({ length: Math.max(openAlerts, 1) }, (_, index) => ({
+      alertId: `boundary-alert-${openAlerts}-${index}`,
+      type: "Data exfiltration",
+      status: index < openAlerts ? "NOT_STARTED" : "CLOSED",
+    }))),
+  }, config);
+  writeByteDifferentialFixture("gws", "boundary", {
+    activeTwoStepCoverage: [84, 85, 97, 98].map((required) => identityAt(required, 100)),
+    openAlerts: [3, 4, 10, 11].map(monitoringAt),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("gws");
+  const exported = await exportGwsAuditBundle(createFakeCollector(), config, exportRoot);
+  writeByteDifferentialFixture("gws", "export", snapshotExportBundle(exported));
 });

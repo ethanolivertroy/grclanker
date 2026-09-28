@@ -5,6 +5,7 @@
  * older okta-inspector project while staying aligned with the official
  * okta-cli-client configuration model and Okta Management API coverage.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, createPrivateKey, randomUUID, sign as signData, type KeyObject } from "node:crypto";
 import {
   createWriteStream,
@@ -20,6 +21,9 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { parseDocument as parseYamlDocument, YAMLError } from "yaml";
 import { REDACTED_VALUE, isSensitiveArgumentKey, scrubSensitiveValues, scrubbedFormsOf } from "../../flue/redact.js";
+import { OKTA_AUTH_RESOLVER, readResolverEnvironment } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
+import { OKTA_SPEC } from "./okta.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -1651,6 +1655,17 @@ const OKTA_CHECKS: Record<string, CheckDefinition> = {
   },
 };
 
+hydrateBatchFrameworkMappings(OKTA_SPEC, Object.fromEntries(
+  Object.entries(OKTA_CHECKS).map(([id, check]) => [id, {
+    fedramp: check.frameworks.fedramp,
+    soc2: check.frameworks.soc2,
+    pci_dss: check.frameworks.pci_dss,
+    disa_stig: check.frameworks.disa_stig,
+    irap: check.frameworks.irap,
+    ismap: check.frameworks.ismap,
+  }]),
+));
+
 export const OKTA_CHECK_IDS = Object.keys(OKTA_CHECKS);
 
 export function clearOktaTokenCacheForTests(): void {
@@ -2101,6 +2116,7 @@ export async function resolveOktaConfiguration(
   cwd: string = process.cwd(),
   homeDir: string = homedir(),
 ): Promise<OktaResolvedConfig> {
+  env = readResolverEnvironment(OKTA_AUTH_RESOLVER, env);
   let merged: OktaConfigOverlay = {
     authMode: "SSWS",
     scopes: [],
@@ -3261,6 +3277,25 @@ export async function collectOktaMonitoringData(
   };
 }
 
+const OKTA_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordOktaDecisionFacts(
+  id: keyof typeof OKTA_CHECKS,
+  facts: Readonly<Record<string, unknown>>,
+): void {
+  const store = OKTA_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside an Okta assessment`);
+  store.set(id, facts);
+}
+
+function completeOktaDatasets(...datasets: CollectedDataset<unknown>[]): boolean {
+  return datasets.every((dataset) => !dataset.error && !dataset.notCollected && dataset.truncated !== true);
+}
+
+function untruncatedOktaDatasets(...datasets: CollectedDataset<unknown>[]): boolean {
+  return datasets.every((dataset) => dataset.truncated !== true);
+}
+
 function buildFinding(
   id: keyof typeof OKTA_CHECKS,
   status: OktaFindingStatus,
@@ -3636,6 +3671,7 @@ export function assessOktaAuthentication(
   data: OktaAuthenticationData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const hostname = new URL(config.orgUrl).hostname;
   const isFederalTenant = FEDERAL_ORG_HOST_PATTERN.test(hostname);
@@ -3658,6 +3694,14 @@ export function assessOktaAuthentication(
   );
   const classicEngine =
     !data.authenticators.error && authenticators.length === 0 && data.orgFactors.data.length > 0;
+  recordOktaDecisionFacts("OKTA-AUTH-001", {
+    readable: !data.authenticators.error,
+    complete: untruncatedOktaDatasets(data.authenticators, data.orgFactors),
+    classic_engine: classicEngine,
+    authenticator_count: authenticators.length,
+    phishing_resistant_count: phishingResistantAuthenticators.length,
+    strong_count: strongAuthenticators.length,
+  });
 
   if (data.authenticators.error) {
     findings.push(
@@ -3738,6 +3782,15 @@ export function assessOktaAuthentication(
   const adminRules = activeRulesFor(adminPolicies, adminRuleMap);
   const adminMfaRules = adminRules.filter(ruleRequiresMfa);
   const adminPolicyCount = adminPolicies.length;
+  recordOktaDecisionFacts("OKTA-AUTH-002", {
+    policy_inventory_readable: !(data.signOnPolicies.error && data.accessPolicies.error),
+    complete: completeOktaDatasets(...policyDatasets, data.authenticators)
+      && untruncatedOktaDatasets(data.mfaPolicies),
+    admin_policy_count: adminPolicyCount,
+    admin_mfa_rule_count: adminMfaRules.length,
+    strong_authenticator_count: strongAuthenticators.length,
+    mfa_control_count: data.mfaPolicies.data.filter(isActiveRecord).length,
+  });
 
   if (data.signOnPolicies.error && data.accessPolicies.error) {
     findings.push(
@@ -3816,6 +3869,38 @@ export function assessOktaAuthentication(
 
   const activePasswordPolicies = data.passwordPolicies.data.filter(isActiveRecord);
   const passwordPolicies = analyzePasswordPolicies(activePasswordPolicies);
+  const complexityPass = passwordPolicies.filter(
+    (policy) =>
+      policy.minLength >= 12 &&
+      policy.requireUppercase &&
+      policy.requireLowercase &&
+      policy.requireNumber &&
+      policy.requireSymbol,
+  );
+  const ageHistoryPass = passwordPolicies.filter(
+    (policy) => policy.maxAge > 0 && policy.maxAge <= 90 && policy.historyCount >= 5,
+  );
+  const lockoutPass = passwordPolicies.filter(
+    (policy) => policy.maxAttempts > 0 && policy.maxAttempts <= 6,
+  );
+  const passwordDecisionBase = {
+    readable: !data.passwordPolicies.error,
+    complete: completeOktaDatasets(data.passwordPolicies),
+    inventory_count: data.passwordPolicies.data.length,
+    policy_count: passwordPolicies.length,
+  };
+  recordOktaDecisionFacts("OKTA-AUTH-003", {
+    ...passwordDecisionBase,
+    gap_count: passwordPolicies.length - complexityPass.length,
+  });
+  recordOktaDecisionFacts("OKTA-AUTH-004", {
+    ...passwordDecisionBase,
+    gap_count: passwordPolicies.length - ageHistoryPass.length,
+  });
+  recordOktaDecisionFacts("OKTA-AUTH-005", {
+    ...passwordDecisionBase,
+    gap_count: passwordPolicies.length - lockoutPass.length,
+  });
   if (data.passwordPolicies.error) {
     const evidence = "Export Security > Authentication > Password policies and record complexity, age, history, and lockout settings.";
     findings.push(manualForDataset("OKTA-AUTH-003", "Password complexity", data.passwordPolicies, evidence));
@@ -3841,14 +3926,6 @@ export function assessOktaAuthentication(
       buildFinding("OKTA-AUTH-005", "Fail", "Password policies exist but none are ACTIVE.", evidence, "Activate a password policy that enforces lockout thresholds."),
     );
   } else {
-    const complexityPass = passwordPolicies.filter(
-      (policy) =>
-        policy.minLength >= 12 &&
-        policy.requireUppercase &&
-        policy.requireLowercase &&
-        policy.requireNumber &&
-        policy.requireSymbol,
-    );
     const complexityStatus: OktaFindingStatus =
       complexityPass.length === passwordPolicies.length
         ? "Pass"
@@ -3868,9 +3945,6 @@ export function assessOktaAuthentication(
       ),
     );
 
-    const ageHistoryPass = passwordPolicies.filter(
-      (policy) => policy.maxAge > 0 && policy.maxAge <= 90 && policy.historyCount >= 5,
-    );
     const ageHistoryStatus: OktaFindingStatus =
       ageHistoryPass.length === passwordPolicies.length
         ? "Pass"
@@ -3890,9 +3964,6 @@ export function assessOktaAuthentication(
       ),
     );
 
-    const lockoutPass = passwordPolicies.filter(
-      (policy) => policy.maxAttempts > 0 && policy.maxAttempts <= 6,
-    );
     const lockoutStatus: OktaFindingStatus =
       lockoutPass.length === passwordPolicies.length
         ? "Pass"
@@ -3915,6 +3986,20 @@ export function assessOktaAuthentication(
   const sessionRules = activeRulesFor(data.signOnPolicies.data, data.signOnPolicyRules.data);
   const sessionSignals = getSessionSignals(sessionRules);
   const sessionErrors = listErrors([data.signOnPolicies, data.signOnPolicyRules]);
+  const sessionComplete = completeOktaDatasets(data.signOnPolicies, data.signOnPolicyRules);
+  recordOktaDecisionFacts("OKTA-AUTH-006", {
+    readable: !data.signOnPolicies.error,
+    complete: sessionComplete,
+    exposed_value_count: sessionSignals.idleTimeouts.length,
+    over_limit_count: sessionSignals.idleTimeouts.filter((entry) => entry > 15).length,
+  });
+  recordOktaDecisionFacts("OKTA-AUTH-007", {
+    readable: !data.signOnPolicies.error,
+    complete: sessionComplete,
+    exposed_value_count: sessionSignals.lifetimes.length + sessionSignals.persistentCookies.length,
+    over_limit_count: sessionSignals.lifetimes.filter((entry) => entry > 1080).length,
+    persistent_cookie_count: sessionSignals.persistentCookies.filter(Boolean).length,
+  });
   const sessionEvidence = "Review each ACTIVE Okta sign-on rule and record maxSessionIdleMinutes, maxSessionLifetimeMinutes, and usePersistentCookie.";
   if (data.signOnPolicies.error) {
     findings.push(manualForDataset("OKTA-AUTH-006", "Session idle timeout", data.signOnPolicies, sessionEvidence));
@@ -3986,6 +4071,13 @@ export function assessOktaAuthentication(
     }
   }
 
+  recordOktaDecisionFacts("OKTA-AUTH-008", {
+    idp_readable: !data.idps.error,
+    authenticator_readable: !data.authenticators.error,
+    complete: untruncatedOktaDatasets(data.idps, data.authenticators),
+    certificate_method_count: certIdps.length + certAuthenticators.length,
+    federal_tenant: isFederalTenant,
+  });
   if (data.idps.error && data.authenticators.error) {
     findings.push(
       manualFinding(
@@ -4070,6 +4162,16 @@ export function assessOktaAuthentication(
   ];
   const fipsRecommendation =
     "Set Okta Verify compliance.fips to REQUIRED, disable SMS, voice, security question, and email authenticators (or limit email to recovery), and rely on FIPS 140 validated authenticators.";
+  recordOktaDecisionFacts("OKTA-AUTH-009", {
+    readable: !data.authenticators.error,
+    complete: untruncatedOktaDatasets(data.authenticators, data.orgFactors),
+    classic_engine: classicEngine,
+    authenticator_count: authenticators.length,
+    federal_tenant: isFederalTenant,
+    okta_verify_active: Boolean(oktaVerify && isActiveAuthenticator(oktaVerify)),
+    fips_required: fipsMode === "REQUIRED",
+    restricted_count: restrictedAuthenticators.length,
+  });
   if (data.authenticators.error) {
     findings.push(
       manualForDataset(
@@ -4178,12 +4280,14 @@ export function assessOktaAuthentication(
     ),
     snapshotSummary,
   };
+  });
 }
 
 export function assessOktaAdminAccess(
   data: OktaAdminAccessData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const privilegedUsers = data.usersWithRoleAssignments.data.map((user) => {
     const userId = asString(user.id) ?? "";
@@ -4202,6 +4306,12 @@ export function assessOktaAdminAccess(
     Boolean(data.usersWithRoleAssignments.error) || privilegedUsers.length === 0;
   const emptyPrivilegedCause =
     "the role-assignee listing returned zero users although every Okta org has at least one super admin, so the audit principal is likely a scoped admin without okta.roles.read visibility";
+  recordOktaDecisionFacts("OKTA-ADMIN-001", {
+    readable: !data.usersWithRoleAssignments.error && !data.userRoles.notCollected,
+    complete: completeOktaDatasets(data.usersWithRoleAssignments, data.userRoles),
+    privileged_user_count: privilegedUsers.length,
+    super_admin_count: superAdmins.length,
+  });
 
   if (data.usersWithRoleAssignments.error) {
     findings.push(
@@ -4239,6 +4349,13 @@ export function assessOktaAdminAccess(
   const unknownActivityPrivileged = privilegedUsers.filter(
     (entry) => daysSince(userLastLogin(entry.user)) === null && !stalePrivileged.includes(entry),
   );
+  recordOktaDecisionFacts("OKTA-ADMIN-002", {
+    readable: !data.usersWithRoleAssignments.error,
+    complete: completeOktaDatasets(data.usersWithRoleAssignments, data.userRoles),
+    privileged_user_count: privilegedUsers.length,
+    stale_count: stalePrivileged.length,
+    unknown_activity_count: unknownActivityPrivileged.length,
+  });
   if (data.usersWithRoleAssignments.error) {
     findings.push(
       manualForDataset("OKTA-ADMIN-002", "Inactive privileged accounts", data.usersWithRoleAssignments, roleAssigneeExport),
@@ -4292,6 +4409,17 @@ export function assessOktaAdminAccess(
     ...listErrors([data.privilegedGroupRoles, data.privilegedGroupMembers]),
     ...listTruncations([data.privilegedGroups]),
   ];
+  recordOktaDecisionFacts("OKTA-ADMIN-003", {
+    readable: !data.groups.error,
+    complete: completeOktaDatasets(
+      data.groups,
+      data.privilegedGroups,
+      data.privilegedGroupRoles,
+      data.privilegedGroupMembers,
+    ),
+    privileged_group_count: privilegedGroups.length,
+    oversized_group_count: oversizedPrivilegedGroups.length,
+  });
   if (data.groups.error) {
     findings.push(
       manualForDataset(
@@ -4340,6 +4468,26 @@ export function assessOktaAdminAccess(
 
   const factorMap = data.privilegedUserFactors.data;
   const factorsReadCount = Object.keys(factorMap).length;
+  const enrollment = privilegedUsers
+    .filter((entry) => factorMap[entry.userId] !== undefined)
+    .map((entry) => {
+      const activeFactors = (factorMap[entry.userId] ?? []).filter(isActiveRecord);
+      return {
+        login: userLogin(entry.user),
+        activeFactors,
+        phishingResistant: activeFactors.some(isPhishingResistantFactor),
+      };
+    });
+  const unenrolled = enrollment.filter((entry) => entry.activeFactors.length === 0);
+  const weakOnly = enrollment.filter((entry) => entry.activeFactors.length > 0 && !entry.phishingResistant);
+  recordOktaDecisionFacts("OKTA-ADMIN-004", {
+    readable: !privilegedInventoryUnavailable && factorsReadCount > 0,
+    complete: completeOktaDatasets(data.usersWithRoleAssignments, data.privilegedUserFactors),
+    privileged_user_count: privilegedUsers.length,
+    inspected_user_count: enrollment.length,
+    unenrolled_count: unenrolled.length,
+    weak_factor_count: weakOnly.length,
+  });
   const factorEvidenceToCollect =
     "For each administrator, open Directory > People > Security and record enrolled ACTIVE factors.";
   if (privilegedInventoryUnavailable) {
@@ -4366,18 +4514,6 @@ export function assessOktaAdminAccess(
       ),
     );
   } else {
-    const enrollment = privilegedUsers
-      .filter((entry) => factorMap[entry.userId] !== undefined)
-      .map((entry) => {
-        const activeFactors = (factorMap[entry.userId] ?? []).filter(isActiveRecord);
-        return {
-          login: userLogin(entry.user),
-          activeFactors,
-          phishingResistant: activeFactors.some(isPhishingResistantFactor),
-        };
-      });
-    const unenrolled = enrollment.filter((entry) => entry.activeFactors.length === 0);
-    const weakOnly = enrollment.filter((entry) => entry.activeFactors.length > 0 && !entry.phishingResistant);
     const partialData = Boolean(data.privilegedUserFactors.error) || Boolean(data.privilegedUserFactors.truncated);
     const baseStatus: OktaFindingStatus = unenrolled.length > 0 ? "Fail" : weakOnly.length > 0 ? "Partial" : "Pass";
     findings.push(
@@ -4424,6 +4560,15 @@ export function assessOktaAdminAccess(
   }, {});
   const attentionStatuses = ["SUSPENDED", "LOCKED_OUT", "PASSWORD_EXPIRED", "RECOVERY", "UNKNOWN"];
   const attentionCount = attentionStatuses.reduce((total, status) => total + (statusCounts[status] ?? 0), 0);
+  recordOktaDecisionFacts("OKTA-ADMIN-005", {
+    readable: !data.users.error,
+    complete: completeOktaDatasets(data.users),
+    user_count: users.length,
+    stale_active_count: staleActiveUsers.length,
+    never_activated_count: neverActivatedUsers.length,
+    unknown_activity_count: neverSignedInUsers.length,
+    attention_state_count: attentionCount,
+  });
   if (data.users.error) {
     findings.push(
       manualForDataset("OKTA-ADMIN-005", "Workforce account lifecycle hygiene", data.users, userInventoryEvidence),
@@ -4478,6 +4623,13 @@ export function assessOktaAdminAccess(
   const thirdPartyAdmin = thirdParty?.thirdPartyAdmin;
   const supportEvidence =
     "Record Settings > Account > Okta Support access (state and expiration) and Settings > Account > Third-party administrators.";
+  recordOktaDecisionFacts("OKTA-ADMIN-006", {
+    support_readable: !supportError,
+    third_party_readable: !thirdPartyError,
+    support_present: Boolean(support),
+    support_state: supportState ?? "",
+    third_party_admin: thirdPartyAdmin ?? null,
+  });
   if (supportError) {
     findings.push(
       manualFinding(
@@ -4571,12 +4723,14 @@ export function assessOktaAdminAccess(
     ),
     snapshotSummary,
   };
+  });
 }
 
 export function assessOktaIntegrations(
   data: OktaIntegrationData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const trustedOrigins = data.trustedOrigins.data.map((origin) => {
     const originUrl =
@@ -4594,6 +4748,12 @@ export function assessOktaIntegrations(
   const activeOrigins = trustedOrigins.filter((origin) => origin.active);
   const insecureOrigins = activeOrigins.filter((origin) => origin.insecure);
   const inactiveInsecureOrigins = trustedOrigins.filter((origin) => !origin.active && origin.insecure);
+  recordOktaDecisionFacts("OKTA-INTEG-001", {
+    readable: !data.trustedOrigins.error,
+    complete: completeOktaDatasets(data.trustedOrigins),
+    active_origin_count: activeOrigins.length,
+    insecure_active_count: insecureOrigins.length,
+  });
 
   if (data.trustedOrigins.error) {
     findings.push(
@@ -4633,6 +4793,12 @@ export function assessOktaIntegrations(
   const customZones = activeZones.filter(
     (zone) => !Boolean(zone.system) && !/legacyipzone/i.test(asString(zone.name) ?? ""),
   );
+  recordOktaDecisionFacts("OKTA-INTEG-002", {
+    readable: !data.networkZones.error,
+    complete: completeOktaDatasets(data.networkZones),
+    zone_count: data.networkZones.data.length,
+    custom_zone_count: customZones.length,
+  });
   if (data.networkZones.error) {
     findings.push(
       manualForDataset(
@@ -4689,6 +4855,13 @@ export function assessOktaIntegrations(
     "Export Applications > Applications and record each app, its status, and OIDC grant types.";
   const emptyAppCause =
     "the Apps API returned zero applications although Okta always exposes its built-in Admin Console and Dashboard apps, so the inventory is incomplete";
+  recordOktaDecisionFacts("OKTA-INTEG-003", {
+    readable: !data.apps.error,
+    complete: completeOktaDatasets(data.apps),
+    app_count: apps.length,
+    risky_active_count: riskyApps.length,
+    risky_inactive_count: riskyInactiveApps.length,
+  });
   if (data.apps.error) {
     findings.push(manualForDataset("OKTA-INTEG-003", "OIDC grant hygiene", data.apps, appInventoryEvidence));
   } else if (apps.length === 0) {
@@ -4724,6 +4897,18 @@ export function assessOktaIntegrations(
   const signOnRules = activeRulesFor(data.signOnPolicies.data, data.signOnPolicyRules.data);
   const accessRules = activeRulesFor(data.accessPolicies.data, data.accessPolicyRules.data);
   const riskAwareRules = [...signOnRules, ...accessRules].filter(appUsesRiskSignal);
+  recordOktaDecisionFacts("OKTA-INTEG-004", {
+    policy_readable: !(data.signOnPolicies.error && data.accessPolicies.error),
+    complete: policyErrors.length === 0 && untruncatedOktaDatasets(
+      data.signOnPolicies,
+      data.signOnPolicyRules,
+      data.accessPolicies,
+      data.accessPolicyRules,
+      data.networkZones,
+    ),
+    risk_aware_rule_count: riskAwareRules.length,
+    custom_zone_count: customZones.length,
+  });
   if (data.signOnPolicies.error && data.accessPolicies.error) {
     findings.push(
       manualFinding(
@@ -4758,6 +4943,12 @@ export function assessOktaIntegrations(
     );
   }
 
+  recordOktaDecisionFacts("OKTA-INTEG-005", {
+    readable: !data.apps.error,
+    complete: completeOktaDatasets(data.apps),
+    app_count: apps.length,
+    inactive_app_count: inactiveApps.length,
+  });
   if (data.apps.error) {
     findings.push(manualForDataset("OKTA-INTEG-005", "Application inventory hygiene", data.apps, appInventoryEvidence));
   } else if (apps.length === 0) {
@@ -4795,6 +4986,13 @@ export function assessOktaIntegrations(
     normalizeStringArray(app.features).some((feature) => feature.toUpperCase() === "PUSH_USER_DEACTIVATION"),
   );
   const activeGroupRules = data.groupRules.data.filter(isActiveRecord);
+  recordOktaDecisionFacts("OKTA-INTEG-006", {
+    readable: !data.apps.error,
+    complete: completeOktaDatasets(data.apps, data.groupRules),
+    app_count: apps.length,
+    provisioning_app_count: provisioningApps.length,
+    deactivation_app_count: deactivationApps.length,
+  });
   if (data.apps.error) {
     findings.push(
       manualForDataset(
@@ -4879,6 +5077,7 @@ export function assessOktaIntegrations(
     ),
     snapshotSummary,
   };
+  });
 }
 
 function threatInsightMode(threatInsight: JsonRecord | null): string {
@@ -4899,11 +5098,21 @@ export function assessOktaMonitoring(
   data: OktaMonitoringData,
   config: OktaResolvedConfig,
 ): OktaAssessmentResult {
+  return runBatchVerdictContext(OKTA_DECISION_CONTEXT, OKTA_SPEC, () => {
   const findings: OktaFinding[] = [];
   const activeHooks = data.eventHooks.data.filter(isActiveRecord);
   const activeStreams = data.logStreams.data.filter(isActiveRecord);
   const logExportEvidence =
     "Record Reports > Log Streaming destinations and Workflow > Event Hooks, plus the SIEM ingestion proof for Okta System Log events.";
+  recordOktaDecisionFacts("OKTA-MON-001", {
+    streams_readable: !data.logStreams.error,
+    hooks_readable: !data.eventHooks.error,
+    complete: !data.logStreams.error
+      && !data.eventHooks.error
+      && untruncatedOktaDatasets(data.logStreams, data.eventHooks),
+    active_stream_count: activeStreams.length,
+    active_hook_count: activeHooks.length,
+  });
 
   if (data.logStreams.error && data.eventHooks.error) {
     findings.push(
@@ -4945,6 +5154,11 @@ export function assessOktaMonitoring(
     );
   }
 
+  recordOktaDecisionFacts("OKTA-MON-002", {
+    readable: !data.systemLogs.error,
+    complete: completeOktaDatasets(data.systemLogs),
+    event_count: data.systemLogs.data.length,
+  });
   if (data.systemLogs.error) {
     findings.push(
       manualForDataset(
@@ -4982,6 +5196,11 @@ export function assessOktaMonitoring(
   }
 
   const insightMode = threatInsightMode(data.threatInsight.data);
+  recordOktaDecisionFacts("OKTA-MON-003", {
+    readable: !data.threatInsight.error,
+    configuration_present: Boolean(data.threatInsight.data),
+    mode: insightMode,
+  });
   if (data.threatInsight.error) {
     findings.push(
       manualForDataset(
@@ -5017,6 +5236,11 @@ export function assessOktaMonitoring(
     );
   }
 
+  recordOktaDecisionFacts("OKTA-MON-004", {
+    readable: !data.behaviors.error,
+    complete: completeOktaDatasets(data.behaviors),
+    active_behavior_count: data.behaviors.data.filter(isActiveRecord).length,
+  });
   if (data.behaviors.error) {
     findings.push(
       manualForDataset(
@@ -5058,6 +5282,14 @@ export function assessOktaMonitoring(
   const undatedTokens = tokenAges.filter((entry) => entry.days === null);
   const emptyTokenSsws =
     "the token listing returned zero tokens although the SSWS audit token itself should appear, so the inventory is incomplete";
+  recordOktaDecisionFacts("OKTA-MON-005", {
+    readable: !data.apiTokens.error,
+    complete: completeOktaDatasets(data.apiTokens),
+    token_count: tokens.length,
+    ssws_auth: config.authMode === "SSWS",
+    stale_count: staleTokens.length,
+    undated_count: undatedTokens.length,
+  });
   if (data.apiTokens.error) {
     findings.push(manualForDataset("OKTA-MON-005", "API token hygiene", data.apiTokens, tokenEvidence));
   } else if (tokens.length === 0 && config.authMode === "SSWS") {
@@ -5093,6 +5325,11 @@ export function assessOktaMonitoring(
     );
   }
 
+  recordOktaDecisionFacts("OKTA-MON-006", {
+    readable: !data.deviceAssurance.error,
+    complete: completeOktaDatasets(data.deviceAssurance),
+    policy_count: data.deviceAssurance.data.length,
+  });
   if (data.deviceAssurance.error) {
     findings.push(
       manualForDataset(
@@ -5140,6 +5377,16 @@ export function assessOktaMonitoring(
   const unrestrictedTokens = tokenGovernance.filter((entry) => entry.connection !== "ZONE");
   const missingExpiryTokens = tokenGovernance.filter((entry) => entry.missingExpiry);
   const longWindowTokens = tokenGovernance.filter((entry) => entry.longWindow);
+  recordOktaDecisionFacts("OKTA-MON-007", {
+    readable: !data.apiTokens.error,
+    complete: completeOktaDatasets(data.apiTokens),
+    token_count: tokens.length,
+    ssws_auth: config.authMode === "SSWS",
+    expired_count: expiredTokens.length,
+    unrestricted_count: unrestrictedTokens.length,
+    missing_expiry_count: missingExpiryTokens.length,
+    long_window_count: longWindowTokens.length,
+  });
   if (data.apiTokens.error) {
     findings.push(
       manualForDataset("OKTA-MON-007", "API token expiry and network restrictions", data.apiTokens, tokenEvidence),
@@ -5189,6 +5436,18 @@ export function assessOktaMonitoring(
   );
   const contactEvidence =
     "Record Settings > Account > Technical contact and Billing contact, confirming each maps to an ACTIVE administrator.";
+  const technicalStatus = (asString(technicalContact?.userStatus) ?? "").toUpperCase();
+  const technicalUserId = asString(technicalContact?.userId);
+  const technicalLookupFailed = !technicalContact && /\bTECHNICAL\b/.test(data.orgContacts.error ?? "");
+  recordOktaDecisionFacts("OKTA-MON-008", {
+    readable: !(data.orgContacts.error && contacts.length === 0),
+    complete: completeOktaDatasets(data.orgContacts),
+    contact_count: contacts.length,
+    technical_contact_present: Boolean(technicalContact),
+    technical_user_assigned: Boolean(technicalUserId),
+    technical_user_state: technicalStatus,
+    technical_lookup_failed: technicalLookupFailed,
+  });
   if (data.orgContacts.error && contacts.length === 0) {
     findings.push(manualForDataset("OKTA-MON-008", "Security contact routing", data.orgContacts, contactEvidence));
   } else if (contacts.length === 0) {
@@ -5201,10 +5460,7 @@ export function assessOktaMonitoring(
       ),
     );
   } else {
-    const technicalStatus = (asString(technicalContact?.userStatus) ?? "").toUpperCase();
-    const technicalUserId = asString(technicalContact?.userId);
     // A failed TECHNICAL lookup drops the contact from the resolved list, which is a permission gap, not a missing assignment.
-    const technicalLookupFailed = !technicalContact && /\bTECHNICAL\b/.test(data.orgContacts.error ?? "");
     const baseStatus: OktaFindingStatus = technicalLookupFailed
       ? "Partial"
       : !technicalContact || !technicalUserId
@@ -5239,6 +5495,7 @@ export function assessOktaMonitoring(
     );
   }
 
+  recordOktaDecisionFacts("OKTA-MON-009", {});
   findings.push(
     buildFinding(
       "OKTA-MON-009",
@@ -5296,6 +5553,7 @@ export function assessOktaMonitoring(
     ),
     snapshotSummary,
   };
+  });
 }
 
 
@@ -5910,6 +6168,7 @@ function buildExportText(config: OktaResolvedConfig, result: OktaAuditBundleResu
 }
 
 export function registerOktaTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, OKTA_SPEC);
   const authParams = {
     org_url: Type.Optional(
       Type.String({

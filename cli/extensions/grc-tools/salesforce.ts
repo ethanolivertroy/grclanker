@@ -6,6 +6,7 @@
  * Uses the REST API (SOQL), the Tooling API, and the Metadata API readMetadata
  * call. Nothing in this module mutates the org.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createSign } from "node:crypto";
 import {
   createWriteStream,
@@ -19,7 +20,10 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import { readResolverEnvironment, SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+import { hydrateBatchFrameworkMappings, runBatchVerdictContext, withIntegrationToolContracts } from "./batch-spec-builder.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
+import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -267,6 +271,20 @@ const CONTROLS: ControlDefinition[] = [
   { control: 19, title: "Clickjack protection", mappings: { FedRAMP: "SC-18", CMMC: "L2 SC.L2-3.13.1", "SOC 2": "CC6.1", CIS: "7.1", "PCI-DSS": "6.2.4", STIG: "SRG-APP-000516", IRAP: "ISM-1486", ISMAP: "6.2.4" } },
   { control: 20, title: "CSRF protection", mappings: { FedRAMP: "SC-18", CMMC: "L2 SC.L2-3.13.1", "SOC 2": "CC6.1", CIS: "7.2", "PCI-DSS": "6.2.4", STIG: "SRG-APP-000516", IRAP: "ISM-1486", ISMAP: "6.2.4" } },
 ];
+
+hydrateBatchFrameworkMappings(SALESFORCE_SPEC, Object.fromEntries(CONTROLS.map((control) => [
+  `SF-${String(control.control).padStart(2, "0")}`,
+  {
+    fedramp: control.mappings.FedRAMP.split(",").map((value) => value.trim()),
+    cmmc: [control.mappings.CMMC],
+    soc2: [control.mappings["SOC 2"]],
+    cis: [control.mappings.CIS],
+    pci_dss: [control.mappings["PCI-DSS"]],
+    disa_stig: [control.mappings.STIG],
+    irap: [control.mappings.IRAP],
+    ismap: [control.mappings.ISMAP],
+  },
+])));
 
 const FRAMEWORK_REPORTS: Array<{ framework: SalesforceFramework; path: string; title: string }> = [
   { framework: "FedRAMP", path: "compliance/fedramp/fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },
@@ -987,6 +1005,7 @@ export function resolveSalesforceConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): SalesforceResolvedConfig {
+  env = readResolverEnvironment(SALESFORCE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const credentialsPath = asString(input.credentials_file) ?? asString(env.SF_CREDENTIALS_FILE);
   const file = credentialsPath ? readCredentialsFile(credentialsPath) : {};
@@ -1860,8 +1879,9 @@ function finding(
   manualEvidence?: string,
 ): SalesforceFinding {
   const definition = controlDefinition(control);
+  const id = `SF-${String(control).padStart(2, "0")}`;
   return {
-    id: `SF-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title: definition.title,
     severity: severityFor(control),
@@ -1871,6 +1891,15 @@ function finding(
     mappings: mappingsFor(control),
     manualEvidence,
   };
+}
+
+const SALESFORCE_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
+
+function recordSalesforceDecisionFacts(control: number, facts: Readonly<Record<string, unknown>>): void {
+  const id = `SF-${String(control).padStart(2, "0")}`;
+  const store = SALESFORCE_DECISION_CONTEXT.getStore();
+  if (!store) throw new Error(`${id} decision facts were recorded outside a Salesforce assessment`);
+  store.set(id, facts);
 }
 
 function manualForUnreadable(control: number, dataset: SalesforceDataset<unknown>, manualEvidence: string, evidence: JsonRecord = {}): SalesforceFinding {
@@ -2158,7 +2187,7 @@ export async function collectSalesforcePlatformData(client: ReadClient, options:
   return { organization, healthCheck, healthCheckRisks, securitySettings, myDomainSettings, profiles, profileMetadata, instanceUrl };
 }
 
-export function assessSalesforcePlatformData(data: SalesforcePlatformData): SalesforceAssessmentResult {
+function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatformData): SalesforceAssessmentResult {
   const findings: SalesforceFinding[] = [];
   const settings = data.securitySettings.data ?? {};
   const session = asObject(settings.sessionSettings) ?? {};
@@ -2169,13 +2198,21 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
   const isSandbox = asBoolean(data.organization.data?.IsSandbox);
 
   const score = asNumber(data.healthCheck.data?.Score);
+  const highRisks = risks.filter((risk) => asString(risk.RiskType) === "HIGH_RISK");
+  const mediumRisks = risks.filter((risk) => asString(risk.RiskType) === "MEDIUM_RISK");
+  recordSalesforceDecisionFacts(1, {
+    health_readable: data.healthCheck.status === "ok",
+    score_present: score !== undefined,
+    risks_readable: data.healthCheckRisks.status === "ok",
+    risks_complete: data.healthCheckRisks.status === "ok" && !data.healthCheckRisks.truncated,
+    score,
+    high_risk_count: highRisks.length,
+  });
   if (data.healthCheck.status !== "ok") {
     findings.push(manualForUnreadable(1, data.healthCheck, "Setup > Security > Health Check: record the score and export the risk list.", { requires: "View Setup and Configuration, View Health Check" }));
   } else if (score === undefined) {
     findings.push(finding(1, "manual", "SecurityHealthCheck returned no Score value; the Health Check page may not have been generated yet.", { record: data.healthCheck.data ?? null }, "Setup > Security > Health Check: open the page so a score is generated, then record it."));
   } else {
-    const highRisks = risks.filter((risk) => asString(risk.RiskType) === "HIGH_RISK");
-    const mediumRisks = risks.filter((risk) => asString(risk.RiskType) === "MEDIUM_RISK");
     const risksReadable = data.healthCheckRisks.status === "ok";
     const status: SalesforceFindingStatus = !risksReadable ? "manual" : score >= 90 && highRisks.length === 0 ? withPartialDowngrade("pass", data.healthCheckRisks) : score >= 70 ? "warn" : "fail";
     findings.push(finding(
@@ -2196,13 +2233,20 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
   }
 
   const sessionManual = "Setup > Security > Session Settings: record Timeout value, Force logout on session timeout, and Lock sessions to the IP address from which they originated.";
+  const timeoutName = metadataString(session.sessionTimeout);
+  const timeoutMinutes = timeoutName ? SESSION_TIMEOUT_MINUTES[timeoutName] : undefined;
+  const forceLogout = metadataBoolean(session.forceLogoutOnSessionTimeout);
+  const lockToIp = metadataBoolean(session.lockSessionsToIp);
+  recordSalesforceDecisionFacts(2, {
+    settings_readable: settingsReadable,
+    required_fields_present: timeoutMinutes !== undefined && forceLogout !== undefined,
+    timeout_minutes: timeoutMinutes,
+    force_logout: forceLogout,
+    lock_to_ip: lockToIp,
+  });
   if (!settingsReadable) {
     findings.push(manualForUnreadable(2, data.securitySettings, sessionManual, { requires: "Modify Metadata Through Metadata API Functions or Modify All Data" }));
   } else {
-    const timeoutName = metadataString(session.sessionTimeout);
-    const timeoutMinutes = timeoutName ? SESSION_TIMEOUT_MINUTES[timeoutName] : undefined;
-    const forceLogout = metadataBoolean(session.forceLogoutOnSessionTimeout);
-    const lockToIp = metadataBoolean(session.lockSessionsToIp);
     const evidence = { session_timeout: timeoutName ?? null, session_timeout_minutes: timeoutMinutes ?? null, force_logout_on_session_timeout: forceLogout ?? null, lock_sessions_to_ip: lockToIp ?? null };
     if (timeoutMinutes === undefined || forceLogout === undefined) {
       findings.push(finding(2, "manual", `SecuritySettings.sessionSettings did not expose a recognized sessionTimeout (${timeoutName ?? "absent"}) or forceLogoutOnSessionTimeout (${forceLogout ?? "absent"}), so the session policy cannot be confirmed.`, evidence, sessionManual));
@@ -2214,15 +2258,27 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
   }
 
   const passwordManual = "Setup > Security > Password Policies: record minimum length, complexity, expiration, history, lockout attempts, and lockout period.";
+  const minimumLength = asNumber(passwords.minimumPasswordLength);
+  const complexity = metadataString(passwords.complexity);
+  const expirationName = metadataString(passwords.expiration);
+  const expirationDays = expirationName === "Never" ? Number.POSITIVE_INFINITY : expirationName ? PASSWORD_EXPIRATION_DAYS[expirationName] : undefined;
+  const history = asNumber(passwords.historyRestriction);
+  const maxAttempts = metadataString(passwords.maxLoginAttempts);
+  const passwordGapCount = minimumLength === undefined || complexity === undefined || expirationDays === undefined || history === undefined
+    ? 0
+    : Number(minimumLength < 12)
+      + Number((PASSWORD_COMPLEXITY_RANK[complexity] ?? 0) < 3)
+      + Number(expirationDays > 90)
+      + Number(history < 12)
+      + Number(maxAttempts === "NoLimit");
+  recordSalesforceDecisionFacts(3, {
+    settings_readable: settingsReadable,
+    required_fields_present: minimumLength !== undefined && complexity !== undefined && expirationDays !== undefined && history !== undefined,
+    gap_count: passwordGapCount,
+  });
   if (!settingsReadable) {
     findings.push(manualForUnreadable(3, data.securitySettings, passwordManual));
   } else {
-    const minimumLength = asNumber(passwords.minimumPasswordLength);
-    const complexity = metadataString(passwords.complexity);
-    const expirationName = metadataString(passwords.expiration);
-    const expirationDays = expirationName === "Never" ? Number.POSITIVE_INFINITY : expirationName ? PASSWORD_EXPIRATION_DAYS[expirationName] : undefined;
-    const history = asNumber(passwords.historyRestriction);
-    const maxAttempts = metadataString(passwords.maxLoginAttempts);
     const lockout = metadataString(passwords.lockoutInterval);
     const evidence = { minimum_password_length: minimumLength ?? null, complexity: complexity ?? null, expiration: expirationName ?? null, history_restriction: history ?? null, max_login_attempts: maxAttempts ?? null, lockout_interval: lockout ?? null };
     if (minimumLength === undefined || complexity === undefined || expirationDays === undefined || history === undefined) {
@@ -2239,17 +2295,30 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
   }
 
   const ipManual = "Setup > Security > Network Access: record trusted IP ranges; then Setup > Profiles > (each sensitive profile) > Login IP Ranges: confirm ranges are defined.";
+  const rawRanges = network.ipRanges;
+  const ranges = asRecords(Array.isArray(rawRanges) ? rawRanges : rawRanges ? [rawRanges] : []);
+  const enforceEveryRequest = metadataBoolean(session.enforceIpRangesEveryRequest);
+  const profileIssue = profileMetadataIssue(data.profiles, data.profileMetadata);
+  const profileView = profileMetadataView(data.profileMetadata);
+  const withRanges = profileView.resolved.filter((record) => loginIpRangeCount(record) > 0);
+  const withoutRanges = profileView.resolved.filter((record) => loginIpRangeCount(record) === 0);
+  recordSalesforceDecisionFacts(5, {
+    settings_readable: settingsReadable,
+    profiles_readable: data.profiles.status === "ok",
+    profile_count: data.profiles.data.length,
+    admin_profile_count: data.profiles.data.filter(isAdminProfile).length,
+    profile_metadata_readable: data.profileMetadata.status === "ok",
+    resolved_profile_count: profileView.resolved.length,
+    profiles_with_ranges_count: withRanges.length,
+    org_range_count: ranges.length,
+    profile_complete: profileView.complete,
+    enforce_every_request: enforceEveryRequest,
+  });
   if (!settingsReadable) {
     findings.push(manualForUnreadable(5, data.securitySettings, ipManual));
   } else {
-    const rawRanges = network.ipRanges;
-    const ranges = asRecords(Array.isArray(rawRanges) ? rawRanges : rawRanges ? [rawRanges] : []);
-    const enforceEveryRequest = metadataBoolean(session.enforceIpRangesEveryRequest);
     const orgWide = `${ranges.length} org-wide trusted IP ranges are defined in SecuritySettings.networkAccess and enforceIpRangesEveryRequest=${enforceEveryRequest ?? "absent"}`;
-    const profileIssue = profileMetadataIssue(data.profiles, data.profileMetadata);
-    const view = profileMetadataView(data.profileMetadata);
-    const withRanges = view.resolved.filter((record) => loginIpRangeCount(record) > 0);
-    const withoutRanges = view.resolved.filter((record) => loginIpRangeCount(record) === 0);
+    const view = profileView;
     const evidence = {
       trusted_ip_ranges: ranges.length,
       ranges: truncateList(ranges.map((range) => `${asString(range.start) ?? "?"}-${asString(range.end) ?? "?"}`)),
@@ -2280,13 +2349,20 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
 
   const domainManual = "Setup > My Domain > Policies: confirm 'Prevent login from https://login.salesforce.com' and 'Require My Domain for API logins' are enabled.";
   const myDomain = data.myDomainSettings.data ?? {};
+  const preventLegacyLogin = metadataBoolean(myDomain.canOnlyLoginWithMyDomainUrl);
+  const requireDomainForApi = metadataBoolean(myDomain.doesApiLoginRequireOrgDomain);
+  const domainName = metadataString(myDomain.myDomainName);
+  const hasMyDomain = Boolean(domainName) || /\.my\.salesforce\.com/i.test(data.instanceUrl ?? "");
+  recordSalesforceDecisionFacts(18, {
+    readable: data.myDomainSettings.status === "ok",
+    has_my_domain: hasMyDomain,
+    can_only_login_with_my_domain_url_present: preventLegacyLogin !== undefined,
+    prevent_legacy_login: preventLegacyLogin,
+    require_domain_for_api: requireDomainForApi,
+  });
   if (data.myDomainSettings.status !== "ok") {
     findings.push(manualForUnreadable(18, data.myDomainSettings, domainManual, { instance_url: data.instanceUrl ?? null }));
   } else {
-    const preventLegacyLogin = metadataBoolean(myDomain.canOnlyLoginWithMyDomainUrl);
-    const requireDomainForApi = metadataBoolean(myDomain.doesApiLoginRequireOrgDomain);
-    const domainName = metadataString(myDomain.myDomainName);
-    const hasMyDomain = Boolean(domainName) || /\.my\.salesforce\.com/i.test(data.instanceUrl ?? "");
     const evidence = { my_domain_name: domainName ?? null, instance_url: data.instanceUrl ?? null, can_only_login_with_my_domain_url: preventLegacyLogin ?? null, does_api_login_require_org_domain: requireDomainForApi ?? null, is_sandbox: isSandbox ?? null };
     if (!hasMyDomain) {
       findings.push(finding(18, "fail", "No My Domain name was exposed by MyDomainSettings and the instance URL is not a My Domain host.", evidence));
@@ -2300,15 +2376,25 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
   }
 
   const clickjackManual = "Setup > Security > Session Settings > Clickjack Protection: confirm all four clickjack options are enabled.";
+  const clickjackFlags = {
+    enable_clickjack_setup: metadataBoolean(session.enableClickjackSetup),
+    enable_clickjack_nonsetup_sfdc: metadataBoolean(session.enableClickjackNonsetupSFDC),
+    enable_clickjack_nonsetup_user: metadataBoolean(session.enableClickjackNonsetupUser),
+    enable_clickjack_nonsetup_user_headerless: metadataBoolean(session.enableClickjackNonsetupUserHeaderless),
+  };
+  const clickjackDisabled = Object.entries(clickjackFlags).filter(([, value]) => value === false).map(([key]) => key);
+  recordSalesforceDecisionFacts(19, {
+    settings_readable: settingsReadable,
+    setup_flag: clickjackFlags.enable_clickjack_setup,
+    nonsetup_sfdc_flag: clickjackFlags.enable_clickjack_nonsetup_sfdc,
+    nonsetup_user_flag: clickjackFlags.enable_clickjack_nonsetup_user,
+    nonsetup_user_headerless_flag: clickjackFlags.enable_clickjack_nonsetup_user_headerless,
+    disabled_count: clickjackDisabled.length,
+  });
   if (!settingsReadable) {
     findings.push(manualForUnreadable(19, data.securitySettings, clickjackManual));
   } else {
-    const flags = {
-      enable_clickjack_setup: metadataBoolean(session.enableClickjackSetup),
-      enable_clickjack_nonsetup_sfdc: metadataBoolean(session.enableClickjackNonsetupSFDC),
-      enable_clickjack_nonsetup_user: metadataBoolean(session.enableClickjackNonsetupUser),
-      enable_clickjack_nonsetup_user_headerless: metadataBoolean(session.enableClickjackNonsetupUserHeaderless),
-    };
+    const flags = clickjackFlags;
     const values = Object.values(flags);
     const disabled = Object.entries(flags).filter(([, value]) => value === false).map(([key]) => key);
     const missing = Object.entries(flags).filter(([, value]) => value === undefined).map(([key]) => key);
@@ -2322,11 +2408,16 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
   }
 
   const csrfManual = "Setup > Security > Session Settings > Cross-Site Request Forgery (CSRF) Protection: confirm GET and POST protection are enabled.";
+  const csrfGet = metadataBoolean(session.enableCSRFOnGet);
+  const csrfPost = metadataBoolean(session.enableCSRFOnPost);
+  recordSalesforceDecisionFacts(20, {
+    settings_readable: settingsReadable,
+    get_enabled: csrfGet,
+    post_enabled: csrfPost,
+  });
   if (!settingsReadable) {
     findings.push(manualForUnreadable(20, data.securitySettings, csrfManual));
   } else {
-    const csrfGet = metadataBoolean(session.enableCSRFOnGet);
-    const csrfPost = metadataBoolean(session.enableCSRFOnPost);
     const evidence = { enable_csrf_on_get: csrfGet ?? null, enable_csrf_on_post: csrfPost ?? null };
     if (csrfGet === true && csrfPost === true) {
       findings.push(finding(20, "pass", "CSRF protection is enabled for GET and POST requests on non-setup pages.", evidence));
@@ -2355,6 +2446,10 @@ export function assessSalesforcePlatformData(data: SalesforcePlatformData): Sale
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.organization, data.healthCheck, data.healthCheckRisks, data.securitySettings, data.myDomainSettings, data.profiles, data.profileMetadata),
   };
+}
+
+export function assessSalesforcePlatformData(data: SalesforcePlatformData): SalesforceAssessmentResult {
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforcePlatformDataWithDecisionContext(data));
 }
 
 export async function assessSalesforcePlatformSecurity(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
@@ -2404,7 +2499,7 @@ function populationIssue(data: SalesforceIdentityData, admins: JsonRecord[]): st
   return undefined;
 }
 
-export function assessSalesforceIdentityData(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
   const findings: SalesforceFinding[] = [];
   const maxAdmins = clampNumber(options.maxAdmins, DEFAULT_MAX_ADMINS, 0, 10_000);
   const users = data.users.data;
@@ -2418,6 +2513,14 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   const adminProfileIds = new Set(adminProfiles.map((profile) => asString(profile.Id) ?? ""));
   const admins = activeUsers.filter((user) => adminProfileIds.has(asString(user.ProfileId) ?? ""));
   const population = populationIssue(data, admins);
+  const populationDecisionFacts = {
+    users_readable: usersReadable,
+    profiles_readable: profilesReadable,
+    user_count: users.length,
+    profile_count: profiles.length,
+    admin_profile_count: adminProfiles.length,
+    admin_count: admins.length,
+  };
   // Counts derived from a dataset that was not read render null rather than the empty fallback's zero.
   const populationEvidence = {
     users_seen: whenOk(data.users.seen, data.users),
@@ -2471,6 +2574,18 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   const capNote = data.twoFactorMethods.truncated
     ? ` TwoFactorMethodsInfo returned ${data.twoFactorMethods.seen} rows, ${capSignal}, so enrollment coverage is incomplete.`
     : "";
+  recordSalesforceDecisionFacts(4, {
+    security_settings_readable: data.securitySettings.status === "ok",
+    mfa_required: mfaRequired,
+    mfa_risk_present: mfaRisk !== undefined,
+    mfa_risk_type: mfaRisk ? asString(mfaRisk.RiskType) : undefined,
+    two_factor_methods_readable: data.twoFactorMethods.status === "ok",
+    ...populationDecisionFacts,
+    active_standard_user_count: standardActiveUsers.length,
+    unenrolled_count: unenrolled.length,
+    enrollment_complete: enrollmentComplete,
+    health_check_risks_readable: data.healthCheckRisks.status === "ok",
+  });
   if (data.securitySettings.status !== "ok" && !mfaRisk) {
     findings.push(finding(4, "manual", `MFA enforcement could not be verified because ${unreadableReason(data.securitySettings)} and Health Check exposed no MFA setting.`, mfaEvidence, mfaManual));
   } else if (mfaRequired === false || mfaRiskMeets === false) {
@@ -2503,16 +2618,27 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
 
   const hoursManual = "Setup > Profiles > (System Administrator and other elevated profiles) > Login Hours: record configured hours or the decision not to restrict them.";
   const hoursIssue = profileMetadataIssue(data.profiles, data.profileMetadata);
+  const hoursView = profileMetadataView(data.profileMetadata);
+  const restricted = hoursView.resolved.filter((record) => loginHoursView(record).unbounded.length === 0);
+  const partiallyRestricted = hoursView.resolved.filter((record) => {
+    const hours = loginHoursView(record);
+    return hours.bounded.length > 0 && hours.unbounded.length > 0;
+  });
+  const unrestricted = hoursView.resolved.filter((record) => loginHoursView(record).bounded.length === 0);
+  recordSalesforceDecisionFacts(6, {
+    profiles_readable: profilesReadable,
+    profile_count: profiles.length,
+    admin_profile_count: adminProfiles.length,
+    profile_metadata_readable: data.profileMetadata.status === "ok",
+    resolved_profile_count: hoursView.resolved.length,
+    fully_restricted_count: restricted.length,
+    partially_restricted_count: partiallyRestricted.length,
+    complete: hoursView.complete,
+  });
   if (hoursIssue) {
     findings.push(finding(6, "manual", `Login hour restrictions could not be verified because ${hoursIssue}.`, { ...populationEvidence, profile_metadata_status: data.profileMetadata.status, profile_metadata_error: data.profileMetadata.error ?? null }, hoursManual));
   } else {
-    const view = profileMetadataView(data.profileMetadata);
-    const restricted = view.resolved.filter((record) => loginHoursView(record).unbounded.length === 0);
-    const partiallyRestricted = view.resolved.filter((record) => {
-      const hours = loginHoursView(record);
-      return hours.bounded.length > 0 && hours.unbounded.length > 0;
-    });
-    const unrestricted = view.resolved.filter((record) => loginHoursView(record).bounded.length === 0);
+    const view = hoursView;
     const evidence = {
       sensitive_profiles: data.profileMetadata.total ?? null,
       sensitive_profiles_read: view.resolved.length,
@@ -2538,15 +2664,20 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
 
   const apiManual = "Setup > Profiles: for each profile with API Enabled, confirm the assigned users require API access; record API Only User profiles.";
   const apiOnlyFlagAvailable = !(data.profiles.omittedFields ?? []).includes("PermissionsApiUserOnly");
+  const apiProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiEnabled) === true);
+  const apiOnlyProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiUserOnly) === true);
+  const usersOnApiProfiles = activeUsers.filter((user) => asBoolean(profileById.get(asString(user.ProfileId) ?? "")?.PermissionsApiEnabled) === true);
+  const ratio = profiles.length > 0 ? apiProfiles.length / profiles.length : 0;
+  const inputsComplete = !data.profiles.truncated && !data.users.truncated;
+  recordSalesforceDecisionFacts(7, {
+    ...populationDecisionFacts,
+    complete: inputsComplete,
+    api_profile_count: apiProfiles.length,
+  });
   if (population) {
     findings.push(populationManual(7, apiManual));
   } else {
-    const apiProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiEnabled) === true);
-    const apiOnlyProfiles = profiles.filter((profile) => asBoolean(profile.PermissionsApiUserOnly) === true);
-    const usersOnApiProfiles = activeUsers.filter((user) => asBoolean(profileById.get(asString(user.ProfileId) ?? "")?.PermissionsApiEnabled) === true);
-    const ratio = profiles.length > 0 ? apiProfiles.length / profiles.length : 0;
     // A ratio over a truncated profile list is a sample, and an absent API Only profile is an absence claim over the unread rows.
-    const inputsComplete = !data.profiles.truncated && !data.users.truncated;
     const evidence = {
       profiles: profiles.length,
       profiles_total: data.profiles.total ?? null,
@@ -2570,6 +2701,23 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
 
   const permSetManual = "Setup > Permission Sets: filter by Modify All Data, View All Data, Manage Users, and Author Apex; export the assignment list and confirm each assignee is justified.";
   const permissionSets = data.permissionSets.data;
+  const elevated = permissionSets.map((set) => ({ set, perms: hasElevatedPermission(set) })).filter((item) => item.perms.length > 0);
+  const assignmentsReadable = data.assignments.status === "ok";
+  const elevatedIds = new Set(elevated.map((item) => asString(item.set.Id) ?? ""));
+  const elevatedAssignments = data.assignments.data.filter((assignment) => elevatedIds.has(asString(assignment.PermissionSetId) ?? ""));
+  const activeElevatedAssignments = elevatedAssignments.filter((assignment) => asBoolean(asObject(assignment.Assignee)?.IsActive) !== false);
+  const assignees = new Set(activeElevatedAssignments.map((assignment) => asString(assignment.AssigneeId) ?? ""));
+  recordSalesforceDecisionFacts(9, {
+    sets_readable: data.permissionSets.status === "ok",
+    ...populationDecisionFacts,
+    set_count: permissionSets.length,
+    elevated_set_count: elevated.length,
+    assignments_readable: assignmentsReadable,
+    complete: !data.permissionSets.truncated
+      && (elevated.length === 0 || assignmentsReadable && !data.assignments.truncated),
+    assignee_count: assignees.size,
+    max_admins: maxAdmins,
+  });
   if (data.permissionSets.status !== "ok") {
     findings.push(manualForUnreadable(9, data.permissionSets, permSetManual));
   } else if (population) {
@@ -2577,12 +2725,6 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   } else if (permissionSets.length === 0) {
     findings.push(finding(9, "manual", "Zero permission sets were returned; even orgs without custom permission sets expose standard ones, so this indicates a permission-limited view.", { permission_sets: 0 }, permSetManual));
   } else {
-    const elevated = permissionSets.map((set) => ({ set, perms: hasElevatedPermission(set) })).filter((item) => item.perms.length > 0);
-    const assignmentsReadable = data.assignments.status === "ok";
-    const elevatedIds = new Set(elevated.map((item) => asString(item.set.Id) ?? ""));
-    const elevatedAssignments = data.assignments.data.filter((assignment) => elevatedIds.has(asString(assignment.PermissionSetId) ?? ""));
-    const activeElevatedAssignments = elevatedAssignments.filter((assignment) => asBoolean(asObject(assignment.Assignee)?.IsActive) !== false);
-    const assignees = new Set(activeElevatedAssignments.map((assignment) => asString(assignment.AssigneeId) ?? ""));
     const evidence = {
       permission_sets: permissionSets.length,
       elevated_permission_sets: truncateList(elevated.map((item) => `${asString(item.set.Name) ?? ""} [${item.perms.join(", ")}]`)),
@@ -2604,16 +2746,23 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   }
 
   const adminManual = "Setup > Users: filter by System Administrator profile and export the list; confirm each administrator is justified.";
+  const adminNow = options.now ?? new Date();
+  const staleDays = clampNumber(options.staleLoginDays, DEFAULT_STALE_LOGIN_DAYS, 1, 3650);
+  const adminsWithoutLogin = admins.filter((user) => asDate(user.LastLoginDate) === undefined);
+  const staleAdmins = admins.filter((user) => {
+    const lastLogin = asDate(user.LastLoginDate);
+    return lastLogin !== undefined && daysBetween(adminNow, lastLogin) > staleDays;
+  });
+  recordSalesforceDecisionFacts(10, {
+    ...populationDecisionFacts,
+    complete: !data.users.truncated && !data.profiles.truncated,
+    max_admins: maxAdmins,
+    stale_admin_count: staleAdmins.length,
+    undated_admin_count: adminsWithoutLogin.length,
+  });
   if (population) {
     findings.push(populationManual(10, adminManual));
   } else {
-    const now = options.now ?? new Date();
-    const staleDays = clampNumber(options.staleLoginDays, DEFAULT_STALE_LOGIN_DAYS, 1, 3650);
-    const adminsWithoutLogin = admins.filter((user) => asDate(user.LastLoginDate) === undefined);
-    const staleAdmins = admins.filter((user) => {
-      const lastLogin = asDate(user.LastLoginDate);
-      return lastLogin !== undefined && daysBetween(now, lastLogin) > staleDays;
-    });
     const evidence = {
       active_users: activeUsers.length,
       admin_profiles: truncateList(adminProfiles.map((profile) => asString(profile.Name) ?? "")),
@@ -2631,15 +2780,21 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   }
 
   const guestManual = "Setup > Sites and Digital Experiences > (each site) > Public Access Settings: confirm guest profiles have no API access, no View All or Modify All permissions, and object access limited to what the site needs.";
+  const guests = users.filter((user) => asString(user.UserType) === "Guest");
+  const activeGuests = guests.filter((user) => asBoolean(user.IsActive) === true);
+  const riskyGuests = activeGuests.filter((user) => {
+    const profile = profileById.get(asString(user.ProfileId) ?? "");
+    return profile !== undefined && (asBoolean(profile.PermissionsApiEnabled) === true || hasElevatedPermission(profile).length > 0);
+  });
+  recordSalesforceDecisionFacts(13, {
+    ...populationDecisionFacts,
+    users_complete: !data.users.truncated,
+    active_guest_count: activeGuests.length,
+    risky_guest_count: riskyGuests.length,
+  });
   if (population) {
     findings.push(populationManual(13, guestManual));
   } else {
-    const guests = users.filter((user) => asString(user.UserType) === "Guest");
-    const activeGuests = guests.filter((user) => asBoolean(user.IsActive) === true);
-    const riskyGuests = activeGuests.filter((user) => {
-      const profile = profileById.get(asString(user.ProfileId) ?? "");
-      return profile !== undefined && (asBoolean(profile.PermissionsApiEnabled) === true || hasElevatedPermission(profile).length > 0);
-    });
     const evidence = {
       guest_users: guests.length,
       active_guest_users: truncateList(activeGuests.map(userLabel)),
@@ -2681,6 +2836,10 @@ export function assessSalesforceIdentityData(data: SalesforceIdentityData, optio
   };
 }
 
+export function assessSalesforceIdentityData(data: SalesforceIdentityData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceIdentityDataWithDecisionContext(data, options));
+}
+
 export async function assessSalesforceIdentityAccess(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
   return assessSalesforceIdentityData(await collectSalesforceIdentityData(client, options), { ...options, now: options.now ?? client.getNow() });
 }
@@ -2699,23 +2858,29 @@ export async function collectSalesforceDataProtectionData(client: ReadClient, op
 const PUBLIC_OWD_VALUES = /^(Edit|Read|ReadWrite|ReadWriteTransfer|ShowDetails|ShowDetailsInsert|HideDetailsInsert|ControlledByLeadOrContact|ControlledByCampaign)$/;
 const STRICT_OWD_VALUES = /^(None|Private|ControlledByParent|HideDetails)$/;
 
-export function assessSalesforceDataProtectionData(data: SalesforceDataProtectionData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+function assessSalesforceDataProtectionDataWithDecisionContext(data: SalesforceDataProtectionData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
   const findings: SalesforceFinding[] = [];
   const now = options.now ?? new Date();
 
   const flsManual = "Setup > Object Manager > (objects holding SSN, payment card, health, or credential data) > Fields > Set Field-Level Security: export which profiles and permission sets can read or edit each sensitive field.";
   const fieldPermissions = data.fieldPermissions.data;
+  const byField = new Map<string, JsonRecord[]>();
+  for (const row of fieldPermissions) {
+    const key = asString(row.Field) ?? "";
+    byField.set(key, [...(byField.get(key) ?? []), row]);
+  }
+  const broad = [...byField.entries()].filter(([, rows]) => rows.length > 5);
+  recordSalesforceDecisionFacts(8, {
+    readable: data.fieldPermissions.status === "ok",
+    complete: data.fieldPermissions.status === "ok" && !data.fieldPermissions.truncated,
+    sensitive_field_count: byField.size,
+    broad_field_count: broad.length,
+  });
   if (data.fieldPermissions.status !== "ok") {
     findings.push(manualForUnreadable(8, data.fieldPermissions, flsManual));
   } else if (fieldPermissions.length === 0) {
     findings.push(finding(8, "manual", `No FieldPermissions rows matched the sensitive-name patterns (${SENSITIVE_FIELD_PATTERNS.length} patterns); sensitive fields may use other names, so classification must be confirmed manually.`, { patterns: SENSITIVE_FIELD_PATTERNS }, flsManual));
   } else {
-    const byField = new Map<string, JsonRecord[]>();
-    for (const row of fieldPermissions) {
-      const key = asString(row.Field) ?? "";
-      byField.set(key, [...(byField.get(key) ?? []), row]);
-    }
-    const broad = [...byField.entries()].filter(([, rows]) => rows.length > 5);
     const editable = fieldPermissions.filter((row) => asBoolean(row.PermissionsEdit) === true);
     const evidence = {
       sensitive_fields: byField.size,
@@ -2730,14 +2895,19 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
 
   const sharingManual = "Setup > Security > Sharing Settings: record organization-wide defaults for every standard and custom object, plus the sharing rules that widen access.";
   const organization = data.organization.data;
+  const owdKeys = ["DefaultAccountAccess", "DefaultContactAccess", "DefaultCaseAccess", "DefaultLeadAccess", "DefaultOpportunityAccess", "DefaultCampaignAccess", "DefaultCalendarAccess", "DefaultPricebookAccess"];
+  const values = owdKeys.map((key) => ({ key, value: asString(organization?.[key]) }));
+  const missing = values.filter((item) => item.value === undefined);
+  const open = values.filter((item) => item.value !== undefined && PUBLIC_OWD_VALUES.test(item.value) && !/^(ReadSelect|Read)$/.test(item.key === "DefaultPricebookAccess" ? item.value : ""));
+  const strict = values.filter((item) => item.value !== undefined && STRICT_OWD_VALUES.test(item.value));
+  recordSalesforceDecisionFacts(12, {
+    readable: data.organization.status === "ok" && organization !== undefined,
+    default_field_count: owdKeys.length - missing.length,
+    open_default_count: open.length,
+  });
   if (data.organization.status !== "ok" || !organization) {
     findings.push(manualForUnreadable(12, data.organization, sharingManual));
   } else {
-    const owdKeys = ["DefaultAccountAccess", "DefaultContactAccess", "DefaultCaseAccess", "DefaultLeadAccess", "DefaultOpportunityAccess", "DefaultCampaignAccess", "DefaultCalendarAccess", "DefaultPricebookAccess"];
-    const values = owdKeys.map((key) => ({ key, value: asString(organization[key]) }));
-    const missing = values.filter((item) => item.value === undefined);
-    const open = values.filter((item) => item.value !== undefined && PUBLIC_OWD_VALUES.test(item.value) && !/^(ReadSelect|Read)$/.test(item.key === "DefaultPricebookAccess" ? item.value : ""));
-    const strict = values.filter((item) => item.value !== undefined && STRICT_OWD_VALUES.test(item.value));
     const evidence = { organization_wide_defaults: Object.fromEntries(values.map((item) => [item.key, item.value ?? null])), open_defaults: open.map((item) => `${item.key}=${item.value}`), strict_defaults: strict.length };
     if (missing.length === owdKeys.length) {
       findings.push(finding(12, "manual", "Organization returned no Default*Access fields, so organization-wide defaults cannot be read.", evidence, sharingManual));
@@ -2750,6 +2920,18 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
 
   const encryptionManual = "Setup > Security > Platform Encryption > Key Management: record active tenant secrets, last rotation dates, and Encryption Policy for sensitive fields (Shield Platform Encryption license required).";
   const secrets = data.tenantSecrets.data;
+  const active = secrets.filter((secret) => asString(secret.Status) === "Active");
+  const dated = active.filter((secret) => asDate(secret.CreatedDate) !== undefined);
+  const undated = active.length - dated.length;
+  const oldest = dated.map((secret) => daysBetween(now, asDate(secret.CreatedDate) as Date)).sort((left, right) => right - left)[0];
+  recordSalesforceDecisionFacts(16, {
+    readable: data.tenantSecrets.status === "ok",
+    complete: data.tenantSecrets.status === "ok" && !data.tenantSecrets.truncated,
+    secret_count: secrets.length,
+    active_count: active.length,
+    undated_active_count: undated,
+    oldest_active_age_days: oldest ?? 0,
+  });
   if (data.tenantSecrets.status === "forbidden" || data.tenantSecrets.status === "unavailable") {
     findings.push(finding(16, "manual", `Shield Platform Encryption is not applicable or not visible: ${unreadableReason(data.tenantSecrets)}. This is a not-applicable or scoped-out result, not a pass.`, { dataset_status: data.tenantSecrets.status, error: data.tenantSecrets.error ?? null }, encryptionManual));
   } else if (data.tenantSecrets.status !== "ok") {
@@ -2760,10 +2942,6 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
   } else if (secrets.length === 0) {
     findings.push(finding(16, "fail", "TenantSecret is readable but no tenant secrets exist, so Shield Platform Encryption has no active keys and no fields are encrypted.", { tenant_secrets: 0 }, encryptionManual));
   } else {
-    const active = secrets.filter((secret) => asString(secret.Status) === "Active");
-    const dated = active.filter((secret) => asDate(secret.CreatedDate) !== undefined);
-    const undated = active.length - dated.length;
-    const oldest = dated.map((secret) => daysBetween(now, asDate(secret.CreatedDate) as Date)).sort((left, right) => right - left)[0];
     const evidence = { tenant_secrets: secrets.length, active_secrets: active.length, active_types: [...new Set(active.map((secret) => asString(secret.Type) ?? ""))], oldest_active_secret_days: oldest ?? null, active_secrets_without_created_date: undated };
     if (active.length === 0) {
       findings.push(finding(16, "fail", `${secrets.length} tenant secrets exist but none are Active.`, evidence, encryptionManual));
@@ -2777,20 +2955,28 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
   const certManual = "Setup > Security > Certificate and Key Management: record each certificate, its expiration, key size, and whether it is CA-signed.";
   const certificates = data.certificates.data;
   const warningDays = clampNumber(options.certificateExpiryWarningDays, DEFAULT_CERT_EXPIRY_WARNING_DAYS, 1, 365);
+  const undatedCerts = certificates.filter((cert) => asDate(cert.ExpirationDate) === undefined);
+  const expired = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() < now.getTime(); });
+  const expiring = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() >= now.getTime() && daysBetween(date, now) <= warningDays; });
+  const weakKeys = certificates.filter((cert) => { const size = asNumber(cert.KeySize); return size !== undefined && size < 2048; });
+  const unknownKeySize = certificates.filter((cert) => asNumber(cert.KeySize) === undefined);
+  const unknownSigning = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === undefined);
+  const exportableKeys = certificates.filter((cert) => asBoolean(cert.OptionsIsPrivateKeyExportable) === true);
+  const pendingChain = certificates.filter((cert) => asBoolean(cert.OptionsIsUnusable) === true);
+  recordSalesforceDecisionFacts(17, {
+    readable: data.certificates.status === "ok",
+    complete: data.certificates.status === "ok" && !data.certificates.truncated,
+    certificate_count: certificates.length,
+    failure_count: expired.length + weakKeys.length,
+    warning_count: expiring.length + undatedCerts.length + unknownKeySize.length + unknownSigning.length + exportableKeys.length + pendingChain.length,
+  });
   if (data.certificates.status !== "ok") {
     findings.push(manualForUnreadable(17, data.certificates, certManual));
   } else if (certificates.length === 0) {
     findings.push(finding(17, "manual", "No certificates were returned from the Certificate object; confirm that SSO, JWT connected apps, and outbound callouts do not rely on unmanaged certificates.", { certificates: 0 }, certManual));
   } else {
-    const undated = certificates.filter((cert) => asDate(cert.ExpirationDate) === undefined);
-    const expired = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() < now.getTime(); });
-    const expiring = certificates.filter((cert) => { const date = asDate(cert.ExpirationDate); return date !== undefined && date.getTime() >= now.getTime() && daysBetween(date, now) <= warningDays; });
-    const weakKeys = certificates.filter((cert) => { const size = asNumber(cert.KeySize); return size !== undefined && size < 2048; });
-    const unknownKeySize = certificates.filter((cert) => asNumber(cert.KeySize) === undefined);
+    const undated = undatedCerts;
     const selfSigned = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === false);
-    const unknownSigning = certificates.filter((cert) => asBoolean(cert.OptionsIsCaSigned) === undefined);
-    const exportableKeys = certificates.filter((cert) => asBoolean(cert.OptionsIsPrivateKeyExportable) === true);
-    const pendingChain = certificates.filter((cert) => asBoolean(cert.OptionsIsUnusable) === true);
     const label = (cert: JsonRecord): string => `${asString(cert.DeveloperName) ?? asString(cert.MasterLabel) ?? "certificate"} (${asString(cert.ExpirationDate) ?? "no expiration date"})`;
     const evidence = {
       certificates: certificates.length,
@@ -2834,6 +3020,10 @@ export function assessSalesforceDataProtectionData(data: SalesforceDataProtectio
   };
 }
 
+export function assessSalesforceDataProtectionData(data: SalesforceDataProtectionData, options: SalesforceAssessmentOptions = {}): SalesforceAssessmentResult {
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceDataProtectionDataWithDecisionContext(data, options));
+}
+
 export async function assessSalesforceDataProtection(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
   return assessSalesforceDataProtectionData(await collectSalesforceDataProtectionData(client, options), { ...options, now: options.now ?? client.getNow() });
 }
@@ -2858,7 +3048,7 @@ function callerPermission(dataset: SalesforceDataset<JsonRecord | undefined>, fi
   return asBoolean(dataset.data[field]);
 }
 
-export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): SalesforceAssessmentResult {
+function assessSalesforceMonitoringDataWithDecisionContext(data: SalesforceMonitoringData): SalesforceAssessmentResult {
   const findings: SalesforceFinding[] = [];
 
   const appManual = "Setup > Apps > Connected Apps > Manage Connected Apps: for each app record Permitted Users, IP Relaxation, Refresh Token Policy, and OAuth scopes; Setup > Connected Apps OAuth Usage: review apps with active tokens.";
@@ -2888,14 +3078,20 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     oauth_tokens_possibly_capped: whenOk(tokensPossiblyCapped, data.oauthTokens),
     oauth_tokens_truncated: whenOk(tokensTruncated, data.oauthTokens),
   };
+  const openApps = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === false);
+  const unknownPolicy = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === undefined);
+  const unboundedRefresh = apps.filter((app) => asNumber(app.RefreshTokenValidityPeriod) === undefined && asBoolean(app.OptionsRefreshTokenValidityMetric) !== true);
+  recordSalesforceDecisionFacts(11, {
+    readable: data.connectedApplications.status === "ok",
+    app_count: apps.length,
+    unknown_policy_count: unknownPolicy.length,
+    open_app_count: openApps.length,
+  });
   if (data.connectedApplications.status !== "ok") {
     findings.push(manualForUnreadable(11, data.connectedApplications, appManual));
   } else if (apps.length === 0) {
     findings.push(finding(11, "manual", `ConnectedApplication returned zero apps; apps without org-managed policies do not appear here, so OAuth usage must be reviewed manually.${tokenViewNote}`, { connected_applications: 0, ...tokenEvidence }, appManual));
   } else {
-    const openApps = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === false);
-    const unknownPolicy = apps.filter((app) => asBoolean(app.OptionsAllowAdminApprovedUsersOnly) === undefined);
-    const unboundedRefresh = apps.filter((app) => asNumber(app.RefreshTokenValidityPeriod) === undefined && asBoolean(app.OptionsRefreshTokenValidityMetric) !== true);
     const tokensByApp = new Map<string, number>();
     for (const token of data.oauthTokens.data) {
       const key = asString(token.AppName) ?? "unknown";
@@ -2922,22 +3118,33 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
 
   const loginManual = `Setup > Identity > Login History: export the last ${data.loginHistoryDays} days and review failed logins, unexpected countries, and legacy TLS or API-only logins.`;
   const logins = data.loginHistory.data;
+  const failed = logins.filter((login) => { const status = asString(login.Status); return status !== undefined && status !== "Success"; });
+  const undatedLogins = logins.filter((login) => asDate(login.LoginTime) === undefined);
+  const failuresByIp = new Map<string, number>();
+  for (const login of failed) {
+    const ip = asString(login.SourceIp) ?? "unknown";
+    failuresByIp.set(ip, (failuresByIp.get(ip) ?? 0) + 1);
+  }
+  const bruteForceIps = [...failuresByIp.entries()].filter(([, count]) => count >= 10).map(([ip, count]) => `${ip} (${count} failures)`);
+  const countries = [...new Set(logins.map((login) => asString(login.CountryIso)).filter((value): value is string => Boolean(value)))];
+  const legacyTls = logins.filter((login) => /TLS 1\.[01]/i.test(asString(login.TlsProtocol) ?? ""));
+  const failureRatio = logins.length > 0 ? failed.length / logins.length : 0;
+  recordSalesforceDecisionFacts(14, {
+    readable: data.loginHistory.status === "ok",
+    login_count: logins.length,
+    complete: data.loginHistory.status === "ok" && !data.loginHistory.truncated,
+    failed_count: failed.length,
+    brute_force_source_count: bruteForceIps.length,
+    legacy_tls_count: legacyTls.length,
+    country_count: countries.length,
+    undated_count: undatedLogins.length,
+  });
   if (data.loginHistory.status !== "ok") {
     findings.push(manualForUnreadable(14, data.loginHistory, loginManual));
   } else if (logins.length === 0) {
     findings.push(finding(14, "manual", `LoginHistory returned zero rows for the last ${data.loginHistoryDays} days, which is implausible for an active org and indicates a permission-limited or empty view.`, { login_rows: 0, window_days: data.loginHistoryDays }, loginManual));
   } else {
-    const failed = logins.filter((login) => { const status = asString(login.Status); return status !== undefined && status !== "Success"; });
-    const undated = logins.filter((login) => asDate(login.LoginTime) === undefined);
-    const failuresByIp = new Map<string, number>();
-    for (const login of failed) {
-      const ip = asString(login.SourceIp) ?? "unknown";
-      failuresByIp.set(ip, (failuresByIp.get(ip) ?? 0) + 1);
-    }
-    const bruteForceIps = [...failuresByIp.entries()].filter(([, count]) => count >= 10).map(([ip, count]) => `${ip} (${count} failures)`);
-    const countries = [...new Set(logins.map((login) => asString(login.CountryIso)).filter((value): value is string => Boolean(value)))];
-    const legacyTls = logins.filter((login) => /TLS 1\.[01]/i.test(asString(login.TlsProtocol) ?? ""));
-    const failureRatio = failed.length / logins.length;
+    const undated = undatedLogins;
     // Over a truncated read the ratio is a sample and every zero is an absence claim over the unread rows.
     const complete = !data.loginHistory.truncated;
     const absenceCount = (value: number): number | null => (complete || value > 0 ? value : null);
@@ -2965,13 +3172,22 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
 
   const auditManual = `Setup > Security > View Setup Audit Trail: download the last ${data.auditTrailDays} days and review permission, profile, admin, session, password, and network access changes.`;
   const trail = data.setupAuditTrail.data;
+  const highRisk = trail.filter((row) => HIGH_RISK_AUDIT_SECTIONS.test(asString(row.Section) ?? "") || HIGH_RISK_AUDIT_ACTIONS.test(asString(row.Action) ?? ""));
+  const undatedTrail = trail.filter((row) => asDate(row.CreatedDate) === undefined);
+  recordSalesforceDecisionFacts(15, {
+    audit_readable: data.setupAuditTrail.status === "ok",
+    audit_count: trail.length,
+    audit_complete: data.setupAuditTrail.status === "ok" && !data.setupAuditTrail.truncated,
+    high_risk_count: highRisk.length,
+    undated_count: undatedTrail.length,
+    event_log_readable: data.eventLogFiles.status === "ok",
+  });
   if (data.setupAuditTrail.status !== "ok") {
     findings.push(manualForUnreadable(15, data.setupAuditTrail, auditManual, { requires: "View Setup and Configuration" }));
   } else if (trail.length === 0) {
     findings.push(finding(15, "manual", `SetupAuditTrail returned zero rows for the last ${data.auditTrailDays} days; an active org almost always has setup changes, so this indicates a permission-limited view.`, { audit_rows: 0, window_days: data.auditTrailDays }, auditManual));
   } else {
-    const highRisk = trail.filter((row) => HIGH_RISK_AUDIT_SECTIONS.test(asString(row.Section) ?? "") || HIGH_RISK_AUDIT_ACTIONS.test(asString(row.Action) ?? ""));
-    const undated = trail.filter((row) => asDate(row.CreatedDate) === undefined);
+    const undated = undatedTrail;
     const actors = [...new Set(highRisk.map((row) => asString(asObject(row.CreatedBy)?.Username) ?? asString(row.CreatedById) ?? "unknown"))];
     const eventLogReadable = data.eventLogFiles.status === "ok";
     const eventLogComplete = eventLogReadable && !data.eventLogFiles.truncated;
@@ -3031,6 +3247,10 @@ export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): 
     findings: findings.sort((left, right) => left.control - right.control),
     errors: datasetErrors(data.connectedApplications, data.oauthTokens, data.callerPermissions, data.loginHistory, data.setupAuditTrail, data.eventLogFiles),
   };
+}
+
+export function assessSalesforceMonitoringData(data: SalesforceMonitoringData): SalesforceAssessmentResult {
+  return runBatchVerdictContext(SALESFORCE_DECISION_CONTEXT, SALESFORCE_SPEC, () => assessSalesforceMonitoringDataWithDecisionContext(data));
 }
 
 export async function assessSalesforceMonitoringIntegrations(client: ReadClient, options: SalesforceAssessmentOptions = {}): Promise<SalesforceAssessmentResult> {
@@ -3442,6 +3662,7 @@ const assessParams = {
 };
 
 export function registerSalesforceTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, SALESFORCE_SPEC);
   pi.registerTool({
     name: "salesforce_check_access",
     label: "Check Salesforce audit access",
