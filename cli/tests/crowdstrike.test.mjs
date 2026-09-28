@@ -681,6 +681,70 @@ test("CrowdstrikeApiClient records truncation instead of treating a first page a
   assert.equal(truncatedAlerts.truncated, true);
 });
 
+test("CrowdstrikeApiClient rejects malformed successful collection responses while accepting valid empty resources envelopes", async (t) => {
+  const echoedSecret = "K8mN4pQ7rT2vW9xZ6cB3";
+  const exclusionQueries = new Set([
+    "/policy/queries/ioa-exclusions/v1",
+    "/policy/queries/ml-exclusions/v1",
+    "/policy/queries/sv-exclusions/v1",
+  ]);
+  const cases = [
+    {
+      name: "empty body",
+      response: () => new Response("", { status: 200, headers: { "content-type": "application/json" } }),
+      error: /expected a JSON object, received empty body/,
+    },
+    {
+      name: "HTML body",
+      response: () => new Response(`<html>api_key=${echoedSecret}</html>`, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } }),
+      error: /expected a JSON object, received non-JSON body \(text\/html, \d+ bytes\)/,
+    },
+    {
+      name: "JSON array",
+      response: () => jsonResponse([]),
+      error: /expected a JSON object, received JSON array/,
+    },
+    {
+      name: "JSON object without resources",
+      response: () => jsonResponse({}),
+      error: /expected a Falcon response envelope with a resources array/,
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const fetchImpl = async (input) => {
+        const url = new URL(typeof input === "string" ? input : input.toString());
+        if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+        if (exclusionQueries.has(url.pathname)) return item.response();
+        return jsonResponse({ resources: [], meta: { pagination: { total: 0 } }, errors: [] });
+      };
+      const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+      const result = await assessCrowdstrikeAccessGovernance(client);
+
+      for (const id of ["CS-19", "CS-20", "CS-21"]) {
+        const found = findingById(result, id);
+        assert.equal(found.status, "manual", `${item.name} must not pass ${id}`);
+        assert.match(found.summary, item.error);
+      }
+      assert.equal(result.errors.length, 3);
+      assert.doesNotMatch(JSON.stringify(result), new RegExp(echoedSecret), "malformed response contents must not reach collection errors");
+    });
+  }
+
+  await t.test("valid empty resources envelope", async () => {
+    const fetchImpl = async (input) => {
+      const url = new URL(typeof input === "string" ? input : input.toString());
+      if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+      return jsonResponse({ resources: [], meta: { pagination: { total: 0 } }, errors: [] });
+    };
+    const result = await assessCrowdstrikeAccessGovernance(new CrowdstrikeApiClient(sampleConfig(), { fetchImpl }));
+    for (const id of ["CS-19", "CS-20", "CS-21"]) {
+      assert.equal(findingById(result, id).status, "pass", `a documented empty resources envelope remains compliant for ${id}`);
+    }
+  });
+});
+
 test("CrowdstrikeApiClient retries 429 and 5xx responses honoring X-RateLimit-RetryAfter and refreshes expired tokens", async () => {
   const sleeps = [];
   let tokenCount = 0;
