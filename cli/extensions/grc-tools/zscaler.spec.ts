@@ -147,7 +147,7 @@ function zscalerCompletenessSemantics(id: string): string {
         : "an error or 403 denial does not change evidence_complete";
     return `${entry.surfaceId}: ${truncated}; ${failed}`;
   });
-  return `Product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
+  return `product credentials not configured make the finding manual and omit evidence_complete. ${clauses.join(". ")}.`;
 }
 
 const rows: ReadonlyArray<readonly [string, Batch2CheckRow["severity"], "zia_policy" | "zia_access_control" | "zpa"]> = [
@@ -419,6 +419,7 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
   runtimeBehavior: ZSCALER_RUNTIME_BEHAVIOR,
   knownGaps: [
     "Across the 41 ZIA-policy and ZPA single-dataset truncation replays, 16 affected finding cases currently remain pass for ZS-03, ZS-04, ZS-05, ZS-16, ZS-17, ZS-20, and ZS-25. Secondary inventories cap pass when unreadable, but those truncations and several primary ZIA truncations are not completeness-gating; a collector follow-up must close these paths.",
+    "Three access-area truncation cases also remain pass: ZS-07 when zia-admin-roles or zia-password-expiry is truncated, and ZS-14 when zia-audit-log-report is truncated. These access-area inventories require collector completeness gating.",
     "ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only.",
   ],
   sensitiveFields: ["apiKey", "password", "clientSecret", "authorization", "cookie", "token"],

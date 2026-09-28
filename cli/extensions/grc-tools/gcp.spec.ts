@@ -112,6 +112,16 @@ const rows: readonly Row[] = [
 const GA = ["truncated", "error", "denied", "not-collected"] as const;
 const GT = ["truncated"] as const;
 const GN = [] as const;
+export const GCP_SERVICE_ACCOUNT_KEY_AGGREGATE = {
+  kind: "attempted-child-reads",
+  parentSurfaceId: "service-accounts",
+  attemptedUnit: "one service-account-key list request for every service account returned by each requested project's readable service-account inventory",
+  mixedFailureModes: ["error", "denied"],
+  mixedFailureEffect: "false",
+  allAttemptsFailedEffect: "unchanged",
+  zeroAttemptsEffect: "unchanged",
+  allAttemptsFailedReadability: "false",
+} as const;
 function gcpCompletenessFailureModes(checkId: string, surfaceId: string): BatchCompletenessSourceDefinition["falseWhen"] {
   if (surfaceId === "organization") return GN;
   if (surfaceId === "projects") return checkId === "GCP-ORG-01" ? GT : GA;
@@ -120,10 +130,30 @@ function gcpCompletenessFailureModes(checkId: string, surfaceId: string): BatchC
   if (["iam-policies", "public-iam-bindings", "kms", "scc-sources", "service-perimeters"].includes(surfaceId)) return GT;
   return GA;
 }
+function gcpCompletenessSource(checkId: string, surfaceId: string): BatchCompletenessSourceDefinition {
+  const source: BatchCompletenessSourceDefinition = {
+    surfaceId,
+    falseWhen: gcpCompletenessFailureModes(checkId, surfaceId),
+  };
+  if (surfaceId === "service-account-keys" && ["GCP-IAM-02", "GCP-IAM-03"].includes(checkId)) {
+    return {
+      ...source,
+      scope: "Project-scoped child aggregate over every attempted service-account key-list request.",
+      aggregate: GCP_SERVICE_ACCOUNT_KEY_AGGREGATE,
+    };
+  }
+  if (surfaceId === "effective-org-policy" && checkId === "GCP-ORG-06") {
+    return {
+      ...source,
+      scope: "Only the per-project effective-policy request for constraints/compute.requireOsLogin.",
+    };
+  }
+  return source;
+}
 export const GCP_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = Object.fromEntries(
   rows.map(([id, , , , sourceSurfaces]) => [
     id,
-    sourceSurfaces.map((surfaceId) => ({ surfaceId, falseWhen: gcpCompletenessFailureModes(id, surfaceId) })),
+    sourceSurfaces.map((surfaceId) => gcpCompletenessSource(id, surfaceId)),
   ]),
 );
 
@@ -273,7 +303,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     completeness: batch2Completeness(
       decisionInputs,
       GCP_COMPLETENESS_SOURCES[id],
-      "Project inventory and per-project scan failures lower evidence_complete except where the source-state table explicitly omits a mode. For service-account keys, an error or denial across the entire attempted key inventory makes the finding manual while leaving this primitive true; a mixed project scan with at least one readable project and at least one failed key inventory makes it false. Direct organization-scoped list errors generally make the finding manual without lowering this primitive; Security Command Center findings, OS Login effective-policy, and Access Context Manager failures are explicit exceptions.",
+      "project inventory and per-project scan failures lower evidence_complete except where the source-state table explicitly omits a mode. For service-account keys, the structured project-scoped aggregate distinguishes mixed successful and failed child reads from a full outage or zero attempts. Direct organization-scoped list errors generally make the finding manual without lowering this primitive; Security Command Center findings, OS Login effective-policy, and Access Context Manager failures are explicit exceptions.",
     ),
     decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
   };

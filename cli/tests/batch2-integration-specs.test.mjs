@@ -13,6 +13,7 @@ import {
   checkContract,
   collectDefinedGrcTools,
   evaluateCheckVerdict,
+  evaluateCompletenessSource,
 } from "../dist/extensions/grc-tools/spec-model.js";
 import { AZURE_RUNTIME_BEHAVIOR, AZURE_SPEC } from "../dist/extensions/grc-tools/azure.spec.js";
 import { resolveAzureConfiguration } from "../dist/extensions/grc-tools/azure.js";
@@ -126,6 +127,16 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
           assert.ok(entry.sourceSurfaceIds.includes(source.surfaceId), `${entry.id}.${inputName}: ${source.surfaceId}`);
           assert.equal(new Set(source.falseWhen).size, source.falseWhen.length);
           assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected", "missing-required-field"].includes(mode)));
+          if (source.aggregate) {
+            assert.equal(source.aggregate.kind, "attempted-child-reads");
+            assert.ok(entry.sourceSurfaceIds.includes(source.aggregate.parentSurfaceId));
+            assert.ok(source.aggregate.attemptedUnit.length >= 40);
+            assert.deepEqual(source.aggregate.mixedFailureModes, ["error", "denied"]);
+            assert.equal(source.aggregate.mixedFailureEffect, "false");
+            assert.equal(source.aggregate.allAttemptsFailedEffect, "unchanged");
+            assert.equal(source.aggregate.zeroAttemptsEffect, "unchanged");
+            assert.equal(source.aggregate.allAttemptsFailedReadability, "false");
+          }
         }
         const rendered = entry.evidenceFieldDefinitions[inputName];
         assert.match(rendered, new RegExp(`For ${entry.id},`));
@@ -153,6 +164,43 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   assert.deepEqual(check(GCP_SPEC, "GCP-IAM-02").completeness.evidence_complete.sources[0].falseWhen, [
     "truncated", "error", "denied", "not-collected",
   ]);
+  const keySource = check(GCP_SPEC, "GCP-IAM-02").completeness.evidence_complete.sources
+    .find((source) => source.surfaceId === "service-account-keys");
+  assert.ok(keySource);
+  assert.match(keySource.scope, /project-scoped child aggregate/i);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 2,
+    successfulCount: 1,
+    failedCount: 1,
+    failureModes: ["denied"],
+    truncated: false,
+  }), false);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 2,
+    successfulCount: 0,
+    failedCount: 2,
+    failureModes: ["denied"],
+    truncated: false,
+  }), true);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 0,
+    successfulCount: 0,
+    failedCount: 0,
+    failureModes: [],
+    truncated: false,
+  }), true);
+  assert.equal(evaluateCompletenessSource(keySource, {
+    attemptedCount: 1,
+    successfulCount: 1,
+    failedCount: 0,
+    failureModes: [],
+    truncated: true,
+  }), false);
+  assert.match(
+    check(GCP_SPEC, "GCP-ORG-06").completeness.evidence_complete.sources
+      .find((source) => source.surfaceId === "effective-org-policy").scope,
+    /constraints\/compute\.requireOsLogin/,
+  );
   assert.equal(check(OCI_SPEC, "OCI-IAM-01").completeness, undefined);
   assert.deepEqual(check(PALOALTO_SPEC, "PA-21").completeness.evidence_complete.sources.map((source) => source.surfaceId), [
     "prisma-policies", "panos-system-info", "panos-policy-config",

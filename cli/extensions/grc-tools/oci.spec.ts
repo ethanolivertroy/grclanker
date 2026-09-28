@@ -248,7 +248,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     completeness: batch2Completeness(
       decisionInputs,
       OCI_COMPLETENESS_SOURCES[id] ?? [],
-      "True only when each named completeness source avoids exactly its declared source-state failures. A source with no lowering failure modes affects evidence_readable or review facts instead; it does not lower evidence_complete. Qualified witness sources participate only when the primary inventory is empty.",
+      "true only when each named completeness source avoids exactly its declared source-state failures. A source with no lowering failure modes affects evidence_readable or review facts instead; it does not lower evidence_complete. Qualified witness sources participate only when the primary inventory is empty.",
     ),
     frameworks: frameworkMappings(id),
     decision: `${decisionPredicate[id]} A proved violation takes precedence over partial collection; otherwise partial or unreadable evidence cannot pass.`,
