@@ -2155,10 +2155,10 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
   recordServicenowDecisionFacts(3, {
     readable: decisionInputsReadable(roleInputs),
     complete: decisionInputsComplete(roleInputs),
-    inventory_proven: !data.roleInheritanceTotal.error
-      && roleVisibilityProof !== undefined
-      && roleVisibilityProof > 0
-      && !visibilityUnproven(data.roleInheritance),
+    role_aggregate_readable: !data.roleInheritanceTotal.error && roleVisibilityProof !== undefined,
+    role_aggregate_count: roleVisibilityProof,
+    role_pages: data.roleInheritance.pages,
+    role_total_known: data.roleInheritance.total !== undefined,
     inheriting_count: data.roleInheritance.rows.length,
   });
   const roleHierarchy = gatedFinding(3, [data.roleInheritance], "Navigate to User Administration > Roles, open admin and security_admin, and review the Contained By related list; justify every role that inherits admin or security_admin.", () => {
@@ -2326,13 +2326,13 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
   recordServicenowDecisionFacts(6, {
     readable: decisionInputsReadable(passwordInputs),
     complete: decisionInputsComplete(passwordInputs),
-    policy_enabled: decisionEnablement.exists ? asBoolean(decisionEnablement.value) : undefined,
+    password_policy_property_value: decisionEnablement.exists ? asBoolean(decisionEnablement.value) : undefined,
     policy_count: decisionPolicies.length,
-    minimum_fields_readable: decisionPolicies.some((policy) => policy.minLength !== undefined),
+    policy_with_minimum_length_count: decisionPolicies.filter((policy) => policy.minLength !== undefined).length,
     weak_policy_count: decisionPolicies.filter((policy) =>
       policy.minLength !== undefined
       && (policy.minLength < data.minPasswordLength || policy.upper === false || policy.lower === false || policy.digit === false)).length,
-    enablement_present: decisionEnablement.exists,
+    password_policy_property_present: decisionEnablement.exists,
   });
   const passwordPolicy = gatedFinding(6, [data.properties, data.passwordPolicies], `Open Password Policy > Password Policies > Default and Password Policy > Properties; record minimum length (expected ${data.minPasswordLength}+), character class requirements, and glide.enable.password_policy.`, () => {
     const enablement = readProperty(data.properties, "glide.enable.password_policy");
@@ -2417,13 +2417,14 @@ function assessServicenowIdentityAccessDataWithDecisionContext(data: ServicenowI
     complete: decisionInputsComplete(mfaInputs),
     properties_complete: tablesComplete([data.properties]),
     platform_property_present: decisionMfaEnabled.exists,
-    platform_enabled: asBoolean(decisionMfaEnabled.value) === true,
+    multifactor_property_value: asBoolean(decisionMfaEnabled.value),
     criteria_count: decisionCriteria.length,
     admin_count: decisionAdmins.length,
     active_role_criteria_count: decisionActiveRoleCriteria.length,
-    role_enforced: ELEVATED_ROLE_NAMES.every((role) => decisionEnforcedRoles.has(role)),
-    user_enforced: decisionAdmins.length > 0 && decisionAdminsWithoutFlag.length === 0,
-    email_otp_enabled: decisionEmailOtp.exists && asBoolean(decisionEmailOtp.value) === true,
+    required_privileged_role_count: ELEVATED_ROLE_NAMES.length,
+    covered_privileged_role_count: ELEVATED_ROLE_NAMES.filter((role) => decisionEnforcedRoles.has(role)).length,
+    admins_without_mfa_flag_count: decisionAdminsWithoutFlag.length,
+    email_otp_property_value: decisionEmailOtp.exists ? asBoolean(decisionEmailOtp.value) : undefined,
   });
   const mfa = gatedFinding(7, [data.properties, data.users, data.privilegedAssignments, data.mfaCriteria], `Open Multi-factor Authentication > Multi-factor Criteria (${MFA_CRITERIA_TABLE}) and confirm the Role-based multi-factor authentication record is Active with admin and security_admin in its Multi-factor Roles list; open System Properties for glide.authenticate.multifactor and glide.authenticate.multifactor.email.otp.enabled; confirm every admin user carries enable_multifactor_authn or is covered by an MFA authentication policy.`, () => {
     const enabled = readProperty(data.properties, "glide.authenticate.multifactor");
@@ -2839,7 +2840,7 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
   recordServicenowDecisionFacts(1, {
     readable: decisionInputsReadable(instanceSecurityInputs),
     complete: decisionInputsComplete(instanceSecurityInputs),
-    noncompliant_count: instanceSecurityChecks.filter((item) => item.compliant === false).length,
+    unexpected_value_count: instanceSecurityChecks.filter((item) => item.compliant === false).length,
     absent_count: instanceSecurityChecks.filter((item) => !item.exists).length,
   });
   const instanceSecurity = gatedFinding(1, [data.properties], "Open System Properties > Security (or the Instance Security Center hardening view) and record glide.security.use_csrf_token, glide.security.csrf.strict.validation.mode, glide.security.file.mime_type.validation, glide.security.diag_txns_acl, and glide.security.strict.user_image_upload.", () =>
@@ -2853,10 +2854,9 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
     readable: decisionInputsReadable(sessionInputs),
     complete: decisionInputsComplete(sessionInputs),
     timeout_present: decisionTimeout.exists,
-    timeout_valid: decisionTimeoutMinutes !== undefined
-      && decisionTimeoutMinutes > 0
-      && decisionTimeoutMinutes <= data.maxSessionTimeoutMinutes,
-    rotate_disabled: decisionRotate.exists && asBoolean(decisionRotate.value) === false,
+    timeout_minutes: decisionTimeoutMinutes,
+    max_timeout_minutes: data.maxSessionTimeoutMinutes,
+    rotate_sessions_value: decisionRotate.exists ? asBoolean(decisionRotate.value) : undefined,
   });
   const session = gatedFinding(5, [data.properties], `Open System Properties > UI Properties and record glide.ui.session_timeout (expected ${data.maxSessionTimeoutMinutes} minutes or less), glide.ui.rotate_sessions, and glide.ui.user_cookie.max_life_span_in_days.`, () => {
     const timeout = readProperty(data.properties, "glide.ui.session_timeout");
@@ -2903,7 +2903,7 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
   recordServicenowDecisionFacts(12, {
     readable: decisionInputsReadable(scriptInputs),
     complete: decisionInputsComplete(scriptInputs),
-    noncompliant_count: scriptChecks.filter((item) => item.compliant === false).length,
+    unexpected_value_count: scriptChecks.filter((item) => item.compliant === false).length,
     absent_count: scriptChecks.filter((item) => !item.exists).length,
     eval_rule_count: data.evalScripts.rows.length,
   });
@@ -2926,7 +2926,7 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
   recordServicenowDecisionFacts(13, {
     readable: decisionInputsReadable(hardeningInputs),
     complete: decisionInputsComplete(hardeningInputs),
-    noncompliant_count: hardeningChecks.filter((item) => item.compliant === false).length,
+    unexpected_value_count: hardeningChecks.filter((item) => item.compliant === false).length,
     absent_count: hardeningChecks.filter((item) => !item.exists).length,
   });
   const hardening = gatedFinding(13, [data.properties], "Open System Properties > Security and the Instance Security Center hardening view; record the strict update, strict action, HTML escaping, sanitizer, code tag, X-Frame-Options, and cookie properties.", () =>
@@ -2970,11 +2970,11 @@ function assessServicenowPlatformHardeningDataWithDecisionContext(data: Servicen
     complete: decisionInputsComplete(ipInputs),
     plugin_present: decisionPluginRow !== undefined,
     plugin_inventory_complete: tablesComplete([data.ipAuthenticatorPlugin]),
-    plugin_active: decisionPluginState === true,
+    plugin_active_value: decisionPluginState,
     active_rule_count: decisionActiveRules.length,
     rule_inventory_complete: tablesComplete([data.ipAccessRules]),
-    table_available: data.ipAccessRules.unavailable === undefined,
-    strict_enabled: decisionStrict.exists && asBoolean(decisionStrict.value) === true,
+    table_readable: data.ipAccessRules.unavailable === undefined,
+    strict_property_value: decisionStrict.exists ? asBoolean(decisionStrict.value) : undefined,
   });
   const ipAccess = gatedFinding(17, [data.properties, data.ipAccessRules, data.ipAuthenticatorPlugin], `Open System Definition > Plugins and confirm IP Range Based Authentication (${IP_AUTHENTICATOR_PLUGIN}) is active, then open System Security > IP Address Access Control and record the active allow and deny rules (type, direction, range) plus glide.ip.authenticate.strict.`, () => {
     const strict = readProperty(data.properties, "glide.ip.authenticate.strict");
@@ -3254,7 +3254,8 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
   recordServicenowDecisionFacts(2, {
     readable: decisionInputsReadable(completenessInputs),
     complete: decisionInputsComplete(completenessInputs),
-    inventory_proven: !data.aclTotal.error && data.aclTotal.count !== undefined && data.aclTotal.count > 0,
+    acl_aggregate_readable: !data.aclTotal.error && data.aclTotal.count !== undefined,
+    acl_aggregate_count: data.aclTotal.count,
     visible_acl_count: described.length,
     unrestricted_count: unrestricted.length,
     wildcard_count: wildcard.length,
@@ -3332,7 +3333,8 @@ function assessServicenowAccessControlDataWithDecisionContext(data: ServicenowAc
   recordServicenowDecisionFacts(11, {
     readable: decisionInputsReadable(tableLevelInputs),
     complete: tablesComplete(tableLevelInputs),
-    inventory_proven: !data.aclTotal.error && data.aclTotal.count !== undefined && data.aclTotal.count > 0,
+    acl_aggregate_readable: !data.aclTotal.error && data.aclTotal.count !== undefined,
+    acl_aggregate_count: data.aclTotal.count,
     uncovered_table_count: decisionCoverage.filter((item) => item.aclCount === 0).length,
     operation_gap_count: decisionCoverage.filter((item) => item.aclCount > 0 && item.missingOperationCount > 0).length,
   });
@@ -3598,10 +3600,11 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
   recordServicenowDecisionFacts(15, {
     readable: decisionInputsReadable(updateSetInputs),
     complete: decisionInputsComplete(updateSetInputs),
-    inventory_proven: !data.updateSetTotal.error
-      && data.updateSetTotal.count !== undefined
-      && data.updateSetTotal.count > 0,
-    visibility_proven: !visibilityUnproven(data.updateSetsInProgress),
+    update_set_aggregate_readable: !data.updateSetTotal.error && data.updateSetTotal.count !== undefined,
+    update_set_aggregate_count: data.updateSetTotal.count,
+    in_progress_row_count: data.updateSetsInProgress.rows.length,
+    in_progress_pages: data.updateSetsInProgress.pages,
+    in_progress_total_known: data.updateSetsInProgress.total !== undefined,
     in_progress_count: data.updateSetsInProgress.rows.length,
     sensitive_change_count: data.sensitiveUpdateXml.rows.length,
   });
@@ -3712,7 +3715,7 @@ function assessServicenowOperationsGovernanceDataWithDecisionContext(data: Servi
     readable: decisionInputsReadable(pluginInputs),
     complete: decisionPluginsComplete,
     plugin_count: decisionPluginRows.length,
-    observed_inactive_required_count: decisionRequiredPlugins.filter((item) => item.present && item.active !== true).length,
+    visible_required_plugin_inactive_count: decisionRequiredPlugins.filter((item) => item.present && item.active !== true).length,
     missing_required_count: decisionRequiredPlugins.filter((item) => !item.present).length,
   });
   const plugins = gatedFinding(20, [data.plugins], "Open System Definition > Plugins; confirm High Security Settings, Contextual Security: Role Management V2, and Security Jump Start are active, record Instance Security Center, Security Incident Response, GRC, and Vulnerability Response status, and review every other active plugin for necessity.", () => {
