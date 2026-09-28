@@ -45,6 +45,8 @@ import {
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 
+const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
+
 function createTempBase(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));
 }
@@ -1211,7 +1213,7 @@ test("OKTA-AUTH-002 keeps the legacy Partial finding when only MFA enrollment po
   assert.ok(finding.evidence.includes("Partial data: MFA_ENROLL pagination cursor repeated after 1 item; total unknown"));
 });
 
-test("portable completeness contracts match 103 runtime permission cases with truncation-only exceptions", async () => {
+portableContractTest("portable completeness contracts match 103 runtime permission cases with truncation-only exceptions", async () => {
   const onePolicyFamily = createSampleAuthenticationData();
   onePolicyFamily.signOnPolicies = dataset([], "403 denied sign-on policies");
   onePolicyFamily.signOnPolicyRules = dataset({}, "not collected after sign-on policy denial");

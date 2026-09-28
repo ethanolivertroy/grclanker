@@ -49,6 +49,7 @@ import {
   writeByteDifferentialFixture,
 } from "./helpers/byte-differential-fixtures.mjs";
 
+const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOGIN = new Date(Date.now() - 2 * DAY_MS).toISOString();
 const OLD_LOGIN = new Date(Date.now() - 400 * DAY_MS).toISOString();
@@ -851,7 +852,7 @@ test("GWS-INTEG-001 keeps the legacy Partial finding when readable users yield n
   assert.ok(finding.evidence.includes("Per-user token reads that failed: 1"));
 });
 
-test("portable completeness contracts match the four truncation-only directory permission cases", async () => {
+portableContractTest("portable completeness contracts match the four truncation-only directory permission cases", async () => {
   const cases = [
     ["users", "403"],
     ["users", "500"],
@@ -873,7 +874,7 @@ test("portable completeness contracts match the four truncation-only directory p
   }
 });
 
-test("GWS-MON-002 primitive facts and contract both use login activity reports, never Alert Center alerts", async () => {
+portableContractTest("GWS-MON-002 primitive facts and contract both use login activity reports, never Alert Center alerts", async () => {
   const { result, facts } = await captureGwsFacts("GWS-MON-002", () => assessGwsMonitoring({
     loginActivities: dataset([], "403 Forbidden: login activity report"),
     adminActivities: dataset(createAdminActivities()),

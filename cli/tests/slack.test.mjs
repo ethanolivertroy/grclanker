@@ -44,6 +44,7 @@ import {
   vendorErrorCode,
 } from "../dist/extensions/grc-tools/slack.js";
 
+const portableContractTest = process.env.GRC_CORPUS_FIXTURE_DIR ? test.skip : test;
 const NOW = new Date("2026-09-21T00:00:00.000Z");
 const EMPTY_ENV = { SLACK_CONFIG_FILE: "" };
 
@@ -455,7 +456,7 @@ test("fixture (d): a compliant Enterprise Grid org passes every automatable cont
   assert.ok(results.every((result) => result.errors.length === 0));
 });
 
-test("MFA and SSO population primitives count every active user, including non-administrators", async () => {
+portableContractTest("MFA and SSO population primitives count every active user, including non-administrators", async () => {
   const identity = await captureSlackFacts("SLACK-ID-01", () => assessSlackIdentity(makeClient((request) => {
     if (request.pathname === "/api/users.list") {
       return {
