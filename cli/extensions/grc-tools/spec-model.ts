@@ -95,12 +95,13 @@ export interface VerdictCriteria {
   warn: string;
   fail: string;
   manual: string;
+  info?: string;
   constants: Readonly<Record<string, PortableValue>>;
   examples: readonly CriterionExample[];
   rules: readonly VerdictRule[];
 }
 
-export type EvaluatedFindingStatus = "pass" | "warn" | "fail" | "manual";
+export type EvaluatedFindingStatus = "pass" | "warn" | "fail" | "manual" | "info";
 export type VerdictFacts = Readonly<Record<string, unknown>>;
 
 export interface VerdictRule {
@@ -130,7 +131,7 @@ export type VerdictCondition =
 export interface CriterionExample {
   kind: CriterionExampleKind;
   input: string;
-  expected: "pass" | "warn" | "fail" | "manual";
+  expected: EvaluatedFindingStatus;
   reason: string;
 }
 

@@ -6,7 +6,6 @@ import {
   checkContract,
   defineGrcTool,
   evaluateCheckVerdict,
-  evaluateVerdictCriteria,
   type CheckContract,
   type DerivedFactRule,
   type EvaluatedFindingStatus,
@@ -124,6 +123,29 @@ export interface BatchOutputDefinition {
   overwritePolicy: string;
   archivePairing: string;
   jsonFormatting?: string;
+}
+
+export function deriveDecisionRules(
+  checkId: string,
+  rules: readonly VerdictRule[],
+): { rules: readonly VerdictRule[]; derivedFactRules: Readonly<Record<string, DerivedFactRule>> } {
+  const derivedFactRules: Record<string, DerivedFactRule> = {};
+  const rewritten = rules.map((entry, index) => {
+    const name = `${checkId.toLowerCase().replaceAll("-", "_")}_branch_${String(index + 1).padStart(2, "0")}_matches`;
+    derivedFactRules[name] = {
+      description: `${checkId} ordered branch ${index + 1} (${entry.status}) is true exactly when its portable evidence condition matches.`,
+      condition: entry.condition,
+    };
+    return {
+      ...entry,
+      condition: {
+        op: "eq" as const,
+        left: { kind: "path" as const, path: name },
+        right: { kind: "value" as const, value: true },
+      },
+    };
+  });
+  return { rules: rewritten, derivedFactRules };
 }
 
 export function buildBatchOutputContract(definition: BatchOutputDefinition): ExportContract {
@@ -457,22 +479,6 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
   };
 }
 
-export function evaluateObservedFindingStatus(
-  spec: IntegrationSpecContract,
-  checkId: string,
-  status: EvaluatedFindingStatus,
-): EvaluatedFindingStatus {
-  const check = checkContract(spec, checkId);
-  const facts = {
-    [factName(check, "required_evidence_readable")]: status !== "manual",
-    [factName(check, "required_evidence_complete")]: status !== "warn",
-    [factName(check, "failure_matches")]: status === "fail",
-    [factName(check, "warning_matches")]: status === "warn",
-    [factName(check, "compliant_matches")]: status === "pass",
-  };
-  return evaluateVerdictCriteria(check.criteria, facts);
-}
-
 export function evaluateBatchCheckVerdict(
   spec: IntegrationSpecContract,
   checkId: string,
@@ -492,7 +498,7 @@ export function assertBatchCheckVerdict<T extends string>(
     Partial: "warn",
     Fail: "fail",
     Manual: "manual",
-    Info: "manual",
+    Info: "info",
   } as Record<string, EvaluatedFindingStatus>)[expectedStatus]
     ?? expectedStatus.toLowerCase() as EvaluatedFindingStatus;
   const evaluated = evaluateBatchCheckVerdict(spec, checkId, rawFacts);
@@ -502,40 +508,19 @@ export function assertBatchCheckVerdict<T extends string>(
   return expectedStatus;
 }
 
-export function materializeBatchCheckVerdict<T extends string>(
+export function materializeBatchCheckVerdict(
   spec: IntegrationSpecContract,
   checkId: string,
   rawFacts: Readonly<Record<string, unknown>>,
-  manualLabel: T,
-): T {
+): "Pass" | "Partial" | "Fail" | "Manual" | "Info" {
   const evaluated = evaluateBatchCheckVerdict(spec, checkId, rawFacts);
-  if (evaluated === "manual") {
-    return (manualLabel === "Info" ? "Info" : "Manual") as T;
-  }
   return ({
     pass: "Pass",
     warn: "Partial",
     fail: "Fail",
-  } as const)[evaluated] as T;
-}
-
-export function preserveRuntimeFindingStatus<T extends string>(
-  spec: IntegrationSpecContract,
-  checkId: string,
-  status: T,
-): T {
-  const normalized = ({
-    Pass: "pass",
-    Partial: "warn",
-    Fail: "fail",
-    Manual: "manual",
-    Info: "manual",
-  } as Record<string, EvaluatedFindingStatus>)[status] ?? status.toLowerCase() as EvaluatedFindingStatus;
-  const evaluated = evaluateObservedFindingStatus(spec, checkId, normalized);
-  if (evaluated !== normalized) {
-    throw new Error(`${checkId} runtime status ${status} disagrees with its ordered contract (${evaluated})`);
-  }
-  return status;
+    manual: "Manual",
+    info: "Info",
+  } as const)[evaluated];
 }
 
 export function withIntegrationToolContracts(pi: ExtensionAPI, spec: IntegrationSpecContract): ExtensionAPI {

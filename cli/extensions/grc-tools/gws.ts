@@ -1128,7 +1128,7 @@ function buildFinding(
   const facts = GWS_DECISION_CONTEXT.getStore()?.get(definitionId);
   if (!facts) throw new Error(`${definitionId} has no runtime decision facts`);
   const legacyStatus = status;
-  status = materializeBatchCheckVerdict(GWS_SPEC, definitionId, facts, status);
+  status = materializeBatchCheckVerdict(GWS_SPEC, definitionId, facts);
   const finding: GwsFinding = {
     id: definition.id,
     title: definition.title,

@@ -2554,7 +2554,7 @@ function buildFinding(
   const definition = DUO_CHECKS[id];
   const facts = DUO_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(DUO_SPEC, id, facts, status);
+  status = materializeBatchCheckVerdict(DUO_SPEC, id, facts);
   return {
     id: definition.id,
     title: definition.title,
