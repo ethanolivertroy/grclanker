@@ -2888,8 +2888,57 @@ test("byte differential fixtures: GCP assessments and export artifacts", { skip:
     };
     return assessGcpIdentity(createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data))), { maxProjects: 5, maxKeys: 1 });
   };
+  const serviceAccountKeyAgeAt = async (days, staleDays = 90) => {
+    const data = {
+      ...COMPLIANT,
+      keys: {
+        keys: [{
+          name: `projects/prod-audit/serviceAccounts/svc@prod-audit.iam.gserviceaccount.com/keys/age-${days}`,
+          keyType: "USER_MANAGED",
+          validAfterTime: new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString(),
+          validBeforeTime: "2027-09-21T00:00:00Z",
+        }],
+      },
+    };
+    return assessGcpIdentity(
+      createClient(async (url, init) => jsonResponse(routeCompliant(url, init, data))),
+      { maxProjects: 5, staleDays },
+    );
+  };
+  const logRetentionAt = async (retentionDays) => assessGcpLoggingDetection(createClient(async (url, init) => jsonResponse(routeCompliant(url, init, {
+    ...COMPLIANT,
+    logBuckets: {
+      buckets: [
+        { name: "projects/prod-audit/locations/global/buckets/_Default", retentionDays },
+        { name: "projects/prod-audit/locations/global/buckets/_Required", retentionDays: 400 },
+      ],
+    },
+  }))));
+  const kmsRotationAt = async (days) => assessGcpDataProtection(createClient(async (url, init) => jsonResponse(routeCompliant(url, init, {
+    ...COMPLIANT,
+    cryptoKeys: {
+      assets: [{
+        ...COMPLIANT.cryptoKeys.assets[0],
+        resource: {
+          data: {
+            ...COMPLIANT.cryptoKeys.assets[0].resource.data,
+            rotationPeriod: `${days * 24 * 60 * 60}s`,
+          },
+        },
+      }],
+    },
+  }))));
+  const keyAgeDefault = await Promise.all([89, 90, 91].map((days) => serviceAccountKeyAgeAt(days)));
+  const keyAgeOverride = await Promise.all([29, 30, 31].map((days) => serviceAccountKeyAgeAt(days, 30)));
+  const logRetention = await Promise.all([89, 90, 91].map(logRetentionAt));
+  const kmsRotation = await Promise.all([364, 365, 366].map(kmsRotationAt));
+  assert.equal(keyAgeDefault.length + keyAgeOverride.length + logRetention.length + kmsRotation.length, 12);
   writeByteDifferentialFixture("gcp", "boundary", {
     serviceAccountKeys: await Promise.all([0, 1, 2].map(keysAt)),
+    serviceAccountKeyAgeDays: keyAgeDefault,
+    serviceAccountKeyAgeOverrideThirtyDays: keyAgeOverride,
+    logRetentionDays: logRetention,
+    kmsRotationDays: kmsRotation,
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("gcp");

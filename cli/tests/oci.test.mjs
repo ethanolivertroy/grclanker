@@ -2188,8 +2188,95 @@ test("byte differential fixtures: OCI assessments and export artifacts", { skip:
   writeByteDifferentialFixture("oci", "missing-null", await runAllAssessments(emptyClient()));
   writeByteDifferentialFixture("oci", "partial", await runAllAssessments(partialClient()));
   writeByteDifferentialFixture("oci", "compliant", await runAllAssessments(compliantClient()));
+  const passwordLengthAt = async (minimumPasswordLength) => {
+    const client = compliantClient();
+    client.getAuthenticationPolicy = async () => ({
+      compartmentId: TENANCY,
+      passwordPolicy: {
+        minimumPasswordLength,
+        isLowercaseCharactersRequired: true,
+        isUppercaseCharactersRequired: true,
+        isNumericCharactersRequired: true,
+        isSpecialCharactersRequired: true,
+      },
+    });
+    return assessOciIdentity(client);
+  };
+  const passwordLengths = await Promise.all([13, 14, 15].map(passwordLengthAt));
+  const credentialAgeAt = async (days) => {
+    const client = compliantClient();
+    client.listApiKeys = async () => [{
+      fingerprint: `boundary-${days}`,
+      lifecycleState: "ACTIVE",
+      timeCreated: new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString(),
+    }];
+    return assessOciIdentity(client);
+  };
+  const auditRetentionAt = async (days) => {
+    const client = compliantClient();
+    client.getAuditConfiguration = async () => ({ retentionPeriodDays: days });
+    return assessOciLoggingDetection(client);
+  };
+  const bastionTtlAt = async (seconds) => {
+    const client = compliantClient();
+    client.getBastion = async () => ({ id: "bastion-1", name: "ops", lifecycleState: "ACTIVE", maxSessionTtlInSeconds: seconds, clientCidrBlockAllowList: ["203.0.113.0/24"] });
+    return assessOciTenancyGuardrails(client);
+  };
+  const sessionTtlHoursAt = async (hours) => {
+    const client = compliantClient();
+    client.listBastionSessions = async () => [{ id: "session-1", lifecycleState: "ACTIVE", sessionTtlInSeconds: hours * 60 * 60 }];
+    return assessOciTenancyGuardrails(client);
+  };
+  const keyAgeAt = async (days) => {
+    const client = compliantClient();
+    client.listKeyVersions = async () => [{
+      id: "boundary-key-version",
+      lifecycleState: "ENABLED",
+      timeCreated: new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString(),
+    }];
+    return assessOciTenancyGuardrails(client);
+  };
+  const keySizeAt = async (algorithm, length) => {
+    const client = compliantClient();
+    client.listKeys = async () => [{ id: "key-1", displayName: "data", algorithm, lifecycleState: "ENABLED", protectionMode: "HSM" }];
+    client.getKey = async (_vault, keyId) => ({ id: keyId, lifecycleState: "ENABLED", keyShape: { algorithm, length } });
+    return assessOciTenancyGuardrails(client);
+  };
+  const preauthenticatedRequestDaysAt = async (days) => {
+    const client = compliantClient();
+    client.listPreauthenticatedRequests = async () => [{
+      id: `par-${days}`,
+      name: "boundary",
+      accessType: "ObjectRead",
+      timeExpires: new Date(NOW.getTime() + days * 24 * 60 * 60 * 1000).toISOString(),
+    }];
+    return assessOciTenancyGuardrails(client);
+  };
+  const credentialAges = await Promise.all([364, 365, 366].map(credentialAgeAt));
+  const auditRetention = await Promise.all([364, 365, 366].map(auditRetentionAt));
+  const bastionTtl = await Promise.all([10_799, 10_800, 10_801].map(bastionTtlAt));
+  const sessionTtlHours = await Promise.all([7, 8, 9].map(sessionTtlHoursAt));
+  const keyAges = await Promise.all([364, 365, 366].map(keyAgeAt));
+  const aesKeyBytes = await Promise.all([31, 32, 33].map((length) => keySizeAt("AES", length)));
+  const rsaKeyBytes = await Promise.all([511, 512, 513].map((length) => keySizeAt("RSA", length)));
+  const preauthenticatedRequestDays = await Promise.all([29, 30, 31].map(preauthenticatedRequestDaysAt));
+  assert.equal(
+    passwordLengths.length + credentialAges.length + auditRetention.length + bastionTtl.length
+      + sessionTtlHours.length + keyAges.length + aesKeyBytes.length + rsaKeyBytes.length
+      + preauthenticatedRequestDays.length,
+    27,
+  );
   writeByteDifferentialFixture("oci", "boundary", {
     keyThresholds: await Promise.all([5, 6, 7].map((maxKeys) => assessOciIdentity(compliantClient(), { maxKeys }))),
+    passwordMinimumLength: passwordLengths,
+    credentialAgeDays: credentialAges,
+    auditRetentionDays: auditRetention,
+    bastionTtlSeconds: bastionTtl,
+    bastionSessionTtlHours: sessionTtlHours,
+    keyRotationAgeDays: keyAges,
+    aesKeyBytes,
+    rsaKeyBytes,
+    preauthenticatedRequestDays,
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("oci");

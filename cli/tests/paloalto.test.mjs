@@ -340,8 +340,8 @@ function computeSnapshot(overrides = {}) {
     images: good
       ? [{ id: "sha256:2", scanTime: "2026-09-01T00:00:00Z", repoTag: { repo: "app" }, vulnerabilityDistribution: { critical: 0, high: 2, medium: 4, low: 1, total: 7 } }]
       : [],
-    vulnerabilityStats: good ? documentedVulnerabilityStats({ critical: 0, high: 3 }) : documentedVulnerabilityStats({ critical: 12, high: 30 }),
-    complianceStats: good ? documentedComplianceStats({ failed: 3, total: 100 }) : documentedComplianceStats({ failed: 0, total: 0 }),
+    vulnerabilityStats: overrides.vulnerabilityStats ?? (good ? documentedVulnerabilityStats({ critical: 0, high: 3 }) : documentedVulnerabilityStats({ critical: 12, high: 30 })),
+    complianceStats: overrides.complianceStats ?? (good ? documentedComplianceStats({ failed: 3, total: 100 }) : documentedComplianceStats({ failed: 0, total: 0 })),
     cloudDiscovery: good ? [{ provider: "aws", serviceType: "eks", total: 3, defended: 3 }] : [],
     ciScans: good ? [{ time: "2026-09-01T00:00:00Z", pass: true }] : [],
     failed: overrides.failed ?? [],
@@ -4592,8 +4592,33 @@ test("byte differential fixtures: Palo Alto assessments and export artifacts", {
     };
     return assessPrismaCloudPosture(boundarySnapshot, { minCompliancePassRate: 90 });
   };
+  const administratorCountAt = (count, maxSuperusers = 3) => {
+    const snapshot = panosSnapshot();
+    snapshot.config[snapshot.config.length - 1] = parseXml(
+      `<mgt-config><users>${Array.from({ length: count }, (_, index) => (
+        `<entry name="admin-${index}"><permissions><role-based><superuser>yes</superuser></role-based></permissions><authentication-profile>mfa-radius</authentication-profile></entry>`
+      )).join("")}</users><password-complexity><enabled>yes</enabled></password-complexity></mgt-config>`,
+    );
+    return assessAdminAccess(prismaSnapshot(), [snapshot], { maxSuperusers });
+  };
+  const superuserBoundaries = [2, 3, 4].map((count) => administratorCountAt(count));
+  const superuserOverrideBoundaries = [4, 5, 6].map((count) => administratorCountAt(count, 5));
+  const criticalCveBoundaries = [0, 1].map((critical) => assessPrismaCompute(computeSnapshot({
+    vulnerabilityStats: documentedVulnerabilityStats({ critical, high: 0 }),
+  })));
+  const hostComplianceBoundaries = [89, 90, 91].map((passRate) => assessPrismaCompute(computeSnapshot({
+    complianceStats: documentedComplianceStats({ failed: 100 - passRate, total: 100 }),
+  })));
+  assert.equal(
+    superuserBoundaries.length + superuserOverrideBoundaries.length + criticalCveBoundaries.length + hostComplianceBoundaries.length,
+    11,
+  );
   writeByteDifferentialFixture("paloalto", "boundary", {
     complianceRate: [69, 70, 89, 90].map(complianceAt),
+    criticalCves: criticalCveBoundaries,
+    hostComplianceRate: hostComplianceBoundaries,
+    superusers: superuserBoundaries,
+    superusersOverrideFive: superuserOverrideBoundaries,
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("paloalto");

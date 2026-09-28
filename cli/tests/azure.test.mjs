@@ -2388,8 +2388,84 @@ test("byte differential fixtures: Azure assessments and export artifacts", { ski
       return [{ currentScore: score, maxScore: 100 }];
     },
   }, compliantClient()));
-  writeByteDifferentialFixture("azure", "boundary", {
+  const identityWithRoleMembers = async (roleName, count) => assessAzureIdentity(clientWith({
+    async listDirectoryRoles() {
+      return [{ id: "boundary-role", displayName: roleName }];
+    },
+    async listDirectoryRoleMembers() {
+      return Array.from({ length: count }, (_, index) => ({ id: `boundary-member-${index}` }));
+    },
+  }, compliantClient()));
+  const identityWithCredential = async (remainingDays, lifetimeDays) => {
+    const end = new Date(NOW.getTime() + remainingDays * 24 * 60 * 60 * 1000).toISOString();
+    const start = new Date(new Date(end).getTime() - lifetimeDays * 24 * 60 * 60 * 1000).toISOString();
+    const credential = { startDateTime: start, endDateTime: end };
+    return assessAzureIdentity(clientWith({
+      async listServicePrincipals() {
+        return [{ displayName: "Boundary SP", passwordCredentials: [credential], keyCredentials: [] }];
+      },
+      async listApplications() {
+        return [{ id: "boundary-app", displayName: "Boundary App", owners: [{ id: "owner" }], passwordCredentials: [credential], keyCredentials: [] }];
+      },
+    }, compliantClient()));
+  };
+  const identityWithPermanentAssignments = async (count) => assessAzureIdentity(clientWith({
+    async listRoleEligibilitySchedules() {
+      return [{ id: "eligible" }];
+    },
+    async listRoleAssignmentSchedules() {
+      return Array.from({ length: count }, (_, index) => ({
+        id: `permanent-${index}`,
+        assignmentType: "Assigned",
+        roleDefinitionId: "62e90394-69f5-4237-9190-012177145e10",
+        scheduleInfo: { expiration: { type: "noExpiration" } },
+      }));
+    },
+  }, compliantClient()));
+  const identityWithGuestAge = async (days) => assessAzureIdentity(clientWith({
+    async listGuestUsers() {
+      return [{
+        id: "boundary-guest",
+        userType: "Guest",
+        accountEnabled: true,
+        signInActivity: { lastSignInDateTime: new Date(NOW.getTime() - days * 24 * 60 * 60 * 1000).toISOString() },
+      }];
+    },
+  }, compliantClient()));
+  const subscriptionAssignments = async (roleName, count) => {
+    const roleId = `/${roleName.toLowerCase()}`;
+    return assessAzureSubscriptionGuardrails(clientWith({
+      async listRoleDefinitions() {
+        return [{ id: roleId, properties: { roleName } }];
+      },
+      async listRoleAssignments() {
+        return Array.from({ length: count }, (_, index) => ({
+          id: `assignment-${index}`,
+          properties: { roleDefinitionId: roleId, principalType: "User" },
+        }));
+      },
+    }, compliantClient()));
+  };
+  const retentionAt = async (days) => assessAzureMonitoring(clientWith({
+    async listLogAnalyticsWorkspaces() {
+      return [{ id: "/subscriptions/sub-123/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law", properties: { retentionInDays: days } }];
+    },
+  }, compliantClient()));
+  const boundary = {
     secureScore: await Promise.all([0, 49, 50, 74, 75].map(scoreAt)),
+    globalAdministrators: await Promise.all([4, 5].map((count) => identityWithRoleMembers("Global Administrator", count))),
+    privilegedAssignments: await Promise.all([5, 6, 10, 11].map((count) => identityWithRoleMembers("Privileged Role Administrator", count))),
+    credentialExpiryDays: await Promise.all([29, 30, 31].map((days) => identityWithCredential(days, 365))),
+    credentialLifetimeDays: await Promise.all([729, 730, 731].map((days) => identityWithCredential(365, days))),
+    permanentPrivilegedAssignments: await Promise.all([1, 2, 3].map(identityWithPermanentAssignments)),
+    guestInactivityDays: await Promise.all([89, 90, 91].map(identityWithGuestAge)),
+    ownerAssignments: await Promise.all([1, 2, 3].map((count) => subscriptionAssignments("Owner", count))),
+    contributorAssignments: await Promise.all([4, 5, 6].map((count) => subscriptionAssignments("Contributor", count))),
+    workspaceRetentionDays: await Promise.all([89, 90, 91].map(retentionAt)),
+  };
+  assert.equal(Object.values(boundary).reduce((total, values) => total + values.length, 0), 32);
+  writeByteDifferentialFixture("azure", "boundary", {
+    ...boundary,
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("azure");
