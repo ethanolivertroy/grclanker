@@ -19,6 +19,15 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
+import {
+  CLOUDFLARE_AUTH_RESOLVER,
+  readResolverEnvironment,
+} from "./auth-resolver-contracts.js";
+import { CLOUDFLARE_SPEC } from "./cloudflare.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -417,6 +426,7 @@ export function resolveCloudflareConfiguration(
   input: JsonRecord = {},
   env: NodeJS.ProcessEnv = process.env,
 ): CloudflareResolvedConfig {
+  env = readResolverEnvironment(CLOUDFLARE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const apiToken = asString(input.api_token)
     ?? asString(input.token)
@@ -1734,6 +1744,20 @@ const SPEC_CONTROL_MAPPINGS: Record<number, ControlMapping> = {
   24: { fedramp: "SC-7", cmmc: "SC.L2-3.13.1", soc2: "CC6.6", cis: "9.9", pci: "1.3.1", stig: "SRG-APP-000383", irap: "ISM-1148", ismap: "CPS-11" },
   25: { fedramp: "SC-8", cmmc: "SC.L2-3.13.8", soc2: "CC6.7", cis: "3.9", pci: "4.1", stig: "SRG-APP-000219", irap: "ISM-0490", ismap: "CPS-09" },
 };
+
+hydrateBatchFrameworkMappings(CLOUDFLARE_SPEC, Object.fromEntries(CLOUDFLARE_SPEC.checks.map((check) => {
+  const mapping = SPEC_CONTROL_MAPPINGS[check.controlNumbers[0]];
+  return [check.id, {
+    fedramp: mapping ? [mapping.fedramp] : [],
+    cmmc: mapping ? [mapping.cmmc] : [],
+    soc2: mapping ? [mapping.soc2] : [],
+    cis: mapping ? [mapping.cis] : [],
+    pci_dss: mapping && mapping.pci !== "n/a" ? [mapping.pci] : [],
+    disa_stig: mapping ? [mapping.stig] : [],
+    irap: mapping ? [mapping.irap] : [],
+    ismap: mapping ? [mapping.ismap] : [],
+  }];
+})));
 
 function mappingsForControl(specControl: number): string[] {
   const mapping = SPEC_CONTROL_MAPPINGS[specControl];
@@ -3470,6 +3494,7 @@ const authParams = {
 };
 
 export function registerCloudflareTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, CLOUDFLARE_SPEC);
   pi.registerTool({
     name: "cloudflare_check_access",
     label: "Check Cloudflare audit access",
