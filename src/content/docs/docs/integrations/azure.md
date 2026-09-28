@@ -15,18 +15,18 @@ The Azure integration audits an Entra ID tenant and one Azure subscription again
 
 ## Setup and authentication
 
-The tools resolve configuration in this order: explicit tool arguments, environment variables, then the `az` CLI (`az account show`, `az account get-access-token`). When `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` are present the CLI is not consulted and tokens are acquired with the OAuth 2.0 client credentials grant (`POST {authority}/{tenant}/oauth2/v2.0/token`, `grant_type=client_credentials`, `scope={resource}/.default`).
+The tools resolve configuration in this order: explicit tool arguments, environment variables, then the `az` CLI (`az account show`, `az account get-access-token`). When `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` (or the `client_id` and `client_secret` arguments) are present the CLI is not consulted, and any Graph or ARM token not already supplied as an argument or environment variable is acquired with the OAuth 2.0 client credentials grant (`POST {authority}/{tenant}/oauth2/v2.0/token`, `grant_type=client_credentials`, `scope={resource}/.default`).
 
 | Variable | Purpose |
 |----------|---------|
 | `AZURE_TENANT_ID` | Entra ID tenant (or `az account show`) |
 | `AZURE_SUBSCRIPTION_ID` | Subscription to audit (or `az account show`) |
-| `AZURE_GRAPH_TOKEN`, `AZURE_MANAGEMENT_TOKEN` | Pre-acquired bearer tokens |
+| `AZURE_GRAPH_TOKEN`, `AZURE_MANAGEMENT_TOKEN` | Pre-acquired bearer tokens; `AZURE_ACCESS_TOKEN` is read as the ARM token when `AZURE_MANAGEMENT_TOKEN` is unset |
 | `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | App registration for the client credentials flow |
 | `AZURE_AUTHORITY_HOST` | `login.microsoftonline.com` (default), `login.microsoftonline.us` (US Government: Graph `graph.microsoft.us`, ARM `management.usgovcloudapi.net`), `login.chinacloudapi.cn` or `login.partner.microsoftonline.cn` (China operated by 21Vianet: Graph `microsoftgraph.chinacloudapi.cn`, ARM `management.chinacloudapi.cn`; both hosts are documented and accepted) |
 | `AZURE_GRAPH_HOST`, `AZURE_MANAGEMENT_HOST` | Optional host overrides (for example DoD Graph `dod-graph.microsoft.us`) |
 
-`AZURE_CLIENT_CERTIFICATE_PATH` is recognised but certificate credentials and managed identity are not implemented; the tools fail fast with an explanatory error rather than guessing. Use a client secret or pass tokens.
+Certificate credentials and managed identity are not implemented. When a client ID is set with `AZURE_CLIENT_CERTIFICATE_PATH` but no client secret, the tools fail fast with an explanatory error rather than guessing; managed identity has no such check, so without a secret or tokens resolution falls through to the `az` CLI. Use a client secret or pass tokens.
 
 ### Required Microsoft Graph application permissions
 
