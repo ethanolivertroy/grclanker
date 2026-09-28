@@ -33,7 +33,7 @@ const batch = [
   [ZENDESK_SPEC, ZENDESK_RUNTIME_BEHAVIOR],
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
-const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM)-/.test(check.id);
+const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|ZD)-/.test(check.id);
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -368,6 +368,49 @@ test("Zoom executable rules ignore legacy status and preserve boundaries, preced
     bad_count: 0,
     unknown_count: 0,
   }), "warn", "the complete 26-user collector state, not a 25-item evidence sample, prevents pass");
+});
+
+test("Zendesk executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+  const legacyStatus = "pass";
+  const sessionFacts = {
+    readable: true,
+    timeout_present: true,
+    severe: false,
+    issue_count: 0,
+  };
+  assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-05", sessionFacts), "pass");
+  assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-05", {
+    ...sessionFacts,
+    severe: true,
+    issue_count: 1,
+  }), "fail", "mutating the timeout evidence changes the verdict while the legacy status is held constant");
+  assert.equal(legacyStatus, "pass");
+  assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-10", {
+    readable: true,
+    dateable: true,
+    oldest_age_days: 365,
+    required_retention_days: 365,
+  }), "pass", "retention passes exactly at the configured threshold");
+  assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-10", {
+    readable: true,
+    dateable: true,
+    oldest_age_days: 364,
+    required_retention_days: 365,
+  }), "warn", "retention warns immediately below the configured threshold");
+  assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-24", {
+    any_readable: true,
+    complete: false,
+    insecure_count: 1,
+    unauthenticated_webhook_count: 0,
+  }), "fail", "a proven insecure destination precedes partial evidence");
+  assert.equal(evaluateBatchCheckVerdict(ZENDESK_SPEC, "ZD-07", {
+    team_readable: true,
+    admin_count: 26,
+    admin_threshold: 25,
+    stale_admin_count: 0,
+    undated_admin_count: 0,
+    complete: true,
+  }), "fail", "the complete 26-admin inventory, not a 25-item evidence sample, controls the result");
 });
 
 test("runtime behavior statements are explicit and generator-visible", () => {

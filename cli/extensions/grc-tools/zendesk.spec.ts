@@ -117,7 +117,6 @@ const cmp = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry:
 const eq = (name: string, entry: PortableValue) => cmp("eq", name, entry);
 const ne = (name: string, entry: PortableValue) => cmp("ne", name, entry);
 const gt = (name: string, entry: PortableValue) => cmp("gt", name, entry);
-const gte = (name: string, entry: PortableValue) => cmp("gte", name, entry);
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
@@ -138,11 +137,11 @@ const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDec
     inputs: input("team_readable", "team_count", "security_readable", "enforcement_present", "enforcement_enabled", "sso_enforced", "without_two_factor_count", "unknown_two_factor_count", "complete"),
     rules: [
       rule("manual", any(ne("team_readable", true), eq("team_count", 0))),
-      rule("fail", gt("without_two_factor_count", 0)),
+      rule("fail", all(gt("without_two_factor_count", 0), ne("security_readable", true))),
       rule("manual", any(ne("security_readable", true), ne("enforcement_present", true))),
       rule("manual", all(eq("enforcement_enabled", false), eq("sso_enforced", true))),
       rule("fail", eq("enforcement_enabled", false)),
-      rule("warn", any(gt("unknown_two_factor_count", 0), ne("complete", true))),
+      rule("warn", any(gt("without_two_factor_count", 0), gt("unknown_two_factor_count", 0), ne("complete", true))),
       rule("pass", { op: "always" }),
     ],
   },
