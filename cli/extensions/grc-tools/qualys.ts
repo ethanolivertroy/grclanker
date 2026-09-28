@@ -19,7 +19,13 @@ import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import {
+  evaluateBatchRuntimeCheckVerdict,
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
 import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
+import { QUALYS_SPEC } from "./qualys.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type FetchImpl = typeof fetch;
@@ -276,6 +282,28 @@ const CONTROL_MAPPINGS: Record<number, string[]> = {
   19: ["FedRAMP AU-6", "CMMC 3.3.5", "SOC 2 CC7.2", "CIS 8.2", "PCI-DSS 10.6.1", "STIG SRG-APP-000516", "IRAP ISM-0580", "ISMAP CPS.AU-6"],
   20: ["FedRAMP RA-5", "CMMC 3.11.2", "SOC 2 CC7.1", "PCI-DSS 11.3.1", "STIG SRG-APP-000516", "IRAP ISM-1163", "ISMAP CPS.RA-5"],
 };
+
+const QUALYS_FRAMEWORK_PREFIXES = {
+  fedramp: "FedRAMP ",
+  cmmc: "CMMC ",
+  soc2: "SOC 2 ",
+  cis: "CIS ",
+  pci_dss: "PCI-DSS ",
+  disa_stig: "STIG ",
+  irap: "IRAP ",
+  ismap: "ISMAP ",
+} as const;
+hydrateBatchFrameworkMappings(QUALYS_SPEC, Object.fromEntries(
+  Object.keys(CONTROL_TITLES).map((numberValue) => {
+    const number = Number(numberValue);
+    return [`QUALYS-C${String(number).padStart(2, "0")}`, Object.fromEntries(
+      Object.entries(QUALYS_FRAMEWORK_PREFIXES).map(([framework, prefix]) => [
+        framework,
+        (CONTROL_MAPPINGS[number] ?? []).filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length)),
+      ]),
+    )];
+  }),
+));
 
 const FRAMEWORKS: Array<{ prefix: string; dir: string; file: string; title: string }> = [
   { prefix: "FedRAMP ", dir: "fedramp", file: "fedramp_compliance_report.md", title: "FedRAMP / NIST 800-53 Compliance Report" },
@@ -1924,12 +1952,20 @@ function finding(
   summary: string,
   evidence: JsonRecord = {},
 ): QualysFinding {
+  const id = `QUALYS-C${String(control).padStart(2, "0")}`;
+  const facts = {
+    evidence_readable: status !== "manual",
+    evidence_complete: status !== "manual",
+    inventory_count: 1,
+    violation_count: status === "fail" ? 1 : 0,
+    review_count: status === "warn" ? 1 : 0,
+  };
   return {
-    id: `QUALYS-C${String(control).padStart(2, "0")}`,
+    id,
     control,
     title: CONTROL_TITLES[control] ?? `Control ${control}`,
     severity,
-    status,
+    status: evaluateBatchRuntimeCheckVerdict(QUALYS_SPEC, id, facts) as QualysFindingStatus,
     summary,
     evidence,
     mappings: CONTROL_MAPPINGS[control] ?? [],
@@ -4552,6 +4588,7 @@ function registerAssessmentTool(
 }
 
 export function registerQualysTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, QUALYS_SPEC);
   pi.registerTool({
     name: "qualys_check_access",
     label: "Check Qualys audit access",
