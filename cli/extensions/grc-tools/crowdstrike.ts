@@ -813,7 +813,7 @@ function summarizeError(error: unknown): string {
  * token shapes (PEM blocks, JWTs, hex digests, vendor prefixes, and long runs with base64 symbols,
  * scattered digits, or token casing).
  */
-function scrubSecretText(text: string, secrets: Iterable<string | undefined> = []): string {
+export function scrubSecretText(text: string, secrets: Iterable<string | undefined> = []): string {
   let scrubbed = text;
   for (const secret of [...secrets, ...KNOWN_SECRETS]) {
     if (!secret || secret.length < MIN_REMEMBERED_SECRET_LENGTH) continue;
@@ -871,7 +871,7 @@ function scrubRememberedSecrets(text: string): string {
  * sys_id, a name such as prod-us-east-2026) stay while a header line, URL credential, assignment,
  * configured secret, or vendor token embedded in a description, name, or note goes.
  */
-function scrubDataText(text: string): string {
+export function scrubDataText(text: string): string {
   return scrubCarriers(scrubRememberedSecrets(text)).replace(VENDOR_TOKEN_PATTERN, REDACTED);
 }
 
@@ -880,7 +880,7 @@ function scrubDataText(text: string): string {
  * rebuilt, primitives and null are kept, and a container nested deeper than MAX_REDACTION_DEPTH is
  * replaced by the marker rather than passed through unscrubbed (the payload is server-controlled).
  */
-function scrubDataStrings<T>(value: T, depth = 0): T {
+export function scrubDataStrings<T>(value: T, depth = 0): T {
   if (typeof value === "string") return scrubDataText(value) as T;
   if (value === null || typeof value !== "object") return value;
   if (depth > MAX_REDACTION_DEPTH) return REDACTED as T;

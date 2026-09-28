@@ -858,7 +858,7 @@ export function scrubErrorText(text: string, secrets: string[] = [], options: Sc
 }
 
 // Data values and bundle content: every rule except the long-token heuristic (see ScrubErrorTextOptions).
-function scrubDataText(text: string, secrets: string[]): string {
+export function scrubDataText(text: string, secrets: string[]): string {
   return scrubErrorText(text, secrets, { longTokens: false });
 }
 
