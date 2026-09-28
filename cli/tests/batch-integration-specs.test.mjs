@@ -294,6 +294,13 @@ test("Okta, Slack, and Zoom execute declared derived facts with ordered first-ma
       assert.equal(branches.length, check.criteria.rules.length, `${check.id}: one executable derivation per outcome`);
       for (const [index, rule] of check.criteria.rules.entries()) {
         const witness = orderedBranchWitness(check, index);
+        const isFinalSafetyFallback = index === check.criteria.rules.length - 1
+          && branches[index].condition.op === "always"
+          && rule.status === "manual";
+        if (!witness && isFinalSafetyFallback) {
+          assert.equal(evaluateCheckVerdict(check, {}), "manual", `${check.id}: safety fallback handles missing evidence`);
+          continue;
+        }
         assert.ok(witness, `${check.id}: executable evidence reaches ordered branch ${index + 1} (${rule.status})`);
         assert.equal(
           evaluateCheckVerdict(check, witness),
