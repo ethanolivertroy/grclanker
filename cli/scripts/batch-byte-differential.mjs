@@ -28,6 +28,12 @@ const testFiles = [
   "box.test.mjs",
   "slack.test.mjs",
   "zoom.test.mjs",
+  "azure.test.mjs",
+  "gcp.test.mjs",
+  "oci.test.mjs",
+  "cloudflare.test.mjs",
+  "paloalto.test.mjs",
+  "zscaler.test.mjs",
 ];
 
 function run(command, args, options = {}) {
