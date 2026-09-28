@@ -441,12 +441,12 @@ const PALOALTO_SOURCE_INPUTS = {
 
 function assessPaloaltoSnapshots(prisma, panos) {
   if (prisma) assessPrismaCloudPosture(prisma);
-  assessPrismaCompute(prisma);
+  assessPrismaCompute(prisma ?? undefined);
   assessPanosFirewallPolicy(panos);
   assessPanosThreatPrevention(panos);
-  assessDataLossPrevention(prisma, panos);
-  assessAdminAccess(prisma, panos);
-  assessLogging(prisma, panos);
+  assessDataLossPrevention(prisma ?? undefined, panos);
+  assessAdminAccess(prisma ?? undefined, panos);
+  assessLogging(prisma ?? undefined, panos);
   assessPanosDeviceHardening(panos);
 }
 
