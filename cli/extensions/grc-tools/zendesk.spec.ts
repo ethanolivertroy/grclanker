@@ -1,4 +1,5 @@
 import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const zendeskSurface = (id: string, path: string, fields: readonly string[]) => ({
   id,
@@ -109,16 +110,246 @@ const decisions = [
   "return fail when any active trigger or automation sends ticket data to an HTTP destination, pass when the complete non-empty rule inventory has no external notification action and destination lookups are complete, warn for external actions or partial evidence, and manual when no active rule is visible or either rule inventory is unavailable.",
 ] as const;
 
+interface ZendeskExecutableDecision { inputs: Readonly<Record<string, string>>; rules: readonly VerdictRule[] }
+const value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
+const path = (name: string) => ({ kind: "path" as const, path: name });
+const cmp = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, entry: PortableValue): VerdictCondition => ({ op, left: path(name), right: value(entry) });
+const eq = (name: string, entry: PortableValue) => cmp("eq", name, entry);
+const ne = (name: string, entry: PortableValue) => cmp("ne", name, entry);
+const gt = (name: string, entry: PortableValue) => cmp("gt", name, entry);
+const gte = (name: string, entry: PortableValue) => cmp("gte", name, entry);
+const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
+const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
+const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
+const input = (...names: string[]) => Object.fromEntries(names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete Zendesk collector state before rendered evidence arrays are capped.`]));
+const manual = (): ZendeskExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
+
+const ZENDESK_EXECUTABLE_DECISIONS: Readonly<Record<string, ZendeskExecutableDecision>> = {
+  "ZD-01": {
+    inputs: input("readable", "fields_present", "enforce_sso", "zendesk_login", "sso_method_count"),
+    rules: [
+      rule("manual", any(ne("readable", true), ne("fields_present", true))),
+      rule("pass", all(eq("enforce_sso", true), eq("zendesk_login", false), gt("sso_method_count", 0))),
+      rule("warn", eq("enforce_sso", true)),
+      rule("fail", { op: "always" }),
+    ],
+  },
+  "ZD-02": {
+    inputs: input("team_readable", "team_count", "security_readable", "enforcement_present", "enforcement_enabled", "sso_enforced", "without_two_factor_count", "unknown_two_factor_count", "complete"),
+    rules: [
+      rule("manual", any(ne("team_readable", true), eq("team_count", 0))),
+      rule("fail", gt("without_two_factor_count", 0)),
+      rule("manual", any(ne("security_readable", true), ne("enforcement_present", true))),
+      rule("manual", all(eq("enforcement_enabled", false), eq("sso_enforced", true))),
+      rule("fail", eq("enforcement_enabled", false)),
+      rule("warn", any(gt("unknown_two_factor_count", 0), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-03": {
+    inputs: input("readable", "policy_present", "recommended", "custom", "high", "custom_gap_count"),
+    rules: [
+      rule("manual", any(ne("readable", true), ne("policy_present", true))),
+      rule("pass", any(eq("recommended", true), all(eq("custom", true), eq("custom_gap_count", 0)))),
+      rule("warn", any(eq("custom", true), eq("high", true))),
+      rule("fail", { op: "always" }),
+    ],
+  },
+  "ZD-04": {
+    inputs: input("readable", "enabled_present", "enabled", "range_count"),
+    rules: [
+      rule("manual", any(ne("readable", true), ne("enabled_present", true))),
+      rule("pass", all(eq("enabled", true), gt("range_count", 0))),
+      rule("warn", eq("enabled", true)),
+      rule("fail", { op: "always" }),
+    ],
+  },
+  "ZD-05": {
+    inputs: input("readable", "timeout_present", "severe", "issue_count"),
+    rules: [
+      rule("manual", any(ne("readable", true), ne("timeout_present", true))),
+      rule("fail", eq("severe", true)),
+      rule("warn", gt("issue_count", 0)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-06": {
+    inputs: input("team_readable", "team_count", "roles_readable", "complete", "populated_admin_equivalent_count", "unassigned_admin_equivalent_count", "agent_count", "unrestricted_agent_count"),
+    rules: [
+      rule("manual", any(ne("team_readable", true), eq("team_count", 0), ne("roles_readable", true))),
+      rule("fail", gt("populated_admin_equivalent_count", 0)),
+      rule("warn", any(ne("complete", true), gt("unassigned_admin_equivalent_count", 0), all(gt("agent_count", 0), { op: "eq", left: path("unrestricted_agent_count"), right: path("agent_count") }))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-07": {
+    inputs: input("team_readable", "admin_count", "admin_threshold", "stale_admin_count", "undated_admin_count", "complete"),
+    rules: [
+      rule("manual", any(ne("team_readable", true), eq("admin_count", 0))),
+      rule("fail", { op: "gt", left: path("admin_count"), right: path("admin_threshold") }),
+      rule("warn", any(gt("stale_admin_count", 0), gt("undated_admin_count", 0), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-08": {
+    inputs: input("groups_readable", "memberships_readable", "group_count", "membership_count", "complete"),
+    rules: [
+      rule("manual", any(ne("groups_readable", true), ne("memberships_readable", true), eq("group_count", 0))),
+      rule("warn", any(eq("group_count", 1), eq("membership_count", 0), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-09": {
+    inputs: input("readable", "entry_count", "sample_cut_short"),
+    rules: [
+      rule("manual", any(ne("readable", true), eq("entry_count", 0))),
+      rule("warn", eq("sample_cut_short", true)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-10": {
+    inputs: input("readable", "dateable", "oldest_age_days", "required_retention_days"),
+    rules: [
+      rule("manual", any(ne("readable", true), ne("dateable", true))),
+      rule("pass", { op: "gte", left: path("oldest_age_days"), right: path("required_retention_days") }),
+      rule("warn", { op: "always" }),
+    ],
+  },
+  "ZD-11": manual(),
+  "ZD-12": {
+    inputs: input("readable", "complete", "schedule_count", "active_count", "active_ticket_count", "active_without_conditions_count", "secondary_complete"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("warn", all(ne("complete", true), any(eq("schedule_count", 0), eq("active_count", 0)))),
+      rule("fail", any(eq("schedule_count", 0), eq("active_count", 0))),
+      rule("warn", any(eq("active_ticket_count", 0), gt("active_without_conditions_count", 0), ne("complete", true), ne("secondary_complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-13": {
+    inputs: input("settings_readable", "token_access_disabled", "token_history_readable", "token_history_complete", "outstanding_token_count"),
+    rules: [
+      rule("manual", ne("settings_readable", true)),
+      rule("warn", all(eq("token_access_disabled", true), ne("token_history_complete", true))),
+      rule("pass", eq("token_access_disabled", true)),
+      rule("manual", ne("token_history_readable", true)),
+      rule("warn", eq("outstanding_token_count", 0)),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "ZD-14": {
+    inputs: input("clients_readable", "clients_complete", "client_count", "unscoped_count", "insecure_redirect_count", "tokens_readable", "tokens_complete", "token_count", "hygiene_warning_count"),
+    rules: [
+      rule("manual", ne("clients_readable", true)),
+      rule("fail", any(gt("unscoped_count", 0), gt("insecure_redirect_count", 0))),
+      rule("warn", any(ne("tokens_readable", true), ne("clients_complete", true), ne("tokens_complete", true), gt("hygiene_warning_count", 0), all(eq("client_count", 0), gt("token_count", 0)))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-15": {
+    inputs: input("installations_readable", "installations_complete", "installation_count", "owned_apps_complete"),
+    rules: [
+      rule("manual", ne("installations_readable", true)),
+      rule("warn", all(eq("installation_count", 0), ne("installations_complete", true))),
+      rule("warn", all(eq("installation_count", 0), ne("owned_apps_complete", true))),
+      rule("pass", eq("installation_count", 0)),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "ZD-16": {
+    inputs: input("readable", "complete", "owned_app_count", "retired_count"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("warn", all(eq("owned_app_count", 0), ne("complete", true))),
+      rule("pass", eq("owned_app_count", 0)),
+      rule("warn", gt("retired_count", 0)),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "ZD-17": {
+    inputs: input("readable", "flag_present", "sandbox_enabled"),
+    rules: [rule("manual", any(ne("readable", true), ne("flag_present", true))), rule("pass", eq("sandbox_enabled", true)), rule("warn", { op: "always" })],
+  },
+  "ZD-18": {
+    inputs: input("readable", "flag_present", "private_attachments", "insecure_cdn_count"),
+    rules: [
+      rule("manual", any(ne("readable", true), ne("flag_present", true))),
+      rule("pass", all(eq("private_attachments", true), eq("insecure_cdn_count", 0))),
+      rule("warn", eq("private_attachments", true)),
+      rule("fail", { op: "always" }),
+    ],
+  },
+  "ZD-19": manual(),
+  "ZD-20": {
+    inputs: input("readable", "complete", "ticket_count", "stale_count", "undated_count"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("warn", any(gt("stale_count", 0), gt("undated_count", 0), ne("complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-21": {
+    inputs: input("security_readable", "fields_present", "enforce_sso", "zendesk_login", "sso_method_count", "strong_password_policy", "account_settings_complete"),
+    rules: [
+      rule("manual", any(ne("security_readable", true), ne("fields_present", true))),
+      rule("warn", all(eq("enforce_sso", true), eq("sso_method_count", 0))),
+      rule("warn", all(eq("zendesk_login", true), ne("strong_password_policy", true))),
+      rule("fail", all(eq("enforce_sso", false), eq("zendesk_login", false), eq("sso_method_count", 0))),
+      rule("warn", ne("account_settings_complete", true)),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-22": {
+    inputs: input("readable", "brand_count", "admin_view", "complete", "inconsistent_state_count"),
+    rules: [
+      rule("manual", any(ne("readable", true), eq("brand_count", 0))),
+      rule("warn", any(ne("admin_view", true), ne("complete", true), gt("inconsistent_state_count", 0))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-23": {
+    inputs: input("readable", "complete", "agreement_count", "broken_count"),
+    rules: [
+      rule("manual", ne("readable", true)),
+      rule("warn", all(eq("agreement_count", 0), ne("complete", true))),
+      rule("pass", eq("agreement_count", 0)),
+      rule("warn", gt("broken_count", 0)),
+      rule("manual", { op: "always" }),
+    ],
+  },
+  "ZD-24": {
+    inputs: input("any_readable", "complete", "insecure_count", "unauthenticated_webhook_count"),
+    rules: [
+      rule("manual", ne("any_readable", true)),
+      rule("fail", gt("insecure_count", 0)),
+      rule("warn", any(ne("complete", true), gt("unauthenticated_webhook_count", 0))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+  "ZD-25": {
+    inputs: input("rules_readable", "rule_count", "rules_complete", "insecure_destination_count", "external_action_count", "destination_sources_complete"),
+    rules: [
+      rule("manual", any(ne("rules_readable", true), eq("rule_count", 0))),
+      rule("fail", gt("insecure_destination_count", 0)),
+      rule("warn", any(gt("external_action_count", 0), ne("rules_complete", true), ne("destination_sources_complete", true))),
+      rule("pass", { op: "always" }),
+    ],
+  },
+};
+
 const checks: BatchCheckDefinition[] = titles.map((title, index) => {
   const control = index + 1;
+  const id = `ZD-${String(control).padStart(2, "0")}`;
   return {
-    id: `ZD-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title,
     severity: [1, 2, 6, 11].includes(control) ? "critical" : [3, 4, 7, 9, 12, 13, 14, 21, 24, 25].includes(control) ? "high" : "medium",
     owner: ownerFor(control),
     surfaces: ZENDESK_CHECK_SURFACES[control],
     evidenceFields: [...ZENDESK_CHECK_SURFACES[control], "complete_source_counts"],
+    decisionInputs: ZENDESK_EXECUTABLE_DECISIONS[id].inputs,
+    decisionRules: ZENDESK_EXECUTABLE_DECISIONS[id].rules,
     decision: decisions[index],
   };
 });
