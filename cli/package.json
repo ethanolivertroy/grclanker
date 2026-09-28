@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "type": "module",
   "description": "Experimental local-first GRC CLI for CMVP, KEV, EPSS, and framework-mapped posture work",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ethanolivertroy/grclanker.git"
