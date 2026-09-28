@@ -1,4 +1,9 @@
-import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  deriveDecisionRules,
+  type BatchCheckDefinition,
+} from "./batch-spec-builder.js";
 import { GWS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
@@ -98,8 +103,19 @@ const compare = (
 const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", name, entry);
 const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
 const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
-const gte = (name: string, entry: PortableValue): VerdictCondition => compare("gte", name, entry);
 const lte = (name: string, entry: PortableValue): VerdictCondition => compare("lte", name, entry);
+const ratio = (
+  comparator: "gt" | "gte" | "lt" | "lte",
+  numerator: string,
+  denominator: string,
+  threshold: number,
+): VerdictCondition => ({
+  op: "ratio",
+  numerator: path(numerator),
+  denominator: path(denominator),
+  comparator,
+  threshold: value(threshold),
+});
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
@@ -127,57 +143,60 @@ const incomplete = ne("complete", true);
 
 const GWS_EXECUTABLE_DECISIONS: Readonly<Record<string, GwsExecutableDecision>> = {
   "GWS-ID-001": {
-    inputs: input("readable", "complete", "privileged_user_count", "enforced_user_count", "coverage"),
+    inputs: input("readable", "complete", "privileged_user_count", "two_step_required_user_count"),
     constants: { warning_minimum: 0.8, pass_minimum: 1 },
     rules: ordered({
       manual: any(unreadable, eq("privileged_user_count", 0)),
-      fail: { op: "lt", left: path("coverage"), right: value(0.8) },
-      warn: any(incomplete, { op: "lt", left: path("coverage"), right: value(1) }),
-      pass: gte("coverage", 1),
+      fail: ratio("lt", "two_step_required_user_count", "privileged_user_count", 0.8),
+      warn: any(incomplete, ratio("lt", "two_step_required_user_count", "privileged_user_count", 1)),
+      pass: ratio("gte", "two_step_required_user_count", "privileged_user_count", 1),
     }),
   },
   "GWS-ID-002": {
-    inputs: input("readable", "complete", "active_user_count", "enforced_user_count", "coverage"),
+    inputs: input("readable", "complete", "active_user_count", "two_step_required_user_count"),
     constants: { warning_minimum: 0.85, pass_minimum: 0.98 },
     rules: ordered({
       manual: any(unreadable, eq("active_user_count", 0)),
-      fail: { op: "lt", left: path("coverage"), right: value(0.85) },
-      warn: any(incomplete, { op: "lt", left: path("coverage"), right: value(0.98) }),
-      pass: gte("coverage", 0.98),
+      fail: ratio("lt", "two_step_required_user_count", "active_user_count", 0.85),
+      warn: any(incomplete, ratio("lt", "two_step_required_user_count", "active_user_count", 0.98)),
+      pass: ratio("gte", "two_step_required_user_count", "active_user_count", 0.98),
     }),
   },
   "GWS-ID-003": {
-    inputs: input("readable", "complete", "active_user_count", "dormant_user_count", "unknown_login_count", "warning_dormant_maximum"),
-    constants: { dormant_days: 90 },
+    inputs: input("readable", "complete", "active_user_count", "dormant_user_count", "unknown_login_count"),
+    constants: { dormant_days: 90, absolute_warning_maximum: 2, proportional_warning_maximum: 0.05 },
     rules: ordered({
       manual: any(unreadable, eq("active_user_count", 0)),
-      fail: { op: "gt", left: path("dormant_user_count"), right: path("warning_dormant_maximum") },
+      fail: all(
+        gt("dormant_user_count", 2),
+        ratio("gt", "dormant_user_count", "active_user_count", 0.05),
+      ),
       warn: any(incomplete, gt("dormant_user_count", 0), gt("unknown_login_count", 0)),
       pass: all(eq("dormant_user_count", 0), eq("unknown_login_count", 0)),
     }),
   },
   "GWS-ID-004": {
-    inputs: input("readable", "complete", "super_admin_count", "unenforced_super_admin_count"),
+    inputs: input("readable", "complete", "super_admin_count", "super_admin_without_two_step_count"),
     rules: ordered({
       manual: any(unreadable, eq("super_admin_count", 0)),
-      fail: gt("unenforced_super_admin_count", 0),
+      fail: gt("super_admin_without_two_step_count", 0),
       warn: incomplete,
-      pass: eq("unenforced_super_admin_count", 0),
+      pass: eq("super_admin_without_two_step_count", 0),
     }),
   },
   "GWS-ID-005": {
-    inputs: input("readable", "complete", "policy_count", "enforcement_policy_count", "enforced_policy_count", "enrollment_disabled_count"),
+    inputs: input("readable", "complete", "policy_count", "two_step_policy_count", "effective_policy_count", "policy_disallowing_enrollment_count"),
     rules: ordered({
-      manual: any(unreadable, eq("enforcement_policy_count", 0)),
-      fail: eq("enforced_policy_count", 0),
+      manual: any(unreadable, eq("two_step_policy_count", 0)),
+      fail: eq("effective_policy_count", 0),
       warn: any(
         incomplete,
-        { op: "lt", left: path("enforced_policy_count"), right: path("enforcement_policy_count") },
-        gt("enrollment_disabled_count", 0),
+        { op: "lt", left: path("effective_policy_count"), right: path("two_step_policy_count") },
+        gt("policy_disallowing_enrollment_count", 0),
       ),
       pass: all(
-        { op: "eq", left: path("enforced_policy_count"), right: path("enforcement_policy_count") },
-        eq("enrollment_disabled_count", 0),
+        { op: "eq", left: path("effective_policy_count"), right: path("two_step_policy_count") },
+        eq("policy_disallowing_enrollment_count", 0),
       ),
     }),
   },
@@ -319,19 +338,25 @@ const GWS_EXECUTABLE_DECISIONS: Readonly<Record<string, GwsExecutableDecision>> 
 let control = 0;
 const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([key, titles]) => {
   const group = key as keyof typeof groups;
-  return titles.map((title, index) => ({
-    id: `GWS-${group}-${String(index + 1).padStart(3, "0")}`,
-    control: ++control,
-    title,
-    severity: /Privileged|Super admin|2-step|Suspicious|Alert Center/i.test(title) ? "high" : "medium",
-    owner: owners[group],
-    surfaces: GWS_CHECK_SURFACES[`GWS-${group}-${String(index + 1).padStart(3, "0")}`],
-    evidenceFields: [...GWS_CHECK_SURFACES[`GWS-${group}-${String(index + 1).padStart(3, "0")}`], "complete_source_counts"],
-    decisionInputs: GWS_EXECUTABLE_DECISIONS[`GWS-${group}-${String(index + 1).padStart(3, "0")}`].inputs,
-    decisionConstants: GWS_EXECUTABLE_DECISIONS[`GWS-${group}-${String(index + 1).padStart(3, "0")}`].constants,
-    decisionRules: GWS_EXECUTABLE_DECISIONS[`GWS-${group}-${String(index + 1).padStart(3, "0")}`].rules,
-    decision: decisions[group][index],
-  }));
+  return titles.map((title, index) => {
+    const id = `GWS-${group}-${String(index + 1).padStart(3, "0")}`;
+    const decision = GWS_EXECUTABLE_DECISIONS[id];
+    const executable = deriveDecisionRules(id, decision.rules);
+    return {
+      id,
+      control: ++control,
+      title,
+      severity: /Privileged|Super admin|2-step|Suspicious|Alert Center/i.test(title) ? "high" : "medium",
+      owner: owners[group],
+      surfaces: GWS_CHECK_SURFACES[id],
+      evidenceFields: [...GWS_CHECK_SURFACES[id], "complete_source_counts"],
+      decisionInputs: decision.inputs,
+      decisionConstants: decision.constants,
+      decisionRules: executable.rules,
+      derivedFactRules: executable.derivedFactRules,
+      decision: decisions[group][index],
+    };
+  });
 });
 
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);

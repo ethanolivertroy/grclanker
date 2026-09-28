@@ -1099,7 +1099,7 @@ function countByStatus(findings: GwsFinding[]): Record<GwsFindingStatus, number>
 }
 
 const GWS_DECISION_CONTEXT = new AsyncLocalStorage<Map<string, Readonly<Record<string, unknown>>>>();
-const GWS_METADATA_DEMOTED_PASSES = new WeakSet<GwsFinding>();
+const GWS_COMPLETENESS_DEMOTED_PASSES = new WeakSet<GwsFinding>();
 
 function recordGwsDecisionFacts(definitionId: string, facts: Readonly<Record<string, unknown>>): void {
   const store = GWS_DECISION_CONTEXT.getStore();
@@ -1128,7 +1128,6 @@ function buildFinding(
   if (!definition) throw new Error(`Unknown GWS check definition: ${definitionId}`);
   const facts = GWS_DECISION_CONTEXT.getStore()?.get(definitionId);
   if (!facts) throw new Error(`${definitionId} has no runtime decision facts`);
-  const legacyStatus = status;
   status = materializeBatchCheckVerdict(GWS_SPEC, definitionId, facts);
   const finding: GwsFinding = {
     id: definition.id,
@@ -1142,7 +1141,13 @@ function buildFinding(
     manualNote,
     frameworks: definition.frameworks,
   };
-  if (legacyStatus === "Pass" && status === "Partial") GWS_METADATA_DEMOTED_PASSES.add(finding);
+  if (
+    status === "Partial"
+    && Object.hasOwn(facts, "complete")
+    && materializeBatchCheckVerdict(GWS_SPEC, definitionId, { ...facts, complete: true }) === "Pass"
+  ) {
+    GWS_COMPLETENESS_DEMOTED_PASSES.add(finding);
+  }
   return finding;
 }
 
@@ -1206,7 +1211,7 @@ function withPartialCap(
   reason = "the credential only saw a partial inventory",
 ): GwsFinding {
   if (notes.length === 0) return finding;
-  const passBeforeCap = finding.status === "Pass" || GWS_METADATA_DEMOTED_PASSES.has(finding);
+  const passBeforeCap = finding.status === "Pass" || GWS_COMPLETENESS_DEMOTED_PASSES.has(finding);
   const status: GwsFindingStatus = passBeforeCap ? "Partial" : finding.status;
   return {
     ...finding,
@@ -2832,9 +2837,9 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
       readable: false,
       complete: false,
       policy_count: 0,
-      enforcement_policy_count: 0,
-      enforced_policy_count: 0,
-      enrollment_disabled_count: 0,
+      two_step_policy_count: 0,
+      effective_policy_count: 0,
+      policy_disallowing_enrollment_count: 0,
     });
     return buildFinding(
       "GWS-ID-005",
@@ -2850,9 +2855,9 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
       readable: false,
       complete: false,
       policy_count: 0,
-      enforcement_policy_count: 0,
-      enforced_policy_count: 0,
-      enrollment_disabled_count: 0,
+      two_step_policy_count: 0,
+      effective_policy_count: 0,
+      policy_disallowing_enrollment_count: 0,
     });
     return unreadableFinding(
       "GWS-ID-005",
@@ -2872,9 +2877,9 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
       readable: true,
       complete: completeGwsDatasets(dataset),
       policy_count: dataset.data.length,
-      enforcement_policy_count: 0,
-      enforced_policy_count: 0,
-      enrollment_disabled_count: 0,
+      two_step_policy_count: 0,
+      effective_policy_count: 0,
+      policy_disallowing_enrollment_count: 0,
     });
     return buildFinding(
       "GWS-ID-005",
@@ -2909,9 +2914,9 @@ function assessTwoStepPolicy(dataset: CollectedDataset<JsonRecord[]> | undefined
     readable: true,
     complete: completeGwsDatasets(dataset),
     policy_count: dataset.data.length,
-    enforcement_policy_count: enforcement.length,
-    enforced_policy_count: enforced.length,
-    enrollment_disabled_count: enrollmentDisabled.length,
+    two_step_policy_count: enforcement.length,
+    effective_policy_count: enforced.length,
+    policy_disallowing_enrollment_count: enrollmentDisabled.length,
   });
   const evidence = [
     countLine("Enforcement policies returned", enforcement.length, [policiesStatus]),
@@ -2980,23 +2985,17 @@ export function assessGwsIdentity(
   const directoryReadable = !directoryProblem;
   const directoryComplete = completeGwsDatasets(data.users, data.roles, data.roleAssignments)
     && privileged.unresolvedAssignments === 0;
-  const privilegedCoverage = privileged.privilegedUsers.length === 0
-    ? 0
-    : privilegedEnforced.length / privileged.privilegedUsers.length;
-  const activeCoverage = activeUsers.length === 0 ? 0 : enforcedUsers.length / activeUsers.length;
   recordGwsDecisionFacts("GWS-ID-001", {
     readable: directoryReadable,
     complete: directoryComplete,
     privileged_user_count: privileged.privilegedUsers.length,
-    enforced_user_count: privilegedEnforced.length,
-    coverage: privilegedCoverage,
+    two_step_required_user_count: privilegedEnforced.length,
   });
   recordGwsDecisionFacts("GWS-ID-002", {
     readable: !data.users.error,
     complete: completeGwsDatasets(data.users),
     active_user_count: activeUsers.length,
-    enforced_user_count: enforcedUsers.length,
-    coverage: activeCoverage,
+    two_step_required_user_count: enforcedUsers.length,
   });
   recordGwsDecisionFacts("GWS-ID-003", {
     readable: !data.users.error,
@@ -3004,13 +3003,12 @@ export function assessGwsIdentity(
     active_user_count: activeUsers.length,
     dormant_user_count: dormancy.dormant,
     unknown_login_count: dormancy.unknownLastLogin,
-    warning_dormant_maximum: Math.max(2, Math.ceil(activeUsers.length * 0.05)),
   });
   recordGwsDecisionFacts("GWS-ID-004", {
     readable: directoryReadable,
     complete: directoryComplete,
     super_admin_count: privileged.superAdmins.length,
-    unenforced_super_admin_count: privileged.superAdmins.length - superAdminEnforced.length,
+    super_admin_without_two_step_count: privileged.superAdmins.length - superAdminEnforced.length,
   });
 
   const findings: GwsFinding[] = [];
