@@ -23,6 +23,7 @@ import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
 import { REDACTED_VALUE, scrubSensitiveValues } from "../../flue/redact.js";
 import {
+  evaluateBatchCheckVerdict,
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
@@ -3494,28 +3495,53 @@ interface EvidenceGate {
   unevaluable?: Record<string, number>;
 }
 
+const PALOALTO_DECISION_FACTS = Symbol("paloalto-decision-facts");
+
+type PaloaltoFindingWithFacts = PaloaltoFinding & {
+  [PALOALTO_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
+};
+
+function paloaltoDecisionFacts(
+  inventoryCount: number,
+  violationCount: number,
+  reviewCount = 0,
+): Readonly<Record<string, unknown>> {
+  return {
+    evidence_readable: true,
+    evidence_complete: true,
+    inventory_count: inventoryCount,
+    violation_count: violationCount,
+    review_count: reviewCount,
+  };
+}
+
 /**
  * Applies the verdict-safety rules: unreadable evidence forces manual,
  * partial inventories (a truncated walk, or records that carried none of the
  * documented members and could not be evaluated) cap the verdict at warn.
  */
 function gate(result: PaloaltoFinding, gateInfo: EvidenceGate, evidenceInstruction: string): PaloaltoFinding {
+  const facts = (result as PaloaltoFindingWithFacts)[PALOALTO_DECISION_FACTS] ?? {};
   if (gateInfo.unreadable.length > 0) {
-    return {
+    const gated = {
       ...result,
-      status: "manual",
+      status: evaluateBatchCheckVerdict(PALOALTO_SPEC, result.id, { ...facts, evidence_readable: false, evidence_complete: false }) as PaloaltoStatus,
       summary: `Evidence unavailable (${gateInfo.unreadable.join("; ")}), so the verdict cannot be derived from the API. Manual evidence required: ${evidenceInstruction}`,
       evidence: { ...(result.evidence ?? {}), unreadable_sources: gateInfo.unreadable, manual_evidence: evidenceInstruction },
     };
+    Object.defineProperty(gated, PALOALTO_DECISION_FACTS, { value: { ...facts, evidence_readable: false, evidence_complete: false } });
+    return gated;
   }
   if (gateInfo.partial.length > 0) {
     const unevaluable = gateInfo.unevaluable && Object.keys(gateInfo.unevaluable).length > 0 ? { unevaluable_records: gateInfo.unevaluable } : {};
-    return {
+    const gated = {
       ...result,
-      status: result.status === "pass" ? "warn" : result.status,
+      status: evaluateBatchCheckVerdict(PALOALTO_SPEC, result.id, { ...facts, evidence_complete: false }) as PaloaltoStatus,
       summary: `${result.summary} Partial inventory: ${gateInfo.partial.join("; ")}.`,
       evidence: { ...(result.evidence ?? {}), partial_inventory: gateInfo.partial, ...unevaluable },
     };
+    Object.defineProperty(gated, PALOALTO_DECISION_FACTS, { value: { ...facts, evidence_complete: false } });
+    return gated;
   }
   return result;
 }
@@ -3696,21 +3722,25 @@ const AUTHENTICATION_PROFILE_XPATHS = [...GLOBALPROTECT_XPATHS, "/config/shared"
 function finding(
   control: number,
   severity: PaloaltoSeverity,
-  status: PaloaltoStatus,
+  _status: PaloaltoStatus,
   summary: string,
   evidence?: JsonRecord,
+  decisionFacts?: Readonly<Record<string, unknown>>,
 ): PaloaltoFinding {
   const definition = CONTROLS_BY_NUMBER.get(control);
-  return {
-    id: definition?.id ?? `PA-${String(control).padStart(2, "0")}`,
+  const id = definition?.id ?? `PA-${String(control).padStart(2, "0")}`;
+  const result: PaloaltoFindingWithFacts = {
+    id,
     control,
     title: definition?.title ?? `Control ${control}`,
     severity,
-    status,
+    status: evaluateBatchCheckVerdict(PALOALTO_SPEC, id, decisionFacts ?? {}) as PaloaltoStatus,
     summary,
     evidence,
     mappings: controlMappings(control),
   };
+  Object.defineProperty(result, PALOALTO_DECISION_FACTS, { value: decisionFacts ?? {} });
+  return result;
 }
 
 function manualFinding(control: number, severity: PaloaltoSeverity, evidenceInstruction: string, reason: string): PaloaltoFinding {
@@ -3811,6 +3841,11 @@ export function assessPrismaCloudPosture(
       high_severity_failed: asNumber(summary.highSeverityFailedResources) ?? null,
       standards: nullUnless(postureReadable, standards.slice(0, 25).map((item) => ({ name: asString(item.name), passed: asNumber(item.passedResources), failed: asNumber(item.failedResources) }))),
     },
+    paloaltoDecisionFacts(
+      total,
+      passRate !== undefined && passRate < minPassRate - 20 ? 1 : 0,
+      passRate !== undefined && passRate < minPassRate && passRate >= minPassRate - 20 ? 1 : 0,
+    ),
   ), prismaGate(snapshot, ["compliance posture"]), "export the Prisma Cloud compliance dashboard with per-standard pass rates."));
 
   const enabledRules = snapshot.alertRules.filter((rule) => asBoolean(rule.enabled) === true);
@@ -3831,6 +3866,7 @@ export function assessPrismaCloudPosture(
       rules_with_notifications: nullUnless(rulesReadable, snapshot.alertRules.filter((rule) => asArray(rule.alertRuleNotificationConfig).length > 0).length),
       open_alerts: summarizeAlerts(snapshot.alerts, snapshot),
     },
+    paloaltoDecisionFacts(snapshot.alertRules.length, enabledRules.length === 0 ? 1 : 0, disabledRules.length + openCritical),
   ), prismaGate(snapshot, ["alert rules", "open alerts"]), "export Alerts > Alert Rules showing enabled rules and their notification channels."));
 
   const iamPolicies = snapshot.policies.filter((policy) => policyType(policy) === "iam");
@@ -3852,6 +3888,7 @@ export function assessPrismaCloudPosture(
       iam_policies_enabled: nullUnless(policiesReadable, iamEnabled.length),
       iam_alerts: summarizeAlerts(iamAlerts, snapshot),
     },
+    paloaltoDecisionFacts(iamPolicies.length, iamPolicies.length > 0 && (iamEnabled.length === 0 || iamAlerts.length > 0) ? 1 : 0),
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export the IAM Security policy list and open identity alerts."));
 
   const enabledAccounts = snapshot.cloudAccounts.filter((account) => asBoolean(account.enabled) === true);
@@ -3872,6 +3909,11 @@ export function assessPrismaCloudPosture(
       ungrouped_accounts: nullUnless(accountsReadable, ungroupedAccounts.map((account) => asString(account.name)).slice(0, 25)),
       errored_accounts: nullUnless(accountsReadable, erroredAccounts.map((account) => `${asString(account.name)}: ${asString(account.status)}`).slice(0, 25)),
     },
+    paloaltoDecisionFacts(
+      snapshot.cloudAccounts.length,
+      snapshot.cloudAccounts.length === 0 ? 1 : disabledAccounts.length + ungroupedAccounts.length,
+      erroredAccounts.length,
+    ),
   ), prismaGate(snapshot, ["cloud accounts", "account groups"]), "export Settings > Cloud Accounts with status and account group membership."));
 
   const networkPolicies = snapshot.policies.filter((policy) => policyType(policy) === "network" && asBoolean(policy.enabled) === true);
@@ -3890,6 +3932,7 @@ export function assessPrismaCloudPosture(
           : `No open network exposure alerts across ${networkPolicies.length} enabled network policies in the sampled window; emptiness is compliant here because detection policies are active and alerts were readable.`
         : `${networkAlerts.length} open network exposure alerts (${networkHighOrCritical.length} critical or high).`,
     { network_policies_enabled: nullUnless(policiesReadable, networkPolicies.length), ...summarizeAlerts(networkAlerts, snapshot) },
+    paloaltoDecisionFacts(networkPolicies.length, networkHighOrCritical.length, networkAlerts.length - networkHighOrCritical.length),
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export open network exposure alerts and the enabled network policy list."));
 
   const encryptionPolicies = snapshot.policies.filter((policy) => ENCRYPTION_PATTERN.test(policyLabels(policy)));
@@ -3907,6 +3950,11 @@ export function assessPrismaCloudPosture(
       encryption_policies_enabled: nullUnless(policiesReadable, encryptionEnabled.length),
       encryption_alerts: summarizeAlerts(encryptionAlerts, snapshot),
     },
+    paloaltoDecisionFacts(
+      encryptionPolicies.length,
+      encryptionEnabled.length === 0 || encryptionAlerts.length > 0 ? 1 : 0,
+      encryptionPolicies.length - encryptionEnabled.length,
+    ),
   ), prismaGate(snapshot, ["policies", "open alerts"]), "export enabled encryption policies and their open alerts."));
 
   return findings;
@@ -4063,6 +4111,11 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       cve_stats_by_resource: nullUnless(cveStatsReadable, cveStats.byResource),
       cve_stats_source: nullUnless(cveStatsReadable, cveStats.source),
     },
+    paloaltoDecisionFacts(
+      vulnPolicyRules.length,
+      vulnPolicyRules.length === 0 || blockingRules.length === 0 || (criticalCves ?? 0) > DEFAULT_MAX_CRITICAL_CVES ? 1 : 0,
+      compute.images.length === 0 || imagesWithoutScanTime.length > 0 || criticalCves === undefined ? 1 : 0,
+    ),
   ), computeGate(compute, ["vulnerability image policy", "images", "vulnerability stats"]), CWPP_EVIDENCE[0].instruction));
 
   const hostRules = enabledPolicyRules(compute.complianceHostPolicy);
@@ -4111,6 +4164,15 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       compliance_source: nullUnless(complianceStatsReadable, compliance.source),
       worst_rules: nullUnless(complianceStatsReadable, compliance.worst),
     },
+    paloaltoDecisionFacts(
+      hostRules.length + containerRules.length,
+      hostRules.length === 0
+        || (connectedDefenders === 0 && !defendersTruncated)
+        || (complianceRate !== undefined && complianceRate < DEFAULT_MIN_HOST_COMPLIANCE_RATE)
+        ? 1
+        : 0,
+      (connectedDefenders === 0 && defendersTruncated) || complianceRate === undefined ? 1 : 0,
+    ),
   ), computeGate(compute, ["compliance host policy", "compliance container policy", "compliance stats", "defenders"]), CWPP_EVIDENCE[1].instruction));
 
   const runtimeRules = enabledPolicyRules(compute.runtimeContainerPolicy);
@@ -4137,6 +4199,11 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       protective_rules: nullUnless(readable("runtime container policy"), protectiveRules.map((rule) => asString(rule.name)).slice(0, 25)),
       alert_only_rules: nullUnless(readable("runtime container policy"), alertOnlyRules.map((rule) => asString(rule.name)).slice(0, 25)),
     },
+    paloaltoDecisionFacts(
+      runtimeRules.length,
+      runtimeRules.length === 0 || (protectiveRules.length > 0 && runtimeDefenders === 0 && !defendersTruncated) ? 1 : 0,
+      protectiveRules.length === 0 || (runtimeDefenders === 0 && defendersTruncated) ? 1 : 0,
+    ),
   ), computeGate(compute, ["runtime container policy", "defenders"]), CWPP_EVIDENCE[2].instruction));
 
   const connected = compute.defenders.filter((defender) => asBoolean(defender.connected) === true);
@@ -4165,6 +4232,11 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       without_timestamp: computeDetail(compute, ["defenders"], withoutTimestamp.map((defender) => asString(defender.hostname)).slice(0, 25)),
       versions: computeDetail(compute, ["defenders"], [...versions]),
     },
+    paloaltoDecisionFacts(
+      compute.defenders.length,
+      disconnected.length + (compute.defenders.length === 0 && !defendersTruncated ? 1 : 0),
+      withoutTimestamp.length + (versions.size > 2 ? 1 : 0) + (compute.defenders.length === 0 && defendersTruncated ? 1 : 0),
+    ),
   ), computeGate(compute, ["defenders"]), CWPP_EVIDENCE[3].instruction));
 
   const registries = asRecords(compute.registrySettings.specifications);
@@ -4189,6 +4261,11 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       registry_scans: computeCount(compute, ["registry scans"], compute.registryScans.length),
       scans_without_time: computeCount(compute, ["registry scans"], registryScansWithoutTime.length),
     },
+    paloaltoDecisionFacts(
+      registries.length,
+      registries.length > 0 && compute.registryScans.length === 0 && !registryScansTruncated ? 1 : 0,
+      registryScansWithoutTime.length + registriesWithoutCadence.length + (compute.registryScans.length === 0 && registryScansTruncated ? 1 : 0),
+    ),
   ), computeGate(compute, ["registry settings", "registry scans"]), CWPP_EVIDENCE[4].instruction));
 
   // An entry that reports neither total nor defended carries nothing the coverage
@@ -4217,6 +4294,7 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       unprotected: computeDetail(compute, ["cloud discovery"], unprotected.map((entry) => `${asString(entry.provider)}/${asString(entry.serviceType)}: ${asNumber(entry.defended) ?? 0}/${asNumber(entry.total) ?? 0}`).slice(0, 25)),
       errors: computeDetail(compute, ["cloud discovery"], discoveryErrors.map((entry) => redactErrorText(asString(entry.err) ?? "")).slice(0, 10)),
     },
+    paloaltoDecisionFacts(compute.cloudDiscovery.length, unprotected.length, unevaluableDiscovery + discoveryErrors.length),
   ), computeGate(compute, ["cloud discovery"]), CWPP_EVIDENCE[5].instruction));
 
   const scansWithoutTime = compute.ciScans.filter((scan) => !asString(scan.time));
@@ -4237,6 +4315,11 @@ export function assessPrismaCompute(snapshot: PrismaSnapshot | undefined): Paloa
       scans_without_time: computeCount(compute, ["ci scans"], scansWithoutTime.length),
       manual_evidence: "export Compute > Defend > Access > Admission rules to confirm admission control gating.",
     },
+    paloaltoDecisionFacts(
+      compute.ciScans.length,
+      compute.ciScans.length === 0 && !ciScansTruncated ? 1 : 0,
+      compute.ciScans.length > 0 ? compute.ciScans.length : ciScansTruncated ? 1 : 0,
+    ),
   ), computeGate(compute, ["ci scans"]), CWPP_EVIDENCE[6].instruction));
 
   return findings;
@@ -4375,6 +4458,7 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
       shadowed_rules: nullUnless(policyReadable, shadowed.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
       unlogged_rules: nullUnless(policyReadable, unlogged.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
+    paloaltoDecisionFacts(rules.length, permissive.length, unlogged.length + shadowed.length + implicitLog.length),
   ), panosGate(snapshots, POLICY_XPATHS), "export the security rulebase with rule usage, logging, and disabled state."));
 
   const zones: Array<{ host: string; name: string; zoneProtection?: string }> = [];
@@ -4419,6 +4503,11 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
       interzone_default_logged: nullUnless(policyReadable, interzoneLogged),
       zones_without_zone_protection: nullUnless(zonesReadable, unprotectedZones.map((zone) => `${zone.host}/${zone.name}`).slice(0, 50)),
     },
+    paloaltoDecisionFacts(
+      zones.length,
+      anyZone.length,
+      (!intrazoneDenied ? 1 : 0) + unprotectedZones.length + (!interzoneLogged ? 1 : 0),
+    ),
   ), panosGate(snapshots, [...ZONE_XPATHS, ...POLICY_XPATHS]), "export zone protection profile assignments and the intrazone and interzone default rule settings."));
 
   const decryptionRules: Array<{ host: string; name: string; action?: string; disabled: boolean }> = [];
@@ -4458,6 +4547,7 @@ export function assessPanosFirewallPolicy(snapshots: PanosDeviceSnapshot[]): Pal
       tls_service_profiles: nullUnless(decryptionReadable, tlsProfiles),
       weak_tls_profiles: nullUnless(decryptionReadable, weakTlsProfiles.slice(0, 25)),
     },
+    paloaltoDecisionFacts(decryptionRules.length, activeDecrypt.length === 0 ? 1 : 0, weakTlsProfiles.length),
   ), panosGate(snapshots, [...POLICY_XPATHS, ...DEVICE_XPATHS]), "export the decryption rulebase and SSL/TLS service profiles."));
 
   return findings;
@@ -4496,6 +4586,11 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
       allow_rules_missing_threat_profiles: nullUnless(policyReadable, missingThreat.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
       lenient_vulnerability_profiles: nullUnless(policyReadable, lenientVulnerability.map(xmlEntryName)),
     },
+    paloaltoDecisionFacts(
+      virus.length + spyware.length + vulnerability.length,
+      virus.length === 0 || spyware.length === 0 || vulnerability.length === 0 || missingThreat.length > 0 ? 1 : 0,
+      lenientVulnerability.length,
+    ),
   ), panosGate(snapshots, POLICY_XPATHS), "export antivirus, anti-spyware, and vulnerability profiles and their rule attachments."));
 
   const wildfire = snapshots.flatMap((snapshot) => profileEntries(snapshot, "wildfire-analysis"));
@@ -4515,6 +4610,7 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
       full_coverage_profiles: nullUnless(policyReadable, fullCoverage.map(xmlEntryName)),
       allow_rules_missing_wildfire: nullUnless(policyReadable, missingWildfire.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
+    paloaltoDecisionFacts(wildfire.length, wildfire.length === 0 ? 1 : 0, missingWildfire.length + (fullCoverage.length === 0 ? 1 : 0)),
   ), panosGate(snapshots, POLICY_XPATHS), "export WildFire analysis profiles, rule attachments, and show wildfire status output."));
 
   const urlProfiles = snapshots.flatMap((snapshot) => profileEntries(snapshot, "url-filtering"));
@@ -4541,6 +4637,11 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
       credential_enforcement_disabled: nullUnless(policyReadable, credentialDisabled.map(xmlEntryName)),
       allow_rules_missing_url_filtering: nullUnless(policyReadable, missingUrl.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
+    paloaltoDecisionFacts(
+      urlProfiles.length,
+      urlProfiles.length === 0 || weakUrlProfiles.length > 0 ? 1 : 0,
+      credentialDisabled.length + missingUrl.length,
+    ),
   ), panosGate(snapshots, POLICY_XPATHS), "export URL filtering profiles with blocked categories and credential enforcement settings."));
 
   const fileBlocking = snapshots.flatMap((snapshot) => profileEntries(snapshot, "file-blocking"));
@@ -4562,6 +4663,7 @@ export function assessPanosThreatPrevention(snapshots: PanosDeviceSnapshot[]): P
       profiles_blocking_pe: nullUnless(policyReadable, blockingPe.map(xmlEntryName)),
       allow_rules_missing_file_blocking: nullUnless(policyReadable, missingFileBlocking.map((rule) => `${rule.location}/${rule.name}`).slice(0, 25)),
     },
+    paloaltoDecisionFacts(fileBlocking.length, blockingPe.length === 0 ? 1 : 0, missingFileBlocking.length),
   ), panosGate(snapshots, POLICY_XPATHS), "export file blocking profiles and their rule attachments."));
 
   return findings;
@@ -4604,7 +4706,11 @@ export function assessDataLossPrevention(prisma: PrismaSnapshot | undefined, sna
     prisma_dlp_policies: nullUnless(prismaPoliciesReadable, dlpPolicies.map((policy) => asString(policy.name)).slice(0, 25)),
     panos_data_filtering_profiles: nullUnless(panosPolicyReadable, panos.profiles),
     panos_rules_with_data_filtering: nullUnless(panosPolicyReadable, panos.attachedRules),
-  }), gateInfo, instruction);
+  }, paloaltoDecisionFacts(
+    evaluated.length,
+    evaluated.length > 0 && evaluated.every((value) => !value) ? 1 : 0,
+    evaluated.some(Boolean) && (!evaluated.every(Boolean) || evaluated.length < 2) ? 1 : 0,
+  )), gateInfo, instruction);
 }
 
 interface AdminAccount {
@@ -4678,7 +4784,11 @@ export function assessAdminAccess(prisma: PrismaSnapshot | undefined, snapshots:
     panos_local_password_only: nullUnless(deviceReadable, localOnly.map((admin) => `${admin.host}/${admin.name}`).slice(0, 50)),
     password_complexity_by_device: nullUnless(deviceReadable, snapshots.map((snapshot, index) => ({ host: snapshot.host, enabled: complexity[index] ?? null }))),
     prisma_roles: nullUnless(rolesReadable, prisma?.userRoles.map((role) => `${asString(role.name)} (${asString(role.roleType) ?? "unknown"})`).slice(0, 50) ?? null),
-  }), gateInfo, instruction);
+  }, paloaltoDecisionFacts(
+    panosEmpty ? 0 : Number(Boolean(prisma)) + Number(snapshots.length > 0),
+    panosFail ? 1 : 0,
+    panosWarn || prismaWarn || singleProduct ? 1 : 0,
+  )), gateInfo, instruction);
 }
 
 export function assessLogging(prisma: PrismaSnapshot | undefined, snapshots: PanosDeviceSnapshot[]): PaloaltoFinding {
@@ -4727,7 +4837,11 @@ export function assessLogging(prisma: PrismaSnapshot | undefined, snapshots: Pan
     log_forwarding_profiles: nullUnless(forwardingReadable, forwardingProfiles),
     panorama_forwarding: nullUnless(forwardingReadable, panoramaForwarding),
     prisma_integrations: nullUnless(integrationsReadable, prisma?.integrations.map((item) => `${asString(item.name)} (${asString(item.integrationType) ?? "unknown"})`).slice(0, 25) ?? null),
-  }), gateInfo, instruction);
+  }, paloaltoDecisionFacts(
+    Number(Boolean(prisma)) + Number(snapshots.length > 0),
+    panosFail ? 1 : 0,
+    panosWarn || prismaWarn || singleProduct ? 1 : 0,
+  )), gateInfo, instruction);
 }
 
 export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): PaloaltoFinding[] {
@@ -4779,6 +4893,11 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
       mfa_authentication_profiles: nullUnless(authProfilesReadable, mfaProfiles),
       split_tunnel_gateways: nullUnless(gpReadable, splitTunnelGateways),
     },
+    paloaltoDecisionFacts(
+      portals.length + gateways.length,
+      portalsWithoutAuth.length + gatewaysWithoutAuth.length,
+      (mfaProfiles.length === 0 ? 1 : 0) + splitTunnelGateways.length,
+    ),
   ), panosGate(snapshots, AUTHENTICATION_PROFILE_XPATHS), "export GlobalProtect portal and gateway authentication settings with the referenced authentication profiles."));
 
   const hardening: JsonRecord[] = [];
@@ -4821,6 +4940,7 @@ export function assessPanosDeviceHardening(snapshots: PanosDeviceSnapshot[]): Pa
       ? "No deviceconfig system settings were readable from any device, so hardening cannot be evaluated. Manual evidence required: export Device > Setup > Management and Services settings."
       : `${snapshots.length} devices inspected: ${failures} fail hardening checks (NTP, default SNMP community, telnet or HTTP management), ${warnings} have warnings (banner, permitted IPs, idle timeout, DNS).`,
     { devices: nullUnless(panosReadable(snapshots, DEVICE_XPATHS), hardening) },
+    paloaltoDecisionFacts(hardening.length, failures, warnings),
   ), panosGate(snapshots, DEVICE_XPATHS, { needsHaState: true }), "export management interface service settings, admin lockout settings, certificates, and HA state."));
 
   const haDetails = snapshots.map((snapshot) => {
