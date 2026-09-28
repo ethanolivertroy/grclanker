@@ -936,6 +936,21 @@ Conditional paths:
 - `findingCount`
 - `errorCount`
 
+#### assessment
+
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
+
+#### pagination_state
+
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
+
 JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
 
 Overwrite policy: Allocate a timestamped <api-host> directory and add a numeric suffix if that directory already exists; allocate the archive independently without overwriting.

@@ -332,7 +332,8 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `GWS-ADMIN-004` | 3 | pass | all of (`gws_admin_004_compliant_matches` equals true; `gws_admin_004_required_evidence_readable` equals true; `gws_admin_004_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
 | `GWS-ADMIN-004` | 4 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
 | `GWS-ADMIN-005` | 1 | manual | any of (`gws_admin_005_required_evidence_readable` equals false; not (`gws_admin_005_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
-| `GWS-ADMIN-005` | 2 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
+| `GWS-ADMIN-005` | 2 | pass | all of (`gws_admin_005_compliant_matches` equals true; `gws_admin_005_required_evidence_readable` equals true; `gws_admin_005_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
+| `GWS-ADMIN-005` | 3 | manual | always | Unknown, contradictory, malformed, and otherwise insufficient evidence falls back to manual. |
 | `GWS-INTEG-001` | 1 | manual | any of (`gws_integ_001_required_evidence_readable` equals false; not (`gws_integ_001_required_evidence_readable` is present and non-null)) | Missing, null, denied, unreadable, or never-requested required evidence cannot pass. |
 | `GWS-INTEG-001` | 2 | warn | any of (`gws_integ_001_warning_matches` equals true; `gws_integ_001_required_evidence_complete` equals false) | A review predicate or incomplete required inventory prevents pass. |
 | `GWS-INTEG-001` | 3 | pass | all of (`gws_integ_001_compliant_matches` equals true; `gws_integ_001_required_evidence_readable` equals true; `gws_integ_001_required_evidence_complete` equals true) | Pass requires the integration-specific compliant predicate and complete readable dependencies. |
@@ -766,6 +767,21 @@ Conditional paths:
 - `fileCount`
 - `findingCount`
 - `errorCount`
+
+#### assessment
+
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
+
+#### pagination_state
+
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
 
 JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
 
