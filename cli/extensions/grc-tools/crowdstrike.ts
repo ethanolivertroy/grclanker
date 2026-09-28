@@ -718,6 +718,16 @@ type CrowdstrikeFindingWithFacts = CrowdstrikeFinding & {
   [CROWDSTRIKE_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
 };
 
+type CrowdstrikeDecisionFacts = Batch3RuntimeFactValues | Readonly<Record<string, unknown>>;
+
+function isBatch3RuntimeFactValues(value: CrowdstrikeDecisionFacts): value is Batch3RuntimeFactValues {
+  return typeof value.readable === "boolean"
+    && typeof value.complete === "boolean"
+    && (typeof value.population === "number" || value.population === null)
+    && (typeof value.failureMatches === "number" || value.failureMatches === null)
+    && (typeof value.reviewMatches === "number" || value.reviewMatches === null);
+}
+
 function crowdstrikeDecisionFacts(
   inventoryCount: number,
   violationCount = 0,
@@ -737,15 +747,17 @@ function finding(
   id: ControlId,
   summary: string,
   evidence?: JsonRecord,
-  decisionFacts?: Batch3RuntimeFactValues,
+  decisionFacts?: CrowdstrikeDecisionFacts,
 ): CrowdstrikeFinding {
   const definition = CONTROL_BY_ID.get(id);
   if (!definition) {
     throw new Error(`Unknown CrowdStrike control ${id}`);
   }
-  const facts = decisionFacts
-    ? batch3RuntimeFacts(id, decisionFacts)
-    : batch3UnavailableFacts(id);
+  const facts = decisionFacts === undefined
+    ? batch3UnavailableFacts(id)
+    : isBatch3RuntimeFactValues(decisionFacts)
+      ? batch3RuntimeFacts(id, decisionFacts)
+      : decisionFacts;
   const result: CrowdstrikeFindingWithFacts = {
     id,
     title: definition.title,
@@ -2438,12 +2450,13 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
       sla_breaches: breaches.length,
       breach_samples: breaches.slice(0, 15),
     },
-    crowdstrikeDecisionFacts(
-      dated,
-      dated > 0 && pct < 80 ? breaches.length : 0,
-      dated > 0 && pct >= 80 && pct < 95 ? breaches.length || 1 : 0,
-      { readable: true, complete: partial === undefined },
-    ),
+    {
+      cs_22_alert_read_succeeded: true,
+      cs_22_alert_list_complete: partial === undefined,
+      cs_22_dated_alert_count: dated,
+      cs_22_sla_compliant_alert_count: compliant,
+      cs_22_undated_alert_count: undated,
+    },
   );
   return withPartialInventory(withUndatedItems(base, undated, "alerts", "created_timestamp"), [partial]);
 }
@@ -2478,7 +2491,15 @@ function evaluateContainment(hosts: CollectedDataset<CrowdstrikePage<JsonRecord>
         : "The Hosts API was readable and the containment status filter returned no hosts, so there is no active containment to document; emptiness is compliant for this control."
       : `${contained.length} hosts are network contained or pending containment changes${aged.length > 0 ? `, ${aged.length} for more than ${maxContainmentHours} hours (based on last host record change)` : ""}; document each containment and its incident reference.`,
     { contained_hosts: contained.length, aged_over_hours: maxContainmentHours, hosts: contained.slice(0, 50) },
-    crowdstrikeDecisionFacts(contained.length, 0, contained.length, { readable: true, complete: partial === undefined }),
+    {
+      cs_23_contained_host_read_succeeded: true,
+      cs_23_contained_host_list_complete: partial === undefined,
+      cs_23_contained_host_count: contained.length,
+      cs_23_max_containment_age_hours: contained.length === undated
+        ? null
+        : Math.max(...contained.map((host) => host.hours_since_status_change ?? Number.NEGATIVE_INFINITY)),
+      cs_23_undated_contained_host_count: undated,
+    },
   );
   return withPartialInventory(withUndatedItems(base, undated, "contained hosts", "modified_timestamp"), [partial]);
 }
@@ -3127,12 +3148,13 @@ function evaluateHostGroupAssignment(hosts: CollectedDataset<CrowdstrikePage<Jso
       host_group_types: Object.fromEntries(groupTypes),
       unassigned_samples: items.filter((host) => asArray(host.groups).length === 0).slice(0, 25).map((host) => ({ hostname: asString(host.hostname), platform: asString(host.platform_name) })),
     },
-    crowdstrikeDecisionFacts(
-      Math.min(items.length, groups.data.items.length),
-      items.length === 0 || groups.data.items.length === 0 || pct < 80 ? Math.max(1, items.length - assigned.length) : 0,
-      items.length > 0 && groups.data.items.length > 0 && pct >= 80 && pct < 95 ? Math.max(1, items.length - assigned.length) : 0,
-      { readable: true, complete: hostPartial === undefined && groupPartial === undefined },
-    ),
+    {
+      cs_14_host_and_group_reads_succeeded: true,
+      cs_14_host_and_group_lists_complete: hostPartial === undefined && groupPartial === undefined,
+      cs_14_host_count: items.length,
+      cs_14_host_group_count: groups.data.items.length,
+      cs_14_assigned_host_count: assigned.length,
+    },
   );
   return withPartialInventory(base, [hostPartial, groupPartial]);
 }

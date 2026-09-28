@@ -33,6 +33,7 @@ export interface Batch3CheckRow {
   decisionRules?: readonly VerdictRule[];
   completenessSources?: readonly BatchCompletenessSourceDefinition[];
   completenessSemantics?: string;
+  runtimeFactNames?: Batch3FactNames;
 }
 
 export interface Batch3FactNames {
@@ -51,11 +52,15 @@ export interface Batch3RuntimeFactValues {
   reviewMatches: number | null;
 }
 
+const REGISTERED_FACT_NAMES = new Map<string, Batch3FactNames>();
+
 function checkPrefix(id: string): string {
   return id.toLowerCase().replaceAll("-", "_");
 }
 
 export function batch3FactNames(id: string): Batch3FactNames {
+  const registered = REGISTERED_FACT_NAMES.get(id);
+  if (registered) return registered;
   const prefix = checkPrefix(id);
   return {
     readable: `${prefix}_required_source_reads_succeeded`,
@@ -137,6 +142,7 @@ export function batch3Source(
 
 export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinition[] {
   return batch2Checks(rows.map((row): Batch2CheckRow => {
+    if (row.runtimeFactNames) REGISTERED_FACT_NAMES.set(row.id, row.runtimeFactNames);
     const names = batch3FactNames(row.id);
     const decisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : {
       [names.readable]: `Boolean set from the named source read results before any finding is created. True only when every response and required field used by ${row.id} is readable.`,
