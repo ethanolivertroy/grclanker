@@ -2262,6 +2262,14 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     violation_count: violationCount,
     review_count: reviewCount,
   });
+  if (
+    Object.prototype.hasOwnProperty.call(evidence, "collection_error")
+    || asRecordArray(evidence.unreadable_inventories).length > 0
+    || evidence.scoped_out_by_configuration === true
+  ) {
+    return {};
+  }
+  if (evidence.user_list_empty === true) return fact(1, 0, 1);
   const observedViolation = evidence.violation_observed === true ? 1 : value("violation_observed") ?? 0;
   switch (id) {
     case "KNOWBE4-01":
@@ -2323,9 +2331,10 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const topics = asRecordArray(evidence.topics);
       const required = asStringArray(evidence.required_compliance_topics) ?? [];
       const missing = topics.filter((topic) => !Array.isArray(topic.assigned_modules) || topic.assigned_modules.length === 0).length;
+      const unenrolled = knowbe4EvidenceCount(evidence, "topics_without_enrollments");
       const incomplete = evidence.completion_data_partial === true;
       const low = topics.filter((topic) => (asNumber(topic.completion_pct) ?? 100) < (value("min_completion_pct") ?? 0)).length;
-      return fact(topics.length, required.length > 0 ? missing : 0, (required.length === 0 ? missing : 0) + low + (incomplete ? 1 : 0), !incomplete);
+      return fact(topics.length, required.length > 0 ? missing + unenrolled : 0, (required.length === 0 ? missing + unenrolled : 0) + low + (incomplete ? 1 : 0), !incomplete);
     }
     case "KNOWBE4-18": {
       const inventory = value("users_evaluated") ?? value("users_evaluated_read") ?? 0;
