@@ -1862,7 +1862,8 @@ export async function assessSlackAdminAccess(
     emoji_readable: emojiResult.ok,
     emoji_complete: emojiComplete,
     emoji_count: emojiEntries.length,
-    roster_available: adminUserIds.size > 0 && !everyAdminListUnreadable,
+    admin_user_count: adminUserIds.size,
+    every_admin_list_unreadable: everyAdminListUnreadable,
     roster_complete: adminRosterComplete,
     non_admin_upload_count: nonAdminUploads?.length ?? 0,
   });
@@ -2182,9 +2183,8 @@ export async function assessSlackIntegrations(
   recordSlackDecisionFacts("SLACK-APP-05", {});
   recordSlackDecisionFacts("SLACK-APP-06", {
     preferences_readable: preferencesResult.ok,
-    setting_present: fileUploadSetting !== undefined,
+    setting_value: fileUploadSetting,
     coverage_complete: !workspaceScope && !identityGap,
-    verdict: fileUploadVerdict,
   });
   recordSlackDecisionFacts("SLACK-APP-07", {});
 
@@ -2445,14 +2445,16 @@ export async function assessSlackChannelGovernance(
   recordSlackDecisionFacts("SLACK-CHAN-01", { external_readable: externalResult.ok, external_complete: externalResult.ok && externalResult.complete, external_count: externalChannels.length });
   recordSlackDecisionFacts("SLACK-CHAN-02", {
     channels_readable: channelsResult.ok,
-    comparison_available: channels.length > 0 && announcementChannels.length > 0 && announcementPrefs.length > 0,
+    channel_count: channels.length,
+    announcement_channel_count: announcementChannels.length,
+    preference_count: announcementPrefs.length,
     complete: channelsComplete && unknownAnnouncements.length === 0 && prefsErrors.length === 0,
     unrestricted_count: unrestrictedAnnouncements.length,
     unknown_count: unknownAnnouncements.length + prefsErrors.length,
   });
   recordSlackDecisionFacts("SLACK-CHAN-03", {
     channels_readable: channelsResult.ok,
-    retention_available: retentionByChannel.length > 0,
+    retention_record_count: retentionByChannel.length,
     complete: channelsComplete && retentionErrors.length === 0,
     short_retention_count: shortRetention.length,
   });
@@ -2607,7 +2609,7 @@ export async function assessSlackMonitoring(
   const logsView = logsResult.ok ? `${entries.length} entries in the last ${days} days${logsResult.complete ? "" : " (window truncated at the sample limit)"}` : "unreadable";
 
   recordSlackDecisionFacts("SLACK-MON-01", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, audit_count: entries.length });
-  recordSlackDecisionFacts("SLACK-MON-02", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, latest_age_known: latestAge !== undefined, latest_age_days: latestAge });
+  recordSlackDecisionFacts("SLACK-MON-02", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, latest_age_days: latestAge });
   recordSlackDecisionFacts("SLACK-MON-03", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, security_event_count: visibleSecurityEvents.length });
   recordSlackDecisionFacts("SLACK-MON-04", { schema_readable: schemasResult.ok, schema_complete: schemasResult.ok && schemasResult.complete, schema_count: schemasResult.ok ? schemasResult.value.length : 0 });
   recordSlackDecisionFacts("SLACK-MON-05", { audit_readable: logsResult.ok, audit_complete: logsResult.ok && logsResult.complete, external_event_count: visibleExternalEvents.length });

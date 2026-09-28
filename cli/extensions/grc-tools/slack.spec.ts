@@ -1,4 +1,9 @@
-import { buildBatchIntegrationSpec, buildBatchOutputContract, type BatchCheckDefinition } from "./batch-spec-builder.js";
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+  deriveDecisionRules,
+  type BatchCheckDefinition,
+} from "./batch-spec-builder.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const SLACK_SURFACES = [
@@ -120,6 +125,7 @@ const compare = (op: "eq" | "ne" | "gt" | "gte" | "lt" | "lte", name: string, en
 const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq", name, entry);
 const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
 const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
+const defined = (name: string): VerdictCondition => ({ op: "defined", operand: path(name) });
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition): VerdictRule => ({ status, condition });
@@ -193,8 +199,8 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
     rules: ordered(any(ne("teams_readable", true), eq("domain_count", 0)), gt("unrestricted_count", 0), any(gt("settings_error_count", 0), ne("teams_complete", true)), gt("domain_count", 0)),
   },
   "SLACK-ADMIN-08": {
-    inputs: input("emoji_readable", "emoji_complete", "emoji_count", "roster_available", "roster_complete", "non_admin_upload_count"),
-    rules: ordered(any(ne("emoji_readable", true), eq("emoji_count", 0), ne("roster_available", true)), gt("non_admin_upload_count", 0), any(ne("roster_complete", true), ne("emoji_complete", true)), gt("emoji_count", 0)),
+    inputs: input("emoji_readable", "emoji_complete", "emoji_count", "admin_user_count", "every_admin_list_unreadable", "roster_complete", "non_admin_upload_count"),
+    rules: ordered(any(ne("emoji_readable", true), eq("emoji_count", 0), eq("admin_user_count", 0), eq("every_admin_list_unreadable", true)), gt("non_admin_upload_count", 0), any(ne("roster_complete", true), ne("emoji_complete", true)), gt("emoji_count", 0)),
   },
   "SLACK-ADMIN-09": manual(),
   "SLACK-APP-01": inventory("approved"),
@@ -206,8 +212,20 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   "SLACK-APP-04": inventory("barrier"),
   "SLACK-APP-05": manual(),
   "SLACK-APP-06": {
-    inputs: input("preferences_readable", "setting_present", "coverage_complete", "verdict"),
-    rules: ordered(any(ne("preferences_readable", true), ne("setting_present", true)), eq("verdict", "fail"), any(ne("verdict", "pass"), ne("coverage_complete", true)), eq("verdict", "pass")),
+    inputs: input("preferences_readable", "setting_value", "coverage_complete"),
+    rules: ordered(
+      any(ne("preferences_readable", true), { op: "not", condition: defined("setting_value") }),
+      eq("setting_value", "allow_all"),
+      any(
+        eq("setting_value", "type:regular"),
+        ne("coverage_complete", true),
+        all(
+          ne("setting_value", "disallow_all"),
+          ne("setting_value", "type:owner,type:admin"),
+        ),
+      ),
+      any(eq("setting_value", "disallow_all"), eq("setting_value", "type:owner,type:admin")),
+    ),
   },
   "SLACK-APP-07": manual(),
   "SLACK-CHAN-01": {
@@ -221,19 +239,19 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
     ],
   },
   "SLACK-CHAN-02": {
-    inputs: input("channels_readable", "comparison_available", "complete", "unrestricted_count", "unknown_count"),
-    rules: ordered(any(ne("channels_readable", true), ne("comparison_available", true)), gt("unrestricted_count", 0), any(gt("unknown_count", 0), ne("complete", true)), eq("unrestricted_count", 0)),
+    inputs: input("channels_readable", "channel_count", "announcement_channel_count", "preference_count", "complete", "unrestricted_count", "unknown_count"),
+    rules: ordered(any(ne("channels_readable", true), eq("channel_count", 0), eq("announcement_channel_count", 0), eq("preference_count", 0)), gt("unrestricted_count", 0), any(gt("unknown_count", 0), ne("complete", true)), eq("unrestricted_count", 0)),
   },
   "SLACK-CHAN-03": {
-    inputs: input("channels_readable", "retention_available", "complete", "short_retention_count"),
-    rules: ordered(any(ne("channels_readable", true), ne("retention_available", true)), gt("short_retention_count", 0), ne("complete", true), eq("short_retention_count", 0)),
+    inputs: input("channels_readable", "retention_record_count", "complete", "short_retention_count"),
+    rules: ordered(any(ne("channels_readable", true), eq("retention_record_count", 0)), gt("short_retention_count", 0), ne("complete", true), eq("short_retention_count", 0)),
   },
   "SLACK-CHAN-04": manual(),
   "SLACK-CHAN-05": manual(),
   "SLACK-MON-01": inventory("audit", { empty: "fail" }),
   "SLACK-MON-02": {
-    inputs: input("audit_readable", "audit_complete", "latest_age_known", "latest_age_days"),
-    rules: ordered(ne("audit_readable", true), gt("latest_age_days", 1), any(ne("latest_age_known", true), ne("audit_complete", true)), compare("lte", "latest_age_days", 1)),
+    inputs: input("audit_readable", "audit_complete", "latest_age_days"),
+    rules: ordered(ne("audit_readable", true), gt("latest_age_days", 1), any({ op: "not", condition: defined("latest_age_days") }, ne("audit_complete", true)), compare("lte", "latest_age_days", 1)),
   },
   "SLACK-MON-03": {
     inputs: input("audit_readable", "audit_complete", "security_event_count"),
@@ -247,18 +265,23 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   "SLACK-MON-06": manual(),
 };
 
-const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, severity, owner], index) => ({
-  id,
-  control,
-  title,
-  severity,
-  owner,
-  surfaces: SLACK_CHECK_SURFACES[id],
-  evidenceFields: [...SLACK_CHECK_SURFACES[id], "complete_source_counts"],
-  decisionInputs: SLACK_EXECUTABLE_DECISIONS[id].inputs,
-  decisionRules: SLACK_EXECUTABLE_DECISIONS[id].rules,
-  decision: decisions[index],
-}));
+const checks: BatchCheckDefinition[] = checkRows.map(([id, control, title, severity, owner], index) => {
+  const decision = SLACK_EXECUTABLE_DECISIONS[id];
+  const executable = deriveDecisionRules(id, decision.rules);
+  return {
+    id,
+    control,
+    title,
+    severity,
+    owner,
+    surfaces: SLACK_CHECK_SURFACES[id],
+    evidenceFields: [...SLACK_CHECK_SURFACES[id], "complete_source_counts"],
+    decisionInputs: decision.inputs,
+    decisionRules: executable.rules,
+    derivedFactRules: executable.derivedFactRules,
+    decision: decisions[index],
+  };
+});
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);
 
 export const SLACK_RUNTIME_BEHAVIOR = [
