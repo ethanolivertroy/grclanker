@@ -17,9 +17,9 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
-// Immutable stack base integrated by merge commit 1ff1140. Update this SHA only
-// when a newer parent head is merged into this branch.
-const baselineRef = "3b8cfd043c395ac94833ab684cbe340bc1ea1c6f";
+// Immutable stack base integrated immediately before final validation. Update
+// this SHA only when a newer parent head is merged into this branch.
+const baselineRef = "f85fdf021892d871aa9392103c79c263a6265c48";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
