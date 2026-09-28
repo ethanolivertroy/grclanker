@@ -900,7 +900,7 @@ details[open] > .agent-group-toggle::before {
 .hero-install-toggle {
   flex: 0 0 auto;
   border: none;
-  background: rgba(35, 38, 52, 0.28);
+  background: var(--color-crust);
   color: var(--color-overlay2);
   padding: 0.78rem 1.18rem;
   font-size: var(--text-sm);
@@ -918,12 +918,12 @@ details[open] > .agent-group-toggle::before {
 }
 
 .hero-install-toggle.is-active {
-  background: rgba(65, 69, 89, 0.94);
+  background: var(--color-surface0);
   color: var(--ui-text);
 }
 
 .hero-install-toggle:not(.is-active):hover {
-  background: rgba(65, 69, 89, 0.55);
+  background: color-mix(in srgb, var(--color-surface0) 55%, var(--color-crust));
   color: var(--ui-text);
 }
 
