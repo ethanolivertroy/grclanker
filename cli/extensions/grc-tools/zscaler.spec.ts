@@ -205,7 +205,7 @@ export const ZSCALER_SPEC = buildBatchIntegrationSpec({
   },
   runtimeBehavior: ZSCALER_RUNTIME_BEHAVIOR,
   knownGaps: [
-    "Current-runtime limitation preserved for parity: secondary ZIA and ZPA inventories processed by capForUnreadableAll cap pass when unreadable, but truncation alone is not completeness-gating. Some single-dataset truncations therefore remain pass until the runtime is corrected.",
+    "Current-runtime limitation preserved for parity: across the 41 ZIA-policy and ZPA single-dataset truncation replays, 16 affected finding cases remain pass for ZS-03, ZS-04, ZS-05, ZS-16, ZS-17, ZS-20, and ZS-25. Secondary inventories cap pass when unreadable, but those truncations and several primary ZIA truncations are not completeness-gating.",
     "ZDX and OneAPI credentials are recognized by configuration but the shipped assessment tools cover ZIA and ZPA only.",
   ],
   sensitiveFields: ["apiKey", "password", "clientSecret", "authorization", "cookie", "token"],

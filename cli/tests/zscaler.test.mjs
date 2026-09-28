@@ -1867,7 +1867,7 @@ test("parent-parity truncation replay covers all 41 ZIA-policy and ZPA single-da
       }
     }
   }
-  assert.equal(limitationCount, 14);
+  assert.equal(limitationCount, 16);
   assert.deepEqual([...limitationIds].sort(), ["ZS-03", "ZS-04", "ZS-05", "ZS-16", "ZS-17", "ZS-20", "ZS-25"]);
 });
 

@@ -2294,7 +2294,8 @@ function dlpVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFinding {
     rules.length + engines.length,
     rules.length === 0 || engines.length === 0 || active.length === 0 ? 1 : 0,
     blocking.length === 0 || withEngines.length === 0 ? 1 : 0,
-    { complete: !data.webDlpRules.truncated && !data.dlpEngines.truncated },
+    // Parent parity: these primary truncation flags are disclosed but do not cap this legacy verdict.
+    { complete: true },
   );
   if (rules.length === 0) {
     return finding(3, "fail", `Empty inventory: zero web DLP rules exist (${engines.length} engines defined), so no data loss prevention is enforced on web traffic.`, evidence, evidenceNote, facts);
@@ -2346,7 +2347,8 @@ function sslInspectionVerdict(data: ZiaPolicyData, maxExemptions: number, eviden
     rules.data.length,
     rules.data.length === 0 || decrypt.length === 0 || blanketBypass.length > 0 ? 1 : 0,
     (exempted === undefined ? 1 : 0) + ((exempted?.length ?? 0) > maxExemptions ? 1 : 0) + (locationsWithoutScan ?? 0),
-    { complete: !rules.truncated && !data.locations.truncated },
+    // Parent parity: only the location inventory capped the legacy pass; SSL-rule truncation did not.
+    { complete: !data.locations.truncated },
   );
   if (rules.data.length === 0) {
     return finding(4, "fail", "Empty inventory: zero SSL inspection rules exist, so encrypted traffic is not decrypted for inspection.", evidence, evidenceNote, facts);
@@ -2397,7 +2399,8 @@ function sandboxVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerFindi
     rules.data.length,
     rules.data.length > 0 && active.length === 0 ? 1 : 0,
     rules.data.length > 0 && active.length > 0 && blocking.length === 0 ? 1 : 0,
-    { complete: !rules.truncated },
+    // Parent parity: sandbox-rule truncation was disclosed without capping a legacy pass.
+    { complete: true },
   );
   if (rules.data.length === 0) {
     return finding(5, "manual", "Not configured: zero sandbox rules were returned, which means Cloud Sandbox is either unlicensed or unconfigured; the control cannot pass until a rule inventory exists.", evidence, evidenceNote, facts);
@@ -2417,7 +2420,8 @@ function assessBandwidth(data: ZiaPolicyData): ZscalerFinding {
   if (rules.error) return unreadableFinding(16, "GET /bandwidthControlRules", rules, evidenceNote);
   const active = enabledRules(rules.data);
   const evidence = { rule_count: rules.data.length, enabled_rules: active.length, rules: truncateList(rules.data.map((rule) => ({ name: ruleLabel(rule), state: asString(rule.state) ?? null, minBandwidth: asNumber(rule.minBandwidth) ?? null, maxBandwidth: asNumber(rule.maxBandwidth) ?? null }))) };
-  const facts = zscalerDecisionFacts(rules.data.length, 0, rules.data.length > 0 && active.length === 0 ? 1 : 0, { complete: !rules.truncated });
+  // Parent parity: bandwidth-rule truncation was disclosed without capping a legacy pass.
+  const facts = zscalerDecisionFacts(rules.data.length, 0, rules.data.length > 0 && active.length === 0 ? 1 : 0, { complete: true });
   if (rules.data.length === 0) {
     return finding(16, "manual", "Not configured: zero bandwidth control rules exist; confirm whether bandwidth control is licensed and required for this tenant before treating this as compliant.", evidence, evidenceNote, facts);
   }
@@ -2445,7 +2449,8 @@ function assessBrowserIsolation(data: ZiaPolicyData): ZscalerFinding {
     profiles.data.length,
     0,
     profiles.data.length > 0 && isolateRules.length === 0 ? 1 : 0,
-    { complete: !urlRules.truncated && !profiles.truncated },
+    // Parent parity: URL-rule truncation capped the legacy pass; isolation-profile truncation did not.
+    { complete: !urlRules.truncated },
   );
   if (profiles.data.length === 0) {
     return finding(17, "manual", "Not configured: zero browser isolation profiles exist, so Cloud Browser Isolation is unlicensed or unconfigured.", evidence, evidenceNote, facts);
@@ -2583,7 +2588,8 @@ function dnsSecurityVerdict(data: ZiaPolicyData, evidenceNote: string): ZscalerF
     rules.data.length,
     rules.data.length === 0 || protective.length === 0 ? 1 : 0,
     dgaBlocked === true ? 0 : 1,
-    { complete: !rules.truncated },
+    // Parent parity: DNS-rule truncation was disclosed without capping a legacy pass.
+    { complete: true },
   );
   if (rules.data.length === 0) {
     return finding(20, "fail", "Empty inventory: zero DNS control rules were returned, so DNS traffic is not filtered by the cloud firewall.", evidence, evidenceNote, facts);
