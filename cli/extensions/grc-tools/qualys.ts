@@ -36,7 +36,16 @@ import { errorResult, formatTable, textResult } from "./shared.js";
 type FetchImpl = typeof fetch;
 type SleepImpl = (ms: number) => Promise<void>;
 type JsonRecord = Record<string, unknown>;
-type QualysDecisionValues = Batch3RuntimeFactValues | Readonly<Record<string, never>>;
+type QualysDecisionValues = Batch3RuntimeFactValues | Readonly<Record<string, unknown>>;
+
+function isQualysDecisionValues(value: QualysDecisionValues | undefined): value is Batch3RuntimeFactValues {
+  return value !== undefined
+    && typeof value.readable === "boolean"
+    && typeof value.complete === "boolean"
+    && (typeof value.population === "number" || value.population === null)
+    && (typeof value.failureMatches === "number" || value.failureMatches === null)
+    && (typeof value.reviewMatches === "number" || value.reviewMatches === null);
+}
 
 const DEFAULT_OUTPUT_DIR = "./export/qualys";
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -1959,7 +1968,7 @@ function finding(
   decisionValues?: QualysDecisionValues,
 ): QualysFinding {
   const id = `QUALYS-C${String(control).padStart(2, "0")}`;
-  const decisionFacts = decisionValues && "readable" in decisionValues
+  const decisionFacts = isQualysDecisionValues(decisionValues)
     ? batch3RuntimeFacts(id, decisionValues)
     : batch3UnavailableFacts(id);
   return {
@@ -2004,7 +2013,9 @@ function guardedFinding(input: VerdictInput): QualysFinding {
   const unknownTotal = buckets.reduce((total, [, count]) => total + count, 0);
   const notes: string[] = [];
   let status = input.status;
-  let decisionFacts = input.decisionFacts;
+  let decisionFacts = isQualysDecisionValues(input.decisionFacts)
+    ? input.decisionFacts
+    : undefined;
 
   if (unreadable.length > 0) {
     const causes = unreadable.map((source) => `${source.name}${source.moduleUnavailable ? " (module unlicensed or role not permitted)" : ""}: ${shortenMessage(source.error ?? "", 120)}`);
