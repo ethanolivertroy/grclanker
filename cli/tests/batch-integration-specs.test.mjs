@@ -64,7 +64,7 @@ const DEFINED = Symbol("defined");
 function alternativeValues(value, domains) {
   if (typeof value === "boolean") return [!value, null];
   if (typeof value === "number") return [
-    ...domains.numbers.filter((candidate) => candidate !== value),
+    ...[-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25, 26, 100].filter((candidate) => candidate !== value),
     value - 1,
     value + 1,
     "__not_numeric__",
@@ -233,7 +233,22 @@ function conditionWitnesses(condition, desired, constants, domains) {
         const actual = new RegExp(condition.pattern, condition.flags).test(String(operand.value));
         return actual === desired ? [new Map()] : [];
       }
-      return [new Map([[operand.path, desired ? "all participants" : "__not_matching__"]])];
+      const candidates = [
+        "open",
+        "public",
+        "anyone",
+        "company",
+        "collaborators",
+        "enterprise",
+        "people_in",
+        "invited",
+        "all participants",
+        "__not_matching__",
+      ];
+      const expression = new RegExp(condition.pattern, condition.flags);
+      return candidates
+        .filter((candidate) => expression.test(candidate) === desired)
+        .map((candidate) => new Map([[operand.path, candidate]]));
     }
     default:
       throw new Error(`Unsupported witness condition ${condition.op}`);
