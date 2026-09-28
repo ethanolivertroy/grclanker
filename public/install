@@ -238,6 +238,7 @@ fallback_instructions() {
   printf "    git clone https://github.com/ethanolivertroy/grclanker.git\n"
   printf "    cd grclanker\n"
   printf "    npm install --prefix cli\n"
+  printf "    npm --prefix cli run build\n"
   printf "    npm install --global ./cli\n"
   printf "\n"
   fail "Install aborted."

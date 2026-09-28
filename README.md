@@ -28,6 +28,7 @@ Source-checkout fallback (requires Node.js 22.19 or newer):
 git clone https://github.com/ethanolivertroy/grclanker.git
 cd grclanker
 npm install --prefix cli
+npm --prefix cli run build
 npm install --global ./cli
 ```
 

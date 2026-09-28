@@ -109,6 +109,7 @@ Use this path only when you already manage Node.js 22.19 or newer and do not nee
 git clone https://github.com/ethanolivertroy/grclanker.git
 cd grclanker
 npm install --prefix cli
+npm --prefix cli run build
 npm install --global ./cli
 ```
 
