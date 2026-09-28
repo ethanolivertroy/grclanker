@@ -143,7 +143,7 @@ export const OCI_SPEC = buildBatchIntegrationSpec({
     oci_export_audit_bundle: checks.map((check) => check.id),
   },
   pagination: [{
-    surfaceIds: surfaces,
+    surfaceIds: surfaces.map((surface) => surface.id),
     cursorFields: ["opc-next-page", "CLI --all"],
     pageSize: null,
     itemCap: null,
