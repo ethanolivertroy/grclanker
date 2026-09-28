@@ -10,6 +10,7 @@
     "sync:tool-catalog": "npm --prefix cli run sync:tool-catalog",
     "generate-types": "wrangler types",
     "check": "astro check",
+    "prebuild": "npm run check",
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
