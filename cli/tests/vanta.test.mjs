@@ -472,22 +472,32 @@ test("exportVantaAuditPackage allocates fresh bundles on sequential reruns", asy
       return evidence;
     },
     async listEvidenceUrls() {
-      return [{
-        id: "url-rerun",
-        url: "https://downloads.example.com/rerun.txt",
-        filename: "rerun.txt",
-        isDownloadable: true,
-      }];
+      return [
+        {
+          id: "url-rerun-stale",
+          url: "https://downloads.example.com/stale.txt",
+          filename: "stale.txt",
+          isDownloadable: true,
+        },
+        {
+          id: "url-rerun-flaky",
+          url: "https://downloads.example.com/flaky.txt",
+          filename: "flaky.txt",
+          isDownloadable: true,
+        },
+      ];
     },
   };
   let failDownload = true;
-  const fetchImpl = async () => {
-    if (failDownload) {
+  const fetchImpl = async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (failDownload && url.endsWith("/flaky.txt")) {
       return new Response("failed", { status: 500, statusText: "Internal Server Error" });
     }
-    return new Response("fresh-run", {
+    const body = failDownload ? "stale-run" : "fresh-run";
+    return new Response(body, {
       status: 200,
-      headers: { "content-length": "9" },
+      headers: { "content-length": String(body.length) },
     });
   };
   const base = createTempBase("grclanker-vanta-rerun-");
@@ -497,6 +507,7 @@ test("exportVantaAuditPackage allocates fresh bundles on sequential reruns", asy
   const firstZipBytes = readFileSync(first.zipPath);
   assert.equal(first.errorCount, 1);
   assert.ok(existsSync(join(first.outputDir, "_errors.log")));
+  assert.ok([...readZipEntries(first.zipPath).values()].includes("stale-run"));
 
   failDownload = false;
   const second = await exportVantaAuditPackage(client, audit, outputRoot, { fetchImpl });
@@ -509,6 +520,7 @@ test("exportVantaAuditPackage allocates fresh bundles on sequential reruns", asy
   const secondZipEntries = readZipEntries(second.zipPath);
   assert.ok([...secondZipEntries.keys()].every((name) => !name.endsWith("/_errors.log")));
   assert.ok([...secondZipEntries.values()].includes("fresh-run"));
+  assert.ok([...secondZipEntries.values()].every((content) => content !== "stale-run"));
 });
 
 test("exportVantaAuditPackage allocates distinct bundles for concurrent exports", async () => {
