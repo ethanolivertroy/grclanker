@@ -260,16 +260,50 @@ test("a special device is rejected without reading an unbounded stream", { skip:
   );
 });
 
-test("symbolic links are rejected instead of following a model-supplied path", { skip: process.platform === "win32" ? "symlink creation may require elevated privileges on Windows" : false }, () => {
+test("a symbolic link to a regular bounded config file is supported", { skip: process.platform === "win32" ? "symlink creation may require elevated privileges on Windows" : false }, () => {
   const base = tempBase();
   const target = join(base, "target.yaml");
   const path = join(base, "config.yaml");
   writeFileSync(target, "name: demo\n");
   symlinkSync(target, path);
 
-  const error = capture(() => readConfigText(path));
-  const message = assertFixedTextError(error, { kind: "read", path, format: undefined, code: "ELOOP", line: undefined, column: undefined }, [], "symbolic link");
-  assert.equal(message, `Unable to read config file ${path} (ELOOP)`);
+  assert.deepEqual(readConfigText(path), { ok: true, path, value: "name: demo\n" });
+});
+
+test("a symbolic link to a FIFO is rejected without blocking", { skip: process.platform === "win32" ? "mkfifo is not available on Windows" : false }, () => {
+  const base = tempBase();
+  const target = join(base, "target.fifo");
+  const path = join(base, "config.yaml");
+  const created = spawnSync("mkfifo", [target], { encoding: "utf8" });
+  assert.equal(created.status, 0, `mkfifo failed: ${created.stderr}`);
+  symlinkSync(target, path);
+
+  const error = readConfigInChild(path);
+  assert.deepEqual(
+    error,
+    {
+      name: "ConfigFileError",
+      kind: "read",
+      code: "EINVAL",
+      message: `Unable to read config file ${path} (EINVAL)`,
+    },
+  );
+});
+
+test("a symbolic link to a special device is rejected without an unbounded read", { skip: process.platform === "win32" || !existsSync("/dev/zero") ? "/dev/zero or symlink creation is not available" : false }, () => {
+  const path = join(tempBase(), "config.yaml");
+  symlinkSync("/dev/zero", path);
+
+  const error = readConfigInChild(path);
+  assert.deepEqual(
+    error,
+    {
+      name: "ConfigFileError",
+      kind: "read",
+      code: "EINVAL",
+      message: `Unable to read config file ${path} (EINVAL)`,
+    },
+  );
 });
 
 test("regular config files over the 1 MiB cap fail with EFBIG", () => {
