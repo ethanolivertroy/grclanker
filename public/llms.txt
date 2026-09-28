@@ -1,8 +1,8 @@
 # grclanker
 
-> Experimental open-source AI GRC CLI with native tools that assess SaaS, cloud, and security platform configurations against major compliance frameworks. Each shipped integration has a repository spec: a language-neutral contract describing its APIs, authentication, checks, framework mappings, and outputs.
+> Experimental open-source AI GRC CLI with native tools that assess SaaS, cloud, and security platform configurations against major compliance frameworks. Most shipped integrations have a repository spec: a language-neutral contract describing the integration's APIs, authentication, checks, framework mappings, and outputs.
 
-Specs are raw markdown. Point any AI coding agent at a spec URL below to inspect, extend, or reimplement an integration. Specs document design and intended behavior; the [tool catalog](https://grclanker.com/docs/tools/catalog/) lists the tools the CLI actually registers.
+Use a spec to inspect, extend, or reimplement an integration. Specs document design and intended behavior; the [tool catalog](https://grclanker.com/docs/tools/catalog/) lists the tools the CLI actually registers.
 
 ## Specs
 
