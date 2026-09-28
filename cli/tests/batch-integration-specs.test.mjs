@@ -712,7 +712,7 @@ test("portable source and population contracts encode the final audit distinctio
   assert.match(check(OKTA_SPEC, "OKTA-AUTH-002").evidenceFieldDefinitions.policy_inventory_readable, /at least one/);
   assert.ok(OKTA_SPEC.knownGaps.some((gap) => /Pass for 31.*Partial for 3.*Manual for 2.*throws for the other 34/.test(gap)));
   assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-INTEG-004.*network-zone read is denied.*Pass/.test(gap)));
-  assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-AUTH-001 and OKTA-AUTH-009.*organization-factor read is denied.*retain Pass/.test(gap)));
+  assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-AUTH-001 and OKTA-AUTH-009.*retain Pass.*organization-factor read is denied/.test(gap)));
   assert.ok(DUO_SPEC.knownGaps.some((gap) => /DUO-AUTH-010.*user inventory only.*WebAuthn.*do not make that fact incomplete/.test(gap)));
   assert.ok(ZOOM_SPEC.knownGaps.some((gap) => /ZOOM-COLLAB-01.*trusted-domain.*truncated.*assertion throw/.test(gap)));
 });
@@ -1254,11 +1254,9 @@ test("contracts enumerate exact surfaces, permission unlocks, framework mappings
     "ZOOM-ID-07",
     "ZOOM-COLLAB-08",
   ]);
-  let surfaceCount = 0;
   for (const [spec] of batch) {
     const surfaceIds = new Set(spec.apiSurfaces.map((surface) => surface.id));
     assert.equal(surfaceIds.size, spec.apiSurfaces.length, `${spec.identity.slug}: unique surfaces`);
-    surfaceCount += spec.apiSurfaces.length;
     for (const check of spec.checks) {
       if (!emptySurfaceChecks.has(check.id)) assert.ok(check.sourceSurfaceIds.length > 0, `${check.id}: source surfaces`);
       for (const surface of check.sourceSurfaceIds) assert.ok(surfaceIds.has(surface), `${check.id}: ${surface}`);
@@ -1274,7 +1272,11 @@ test("contracts enumerate exact surfaces, permission unlocks, framework mappings
       for (const surface of permission.unlocks) assert.ok(surfaceIds.has(surface), `${permission.id}: ${surface}`);
     }
   }
-  assert.equal(surfaceCount, 251, "all runtime-owned batch surfaces are represented exactly once");
+  const publishedSurfaceCount = PUBLISHED_INTEGRATION_SPECS.reduce(
+    (count, entry) => count + entry.contract.apiSurfaces.length,
+    0,
+  );
+  assert.equal(publishedSurfaceCount, 251, "all runtime-owned pilot and batch surfaces are represented exactly once");
   const slackConfig = resolveSlackConfiguration({ token: "surface-contract-token" }, {});
   const slackScimUsers = SLACK_SPEC.apiSurfaces.find((surface) => surface.id === "scim-users");
   assert.equal(slackConfig.scimBaseUrl, "https://api.slack.com/scim/v2");

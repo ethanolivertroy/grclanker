@@ -253,7 +253,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       admin_mfa_rule_count: "active admin-policy rules requiring MFA", strong_authenticator_count: "active strong authenticators", mfa_control_count: "visible MFA controls",
       inventory_count: "active records in the check's policy inventory", policy_count: "active policies", gap_count: "policies missing a requirement enumerated by the check",
       exposed_value_count: "readable policy threshold values", over_limit_count: "values above the declared maximum", persistent_cookie_count: "rules permitting persistent cookies",
-      certificate_method_count: "active certificate, smart-card, PIV, or CAC methods", restricted_count: "rules meeting the check's device or platform restriction",
+      certificate_method_count: "active certificate, smart-card, PIV, or CAC methods",
       privileged_user_count: "distinct directly or indirectly privileged users", super_admin_count: "SUPER_ADMIN users", stale_count: "records beyond the check's age threshold",
       unknown_activity_count: "users without required activity timestamps", privileged_group_count: "groups matching the documented privileged-name pattern",
       oversized_group_count: "privileged groups with more than 25 members", inspected_user_count: "privileged users with usable factor inventories",
@@ -265,7 +265,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       inactive_app_count: "inactive applications", deactivation_app_count: "DEPROVISIONED or INACTIVE applications", provisioning_app_count: "applications with provisioning enabled",
       app_count: "applications", token_count: "API tokens", expired_count: "expired API tokens", missing_expiry_count: "tokens without parseable expiry",
       long_window_count: "tokens exceeding the lifetime threshold", undated_count: "records without parseable creation or activity timestamps",
-      unrestricted_count: "rules missing the required restriction", zone_count: "network zones", custom_zone_count: "active non-blocklist zones with gateways or CIDRs",
+      zone_count: "network zones", custom_zone_count: "active non-blocklist zones with gateways or CIDRs",
       active_hook_count: "active event hooks", active_behavior_count: "active behavior rules", event_count: "system-log events in the requested lookback",
       active_stream_count: "active log streams", contact_count: "organization contacts",
     };
@@ -282,7 +282,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       technical_lookup_failed: "the referenced technical user lookup failed", policy_readable: "the policy family required by the check was readable",
     };
     const raw: Readonly<Record<string, string>> = {
-      support_state: "Raw Okta Support access state compared case-insensitively with DISABLED.", mode: "Raw normalized application sign-on mode.",
+      support_state: "Raw Okta Support access state compared case-insensitively with DISABLED.",
       technical_user_state: "Raw lifecycle state of the user assigned as TECHNICAL contact.",
     };
     const definition = counts[name] ? `Non-negative cardinality of ${counts[name]} in the complete Okta inventory at the verdict point.`
@@ -290,6 +290,12 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
     if (!definition) throw new Error(`Okta primitive ${name} lacks an explicit portable definition`);
     return [name, definition];
   }),
+);
+const inputWith = (
+  overrides: Readonly<Record<string, string>>,
+  ...names: string[]
+): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, overrides[name] ?? input(name)[name]]),
 );
 const unavailable = any(ne("readable", true), { op: "not", condition: { op: "defined", operand: path("readable") } });
 const incomplete = ne("complete", true);
@@ -383,10 +389,9 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-AUTH-009": {
-    inputs: {
-      ...input("readable", "complete", "classic_engine", "authenticator_count", "federal_tenant", "okta_verify_active", "fips_required", "restricted_count"),
+    inputs: inputWith({
       restricted_count: "Non-negative cardinality of ACTIVE authenticators whose key is `phone_number`, `security_question`, or `okta_email`, excluding email authenticators whose normalized `settings.allowedFor` value is `recovery` or `none`.",
-    },
+    }, "readable", "complete", "classic_engine", "authenticator_count", "federal_tenant", "okta_verify_active", "fips_required", "restricted_count"),
     rules: ordered({
       manual: any(unavailable, eq("classic_engine", true)),
       fail: any(
@@ -537,10 +542,9 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-MON-003": {
-    inputs: {
-      ...input("readable", "configuration_present", "mode"),
+    inputs: inputWith({
       mode: "Raw Okta ThreatInsight action mode selected in this order from the configuration object: top-level `action`, top-level `mode`, then `settings.action`; the string `unknown` is used only when none is present.",
-    },
+    }, "readable", "configuration_present", "mode"),
     rules: ordered({
       manual: any(unavailable, eq("configuration_present", false)),
       fail: all(ne("mode", "block"), ne("mode", "audit"), ne("mode", "log_only")),
@@ -574,10 +578,9 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
     }),
   },
   "OKTA-MON-007": {
-    inputs: {
-      ...input("readable", "complete", "token_count", "ssws_auth", "expired_count", "unrestricted_count", "missing_expiry_count", "long_window_count"),
+    inputs: inputWith({
       unrestricted_count: "Non-negative cardinality of API tokens whose normalized uppercase `network.connection` value is not `ZONE`; an absent value defaults to `ANYWHERE` and is counted.",
-    },
+    }, "readable", "complete", "token_count", "ssws_auth", "expired_count", "unrestricted_count", "missing_expiry_count", "long_window_count"),
     constants: { maximum_window_days: 30 },
     rules: ordered({
       manual: any(unavailable, all(eq("token_count", 0), eq("ssws_auth", true))),

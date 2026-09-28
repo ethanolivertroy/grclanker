@@ -188,14 +188,14 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       admin_inventory_count: "administrator assignments across readable workspaces", excessive_admin_workspace_count: "workspaces above the administrator threshold",
       guest_count: "active guest users", unknown_mfa_count: "active human users without known MFA state", without_mfa_count: "active human users with MFA disabled",
       unknown_sso_count: "active organization users without known SSO state", without_sso_count: "active organization users with SSO disabled", workspace_count: "Grid workspaces",
-      channel_count: "channels", open_count: "public channels matching the open-membership predicate", announcement_channel_count: "announcement-only channels",
+      channel_count: "channels", announcement_channel_count: "announcement-only channels",
       external_count: "external organizations or externally shared channels", external_event_count: "external-collaboration audit events",
       approved_count: "approved applications", scim_count: "SCIM user records", scim_user_count: "active users represented in SCIM",
-      preference_count: "workspace preference records", settings_error_count: "workspace preference reads that failed", duration_count: "readable session durations",
+      settings_error_count: "workspace preference reads that failed", duration_count: "readable session durations",
       overlong_count: "session durations above the maximum", audit_count: "audit events in the lookback", security_event_count: "events in the security action set",
       non_admin_upload_count: "uploads by non-administrators", retention_record_count: "retention preference records", short_retention_count: "retention values below the minimum",
-      restricted_count: "restricted applications", unrestricted_count: "applications outside approved and restricted inventories", schema_count: "audit schemas",
-      mismatch_count: "schemas with incorrect treatment", barrier_count: "information barriers", emoji_count: "custom emoji", flagged_count: "emoji matching the sensitive-term pattern",
+      restricted_count: "restricted applications", schema_count: "audit schemas",
+      barrier_count: "information barriers", emoji_count: "custom emoji",
       unknown_count: "records whose required classification is unknown", domain_count: "distinct verified or allowed domains",
     };
     const booleans: Readonly<Record<string, string>> = {
@@ -217,6 +217,12 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
     if (!definition) throw new Error(`Slack primitive ${name} lacks an explicit portable definition`);
     return [name, definition];
   }),
+);
+const inputWith = (
+  overrides: Readonly<Record<string, string>>,
+  ...names: string[]
+): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, overrides[name] ?? input(name)[name]]),
 );
 const manual = (): SlackExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
 const inventory = (prefix: string, options: { empty?: "fail" | "warn" | "manual"; positive?: "pass" | "warn" } = {}): SlackExecutableDecision => {
@@ -248,10 +254,9 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   },
   "SLACK-ID-03": inventory("scim", { empty: "fail" }),
   "SLACK-ID-04": {
-    inputs: {
-      ...input("users_readable", "scim_readable", "complete", "scim_user_count", "mismatch_count"),
+    inputs: inputWith({
       mismatch_count: "Non-negative cardinality of SCIM user records whose `active` field is not false and whose primary email equals the email of a deactivated Slack user.",
-    },
+    }, "users_readable", "scim_readable", "complete", "scim_user_count", "mismatch_count"),
     rules: ordered(any(ne("users_readable", true), ne("scim_readable", true)), gt("mismatch_count", 0), any(ne("complete", true), eq("scim_user_count", 0)), gt("scim_user_count", 0)),
   },
   "SLACK-ID-05": {
@@ -272,18 +277,16 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   },
   "SLACK-ADMIN-04": manual(),
   "SLACK-ADMIN-05": {
-    inputs: {
-      ...input("teams_readable", "teams_complete", "workspace_count", "open_count", "unknown_count"),
+    inputs: inputWith({
       open_count: "Non-negative cardinality of Slack Grid workspaces whose normalized `discoverability` value from admin.teams.list equals `open`.",
-    },
+    }, "teams_readable", "teams_complete", "workspace_count", "open_count", "unknown_count"),
     rules: ordered(any(ne("teams_readable", true), eq("workspace_count", 0)), gt("open_count", 0), any(gt("unknown_count", 0), ne("teams_complete", true)), gt("workspace_count", 0)),
   },
   "SLACK-ADMIN-06": manual(),
   "SLACK-ADMIN-07": {
-    inputs: {
-      ...input("teams_readable", "teams_complete", "domain_count", "unrestricted_count", "settings_error_count"),
+    inputs: inputWith({
       unrestricted_count: "Non-negative cardinality of readable admin.teams.settings.info responses whose trimmed `team.email_domain` value is an empty string.",
-    },
+    }, "teams_readable", "teams_complete", "domain_count", "unrestricted_count", "settings_error_count"),
     rules: ordered(any(ne("teams_readable", true), eq("domain_count", 0)), gt("unrestricted_count", 0), any(gt("settings_error_count", 0), ne("teams_complete", true)), gt("domain_count", 0)),
   },
   "SLACK-ADMIN-08": {
@@ -294,10 +297,9 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
   "SLACK-APP-01": inventory("approved"),
   "SLACK-APP-02": inventory("restricted"),
   "SLACK-APP-03": {
-    inputs: {
-      ...input("approved_readable", "approved_complete", "approved_count", "flagged_count"),
+    inputs: inputWith({
       flagged_count: "Non-negative cardinality of distinct approved-app names for which the app is internal, is outside the Slack Marketplace, or has at least one scope whose `is_sensitive` field is true.",
-    },
+    }, "approved_readable", "approved_complete", "approved_count", "flagged_count"),
     rules: ordered(ne("approved_readable", true), undefined, any(eq("approved_count", 0), gt("flagged_count", 0), ne("approved_complete", true)), all(gt("approved_count", 0), eq("flagged_count", 0))),
   },
   "SLACK-APP-04": inventory("barrier"),
@@ -330,11 +332,10 @@ const SLACK_EXECUTABLE_DECISIONS: Readonly<Record<string, SlackExecutableDecisio
     ],
   },
   "SLACK-CHAN-02": {
-    inputs: {
-      ...input("channels_readable", "channel_count", "announcement_channel_count", "preference_count", "complete", "unrestricted_count", "unknown_count"),
+    inputs: inputWith({
       preference_count: "Non-negative cardinality of announcement-channel records with a successful admin.conversations.getConversationPrefs response.",
       unrestricted_count: "Non-negative cardinality of announcement-channel preference records whose posting-restriction classifier returns false.",
-    },
+    }, "channels_readable", "channel_count", "announcement_channel_count", "preference_count", "complete", "unrestricted_count", "unknown_count"),
     rules: ordered(any(ne("channels_readable", true), eq("channel_count", 0), eq("announcement_channel_count", 0), eq("preference_count", 0)), gt("unrestricted_count", 0), any(gt("unknown_count", 0), ne("complete", true)), eq("unrestricted_count", 0)),
   },
   "SLACK-CHAN-03": {
