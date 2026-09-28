@@ -2540,7 +2540,7 @@ function recordDuoDecisionFacts(id: DuoCheckId, facts: Readonly<Record<string, u
 }
 
 function completeDuoDatasets(...datasets: Array<CollectedDataset<unknown> | undefined>): boolean {
-  return datasets.every((dataset) => Boolean(dataset) && !dataset?.error && dataset.complete !== false);
+  return datasets.every((dataset) => dataset !== undefined && !dataset.error && dataset.complete !== false);
 }
 
 function buildFinding(
