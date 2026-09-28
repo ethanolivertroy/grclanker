@@ -453,6 +453,36 @@ function createPartialClient() {
   });
 }
 
+function createRepresentativeClient() {
+  return createFakeClient({
+    listPreventionPolicies: async () => [
+      preventionPolicy({ detection: "CAUTIOUS", prevention: "DISABLED", exploitEnabled: false, scriptEnabled: false, tamperEnabled: false, detectOnWrite: false }),
+    ],
+    listResponsePolicies: async () => [responsePolicy({ rtr: false })],
+    listAlerts: async () => [
+      { composite_id: "a-old", severity: 90, severity_name: "Critical", status: "new", created_timestamp: isoHoursAgo(100) },
+    ],
+    getDeviceControlPoliciesV2: async () => [{
+      id: "dc-1",
+      usb_settings: {
+        enforcement_mode: "MONITOR_ONLY",
+        pcie_enforcement_mode: "MONITOR_ONLY",
+        classes: [{ id: "MASS_STORAGE", action: "FULL_ACCESS", exceptions: [] }],
+      },
+    }],
+    listSensorUpdatePolicies: async () => [
+      sensorUpdatePolicy({ name: "Updates Off", settings: { build: "", uninstall_protection: "DISABLED" } }),
+    ],
+    listHosts: async (_limit, filter) => filter
+      ? [host({ hostname: "contained-01", status: "contained", modified_timestamp: isoHoursAgo(200) })]
+      : [host({ last_seen: isoDaysAgo(30), groups: [], reduced_functionality_mode: "yes" })],
+    countDiscoverHosts: async (filter) => (filter.includes("unmanaged") ? 2 : 1),
+    listDiscoverHosts: async () => [{ hostname: "rogue-01", platform_name: "Linux", last_seen_timestamp: isoDaysAgo(1) }],
+    countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? 1 : 1),
+    listZtaAssessments: async () => [{ aid: "aid-1", score: 22 }],
+  });
+}
+
 test("resolveCrowdstrikeConfiguration prefers explicit args over environment and config file values", () => {
   const home = createTempBase("grclanker-cs-home-");
   mkdirSync(join(home, ".crowdstrike"), { recursive: true });
@@ -3030,7 +3060,7 @@ test("CrowdStrike tools are registered in the tool catalog under the CrowdStrike
 });
 
 test("byte differential fixtures: CrowdStrike assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
-  writeByteDifferentialFixture("crowdstrike", "representative", await runAllCrowdstrikeAssessments(createPartialClient()));
+  writeByteDifferentialFixture("crowdstrike", "representative", await runAllCrowdstrikeAssessments(createRepresentativeClient()));
   writeByteDifferentialFixture("crowdstrike", "compliant", await runAllCrowdstrikeAssessments(createFakeClient()));
   writeByteDifferentialFixture("crowdstrike", "denied", await runAllCrowdstrikeAssessments(createForbiddenClient()));
   writeByteDifferentialFixture("crowdstrike", "missing-null", await runAllCrowdstrikeAssessments(createEmptyClient()));

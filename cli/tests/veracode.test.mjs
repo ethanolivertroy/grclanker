@@ -237,6 +237,23 @@ function partialClient() {
   });
 }
 
+function representativeClient() {
+  const fixture = healthyFixture();
+  fixture.applications[0].last_completed_scan_date = daysAgo(200);
+  fixture.applications[0].scans[0].modified_date = daysAgo(200);
+  fixture.applications[0].profile.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", is_default: true, policy_compliance_status: "DID_NOT_PASS" }];
+  fixture.applications[1].profile.policies = [];
+  fixture.policies = [{ guid: "pol-builtin", name: "Veracode Recommended", type: "BUILTIN", finding_rules: [] }];
+  fixture.findings = [
+    { issue_id: 1, finding_status: { status: "OPEN", resolution: "UNRESOLVED", resolution_status: "NONE", first_found_date: daysAgo(120) }, finding_details: { severity: 5 }, annotations: [] },
+    { issue_id: 2, finding_status: { status: "OPEN", resolution_status: "PROPOSED" }, finding_details: { severity: 4 }, annotations: [{ action: "FP", comment: "" }] },
+  ];
+  fixture.vulnerabilityIssues = [{ id: "i1", issue_type: "vulnerability", severity: 9.8, library: { name: "log4j" }, vulnerability: { cve: "CVE-2021-44228", cvss3_score: 10 } }];
+  fixture.licenseIssues = [{ id: "i2", issue_type: "license", license: { name: "GPL-3.0", risk: "HIGH" }, library: { name: "gpl-lib" } }];
+  fixture.sandboxes = [];
+  return mockClient(fixture);
+}
+
 async function runAllAssessments(client) {
   const results = await Promise.all([
     assessVeracodeScanCoverage(client, { now: NOW }),
@@ -3012,7 +3029,7 @@ test("class 10: a single object carrying a documented member is kept whatever el
 });
 
 test("byte differential fixtures: Veracode assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
-  writeByteDifferentialFixture("veracode", "representative", await runVeracodeAssessments(partialClient()));
+  writeByteDifferentialFixture("veracode", "representative", await runVeracodeAssessments(representativeClient()));
   writeByteDifferentialFixture("veracode", "compliant", await runVeracodeAssessments(mockClient()));
   writeByteDifferentialFixture("veracode", "denied", await runVeracodeAssessments(forbiddenClient()));
   writeByteDifferentialFixture("veracode", "missing-null", await runVeracodeAssessments(emptyClient()));

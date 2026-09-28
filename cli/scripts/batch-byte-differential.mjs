@@ -19,7 +19,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "4abca89d98c1182afa3111c528a42c1cb5a3f87a";
+const baselineRef = "fd770ee84b188ed8a3e3360f2d9e9828dc3b4d8d";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -162,10 +162,14 @@ const __corpusSweepFunctions = new Set([
   "assessZoomIdentityFromSnapshot", "assessZoomCollaborationGovernanceFromSnapshot", "assessZoomMeetingSecurityFromSnapshot",
   "assessSalesforcePlatformData", "assessSalesforceIdentityData", "assessSalesforceDataProtectionData", "assessSalesforceMonitoringData",
   "assessServicenowIdentityAccessData", "assessServicenowPlatformHardeningData", "assessServicenowAccessControlData", "assessServicenowOperationsGovernanceData",
+  "assessCrowdstrikePreventionPolicies", "assessCrowdstrikeResponseReadiness", "assessCrowdstrikeDeviceFirewall", "assessCrowdstrikeSensorCoverage", "assessCrowdstrikeAccessGovernance",
   "assessTenableScanProgram", "assessTenableSensorCoverage", "assessTenableAccessControl", "assessTenableVulnerabilityManagement",
+  "assessQualysScanCoverage", "assessQualysAssetInventory", "assessQualysVulnerabilityManagement", "assessQualysAdministration",
+  "assessVeracodeScanCoverage", "assessVeracodePolicyCompliance", "assessVeracodeFindingsHygiene", "assessVeracodeScaPosture", "assessVeracodeAccessControls",
   "assessKnowbe4PhishingProgram", "assessKnowbe4TrainingProgram", "assessKnowbe4UserRisk", "assessKnowbe4AccountGovernance",
 ]);
 const __corpusSweptInputs = new Set();
+const __corpusSweptAsyncInputs = new Set();
 function __corpusSweep(name, args, original) {
   if (!__corpusSweepFunctions.has(name) || !args[0] || typeof args[0] !== "object") return;
   const signature = name + ":" + JSON.stringify(args[0]);
@@ -217,6 +221,60 @@ function __corpusSweep(name, args, original) {
     }
   }
 }
+function __corpusClientMethods(client) {
+  const methods = new Set();
+  for (let value = client; value && value !== Object.prototype; value = Object.getPrototypeOf(value)) {
+    for (const name of Object.getOwnPropertyNames(value)) {
+      if (name !== "constructor" && name !== "getResolvedConfig" && typeof client[name] === "function") methods.add(name);
+    }
+  }
+  return [...methods].sort();
+}
+function __corpusMutateCollection(value, mode) {
+  if (Array.isArray(value)) {
+    if (mode === "empty") return [];
+    if (mode === "truncated") return { items: value, truncated: true, truncationReason: "independent differential truncation", pages: 1 };
+    return value;
+  }
+  if (!value || typeof value !== "object" || !Array.isArray(value.items)) return mode === "empty" ? {} : value;
+  if (mode === "empty") {
+    return { ...value, items: [], truncated: false, complete: true, total: 0, totalElements: 0, totalPages: 1 };
+  }
+  return {
+    ...value,
+    truncated: true,
+    truncationReason: "independent differential truncation",
+    complete: false,
+    total: Math.max(value.items.length + 1, Number(value.total) || 0),
+    totalElements: Math.max(value.items.length + 1, Number(value.totalElements) || 0),
+    totalPages: Math.max(2, Number(value.totalPages) || 0),
+  };
+}
+async function __corpusAsyncSweep(name, args, original) {
+  if (!__corpusSweepFunctions.has(name) || !args[0] || typeof args[0] !== "object") return;
+  const signature = name + ":" + JSON.stringify(args.slice(1));
+  if (__corpusSweptAsyncInputs.has(signature)) return;
+  __corpusSweptAsyncInputs.add(signature);
+  const client = args[0];
+  for (const methodName of __corpusClientMethods(client)) {
+    for (const mode of ["truncated", "denied", "empty"]) {
+      const proxy = Object.create(client);
+      proxy[methodName] = async (...methodArgs) => {
+        if (mode === "denied") throw new Error("403 Forbidden");
+        return __corpusMutateCollection(await client[methodName](...methodArgs), mode);
+      };
+      const mutatedArgs = [proxy, ...args.slice(1)];
+      try {
+        __corpusRecord(name + "::sweep::" + mode + "::" + methodName, "result", await original(...mutatedArgs));
+      } catch (error) {
+        __corpusRecord(name + "::sweep::" + mode + "::" + methodName, "error", {
+          name: error instanceof Error ? error.name : typeof error,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+}
 `;
     const wrapperSource = wrappers.map(({ async, functionName, originalName }) => async
       ? `
@@ -224,6 +282,7 @@ export async function ${functionName}(...args) {
   try {
     const result = await ${originalName}(...args);
     __corpusRecord(${JSON.stringify(functionName)}, "result", result);
+    await __corpusAsyncSweep(${JSON.stringify(functionName)}, args, ${originalName});
     return result;
   } catch (error) {
     __corpusRecord(${JSON.stringify(functionName)}, "error", {
@@ -441,8 +500,12 @@ try {
   for (const integration of [...batch2Integrations, ...batch3Integrations]) {
     const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
     const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
+    const partial = readFileSync(join(branchFixtures, integration, "partial.json"));
     if (representative.equals(compliant)) {
       throw new Error(`${integration}: representative fixture is byte-identical to compliant`);
+    }
+    if (representative.equals(partial)) {
+      throw new Error(`${integration}: representative fixture is byte-identical to partial`);
     }
   }
   const classes = [...new Set(compared.map((path) => path.split("/").at(-1).replace(/\.json$/, "")))].sort();
