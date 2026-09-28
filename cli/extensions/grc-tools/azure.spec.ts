@@ -7,6 +7,7 @@ import {
   batch2Any as any,
   batch2Checks,
   batch2ComparePaths as comparePaths,
+  batch2DecisionInputPaths,
   batch2Defined as defined,
   batch2Eq as eq,
   batch2Gt as gt,
@@ -234,11 +235,16 @@ const countDecision = (
   names: string[],
   branches: Parameters<typeof ordered>[0],
   constants?: Readonly<Record<string, PortableValue>>,
-): AzureDecision => ({ inputs: inputs("readable", "complete", "inventory_count", ...names), constants, rules: ordered(branches) });
+): AzureDecision => {
+  const rules = ordered(branches);
+  const referenced = batch2DecisionInputPaths(rules);
+  const inputNames = ["readable", "complete", "inventory_count", ...names].filter((name) => referenced.has(name));
+  return { inputs: inputs(...inputNames), constants, rules };
+};
 
 const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
   "AZURE-ID-01": {
-    inputs: inputs("policy_readable", "complete", "policy_count", "mfa_policy_count", "security_defaults_readable", "security_defaults_enabled"),
+    inputs: inputs("policy_readable", "complete", "mfa_policy_count", "security_defaults_readable", "security_defaults_enabled"),
     rules: ordered({
       manual: any(ne("policy_readable", true), all(eq("mfa_policy_count", 0), ne("security_defaults_readable", true))),
       fail: all(eq("mfa_policy_count", 0), eq("security_defaults_enabled", false)),

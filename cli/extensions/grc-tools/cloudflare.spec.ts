@@ -164,7 +164,6 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
             evidence_complete: "Boolean. True only when Gateway rule pagination proved exhaustion.",
             gateway_provisioned: "Boolean. True when /accounts/{account_id}/gateway returns a non-empty gateway_tag.",
             gateway_rule_count: "Complete count of Gateway rules before presentation slicing.",
-            enabled_rule_count: "Count of Gateway rules whose enabled field is not false.",
             blocking_or_isolating_rule_count: "Count of enabled rules whose action is block, isolate, or override.",
             dns_or_http_filter_present: "Boolean. True when at least one enabled rule names a DNS or HTTP filter.",
           },
