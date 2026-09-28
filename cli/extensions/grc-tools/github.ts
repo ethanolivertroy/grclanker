@@ -1001,8 +1001,8 @@ function validateGraphqlUrl(graphqlUrl: string, apiBaseUrl: string): void {
   if (parsedGraphqlUrl.username.length > 0 || parsedGraphqlUrl.password.length > 0) {
     throw new Error("GitHub GraphQL URL must not carry userinfo.");
   }
-  if (parsedGraphqlUrl.protocol !== "https:") {
-    throw new Error("GitHub GraphQL URL must use HTTPS.");
+  if (parsedGraphqlUrl.protocol !== "http:" && parsedGraphqlUrl.protocol !== "https:") {
+    throw new Error("GitHub GraphQL URL must use HTTP or HTTPS.");
   }
 
   let parsedApiBaseUrl: URL;
