@@ -4017,6 +4017,35 @@ function formatAssessmentText(result: ZendeskAssessmentResult): string {
   ].join("\n");
 }
 
+export type ZendeskAssessmentToolDetails = {
+  tool: string;
+  category: string;
+  title: string;
+  summary: JsonRecord;
+  findings: ZendeskFinding[];
+  errors: string[];
+  snapshot_keys: string[];
+};
+
+/**
+ * Native tool `details` for the assessment tools. Pi persists `details` in the session log and
+ * renders them in the UI (the Agent SDK and Flue adapters drop them from model context), so this
+ * is an explicit allowlist rather than a spread of the result: raw snapshots grow with tenant
+ * size and belong in the export bundle's core_data/, so only their dataset names are carried.
+ * The text content is still rendered from the full result and is unaffected.
+ */
+export function zendeskAssessmentToolDetails(tool: string, result: ZendeskAssessmentResult): ZendeskAssessmentToolDetails {
+  return {
+    tool,
+    category: result.category,
+    title: result.title,
+    summary: result.summary,
+    findings: result.findings,
+    errors: result.errors,
+    snapshot_keys: Object.keys(result.snapshots),
+  };
+}
+
 function buildExecutiveSummary(config: ZendeskResolvedConfig, assessments: ZendeskAssessmentResult[], errors: string[], generatedAt: string): string {
   const findings = assessments.flatMap((assessment) => assessment.findings);
   // A category renders a null status count only when an inventory its findings read was
@@ -4260,7 +4289,7 @@ function registerAssessmentTool(
     async execute(_toolCallId: string, args: AssessArgs) {
       return runSealed(label, name, args, async (client) => {
         const result = await run(client, toOptions(args));
-        return textResult(formatAssessmentText(result), { tool: name, ...result });
+        return textResult(formatAssessmentText(result), zendeskAssessmentToolDetails(name, result));
       });
     },
   });

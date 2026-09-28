@@ -26,6 +26,7 @@ import {
   defaultCertificateProbe,
   exportMulesoftAuditBundle,
   getMulesoftControlCatalog,
+  mulesoftAssessmentToolDetails,
   parseSimpleToml,
   redactSecretText,
   redactSnapshot,
@@ -4126,4 +4127,165 @@ test("reviewer B round 4 verdict N3: MULESOFT-IAM-01 is manual, not fail, on an 
   const disabledFinding = findingById(disabled, "MULESOFT-IAM-01");
   assert.equal(disabledFinding.status, "fail", disabledFinding.summary);
   assert.match(disabledFinding.summary, /Partial view: identity provider list truncated at 1 of 3 total/);
+});
+
+// ---------------------------------------------------------------------------
+// Native assessment tool details: Pi persists and renders details, so they carry a bounded
+// projection of the result and never the raw snapshots (those belong in core_data/).
+// ---------------------------------------------------------------------------
+
+const MULESOFT_ASSESSMENT_DETAIL_KEYS = ["tool", "category", "title", "summary", "findings", "errors", "snapshot_keys"];
+const MULESOFT_BULK_MARKER = "bulk-inventory-item";
+
+function bulkItems(count, make) {
+  return Array.from({ length: count }, (_, index) => make(index));
+}
+
+// Each assessment under five fixture shapes. The bulk shape fills the inventories the category
+// snapshots carry up to the default user and application limits, so the snapshots grow with it
+// while the details must not.
+const MULESOFT_DETAIL_TOOLS = [
+  {
+    tool: "mulesoft_assess_identity_access",
+    run: assessMulesoftIdentityAccess,
+    fixtures: {
+      healthy: () => healthyIdentityClient(),
+      forbidden: () => forbidAll(healthyIdentityClient()),
+      empty: () => emptyIdentityClient(),
+      partial: () => partialIdentityClient(),
+      bulk: () => healthyIdentityClient({
+        async listMembers() {
+          return bulkItems(1000, (index) => ({ id: `u-${index}`, username: `${MULESOFT_BULK_MARKER}-${index}`, email: `${MULESOFT_BULK_MARKER}-${index}@example.com` }));
+        },
+      }),
+    },
+  },
+  {
+    tool: "mulesoft_assess_api_gateway",
+    run: assessMulesoftApiGateway,
+    fixtures: {
+      healthy: () => healthyApiGatewayClient(),
+      forbidden: () => forbidAll(healthyApiGatewayClient()),
+      empty: () => emptyApiGatewayClient(),
+      partial: () => partialApiGatewayClient(),
+      bulk: () => healthyApiGatewayClient({
+        async listExchangeAssets() {
+          return bulkItems(500, (index) => ({ organizationId: ORG_ID, assetId: `${MULESOFT_BULK_MARKER}-${index}`, name: `${MULESOFT_BULK_MARKER} ${index}`, status: "published", isPublic: false, type: "rest-api" }));
+        },
+      }),
+    },
+  },
+  {
+    tool: "mulesoft_assess_runtime_infrastructure",
+    run: assessMulesoftRuntimeInfrastructure,
+    fixtures: {
+      healthy: () => healthyRuntimeClient(),
+      forbidden: () => forbidAll(healthyRuntimeClient()),
+      empty: () => emptyRuntimeClient(),
+      partial: () => partialRuntimeClient(),
+      bulk: () => healthyRuntimeClient({
+        async listCloudhubApplications(environmentId) {
+          return bulkItems(100, (index) => ({
+            domain: `${MULESOFT_BULK_MARKER}-${environmentId}-${index}`,
+            muleVersion: { version: "4.6.0", endOfSupportDate: isoDaysFromNow(400) },
+            workers: { amount: 2, type: { name: "Small", weight: 0.2 }, recentStatistics: { cpu: 45 } },
+            persistentQueues: true,
+            persistentQueuesEncrypted: true,
+            properties: {},
+          }));
+        },
+      }),
+    },
+  },
+  {
+    tool: "mulesoft_assess_audit_monitoring",
+    run: assessMulesoftAuditMonitoring,
+    fixtures: {
+      healthy: () => healthyAuditClient(),
+      forbidden: () => forbidAll(healthyAuditClient()),
+      empty: () => emptyAuditClient(),
+      partial: () => partialAuditClient(),
+      bulk: () => healthyAuditClient({
+        async listCloudhubAlerts(environmentId) {
+          return bulkItems(500, (index) => ({ id: `alert-${environmentId}-${index}`, name: `${MULESOFT_BULK_MARKER} ${index}`, enabled: true, condition: { resources: ["*"] } }));
+        },
+      }),
+    },
+  },
+];
+
+// Serialized-size ceilings, in characters, at roughly twice the largest value these fixtures produce.
+// Measured maxima across the four tools: healthy 7.3k, forbidden 14.0k, empty 9.9k, partial 12.5k, bulk 8.9k.
+const MULESOFT_DETAILS_CEILING = { healthy: 16000, forbidden: 28000, empty: 20000, partial: 26000, bulk: 18000 };
+
+function assertMulesoftDetailsShape(details, tool, label) {
+  assert.deepEqual(Object.keys(details), MULESOFT_ASSESSMENT_DETAIL_KEYS, `${label}: details carry exactly the projected fields`);
+  assert.equal("snapshots" in details, false, `${label}: raw snapshots are not carried in details`);
+  assert.equal(details.tool, tool, `${label}: tool name`);
+  assert.ok(details.snapshot_keys.length > 0, `${label}: the snapshot dataset names are kept`);
+  assert.ok(details.snapshot_keys.every((key) => typeof key === "string"), `${label}: snapshot_keys lists names only`);
+}
+
+test("assessment tool details are a bounded projection: raw snapshots are dropped while the snapshot names, summary, findings, and errors are kept", async () => {
+  for (const { tool, run, fixtures } of MULESOFT_DETAIL_TOOLS) {
+    const sizes = {};
+    const snapshotSizes = {};
+    for (const [fixture, makeClient] of Object.entries(fixtures)) {
+      const label = `${tool} (${fixture})`;
+      const result = await run(makeClient());
+      const details = mulesoftAssessmentToolDetails(tool, result);
+      assertMulesoftDetailsShape(details, tool, label);
+      for (const key of ["category", "title", "summary", "findings", "errors"]) {
+        assert.deepEqual(details[key], result[key], `${label}: ${key} is preserved`);
+      }
+      assert.deepEqual(details.snapshot_keys, Object.keys(result.snapshots), `${label}: snapshot_keys names every snapshot`);
+      sizes[fixture] = JSON.stringify(details).length;
+      snapshotSizes[fixture] = JSON.stringify(result.snapshots).length;
+      assert.ok(sizes[fixture] <= MULESOFT_DETAILS_CEILING[fixture], `${label}: details serialize to ${sizes[fixture]} characters, over the ${MULESOFT_DETAILS_CEILING[fixture]} ceiling`);
+    }
+    assert.ok(snapshotSizes.bulk > 10 * snapshotSizes.healthy, `${tool}: the bulk fixture grows the snapshots (${snapshotSizes.healthy} -> ${snapshotSizes.bulk})`);
+    assert.ok(sizes.bulk <= 2 * sizes.healthy, `${tool}: the details do not grow with the snapshots (${sizes.healthy} -> ${sizes.bulk})`);
+  }
+});
+
+test("the registered assessment tools return the bounded details over HTTP and still render every finding and error in the text", async () => {
+  const registered = new Map();
+  registerMulesoftTools({ registerTool: (tool) => registered.set(tool.name, tool) });
+  const upstream = msCanaryFetch({});
+  // No dedicated load balancer, so the runtime assessment never opens a live TLS probe.
+  const fetchImpl = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (msSurfaceOf(url) === "loadBalancers") return jsonResponse({ data: [], total: 0 });
+    return upstream(input, init);
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  try {
+    for (const { tool, run } of MULESOFT_DETAIL_TOOLS) {
+      const registeredTool = registered.get(tool);
+      const output = await registeredTool.execute("call-details", registeredTool.prepareArguments({ organization_id: ORG_ID, token: SAMPLE_TOKEN, control_plane: "us" }));
+      assert.notEqual(output.isError, true, output.content[0].text);
+      const { details } = output;
+      assertMulesoftDetailsShape(details, tool, tool);
+
+      const direct = await run(new MulesoftApiClient(sampleConfig(), { fetchImpl, sleepImpl: async () => {}, maxRetries: 0 }));
+      assert.equal(details.category, direct.category, `${tool}: category`);
+      assert.equal(details.title, direct.title, `${tool}: title`);
+      assert.deepEqual(Object.keys(details.summary), Object.keys(direct.summary), `${tool}: summary fields`);
+      assert.deepEqual(details.findings.map((item) => [item.id, item.status]), direct.findings.map((item) => [item.id, item.status]), `${tool}: findings`);
+      assert.deepEqual(details.errors, direct.errors, `${tool}: errors`);
+      assert.deepEqual(details.snapshot_keys, Object.keys(direct.snapshots), `${tool}: snapshot_keys names every snapshot the assessment collected`);
+
+      const text = output.content.map((part) => part.text ?? "").join("\n");
+      assert.ok(text.startsWith(`${details.title}\n`), `${tool}: the text leads with the title`);
+      for (const key of Object.keys(details.summary)) assert.ok(text.includes(`- ${key}: `), `${tool}: the text renders summary.${key}`);
+      for (const item of details.findings) assert.ok(text.includes(item.id), `${tool}: the text renders ${item.id}`);
+      for (const error of details.errors) assert.ok(text.includes(`- ${error}`), `${tool}: the text renders the collection error`);
+
+      const size = JSON.stringify(details).length;
+      assert.ok(size <= MULESOFT_DETAILS_CEILING.healthy, `${tool}: details serialize to ${size} characters, over the ${MULESOFT_DETAILS_CEILING.healthy} ceiling`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
