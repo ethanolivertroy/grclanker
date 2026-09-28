@@ -284,6 +284,7 @@ function describeJsonlMismatches(expected, actual, limit = 25) {
   let actualStart = 0;
   let mismatchCount = 0;
   const descriptions = [];
+  const seenDescriptions = new Set();
   while (expectedStart < expected.length || actualStart < actual.length) {
     const expectedNewline = expected.indexOf(0x0a, expectedStart);
     const actualNewline = actual.indexOf(0x0a, actualStart);
@@ -302,12 +303,18 @@ function describeJsonlMismatches(expected, actual, limit = 25) {
           const statusChanges = [...new Set([...expectedStatuses.keys(), ...actualStatuses.keys()])]
             .filter((id) => expectedStatuses.get(id) !== actualStatuses.get(id))
             .map((id) => `${id}:${expectedStatuses.get(id) ?? "<missing>"}->${actualStatuses.get(id) ?? "<missing>"}`);
-          descriptions.push(
+          const description =
             `${expectedRecord.name ?? actualRecord.name ?? "<unnamed>"}`
-            + (statusChanges.length > 0 ? ` [${statusChanges.join(", ")}]` : " [serialized evidence differs]"),
-          );
+            + (statusChanges.length > 0 ? ` [${statusChanges.join(", ")}]` : " [serialized evidence differs]");
+          if (!seenDescriptions.has(description)) {
+            seenDescriptions.add(description);
+            descriptions.push(description);
+          }
         } catch {
-          descriptions.push("<unparseable record>");
+          if (!seenDescriptions.has("<unparseable record>")) {
+            seenDescriptions.add("<unparseable record>");
+            descriptions.push("<unparseable record>");
+          }
         }
       }
     }
