@@ -131,6 +131,8 @@ export type VerdictCondition =
       denominator: VerdictOperand;
       comparator: "gt" | "gte" | "lt" | "lte";
       threshold: VerdictOperand;
+      scale?: number;
+      roundDigits?: number;
     }
   | { op: "matches"; operand: VerdictOperand; pattern: string; flags?: string }
   | { op: "defined" | "null"; operand: VerdictOperand }
@@ -384,7 +386,10 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
       if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0 || !Number.isFinite(threshold)) {
         return false;
       }
-      const ratio = numerator / denominator;
+      const scaledRatio = (numerator / denominator) * (condition.scale ?? 1);
+      const ratio = condition.roundDigits === undefined
+        ? scaledRatio
+        : Math.round(scaledRatio * (10 ** condition.roundDigits)) / (10 ** condition.roundDigits);
       if (condition.comparator === "gt") return ratio > threshold;
       if (condition.comparator === "gte") return ratio >= threshold;
       if (condition.comparator === "lt") return ratio < threshold;
@@ -453,7 +458,11 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
     case "lte":
       return `${renderOperand(condition.left)} is at most ${renderOperand(condition.right)}`;
     case "ratio":
-      return `${renderOperand(condition.numerator)} divided by ${renderOperand(condition.denominator)} is ${
+      return `${renderOperand(condition.numerator)} divided by ${renderOperand(condition.denominator)}${
+        condition.scale === undefined ? "" : `, multiplied by ${condition.scale}`
+      }${
+        condition.roundDigits === undefined ? "" : `, rounded to ${condition.roundDigits} decimal place(s)`
+      } is ${
         condition.comparator === "gt"
           ? "greater than"
           : condition.comparator === "gte"
