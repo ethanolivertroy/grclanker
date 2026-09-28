@@ -186,19 +186,17 @@ Supported modes:
 
 Credential precedence, highest first:
 
-1. Explicit access token
-2. Explicit OAuth client credentials or refresh token
-3. Explicit Basic credentials
-4. Config file
-5. SERVICENOW_* environment variables
+1. Explicit tool arguments
+2. SERVICENOW_* environment variables
+3. Explicit or default ServiceNow YAML config
 
-Environment variables: `SERVICENOW_INSTANCE`, `SERVICENOW_USERNAME`, `SERVICENOW_PASSWORD`, `SERVICENOW_CLIENT_ID`, `SERVICENOW_CLIENT_SECRET`, `SERVICENOW_ACCESS_TOKEN`, `SERVICENOW_REFRESH_TOKEN`
+Environment variables: `SERVICENOW_CONFIG_FILE`, `SERVICENOW_URL`, `SERVICENOW_INSTANCE_URL`, `SERVICENOW_INSTANCE`, `SERVICENOW_AUTH_METHOD`, `SERVICENOW_USERNAME`, `SERVICENOW_PASSWORD`, `SERVICENOW_CLIENT_ID`, `SERVICENOW_CLIENT_SECRET`, `SERVICENOW_ACCESS_TOKEN`, `SERVICENOW_TOKEN`, `SERVICENOW_REFRESH_TOKEN`, `SERVICENOW_TIMEOUT`, `SERVICENOW_MAX_RETRIES`, `SERVICENOW_PAGE_SIZE`
 
-Configuration locations: ~/.servicenow-sec-inspector/config.yaml
+Configuration locations: ./.servicenow.yaml, ~/.servicenow-sec-inspector/config.yaml, Explicit path from config_file or SERVICENOW_CONFIG_FILE
 
-Credential and deployment variants: Instance name or explicit HTTPS instance URL
+Credential and deployment variants: Instance name or explicit HTTPS instance URL, Mutual TLS is rejected as unsupported
 
-Configuration fields: `instanceUrl`, `instanceName`, `authMode`, `username`, `password`, `clientId`, `clientSecret`, `accessToken`, `refreshToken`, `pageSize`
+Configuration fields: `instance_url`, `url`, `instanceUrl`, `base_url`, `instance`, `instance_name`, `instanceName`, `auth_method`, `authMethod`, `auth_mode`, `username`, `user`, `password`, `client_id`, `clientId`, `client_secret`, `clientSecret`, `access_token`, `accessToken`, `token`, `refresh_token`, `refreshToken`, `timeout_seconds`, `timeout`, `max_retries`, `maxRetries`, `page_size`, `pageSize`
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 

@@ -105,7 +105,7 @@ function renderAuthentication(spec) {
     "",
     `Environment variables: ${listCell(auth.environmentVariables)}`,
     "",
-    `Configuration locations: ${auth.configLocations.join(", ")}`,
+    `Configuration locations: ${auth.configLocations.join(", ") || "(none)"}`,
     "",
     `Credential and deployment variants: ${auth.variants.join(", ")}`,
     "",

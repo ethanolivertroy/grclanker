@@ -186,25 +186,23 @@ This specification requires [shared integration contract version 1.1](./integrat
 Supported modes:
 
 - JWT bearer
-- username/password plus security token
+- Username/password plus security token
 - OAuth refresh token
-- explicit access token
+- Explicit access token
 
 Credential precedence, highest first:
 
-1. Explicit access token and instance URL
-2. Explicit refresh token
-3. Explicit JWT credentials
-4. Password grant
-5. Credentials file and SF_* environment variables
+1. Explicit tool arguments
+2. SF_* environment variables
+3. Explicit credentials JSON file
 
-Environment variables: `SF_INSTANCE_URL`, `SF_LOGIN_URL`, `SF_USERNAME`, `SF_PASSWORD`, `SF_SECURITY_TOKEN`, `SF_CONSUMER_KEY`, `SF_CONSUMER_SECRET`, `SF_PRIVATE_KEY`, `SF_REFRESH_TOKEN`, `SF_ACCESS_TOKEN`
+Environment variables: `SF_CREDENTIALS_FILE`, `SF_INSTANCE_URL`, `SF_LOGIN_URL`, `SF_USERNAME`, `SF_PASSWORD`, `SF_SECURITY_TOKEN`, `SF_CONSUMER_KEY`, `SF_CLIENT_ID`, `SF_CONSUMER_SECRET`, `SF_CLIENT_SECRET`, `SF_PRIVATE_KEY_FILE`, `SF_PRIVATE_KEY`, `SF_REFRESH_TOKEN`, `SF_ACCESS_TOKEN`, `SF_API_VERSION`, `SF_GRANT_TYPE`, `SF_SANDBOX`, `SF_TIMEOUT`, `SF_MAX_RETRIES`
 
-Configuration locations: Explicit credentials JSON file
+Configuration locations: Explicit credentials JSON file from credentials_file or SF_CREDENTIALS_FILE
 
 Credential and deployment variants: Production login, Sandbox login, Custom My Domain login
 
-Configuration fields: `instanceUrl`, `loginUrl`, `username`, `password`, `securityToken`, `consumerKey`, `consumerSecret`, `privateKey`, `refreshToken`, `accessToken`, `apiVersion`
+Configuration fields: `instance_url`, `instanceUrl`, `login_url`, `loginUrl`, `username`, `password`, `security_token`, `securityToken`, `consumer_key`, `client_id`, `consumerKey`, `clientId`, `consumer_secret`, `client_secret`, `consumerSecret`, `clientSecret`, `private_key_file`, `privateKeyFile`, `private_key`, `privateKey`, `refresh_token`, `refreshToken`, `access_token`, `accessToken`, `api_version`, `apiVersion`, `grant_type`, `grantType`, `sandbox`
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 

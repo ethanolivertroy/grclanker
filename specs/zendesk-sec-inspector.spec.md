@@ -163,18 +163,17 @@ Supported modes:
 
 Credential precedence, highest first:
 
-1. Explicit OAuth token
-2. Explicit API token and email
-3. Explicit config file
-4. ZENDESK_* environment variables
+1. Explicit tool arguments
+2. ZENDESK_* environment variables
+3. Zendesk JSON config file
 
-Environment variables: `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN`, `ZENDESK_OAUTH_TOKEN`, `ZENDESK_CONFIG_FILE`
+Environment variables: `ZENDESK_CONFIG_FILE`, `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN`, `ZENDESK_OAUTH_TOKEN`, `ZENDESK_ACCESS_TOKEN`, `ZENDESK_BASE_URL`, `ZENDESK_TIMEOUT`
 
-Configuration locations: ~/.zendesk/config.json
+Configuration locations: ~/.zendesk/config.json, Explicit path from config_file or ZENDESK_CONFIG_FILE
 
 Credential and deployment variants: Zendesk subdomain or explicit same-origin API base URL
 
-Configuration fields: `subdomain`, `email`, `apiToken`, `oauthToken`, `baseUrl`, `timeoutMs`
+Configuration fields: `subdomain`, `email`, `api_token`, `apiToken`, `oauth_token`, `oauthToken`, `base_url`, `baseUrl`, `timeout_seconds`
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 

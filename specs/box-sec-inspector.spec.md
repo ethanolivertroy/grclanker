@@ -204,18 +204,17 @@ Supported modes:
 
 Credential precedence, highest first:
 
-1. Explicit arguments
-2. Explicit config path
-3. Box inspector config
-4. BOX_* environment variables
+1. Explicit tool arguments
+2. BOX_* environment variables
+3. Explicit or default inspector YAML config
 
-Environment variables: `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, `BOX_ENTERPRISE_ID`, `BOX_ACCESS_TOKEN`, `BOX_REFRESH_TOKEN`, `BOX_JWT_CONFIG`
+Environment variables: `BOX_AUTH_METHOD`, `BOX_JWT_CONFIG_PATH`, `BOX_JWT_PASSPHRASE`, `BOX_JWT_ALGORITHM`, `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, `BOX_ENTERPRISE_ID`, `BOX_SUBJECT_TYPE`, `BOX_SUBJECT_ID`, `BOX_ACCESS_TOKEN`, `BOX_TOKEN`, `BOX_DEVELOPER_TOKEN`, `BOX_REFRESH_TOKEN`, `BOX_API_BASE_URL`, `BOX_BASE_URL`, `BOX_TOKEN_URL`, `BOX_TIMEOUT`, `BOX_MAX_RETRIES`, `BOX_CONFIG_PATH`
 
-Configuration locations: ~/.box-sec-inspector/config.yaml
+Configuration locations: Explicit path from config_path or BOX_CONFIG_PATH, ~/.box-sec-inspector/config.yaml
 
 Credential and deployment variants: Enterprise or user subject, JWT RS256, RS384, or RS512 assertion
 
-Configuration fields: `clientId`, `clientSecret`, `enterpriseId`, `subjectType`, `subjectId`, `accessToken`, `refreshToken`, `jwt`
+Configuration fields: `auth_method`, `authMethod`, `auth_mode`, `jwt_config_path`, `jwt_config`, `jwtConfigPath`, `jwt_passphrase`, `passphrase`, `jwt_algorithm`, `jwtAlgorithm`, `client_id`, `clientId`, `clientID`, `client_secret`, `clientSecret`, `enterprise_id`, `enterpriseId`, `enterpriseID`, `subject_type`, `subjectType`, `subject_id`, `subjectId`, `user_id`, `access_token`, `accessToken`, `token`, `developer_token`, `refresh_token`, `refreshToken`, `base_url`, `baseUrl`, `api_base_url`, `token_url`, `tokenUrl`, `timeout_seconds`, `timeout`, `max_retries`, `maxRetries`
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 

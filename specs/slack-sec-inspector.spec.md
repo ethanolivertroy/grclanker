@@ -157,16 +157,16 @@ Supported modes:
 Credential precedence, highest first:
 
 1. Explicit tool arguments
-2. Explicit config file
-3. SLACK_* environment variables
+2. SLACK_* environment variables
+3. Slack JSON config file
 
-Environment variables: `SLACK_USER_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_SCIM_TOKEN`, `SLACK_ORG_ID`, `SLACK_CONFIG_FILE`
+Environment variables: `SLACK_CONFIG_FILE`, `SLACK_USER_TOKEN`, `SLACK_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_SCIM_TOKEN`, `SLACK_ORG_ID`, `SLACK_ENTERPRISE_ID`, `SLACK_WEB_API_BASE_URL`, `SLACK_SCIM_BASE_URL`, `SLACK_AUDIT_BASE_URL`, `SLACK_TIMEOUT`
 
-Configuration locations: ~/.config/grclanker/slack.json
+Configuration locations: ~/.config/grclanker/slack.json, Explicit path from SLACK_CONFIG_FILE
 
 Credential and deployment variants: Enterprise Grid org token plus optional bot and SCIM credentials
 
-Configuration fields: `token`, `botToken`, `scimToken`, `orgId`, `webApiBaseUrl`, `scimBaseUrl`, `auditBaseUrl`
+Configuration fields: `user_token`, `token`, `bot_token`, `scim_token`, `org_id`
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 
@@ -335,22 +335,22 @@ These notes explain intent only. The ordered rule table is normative.
 | `SLACK-ADMIN-05` | medium | `slack_assess_admin_access` | `workspaces`, `workspace-settings` | `teams_readable`, `teams_complete`, `workspace_count`, `open_count`, `unknown_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any workspace has discoverability=open, pass when every workspace in a complete non-empty inventory has a known non-open value, and warn for unknown or partial evidence. | The required evidence for Workspace discoverability is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-ADMIN-06` | medium | `slack_assess_admin_access` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because mobile-specific session and jailbreak controls are not exposed by the read API. | The required evidence for Mobile session controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-ADMIN-07` | high | `slack_assess_admin_access` | `workspaces`, `workspace-settings` | `teams_readable`, `teams_complete`, `domain_count`, `unrestricted_count`, `settings_error_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any readable workspace has an empty email-domain restriction, pass when every workspace has a populated domain and coverage is complete, and warn for unreadable or partial workspace settings. | The required evidence for Email domain restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SLACK-ADMIN-08` | low | `slack_assess_admin_access` | `emoji`, `workspace-admins` | `emoji_readable`, `emoji_complete`, `emoji_count`, `roster_available`, `roster_complete`, `non_admin_upload_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | The required evidence for Custom emoji governance is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-ADMIN-08` | low | `slack_assess_admin_access` | `emoji`, `workspace-admins` | `emoji_readable`, `emoji_complete`, `emoji_count`, `admin_user_count`, `every_admin_list_unreadable`, `roster_complete`, `non_admin_upload_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any custom emoji was uploaded by a proven non-admin, pass when complete emoji and admin inventories show every uploader is an admin or owner, warn for partial evidence, and manual when the uploader cannot be compared to an admin roster. | The required evidence for Custom emoji governance is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-ADMIN-09` | medium | `slack_assess_admin_access` | `analytics-export` | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the API can probe analytics export but cannot list which administrators hold analytics access. | The required evidence for Workspace analytics access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-APP-01` | high | `slack_assess_integrations` | `approved-apps` | `approved_readable`, `approved_complete`, `approved_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete approved-app inventory is non-empty and warn when it is empty or partial. | The required evidence for Approved app inventory is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-APP-02` | medium | `slack_assess_integrations` | `restricted-apps` | `restricted_readable`, `restricted_complete`, `restricted_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete restricted-app inventory is non-empty and warn when it is empty or partial because emptiness does not prove an approval policy. | The required evidence for Restricted app policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-APP-03` | medium | `slack_assess_integrations` | `approved-apps` | `approved_readable`, `approved_complete`, `approved_count`, `flagged_count` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when any approved app is internal, outside the Marketplace, or has a sensitive scope, pass when a complete non-empty inventory has none, and warn for empty or partial evidence. | The required evidence for Custom and sensitive-scope apps is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-APP-04` | high | `slack_assess_integrations` | `barriers` | `barrier_readable`, `barrier_complete`, `barrier_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the complete information-barrier inventory is non-empty and warn when it is empty or partial. | The required evidence for Information barriers is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-APP-05` | medium | `slack_assess_integrations` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because public APIs expose neither Discovery entitlement nor DLP scanning status. | The required evidence for DLP and Discovery evidence is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SLACK-APP-06` | medium | `slack_assess_integrations` | `workspaces`, `team-preferences` | `preferences_readable`, `setting_present`, `coverage_complete`, `verdict` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | The required evidence for File upload restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-APP-06` | medium | `slack_assess_integrations` | `workspaces`, `team-preferences` | `preferences_readable`, `setting_value`, `coverage_complete` | Complete readable evidence satisfies the compliant branch of this derivation: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass for disable_file_uploads=disallow_all or type:owner,type:admin with complete workspace scope, warn for type:regular or incomplete scope, fail for allow_all, and warn for an undocumented value. | The required evidence for File upload restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-APP-07` | medium | `slack_assess_integrations` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because token rotation is app-level and no read method lists token age, rotation state, or legacy-token revocation. | The required evidence for Token rotation and revocation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-CHAN-01` | high | `slack_assess_channel_governance` | `channels` | `external_readable`, `external_complete`, `external_count` | Complete readable evidence satisfies the compliant branch of this derivation: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return warn when any externally shared channel exists, pass when a complete search is empty, and warn when emptiness comes from a partial search. | The required evidence for Slack Connect exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SLACK-CHAN-02` | medium | `slack_assess_channel_governance` | `channels`, `channel-preferences` | `channels_readable`, `comparison_available`, `complete`, `unrestricted_count`, `unknown_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | The required evidence for Channel posting restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SLACK-CHAN-03` | medium | `slack_assess_channel_governance` | `channels`, `channel-retention` | `channels_readable`, `retention_available`, `complete`, `short_retention_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | The required evidence for Channel retention overrides is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-02` | medium | `slack_assess_channel_governance` | `channels`, `channel-preferences` | `channels_readable`, `channel_count`, `announcement_channel_count`, `preference_count`, `complete`, `unrestricted_count`, `unknown_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any general, org-default, or mandatory channel allows unrestricted posting, pass when every such channel restricts posting to admins or owners and coverage is complete, and warn for unknown or partial preferences. | The required evidence for Channel posting restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-CHAN-03` | medium | `slack_assess_channel_governance` | `channels`, `channel-retention` | `channels_readable`, `retention_record_count`, `complete`, `short_retention_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when any readable channel override retains data for less than the configured minimum, pass when complete channel and override evidence has none, and warn for unreadable or partial coverage. | The required evidence for Channel retention overrides is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-CHAN-04` | medium | `slack_assess_channel_governance` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because the Admin conversations API exposes no channel email-address or email-to-channel setting. | The required evidence for External email ingestion is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-CHAN-05` | medium | `slack_assess_channel_governance` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: always return manual because admin team settings expose no link-preview or URL-unfurl control. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: always return manual because admin team settings expose no link-preview or URL-unfurl control. | Complete readable evidence satisfies the violation branch, which has first-match precedence: always return manual because admin team settings expose no link-preview or URL-unfurl control. | The required evidence for Link previews and URL unfurling is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-MON-01` | critical | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `audit_count` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the readable audit lookback is empty, pass when it is non-empty and complete, and warn when it is non-empty but truncated. | The required evidence for Audit Logs API access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
-| `SLACK-MON-02` | high | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `latest_age_known`, `latest_age_days` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | The required evidence for Audit log recency is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `SLACK-MON-02` | high | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `latest_age_days` | Complete readable evidence satisfies the compliant branch of this derivation: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return fail when the newest dated audit event is older than one day, pass when it is at most one day old with a complete window, and warn when dates are absent or the window is partial. | The required evidence for Audit log recency is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-MON-03` | medium | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `security_event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete audit window contains at least one common security-administration action and warn when none is visible or the window is partial. | The required evidence for Security event visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-MON-04` | low | `slack_assess_monitoring` | `audit-schemas` | `schema_readable`, `schema_complete`, `schema_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when the Audit Logs schemas endpoint returns at least one schema and warn when it returns none. | The required evidence for Audit schema visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 | `SLACK-MON-05` | medium | `slack_assess_monitoring` | `audit-logs` | `audit_readable`, `audit_complete`, `external_event_count` | Complete readable evidence satisfies the compliant branch of this derivation: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | Complete readable evidence satisfies the violation branch, which has first-match precedence: return pass when a complete audit window contains at least one Slack Connect or external-sharing action and warn when none is visible or the window is partial. | The required evidence for External sharing monitoring is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
@@ -362,135 +362,257 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 
 | Finding | Order | Outcome | First-match condition | Explanatory note |
 |---|---|---|---|---|
-| `SLACK-ID-01` | 1 | manual | `users_readable` does not equal true |  |
-| `SLACK-ID-01` | 2 | fail | `without_mfa_count` is greater than 0 |  |
-| `SLACK-ID-01` | 3 | warn | any of (`active_user_count` equals 0; `unknown_mfa_count` is greater than 0; `users_complete` does not equal true) |  |
-| `SLACK-ID-01` | 4 | pass | `active_user_count` is greater than 0 |  |
-| `SLACK-ID-01` | 5 | manual | always |  |
-| `SLACK-ID-02` | 1 | manual | `users_readable` does not equal true |  |
-| `SLACK-ID-02` | 2 | warn | any of (`guest_count` is greater than 0; `active_user_count` equals 0; `users_complete` does not equal true) |  |
-| `SLACK-ID-02` | 3 | pass | all of (`active_user_count` is greater than 0; `guest_count` equals 0) |  |
-| `SLACK-ID-02` | 4 | manual | always |  |
-| `SLACK-ID-03` | 1 | manual | `scim_readable` does not equal true |  |
-| `SLACK-ID-03` | 2 | fail | `scim_count` equals 0 |  |
-| `SLACK-ID-03` | 3 | warn | `scim_complete` does not equal true |  |
-| `SLACK-ID-03` | 4 | pass | `scim_count` is greater than 0 |  |
-| `SLACK-ID-03` | 5 | manual | always |  |
-| `SLACK-ID-04` | 1 | manual | any of (`users_readable` does not equal true; `scim_readable` does not equal true) |  |
-| `SLACK-ID-04` | 2 | fail | `mismatch_count` is greater than 0 |  |
-| `SLACK-ID-04` | 3 | warn | any of (`complete` does not equal true; `scim_user_count` equals 0) |  |
-| `SLACK-ID-04` | 4 | pass | `scim_user_count` is greater than 0 |  |
-| `SLACK-ID-04` | 5 | manual | always |  |
-| `SLACK-ID-05` | 1 | manual | `users_readable` does not equal true |  |
-| `SLACK-ID-05` | 2 | warn | any of (`users_complete` does not equal true; `human_user_count` equals 0) |  |
-| `SLACK-ID-05` | 3 | pass | `human_user_count` is greater than 0 |  |
-| `SLACK-ID-05` | 4 | manual | always |  |
-| `SLACK-ADMIN-01` | 1 | manual | any of (`teams_readable` does not equal true; `admin_inventory_count` equals 0) |  |
-| `SLACK-ADMIN-01` | 2 | fail | `excessive_admin_workspace_count` is greater than 0 |  |
-| `SLACK-ADMIN-01` | 3 | warn | `complete` does not equal true |  |
-| `SLACK-ADMIN-01` | 4 | pass | `admin_inventory_count` is greater than 0 |  |
-| `SLACK-ADMIN-01` | 5 | manual | always |  |
-| `SLACK-ADMIN-02` | 1 | manual | `users_readable` does not equal true |  |
-| `SLACK-ADMIN-02` | 2 | fail | `without_sso_count` is greater than 0 |  |
-| `SLACK-ADMIN-02` | 3 | warn | any of (`active_user_count` equals 0; `unknown_sso_count` is greater than 0; `users_complete` does not equal true) |  |
-| `SLACK-ADMIN-02` | 4 | pass | `active_user_count` is greater than 0 |  |
-| `SLACK-ADMIN-02` | 5 | manual | always |  |
-| `SLACK-ADMIN-03` | 1 | manual | any of (`session_readable` does not equal true; `duration_count` equals 0) |  |
-| `SLACK-ADMIN-03` | 2 | fail | `overlong_count` is greater than 0 |  |
-| `SLACK-ADMIN-03` | 3 | warn | `complete` does not equal true |  |
-| `SLACK-ADMIN-03` | 4 | pass | `duration_count` is greater than 0 |  |
-| `SLACK-ADMIN-03` | 5 | manual | always |  |
-| `SLACK-ADMIN-04` | 1 | manual | always |  |
-| `SLACK-ADMIN-05` | 1 | manual | any of (`teams_readable` does not equal true; `workspace_count` equals 0) |  |
-| `SLACK-ADMIN-05` | 2 | fail | `open_count` is greater than 0 |  |
-| `SLACK-ADMIN-05` | 3 | warn | any of (`unknown_count` is greater than 0; `teams_complete` does not equal true) |  |
-| `SLACK-ADMIN-05` | 4 | pass | `workspace_count` is greater than 0 |  |
-| `SLACK-ADMIN-05` | 5 | manual | always |  |
-| `SLACK-ADMIN-06` | 1 | manual | always |  |
-| `SLACK-ADMIN-07` | 1 | manual | any of (`teams_readable` does not equal true; `domain_count` equals 0) |  |
-| `SLACK-ADMIN-07` | 2 | fail | `unrestricted_count` is greater than 0 |  |
-| `SLACK-ADMIN-07` | 3 | warn | any of (`settings_error_count` is greater than 0; `teams_complete` does not equal true) |  |
-| `SLACK-ADMIN-07` | 4 | pass | `domain_count` is greater than 0 |  |
-| `SLACK-ADMIN-07` | 5 | manual | always |  |
-| `SLACK-ADMIN-08` | 1 | manual | any of (`emoji_readable` does not equal true; `emoji_count` equals 0; `roster_available` does not equal true) |  |
-| `SLACK-ADMIN-08` | 2 | fail | `non_admin_upload_count` is greater than 0 |  |
-| `SLACK-ADMIN-08` | 3 | warn | any of (`roster_complete` does not equal true; `emoji_complete` does not equal true) |  |
-| `SLACK-ADMIN-08` | 4 | pass | `emoji_count` is greater than 0 |  |
-| `SLACK-ADMIN-08` | 5 | manual | always |  |
-| `SLACK-ADMIN-09` | 1 | manual | always |  |
-| `SLACK-APP-01` | 1 | manual | `approved_readable` does not equal true |  |
-| `SLACK-APP-01` | 2 | warn | `approved_count` equals 0 |  |
-| `SLACK-APP-01` | 3 | warn | `approved_complete` does not equal true |  |
-| `SLACK-APP-01` | 4 | pass | `approved_count` is greater than 0 |  |
-| `SLACK-APP-01` | 5 | manual | always |  |
-| `SLACK-APP-02` | 1 | manual | `restricted_readable` does not equal true |  |
-| `SLACK-APP-02` | 2 | warn | `restricted_count` equals 0 |  |
-| `SLACK-APP-02` | 3 | warn | `restricted_complete` does not equal true |  |
-| `SLACK-APP-02` | 4 | pass | `restricted_count` is greater than 0 |  |
-| `SLACK-APP-02` | 5 | manual | always |  |
-| `SLACK-APP-03` | 1 | manual | `approved_readable` does not equal true |  |
-| `SLACK-APP-03` | 2 | warn | any of (`approved_count` equals 0; `flagged_count` is greater than 0; `approved_complete` does not equal true) |  |
-| `SLACK-APP-03` | 3 | pass | all of (`approved_count` is greater than 0; `flagged_count` equals 0) |  |
-| `SLACK-APP-03` | 4 | manual | always |  |
-| `SLACK-APP-04` | 1 | manual | `barrier_readable` does not equal true |  |
-| `SLACK-APP-04` | 2 | warn | `barrier_count` equals 0 |  |
-| `SLACK-APP-04` | 3 | warn | `barrier_complete` does not equal true |  |
-| `SLACK-APP-04` | 4 | pass | `barrier_count` is greater than 0 |  |
-| `SLACK-APP-04` | 5 | manual | always |  |
-| `SLACK-APP-05` | 1 | manual | always |  |
-| `SLACK-APP-06` | 1 | manual | any of (`preferences_readable` does not equal true; `setting_present` does not equal true) |  |
-| `SLACK-APP-06` | 2 | fail | `verdict` equals "fail" |  |
-| `SLACK-APP-06` | 3 | warn | any of (`verdict` does not equal "pass"; `coverage_complete` does not equal true) |  |
-| `SLACK-APP-06` | 4 | pass | `verdict` equals "pass" |  |
-| `SLACK-APP-06` | 5 | manual | always |  |
-| `SLACK-APP-07` | 1 | manual | always |  |
-| `SLACK-CHAN-01` | 1 | manual | `external_readable` does not equal true |  |
-| `SLACK-CHAN-01` | 2 | warn | `external_count` is greater than 0 |  |
-| `SLACK-CHAN-01` | 3 | warn | `external_complete` does not equal true |  |
-| `SLACK-CHAN-01` | 4 | pass | `external_count` equals 0 |  |
-| `SLACK-CHAN-01` | 5 | manual | always |  |
-| `SLACK-CHAN-02` | 1 | manual | any of (`channels_readable` does not equal true; `comparison_available` does not equal true) |  |
-| `SLACK-CHAN-02` | 2 | fail | `unrestricted_count` is greater than 0 |  |
-| `SLACK-CHAN-02` | 3 | warn | any of (`unknown_count` is greater than 0; `complete` does not equal true) |  |
-| `SLACK-CHAN-02` | 4 | pass | `unrestricted_count` equals 0 |  |
-| `SLACK-CHAN-02` | 5 | manual | always |  |
-| `SLACK-CHAN-03` | 1 | manual | any of (`channels_readable` does not equal true; `retention_available` does not equal true) |  |
-| `SLACK-CHAN-03` | 2 | fail | `short_retention_count` is greater than 0 |  |
-| `SLACK-CHAN-03` | 3 | warn | `complete` does not equal true |  |
-| `SLACK-CHAN-03` | 4 | pass | `short_retention_count` equals 0 |  |
-| `SLACK-CHAN-03` | 5 | manual | always |  |
-| `SLACK-CHAN-04` | 1 | manual | always |  |
-| `SLACK-CHAN-05` | 1 | manual | always |  |
-| `SLACK-MON-01` | 1 | manual | `audit_readable` does not equal true |  |
-| `SLACK-MON-01` | 2 | fail | `audit_count` equals 0 |  |
-| `SLACK-MON-01` | 3 | warn | `audit_complete` does not equal true |  |
-| `SLACK-MON-01` | 4 | pass | `audit_count` is greater than 0 |  |
-| `SLACK-MON-01` | 5 | manual | always |  |
-| `SLACK-MON-02` | 1 | manual | `audit_readable` does not equal true |  |
-| `SLACK-MON-02` | 2 | fail | `latest_age_days` is greater than 1 |  |
-| `SLACK-MON-02` | 3 | warn | any of (`latest_age_known` does not equal true; `audit_complete` does not equal true) |  |
-| `SLACK-MON-02` | 4 | pass | `latest_age_days` is at most 1 |  |
-| `SLACK-MON-02` | 5 | manual | always |  |
-| `SLACK-MON-03` | 1 | manual | `audit_readable` does not equal true |  |
-| `SLACK-MON-03` | 2 | warn | any of (`security_event_count` equals 0; `audit_complete` does not equal true) |  |
-| `SLACK-MON-03` | 3 | pass | `security_event_count` is greater than 0 |  |
-| `SLACK-MON-03` | 4 | manual | always |  |
-| `SLACK-MON-04` | 1 | manual | `schema_readable` does not equal true |  |
-| `SLACK-MON-04` | 2 | warn | `schema_count` equals 0 |  |
-| `SLACK-MON-04` | 3 | warn | `schema_complete` does not equal true |  |
-| `SLACK-MON-04` | 4 | pass | `schema_count` is greater than 0 |  |
-| `SLACK-MON-04` | 5 | manual | always |  |
-| `SLACK-MON-05` | 1 | manual | `audit_readable` does not equal true |  |
-| `SLACK-MON-05` | 2 | warn | any of (`external_event_count` equals 0; `audit_complete` does not equal true) |  |
-| `SLACK-MON-05` | 3 | pass | `external_event_count` is greater than 0 |  |
-| `SLACK-MON-05` | 4 | manual | always |  |
-| `SLACK-MON-06` | 1 | manual | always |  |
+| `SLACK-ID-01` | 1 | manual | `slack_id_01_branch_01_matches` equals true |  |
+| `SLACK-ID-01` | 2 | fail | `slack_id_01_branch_02_matches` equals true |  |
+| `SLACK-ID-01` | 3 | warn | `slack_id_01_branch_03_matches` equals true |  |
+| `SLACK-ID-01` | 4 | pass | `slack_id_01_branch_04_matches` equals true |  |
+| `SLACK-ID-01` | 5 | manual | `slack_id_01_branch_05_matches` equals true |  |
+| `SLACK-ID-02` | 1 | manual | `slack_id_02_branch_01_matches` equals true |  |
+| `SLACK-ID-02` | 2 | warn | `slack_id_02_branch_02_matches` equals true |  |
+| `SLACK-ID-02` | 3 | pass | `slack_id_02_branch_03_matches` equals true |  |
+| `SLACK-ID-02` | 4 | manual | `slack_id_02_branch_04_matches` equals true |  |
+| `SLACK-ID-03` | 1 | manual | `slack_id_03_branch_01_matches` equals true |  |
+| `SLACK-ID-03` | 2 | fail | `slack_id_03_branch_02_matches` equals true |  |
+| `SLACK-ID-03` | 3 | warn | `slack_id_03_branch_03_matches` equals true |  |
+| `SLACK-ID-03` | 4 | pass | `slack_id_03_branch_04_matches` equals true |  |
+| `SLACK-ID-03` | 5 | manual | `slack_id_03_branch_05_matches` equals true |  |
+| `SLACK-ID-04` | 1 | manual | `slack_id_04_branch_01_matches` equals true |  |
+| `SLACK-ID-04` | 2 | fail | `slack_id_04_branch_02_matches` equals true |  |
+| `SLACK-ID-04` | 3 | warn | `slack_id_04_branch_03_matches` equals true |  |
+| `SLACK-ID-04` | 4 | pass | `slack_id_04_branch_04_matches` equals true |  |
+| `SLACK-ID-04` | 5 | manual | `slack_id_04_branch_05_matches` equals true |  |
+| `SLACK-ID-05` | 1 | manual | `slack_id_05_branch_01_matches` equals true |  |
+| `SLACK-ID-05` | 2 | warn | `slack_id_05_branch_02_matches` equals true |  |
+| `SLACK-ID-05` | 3 | pass | `slack_id_05_branch_03_matches` equals true |  |
+| `SLACK-ID-05` | 4 | manual | `slack_id_05_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-01` | 1 | manual | `slack_admin_01_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-01` | 2 | fail | `slack_admin_01_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-01` | 3 | warn | `slack_admin_01_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-01` | 4 | pass | `slack_admin_01_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-01` | 5 | manual | `slack_admin_01_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-02` | 1 | manual | `slack_admin_02_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-02` | 2 | fail | `slack_admin_02_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-02` | 3 | warn | `slack_admin_02_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-02` | 4 | pass | `slack_admin_02_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-02` | 5 | manual | `slack_admin_02_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-03` | 1 | manual | `slack_admin_03_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-03` | 2 | fail | `slack_admin_03_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-03` | 3 | warn | `slack_admin_03_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-03` | 4 | pass | `slack_admin_03_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-03` | 5 | manual | `slack_admin_03_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-04` | 1 | manual | `slack_admin_04_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-05` | 1 | manual | `slack_admin_05_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-05` | 2 | fail | `slack_admin_05_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-05` | 3 | warn | `slack_admin_05_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-05` | 4 | pass | `slack_admin_05_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-05` | 5 | manual | `slack_admin_05_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-06` | 1 | manual | `slack_admin_06_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-07` | 1 | manual | `slack_admin_07_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-07` | 2 | fail | `slack_admin_07_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-07` | 3 | warn | `slack_admin_07_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-07` | 4 | pass | `slack_admin_07_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-07` | 5 | manual | `slack_admin_07_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-08` | 1 | manual | `slack_admin_08_branch_01_matches` equals true |  |
+| `SLACK-ADMIN-08` | 2 | fail | `slack_admin_08_branch_02_matches` equals true |  |
+| `SLACK-ADMIN-08` | 3 | warn | `slack_admin_08_branch_03_matches` equals true |  |
+| `SLACK-ADMIN-08` | 4 | pass | `slack_admin_08_branch_04_matches` equals true |  |
+| `SLACK-ADMIN-08` | 5 | manual | `slack_admin_08_branch_05_matches` equals true |  |
+| `SLACK-ADMIN-09` | 1 | manual | `slack_admin_09_branch_01_matches` equals true |  |
+| `SLACK-APP-01` | 1 | manual | `slack_app_01_branch_01_matches` equals true |  |
+| `SLACK-APP-01` | 2 | warn | `slack_app_01_branch_02_matches` equals true |  |
+| `SLACK-APP-01` | 3 | warn | `slack_app_01_branch_03_matches` equals true |  |
+| `SLACK-APP-01` | 4 | pass | `slack_app_01_branch_04_matches` equals true |  |
+| `SLACK-APP-01` | 5 | manual | `slack_app_01_branch_05_matches` equals true |  |
+| `SLACK-APP-02` | 1 | manual | `slack_app_02_branch_01_matches` equals true |  |
+| `SLACK-APP-02` | 2 | warn | `slack_app_02_branch_02_matches` equals true |  |
+| `SLACK-APP-02` | 3 | warn | `slack_app_02_branch_03_matches` equals true |  |
+| `SLACK-APP-02` | 4 | pass | `slack_app_02_branch_04_matches` equals true |  |
+| `SLACK-APP-02` | 5 | manual | `slack_app_02_branch_05_matches` equals true |  |
+| `SLACK-APP-03` | 1 | manual | `slack_app_03_branch_01_matches` equals true |  |
+| `SLACK-APP-03` | 2 | warn | `slack_app_03_branch_02_matches` equals true |  |
+| `SLACK-APP-03` | 3 | pass | `slack_app_03_branch_03_matches` equals true |  |
+| `SLACK-APP-03` | 4 | manual | `slack_app_03_branch_04_matches` equals true |  |
+| `SLACK-APP-04` | 1 | manual | `slack_app_04_branch_01_matches` equals true |  |
+| `SLACK-APP-04` | 2 | warn | `slack_app_04_branch_02_matches` equals true |  |
+| `SLACK-APP-04` | 3 | warn | `slack_app_04_branch_03_matches` equals true |  |
+| `SLACK-APP-04` | 4 | pass | `slack_app_04_branch_04_matches` equals true |  |
+| `SLACK-APP-04` | 5 | manual | `slack_app_04_branch_05_matches` equals true |  |
+| `SLACK-APP-05` | 1 | manual | `slack_app_05_branch_01_matches` equals true |  |
+| `SLACK-APP-06` | 1 | manual | `slack_app_06_branch_01_matches` equals true |  |
+| `SLACK-APP-06` | 2 | fail | `slack_app_06_branch_02_matches` equals true |  |
+| `SLACK-APP-06` | 3 | warn | `slack_app_06_branch_03_matches` equals true |  |
+| `SLACK-APP-06` | 4 | pass | `slack_app_06_branch_04_matches` equals true |  |
+| `SLACK-APP-06` | 5 | manual | `slack_app_06_branch_05_matches` equals true |  |
+| `SLACK-APP-07` | 1 | manual | `slack_app_07_branch_01_matches` equals true |  |
+| `SLACK-CHAN-01` | 1 | manual | `slack_chan_01_branch_01_matches` equals true |  |
+| `SLACK-CHAN-01` | 2 | warn | `slack_chan_01_branch_02_matches` equals true |  |
+| `SLACK-CHAN-01` | 3 | warn | `slack_chan_01_branch_03_matches` equals true |  |
+| `SLACK-CHAN-01` | 4 | pass | `slack_chan_01_branch_04_matches` equals true |  |
+| `SLACK-CHAN-01` | 5 | manual | `slack_chan_01_branch_05_matches` equals true |  |
+| `SLACK-CHAN-02` | 1 | manual | `slack_chan_02_branch_01_matches` equals true |  |
+| `SLACK-CHAN-02` | 2 | fail | `slack_chan_02_branch_02_matches` equals true |  |
+| `SLACK-CHAN-02` | 3 | warn | `slack_chan_02_branch_03_matches` equals true |  |
+| `SLACK-CHAN-02` | 4 | pass | `slack_chan_02_branch_04_matches` equals true |  |
+| `SLACK-CHAN-02` | 5 | manual | `slack_chan_02_branch_05_matches` equals true |  |
+| `SLACK-CHAN-03` | 1 | manual | `slack_chan_03_branch_01_matches` equals true |  |
+| `SLACK-CHAN-03` | 2 | fail | `slack_chan_03_branch_02_matches` equals true |  |
+| `SLACK-CHAN-03` | 3 | warn | `slack_chan_03_branch_03_matches` equals true |  |
+| `SLACK-CHAN-03` | 4 | pass | `slack_chan_03_branch_04_matches` equals true |  |
+| `SLACK-CHAN-03` | 5 | manual | `slack_chan_03_branch_05_matches` equals true |  |
+| `SLACK-CHAN-04` | 1 | manual | `slack_chan_04_branch_01_matches` equals true |  |
+| `SLACK-CHAN-05` | 1 | manual | `slack_chan_05_branch_01_matches` equals true |  |
+| `SLACK-MON-01` | 1 | manual | `slack_mon_01_branch_01_matches` equals true |  |
+| `SLACK-MON-01` | 2 | fail | `slack_mon_01_branch_02_matches` equals true |  |
+| `SLACK-MON-01` | 3 | warn | `slack_mon_01_branch_03_matches` equals true |  |
+| `SLACK-MON-01` | 4 | pass | `slack_mon_01_branch_04_matches` equals true |  |
+| `SLACK-MON-01` | 5 | manual | `slack_mon_01_branch_05_matches` equals true |  |
+| `SLACK-MON-02` | 1 | manual | `slack_mon_02_branch_01_matches` equals true |  |
+| `SLACK-MON-02` | 2 | fail | `slack_mon_02_branch_02_matches` equals true |  |
+| `SLACK-MON-02` | 3 | warn | `slack_mon_02_branch_03_matches` equals true |  |
+| `SLACK-MON-02` | 4 | pass | `slack_mon_02_branch_04_matches` equals true |  |
+| `SLACK-MON-02` | 5 | manual | `slack_mon_02_branch_05_matches` equals true |  |
+| `SLACK-MON-03` | 1 | manual | `slack_mon_03_branch_01_matches` equals true |  |
+| `SLACK-MON-03` | 2 | warn | `slack_mon_03_branch_02_matches` equals true |  |
+| `SLACK-MON-03` | 3 | pass | `slack_mon_03_branch_03_matches` equals true |  |
+| `SLACK-MON-03` | 4 | manual | `slack_mon_03_branch_04_matches` equals true |  |
+| `SLACK-MON-04` | 1 | manual | `slack_mon_04_branch_01_matches` equals true |  |
+| `SLACK-MON-04` | 2 | warn | `slack_mon_04_branch_02_matches` equals true |  |
+| `SLACK-MON-04` | 3 | warn | `slack_mon_04_branch_03_matches` equals true |  |
+| `SLACK-MON-04` | 4 | pass | `slack_mon_04_branch_04_matches` equals true |  |
+| `SLACK-MON-04` | 5 | manual | `slack_mon_04_branch_05_matches` equals true |  |
+| `SLACK-MON-05` | 1 | manual | `slack_mon_05_branch_01_matches` equals true |  |
+| `SLACK-MON-05` | 2 | warn | `slack_mon_05_branch_02_matches` equals true |  |
+| `SLACK-MON-05` | 3 | pass | `slack_mon_05_branch_03_matches` equals true |  |
+| `SLACK-MON-05` | 4 | manual | `slack_mon_05_branch_04_matches` equals true |  |
+| `SLACK-MON-06` | 1 | manual | `slack_mon_06_branch_01_matches` equals true |  |
 
 ### Derived decision facts
 
 | Finding | Input | Portable derivation |
 |---|---|---|
-| None |  |  |
+| `SLACK-ID-01` | `slack_id_01_branch_01_matches` | SLACK-ID-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ID-01` | `slack_id_01_branch_02_matches` | SLACK-ID-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `without_mfa_count` is greater than 0. |
+| `SLACK-ID-01` | `slack_id_01_branch_03_matches` | SLACK-ID-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`active_user_count` equals 0; `unknown_mfa_count` is greater than 0; `users_complete` does not equal true). |
+| `SLACK-ID-01` | `slack_id_01_branch_04_matches` | SLACK-ID-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `active_user_count` is greater than 0. |
+| `SLACK-ID-01` | `slack_id_01_branch_05_matches` | SLACK-ID-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-02` | `slack_id_02_branch_01_matches` | SLACK-ID-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ID-02` | `slack_id_02_branch_02_matches` | SLACK-ID-02 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`guest_count` is greater than 0; `active_user_count` equals 0; `users_complete` does not equal true). |
+| `SLACK-ID-02` | `slack_id_02_branch_03_matches` | SLACK-ID-02 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`active_user_count` is greater than 0; `guest_count` equals 0). |
+| `SLACK-ID-02` | `slack_id_02_branch_04_matches` | SLACK-ID-02 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-03` | `slack_id_03_branch_01_matches` | SLACK-ID-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `scim_readable` does not equal true. |
+| `SLACK-ID-03` | `slack_id_03_branch_02_matches` | SLACK-ID-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `scim_count` equals 0. |
+| `SLACK-ID-03` | `slack_id_03_branch_03_matches` | SLACK-ID-03 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `scim_complete` does not equal true. |
+| `SLACK-ID-03` | `slack_id_03_branch_04_matches` | SLACK-ID-03 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `scim_count` is greater than 0. |
+| `SLACK-ID-03` | `slack_id_03_branch_05_matches` | SLACK-ID-03 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-04` | `slack_id_04_branch_01_matches` | SLACK-ID-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`users_readable` does not equal true; `scim_readable` does not equal true). |
+| `SLACK-ID-04` | `slack_id_04_branch_02_matches` | SLACK-ID-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `mismatch_count` is greater than 0. |
+| `SLACK-ID-04` | `slack_id_04_branch_03_matches` | SLACK-ID-04 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `scim_user_count` equals 0). |
+| `SLACK-ID-04` | `slack_id_04_branch_04_matches` | SLACK-ID-04 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `scim_user_count` is greater than 0. |
+| `SLACK-ID-04` | `slack_id_04_branch_05_matches` | SLACK-ID-04 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ID-05` | `slack_id_05_branch_01_matches` | SLACK-ID-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ID-05` | `slack_id_05_branch_02_matches` | SLACK-ID-05 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`users_complete` does not equal true; `human_user_count` equals 0). |
+| `SLACK-ID-05` | `slack_id_05_branch_03_matches` | SLACK-ID-05 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `human_user_count` is greater than 0. |
+| `SLACK-ID-05` | `slack_id_05_branch_04_matches` | SLACK-ID-05 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_01_matches` | SLACK-ADMIN-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`teams_readable` does not equal true; `admin_inventory_count` equals 0). |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_02_matches` | SLACK-ADMIN-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `excessive_admin_workspace_count` is greater than 0. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_03_matches` | SLACK-ADMIN-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_04_matches` | SLACK-ADMIN-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `admin_inventory_count` is greater than 0. |
+| `SLACK-ADMIN-01` | `slack_admin_01_branch_05_matches` | SLACK-ADMIN-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_01_matches` | SLACK-ADMIN-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `users_readable` does not equal true. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_02_matches` | SLACK-ADMIN-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `without_sso_count` is greater than 0. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_03_matches` | SLACK-ADMIN-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`active_user_count` equals 0; `unknown_sso_count` is greater than 0; `users_complete` does not equal true). |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_04_matches` | SLACK-ADMIN-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `active_user_count` is greater than 0. |
+| `SLACK-ADMIN-02` | `slack_admin_02_branch_05_matches` | SLACK-ADMIN-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_01_matches` | SLACK-ADMIN-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`session_readable` does not equal true; `duration_count` equals 0). |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_02_matches` | SLACK-ADMIN-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `overlong_count` is greater than 0. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_03_matches` | SLACK-ADMIN-03 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_04_matches` | SLACK-ADMIN-03 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `duration_count` is greater than 0. |
+| `SLACK-ADMIN-03` | `slack_admin_03_branch_05_matches` | SLACK-ADMIN-03 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-04` | `slack_admin_04_branch_01_matches` | SLACK-ADMIN-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_01_matches` | SLACK-ADMIN-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`teams_readable` does not equal true; `workspace_count` equals 0). |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_02_matches` | SLACK-ADMIN-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `open_count` is greater than 0. |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_03_matches` | SLACK-ADMIN-05 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`unknown_count` is greater than 0; `teams_complete` does not equal true). |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_04_matches` | SLACK-ADMIN-05 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `workspace_count` is greater than 0. |
+| `SLACK-ADMIN-05` | `slack_admin_05_branch_05_matches` | SLACK-ADMIN-05 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-06` | `slack_admin_06_branch_01_matches` | SLACK-ADMIN-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_01_matches` | SLACK-ADMIN-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`teams_readable` does not equal true; `domain_count` equals 0). |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_02_matches` | SLACK-ADMIN-07 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `unrestricted_count` is greater than 0. |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_03_matches` | SLACK-ADMIN-07 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`settings_error_count` is greater than 0; `teams_complete` does not equal true). |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_04_matches` | SLACK-ADMIN-07 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `domain_count` is greater than 0. |
+| `SLACK-ADMIN-07` | `slack_admin_07_branch_05_matches` | SLACK-ADMIN-07 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_01_matches` | SLACK-ADMIN-08 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`emoji_readable` does not equal true; `emoji_count` equals 0; `admin_user_count` equals 0; `every_admin_list_unreadable` equals true). |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_02_matches` | SLACK-ADMIN-08 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `non_admin_upload_count` is greater than 0. |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_03_matches` | SLACK-ADMIN-08 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`roster_complete` does not equal true; `emoji_complete` does not equal true). |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_04_matches` | SLACK-ADMIN-08 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `emoji_count` is greater than 0. |
+| `SLACK-ADMIN-08` | `slack_admin_08_branch_05_matches` | SLACK-ADMIN-08 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-ADMIN-09` | `slack_admin_09_branch_01_matches` | SLACK-ADMIN-09 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-01` | `slack_app_01_branch_01_matches` | SLACK-APP-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `approved_readable` does not equal true. |
+| `SLACK-APP-01` | `slack_app_01_branch_02_matches` | SLACK-APP-01 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `approved_count` equals 0. |
+| `SLACK-APP-01` | `slack_app_01_branch_03_matches` | SLACK-APP-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `approved_complete` does not equal true. |
+| `SLACK-APP-01` | `slack_app_01_branch_04_matches` | SLACK-APP-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `approved_count` is greater than 0. |
+| `SLACK-APP-01` | `slack_app_01_branch_05_matches` | SLACK-APP-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-02` | `slack_app_02_branch_01_matches` | SLACK-APP-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `restricted_readable` does not equal true. |
+| `SLACK-APP-02` | `slack_app_02_branch_02_matches` | SLACK-APP-02 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `restricted_count` equals 0. |
+| `SLACK-APP-02` | `slack_app_02_branch_03_matches` | SLACK-APP-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `restricted_complete` does not equal true. |
+| `SLACK-APP-02` | `slack_app_02_branch_04_matches` | SLACK-APP-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `restricted_count` is greater than 0. |
+| `SLACK-APP-02` | `slack_app_02_branch_05_matches` | SLACK-APP-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-03` | `slack_app_03_branch_01_matches` | SLACK-APP-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `approved_readable` does not equal true. |
+| `SLACK-APP-03` | `slack_app_03_branch_02_matches` | SLACK-APP-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`approved_count` equals 0; `flagged_count` is greater than 0; `approved_complete` does not equal true). |
+| `SLACK-APP-03` | `slack_app_03_branch_03_matches` | SLACK-APP-03 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`approved_count` is greater than 0; `flagged_count` equals 0). |
+| `SLACK-APP-03` | `slack_app_03_branch_04_matches` | SLACK-APP-03 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-04` | `slack_app_04_branch_01_matches` | SLACK-APP-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `barrier_readable` does not equal true. |
+| `SLACK-APP-04` | `slack_app_04_branch_02_matches` | SLACK-APP-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `barrier_count` equals 0. |
+| `SLACK-APP-04` | `slack_app_04_branch_03_matches` | SLACK-APP-04 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `barrier_complete` does not equal true. |
+| `SLACK-APP-04` | `slack_app_04_branch_04_matches` | SLACK-APP-04 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `barrier_count` is greater than 0. |
+| `SLACK-APP-04` | `slack_app_04_branch_05_matches` | SLACK-APP-04 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-05` | `slack_app_05_branch_01_matches` | SLACK-APP-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-06` | `slack_app_06_branch_01_matches` | SLACK-APP-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`preferences_readable` does not equal true; not (`setting_value` is present and non-null)). |
+| `SLACK-APP-06` | `slack_app_06_branch_02_matches` | SLACK-APP-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `setting_value` equals "allow_all". |
+| `SLACK-APP-06` | `slack_app_06_branch_03_matches` | SLACK-APP-06 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`setting_value` equals "type:regular"; `coverage_complete` does not equal true; all of (`setting_value` does not equal "disallow_all"; `setting_value` does not equal "type:owner,type:admin")). |
+| `SLACK-APP-06` | `slack_app_06_branch_04_matches` | SLACK-APP-06 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: any of (`setting_value` equals "disallow_all"; `setting_value` equals "type:owner,type:admin"). |
+| `SLACK-APP-06` | `slack_app_06_branch_05_matches` | SLACK-APP-06 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-APP-07` | `slack_app_07_branch_01_matches` | SLACK-APP-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_01_matches` | SLACK-CHAN-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `external_readable` does not equal true. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_02_matches` | SLACK-CHAN-01 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `external_count` is greater than 0. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_03_matches` | SLACK-CHAN-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `external_complete` does not equal true. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_04_matches` | SLACK-CHAN-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `external_count` equals 0. |
+| `SLACK-CHAN-01` | `slack_chan_01_branch_05_matches` | SLACK-CHAN-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_01_matches` | SLACK-CHAN-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`channels_readable` does not equal true; `channel_count` equals 0; `announcement_channel_count` equals 0; `preference_count` equals 0). |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_02_matches` | SLACK-CHAN-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `unrestricted_count` is greater than 0. |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_03_matches` | SLACK-CHAN-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`unknown_count` is greater than 0; `complete` does not equal true). |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_04_matches` | SLACK-CHAN-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `unrestricted_count` equals 0. |
+| `SLACK-CHAN-02` | `slack_chan_02_branch_05_matches` | SLACK-CHAN-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_01_matches` | SLACK-CHAN-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`channels_readable` does not equal true; `retention_record_count` equals 0). |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_02_matches` | SLACK-CHAN-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `short_retention_count` is greater than 0. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_03_matches` | SLACK-CHAN-03 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_04_matches` | SLACK-CHAN-03 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `short_retention_count` equals 0. |
+| `SLACK-CHAN-03` | `slack_chan_03_branch_05_matches` | SLACK-CHAN-03 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-04` | `slack_chan_04_branch_01_matches` | SLACK-CHAN-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-CHAN-05` | `slack_chan_05_branch_01_matches` | SLACK-CHAN-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-01` | `slack_mon_01_branch_01_matches` | SLACK-MON-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-01` | `slack_mon_01_branch_02_matches` | SLACK-MON-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `audit_count` equals 0. |
+| `SLACK-MON-01` | `slack_mon_01_branch_03_matches` | SLACK-MON-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `audit_complete` does not equal true. |
+| `SLACK-MON-01` | `slack_mon_01_branch_04_matches` | SLACK-MON-01 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `audit_count` is greater than 0. |
+| `SLACK-MON-01` | `slack_mon_01_branch_05_matches` | SLACK-MON-01 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-02` | `slack_mon_02_branch_01_matches` | SLACK-MON-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-02` | `slack_mon_02_branch_02_matches` | SLACK-MON-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `latest_age_days` is greater than 1. |
+| `SLACK-MON-02` | `slack_mon_02_branch_03_matches` | SLACK-MON-02 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (not (`latest_age_days` is present and non-null); `audit_complete` does not equal true). |
+| `SLACK-MON-02` | `slack_mon_02_branch_04_matches` | SLACK-MON-02 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `latest_age_days` is at most 1. |
+| `SLACK-MON-02` | `slack_mon_02_branch_05_matches` | SLACK-MON-02 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-03` | `slack_mon_03_branch_01_matches` | SLACK-MON-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-03` | `slack_mon_03_branch_02_matches` | SLACK-MON-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`security_event_count` equals 0; `audit_complete` does not equal true). |
+| `SLACK-MON-03` | `slack_mon_03_branch_03_matches` | SLACK-MON-03 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `security_event_count` is greater than 0. |
+| `SLACK-MON-03` | `slack_mon_03_branch_04_matches` | SLACK-MON-03 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-04` | `slack_mon_04_branch_01_matches` | SLACK-MON-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `schema_readable` does not equal true. |
+| `SLACK-MON-04` | `slack_mon_04_branch_02_matches` | SLACK-MON-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `schema_count` equals 0. |
+| `SLACK-MON-04` | `slack_mon_04_branch_03_matches` | SLACK-MON-04 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `schema_complete` does not equal true. |
+| `SLACK-MON-04` | `slack_mon_04_branch_04_matches` | SLACK-MON-04 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: `schema_count` is greater than 0. |
+| `SLACK-MON-04` | `slack_mon_04_branch_05_matches` | SLACK-MON-04 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-05` | `slack_mon_05_branch_01_matches` | SLACK-MON-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `audit_readable` does not equal true. |
+| `SLACK-MON-05` | `slack_mon_05_branch_02_matches` | SLACK-MON-05 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`external_event_count` equals 0; `audit_complete` does not equal true). |
+| `SLACK-MON-05` | `slack_mon_05_branch_03_matches` | SLACK-MON-05 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `external_event_count` is greater than 0. |
+| `SLACK-MON-05` | `slack_mon_05_branch_04_matches` | SLACK-MON-05 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `SLACK-MON-06` | `slack_mon_06_branch_01_matches` | SLACK-MON-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 
 ### Criterion constants
 

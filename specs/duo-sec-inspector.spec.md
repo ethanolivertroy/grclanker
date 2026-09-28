@@ -115,16 +115,15 @@ Supported modes:
 Credential precedence, highest first:
 
 1. Explicit tool arguments
-2. Explicit config file
-3. DUO_* environment variables
+2. DUO_* environment variables
 
-Environment variables: `DUO_IKEY`, `DUO_SKEY`, `DUO_API_HOSTNAME`, `DUO_CONFIG_FILE`
+Environment variables: `DUO_API_HOST`, `DUO_IKEY`, `DUO_SKEY`, `DUO_LOOKBACK_DAYS`
 
-Configuration locations: Explicit JSON or YAML config file
+Configuration locations: (none)
 
-Credential and deployment variants: Commercial and FedRAMP Duo API hostnames selected by api_hostname
+Credential and deployment variants: Commercial and FedRAMP Duo API hostnames selected by api_host
 
-Configuration fields: `integrationKey`, `secretKey`, `apiHostname`, `timeoutMs`
+Configuration fields: None
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 

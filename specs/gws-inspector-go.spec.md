@@ -136,21 +136,20 @@ This specification requires [shared integration contract version 1.1](./integrat
 Supported modes:
 
 - Service-account JWT assertion with domain-wide delegation
-- Explicit access tokens for directory/reporting and Cloud Identity policy reads
+- Explicit OAuth access token
 
 Credential precedence, highest first:
 
-1. Explicit tool arguments and tokens
-2. Explicit service-account JSON
-3. GOOGLE_* and GWS_* environment variables
+1. Explicit tool arguments
+2. GWS_* and GOOGLE_APPLICATION_CREDENTIALS environment variables
 
-Environment variables: `GOOGLE_APPLICATION_CREDENTIALS`, `GWS_SERVICE_ACCOUNT_FILE`, `GWS_ADMIN_EMAIL`, `GWS_CUSTOMER_ID`, `GWS_ACCESS_TOKEN`, `GWS_POLICY_ACCESS_TOKEN`
+Environment variables: `GWS_AUTH_MODE`, `GWS_CREDENTIALS_FILE`, `GWS_SERVICE_ACCOUNT_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`, `GWS_CREDENTIALS_JSON`, `GWS_SERVICE_ACCOUNT_JSON`, `GWS_ACCESS_TOKEN`, `GWS_ADMIN_EMAIL`, `GWS_DOMAIN`, `GWS_CUSTOMER_ID`, `GWS_LOOKBACK_DAYS`
 
-Configuration locations: Service-account JSON supplied by path
+Configuration locations: Service-account credential JSON supplied explicitly by credentials_file
 
-Credential and deployment variants: my_customer alias or explicit customer ID, Separate delegated subject and Cloud Identity policy token
+Credential and deployment variants: my_customer alias or explicit customer ID, Delegated administrator subject for service-account authentication
 
-Configuration fields: `client_email`, `private_key`, `private_key_id`, `adminEmail`, `customerId`, `accessToken`, `policyAccessToken`
+Configuration fields: `client_email`, `private_key`, `token_uri`
 
 Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 

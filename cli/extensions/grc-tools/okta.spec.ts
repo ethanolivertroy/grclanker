@@ -520,7 +520,7 @@ const byOwner = (name: string): string[] => checks.filter((check) => check.owner
 export const OKTA_RUNTIME_BEHAVIOR = [
   "Generic list truncation metadata is not complete for every Okta collection; the runtime still prevents pass when a dependent inventory is known partial, but some cap exits have less-specific prose.",
   "Administrator notification preferences have no shipped read implementation; OKTA-MON-009 remains manual and names Admin Console evidence.",
-  "The generated rule input records the existing evidence-specific verdict after complete-cardinality calculations; this migration does not alter thresholds, sampling, text, or finding ordering.",
+  "Every automated finding passes raw collector facts and complete source cardinalities through the same ordered executable rules rendered below; exported record samples do not decide verdicts.",
 ] as const;
 
 export const OKTA_SPEC = buildBatchIntegrationSpec({
