@@ -2992,6 +2992,14 @@ test("Datadog truncation remediation only names limit arguments exposed by each 
   assert.ok(registered.every((tool) => !("org_connection_limit" in tool.parameters.properties)));
 });
 
+test("Datadog guide documents manual remediation for fixed-cap inventories", () => {
+  const guide = readFileSync(join(import.meta.dirname, "..", "..", "src", "content", "docs", "docs", "integrations", "datadog.md"), "utf8");
+
+  assert.match(guide, /Shared dashboards use a fixed collector cap of 2,000 and org connections use a fixed collector cap of 10,000/);
+  assert.match(guide, /inspect the full inventory manually in Dashboards > Shared Dashboards or Organization Settings > Org Connections/);
+  assert.doesNotMatch(guide, /dashboard_limit|org_connection_limit|raise (?:the )?(?:dashboard|org connection) limit/);
+});
+
 // ---------------------------------------------------------------------------------------------------------------
 // Addenda 2, 3, and 5. The fixtures below drive the real DatadogApiClient through an HTTP router that records every
 // request it served, so the status codes and endpoints named in the output can be checked against the requests the
