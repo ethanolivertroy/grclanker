@@ -4217,7 +4217,7 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
   const currentUserSurface = await probeSurface({
     name: "current_user",
     endpoint: "/accounts/api/me",
-    permission: "Any authenticated principal (profile scope)",
+    permission: "Connected Apps: profile (implicit for client_credentials)",
     load: async () => {
       currentUser = scrubDataStrings(await client.getCurrentUser());
       return currentUser;
@@ -4244,31 +4244,31 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
 
   const surfaces: MulesoftAccessSurface[] = [
     currentUserSurface,
-    await probeSurface({ name: "organization", endpoint: orgPath, permission: "Access Management: View Organization", load: () => client.getOrganization(), count: () => 1 }),
-    await probeSurface({ name: "identity_providers", endpoint: `${orgPath}/identityProviders`, permission: "Access Management: Organization Administrator (identity provider settings)", load: () => client.listIdentityProviders(), count: countItems }),
-    await probeSurface({ name: "members", endpoint: `${orgPath}/members`, permission: "Access Management: View Users", load: () => client.listMembers(100), count: countItems }),
-    await probeSurface({ name: "mfa_exempt_users", endpoint: `${orgPath}/users?mfaVerificationExcluded=true`, permission: "Access Management: View Users", load: () => client.listMfaExemptUsers(100), count: countItems }),
-    await probeSurface({ name: "role_groups", endpoint: `${orgPath}/rolegroups`, permission: "Access Management: View Role Groups", load: () => client.listRoleGroups(), count: countItems }),
-    await probeSurface({ name: "environments", endpoint: `${orgPath}/environments`, permission: "Access Management: View Environment", load: () => client.listEnvironments(), count: countItems }),
-    await probeSurface({ name: "connected_applications", endpoint: `${orgPath}/connectedApplications`, permission: "Access Management: View Connected Applications", load: () => client.listConnectedApplications(100), count: countItems }),
-    await probeSurface({ name: "organization_hierarchy", endpoint: `${orgPath}/hierarchy`, permission: "Access Management: View Organization", load: () => client.getOrganizationHierarchy(), count: () => 1 }),
-    await environmentSurface("api_manager_apis", `/apimanager/api/v1/organizations/${config.organizationId}/environments/{envId}/apis`, "API Manager: View APIs Configuration", (id) => client.listManagedApis(id, 50)),
-    await probeSurface({ name: "exchange_assets", endpoint: "/exchange/api/v2/assets/search", permission: "Exchange: Exchange Viewer", load: () => client.listExchangeAssets(50), count: countItems }),
-    await environmentSurface("cloudhub_applications", "/cloudhub/api/v2/applications (X-ANYPNT-ENV-ID {envId})", "Runtime Manager: Read Applications", (id) => client.listCloudhubApplications(id)),
-    await environmentSurface("cloudhub_alerts", "/cloudhub/api/v2/alerts (X-ANYPNT-ENV-ID {envId})", "Runtime Manager: Read Alerts", (id) => client.listCloudhubAlerts(id)),
-    await probeSurface({ name: "vpcs", endpoint: `/cloudhub/api/organizations/${config.organizationId}/vpcs`, permission: "CloudHub Network: CloudHub Network Viewer", load: () => client.listVpcs(), count: countItems }),
-    await probeSurface({ name: "load_balancers", endpoint: `/cloudhub/api/organizations/${config.organizationId}/loadbalancers`, permission: "CloudHub Network: CloudHub Network Viewer", load: () => client.listLoadBalancers(), count: countItems }),
-    await environmentSurface("hybrid_servers", "/hybrid/api/v1/servers (X-ANYPNT-ENV-ID {envId})", "Runtime Manager: Read Servers", (id) => client.listHybridServers(id)),
-    await probeSurface({ name: "audit_platforms", endpoint: `/audit/v2/organizations/${config.organizationId}/platforms`, permission: "Audit Log: Audit Log Viewer", load: () => client.listAuditPlatforms(), count: countItems }),
+    await probeSurface({ name: "organization", endpoint: orgPath, permission: "Access Management: View Organization (`read:organization`)", load: () => client.getOrganization(), count: () => 1 }),
+    await probeSurface({ name: "identity_providers", endpoint: `${orgPath}/identityProviders`, permission: "Access Management connected-app scope `view:identityproviders`", load: () => client.listIdentityProviders(), count: countItems }),
+    await probeSurface({ name: "members", endpoint: `${orgPath}/members`, permission: "Access Management connected-app scope `read:orgusers`", load: () => client.listMembers(100), count: countItems }),
+    await probeSurface({ name: "mfa_exempt_users", endpoint: `${orgPath}/users?mfaVerificationExcluded=true`, permission: "Access Management connected-app scope `read:orgusers`", load: () => client.listMfaExemptUsers(100), count: countItems }),
+    await probeSurface({ name: "role_groups", endpoint: `${orgPath}/rolegroups`, permission: "Connected Apps: Read-only full access (`read:full`; no narrower public role-group scope is documented)", load: () => client.listRoleGroups(), count: countItems }),
+    await probeSurface({ name: "environments", endpoint: `${orgPath}/environments`, permission: "Access Management: View Environment (`read:orgenvironments`; `view:environment`)", load: () => client.listEnvironments(), count: countItems }),
+    await probeSurface({ name: "connected_applications", endpoint: `${orgPath}/connectedApplications`, permission: "Access Management connected-app scope `read:orgconnapps`", load: () => client.listConnectedApplications(100), count: countItems }),
+    await probeSurface({ name: "organization_hierarchy", endpoint: `${orgPath}/hierarchy`, permission: "Access Management: View Organization (`read:organization`)", load: () => client.getOrganizationHierarchy(), count: () => 1 }),
+    await environmentSurface("api_manager_apis", `/apimanager/api/v1/organizations/${config.organizationId}/environments/{envId}/apis`, "API Manager: View APIs Configuration (`read:api_configuration`)", (id) => client.listManagedApis(id, 50)),
+    await probeSurface({ name: "exchange_assets", endpoint: "/exchange/api/v2/assets/search", permission: "Exchange: Exchange Viewer (`read:exchange`)", load: () => client.listExchangeAssets(50), count: countItems }),
+    await environmentSurface("cloudhub_applications", "/cloudhub/api/v2/applications (X-ANYPNT-ENV-ID {envId})", "Runtime Manager: Read Applications (`read:applications`)", (id) => client.listCloudhubApplications(id)),
+    await environmentSurface("cloudhub_alerts", "/cloudhub/api/v2/alerts (X-ANYPNT-ENV-ID {envId})", "Runtime Manager: Read Alerts (`read:application_alerts`)", (id) => client.listCloudhubAlerts(id)),
+    await probeSurface({ name: "vpcs", endpoint: `/cloudhub/api/organizations/${config.organizationId}/vpcs`, permission: "Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`)", load: () => client.listVpcs(), count: countItems }),
+    await probeSurface({ name: "load_balancers", endpoint: `/cloudhub/api/organizations/${config.organizationId}/loadbalancers`, permission: "Runtime Manager: CloudHub Network Viewer (`read:cloudhub_networking`)", load: () => client.listLoadBalancers(), count: countItems }),
+    await environmentSurface("hybrid_servers", "/hybrid/api/v1/servers (X-ANYPNT-ENV-ID {envId})", "Runtime Manager: Read Servers (`read:servers`)", (id) => client.listHybridServers(id)),
+    await probeSurface({ name: "audit_platforms", endpoint: `/audit/v2/organizations/${config.organizationId}/platforms`, permission: "Access Management: Audit Log Viewer (`read:audit_logs`)", load: () => client.listAuditPlatforms(), count: countItems }),
     await probeSurface({
       name: "audit_query",
       endpoint: `/audit/v2/organizations/${config.organizationId}/query`,
-      permission: "Audit Log: Audit Log Viewer",
+      permission: "Access Management: Audit Log Viewer (`read:audit_logs`)",
       load: () => client.queryAuditLogs({ startDate: new Date(Date.now() - DAY_MS).toISOString(), limit: 1 }),
       count: (value) => extractCollection(value).length,
     }),
-    await environmentSurface("mq_regions", `/mq/admin/api/v1/organizations/${config.organizationId}/environments/{envId}/regions`, "Anypoint MQ: MQ Viewer", (id) => client.listMqRegions(id)),
-    await environmentSurface("secret_groups", `/secrets-manager/api/v1/organizations/${config.organizationId}/environments/{envId}/secretGroups`, "Secrets Manager: Read Secret Groups", (id) => client.listSecretGroups(id)),
+    await environmentSurface("mq_regions", `/mq/admin/api/v1/organizations/${config.organizationId}/environments/{envId}/regions`, "Anypoint MQ: View destinations (`view:destinations`)", (id) => client.listMqRegions(id)),
+    await environmentSurface("secret_groups", `/secrets-manager/api/v1/organizations/${config.organizationId}/environments/{envId}/secretGroups`, "Secrets Manager: Read secrets metadata (`read:secrets_metadata`)", (id) => client.listSecretGroups(id)),
   ];
 
   const readable = surfaces.filter((surface) => surface.status === "readable");
@@ -4304,7 +4304,7 @@ export async function checkMulesoftAccess(client: AccessClient): Promise<Mulesof
       status === "healthy"
         ? "Run mulesoft_assess_identity_access, mulesoft_assess_api_gateway, mulesoft_assess_runtime_infrastructure, mulesoft_assess_audit_monitoring, or mulesoft_export_audit_bundle."
         : missingPermissions.length > 0
-          ? `Grant the connected app or user these read permissions and retry: ${missingPermissions.join("; ")}.`
+          ? `Add these documented connected-app scopes or permissions, then retry: ${missingPermissions.join("; ")}.`
           : "Confirm the organization ID, control plane, and credentials, then retry.",
   };
 }
