@@ -183,9 +183,13 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     inputs: input("policy_readable", "has_webauthn", "allows_push", "requires_verified_push", "supporting_strong_method_count"),
     rules: ordered({
       manual: ne("policy_readable", true),
-      warn: any(eq("allows_push", true), gt("supporting_strong_method_count", 0)),
+      warn: all(
+        eq("has_webauthn", false),
+        { op: "not", condition: all(eq("allows_push", true), eq("requires_verified_push", true)) },
+        any(eq("allows_push", true), gt("supporting_strong_method_count", 0)),
+      ),
       pass: any(eq("has_webauthn", true), all(eq("allows_push", true), eq("requires_verified_push", true))),
-      fail: { op: "always" },
+      fail: all(eq("has_webauthn", false), eq("allows_push", false), eq("supporting_strong_method_count", 0)),
     }),
   },
   "DUO-AUTH-002": {
@@ -244,7 +248,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       ),
       warn: any(incomplete, ne("settings_readable", true), gt("bypass_code_count", 0), gt("undated_code_count", 0)),
       pass: eq("bypass_code_count", 0),
-      failFirst: true,
     }),
   },
   "DUO-AUTH-007": {
@@ -267,7 +270,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       ),
       warn: any(incomplete, gt("unenrolled_user_count", 0)),
       pass: all(eq("bypass_user_count", 0), eq("unenrolled_user_count", 0)),
-      failFirst: true,
     }),
   },
   "DUO-AUTH-009": {
@@ -278,7 +280,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       fail: gt("inactive_percent", 10),
       warn: any(incomplete, gt("inactive_user_count", 0), gt("undated_user_count", 0)),
       pass: all(eq("inactive_user_count", 0), eq("undated_user_count", 0)),
-      failFirst: true,
     }),
   },
   "DUO-AUTH-010": {
@@ -289,7 +290,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       fail: eq("webauthn_user_count", 0),
       warn: any(incomplete, { op: "lt", left: path("adoption_percent"), right: value(75) }, gt("deprecated_u2f_user_count", 0)),
       pass: all(gte("adoption_percent", 75), eq("deprecated_u2f_user_count", 0)),
-      failFirst: true,
     }),
   },
   "DUO-AUTH-011": {
@@ -337,7 +337,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       fail: eq("stale_at_least_one_third", true),
       warn: any(incomplete, gt("stale_admin_count", 0), gt("undated_admin_count", 0)),
       pass: all(eq("stale_admin_count", 0), eq("undated_admin_count", 0)),
-      failFirst: true,
     }),
   },
   "DUO-ADMIN-005": {
@@ -374,7 +373,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
         right: path("applicable_integration_count"),
       }),
       pass: { op: "eq", left: path("universal_prompt_count"), right: path("applicable_integration_count") },
-      failFirst: true,
     }),
   },
   "DUO-INTEGRATIONS-003": {
@@ -388,7 +386,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       }),
       warn: any(incomplete, eq("protected_integration_count", 0), gt("self_service_enabled_count", 0)),
       pass: all(gt("field_exposed_count", 0), eq("self_service_enabled_count", 0)),
-      failFirst: true,
     }),
   },
   "DUO-INTEGRATIONS-004": {
@@ -402,7 +399,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       }),
       warn: any(incomplete, eq("admin_api_count", 0), gt("overprivileged_admin_api_count", 0)),
       pass: all(gt("admin_api_count", 0), eq("overprivileged_admin_api_count", 0)),
-      failFirst: true,
     }),
   },
   "DUO-INTEGRATIONS-005": {
@@ -416,7 +412,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       },
       warn: any(incomplete, gt("tagged_without_policy_count", 0)),
       pass: eq("tagged_without_policy_count", 0),
-      failFirst: true,
     }),
   },
   "DUO-INTEGRATIONS-006": {
@@ -453,7 +448,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       fail: all(gt("telephony_event_count", 0), { op: "lt", left: path("credits_remaining"), right: value(25) }),
       warn: any(incomplete, gt("telephony_event_count", 0), { op: "lt", left: path("credits_remaining"), right: value(100) }),
       pass: gte("credits_remaining", 100),
-      failFirst: true,
     }),
   },
   "DUO-MON-004": {
@@ -477,7 +471,6 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
       fail: gt("impossible_travel_count", 0),
       warn: any(incomplete, all(eq("attempt_count", 0), eq("event_count", 0)), gt("fraud_count", 0), gt("denied_percent", 20)),
       pass: { op: "always" },
-      failFirst: true,
     }),
   },
 };
