@@ -234,7 +234,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       enabled_notification_count: "enabled administrator notifications",
     };
     const booleans: Readonly<Record<string, string>> = {
-      readable: "the check's required Duo response was collected and parseable", complete: "all check-specific pages and child reads completed",
+      readable: "the check's required Duo response was collected and parseable", complete: "defined by this check's structured completeness contract",
       settings_readable: "Duo authentication settings were returned", allows_push: "push is enabled", requires_verified_push: "verified push is required", has_webauthn: "WebAuthn is enabled",
       sms_enabled: "SMS authentication is enabled", voice_enabled: "voice authentication is enabled", policy_readable: "Duo policies were returned",
       helpdesk_bypass: "help-desk administrators may issue bypass codes", attempts_readable: "authentication attempts were returned", logs_readable: "the required Duo log was returned",

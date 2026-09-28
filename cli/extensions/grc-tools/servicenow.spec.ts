@@ -238,7 +238,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     unverified_count: "certificates with unknown validity",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the required table, aggregate, or property response was returned", complete: "all check-specific pages, totals, and child reads completed",
+    readable: "the required table, aggregate, or property response was returned", complete: "defined by this check's structured completeness contract",
     role_aggregate_readable: "the role aggregate was returned", role_total_known: "role total is reported or pagination exhausted", providers_complete: "all provider pages completed",
     plugin_present: "the named plugin has a visible record", plugin_active_value: "the named plugin is active", plugin_inventory_complete: "all plugin pages completed",
     password_policy_property_present: "glide.enable.password_policy has a visible row", platform_property_present: "the required platform property has a visible row",

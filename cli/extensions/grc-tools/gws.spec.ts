@@ -208,7 +208,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
     };
     const booleans: Readonly<Record<string, string>> = {
       readable: "the check's required Workspace response was collected and parseable",
-      complete: "all check-specific pages and required per-user reads completed without truncation or denied child reads",
+      complete: "defined by this check's structured completeness contract",
       directory_readable: "directory users and role assignments were returned and parseable",
       users_readable: "directory users were returned and parseable",
     };

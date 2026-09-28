@@ -171,7 +171,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       anomaly_event_count: "Shield alert or block events", access_event_count: "ordinary content-access events",
     };
     const booleans: Readonly<Record<string, string>> = {
-      readable: "the check's required Box response was collected and parseable", complete: "all check-specific pages and child reads completed",
+      readable: "the check's required Box response was collected and parseable", complete: "defined by this check's structured completeness contract",
       settings_readable: "the relevant enterprise configuration category was present and parseable", sso_required: "enterprise sign-in requires SSO", sso_testing: "SSO remains in testing mode",
       users_readable: "the enterprise user inventory was returned and parseable", mfa_required: "enterprise configuration requires MFA", users_truncated: "the user inventory stopped before exhaustion",
       allowlist_readable: "allowlist entries were returned and parseable", config_readable: "collaboration configuration was returned and parseable",

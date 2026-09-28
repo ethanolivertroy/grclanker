@@ -143,7 +143,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     region_count: "enabled data-center regions",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the check's required Zoom response was returned", complete: "all check-specific pages and child reads completed",
+    readable: "the check's required Zoom response was returned", complete: "defined by this check's structured completeness contract",
     settings_readable: "the required account settings category was returned", setting_present: "the named account setting exists",
     roles_readable: "roles and members were returned", roles_complete: "all role and member pages completed", member_read_denied: "a role-member read was denied",
     client_setting_present: "the desktop timeout exists", web_setting_present: "the web timeout exists", cloud_recording_present: "cloud recording exists",

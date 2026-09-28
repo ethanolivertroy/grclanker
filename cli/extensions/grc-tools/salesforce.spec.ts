@@ -145,7 +145,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     warning_count: "certificates in warning window", disabled_count: "session-CSRF flags set false",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the required query or metadata response was returned", complete: "all check-specific pages and metadata reads completed",
+    readable: "the required query or metadata response was returned", complete: "defined by this check's structured completeness contract",
     health_readable: "Security Health Check summary was returned", score_present: "Health Check contains a numeric score", risks_readable: "Health Check risks were returned",
     risks_complete: "all risk pages completed", settings_readable: "required organization settings were returned", required_fields_present: "every required settings field exists",
     force_logout: "sessions force logout on timeout", lock_to_ip: "sessions are locked to originating IP", security_settings_readable: "security settings were returned",

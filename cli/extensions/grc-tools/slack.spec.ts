@@ -199,7 +199,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       unknown_count: "records whose required classification is unknown", domain_count: "distinct verified or allowed domains",
     };
     const booleans: Readonly<Record<string, string>> = {
-      complete: "all check-specific pages and workspace child reads completed", users_readable: "user rosters were returned", users_complete: "all roster pages completed",
+      complete: "defined by this check's structured completeness contract", users_readable: "user rosters were returned", users_complete: "defined by this check's structured completeness contract",
       teams_readable: "Grid workspaces were returned", teams_complete: "all workspace pages completed", every_admin_list_unreadable: "no workspace admin roster was readable",
       channels_readable: "channels were returned", external_readable: "external-collaboration records were returned", external_complete: "all external pages completed",
       approved_readable: "approved applications were returned", approved_complete: "all approved-app pages completed", scim_readable: "SCIM users were returned",

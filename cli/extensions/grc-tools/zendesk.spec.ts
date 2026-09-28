@@ -187,7 +187,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     rule_count: "triggers and automations", insecure_destination_count: "external destinations with insecure transport or missing auth", external_action_count: "actions sending data externally",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the check's required Zendesk response was returned", complete: "all check-specific pages and child reads completed",
+    readable: "the check's required Zendesk response was returned", complete: "defined by this check's structured completeness contract",
     credential_is_admin: "the authenticated principal is an administrator", fields_present: "all required account fields exist", enforce_sso: "SSO enforcement is enabled",
     zendesk_login: "native Zendesk login remains enabled", team_readable: "agent and administrator users were returned", security_readable: "security settings were returned",
     two_factor_enforce_present: "the two-factor enforcement field exists", two_factor_enforce_value: "two-factor enforcement is enabled",
