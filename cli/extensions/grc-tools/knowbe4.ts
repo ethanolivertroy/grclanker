@@ -2252,6 +2252,16 @@ type Knowbe4FindingWithFacts = Knowbe4Finding & {
   [KNOWBE4_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
 };
 
+type Knowbe4DecisionInput = Batch3RuntimeFactValues | Readonly<Record<string, unknown>>;
+
+function isBatch3RuntimeFactValues(value: Knowbe4DecisionInput): value is Batch3RuntimeFactValues {
+  return typeof value.readable === "boolean"
+    && typeof value.complete === "boolean"
+    && (typeof value.population === "number" || value.population === null)
+    && (typeof value.failureMatches === "number" || value.failureMatches === null)
+    && (typeof value.reviewMatches === "number" || value.reviewMatches === null);
+}
+
 function knowbe4EvidenceCount(evidence: JsonRecord, name: string): number {
   const value = evidence[name];
   if (Array.isArray(value)) return value.length;
@@ -2301,7 +2311,13 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const late = value("late_or_missing_enrollments") ?? value("late_or_missing_enrollments_among_read_users");
       const complete = late !== undefined;
       const latePct = value("late_pct") ?? (complete && inventory > 0 ? ((late ?? 0) / inventory) * 100 : 0);
-      return fact(inventory, complete && latePct > 5 ? late : 0, !complete || (late ?? 0) > 0 ? Math.max(1, late ?? 0) : 0, complete);
+      return {
+        knowbe4_04_user_and_enrollment_reads_succeeded: true,
+        knowbe4_04_user_and_enrollment_lists_complete: complete,
+        knowbe4_04_new_user_count: inventory,
+        knowbe4_04_late_or_missing_enrollment_count: late ?? 0,
+        knowbe4_04_late_enrollment_percent: complete ? latePct : null,
+      };
     }
     case "KNOWBE4-05":
       return fact(value("users_scored") ?? value("users_scored_read") ?? 0, (value("mean_risk_score") ?? 0) > (value("max_mean_risk_score") ?? 0) ? 1 : 0, value("mean_risk_score") === undefined || (value("stddev_risk_score") ?? 0) > (value("max_risk_score_stddev") ?? 0) ? 1 : 0);
@@ -2312,7 +2328,12 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "KNOWBE4-07": {
       const delta = value("delta_points");
-      return fact(value("security_tests_considered") ?? 0, delta !== undefined && delta > 5 ? 1 : 0, delta === undefined || delta > 0 ? 1 : 0);
+      return {
+        knowbe4_07_test_reads_succeeded: true,
+        knowbe4_07_test_and_recipient_lists_complete: true,
+        knowbe4_07_security_tests_compared: value("security_tests_considered") ?? 0,
+        knowbe4_07_failure_rate_delta_points: delta ?? null,
+      };
     }
     case "KNOWBE4-08":
       return fact(value("active_groups") ?? value("active_groups_read") ?? 0, observedViolation, (value("active_groups") ?? value("active_groups_read") ?? 0) === 0 || evidence.groups_missing_phishing === null || evidence.groups_missing_training === null ? 1 : 0);
@@ -2330,12 +2351,13 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const unsampled = value("unsampled_security_tests") ?? 0;
       const noRemediationDue = value("failed_users_in_sampled_tests") === 0 && unsampled === 0;
       const complete = noRemediationDue || (pct !== undefined && unsampled === 0);
-      const reviewCount = noRemediationDue
-        ? 0
-        : pct === undefined || pct < 90
-          ? Math.max(1, observedViolation)
-          : 0;
-      return fact(inventory, observedViolation > 0 && pct !== undefined && pct < 50 ? observedViolation : 0, reviewCount, complete);
+      return {
+        knowbe4_10_remediation_reads_succeeded: true,
+        knowbe4_10_recipient_and_enrollment_reads_complete: complete,
+        knowbe4_10_failed_user_count: Math.max(evaluated, observedViolation),
+        knowbe4_10_remediated_percent: pct ?? null,
+        knowbe4_10_no_remediation_due: noRemediationDue,
+      };
     }
     case "KNOWBE4-11":
       return fact(value("modules_reviewed") ?? 0, count("retired_modules"), count("stale_modules", "undated_module_count"));
@@ -2370,7 +2392,14 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "KNOWBE4-19": {
       const rate = value("report_rate_pct");
       const minimum = value("min_report_rate_pct") ?? 0;
-      return fact(value("delivered_count") ?? 0, rate !== undefined && rate < minimum / 2 ? 1 : 0, rate === undefined || rate < minimum ? 1 : 0);
+      return {
+        knowbe4_19_security_test_reads_succeeded: true,
+        knowbe4_19_security_test_and_recipient_lists_complete: true,
+        knowbe4_19_delivered_recipient_count: value("delivered_count") ?? 0,
+        knowbe4_19_report_rate_percent: rate ?? null,
+        knowbe4_19_configured_minimum_percent: minimum,
+        knowbe4_19_configured_fail_percent: minimum / 2,
+      };
     }
     case "KNOWBE4-20": {
       const tests = value("security_tests_all_time") ?? value("security_tests_read") ?? 0;
@@ -2387,13 +2416,15 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
   manualEvidence?: string,
-  decisionValues?: Batch3RuntimeFactValues,
+  decisionValues?: Knowbe4DecisionInput,
 ): Knowbe4Finding {
   const definition = controlById(number);
   const id = findingId(number);
-  const facts = decisionValues
-    ? batch3RuntimeFacts(id, decisionValues)
-    : knowbe4DecisionFacts(id, evidence ?? {});
+  const facts = decisionValues === undefined
+    ? knowbe4DecisionFacts(id, evidence ?? {})
+    : isBatch3RuntimeFactValues(decisionValues)
+      ? batch3RuntimeFacts(id, decisionValues)
+      : decisionValues;
   const result: Knowbe4FindingWithFacts = {
     id,
     control: number,
@@ -3074,21 +3105,13 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
     security_tests_read: snapshot.securityTests.data.length,
     phisher: phisherEvidence,
   };
-  const violationCount = delivered > 0
-    && reportRate !== undefined
-    && reportRate < minReportRatePct / 2
-    ? 1
-    : 0;
-  const reviewCount = violationCount === 0
-    && (delivered === 0 || reportRate === undefined || reportRate < minReportRatePct)
-    ? 1
-    : 0;
   return withInventoryCaveats(finding(19, "medium", summary, evidence, undefined, {
-    readable: true,
-    complete: true,
-    population: recent.length,
-    failureMatches: violationCount,
-    reviewMatches: reviewCount,
+    knowbe4_19_security_test_reads_succeeded: true,
+    knowbe4_19_security_test_and_recipient_lists_complete: true,
+    knowbe4_19_delivered_recipient_count: delivered,
+    knowbe4_19_report_rate_percent: reportRate ?? null,
+    knowbe4_19_configured_minimum_percent: minReportRatePct,
+    knowbe4_19_configured_fail_percent: minReportRatePct / 2,
   }), snapshot, [
     SECURITY_TEST_READ,
     // PhishER enrichment is context: the rate itself comes from the security test counters, so the inbox only demotes when unreadable.
