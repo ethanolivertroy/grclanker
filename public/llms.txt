@@ -31,16 +31,6 @@ All specs are available as raw markdown. Point your agent at any URL below.
 - [Veracode Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/veracode-sec-inspector.spec.md): Scan coverage, policy compliance, flaw aging, SCA library health
 - [Zscaler Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/zscaler-sec-inspector.spec.md): ZIA and ZPA URL filtering, DLP policies, SSL inspection
 
-## How to use
-
-Point any AI coding agent at a raw spec URL above. The spec contains everything needed to build the tool: APIs, authentication, security controls, framework mappings, architecture, and build sequence.
-
-## Source
-
-- Website: https://grclanker.com
-- Repository: https://github.com/hackIDLE/grclanker
-- Clone all specs: git clone https://github.com/hackIDLE/grclanker.git
-
 <!-- generated integration registry start -->
 ### Generated portable contracts
 
@@ -56,3 +46,13 @@ Point any AI coding agent at a raw spec URL above. The spec contains everything 
 - [Zendesk Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zendesk-sec-inspector.spec.md): Portable contract for the shipped Zendesk authentication, access-control, data-protection, and integration assessments.
 - [Zoom Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zoom-sec-inspector.spec.md): Portable contract for the shipped Zoom identity, collaboration-governance, and meeting-security assessments.
 <!-- generated integration registry end -->
+
+## How to use
+
+Point any AI coding agent at a raw spec URL above. The spec contains everything needed to build the tool: APIs, authentication, security controls, framework mappings, architecture, and build sequence.
+
+## Source
+
+- Website: https://grclanker.com
+- Repository: https://github.com/hackIDLE/grclanker
+- Clone all specs: git clone https://github.com/ethanolivertroy/grclanker.git
