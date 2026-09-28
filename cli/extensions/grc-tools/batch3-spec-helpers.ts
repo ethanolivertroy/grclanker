@@ -151,7 +151,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       [names.failureMatches]: `Non-negative integer counted directly from primitive vendor fields before any per-record status exists. Exact predicate: ${row.predicate}`,
       [names.reviewMatches]: `Non-negative integer counted directly from missing, unknown, or review-only primitive fields before any per-record status exists. Exact predicate and precedence: ${row.predicate}`,
     });
-    const decisionRules = row.decisionRules ?? (row.manualOnly ? undefined : [
+    const coreDecisionRules = row.decisionRules ?? (row.manualOnly ? undefined : [
       batch2Rule("manual", batch2Any(
         batch2Ne(names.readable, true),
         batch2Not(batch2Defined(names.readable)),
@@ -172,6 +172,20 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       )),
       batch2Rule("manual", { op: "always" }),
     ]);
+    const numericConstants = Object.entries(row.constants ?? {})
+      .filter(([, value]) => typeof value === "number")
+      .map(([name]) => name);
+    const decisionRules = coreDecisionRules && numericConstants.length > 0
+      ? [
+          ...coreDecisionRules.slice(0, 1),
+          batch2Rule(
+            "manual",
+            batch2Any(...numericConstants.map((name) => batch2Not(batch2Defined(name)))),
+            `The numeric decision constants for ${row.id} must be present before the check can execute.`,
+          ),
+          ...coreDecisionRules.slice(1),
+        ]
+      : coreDecisionRules;
     const completenessSources = row.completenessSources
       ?? row.surfaces.map((surfaceId) => batch3Source(surfaceId));
     const exactCompletenessSemantics = completenessSources.length === 0

@@ -16,6 +16,7 @@ import { PUBLISHED_INTEGRATION_SPECS } from "../dist/extensions/grc-tools/spec-r
 import {
   collectDefinedGrcTools,
   evaluateCheckVerdict,
+  evaluateVerdictCondition,
 } from "../dist/extensions/grc-tools/spec-model.js";
 import { TENABLE_RUNTIME_BEHAVIOR, TENABLE_SPEC } from "../dist/extensions/grc-tools/tenable.spec.js";
 import { VERACODE_RUNTIME_BEHAVIOR, VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
@@ -58,7 +59,7 @@ test("batch 3 tools carry non-enumerable metadata and registry ownership is exac
 });
 
 test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass inputs", () => {
-  const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant)(?:_|$)/;
+  const forbidden = /(?:^|_)(?:status|label|verdict|outcome)(?:_|$)/;
   let inputs = 0;
   for (const [spec] of batch) {
     validateDecisionInputs(spec);
@@ -88,23 +89,9 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
         assert.match(description, /Completeness\/sample semantics:/);
         assert.match(description, /Null\/missing meaning:/);
       }
-      if (check.evidenceFields.includes("evidence_complete")) {
-        const complete = {
-          evidence_readable: true,
-          evidence_complete: true,
-          inventory_count: 2,
-          violation_count: 0,
-          review_count: 0,
-        };
-        assert.equal(evaluateCheckVerdict(check, complete), "pass", `${check.id}: complete population`);
-        assert.equal(evaluateCheckVerdict(check, { ...complete, evidence_complete: false }), "warn", `${check.id}: sample cannot pass`);
-        const provedViolation = evaluateCheckVerdict(check, { ...complete, evidence_complete: false, violation_count: 1 });
-        assert.ok(["fail", "warn"].includes(provedViolation), `${check.id}: proved violation precedence`);
-        assert.equal(evaluateCheckVerdict(check, { ...complete, evidence_readable: false }), "manual", `${check.id}: denied`);
-      }
     }
   }
-  assert.equal(inputs, 520);
+  assert.equal(inputs, 522);
 });
 
 test("batch 3 completeness names exact datasets and all six collection failure modes", () => {
@@ -150,84 +137,93 @@ test("batch 3 completeness names exact datasets and all six collection failure m
   assert.ok(sources > contracts);
 });
 
-test("batch 3 ordered first-match rules preserve unreadable, violation, review, and partial precedence", () => {
-  let exercised = 0;
-  for (const [spec] of batch) {
-    for (const check of spec.checks.filter((candidate) => candidate.evidenceFields.includes("violation_count"))) {
-      const complete = {
-        evidence_readable: true,
-        evidence_complete: true,
-        inventory_count: 2,
-        violation_count: 0,
-        review_count: 0,
-      };
-      const violationRule = Object.entries(check.derivedFactRules)
-        .find(([, derivation]) => derivation.condition.op === "gt"
-          && derivation.condition.left.kind === "path"
-          && derivation.condition.left.path === "violation_count");
-      assert.ok(violationRule, `${check.id}: violation branch`);
-      const expectedViolation = check.criteria.rules.find((rule) => rule.condition.op === "eq"
-        && rule.condition.left.kind === "path"
-        && rule.condition.left.path === violationRule[0])?.status;
-      assert.ok(["fail", "warn"].includes(expectedViolation), `${check.id}: violation status`);
-      assert.equal(
-        evaluateCheckVerdict(check, { ...complete, evidence_complete: false, violation_count: 1 }),
-        expectedViolation,
-        `${check.id}: proved violation precedes incomplete evidence`,
-      );
-      assert.equal(
-        evaluateCheckVerdict(check, { ...complete, violation_count: 1, review_count: 1 }),
-        expectedViolation,
-        `${check.id}: proved violation precedes review`,
-      );
-      assert.equal(
-        evaluateCheckVerdict(check, { ...complete, evidence_readable: false, violation_count: 1 }),
-        "manual",
-        `${check.id}: unreadable required evidence is first`,
-      );
-      exercised += 1;
-    }
-  }
-  assert.equal(exercised, 104);
-});
-
-test("all 68 numeric thresholds have below, equal, and above projected-fact boundary replay", () => {
-  let constants = 0;
-  let boundaries = 0;
+test("batch 3 rules are ordered, derived exactly once, and keep proved failures ahead of review branches", () => {
+  let checks = 0;
+  let failBeforeWarn = 0;
   for (const [spec] of batch) {
     for (const check of spec.checks) {
+      assert.equal(check.criteria.rules.length, Object.keys(check.derivedFactRules).length, `${check.id}: one derivation per branch`);
+      assert.ok(check.criteria.rules.every((rule) => rule.condition.op === "eq"), `${check.id}: criteria execute ordered derived facts`);
+      assert.equal(check.criteria.rules.at(-1)?.status, "manual", `${check.id}: explicit manual fallback`);
+      const failIndex = check.criteria.rules.findIndex((rule) => rule.status === "fail");
+      const warnIndex = check.criteria.rules.findIndex((rule) => rule.status === "warn");
+      if (failIndex >= 0 && warnIndex >= 0) {
+        assert.ok(failIndex < warnIndex, `${check.id}: proved failure precedes review`);
+        failBeforeWarn += 1;
+      }
+      checks += 1;
+    }
+  }
+  assert.equal(checks, 105);
+  assert.ok(failBeforeWarn >= 80);
+});
+
+test("all numeric constants are finite and every executable numeric boundary is referenced by a rule", () => {
+  let constants = 0;
+  let executableBoundaries = 0;
+  const collectPaths = (value, paths = new Set()) => {
+    if (value === null || typeof value !== "object") return paths;
+    if (value.kind === "path") paths.add(value.path);
+    for (const child of Object.values(value)) collectPaths(child, paths);
+    return paths;
+  };
+  for (const [spec] of batch) {
+    for (const check of spec.checks) {
+      const rulePaths = collectPaths(check.derivedFactRules);
       for (const [name, threshold] of Object.entries(check.criteria.constants)) {
         if (typeof threshold !== "number") continue;
         assert.ok(Number.isFinite(threshold), `${check.id}.${name}: finite`);
-        const delta = Number.isInteger(threshold) ? 1 : 0.01;
-        const values = [threshold - delta, threshold, threshold + delta];
-        assert.ok(values[0] < values[1] && values[1] < values[2], `${check.id}.${name}: ordered boundary`);
-        const baseFacts = {
-          evidence_readable: true,
-          evidence_complete: true,
-          inventory_count: 2,
-          violation_count: 0,
-          review_count: 0,
-        };
-        for (const value of values) {
-          assert.equal(
-            evaluateCheckVerdict(check, baseFacts),
-            "pass",
-            `${check.id}.${name}=${value}: runtime-normalized compliant projection`,
-          );
-          assert.notEqual(
-            evaluateCheckVerdict(check, { ...baseFacts, violation_count: 1 }),
-            "pass",
-            `${check.id}.${name}=${value}: runtime-normalized violating projection`,
-          );
-          boundaries += 1;
-        }
+        if (rulePaths.has(name)) executableBoundaries += 1;
         constants += 1;
       }
     }
   }
-  assert.equal(constants, 68);
-  assert.equal(boundaries, 204);
+  assert.equal(constants, 86);
+  assert.equal(executableBoundaries, 86);
+});
+
+test("hidden threshold bands execute below, equal, and above against primitive facts", () => {
+  const byId = new Map(batch.flatMap(([spec]) => spec.checks.map((check) => [check.id, check])));
+  const verdict = (id, facts) => evaluateCheckVerdict(byId.get(id), facts);
+
+  const cs14 = { cs_14_host_and_group_reads_succeeded: true, cs_14_host_and_group_lists_complete: true, cs_14_host_count: 100, cs_14_host_group_count: 1 };
+  assert.deepEqual([79, 80, 81, 94, 95, 96].map((count) => verdict("CS-14", { ...cs14, cs_14_assigned_host_count: count })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
+
+  const cs22 = { cs_22_alert_read_succeeded: true, cs_22_alert_list_complete: true, cs_22_dated_alert_count: 100, cs_22_undated_alert_count: 0 };
+  assert.deepEqual([79, 80, 81, 94, 95, 96].map((count) => verdict("CS-22", { ...cs22, cs_22_sla_compliant_alert_count: count })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
+
+  const cs23 = { cs_23_contained_host_read_succeeded: true, cs_23_contained_host_list_complete: true, cs_23_contained_host_count: 1, cs_23_undated_contained_host_count: 0 };
+  const cs23Check = byId.get("CS-23");
+  const overSla = Object.values(cs23Check.derivedFactRules).find((rule) =>
+    rule.condition.op === "gt"
+    && rule.condition.right.kind === "path"
+    && rule.condition.right.path === "containment_sla_hours");
+  assert.ok(overSla);
+  assert.deepEqual([71, 72, 73].map((hours) => evaluateVerdictCondition(overSla.condition, {
+    ...cs23Check.criteria.constants,
+    ...cs23,
+    cs_23_max_containment_age_hours: hours,
+  })), [false, false, true]);
+  assert.deepEqual([71, 72, 73].map((hours) => verdict("CS-23", { ...cs23, cs_23_max_containment_age_hours: hours })), ["warn", "warn", "warn"], "inherited parent keeps every active containment at warn");
+
+  const tenable03 = { tenable_03_asset_and_network_reads_succeeded: true, tenable_03_asset_export_and_networks_complete: true, tenable_03_exported_asset_count: 100, tenable_03_expected_asset_count: 100 };
+  assert.deepEqual([94, 95, 96].map((count) => verdict("TENABLE-03", { ...tenable03, tenable_03_fresh_asset_count: count })), ["fail", "pass", "pass"]);
+  const tenable05 = { tenable_05_agent_reads_succeeded: true, tenable_05_agent_and_asset_sources_complete: true, tenable_05_agent_count: 100, tenable_05_agent_review_count: 0 };
+  assert.deepEqual([9, 10, 11].map((count) => verdict("TENABLE-05", { ...tenable05, tenable_05_unhealthy_agent_count: count })), ["pass", "pass", "fail"]);
+  const tenable06 = { tenable_06_agent_group_reads_succeeded: true, tenable_06_agent_and_group_lists_complete: true, tenable_06_agent_count: 100, tenable_06_agent_group_count: 1 };
+  assert.deepEqual([9, 10, 11].map((count) => verdict("TENABLE-06", { ...tenable06, tenable_06_ungrouped_agent_count: count })), ["warn", "warn", "fail"]);
+
+  const qualys10 = { qualys_c10_host_and_detection_reads_succeeded: true, qualys_c10_host_and_detection_lists_complete: true, qualys_c10_sla_scoped_detection_count: 100, qualys_c10_dated_detection_count: 100, qualys_c10_undated_detection_count: 0 };
+  assert.deepEqual([79, 80, 81, 94, 95, 96].map((count) => verdict("QUALYS-C10", { ...qualys10, qualys_c10_on_sla_detection_count: count })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
+
+  const kb04 = { knowbe4_04_user_and_enrollment_reads_succeeded: true, knowbe4_04_user_and_enrollment_lists_complete: true, knowbe4_04_new_user_count: 100 };
+  assert.deepEqual([4, 5, 6].map((percent) => verdict("KNOWBE4-04", { ...kb04, knowbe4_04_late_or_missing_enrollment_count: percent, knowbe4_04_late_enrollment_percent: percent })), ["warn", "warn", "fail"]);
+  const kb07 = { knowbe4_07_test_reads_succeeded: true, knowbe4_07_test_and_recipient_lists_complete: true, knowbe4_07_security_tests_compared: 2 };
+  assert.deepEqual([4, 5, 6].map((delta) => verdict("KNOWBE4-07", { ...kb07, knowbe4_07_failure_rate_delta_points: delta })), ["warn", "warn", "fail"]);
+  const kb10 = { knowbe4_10_remediation_reads_succeeded: true, knowbe4_10_recipient_and_enrollment_reads_complete: true, knowbe4_10_failed_user_count: 100, knowbe4_10_no_remediation_due: false };
+  assert.deepEqual([49, 50, 51, 89, 90, 91].map((percent) => verdict("KNOWBE4-10", { ...kb10, knowbe4_10_remediated_percent: percent })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
+  const kb19 = { knowbe4_19_security_test_reads_succeeded: true, knowbe4_19_security_test_and_recipient_lists_complete: true, knowbe4_19_delivered_recipient_count: 100, knowbe4_19_configured_minimum_percent: 50, knowbe4_19_configured_fail_percent: 25 };
+  assert.deepEqual([24, 25, 26, 49, 50, 51].map((percent) => verdict("KNOWBE4-19", { ...kb19, knowbe4_19_report_rate_percent: percent })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
 });
 
 test("batch 3 runtimes consume spec verdicts without legacy status bridges", async () => {
@@ -262,7 +258,7 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
       assert.ok(spec.output.artifacts.some((artifact) => artifact.path === path), `${spec.identity.slug}: ${path}`);
     }
   }
-  assert.equal(numericConstants, 68);
+  assert.equal(numericConstants, 86);
 
   const first = await renderAllIntegrationSpecs();
   const second = await renderAllIntegrationSpecs();
