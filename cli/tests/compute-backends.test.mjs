@@ -230,6 +230,7 @@ test("normalizeGrclankerSettings keeps remote kinds and drops invalid profile va
 test("extractComputeFlag plumbs --compute for setup, investigate, and audit", () => {
   assert.deepEqual(extractComputeFlag(["--compute", "modal"]), { compute: "modal", rest: [] });
   assert.deepEqual(extractComputeFlag(["--compute=docker", "extra"]), { compute: "docker", rest: ["extra"] });
+  assert.deepEqual(extractComputeFlag(["--", "--compute", "nope"]), { compute: undefined, rest: ["--compute", "nope"] });
   assert.deepEqual(extractComputeFlag([]), { compute: undefined, rest: [] });
   assert.throws(() => extractComputeFlag(["--compute", "nope"]), /Unknown compute backend/);
   assert.throws(() => extractComputeFlag(["--compute"]), /Missing value/);

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { syncBundledAssets } from "../bootstrap/sync.js";
 import {
   ensureGrclankerHome,
@@ -55,7 +55,7 @@ export function buildCliLaunchArgs(
   appRoot: string,
   agentDir: string,
   settings: GrclankerSettings,
-  workflow?: string,
+  prompt?: string,
 ): string[] {
   const args: string[] = [];
   if (
@@ -73,22 +73,22 @@ export function buildCliLaunchArgs(
   args.push("--prompt-template", resolve(appRoot, "prompts"));
   args.push("--system-prompt", readFileSync(resolve(appRoot, ".grclanker", "SYSTEM.md"), "utf8"));
 
-  if (workflow) {
-    const promptPath = join(appRoot, "prompts", `${workflow}.md`);
-    if (!existsSync(promptPath)) {
-      console.error(`Workflow prompt not found: ${promptPath}`);
-      process.exit(1);
-    }
-    args.push(readFileSync(promptPath, "utf8"));
+  if (prompt) {
+    args.push("--", prompt);
   }
 
   return args;
+}
+
+export function buildWorkflowPrompt(workflow: string, subject?: string): string {
+  return subject ? `/${workflow} ${subject}` : `/${workflow}`;
 }
 
 export async function launchCli(
   appRoot: string,
   workflow?: string,
   compute?: ComputeBackendKind,
+  prompt?: string,
 ): Promise<void> {
   const workingDir = process.cwd();
   const { agentDir, settingsPath } = prepareCliRuntime(appRoot);
@@ -97,7 +97,12 @@ export async function launchCli(
     process.env[COMPUTE_BACKEND_OVERRIDE_ENV] = compute;
   }
   const settings = applyComputeBackendOverride(readGrclankerSettings(settingsPath), compute);
-  const args = buildCliLaunchArgs(appRoot, agentDir, settings, workflow);
+  const args = buildCliLaunchArgs(
+    appRoot,
+    agentDir,
+    settings,
+    workflow ? buildWorkflowPrompt(workflow, prompt) : prompt,
+  );
 
   process.env.GRCLANKER_CODING_AGENT_DIR = agentDir;
   process.env.GRCLANKER_COMPUTE_BACKEND = resolveComputeBackend(settings);

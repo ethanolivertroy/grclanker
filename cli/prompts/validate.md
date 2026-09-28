@@ -1,5 +1,7 @@
 # FIPS Validation Check
 
+Subject: $ARGUMENTS
+
 Validate the cryptographic module status of the specified vendor, product, library, or appliance.
 
 ## Phase 1: Active Validation

@@ -70,6 +70,10 @@ export function extractComputeFlag(args: string[]): { compute?: ComputeBackendKi
   let compute: ComputeBackendKind | undefined;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
+    if (arg === "--") {
+      rest.push(...args.slice(index + 1));
+      break;
+    }
     if (arg === "--compute") {
       const value = args[index + 1];
       if (!value) throw new GrclankerUserError("Missing value for --compute.");
