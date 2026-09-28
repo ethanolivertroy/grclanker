@@ -273,7 +273,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     completeness: batch2Completeness(
       decisionInputs,
       GCP_COMPLETENESS_SOURCES[id],
-      "Project inventory and per-project scan failures lower evidence_complete except where the source-state table explicitly omits a mode. Direct organization-scoped list errors generally make the finding manual without lowering this primitive; Security Command Center findings, OS Login effective-policy, and Access Context Manager failures are explicit exceptions.",
+      "Project inventory and per-project scan failures lower evidence_complete except where the source-state table explicitly omits a mode. For service-account keys, an error or denial across the entire attempted key inventory makes the finding manual while leaving this primitive true; a mixed project scan with at least one readable project and at least one failed key inventory makes it false. Direct organization-scoped list errors generally make the finding manual without lowering this primitive; Security Command Center findings, OS Login effective-policy, and Access Context Manager failures are explicit exceptions.",
     ),
     decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
   };

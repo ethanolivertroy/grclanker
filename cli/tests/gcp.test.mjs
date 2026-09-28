@@ -1224,7 +1224,11 @@ function assertGcpCompletenessMutation(row, mode, facts, scope) {
       `${row.id}/${checkId}: runtime dependency and spec source agree`,
     );
     const actual = facts.get(checkId)?.evidence_complete;
-    if (source?.falseWhen.includes(mode)) {
+    const mixedKeyReadFailure = scope === "partial-project"
+      && row.key === "serviceAccountKeys"
+      && ["GCP-IAM-02", "GCP-IAM-03"].includes(checkId)
+      && ["error", "denied"].includes(mode);
+    if (source?.falseWhen.includes(mode) || mixedKeyReadFailure) {
       assert.equal(actual, false, `${row.id}/${mode}/${scope}/${checkId}: lowering failure mode`);
     } else {
       assert.notEqual(actual, false, `${row.id}/${mode}/${scope}/${checkId}: non-lowering failure mode`);
