@@ -63,7 +63,13 @@ const DEFINED = Symbol("defined");
 
 function alternativeValues(value, domains) {
   if (typeof value === "boolean") return [!value, null];
-  if (typeof value === "number") return [value - 1, value + 1, "__not_numeric__", null];
+  if (typeof value === "number") return [
+    ...domains.numbers.filter((candidate) => candidate !== value),
+    value - 1,
+    value + 1,
+    "__not_numeric__",
+    null,
+  ];
   if (typeof value === "string") return domains.strings.filter((candidate) => candidate !== value);
   if (value === null) return [0];
   return ["__different"];
