@@ -211,6 +211,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
           ? {
               decisionInputs: {
                 evidence_readable: "Boolean. True only when both Advanced Threat Protection and malware settings objects were readable.",
+                evidence_complete: "Boolean collector state disclosed by unreadable or truncated companion inventories. For parent parity, this value is not a direct ZS-25 decision gate; the documented capForUnreadableAll limitation remains.",
                 atp_setting_count: "Non-negative integer count of raw fields in the Advanced Threat Protection settings object.",
                 malware_setting_count: "Non-negative integer count of raw fields in the malware settings object.",
                 missing_atp_flag_count: `Count of these required fields whose raw value is not true: ${ZSCALER_REQUIRED_ATP_FLAGS.join(", ")}.`,
