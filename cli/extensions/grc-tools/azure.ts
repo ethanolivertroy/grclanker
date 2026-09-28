@@ -1413,9 +1413,9 @@ function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<
     case "AZURE-SUB-05":
       return { readable, complete, inventory_count: inventoryCount, privileged_service_principal_count: evidenceCount(item, "privileged_service_principals") };
     case "AZURE-DP-01":
-      return { readable, complete, inventory_count: asNumber(item.compliance_policies) ?? 0, license_present: item.intune_license ?? true, device_count: asNumber(item.devices) ?? 0, compliant_device_policy_count: asNumber(item.compliant_device_ca_policies) ?? 0, noncompliant_device_count: asNumber(item.noncompliant_devices) ?? 0, unknown_device_count: asNumber(item.unknown_state_devices) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.compliance_policies) ?? 0, license_present: item.intune_license ?? true, device_count: asNumber(item.devices) ?? 0, device_policy_with_required_settings_count: asNumber(item.compliant_device_ca_policies) ?? 0, noncompliant_device_count: asNumber(item.noncompliant_devices) ?? 0, unknown_device_count: asNumber(item.unknown_state_devices) ?? 0 };
     case "AZURE-DP-03":
-      return { readable, complete, inventory_count: asNumber(item.labels) ?? 0, active_label_count: asNumber(item.active_labels) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.labels) ?? 0, active_sensitivity_record_count: asNumber(item.active_labels) ?? 0 };
     case "AZURE-DP-04":
       return { readable, complete, inventory_count: asNumber(item.vaults) ?? 0, missing_protection_count: evidenceCount(item, "missing_protection"), access_policy_vault_count: evidenceCount(item, "access_policy_vaults"), open_network_count: evidenceCount(item, "open_network") };
     case "AZURE-DP-05":
@@ -1429,7 +1429,7 @@ function azureDecisionFacts(id: string, evidence?: JsonRecord): Readonly<Record<
     case "AZURE-NP-01":
       return { readable, complete, inventory_count: asNumber(item.network_security_groups) ?? 0, exposed_rule_count: evidenceCount(item, "exposed_rules") };
     case "AZURE-NP-02":
-      return { readable, complete, inventory_count: asNumber(item.assignments) ?? 0, enforced_assignment_count: asNumber(item.enforced) ?? 0 };
+      return { readable, complete, inventory_count: asNumber(item.assignments) ?? 0, assignment_not_do_not_enforce_count: asNumber(item.enforced) ?? 0 };
     case "AZURE-NP-03":
       return { readable, resource_count_present: item.non_compliant_resources !== null && item.non_compliant_resources !== undefined, policy_count_present: item.non_compliant_policies !== null && item.non_compliant_policies !== undefined, noncompliant_policy_count: asNumber(item.non_compliant_policies) ?? 0 };
     case "AZURE-NP-04":
@@ -3072,7 +3072,7 @@ export async function assessAzureDataProtection(
           ? "Compliance policies exist but zero managed devices were returned; confirm enrollment before treating this as compliant."
           : `${compliancePolicies.value.items.length} compliance policies, ${nonCompliant.length}/${devices.value.items.length} devices noncompliant/conflict/error, ${unknown.length} with unknown complianceState, ${compliantDevicePolicies.length} enabled Conditional Access policies require a compliant device.${partialNote(devices.value, "managed devices")}`,
       { compliance_policies: compliancePolicies.value.items.length, devices: devices.value.items.length, noncompliant_devices: nonCompliant.length, unknown_state_devices: unknown.length, compliant_device_ca_policies: compliantDevicePolicies.length, ...pageEvidence(devices.value) },
-      { readable: true, complete: !compliancePolicies.value.truncated && !devices.value.truncated && !policies.value.truncated, inventory_count: compliancePolicies.value.items.length, license_present: true, device_count: devices.value.items.length, compliant_device_policy_count: compliantDevicePolicies.length, noncompliant_device_count: nonCompliant.length, unknown_device_count: unknown.length }));
+      { readable: true, complete: !compliancePolicies.value.truncated && !devices.value.truncated && !policies.value.truncated, inventory_count: compliancePolicies.value.items.length, license_present: true, device_count: devices.value.items.length, device_policy_with_required_settings_count: compliantDevicePolicies.length, noncompliant_device_count: nonCompliant.length, unknown_device_count: unknown.length }));
   }
 
   findings.push(finding("AZURE-DP-02", 10, "Data Loss Prevention policies", "medium", "manual",
