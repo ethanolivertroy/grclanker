@@ -200,7 +200,11 @@ function formatKev(vulnerability: KevVulnerability, epss?: EpssEntry): string {
   if (epss) {
     const score = (parseFloat(epss.epss) * 100).toFixed(1);
     const percentile = (parseFloat(epss.percentile) * 100).toFixed(1);
-    lines.push(`  EPSS:        ${score}% probability (${percentile}th percentile)`);
+    const scoreDate = asString(epss.date);
+    lines.push(
+      `  EPSS:        ${score}% probability (${percentile}th percentile)` +
+        (scoreDate ? `, scored ${scoreDate}` : ""),
+    );
   }
 
   if (vulnerability.notes) {
@@ -231,6 +235,20 @@ async function fetchEpss(cveIds: string[]): Promise<Map<string, EpssEntry>> {
   }
 
   return scores;
+}
+
+function epssScoreDates(
+  scores: Map<string, EpssEntry>,
+  cveIds: string[],
+): Record<string, string> {
+  const dates: Record<string, string> = {};
+  for (const cveId of cveIds) {
+    const scoreDate = asString(scores.get(cveId)?.date);
+    if (scoreDate) {
+      dates[cveId] = scoreDate;
+    }
+  }
+  return dates;
 }
 
 export function registerKevsTools(pi: any): void {
@@ -284,7 +302,9 @@ export function registerKevsTools(pi: any): void {
           );
         }
 
-        const epssScores = await fetchEpss(matches.map((vulnerability) => vulnerability.cveID));
+        const matchedCveIds = matches.map((vulnerability) => vulnerability.cveID);
+        const epssScores = await fetchEpss(matchedCveIds);
+        const scoreDates = epssScoreDates(epssScores, matchedCveIds);
         const heading = capped
           ? `Showing ${matches.length} of ${allMatches.length} KEV entries matching "${args.query}" ` +
             `(catalog size: ${catalog.count}). Results are capped at ${MAX_SEARCH_LIMIT}; ` +
@@ -296,9 +316,12 @@ export function registerKevsTools(pi: any): void {
             matches
               .map((vulnerability) => formatKev(vulnerability, epssScores.get(vulnerability.cveID)))
               .join("\n\n"),
-          capped
-            ? { query: args.query, count: matches.length, total_matches: allMatches.length, capped: true }
-            : { query: args.query, count: matches.length },
+          {
+            query: args.query,
+            count: matches.length,
+            ...(capped ? { total_matches: allMatches.length, capped: true } : {}),
+            ...(Object.keys(scoreDates).length > 0 ? { epss_score_dates: scoreDates } : {}),
+          },
         );
       } catch (error) {
         return errorResult(
@@ -339,24 +362,29 @@ export function registerKevsTools(pi: any): void {
           );
         }
 
+        const scoreDates = epssScoreDates(epssScores, args.cve_ids);
+        const hasScoreDates = Object.keys(scoreDates).length > 0;
         const rows = args.cve_ids.map((cveId) => {
           const entry = epssScores.get(cveId);
+          const dateColumn = hasScoreDates ? [scoreDates[cveId] ?? "N/A"] : [];
           if (!entry) {
-            return [cveId, "Not scored", "N/A"];
+            return [cveId, "Not scored", "N/A", ...dateColumn];
           }
 
           const score = (parseFloat(entry.epss) * 100).toFixed(2);
           const percentile = (parseFloat(entry.percentile) * 100).toFixed(1);
-          return [cveId, `${score}%`, `${percentile}th`];
+          return [cveId, `${score}%`, `${percentile}th`, ...dateColumn];
         });
+        const headers = ["CVE ID", "EPSS Score", "Percentile", ...(hasScoreDates ? ["Score Date"] : [])];
 
         return textResult(
           "EPSS Exploit Probability Scores:\n\n" +
-            formatTable(["CVE ID", "EPSS Score", "Percentile"], rows) +
+            formatTable(headers, rows) +
             "\n\nEPSS estimates exploitation likelihood in the next 30 days. Scores above 10% are usually worth fast triage.",
           {
             cve_ids: args.cve_ids,
             count: rows.length,
+            ...(hasScoreDates ? { epss_score_dates: scoreDates } : {}),
           },
         );
       } catch (error) {

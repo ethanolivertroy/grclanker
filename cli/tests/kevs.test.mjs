@@ -5,6 +5,7 @@ import { registerKevsTools } from "../dist/extensions/grc-tools/kevs.js";
 import { clearGrcSharedCachesForTests } from "../dist/extensions/grc-tools/shared.js";
 
 const KEV_URL = "https://raw.githubusercontent.com/cisagov/kev-data/main/known_exploited_vulnerabilities.json";
+const EPSS_DATE = "2024-05-01";
 
 function kevEntry(index) {
   const id = `CVE-2024-${String(index).padStart(4, "0")}`;
@@ -33,9 +34,13 @@ function expectedBlock(index) {
     `  Ransomware:  ${entry.knownRansomwareCampaignUse}`,
     `  Action:      ${entry.requiredAction}`,
     `  Description: ${entry.shortDescription}`,
-    "  EPSS:        12.5% probability (90.0th percentile)",
+    `  EPSS:        12.5% probability (90.0th percentile), scored ${EPSS_DATE}`,
     `  Notes:       ${entry.notes}`,
   ].join("\n");
+}
+
+function scoreDates(count) {
+  return Object.fromEntries(Array.from({ length: count }, (_, index) => [kevEntry(index + 1).cveID, EPSS_DATE]));
 }
 
 async function runSearch(args, matchCount) {
@@ -56,7 +61,7 @@ async function runSearch(args, matchCount) {
     return new Response(JSON.stringify({
       status: "OK",
       total: cves.length,
-      data: cves.map((cve) => ({ cve, epss: "0.125", percentile: "0.9", date: "2024-05-01" })),
+      data: cves.map((cve) => ({ cve, epss: "0.125", percentile: "0.9", date: EPSS_DATE })),
     }));
   };
   try {
@@ -80,7 +85,7 @@ test("kevs_search caps an oversized limit at 50 results and says how many matche
   assert.equal(rest[0], expectedBlock(1), "the first retained entry renders every field");
   assert.equal(rest[49], expectedBlock(50), "the last retained entry renders every field");
   assert.ok(!text.includes("CVE-2024-0051"), "entries beyond the cap are not rendered");
-  assert.deepEqual(result.details, { query: "acme", count: 50, total_matches: 120, capped: true });
+  assert.deepEqual(result.details, { query: "acme", count: 50, total_matches: 120, capped: true, epss_score_dates: scoreDates(50) });
   assert.deepEqual(epssRequests.flat().length, 50, "EPSS is only requested for shown entries");
 });
 
@@ -88,16 +93,16 @@ test("kevs_search output is unchanged when the cap does not remove results", asy
   const byDefault = await runSearch({ query: "acme" }, 120);
   assert.ok(byDefault.text.startsWith('Found 10 KEV entries matching "acme" (catalog size: 120):\n\n'));
   assert.equal(byDefault.text.split("\n\n").length, 11);
-  assert.deepEqual(byDefault.result.details, { query: "acme", count: 10 });
+  assert.deepEqual(byDefault.result.details, { query: "acme", count: 10, epss_score_dates: scoreDates(10) });
 
   const atBound = await runSearch({ query: "acme", limit: 50 }, 120);
   assert.ok(atBound.text.startsWith('Found 50 KEV entries matching "acme" (catalog size: 120):\n\n'));
-  assert.deepEqual(atBound.result.details, { query: "acme", count: 50 });
+  assert.deepEqual(atBound.result.details, { query: "acme", count: 50, epss_score_dates: scoreDates(50) });
 
   const fewMatches = await runSearch({ query: "acme", limit: 10000 }, 3);
   assert.ok(fewMatches.text.startsWith('Found 3 KEV entries matching "acme" (catalog size: 3):\n\n'));
   assert.equal(fewMatches.text.split("\n\n").at(-1), expectedBlock(3));
-  assert.deepEqual(fewMatches.result.details, { query: "acme", count: 3 });
+  assert.deepEqual(fewMatches.result.details, { query: "acme", count: 3, epss_score_dates: scoreDates(3) });
 });
 
 test("kevs_search treats zero, negative, and sub-1 limits as the default of 10", async () => {
@@ -107,7 +112,7 @@ test("kevs_search treats zero, negative, and sub-1 limits as the default of 10",
     assert.ok(text.startsWith('Found 10 KEV entries matching "acme" (catalog size: 120):\n\n'), label);
     assert.equal(text.split("\n\n").length, 11, label);
     assert.equal(text.split("\n\n").at(-1), expectedBlock(10), label);
-    assert.deepEqual(result.details, { query: "acme", count: 10 }, label);
+    assert.deepEqual(result.details, { query: "acme", count: 10, epss_score_dates: scoreDates(10) }, label);
   }
 });
 
@@ -117,11 +122,11 @@ test("kevs_search honors the smallest positive limit and truncates fractional li
 
   const fractionalAtBound = await runSearch({ query: "acme", limit: 50.9 }, 120);
   assert.ok(fractionalAtBound.text.startsWith('Found 50 KEV entries matching "acme" (catalog size: 120):\n\n'));
-  assert.deepEqual(fractionalAtBound.result.details, { query: "acme", count: 50 });
+  assert.deepEqual(fractionalAtBound.result.details, { query: "acme", count: 50, epss_score_dates: scoreDates(50) });
 
   const justOver = await runSearch({ query: "acme", limit: 51 }, 120);
   assert.ok(justOver.text.startsWith("Showing 50 of 120 KEV entries"));
-  assert.deepEqual(justOver.result.details, { query: "acme", count: 50, total_matches: 120, capped: true });
+  assert.deepEqual(justOver.result.details, { query: "acme", count: 50, total_matches: 120, capped: true, epss_score_dates: scoreDates(50) });
 });
 
 test("kevs_search advertises both limit bounds in its schema", async () => {
@@ -134,4 +139,110 @@ test("kevs_search advertises both limit bounds in its schema", async () => {
   );
   assert.equal(limit.minimum, undefined, "out-of-range limits are normalized, not rejected by schema validation");
   assert.equal(limit.maximum, undefined, "out-of-range limits are normalized, not rejected by schema validation");
+});
+
+const KEV_CATALOG = {
+  title: "CISA Catalog of Known Exploited Vulnerabilities",
+  catalogVersion: "2026.09.27",
+  dateReleased: "2026-09-27T00:00:00.000Z",
+  count: 2,
+  vulnerabilities: [
+    {
+      cveID: "CVE-2024-3400",
+      vendorProject: "Palo Alto Networks",
+      product: "PAN-OS",
+      vulnerabilityName: "PAN-OS Command Injection Vulnerability",
+      dateAdded: "2024-04-12",
+      shortDescription: "Command injection in GlobalProtect.",
+      requiredAction: "Apply mitigations per vendor instructions.",
+      dueDate: "2024-04-19",
+      knownRansomwareCampaignUse: "Unknown",
+      notes: "",
+    },
+    {
+      cveID: "CVE-2023-0001",
+      vendorProject: "Example",
+      product: "Widget",
+      vulnerabilityName: "Widget Example Vulnerability",
+      dateAdded: "2023-01-10",
+      shortDescription: "Example issue.",
+      requiredAction: "Apply updates.",
+      dueDate: "2023-01-31",
+      knownRansomwareCampaignUse: "Unknown",
+      notes: "",
+    },
+  ],
+};
+
+const EPSS_ENTRIES = {
+  "CVE-2024-3400": { cve: "CVE-2024-3400", epss: "0.94321", percentile: "0.99912", date: "2026-09-27" },
+  "CVE-2023-0001": { cve: "CVE-2023-0001", epss: "0.01000", percentile: "0.50000" },
+};
+
+function loadKevsTools() {
+  const tools = new Map();
+  registerKevsTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  return tools;
+}
+
+async function withMockedFetch(run) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.hostname === "raw.githubusercontent.com") {
+      return Response.json(KEV_CATALOG);
+    }
+    if (url.hostname === "api.first.org") {
+      const cves = (url.searchParams.get("cve") ?? "").split(",");
+      const data = cves.map((cve) => EPSS_ENTRIES[cve]).filter(Boolean);
+      return Response.json({ status: "OK", total: data.length, data });
+    }
+    return new Response("not found", { status: 404, statusText: "Not Found" });
+  };
+  clearGrcSharedCachesForTests();
+
+  try {
+    await run(loadKevsTools());
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearGrcSharedCachesForTests();
+  }
+}
+
+test("kevs_get_epss shows the EPSS score date when the API provides it", async () => {
+  await withMockedFetch(async (tools) => {
+    const result = await tools.get("kevs_get_epss").execute("call-1", { cve_ids: ["CVE-2024-3400"] });
+    const text = result.content[0].text;
+
+    assert.match(text, /Score Date/);
+    assert.match(text, /CVE-2024-3400\s+│\s+94\.32%\s+│\s+99\.9th\s+│\s+2026-09-27/);
+    assert.deepEqual(result.details.epss_score_dates, { "CVE-2024-3400": "2026-09-27" });
+  });
+});
+
+test("kevs_get_epss keeps the original table when no score date is provided", async () => {
+  await withMockedFetch(async (tools) => {
+    const result = await tools.get("kevs_get_epss").execute("call-2", { cve_ids: ["CVE-2023-0001"] });
+    const text = result.content[0].text;
+
+    assert.doesNotMatch(text, /Score Date/);
+    assert.match(text, /CVE-2023-0001\s+│\s+1\.00%\s+│\s+50\.0th/);
+    assert.deepEqual(result.details, { cve_ids: ["CVE-2023-0001"], count: 1 });
+  });
+});
+
+test("kevs_search EPSS lines include the score date only when the API provides it", async () => {
+  await withMockedFetch(async (tools) => {
+    const dated = await tools.get("kevs_search").execute("call-3", { query: "CVE-2024-3400" });
+    assert.match(
+      dated.content[0].text,
+      /EPSS:\s+94\.3% probability \(99\.9th percentile\), scored 2026-09-27/,
+    );
+    assert.deepEqual(dated.details.epss_score_dates, { "CVE-2024-3400": "2026-09-27" });
+
+    const undated = await tools.get("kevs_search").execute("call-4", { query: "CVE-2023-0001" });
+    assert.match(undated.content[0].text, /EPSS:\s+1\.0% probability \(50\.0th percentile\)$/m);
+    assert.doesNotMatch(undated.content[0].text, /scored/);
+    assert.deepEqual(undated.details, { query: "CVE-2023-0001", count: 1 });
+  });
 });
