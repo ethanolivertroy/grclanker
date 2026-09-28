@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
 } from "./batch-spec-builder.js";
 import { SALESFORCE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
@@ -30,12 +31,46 @@ const SALESFORCE_SURFACES = [
 ].map(([id, method, path]) => ({ id, method: method as "GET" | "POST", path, service: path.includes("Soap") ? "Salesforce Metadata API" : path.includes("tooling") ? "Salesforce Tooling API" : "Salesforce REST API", documentationUrl: "https://developer.salesforce.com/docs/platform/", fields: ["selected fields named in the runtime SOQL or Metadata API request"] }));
 
 const SALESFORCE_CHECK_SURFACES: Readonly<Record<number, readonly string[]>> = {
-  1: ["health-check"], 2: ["security-settings"], 3: ["security-settings"], 4: ["security-settings", "users", "profiles", "two-factor-methods"],
+  1: ["health-check", "health-check-risks"], 2: ["security-settings"], 3: ["security-settings"], 4: ["security-settings", "health-check-risks", "users", "profiles", "two-factor-methods"],
   5: ["security-settings", "profiles", "profile-metadata"], 6: ["profiles", "profile-metadata"], 7: ["users", "profiles"],
-  8: ["field-permissions"], 9: ["permission-sets", "permission-set-assignments"], 10: ["users", "profiles"],
+  8: ["field-permissions"], 9: ["users", "profiles", "permission-sets", "permission-set-assignments"], 10: ["users", "profiles"],
   11: ["connected-applications", "oauth-tokens"], 12: ["organization"], 13: ["users", "profiles"],
   14: ["login-history"], 15: ["setup-audit-trail", "event-log-files"], 16: ["tenant-secrets"],
   17: ["certificates"], 18: ["my-domain-settings"], 19: ["security-settings"], 20: ["security-settings"],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const TRUNCATION_ONLY = ["truncated"] as const;
+const completeFrom = (
+  sourceIds: readonly string[],
+  semantics: string,
+  falseWhen: readonly ("truncated" | "error" | "denied" | "not-collected")[] = ALL_FAILURE_MODES,
+): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen })),
+  semantics,
+});
+const SALESFORCE_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "SF-01": { risks_complete: completeFrom(["health-check-risks"], "true only when the Health Check risk query is readable and completely paged; the summary score query does not contribute.") },
+  "SF-04": { enrollment_complete: completeFrom(["users", "two-factor-methods"], "true only when both users and TwoFactorMethodsInfo are readable and completely paged; profiles, SecuritySettings, and Health Check risk reads do not contribute.") },
+  "SF-05": { profile_complete: completeFrom(["profile-metadata"], "true only when at least one sensitive profile metadata record resolves, none remains unresolved, and the metadata listing is untruncated; profile-query truncation and SecuritySettings state do not contribute.") },
+  "SF-06": { complete: completeFrom(["profile-metadata"], "true only when at least one sensitive profile metadata record resolves, none remains unresolved, and the metadata listing is untruncated; profile-query truncation, error, or denial does not itself change this fact.") },
+  "SF-07": { complete: completeFrom(["users", "profiles"], "true when both user and profile inventories are untruncated; errors, denials, and not-collected states are handled by separate population-readability facts and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "SF-08": { complete: completeFrom(["field-permissions"], "true only when FieldPermissions is readable and completely paged.") },
+  "SF-09": {
+    complete: {
+      sources: [
+        { surfaceId: "permission-sets", falseWhen: TRUNCATION_ONLY },
+        { surfaceId: "permission-set-assignments", falseWhen: ALL_FAILURE_MODES },
+      ],
+      semantics: "true when the PermissionSet inventory is untruncated and, only if at least one elevated set exists, PermissionSetAssignment is readable and untruncated; assignment failure modes do not change this fact when no elevated set exists, and users and profiles never contribute.",
+    },
+  },
+  "SF-10": { complete: completeFrom(["users", "profiles"], "true when both user and profile inventories are untruncated; errors, denials, and not-collected states are handled by separate population-readability facts and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "SF-13": { users_complete: completeFrom(["users"], "true when the user inventory is untruncated; errors, denials, and not-collected states are handled by `users_readable` and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "SF-14": { complete: completeFrom(["login-history"], "true only when LoginHistory is readable and completely paged.") },
+  "SF-15": { audit_complete: completeFrom(["setup-audit-trail"], "true only when SetupAuditTrail is readable and completely paged; EventLogFile readability is a separate fact and does not contribute.") },
+  "SF-16": { complete: completeFrom(["tenant-secrets"], "true only when TenantSecret is readable and completely paged.") },
+  "SF-17": { complete: completeFrom(["certificates"], "true only when the certificate inventory is readable and completely paged.") },
 };
 
 const titles = [
@@ -110,7 +145,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     warning_count: "certificates in warning window", disabled_count: "session-CSRF flags set false",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the required query or metadata response was returned", complete: "all check-specific pages and metadata reads completed",
+    readable: "the required query or metadata response was returned", complete: "defined by this check's structured completeness contract",
     health_readable: "Security Health Check summary was returned", score_present: "Health Check contains a numeric score", risks_readable: "Health Check risks were returned",
     risks_complete: "all risk pages completed", settings_readable: "required organization settings were returned", required_fields_present: "every required settings field exists",
     force_logout: "sessions force logout on timeout", lock_to_ip: "sessions are locked to originating IP", security_settings_readable: "security settings were returned",
@@ -328,6 +363,7 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
     decisionInputs: decision.inputs,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
+    completeness: SALESFORCE_COMPLETENESS[id],
     decision: decisions[index],
   };
 });

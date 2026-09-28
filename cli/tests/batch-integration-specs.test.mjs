@@ -558,6 +558,62 @@ test("all 1117 primitive input uses have explicit portable owner, domain, comple
   assert.equal(inputUses, 1117);
 });
 
+test("151 completeness primitives have exact per-check sources, failure modes, and rendered semantics", () => {
+  let checksWithCompleteness = 0;
+  let completenessFields = 0;
+  for (const [spec] of batch) {
+    for (const check of spec.checks) {
+      const inputs = check.evidenceFields.filter((name) => name.includes("complete")).sort();
+      const contracts = Object.keys(check.completeness ?? {}).sort();
+      assert.deepEqual(contracts, inputs, `${check.id}: exact completeness input coverage`);
+      if (contracts.length > 0) checksWithCompleteness += 1;
+      completenessFields += contracts.length;
+      for (const [inputName, contract] of Object.entries(check.completeness ?? {})) {
+        assert.ok(contract.semantics.length >= 40, `${check.id}.${inputName}: substantive semantics`);
+        for (const source of contract.sources) {
+          assert.ok(check.sourceSurfaceIds.includes(source.surfaceId), `${check.id}.${inputName}: declared source ${source.surfaceId}`);
+          assert.equal(new Set(source.falseWhen).size, source.falseWhen.length);
+          assert.ok(source.falseWhen.every((mode) => ["truncated", "error", "denied", "not-collected"].includes(mode)));
+        }
+        const rendered = check.evidenceFieldDefinitions[inputName];
+        assert.match(rendered, new RegExp(`For ${check.id},`));
+        assert.match(rendered, /Exact source-state effects:/);
+        assert.match(rendered, new RegExp(contract.semantics.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        assert.doesNotMatch(rendered, /all check-specific pages|check-specific source and precedence semantics/);
+      }
+    }
+  }
+  assert.equal(checksWithCompleteness, 142);
+  assert.equal(completenessFields, 151);
+});
+
+test("portable source and population contracts encode the final audit distinctions", () => {
+  const check = (spec, id) => spec.checks.find((entry) => entry.id === id);
+  const sourceIds = (spec, id, inputName = "complete") =>
+    check(spec, id).completeness[inputName].sources.map((source) => source.surfaceId);
+  const falseWhen = (spec, id, sourceId, inputName = "complete") =>
+    check(spec, id).completeness[inputName].sources.find((source) => source.surfaceId === sourceId).falseWhen;
+
+  assert.deepEqual(check(GWS_SPEC, "GWS-MON-002").sourceSurfaceIds, ["login-activities"]);
+  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-MON-002"), ["login-activities"]);
+  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-ADMIN-005"), ["directory-users", "roles", "role-assignments"]);
+  assert.deepEqual(falseWhen(GWS_SPEC, "GWS-ADMIN-005", "roles"), ["truncated"]);
+  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-INTEG-001"), ["directory-users", "user-tokens"]);
+  assert.deepEqual(sourceIds(GWS_SPEC, "GWS-INTEG-003"), ["directory-users", "user-tokens"]);
+  assert.deepEqual(sourceIds(DUO_SPEC, "DUO-AUTH-010"), ["users"]);
+  assert.deepEqual(sourceIds(SALESFORCE_SPEC, "SF-06"), ["profile-metadata"]);
+  assert.deepEqual(falseWhen(SALESFORCE_SPEC, "SF-07", "users"), ["truncated"]);
+  assert.deepEqual(falseWhen(SALESFORCE_SPEC, "SF-09", "permission-set-assignments"), ["truncated", "error", "denied", "not-collected"]);
+  assert.deepEqual(falseWhen(OKTA_SPEC, "OKTA-AUTH-002", "mfa-policies"), ["truncated"]);
+  assert.deepEqual(falseWhen(OKTA_SPEC, "OKTA-INTEG-004", "network-zones"), ["truncated"]);
+
+  assert.match(check(SLACK_SPEC, "SLACK-ID-01").evidenceFieldDefinitions.without_mfa_count, /active human users/);
+  assert.match(check(SLACK_SPEC, "SLACK-ADMIN-02").evidenceFieldDefinitions.without_sso_count, /active organization users/);
+  assert.match(check(OKTA_SPEC, "OKTA-AUTH-002").evidenceFieldDefinitions.policy_inventory_readable, /at least one/);
+  assert.ok(OKTA_SPEC.knownGaps.some((gap) => /Pass for 32.*Partial for 3.*Manual for 2/.test(gap)));
+  assert.ok(OKTA_SPEC.knownGaps.some((gap) => /OKTA-INTEG-004.*network-zone read is denied.*Pass/.test(gap)));
+});
+
 test("ServiceNow metadata owns every concrete runtime property and relevant check", () => {
   const concrete = new Set(Object.values(SERVICENOW_PROPERTY_SOURCES).flat().filter((name) => !name.startsWith("dynamic ")));
   const expected = new Set([

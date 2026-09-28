@@ -7,6 +7,9 @@ import {
   defineGrcTool,
   evaluateCheckVerdict,
   type CheckContract,
+  type CompletenessContract,
+  type CompletenessFailureMode,
+  type CompletenessSourceContract,
   type DerivedFactRule,
   type EvaluatedFindingStatus,
   type ExportContract,
@@ -20,6 +23,7 @@ import {
   type VerdictRule,
   toolContract,
 } from "./spec-model.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const FRAMEWORK_KEYS: readonly FrameworkKey[] = [
@@ -57,6 +61,7 @@ export interface BatchCheckDefinition {
   decisionRules?: readonly VerdictRule[];
   derivedFacts?: Readonly<Record<string, string>>;
   derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
+  completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
   decision: string;
   outcomes?: {
     fail?: boolean;
@@ -64,6 +69,10 @@ export interface BatchCheckDefinition {
     pass?: boolean;
   };
 }
+
+export type BatchCompletenessFailureMode = CompletenessFailureMode;
+export type BatchCompletenessSourceDefinition = CompletenessSourceContract;
+export type BatchCompletenessDefinition = CompletenessContract;
 
 export interface BatchPermissionDefinition {
   id: string;
@@ -482,21 +491,43 @@ function renderPortableInputDefinitions(
     const usedBy = inputUsage && inputUsage.derivedFacts.size > 0
       ? ` It feeds executable derived facts ${[...inputUsage.derivedFacts].sort().map((fact) => `\`${fact}\``).join(", ")}.`
       : " It is declared for the finding's explicit manual-only contract.";
-    const source = check.surfaces.length > 0
-      ? check.surfaces.map((surfaceId) => {
+    const completenessContract = check.completeness?.[name];
+    const ownedSourceIds = completenessContract
+      ? completenessContract.sources.map((entry) => entry.surfaceId)
+      : check.surfaces;
+    const source = ownedSourceIds.length > 0
+      ? ownedSourceIds.map((surfaceId) => {
         const surface = definition.surfaces.find((candidate) => candidate.id === surfaceId);
         if (!surface) throw new Error(`${check.id} input ${name} references unknown source ${surfaceId}`);
         return `\`${surface.method ?? "GET"} ${surface.path}\` (${surface.id})`;
       }).join(", ")
       : "the explicitly manual collector state; this check performs no vendor read";
-    const completeness = name === "complete"
-      ? `For ${check.id}, this boolean is true only under the check-specific source and precedence semantics stated here: ${check.decision}`
+    const completeness = name.includes("complete")
+      ? renderCompletenessSemantics(check, name, completenessContract)
       : "The primitive is calculated from the uncapped collector state before any 25-item finding preview or export sample; list cardinalities therefore refer to every item the collector obtained";
+    const portableMeaning = completenessContract?.semantics ?? supplied;
     return [
       name,
-      `Type/domain: ${inputTypes}.${values} Source/owner: ${definition.vendor} collector projection from ${source}. Completeness/sample semantics: ${completeness}. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule.${usedBy} Portable meaning: ${supplied}`,
+      `Type/domain: ${inputTypes}.${values} Source/owner: ${definition.vendor} collector projection from ${source}. Completeness/sample semantics: ${completeness}. Null/missing meaning: the named source did not establish this primitive; null or absence cannot independently satisfy a passing rule.${usedBy} Portable meaning: ${portableMeaning}`,
     ];
   }));
+}
+
+function renderCompletenessSemantics(
+  check: BatchCheckDefinition,
+  inputName: string,
+  contract: BatchCompletenessDefinition | undefined,
+): string {
+  if (!contract) throw new Error(`${check.id} input ${inputName} requires an explicit completeness contract`);
+  if (!contract.semantics.trim()) throw new Error(`${check.id} input ${inputName} completeness semantics are empty`);
+  if (contract.sources.length === 0) {
+    return `For ${check.id}, this fact has no vendor dataset dependency. ${contract.semantics}`;
+  }
+  const sourceText = contract.sources.map((source) => {
+    const falseModes = source.falseWhen.length > 0 ? source.falseWhen.join(", ") : "none";
+    return `\`${source.surfaceId}\`: false on ${falseModes}; other failure modes do not change this fact`;
+  }).join("; ");
+  return `For ${check.id}, ${contract.semantics} Exact source-state effects: ${sourceText}`;
 }
 
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {
@@ -506,6 +537,24 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     }
     if (/\b(?:TypeScript|JavaScript|buildFinding|cli\/|runtime predicates?)\b/i.test(check.decision)) {
       throw new Error(`${check.id} decision derivation contains an implementation-specific reference`);
+    }
+    const completionInputs = Object.keys(check.decisionInputs ?? {}).filter((name) => name.includes("complete"));
+    const completionContracts = Object.keys(check.completeness ?? {});
+    if (completionInputs.sort().join("\0") !== completionContracts.sort().join("\0")) {
+      throw new Error(`${check.id} completeness contracts must exactly cover ${completionInputs.join(", ") || "(none)"}`);
+    }
+    for (const [inputName, completeness] of Object.entries(check.completeness ?? {})) {
+      const seen = new Set<string>();
+      for (const source of completeness.sources) {
+        if (!check.surfaces.includes(source.surfaceId)) {
+          throw new Error(`${check.id} completeness input ${inputName} references undeclared source ${source.surfaceId}`);
+        }
+        if (seen.has(source.surfaceId)) throw new Error(`${check.id} completeness input ${inputName} repeats source ${source.surfaceId}`);
+        seen.add(source.surfaceId);
+        if (new Set(source.falseWhen).size !== source.falseWhen.length) {
+          throw new Error(`${check.id} completeness input ${inputName} repeats a failure mode for ${source.surfaceId}`);
+        }
+      }
     }
   }
   const controls = [...new Map(
@@ -562,6 +611,7 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
       : [...new Set(check.evidenceFields.flatMap((field) =>
         definition.surfaces.find((surface) => surface.id === field)?.fields ?? [field]))],
     ...(check.decisionInputs ? { evidenceFieldDefinitions: renderPortableInputDefinitions(definition, check) } : {}),
+    ...(check.completeness ? { completeness: check.completeness } : {}),
     derivedFacts: check.decisionInputs
       ? Object.fromEntries(Object.entries(check.derivedFactRules ?? {}).map(([name, rule]) => [name, rule.description]))
       : {
@@ -703,6 +753,21 @@ interface BatchVerdictResult {
   findings: readonly BatchVerdictFinding[];
 }
 
+export interface CapturedBatchDecisionFacts {
+  integration: string;
+  checks: ReadonlyMap<string, Readonly<Record<string, unknown>>>;
+}
+
+const BATCH_DECISION_CAPTURE = new AsyncLocalStorage<CapturedBatchDecisionFacts[]>();
+
+export async function captureBatchDecisionFacts<T>(
+  callback: () => T | Promise<T>,
+): Promise<{ result: T; captures: readonly CapturedBatchDecisionFacts[] }> {
+  const captures: CapturedBatchDecisionFacts[] = [];
+  const result = await BATCH_DECISION_CAPTURE.run(captures, callback);
+  return { result, captures };
+}
+
 function assertBatchResultVerdicts<T>(
   spec: IntegrationSpecContract,
   factsByCheck: ReadonlyMap<string, Readonly<Record<string, unknown>>>,
@@ -712,6 +777,10 @@ function assertBatchResultVerdicts<T>(
   if (!candidate || !Array.isArray(candidate.findings)) {
     throw new Error(`${spec.identity.slug} assessment did not return a findings array`);
   }
+  BATCH_DECISION_CAPTURE.getStore()?.push({
+    integration: spec.identity.slug,
+    checks: new Map(factsByCheck),
+  });
   for (const finding of candidate.findings) {
     const facts = factsByCheck.get(finding.id);
     if (!facts) throw new Error(`${finding.id} has no runtime decision facts`);

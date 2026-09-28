@@ -155,9 +155,22 @@ export interface CheckContract {
   sourceSurfaceIds: readonly string[];
   evidenceFields: readonly string[];
   evidenceFieldDefinitions?: Readonly<Record<string, string>>;
+  completeness?: Readonly<Record<string, CompletenessContract>>;
   derivedFacts: Readonly<Record<string, string>>;
   derivedFactRules?: Readonly<Record<string, DerivedFactRule>>;
   criteria: VerdictCriteria;
+}
+
+export type CompletenessFailureMode = "truncated" | "error" | "denied" | "not-collected";
+
+export interface CompletenessSourceContract {
+  surfaceId: string;
+  falseWhen: readonly CompletenessFailureMode[];
+}
+
+export interface CompletenessContract {
+  sources: readonly CompletenessSourceContract[];
+  semantics: string;
 }
 
 export interface ControlContract {

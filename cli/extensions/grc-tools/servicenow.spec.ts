@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
 } from "./batch-spec-builder.js";
 import { SERVICENOW_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
@@ -46,6 +47,47 @@ export const SERVICENOW_PROPERTY_SOURCES = {
   "SNOW-18": ["glide.smtp.auth", "glide.email.email_with_no_target_visible_to_all"],
   "SNOW-19": ["mid.version.override"],
 } as const;
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const PARTIAL_ONLY = ["truncated"] as const;
+const completeFrom = (
+  sourceIds: readonly string[],
+  semantics: string,
+  falseWhen: readonly ("truncated" | "error" | "denied" | "not-collected")[] = PARTIAL_ONLY,
+): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen })),
+  semantics,
+});
+const partialTableSemantics = (description: string): string =>
+  `true when ${description} has no truncation, hidden-row total mismatch, zero-row response with unproven visibility, or unknown total; unreadable, denied, and not-collected states are handled by the separate readability fact and do not themselves change this fact.`;
+const SERVICENOW_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "SNOW-01": { complete: completeFrom(["hardening-properties"], partialTableSemantics("the hardening-property table read")) },
+  "SNOW-02": { complete: completeFrom(["acls", "acl-roles", "public-pages"], partialTableSemantics("ACL, ACL-role, and public-page table reads")) },
+  "SNOW-03": { complete: completeFrom(["role-inheritance"], partialTableSemantics("the role-inheritance table read")) },
+  "SNOW-04": { complete: completeFrom(["users", "privileged-assignments"], partialTableSemantics("user and privileged-assignment table reads")) },
+  "SNOW-05": { complete: completeFrom(["hardening-properties"], partialTableSemantics("the hardening-property table read")) },
+  "SNOW-06": { complete: completeFrom(["identity-properties", "password-policies"], partialTableSemantics("identity-property and password-policy table reads")) },
+  "SNOW-07": {
+    complete: completeFrom(["identity-properties", "users", "privileged-assignments", "mfa-criteria"], partialTableSemantics("identity-property, user, privileged-assignment, and MFA-criteria table reads")),
+    properties_complete: completeFrom(["identity-properties"], "true only when the identity-property table read is readable and has proven full visibility.", ALL_FAILURE_MODES),
+  },
+  "SNOW-08": {
+    complete: completeFrom(["sso-providers", "ldap-servers", "identity-properties", "certificates"], partialTableSemantics("SSO-provider, LDAP-server, identity-property, and certificate table reads")),
+    providers_complete: completeFrom(["sso-providers", "ldap-servers"], "true only when both provider inventories are readable and have proven full visibility.", ALL_FAILURE_MODES),
+  },
+  "SNOW-11": { complete: completeFrom(["acls", "acl-roles"], "true only when ACL and ACL-role inventories are readable and have proven full visibility; the ACL aggregate is represented by a separate fact.", ALL_FAILURE_MODES) },
+  "SNOW-12": { complete: completeFrom(["hardening-properties", "eval-scripts"], partialTableSemantics("hardening-property and evaluatable-script table reads")) },
+  "SNOW-13": { complete: completeFrom(["hardening-properties"], partialTableSemantics("the hardening-property table read")) },
+  "SNOW-14": { complete: completeFrom(["users", "privileged-assignments", "oauth-entities"], partialTableSemantics("user, privileged-assignment, and OAuth-entity table reads")) },
+  "SNOW-15": { complete: completeFrom(["update-sets", "sensitive-update-xml"], partialTableSemantics("in-progress update-set and sensitive update-XML table reads")) },
+  "SNOW-16": { complete: completeFrom(["hardening-properties", "debug-properties"], partialTableSemantics("hardening-property and debug-property table reads")) },
+  "SNOW-17": {
+    complete: completeFrom(["hardening-properties", "ip-access", "ip-authenticator-plugin"], partialTableSemantics("hardening-property, IP-access-rule, and IP-authenticator-plugin table reads")),
+    plugin_inventory_complete: completeFrom(["ip-authenticator-plugin"], "true only when the IP-authenticator plugin inventory is readable and has proven full visibility.", ALL_FAILURE_MODES),
+    rule_inventory_complete: completeFrom(["ip-access"], "true only when the IP-access-rule inventory is readable and has proven full visibility.", ALL_FAILURE_MODES),
+  },
+  "SNOW-20": { complete: completeFrom(["plugins"], "true only when the plugin inventory is readable and has proven full visibility.", ALL_FAILURE_MODES) },
+};
 
 const tableSurface = (id: string, table: string, fields: readonly string[]) => ({
   id,
@@ -196,7 +238,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     unverified_count: "certificates with unknown validity",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the required table, aggregate, or property response was returned", complete: "all check-specific pages, totals, and child reads completed",
+    readable: "the required table, aggregate, or property response was returned", complete: "defined by this check's structured completeness contract",
     role_aggregate_readable: "the role aggregate was returned", role_total_known: "role total is reported or pagination exhausted", providers_complete: "all provider pages completed",
     plugin_present: "the named plugin has a visible record", plugin_active_value: "the named plugin is active", plugin_inventory_complete: "all plugin pages completed",
     password_policy_property_present: "glide.enable.password_policy has a visible row", platform_property_present: "the required platform property has a visible row",
@@ -377,6 +419,7 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
     decisionInputs: decision.inputs,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
+    completeness: SERVICENOW_COMPLETENESS[id],
     decision: decisions[index],
   };
 });

@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
 } from "./batch-spec-builder.js";
 import { ZENDESK_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
@@ -65,6 +66,46 @@ const ZENDESK_CHECK_SURFACES: Readonly<Record<number, readonly string[]>> = {
   23: ["sharing-agreements"],
   24: ["targets", "webhooks"],
   25: ["triggers", "automations", "targets", "webhooks"],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const TRUNCATION_ONLY = ["truncated"] as const;
+const completeFrom = (
+  sourceIds: readonly string[],
+  semantics: string,
+  falseWhen: readonly ("truncated" | "error" | "denied" | "not-collected")[] = ALL_FAILURE_MODES,
+): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen })),
+  semantics,
+});
+const ZENDESK_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "ZD-02": { complete: completeFrom(["team-members"], "true when the team-member inventory is untruncated; read errors, denials, and not-collected states are handled by readability facts and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "ZD-06": { complete: completeFrom(["team-members", "custom-roles"], "true when team members and custom roles are untruncated; read errors, denials, and not-collected states are handled by readability facts and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "ZD-07": { complete: completeFrom(["team-members"], "true when the team-member inventory is untruncated; read errors, denials, and not-collected states are handled by readability facts and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "ZD-08": { complete: completeFrom(["groups", "group-memberships"], "true when group and membership inventories are untruncated; read errors, denials, and not-collected states are handled by readability facts and do not themselves change this fact.", TRUNCATION_ONLY) },
+  "ZD-12": {
+    complete: completeFrom(["deletion-schedules"], "true only when the deletion-schedule inventory is readable and untruncated."),
+    secondary_complete: completeFrom(["account-settings", "custom-roles"], "true only when account settings and custom roles are readable and the custom-role inventory is untruncated."),
+  },
+  "ZD-13": { token_history_complete: completeFrom(["api-token-audit-logs"], "true only when API-token audit history is readable and untruncated; account settings do not contribute.") },
+  "ZD-14": {
+    clients_complete: completeFrom(["oauth-clients"], "true only when OAuth clients are readable and untruncated."),
+    tokens_complete: completeFrom(["oauth-tokens"], "true only when OAuth tokens are readable and untruncated."),
+  },
+  "ZD-15": {
+    installations_complete: completeFrom(["app-installations"], "true only when app installations are readable and untruncated."),
+    owned_apps_complete: completeFrom(["owned-apps"], "true only when owned apps are readable and untruncated."),
+  },
+  "ZD-16": { complete: completeFrom(["owned-apps"], "true only when owned apps are readable and untruncated.") },
+  "ZD-20": { complete: completeFrom(["suspended-tickets"], "true only when suspended tickets are readable and untruncated.") },
+  "ZD-21": { account_settings_complete: completeFrom(["account-settings"], "true only when account settings are readable; security settings do not contribute.") },
+  "ZD-22": { complete: completeFrom(["brands"], "true only when brands are readable and untruncated.") },
+  "ZD-23": { complete: completeFrom(["sharing-agreements"], "true only when sharing agreements are readable and untruncated.") },
+  "ZD-24": { complete: completeFrom(["targets", "webhooks"], "true only when targets and webhooks are both readable and untruncated.") },
+  "ZD-25": {
+    rules_complete: completeFrom(["triggers", "automations"], "true only when triggers and automations are both readable and untruncated."),
+    destination_sources_complete: completeFrom(["targets", "webhooks"], "true only when targets and webhooks are both readable and untruncated."),
+  },
 };
 
 const titles = [
@@ -146,7 +187,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     rule_count: "triggers and automations", insecure_destination_count: "external destinations with insecure transport or missing auth", external_action_count: "actions sending data externally",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the check's required Zendesk response was returned", complete: "all check-specific pages and child reads completed",
+    readable: "the check's required Zendesk response was returned", complete: "defined by this check's structured completeness contract",
     credential_is_admin: "the authenticated principal is an administrator", fields_present: "all required account fields exist", enforce_sso: "SSO enforcement is enabled",
     zendesk_login: "native Zendesk login remains enabled", team_readable: "agent and administrator users were returned", security_readable: "security settings were returned",
     two_factor_enforce_present: "the two-factor enforcement field exists", two_factor_enforce_value: "two-factor enforcement is enabled",
@@ -438,6 +479,7 @@ const checks: BatchCheckDefinition[] = titles.map((title, index) => {
       : decision.inputs,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
+    completeness: ZENDESK_COMPLETENESS[id],
     decision: decisions[index],
   };
 });

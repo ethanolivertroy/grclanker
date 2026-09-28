@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
 } from "./batch-spec-builder.js";
 import { ZOOM_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
@@ -37,6 +38,27 @@ const ZOOM_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "ZOOM-MTG-08": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
   "ZOOM-MTG-09": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
   "ZOOM-MTG-10": ["account-settings", "account-lock-settings", "groups", "group-settings", "group-lock-settings"],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const TRUNCATION_ONLY = ["truncated"] as const;
+const completeFrom = (
+  sourceIds: readonly string[],
+  semantics: string,
+  falseWhen: readonly ("truncated" | "error" | "denied" | "not-collected")[] = TRUNCATION_ONLY,
+): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen })),
+  semantics,
+});
+const ZOOM_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "ZOOM-ID-01": { complete: completeFrom(["users"], "true when the active-user inventory is untruncated; unreadable or denied status is represented by `readable` and does not itself change this fact.") },
+  "ZOOM-ID-02": { roles_complete: completeFrom(["roles"], "true only when the role inventory is readable and untruncated; account settings and role-member reads do not contribute.", ALL_FAILURE_MODES) },
+  "ZOOM-ID-03": { complete: completeFrom(["managed-domains"], "true when the managed-domain inventory is untruncated; unreadable or denied status is represented by `readable` and does not itself change this fact.") },
+  "ZOOM-ID-04": { complete: completeFrom(["roles", "role-members"], "true when the role list and every returned administrator-role member list are untruncated; denied member reads are represented by `member_read_denied` and do not themselves change this fact.") },
+  "ZOOM-ID-05": { complete: completeFrom(["users"], "true when the active-user inventory is untruncated; unreadable or denied status is represented by `readable` and does not itself change this fact.") },
+  "ZOOM-COLLAB-01": { complete: completeFrom(["trusted-domains"], "true when the trusted-domain inventory is untruncated; its shipped collector currently always reports this inventory untruncated.") },
+  "ZOOM-COLLAB-05": { complete: completeFrom(["operation-logs"], "true when the operation-log inventory is untruncated; unreadable or denied status is represented by `readable` and does not itself change this fact.") },
+  "ZOOM-COLLAB-06": { complete: completeFrom(["im-groups"], "true when the IM-group inventory is untruncated; unreadable or denied status is represented by `readable` and does not itself change this fact.") },
 };
 
 const rows = [
@@ -121,7 +143,7 @@ const input = (...names: string[]) => Object.fromEntries(names.map((name) => {
     region_count: "enabled data-center regions",
   };
   const booleans: Readonly<Record<string, string>> = {
-    readable: "the check's required Zoom response was returned", complete: "all check-specific pages and child reads completed",
+    readable: "the check's required Zoom response was returned", complete: "defined by this check's structured completeness contract",
     settings_readable: "the required account settings category was returned", setting_present: "the named account setting exists",
     roles_readable: "roles and members were returned", roles_complete: "all role and member pages completed", member_read_denied: "a role-member read was denied",
     client_setting_present: "the desktop timeout exists", web_setting_present: "the web timeout exists", cloud_recording_present: "cloud recording exists",
@@ -377,6 +399,7 @@ const checks: BatchCheckDefinition[] = rows.map(([id, control, title, severity, 
     decisionConstants: decision.constants,
     decisionRules: executable.rules,
     derivedFactRules: executable.derivedFactRules,
+    completeness: ZOOM_COMPLETENESS[id],
     decision: decisions[index],
   };
 });

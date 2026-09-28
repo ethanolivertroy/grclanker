@@ -3,6 +3,7 @@ import {
   buildBatchOutputContract,
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
 import { DUO_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
@@ -46,6 +47,29 @@ const DUO_CHECK_SURFACES: Readonly<Record<string, readonly string[]>> = {
   "DUO-MON-001": ["authentication-logs"], "DUO-MON-002": ["trust-monitor-events"],
   "DUO-MON-003": ["info-summary", "telephony-logs"], "DUO-MON-004": ["settings"],
   "DUO-MON-005": ["authentication-attempts", "authentication-logs"],
+};
+
+const ALL_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const completeFrom = (sourceIds: readonly string[], semantics: string): BatchCompletenessDefinition => ({
+  sources: sourceIds.map((surfaceId) => ({ surfaceId, falseWhen: ALL_FAILURE_MODES })),
+  semantics,
+});
+const DUO_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchCompletenessDefinition>>>> = {
+  "DUO-AUTH-006": { complete: completeFrom(["bypass-codes"], "true only when the bypass-code inventory is readable and its authoritative total is exhausted; Settings readability is a separate fact and does not contribute.") },
+  "DUO-AUTH-008": { complete: completeFrom(["users"], "true only when the user inventory is readable and its authoritative total is exhausted.") },
+  "DUO-AUTH-009": { complete: completeFrom(["users"], "true only when the user inventory is readable and its authoritative total is exhausted.") },
+  "DUO-AUTH-010": { complete: completeFrom(["users"], "true only when the user inventory is readable and its authoritative total is exhausted; WebAuthn credential evidence contributes enrollment counts but never changes this completeness fact.") },
+  "DUO-ADMIN-001": { complete: completeFrom(["admins"], "true only when the administrator inventory is readable and its authoritative total is exhausted.") },
+  "DUO-ADMIN-004": { complete: completeFrom(["admins"], "true only when the administrator inventory is readable and its authoritative total is exhausted.") },
+  "DUO-INTEGRATIONS-001": { complete: completeFrom(["integrations"], "true only when the integration inventory is readable and its authoritative total is exhausted.") },
+  "DUO-INTEGRATIONS-002": { complete: completeFrom(["integrations"], "true only when the integration inventory is readable and its authoritative total is exhausted.") },
+  "DUO-INTEGRATIONS-003": { complete: completeFrom(["integrations"], "true only when the integration inventory is readable and its authoritative total is exhausted.") },
+  "DUO-INTEGRATIONS-004": { complete: completeFrom(["integrations"], "true only when the integration inventory is readable and its authoritative total is exhausted.") },
+  "DUO-INTEGRATIONS-005": { complete: completeFrom(["integrations"], "true only when the integration inventory is readable and its authoritative total is exhausted.") },
+  "DUO-MON-001": { complete: completeFrom(["authentication-logs"], "true only when the authentication-log inventory is readable and its authoritative total is exhausted.") },
+  "DUO-MON-002": { complete: completeFrom(["trust-monitor-events"], "true only when the Trust Monitor event inventory is readable and its authoritative total is exhausted.") },
+  "DUO-MON-003": { complete: completeFrom(["telephony-logs", "info-summary"], "true only when both telephony logs and the information summary are readable and complete.") },
+  "DUO-MON-005": { complete: completeFrom(["authentication-attempts", "authentication-logs"], "true only when both the authentication-attempt aggregate and authentication-log inventory are readable and complete.") },
 };
 
 const groups = {
@@ -210,7 +234,7 @@ const input = (...names: string[]): Readonly<Record<string, string>> => Object.f
       enabled_notification_count: "enabled administrator notifications",
     };
     const booleans: Readonly<Record<string, string>> = {
-      readable: "the check's required Duo response was collected and parseable", complete: "all check-specific pages and child reads completed",
+      readable: "the check's required Duo response was collected and parseable", complete: "defined by this check's structured completeness contract",
       settings_readable: "Duo authentication settings were returned", allows_push: "push is enabled", requires_verified_push: "verified push is required", has_webauthn: "WebAuthn is enabled",
       sms_enabled: "SMS authentication is enabled", voice_enabled: "voice authentication is enabled", policy_readable: "Duo policies were returned",
       helpdesk_bypass: "help-desk administrators may issue bypass codes", attempts_readable: "authentication attempts were returned", logs_readable: "the required Duo log was returned",
@@ -596,6 +620,7 @@ const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([groupNam
       decisionConstants: decision.constants,
       decisionRules: executable.rules,
       derivedFactRules: executable.derivedFactRules,
+      completeness: DUO_COMPLETENESS[id],
       decision: decisions[group][index],
     };
   });
