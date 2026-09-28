@@ -145,6 +145,7 @@ const rows: readonly Batch3CheckRow[] = [
     decisionInputs: {
       qualys_c02_host_list_readable: "Boolean true only when the host XML list returns parseable LAST_VULN_SCAN_DATETIME and LAST_VM_AUTH_SCANNED_DATE fields.",
       qualys_c02_host_list_complete: "Boolean true only when host XML pagination exhausts without a cap, repeated continuation, request error, denial, or missing required fields.",
+      qualys_c02_returned_host_count: "Uncapped host XML record count; zero means the subscription population is unknown rather than a zero-percent authenticated population.",
       qualys_c02_scanned_host_count: "Uncapped count of hosts carrying a parseable vulnerability scan date; this is the ratio denominator.",
       qualys_c02_authenticated_host_count: "Uncapped count of scanned hosts whose LAST_VM_AUTH_SCANNED_DATE falls inside max(configured lookbackDays, 30 days).",
       qualys_c02_hosts_without_scan_date_count: "Uncapped count of returned hosts without a parseable vulnerability scan date; these hosts never enter the denominator and require review only after the ratio branch.",
@@ -153,6 +154,7 @@ const rows: readonly Batch3CheckRow[] = [
     decisionRules: [
       batch2Rule("manual", batch2Ne("qualys_c02_host_list_readable", true)),
       batch2Rule("manual", batch2Not(batch2Defined("qualys_c02_configured_min_auth_scan_percent"))),
+      batch2Rule("manual", batch2Eq("qualys_c02_returned_host_count", 0)),
       batch2Rule("fail", batch2Eq("qualys_c02_scanned_host_count", 0)),
       batch2Rule("fail", {
         op: "ratio",

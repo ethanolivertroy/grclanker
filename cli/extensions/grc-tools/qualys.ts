@@ -27,6 +27,7 @@ import {
 import {
   batch3RuntimeFacts,
   batch3SetCompleteness,
+  batch3SetReadability,
   batch3UnavailableFacts,
   type Batch3RuntimeFactValues,
 } from "./batch3-spec-helpers.js";
@@ -2025,11 +2026,19 @@ function guardedFinding(input: VerdictInput): QualysFinding {
       ? { ...decisionFacts, complete: false }
       : batch3SetCompleteness(`QUALYS-C${String(input.control).padStart(2, "0")}`, decisionFacts, false);
   };
+  const markUnreadable = (): void => {
+    if (!decisionFacts) return;
+    const id = `QUALYS-C${String(input.control).padStart(2, "0")}`;
+    decisionFacts = isQualysDecisionValues(decisionFacts)
+      ? { ...decisionFacts, readable: false }
+      : batch3SetReadability(id, decisionFacts, false);
+  };
 
   if (unreadable.length > 0) {
     const causes = unreadable.map((source) => `${source.name}${source.moduleUnavailable ? " (module unlicensed or role not permitted)" : ""}: ${shortenMessage(source.error ?? "", 120)}`);
     if (status !== "fail") status = "manual";
     markIncomplete();
+    markUnreadable();
     notes.push(`${status === "fail" ? "Additional evidence was not readable" : "Required evidence was not readable"}: ${causes.join("; ")}.`);
   }
   // A call blocked by an unreadable upstream is disclosed with the read it would have made; a call skipped because
@@ -2893,6 +2902,7 @@ export async function assessQualysScanCoverage(
     decisionFacts: {
       qualys_c02_host_list_readable: !hosts.error,
       qualys_c02_host_list_complete: !hosts.error && !hosts.truncated,
+      qualys_c02_returned_host_count: hosts.error ? null : hosts.data.length,
       qualys_c02_scanned_host_count: hosts.error ? null : scannedHosts.length,
       qualys_c02_authenticated_host_count: hosts.error ? null : authScannedHosts.length,
       qualys_c02_hosts_without_scan_date_count: hosts.error ? null : hostsWithoutScanDate.length,

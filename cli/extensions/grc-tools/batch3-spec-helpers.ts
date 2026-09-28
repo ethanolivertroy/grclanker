@@ -64,6 +64,8 @@ function checkPrefix(id: string): string {
 function semanticStem(title: string): string {
   return title
     .toLowerCase()
+    .replaceAll(/\bstatus\b/g, "state")
+    .replaceAll(/\b(?:label|verdict|outcome)\b/g, "result")
     .replaceAll(/[^a-z0-9]+/g, "_")
     .replaceAll(/^_+|_+$/g, "");
 }
@@ -118,6 +120,14 @@ export function batch3SetCompleteness(
   return { ...facts, [batch3FactNames(id).complete]: complete };
 }
 
+export function batch3SetReadability(
+  id: string,
+  facts: Readonly<Record<string, unknown>>,
+  readable: boolean,
+): Readonly<Record<string, unknown>> {
+  return { ...facts, [batch3FactNames(id).readable]: readable };
+}
+
 export function batch3SetReviewMinimum(
   id: string,
   facts: Readonly<Record<string, unknown>>,
@@ -166,13 +176,16 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       [names.failureMatches]: `Non-negative integer counted directly from primitive vendor fields before any per-record status exists. Exact predicate: ${row.predicate}`,
       [names.reviewMatches]: `Non-negative integer counted directly from missing, unknown, or review-only primitive fields before any per-record status exists. Exact predicate and precedence: ${row.predicate}`,
     });
+    const unreadableRule = batch2Rule("manual", batch2Any(
+      batch2Ne(names.readable, true),
+      batch2Not(batch2Defined(names.readable)),
+      ...(row.incompleteOutcome === "manual" ? [batch2Ne(names.complete, true)] : []),
+    ));
+    const violationRule = batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0));
     const suppliedDecisionRules = row.decisionRules ?? (row.manualOnly ? undefined : [
-      batch2Rule("manual", batch2Any(
-        batch2Ne(names.readable, true),
-        batch2Not(batch2Defined(names.readable)),
-        ...(row.incompleteOutcome === "manual" ? [batch2Ne(names.complete, true)] : []),
-      )),
-      batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0)),
+      ...(row.incompleteOutcome === "manual"
+        ? [unreadableRule, violationRule]
+        : [violationRule, unreadableRule]),
       ...(row.emptyOutcome === undefined || row.emptyOutcome === "manual"
         ? [batch2Rule("manual", batch2Eq(names.population, 0))]
         : [batch2Rule(row.emptyOutcome, batch2All(batch2Eq(names.population, 0), batch2Eq(names.complete, true)))]),
