@@ -240,7 +240,9 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       completeness: row.completeness ?? batch2Completeness(
         decisionInputs,
         completenessSources,
-        row.completenessSemantics ?? exactCompletenessSemantics,
+        row.completenessSemantics
+          ? `${names.complete}: ${row.completenessSemantics}`
+          : exactCompletenessSemantics,
       ),
       specificCriteria: true,
     };

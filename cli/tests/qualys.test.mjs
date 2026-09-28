@@ -6,6 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { inflateRawSync } from "node:zlib";
+import { createHash } from "node:crypto";
 
 import { assertNoCanaryWindows } from "./helpers/error-canaries.mjs";
 import {
@@ -2117,6 +2118,61 @@ test("assessQualysScanCoverage: empty fixture never passes and states the emptin
   assert.equal(findingById(noHosts, "QUALYS-C02").status, "manual");
   const noGroups = await assessQualysScanCoverage(createFakeClient({ ...healthyFixtures, listAssetGroups: async () => [] }));
   assert.equal(findingById(noGroups, "QUALYS-C01").status, "manual");
+});
+
+test("QUALYS-C16 preserves exact proved-failure bytes across one denied source and 45 independent second-source failures", async () => {
+  const deniedProfiles = failing("Qualys request failed (403) for listOptionProfiles: code 2010: Forbidden, module not subscribed for this user");
+  const broadRange = async () => [{ type: "range", value: "10.0.0.0-10.0.255.255" }];
+  const baseOverrides = {
+    ...healthyFixtures,
+    listOptionProfiles: deniedProfiles,
+    listExcludedIps: broadRange,
+  };
+  const project = (results) => {
+    const finding = allFindings(results).find((item) => item.id === "QUALYS-C16");
+    assert.ok(finding);
+    return JSON.stringify({ status: finding.status, summary: finding.summary, evidence: finding.evidence });
+  };
+  const baselineBytes = project(await runAllAssessments(createFakeClient(baseOverrides)));
+  assert.equal(
+    createHash("sha256").update(baselineBytes).digest("hex"),
+    "QUALYS_C16_DENIED_PROFILE_BASELINE_SHA256",
+    "the status, summary, and evidence snapshot is intentionally byte-pinned",
+  );
+  assert.match(baselineBytes, /^{"status":"fail","summary":"1 excluded IP ranges span more than 256 addresses\. Additional evidence was not readable:/);
+
+  const secondSources = [
+    "listAppliances",
+    "listAuthRecordSummary",
+    "listCompliancePolicies",
+    "listDetections",
+    "listKnowledgeBase",
+    "listScheduledReports",
+    "listReports",
+    "listActivityLog",
+    "searchCloudAgents",
+    "searchConnectors",
+    "searchTags",
+    "searchWebApps",
+    "searchWasScans",
+    "searchWasAuthRecords",
+    "searchWasSchedules",
+  ];
+  let cases = 1;
+  for (const methodName of secondSources) {
+    for (const mode of ["denied", "empty", "truncated"]) {
+      const original = healthyFixtures[methodName];
+      const override = mode === "denied"
+        ? failing(`Qualys request failed (403) for ${methodName}: code 2010: Forbidden`)
+        : mode === "empty"
+          ? async () => []
+          : async (...args) => truncated(normalizeList(await original(...args)).items, `${methodName} pairwise truncation`);
+      const bytes = project(await runAllAssessments(createFakeClient({ ...baseOverrides, [methodName]: override })));
+      assert.equal(bytes, baselineBytes, `${methodName}/${mode}: unrelated second-source failure must not alter QUALYS-C16 bytes`);
+      cases += 1;
+    }
+  }
+  assert.equal(cases, 46);
 });
 
 test("assessQualysScanCoverage: partial fixture never passes and reports seen versus cap", async () => {

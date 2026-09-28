@@ -213,11 +213,11 @@ const rows: readonly Batch3CheckRow[] = [
     completeness: {
       qualys_c10_host_and_detection_lists_complete: {
         sources: [batch3Source("hosts"), batch3Source("detections")],
-        semantics: "For QUALYS-C10, qualys_c10_host_and_detection_lists_complete is true only when both host and detection pagination exhaust. Exact source-state effects: hosts sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field; detections sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field. Finding previews and exported samples never establish source cardinality.",
+        semantics: "qualys_c10_host_and_detection_lists_complete is true only when both host and detection pagination exhaust. Hosts and detections each set this named fact false on truncated, error, denied, not-collected, not-configured, or missing-required-field. Finding previews and exported samples never establish source cardinality.",
       },
       qualys_c10_detection_list_complete: {
         sources: [batch3Source("detections")],
-        semantics: "For QUALYS-C10, qualys_c10_detection_list_complete is true when detection pagination exhausts regardless of host-list coverage. Exact source-state effects: detections sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field. Finding previews and exported samples never establish source cardinality.",
+        semantics: "qualys_c10_detection_list_complete is true when detection pagination exhausts regardless of host-list coverage. Detections sets this named fact false on truncated, error, denied, not-collected, not-configured, or missing-required-field. Finding previews and exported samples never establish source cardinality.",
       },
     },
     decisionRules: [

@@ -248,7 +248,7 @@ const rows: readonly Batch3CheckRow[] = [
       batch2Rule("manual", batch2Ne("cs_23_contained_host_read_succeeded", true)),
       batch2Rule("warn", batch2All(batch2Eq("cs_23_contained_host_count", 0), batch2Ne("cs_23_contained_host_list_complete", true))),
       batch2Rule("pass", batch2All(batch2Eq("cs_23_contained_host_count", 0), batch2Eq("cs_23_contained_host_list_complete", true))),
-      batch2Rule("warn", { op: "gt", left: batch2Path("cs_23_max_containment_age_hours"), right: batch2Path("containment_sla_hours") }, "The shipped parent reports every active containment as warn; this ordered branch separately identifies hosts beyond the 72-hour SLA without changing bytes."),
+      batch2Rule("warn", { op: "gt", left: batch2Path("cs_23_max_containment_age_hours"), right: batch2Path("containment_sla_hours") }, "Every active containment reports warn; this ordered branch separately identifies hosts beyond the 72-hour SLA."),
       batch2Rule("warn", batch2Gt("cs_23_contained_host_count", 0)),
       batch2Rule("warn", batch2Any(batch2Ne("cs_23_contained_host_list_complete", true), batch2Gt("cs_23_undated_contained_host_count", 0))),
       batch2Rule("pass", { op: "always" }),

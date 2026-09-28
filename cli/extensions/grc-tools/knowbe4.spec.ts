@@ -396,8 +396,8 @@ export const KNOWBE4_SPEC = buildBatchIntegrationSpec({
   runtimeBehavior: KNOWBE4_RUNTIME_BEHAVIOR,
   knownGaps: [
     "The Reporting API exposes neither USB drop campaign execution nor a complete administrative-role directory on every subscription; unavailable fields remain manual.",
-    "KNOWBE4-10 preserves the shipped parent behavior when the security-test collection is empty but previously collected recipient samples remain present: a clean sampled outcome (no failures due or a 90% or higher remediation rate) can pass even though recipient_reads_complete is false. This contradictory snapshot is a report-only runtime candidate; the spec binding does not harden it.",
-    "KNOWBE4-18 preserves the shipped parent behavior when the security-test collection is empty but stale activity metadata marks the read partial: zero users_without_loaded_activity can pass even though inactive_users is null and partial_activity_data is true. This contradictory snapshot is a report-only runtime candidate; the spec binding does not harden it.",
+    "KNOWBE4-10 can pass when the security-test collection is empty but retained recipient samples prove no failures are due or at least 90 percent remediation even though recipient_reads_complete is false. This contradictory snapshot is explicitly represented and remains a runtime candidate.",
+    "KNOWBE4-18 can pass when the security-test collection is empty, stale activity metadata marks the read partial, users_without_loaded_activity is zero, and inactive_users is null. This contradictory snapshot is explicitly represented and remains a runtime candidate.",
   ],
   sensitiveFields: ["api_token", "phisher_api_token", "authorization", "cookie", "email", "first_name", "last_name", "manager_name", "ip_address"],
   credentialFormats: ["KnowBe4 Reporting API bearer tokens", "PhishER Product API bearer tokens", "authorization headers", "user PII"],

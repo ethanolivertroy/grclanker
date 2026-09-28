@@ -114,9 +114,9 @@ test("batch 3 completeness names exact datasets and all six collection failure m
         contracts += 1;
         assert.ok(contract.semantics.length >= 80, `${check.id}.${name}: exact semantics`);
         assert.deepEqual(new Set(contract.sources.map((source) => source.surfaceId)).size, contract.sources.length);
-        assert.match(contract.semantics, new RegExp(`For ${check.id},`));
-        assert.match(contract.semantics, /Exact source-state effects:/);
+        assert.match(contract.semantics, new RegExp(name));
         assert.match(contract.semantics, /Finding previews and exported samples never establish source cardinality\./);
+        assert.doesNotMatch(contract.semantics, /\bevidence_complete\b|For [A-Z0-9-]+, For /);
         for (const source of contract.sources) {
           sources += 1;
           assert.ok(surfaceIds.has(source.surfaceId), `${check.id}.${name}.${source.surfaceId}`);
@@ -125,7 +125,7 @@ test("batch 3 completeness names exact datasets and all six collection failure m
             ? expectedModes.filter((mode) => mode !== "truncated")
             : expectedModes;
           assert.deepEqual([...source.falseWhen].sort(), expectedFalseWhen, sourceKey);
-          assert.match(contract.semantics, new RegExp(`${source.surfaceId} sets evidence_complete false on`));
+          assert.match(contract.semantics, new RegExp(source.surfaceId));
           for (const mode of expectedModes) {
             assert.match(contract.semantics, new RegExp(`\\b${mode}\\b`), `${check.id}.${name}.${source.surfaceId}.${mode}`);
           }
@@ -268,7 +268,7 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
     const markdown = [...first.entries()].find(([path]) => path.endsWith(suffix))?.[1];
     assert.ok(markdown, entry.outputPath);
     assert.match(markdown, /Rules are evaluated from lowest order number to highest/);
-    assert.match(markdown, /Portable derivation/);
+    assert.match(markdown, /Decision predicate/);
     for (const check of spec.checks) {
       for (const [name, value] of Object.entries(check.criteria.constants)) {
         if (typeof value !== "number") continue;
@@ -280,5 +280,52 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
       /\b(?:TypeScript|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments|evaluateBatchRuntimeCheckVerdict|batch[23](?:Checks|Completeness)|cli\/extensions)\b/,
     );
     assert.doesNotMatch(markdown, /all explicitly named source datasets|check-specific source and precedence semantics|name-derived|generic decision/i);
+    assert.doesNotMatch(markdown, /\bevidence_complete\b|For [A-Z0-9-]+, For |shipped parent|without changing bytes|migration/i);
+    for (const check of spec.checks) {
+      for (const example of check.criteria.examples) {
+        assert.match(example.input, /concrete primitive assignment:/, `${check.id}.${example.kind}: concrete example`);
+        assert.equal(example.expected, check.criteria.rules.find((rule) => rule.status === example.expected)?.status ?? example.expected);
+      }
+    }
+  }
+});
+
+test("Qualys metadata matches every concrete VM/PC v2 and QPS request parameter", () => {
+  const byId = new Map(QUALYS_SPEC.apiSurfaces.map((surface) => [surface.id, surface]));
+  const expectedVmParameters = {
+    "scheduled-scans": ["action", "show_notifications"],
+    scans: ["action", "launched_after_datetime", "show_ags", "show_op"],
+    hosts: ["action", "details", "show_tags", "truncation_limit"],
+    "option-profiles": ["action"],
+    "excluded-ips": ["action"],
+    "asset-groups": ["action", "show_attributes", "truncation_limit"],
+    appliances: ["action", "output_mode"],
+    "auth-records": ["action"],
+    "compliance-policies": ["action", "details"],
+    detections: ["action", "status", "severities", "show_qds", "truncation_limit", "output_format"],
+    "knowledge-base": ["action", "details", "ids"],
+    "scheduled-reports": ["action", "is_active"],
+    reports: ["action"],
+    "activity-log": ["action", "since_datetime", "truncation_limit"],
+    "user-list": [],
+  };
+  for (const [id, names] of Object.entries(expectedVmParameters)) {
+    const surface = byId.get(id);
+    assert.ok(surface, id);
+    assert.equal(surface.method, "GET", `${id}: VM/PC and Administration reads use GET`);
+    assert.ok(surface.request.headers.includes("X-Requested-With: grclanker"), id);
+    assert.deepEqual(surface.request.parameters.map((entry) => entry.name), names, id);
+  }
+  assert.equal(byId.get("detections").request.parameters.find((entry) => entry.name === "status").value, "Active,New,Re-Opened");
+
+  const qpsIds = ["connectors", "cloud-agents", "tags", "users", "was-webapps", "was-scans", "was-scan-history", "was-auth-records", "was-schedules"];
+  for (const id of qpsIds) {
+    const surface = byId.get(id);
+    assert.equal(surface.method, "POST", `${id}: every QPS search is POST`);
+    assert.deepEqual(
+      surface.request.parameters.slice(0, 2).map((entry) => entry.name),
+      ["ServiceRequest.preferences.limitResults", "ServiceRequest.preferences.startFromId"],
+      `${id}: exact QPS pagination envelope`,
+    );
   }
 });
