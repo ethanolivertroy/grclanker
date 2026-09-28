@@ -22,6 +22,18 @@ function joinPrompt(args: string[]): string | undefined {
   return args.length > 0 ? args.join(" ") : undefined;
 }
 
+function withPromptOptions(
+  result: Pick<CliInvocation, "kind"> & Partial<Extract<CliInvocation, { kind: "command" | "prompt" }>>,
+  compute: ComputeBackendKind | undefined,
+  prompt: string | undefined,
+): CliInvocation {
+  return {
+    ...result,
+    ...(compute ? { compute } : {}),
+    ...(prompt ? { prompt } : {}),
+  } as CliInvocation;
+}
+
 export function routeCliInvocation(
   args: string[],
   commands: readonly string[],
@@ -34,7 +46,7 @@ export function routeCliInvocation(
 
   if (commands.includes(command)) {
     const { compute, rest } = extractComputeFlag(args.slice(1));
-    return { kind: "command", command, compute, prompt: joinPrompt(rest) };
+    return withPromptOptions({ kind: "command", command }, compute, joinPrompt(rest));
   }
 
   if (command !== "--" && command.startsWith("-")) {
@@ -42,5 +54,5 @@ export function routeCliInvocation(
   }
 
   const { compute, rest } = extractComputeFlag(args);
-  return { kind: "prompt", compute, prompt: joinPrompt(rest) };
+  return withPromptOptions({ kind: "prompt" }, compute, joinPrompt(rest));
 }
