@@ -68,6 +68,7 @@ test("batch 2 tool definitions carry non-enumerable contracts without changing e
 
 test("batch 2 executable decisions reject undeclared, missing, and null evidence", () => {
   const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant|availability|available|enforcement|enforced)(?:_|$)/;
+  const documentedRawVendorStatusFields = new Set(["CF-IAM-02:verified_status"]);
   for (const [spec] of batch) {
     validateDecisionInputs(spec);
     for (const check of spec.checks) {
@@ -81,7 +82,19 @@ test("batch 2 executable decisions reject undeclared, missing, and null evidence
         () => evaluateCheckVerdict(check, { ...nullFacts, legacy_selected_status: "pass" }),
         new RegExp(`${check.id} received undeclared decision input`),
       );
-      for (const name of check.evidenceFields) assert.doesNotMatch(name, forbidden, `${check.id}: ${name}`);
+      assert.deepEqual(
+        Object.keys(check.evidenceFieldDescriptions ?? {}).sort(),
+        [...check.evidenceFields].sort(),
+        `${check.id}: every declared raw input has exactly one rendered description`,
+      );
+      for (const name of check.evidenceFields) {
+        if (!documentedRawVendorStatusFields.has(`${check.id}:${name}`)) {
+          assert.doesNotMatch(name, forbidden, `${check.id}: ${name}`);
+        }
+        const description = check.evidenceFieldDescriptions?.[name] ?? "";
+        assert.ok(description.length >= 40, `${check.id}: ${name} has a substantive portable description`);
+        assert.doesNotMatch(description, /Primitive value computed|implementation|repository|TypeScript/i, `${check.id}: ${name}`);
+      }
     }
   }
 });

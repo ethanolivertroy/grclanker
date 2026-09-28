@@ -90,10 +90,10 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
       ? {}
       : {
           evidence_readable: "True only when every raw vendor field required by this finding was returned and is non-null.",
-          evidence_complete: "True only when every required inventory proved exhaustion before any presentation sample was capped.",
-          inventory_count: "The complete number of source records evaluated by this finding, before presentation truncation.",
-          violation_count: "The complete count of source records that satisfy the finding-specific violation predicate.",
-          review_count: "The complete count of readable source records that satisfy the finding-specific warning or review predicate.",
+          evidence_complete: "Boolean. True only when every required inventory proved exhaustion before any presentation sample was capped; null or missing means completeness was not proved and cannot support pass.",
+          inventory_count: "Non-negative integer. The complete number of source records evaluated by this finding before presentation truncation; null or missing means cardinality is unknown and cannot support pass.",
+          violation_count: "Non-negative integer. The complete count of source records that satisfy the finding-specific violation predicate stated by this check; null or missing means the predicate was not evaluated and cannot support pass.",
+          review_count: "Non-negative integer. The complete count of readable source records that satisfy the finding-specific warning predicate stated by this check; null or missing means the predicate was not evaluated and cannot support pass.",
         });
     const executable = deriveDecisionRules(row.id, executableRules(row));
     return {
