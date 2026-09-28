@@ -61,6 +61,14 @@ const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|
 const ABSENT = Symbol("absent");
 const DEFINED = Symbol("defined");
 
+function alternativeValues(value, domains) {
+  if (typeof value === "boolean") return [!value, null];
+  if (typeof value === "number") return [value - 1, value + 1, "__not_numeric__", null];
+  if (typeof value === "string") return domains.strings.filter((candidate) => candidate !== value).slice(0, 3);
+  if (value === null) return [0];
+  return ["__different"];
+}
+
 function mergeAssignments(left, right) {
   const merged = new Map(left);
   for (const [name, value] of right) {
@@ -101,25 +109,37 @@ function operandState(operand, constants) {
 function comparisonWitnesses(condition, desired, constants, domains) {
   const left = operandState(condition.left, constants);
   const right = operandState(condition.right, constants);
-  const candidatesFor = (knownPeer) => {
-    if (typeof knownPeer === "boolean") return [true, false, null];
-    if (typeof knownPeer === "string") return [knownPeer, ...domains.strings, "__different__", null];
-    if (typeof knownPeer === "number") return [knownPeer - 1, knownPeer, knownPeer + 1, ...domains.numbers, null, "__not_numeric__"];
-    return [...domains.numbers, ...domains.strings, true, false, null, "__not_numeric__"];
-  };
-  const leftValues = left.known
-    ? [left.value]
-    : candidatesFor(right.known ? right.value : undefined);
-  const rightValues = right.known
-    ? [right.value]
-    : candidatesFor(left.known ? left.value : undefined);
-  return leftValues.flatMap((leftValue) => rightValues.flatMap((rightValue) => {
-    const assignment = new Map();
-    if (!left.known) assignment.set(left.path, leftValue);
-    if (!right.known) assignment.set(right.path, rightValue);
-    const facts = { ...constants, ...rawFacts(assignment) };
-    return evaluateVerdictCondition(condition, facts) === desired ? [assignment] : [];
-  }));
+  const evaluate = (leftValue, rightValue) => evaluateVerdictCondition(condition, {
+    ...constants,
+    ...(!left.known ? { [left.path]: leftValue } : {}),
+    ...(!right.known ? { [right.path]: rightValue } : {}),
+  });
+  if (left.known && right.known) return evaluate(left.value, right.value) === desired ? [new Map()] : [];
+
+  if (!left.known && right.known) {
+    const values = condition.op === "eq" || condition.op === "ne"
+      ? [right.value, ...alternativeValues(right.value, domains)]
+      : [...domains.numbers, Number(right.value) - 1, Number(right.value), Number(right.value) + 1, "__not_numeric__"];
+    return [...new Set(values)]
+      .filter((leftValue) => evaluate(leftValue, right.value) === desired)
+      .map((leftValue) => new Map([[left.path, leftValue]]));
+  }
+  if (left.known && !right.known) {
+    const values = condition.op === "eq" || condition.op === "ne"
+      ? [left.value, ...alternativeValues(left.value, domains)]
+      : [...domains.numbers, Number(left.value) - 1, Number(left.value), Number(left.value) + 1, "__not_numeric__"];
+    return [...new Set(values)]
+      .filter((rightValue) => evaluate(left.value, rightValue) === desired)
+      .map((rightValue) => new Map([[right.path, rightValue]]));
+  }
+
+  const values = domains.numbers.slice(0, 20);
+  return values.flatMap((leftValue) => values
+    .filter((rightValue) => evaluate(leftValue, rightValue) === desired)
+    .map((rightValue) => new Map([
+      [left.path, leftValue],
+      [right.path, rightValue],
+    ])));
 }
 
 function ratioWitnesses(condition, desired, constants) {
