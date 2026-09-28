@@ -1430,6 +1430,15 @@ test("verdict safety rule 7: truncated pages downgrade the assessments that depe
     assert.match(item.summary, /3 of an unknown total of prevention policies/);
   }
   assert.equal(prevention.summary.policies_truncated, true);
+
+  const emptyPrevention = await assessCrowdstrikePreventionPolicies(createFakeClient({
+    listPreventionPolicies: async () => ({ items: [], total: 3, truncated: true }),
+  }));
+  for (const item of emptyPrevention.findings) {
+    assert.equal(item.status, "manual", `${item.id} cannot infer an absence violation from zero visible rows of a truncated policy list`);
+    assert.equal(item.evidence.absence_claim, true, `${item.id} marks the unavailable absence predicate`);
+    assert.match(item.summary, /0 of 3 prevention policies/);
+  }
 });
 
 test("verdict safety rule 8: re-running an export pairs each bundle directory with its own zip", async () => {
