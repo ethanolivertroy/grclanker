@@ -3,11 +3,21 @@ import {
   buildBatchOutputContract,
 } from "./batch-spec-builder.js";
 import {
+  batch2All as all,
+  batch2Any as any,
   batch2Checks,
+  batch2ComparePaths as comparePaths,
+  batch2Eq as eq,
+  batch2Gt as gt,
+  batch2Gte as gte,
+  batch2Lte as lte,
+  batch2Ne as ne,
+  batch2Rule as rule,
   restSurface,
   type Batch2CheckRow,
 } from "./batch2-spec-helpers.js";
 import { AZURE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+import type { PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 const DOCS = "https://learn.microsoft.com/en-us/graph/api/overview";
 const ARM_DOCS = "https://learn.microsoft.com/en-us/rest/api/azure/";
@@ -92,6 +102,247 @@ const rows: readonly AzureRow[] = [
   ["AZURE-NP-04", 24, "NSG flow logs enabled", "medium", ["network-security-groups", "network-watchers", "flow-logs"], "manual"],
 ] as const;
 
+interface AzureDecision {
+  inputs: Readonly<Record<string, string>>;
+  constants?: Readonly<Record<string, PortableValue>>;
+  rules: readonly VerdictRule[];
+}
+
+const inputs = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
+  names.map((name) => [name, `Primitive value computed from every record in the complete declared Azure source inventory: ${name.replaceAll("_", " ")}.`]),
+);
+const ordered = (branches: {
+  manual?: VerdictCondition;
+  fail?: VerdictCondition;
+  warn?: VerdictCondition;
+  pass?: VerdictCondition;
+  failFirst?: boolean;
+}): readonly VerdictRule[] => [
+  ...(branches.failFirst && branches.fail ? [rule("fail", branches.fail, "A proved violation precedes incomplete companion evidence.")] : []),
+  ...(branches.manual ? [rule("manual", branches.manual)] : []),
+  ...(!branches.failFirst && branches.fail ? [rule("fail", branches.fail)] : []),
+  ...(branches.warn ? [rule("warn", branches.warn)] : []),
+  ...(branches.pass ? [rule("pass", branches.pass)] : []),
+  rule("manual", { op: "always" }, "Unknown, null, contradictory, or otherwise insufficient evidence requires manual review."),
+];
+const unreadable = ne("readable", true);
+const incomplete = ne("complete", true);
+const empty = eq("inventory_count", 0);
+const countDecision = (
+  names: string[],
+  branches: Parameters<typeof ordered>[0],
+  constants?: Readonly<Record<string, PortableValue>>,
+): AzureDecision => ({ inputs: inputs("readable", "complete", "inventory_count", ...names), constants, rules: ordered(branches) });
+
+const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
+  "AZURE-ID-01": {
+    inputs: inputs("policy_readable", "complete", "policy_count", "mfa_policy_count", "security_defaults_readable", "security_defaults_enabled"),
+    rules: ordered({
+      manual: any(ne("policy_readable", true), all(eq("mfa_policy_count", 0), ne("security_defaults_readable", true))),
+      fail: all(eq("mfa_policy_count", 0), eq("security_defaults_enabled", false)),
+      warn: incomplete,
+      pass: any(gt("mfa_policy_count", 0), eq("security_defaults_enabled", true)),
+    }),
+  },
+  "AZURE-ID-02": {
+    inputs: inputs("policy_readable", "complete", "legacy_block_policy_count", "security_defaults_readable", "security_defaults_enabled"),
+    rules: ordered({
+      manual: any(ne("policy_readable", true), all(eq("legacy_block_policy_count", 0), ne("security_defaults_readable", true))),
+      fail: all(eq("legacy_block_policy_count", 0), eq("security_defaults_enabled", false)),
+      warn: incomplete,
+      pass: any(gt("legacy_block_policy_count", 0), eq("security_defaults_enabled", true)),
+    }),
+  },
+  "AZURE-ID-03": countDecision(["without_mfa_count", "without_mfa_ratio"], {
+    manual: any(unreadable, empty),
+    fail: gt("without_mfa_ratio", 0.1),
+    warn: any(incomplete, gt("without_mfa_count", 0)),
+    pass: eq("without_mfa_count", 0),
+  }, { warning_ratio_maximum: 0.1 }),
+  "AZURE-ID-04": countDecision(["global_admin_count", "privileged_assignment_count"], {
+    manual: any(unreadable, eq("privileged_assignment_count", 0)),
+    fail: any(gt("global_admin_count", 4), gt("privileged_assignment_count", 10)),
+    warn: any(incomplete, gt("privileged_assignment_count", 5)),
+    pass: lte("privileged_assignment_count", 5),
+  }, { maximum_global_admins: 4, pass_maximum_assignments: 5, fail_above_assignments: 10 }),
+  "AZURE-ID-05": countDecision(["expired_credential_count", "expiring_credential_count", "missing_expiry_count", "long_lived_credential_count"], {
+    manual: any(unreadable, empty),
+    fail: gt("expired_credential_count", 0),
+    warn: any(incomplete, gt("expiring_credential_count", 0), gt("missing_expiry_count", 0), gt("long_lived_credential_count", 0)),
+    pass: { op: "always" },
+  }, { expiring_days: 30, long_lived_days: 730 }),
+  "AZURE-ID-06": countDecision(["eligible_assignment_count", "permanent_privileged_count"], {
+    manual: any(unreadable, all(eq("eligible_assignment_count", 0), eq("permanent_privileged_count", 0))),
+    fail: gt("permanent_privileged_count", 2),
+    warn: any(incomplete, gt("permanent_privileged_count", 0), eq("eligible_assignment_count", 0)),
+    pass: { op: "always" },
+  }, { maximum_permanent_privileged_assignments: 2 }),
+  "AZURE-ID-07": {
+    inputs: inputs("readable", "guest_role_present", "guest_role_restricted", "guest_role_same_as_member", "invites_restricted", "invites_from_everyone"),
+    rules: ordered({
+      manual: any(unreadable, ne("guest_role_present", true)),
+      fail: any(eq("guest_role_same_as_member", true), eq("invites_from_everyone", true)),
+      warn: any(ne("guest_role_restricted", true), ne("invites_restricted", true)),
+      pass: all(eq("guest_role_restricted", true), eq("invites_restricted", true)),
+    }),
+  },
+  "AZURE-ID-08": countDecision(["stale_guest_count", "unknown_activity_count"], {
+    manual: unreadable,
+    fail: gt("stale_guest_count", 0),
+    warn: any(incomplete, gt("unknown_activity_count", 0)),
+    pass: { op: "always" },
+  }, { stale_days: 90 }),
+  "AZURE-ID-09": countDecision(["license_present", "enforcing_policy_count"], {
+    manual: any(unreadable, ne("license_present", true)),
+    fail: eq("enforcing_policy_count", 0),
+    warn: incomplete,
+    pass: gt("enforcing_policy_count", 0),
+  }),
+  "AZURE-ID-10": countDecision(["license_present", "enforcing_policy_count"], {
+    manual: any(unreadable, ne("license_present", true)),
+    fail: eq("enforcing_policy_count", 0),
+    warn: incomplete,
+    pass: gt("enforcing_policy_count", 0),
+  }),
+  "AZURE-ID-11": countDecision(["high_risk_user_count"], {
+    manual: unreadable,
+    fail: gt("high_risk_user_count", 0),
+    warn: any(incomplete, gt("inventory_count", 0)),
+    pass: eq("inventory_count", 0),
+  }),
+  "AZURE-ID-12": countDecision(["expired_credential_count", "expiring_credential_count", "missing_expiry_count", "long_lived_credential_count", "ownerless_application_count"], {
+    manual: any(unreadable, empty),
+    fail: gt("expired_credential_count", 0),
+    warn: any(incomplete, gt("expiring_credential_count", 0), gt("missing_expiry_count", 0), gt("long_lived_credential_count", 0), gt("ownerless_application_count", 0)),
+    pass: { op: "always" },
+  }, { expiring_days: 30, long_lived_days: 730 }),
+  "AZURE-ID-13": countDecision(["risky_grant_count"], {
+    manual: any(unreadable, empty),
+    fail: gt("risky_grant_count", 0),
+    warn: incomplete,
+    pass: eq("risky_grant_count", 0),
+  }),
+  "AZURE-MON-01": {
+    inputs: inputs("readable", "maximum_score", "score_ratio"),
+    constants: { pass_minimum_ratio: 0.75, warn_minimum_ratio: 0.5 },
+    rules: ordered({
+      manual: any(unreadable, lte("maximum_score", 0)),
+      fail: { op: "not", condition: gte("score_ratio", 0.5) },
+      warn: all(gte("score_ratio", 0.5), { op: "not", condition: gte("score_ratio", 0.75) }),
+      pass: gte("score_ratio", 0.75),
+    }),
+  },
+  "AZURE-MON-02": countDecision([], { manual: unreadable, warn: any(incomplete, empty), pass: gt("inventory_count", 0) }),
+  "AZURE-MON-03": countDecision([], { manual: unreadable, warn: any(incomplete, empty), pass: gt("inventory_count", 0) }),
+  "AZURE-MON-04": countDecision(["standard_plan_count"], {
+    manual: any(unreadable, empty),
+    fail: eq("standard_plan_count", 0),
+    warn: any(incomplete, { op: "not", condition: comparePaths("eq", "standard_plan_count", "inventory_count") }),
+    pass: comparePaths("eq", "standard_plan_count", "inventory_count"),
+  }),
+  "AZURE-MON-05": countDecision(["effective_setting_count"], {
+    manual: unreadable,
+    fail: eq("effective_setting_count", 0),
+    warn: incomplete,
+    pass: gt("effective_setting_count", 0),
+  }),
+  "AZURE-MON-06": countDecision(["destination_workspace_count", "linked_workspace_count", "compliant_workspace_count"], {
+    manual: any(unreadable, all(gt("destination_workspace_count", 0), eq("linked_workspace_count", 0))),
+    fail: any(eq("destination_workspace_count", 0), { op: "not", condition: comparePaths("eq", "compliant_workspace_count", "linked_workspace_count") }),
+    warn: incomplete,
+    pass: comparePaths("eq", "compliant_workspace_count", "linked_workspace_count"),
+  }, { minimum_retention_days: 90 }),
+  "AZURE-SUB-01": countDecision(["matching_assignment_count", "warn_maximum"], {
+    manual: any(unreadable, empty),
+    fail: comparePaths("gt", "matching_assignment_count", "warn_maximum"),
+    warn: any(incomplete, gt("matching_assignment_count", 0)),
+    pass: eq("matching_assignment_count", 0),
+  }),
+  "AZURE-SUB-02": countDecision(["matching_assignment_count", "warn_maximum"], {
+    manual: any(unreadable, empty),
+    fail: comparePaths("gt", "matching_assignment_count", "warn_maximum"),
+    warn: any(incomplete, gt("matching_assignment_count", 0)),
+    pass: eq("matching_assignment_count", 0),
+  }),
+  "AZURE-SUB-03": countDecision(["configured_contact_count"], {
+    manual: unreadable,
+    fail: eq("configured_contact_count", 0),
+    pass: gt("configured_contact_count", 0),
+  }),
+  "AZURE-SUB-04": countDecision([], { manual: unreadable, warn: any(incomplete, empty), pass: gt("inventory_count", 0) }),
+  "AZURE-SUB-05": countDecision(["privileged_service_principal_count"], {
+    manual: any(unreadable, empty),
+    fail: gt("privileged_service_principal_count", 0),
+    warn: incomplete,
+    pass: eq("privileged_service_principal_count", 0),
+  }),
+  "AZURE-DP-01": countDecision(["license_present", "device_count", "compliant_device_policy_count", "noncompliant_device_count", "unknown_device_count"], {
+    manual: any(unreadable, ne("license_present", true), all(gt("inventory_count", 0), eq("device_count", 0))),
+    fail: any(eq("inventory_count", 0), eq("compliant_device_policy_count", 0), gt("noncompliant_device_count", 0)),
+    warn: any(incomplete, gt("unknown_device_count", 0)),
+    pass: { op: "always" },
+  }),
+  "AZURE-DP-03": countDecision(["active_label_count"], {
+    manual: unreadable,
+    fail: eq("active_label_count", 0),
+    warn: incomplete,
+    pass: gt("active_label_count", 0),
+  }),
+  "AZURE-DP-04": countDecision(["missing_protection_count", "access_policy_vault_count", "open_network_count"], {
+    manual: any(unreadable, empty),
+    fail: gt("missing_protection_count", 0),
+    warn: any(incomplete, gt("access_policy_vault_count", 0), gt("open_network_count", 0)),
+    pass: { op: "always" },
+  }),
+  "AZURE-DP-05": countDecision(["http_allowed_count", "public_blob_count", "public_blob_unset_count", "weak_tls_count"], {
+    manual: any(unreadable, empty),
+    fail: any(gt("http_allowed_count", 0), gt("public_blob_count", 0)),
+    warn: any(incomplete, gt("public_blob_unset_count", 0), gt("weak_tls_count", 0)),
+    pass: { op: "always" },
+  }),
+  "AZURE-DP-06": countDecision(["mailbox_read_count", "mailbox_unreadable_count", "forwarding_rule_count"], {
+    manual: any(unreadable, empty),
+    fail: gt("forwarding_rule_count", 0),
+    warn: any(incomplete, gt("mailbox_unreadable_count", 0)),
+    pass: eq("forwarding_rule_count", 0),
+  }, undefined),
+  "AZURE-DP-08": {
+    inputs: inputs("readable", "capability_present", "capability", "domain_allowlist", "external_resharing"),
+    rules: ordered({
+      manual: any(unreadable, ne("capability_present", true)),
+      fail: all(ne("capability", "disabled"), ne("capability", "existingexternalusersharingonly"), ne("capability", "externalusersharingonly")),
+      warn: any(eq("external_resharing", true), all(eq("capability", "externalusersharingonly"), ne("domain_allowlist", true))),
+      pass: { op: "always" },
+    }),
+  },
+  "AZURE-NP-01": countDecision(["exposed_rule_count"], {
+    manual: any(unreadable, empty),
+    fail: gt("exposed_rule_count", 0),
+    warn: incomplete,
+    pass: eq("exposed_rule_count", 0),
+  }),
+  "AZURE-NP-02": countDecision(["enforced_assignment_count"], {
+    manual: unreadable,
+    fail: any(empty, eq("enforced_assignment_count", 0)),
+    warn: any(incomplete, { op: "not", condition: comparePaths("eq", "enforced_assignment_count", "inventory_count") }),
+    pass: comparePaths("eq", "enforced_assignment_count", "inventory_count"),
+  }),
+  "AZURE-NP-03": {
+    inputs: inputs("readable", "resource_count_present", "policy_count_present", "noncompliant_policy_count"),
+    rules: ordered({
+      manual: any(unreadable, ne("resource_count_present", true), ne("policy_count_present", true)),
+      warn: gt("noncompliant_policy_count", 0),
+      pass: eq("noncompliant_policy_count", 0),
+    }),
+  },
+  "AZURE-NP-04": countDecision(["covered_nsg_count", "uncovered_nsg_count"], {
+    manual: any(unreadable, empty),
+    fail: all(gt("uncovered_nsg_count", 0), eq("covered_nsg_count", 0)),
+    warn: any(incomplete, gt("uncovered_nsg_count", 0)),
+    pass: eq("uncovered_nsg_count", 0),
+  }),
+};
+
 const owner = (id: string): string => id.startsWith("AZURE-ID-")
   ? "azure_assess_identity"
   : id.startsWith("AZURE-MON-")
@@ -111,6 +362,9 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
   surfaces: sourceSurfaces,
   manualOnly: sourceSurfaces.length === 0,
   emptyOutcome,
+  decisionInputs: AZURE_DECISIONS[id]?.inputs,
+  decisionRules: AZURE_DECISIONS[id]?.rules,
+  constants: AZURE_DECISIONS[id]?.constants,
   decision: `Evaluate ${title} from the declared raw vendor fields and complete collector cardinalities: a proved violation takes precedence, unreadable or missing dependencies return manual, incomplete evidence or review predicates warn, and pass requires complete readable evidence with no violation.`,
 })));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
