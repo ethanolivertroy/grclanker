@@ -695,6 +695,16 @@ test("all-nine authentication environment names exactly match the variables read
     const args = extraArguments.length > 0 ? [...extraArguments] : [{}];
     args[1] = env;
     await resolver(...args);
+    const emptyProbe = trackedEnvironment();
+    const emptyArgs = extraArguments.length > 0 ? [...extraArguments] : [{}];
+    emptyArgs[1] = emptyProbe.env;
+    try {
+      await resolver(...emptyArgs);
+    } catch {
+      // Missing credentials are expected. This probe forces fallback aliases
+      // behind short-circuiting primary variables to be observed.
+    }
+    for (const variable of emptyProbe.accessed) accessed.add(variable);
     assert.deepEqual(
       [...accessed].sort(),
       [...resolverContract.environment].sort(),
