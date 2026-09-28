@@ -94,10 +94,20 @@ function mergeAssignments(left, right) {
 
 function combineAssignments(left, right) {
   const combined = [];
+  const seen = new Set();
   for (const first of left) {
     for (const second of right) {
       const merged = mergeAssignments(first, second);
-      if (merged) combined.push(merged);
+      if (!merged) continue;
+      const key = JSON.stringify(
+        [...merged]
+          .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
+          .map(([name, value]) => [name, value === ABSENT ? "__ABSENT__" : value === DEFINED ? "__DEFINED__" : value]),
+      );
+      if (seen.has(key)) continue;
+      seen.add(key);
+      combined.push(merged);
+      if (combined.length >= 5_000) return combined;
     }
   }
   return combined;
