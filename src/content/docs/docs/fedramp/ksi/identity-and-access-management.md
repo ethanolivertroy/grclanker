@@ -1,6 +1,6 @@
 ---
-title: Identity and Access Management — FedRAMP KSI Domain
-description: Official Consolidated Rules summary for the IAM FedRAMP key security indicator domain.
+title: "Identity and Access Management: FedRAMP KSI Domain"
+description: "Official Consolidated Rules summary for the IAM FedRAMP key security indicator domain."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -14,23 +14,23 @@ Domain code: `IAM` · Domain ID: `KSI-IAM` · Web slug: `identity-and-access-man
 
 ## Indicators
 
-### `KSI-IAM-AAM` — Automating Account Management
+### `KSI-IAM-AAM`: Automating Account Management
 
 The lifecycle and privileges of all accounts, roles, and groups are securely managed using automation.
 
 Mapped Rev5 controls: `ac-2.2`, `ac-2.3`, `ac-2.13`, `ac-6.7`, `ia-4.4`, `ia-12`, `ia-12.2`, `ia-12.3`, `ia-12.5`
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-IAM-APM` — Adopting Passwordless Methods
+### `KSI-IAM-APM`: Adopting Passwordless Methods
 
 Secure passwordless methods are used for user authentication and authorization when feasible, otherwise strong passwords with phishing-resistant MFA is used.
 
 Mapped Rev5 controls: `ac-3`, `ia-5.1`, `ia-5.2`, `ia-5.6`, `ia-6`, `ac-2`, `ia-2`, `ia-2.1`, `ia-2.2`, `ia-2.8`, `ia-5`, `ia-8`, `sc-23`
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-IAM-ELP` — Ensuring Least Privilege
+### `KSI-IAM-ELP`: Ensuring Least Privilege
 
 Identity and access management measures are used and persistently reviewed to ensure each user or device can only access the resources they need.
 
@@ -38,9 +38,9 @@ Mapped Rev5 controls: `ac-2.5`, `ac-2.6`, `ac-3`, `ac-4`, `ac-6`, `ac-12`, `ac-1
 
 Terms: `Persistently`
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-IAM-JIT` — Authorizing Just-in-Time
+### `KSI-IAM-JIT`: Authorizing Just-in-Time
 
 A least-privileged, role and attribute-based, and just-in-time security authorization model is used and persistently reviewed for all user and non-user accounts and services.
 
@@ -48,9 +48,9 @@ Mapped Rev5 controls: `ac-2`, `ac-2.1`, `ac-2.2`, `ac-2.3`, `ac-2.4`, `ac-2.6`, 
 
 Terms: `Persistently`
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-IAM-SNU` — Securing Non-User Authentication
+### `KSI-IAM-SNU`: Securing Non-User Authentication
 
 Appropriately secure authentication methods are used and persistently reviewed for non-user accounts and services.
 
@@ -58,9 +58,9 @@ Mapped Rev5 controls: `ac-2`, `ac-2.2`, `ac-4`, `ac-6.5`, `ia-3`, `ia-5.2`, `ra-
 
 Terms: `Persistently`
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `KSI-IAM-SUS` — Responding to Suspicious Activity
+### `KSI-IAM-SUS`: Responding to Suspicious Activity
 
 Accounts with privileged access are disabled or otherwise secured in response to suspicious activity.
 
@@ -68,4 +68,4 @@ Mapped Rev5 controls: `ac-2`, `ac-2.1`, `ac-2.3`, `ac-2.13`, `ac-7`, `ps-4`, `ps
 
 Terms: `Vulnerability Response`
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
