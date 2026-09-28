@@ -1,6 +1,6 @@
 ---
-title: Agency Use of FedRAMP Certified Cloud Services — FedRAMP Process
-description: Official Consolidated Rules summary for the AGU FedRAMP process, including applicability and requirements.
+title: "Agency Use of FedRAMP Certified Cloud Services: FedRAMP Process"
+description: "Official Consolidated Rules summary for the AGU FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,23 +30,23 @@ The Agency Use rules summarize the many demands made on agencies by the FedRAMP 
 
 ## Rule Subsets
 
-- `AGC` — General Agency Responsibilities: These rules apply to agencies based on the FedRAMP Authorization Act, OMB M-24-15, and related FedRAMP policies. · types: 20x, Rev5 · classes: A, B, C, D
-- `SPN` — Agency Sponsored Certifications: These rules apply when an agency sponsors a FedRAMP Rev5 Certification after completing an agency authorization. · types: Rev5 · classes: B, C, D
-- `USE` — Use of FedRAMP Certifications: These rules apply when agencies use FedRAMP Certifications to make agency authorization decisions. · types: 20x, Rev5 · classes: A, B, C, D
+- `AGC` · General Agency Responsibilities: These rules apply to agencies based on the FedRAMP Authorization Act, OMB M-24-15, and related FedRAMP policies. · types: 20x, Rev5 · classes: A, B, C, D
+- `SPN` · Agency Sponsored Certifications: These rules apply when an agency sponsors a FedRAMP Rev5 Certification after completing an agency authorization. · types: Rev5 · classes: B, C, D
+- `USE` · Use of FedRAMP Certifications: These rules apply when agencies use FedRAMP Certifications to make agency authorization decisions. · types: 20x, Rev5 · classes: A, B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `AGU-AGC-AIP` MUST — Agency Internal Policies
+### `AGU-AGC-AIP` MUST: Agency Internal Policies
 
 Agencies MUST maintain agency-wide policy that aligns with the requirements in OMB Memorandum M-24-15.
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-AGC-GRC` MUST — Governance, Risk, and Compliance Tools
+### `AGU-AGC-GRC` MUST: Governance, Risk, and Compliance Tools
 
 Agencies MUST ensure that internal governance, risk, compliance, and inventory tools can produce and ingest machine-readable artifacts using formats identified by FedRAMP, including at least:
 
@@ -58,17 +58,17 @@ Terms: `Artifacts`, `Machine-Readable`
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-AGC-LIA` SHOULD — Agency Liaison Program
+### `AGU-AGC-LIA` SHOULD: Agency Liaison Program
 
 Agencies SHOULD assign at least 1 federal employee to be an active participant in the FedRAMP Agency Liaison program.
 
 Affects: Agencies
 
-Recent update: 2026-09-13 — Fixed broken reference URL for the Agency Liaison Program.
+Recent update (2026-09-13): Fixed broken reference URL for the Agency Liaison Program.
 
-### `AGU-AGC-NAA` MUST — Notify FedRAMP After Authorization
+### `AGU-AGC-NAA` MUST: Notify FedRAMP After Authorization
 
 Agencies MUST notify FedRAMP upon authorizing the use of a cloud service within the scope of FedRAMP, supplying at least the following information:
 
@@ -78,9 +78,9 @@ Checklist items:
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-AGC-NAI` MUST — Notify Additional Information Requests
+### `AGU-AGC-NAI` MUST: Notify Additional Information Requests
 
 Agencies MUST notify FedRAMP after requesting any additional information or materials from a FedRAMP Certified cloud service offering beyond those required by FedRAMP.
 
@@ -90,9 +90,9 @@ Affects: Agencies
 
 Note: Agencies are expected to notify FedRAMP under OMB Memorandum M-24-15 section IV (a).
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-AGC-NAR` MUST NOT — No Additional Security Requirements
+### `AGU-AGC-NAR` MUST NOT: No Additional Security Requirements
 
 Agencies MUST NOT require additional information or materials from FedRAMP Certified cloud service offerings beyond those required by FedRAMP UNLESS the head of the agency or an authorized delegate determines there is a demonstrable need and notifies FedRAMP; this does not apply to seeking clarification or asking general questions about FedRAMP Certification Data.
 
@@ -102,9 +102,9 @@ Affects: Agencies
 
 Note: This is related to the Presumption of Adequacy for a FedRAMP Certification and notification is mandated by OMB Memorandum M-24-15 section IV (a).
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-AGC-SIN` SHOULD — Shared FedRAMP Inbox
+### `AGU-AGC-SIN` SHOULD: Shared FedRAMP Inbox
 
 Agencies SHOULD establish and maintain a dedicated shared FedRAMP agency inbox to serve as the official point of contact for communications between FedRAMP and the agency.
 
@@ -112,9 +112,9 @@ Affects: Agencies
 
 Note: A shared FedRAMP agency inbox may follow an agency-specific format such as agency-fedramp@agency.gov.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-AGC-TPP` MUST NOT — No Certification Type or Path Preferences
+### `AGU-AGC-TPP` MUST NOT: No Certification Type or Path Preferences
 
 Agencies MUST NOT require cloud service offerings to obtain or maintain a specific FedRAMP Certification Type or FedRAMP Certification Path, UNLESS the head of the agency or an authorized delegate determines there is a demonstrable need and notifies FedRAMP.
 
@@ -124,25 +124,25 @@ Affects: Agencies
 
 Note: This is related to the Presumption of Adequacy for a FedRAMP Certification and notification is mandated by OMB Memorandum M-24-15 section IV (a).
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-AGC-WKG` SHOULD — FedRAMP Working Groups
+### `AGU-AGC-WKG` SHOULD: FedRAMP Working Groups
 
 Agencies SHOULD participate in FedRAMP working groups, communities of practice, and stakeholder engagements to supply feedback and align practices across government.
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-SPN-MRC` MUST — Most Recent Consolidated Rules
+### `AGU-SPN-MRC` MUST: Most Recent Consolidated Rules
 
 Agencies MUST follow the most recent FedRAMP Consolidated Rules when initiating agency-sponsored FedRAMP Certification.
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-ABU` MUST — Authorization Before Use
+### `AGU-USE-ABU` MUST: Authorization Before Use
 
 Agencies MUST complete the Authorization to Operate process for federal information systems that use FedRAMP Certified cloud service offerings.
 
@@ -152,9 +152,9 @@ Affects: Agencies
 
 Note: FedRAMP provides technical assistance to help agencies navigate this process.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-AFR` MUST — Accept FedRAMP Rules
+### `AGU-USE-AFR` MUST: Accept FedRAMP Rules
 
 Agencies MUST allow FedRAMP Certified cloud service offerings to follow FedRAMP rules.
 
@@ -162,9 +162,9 @@ Terms: `Cloud Service Offering`, `FedRAMP Certified`
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-CLA` SHOULD NOT — Using FedRAMP Class A Certifications
+### `AGU-USE-CLA` SHOULD NOT: Using FedRAMP Class A Certifications
 
 Agencies SHOULD NOT authorize the use of a FedRAMP Class A Certified cloud service offering for more than 12 months UNLESS the cloud service offering is actively seeking a FedRAMP Class B, C, or D Certification.
 
@@ -172,9 +172,9 @@ Terms: `Cloud Service Offering`, `FedRAMP Certified`
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-DSO` SHOULD — Designate Senior Official
+### `AGU-USE-DSO` SHOULD: Designate Senior Official
 
 Agencies SHOULD designate a federal senior information security official to review Ongoing Certification Reports and represent the agency at Quarterly Reviews for cloud service offerings included in agency information systems.
 
@@ -182,9 +182,9 @@ Terms: `Cloud Service Offering`, `Ongoing Certification`, `Quarterly Review`
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-NFC` MUST — Notify FedRAMP of Monitoring Concerns
+### `AGU-USE-NFC` MUST: Notify FedRAMP of Monitoring Concerns
 
 Agencies MUST notify FedRAMP if information presented in an Ongoing Certification Report, Quarterly Review, or other FedRAMP Certification Data causes significant concerns for the authorizing official that would likely result in rescission of their Authorization to Operate.
 
@@ -194,9 +194,9 @@ Affects: Agencies
 
 Note: Agencies are expected to notify FedRAMP under OMB Memorandum M-24-15 section IV (a).
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-NPC` SHOULD — Notify Provider of Concerns
+### `AGU-USE-NPC` SHOULD: Notify Provider of Concerns
 
 Agencies SHOULD formally notify the cloud service provider if information presented in an Ongoing Certification Report, Quarterly Review, or other FedRAMP Certification Data causes significant concerns for the authorizing official that would likely result in rescission of their Authorization to Operate.
 
@@ -204,9 +204,9 @@ Terms: `Certification Data`, `FedRAMP Certification Report`, `Likely`, `Ongoing 
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-RCF` MUST — Resolve Certification Package Conflicts
+### `AGU-USE-RCF` MUST: Resolve Certification Package Conflicts
 
 Agencies MUST collaborate with FedRAMP when discrepancies or conflicts arise between agency-specific security determinations and the FedRAMP Certification Package.
 
@@ -214,9 +214,9 @@ Terms: `Certification Package`
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-RIR` SHOULD — Review All Information Resources
+### `AGU-USE-RIR` SHOULD: Review All Information Resources
 
 Agencies SHOULD consider third-party information resources used by the cloud service offering during initial and ongoing authorization activities.
 
@@ -224,9 +224,9 @@ Terms: `Cloud Service Offering`, `Information Resource`, `Third-Party Informatio
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-ROR` SHOULD — Review Ongoing Certification Reports
+### `AGU-USE-ROR` SHOULD: Review Ongoing Certification Reports
 
 Agencies SHOULD review each Ongoing Certification Report to understand how changes to the cloud service offering may impact the risk tolerance documented in the agency Authorization to Operate for the federal information system that includes the cloud service offering in its boundary.
 
@@ -236,12 +236,12 @@ Affects: Agencies
 
 Note: This agency review supports agency responsibilities under 44 USC § 35, OMB Circular A-130, FIPS-200, and OMB Memorandum M-24-15.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `AGU-USE-RSG` MUST — Review Secure Configuration Guides
+### `AGU-USE-RSG` MUST: Review Secure Configuration Guides
 
 Agencies MUST review the Secure Configuration Guides supplied by Providers and configure relevant security settings.
 
 Affects: Agencies
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

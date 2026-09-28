@@ -1,6 +1,6 @@
 ---
-title: FedRAMP Certification — FedRAMP Process
-description: Official Consolidated Rules summary for the FRC FedRAMP process, including applicability and requirements.
+title: "FedRAMP Certification: FedRAMP Process"
+description: "Official Consolidated Rules summary for the FRC FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,27 +30,27 @@ This ruleset explains how cloud service offerings obtain and maintain FedRAMP Ce
 
 ## Rule Subsets
 
-- `APP` — Applying for FedRAMP Certification: These rules apply to cloud service providers who have met all other relevant rules and are ready to apply for any FedRAMP Certification. · types: 20x, Rev5 · classes: A, B, C, D
-- `APS` — Applying for FedRAMP Certification with an Agency Sponsor: These rules apply to cloud service providers with an Agency Sponsor who have met all other relevant rules and are ready to apply for any FedRAMP Certification. · types: Rev5 · classes: B, C, D
-- `CCL` — Changing Certification Class: These rules apply to cloud service providers when changing their FedRAMP Certification Class. · types: Rev5 · classes: B, C, D
-- `CLA` — FedRAMP Class A Certification Rules: These are specific rules that apply to providers seeking FedRAMP Class A Certifications. · types: 20x · classes: A
-- `CSF` — Rev5-Specific Provider Responsibilities: These rules apply to providers for FedRAMP Rev5 Certifications. · types: Rev5 · classes: B, C, D
-- `CSO` — General Provider Responsibilities: These rules apply to cloud service providers obtaining and maintaining any FedRAMP Certification. · types: 20x, Rev5 · classes: A, B, C, D
-- `CSX` — 20x-Specific Provider Responsibilities: These rules apply to providers for FedRAMP 20x Certifications. · types: 20x · classes: B, C, D
+- `APP` · Applying for FedRAMP Certification: These rules apply to cloud service providers who have met all other relevant rules and are ready to apply for any FedRAMP Certification. · types: 20x, Rev5 · classes: A, B, C, D
+- `APS` · Applying for FedRAMP Certification with an Agency Sponsor: These rules apply to cloud service providers with an Agency Sponsor who have met all other relevant rules and are ready to apply for any FedRAMP Certification. · types: Rev5 · classes: B, C, D
+- `CCL` · Changing Certification Class: These rules apply to cloud service providers when changing their FedRAMP Certification Class. · types: Rev5 · classes: B, C, D
+- `CLA` · FedRAMP Class A Certification Rules: These are specific rules that apply to providers seeking FedRAMP Class A Certifications. · types: 20x · classes: A
+- `CSF` · Rev5-Specific Provider Responsibilities: These rules apply to providers for FedRAMP Rev5 Certifications. · types: Rev5 · classes: B, C, D
+- `CSO` · General Provider Responsibilities: These rules apply to cloud service providers obtaining and maintaining any FedRAMP Certification. · types: 20x, Rev5 · classes: A, B, C, D
+- `CSX` · 20x-Specific Provider Responsibilities: These rules apply to providers for FedRAMP 20x Certifications. · types: 20x · classes: B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `FRC-APP-AFC` MUST — Applying for FedRAMP Certification
+### `FRC-APP-AFC` MUST: Applying for FedRAMP Certification
 
 Providers MUST complete the FedRAMP Certification Application Form in full to request an initial assessment by FedRAMP.
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-APP-FCP` MUST — Fresh FedRAMP Certification Package
+### `FRC-APP-FCP` MUST: Fresh FedRAMP Certification Package
 
 Providers MUST supply a fresh initial FedRAMP Certification Package that shows the current status of the cloud service offering as verified and validated by the provider within the previous 7 days.
 
@@ -58,9 +58,9 @@ Terms: `Certification Package`, `Cloud Service Offering`, `Validation`, `Verific
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-APP-FIA` VARIES BY CLASS — Fresh Independent Assessment
+### `FRC-APP-FIA` VARIES BY CLASS: Fresh Independent Assessment
 
 Varies by certification class:
 
@@ -75,9 +75,9 @@ Affects: Providers
 
 Structured timeframe: `3` months
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-APP-MLF` MUST — Marketplace Listing First
+### `FRC-APP-MLF` MUST: Marketplace Listing First
 
 Providers MUST be listed in the FedRAMP Marketplace before applying for FedRAMP Certification, including:
 
@@ -89,9 +89,9 @@ Checklist items:
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-APP-NTP` MUST NOT — No Third-Party Applicants
+### `FRC-APP-NTP` MUST NOT: No Third-Party Applicants
 
 Providers MUST NOT use a third party to apply for a FedRAMP Certification on their behalf; this includes independent assessment services.
 
@@ -100,9 +100,9 @@ Affects: Providers
 Note: FedRAMP previously allowed independent assessment services to submit applications on behalf of providers, but this caused confusion about who was responsible for the application and the information in it. Providers should apply directly to ensure clear accountability.
 Providers may use third parties to help them prepare their application and assessment materials for submission.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-APP-USA` MAY — Updating Stale Assessments
+### `FRC-APP-USA` MAY: Updating Stale Assessments
 
 Providers MAY freshen a stale initial independent verification and validation assessment by having a FedRAMP Recognized independent assessment service review any changes between the original assessment and the current status of the cloud service offering in place of a full re-assessment, UNLESS the stale assessment is more than 9 months old.
 
@@ -110,9 +110,9 @@ Terms: `Cloud Service Offering`, `FedRAMP Recognized`, `Validation`, `Verificati
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-APS-ATO` MUST — Agency Authorization to Operate
+### `FRC-APS-ATO` MUST: Agency Authorization to Operate
 
 Providers seeking a FedRAMP Rev5 Agency Certification MUST have completed the Authorization to Operate (ATO) process with their agency sponsor for the cloud service offering, concluding with a formal signed ATO letter that the agency has sent over official government channels to FedRAMP.
 
@@ -120,9 +120,9 @@ Terms: `Cloud Service Offering`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CCL-DCC` MUST — Downgrading Certification Class
+### `FRC-CCL-DCC` MUST: Downgrading Certification Class
 
 Providers MUST apply for a new FedRAMP Certification to downgrade their Certification Class.
 
@@ -133,9 +133,9 @@ Affects: Providers
 Note: Downgrade paths include moving from D to C, B, or A; C to B or A; or B to A.
 FRC-CCL-DNP (Downgrade Notification Period) applies - please DO NOT downgrade Certification Class with providing advance notification to all necessary parties!
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CCL-DNP` SHOULD — Downgrade Notification Period
+### `FRC-CCL-DNP` SHOULD: Downgrade Notification Period
 
 Providers SHOULD notify all necessary parties at least 120 days in advance of an intended downgrade or cancellation of FedRAMP Certification.
 
@@ -145,9 +145,9 @@ Affects: Providers
 
 Note: Downgrading or canceling FedRAMP Certification will have severe negative consequences for the provider and their agency customers and should only be done after careful consideration and planning... but if it must be done, notify all necessary parties as soon as possible.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CCL-UCC` MUST — Upgrading Certification Class
+### `FRC-CCL-UCC` MUST: Upgrading Certification Class
 
 Providers MUST apply for a new FedRAMP Certification to upgrade their Certification Class; all applicable requirements MUST be met in advance.
 
@@ -158,9 +158,9 @@ Affects: Providers
 Note: Upgrade paths include moving from A to B, C, or D; B to C or D; and C to D.
 The preferred path is to incrementally update the implementation and assurance commitments within the current Certification Class until the provider has met all requirements for the target Certification Class, then apply for the new Certification Class.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CLA-ASF` MUST — Approved Alternative Security Frameworks
+### `FRC-CLA-ASF` MUST: Approved Alternative Security Frameworks
 
 Providers seeking a FedRAMP Class A Certification MUST have completed a certification or equivalent process, including an independent assessment if applicable, from one of the following alternative security frameworks within the past 12 months:
 
@@ -173,9 +173,9 @@ Terms: `Security Category`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CLA-EAM` MUST — External Assessment Materials
+### `FRC-CLA-EAM` MUST: External Assessment Materials
 
 Providers seeking a FedRAMP Class A Certification MUST supply the following materials from their alternative security framework assessment to all necessary parties:
 
@@ -188,9 +188,9 @@ Terms: `All Necessary Parties`, `Verification`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CLA-IVV` MAY — Optional Independent Verification and Validation
+### `FRC-CLA-IVV` MAY: Optional Independent Verification and Validation
 
 Providers seeking a FedRAMP Class A Certification MAY have the FedRAMP Certification Package independently verified and validated by a FedRAMP Recognized assessor before submission to FedRAMP.
 
@@ -198,9 +198,9 @@ Terms: `Certification Package`, `FedRAMP Recognized`, `Validation`, `Verificatio
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CLA-MFR` MUST — Mandatory FedRAMP Rules for Class A
+### `FRC-CLA-MFR` MUST: Mandatory FedRAMP Rules for Class A
 
 Providers seeking a Class A FedRAMP Certification MUST address all rules in this FedRAMP Class A Certification subset (FRC-CLA) AND the following additional FedRAMP Class A rules; the appropriate artifacts or information mapping for all rules MUST be supplied in the FedRAMP Certification Package.
 
@@ -237,9 +237,9 @@ Note: Some of these specific FedRAMP rules may not have similar counterparts in 
 In general, for each of these FedRAMP requirements, providers should include a sufficiently detailed summary that reviewers will not need to dig into the related security framework materials to understand the related decisions - just saying "see SOC 2 report" is not particularly helpful.
 Information about how the provider addresses the included Key Security Indicators are required to receive a class A certification even if the provider intends to pursue a Rev 5 Program Certification path in the future.
 
-Recent update: 2026-07-14 — Clarified that providers MUST address the Key Security Indicators even if they intend to pursue a Rev 5 Program Certification path in the future.
+Recent update (2026-07-14): Clarified that providers MUST address the Key Security Indicators even if they intend to pursue a Rev 5 Program Certification path in the future.
 
-### `FRC-CLA-OFR` MAY — Address Optional FedRAMP Rules for Class A
+### `FRC-CLA-OFR` MAY: Address Optional FedRAMP Rules for Class A
 
 Providers seeking a Class A FedRAMP Certification MAY address the following additional optional FedRAMP Class A rules (if applicable):
 
@@ -258,9 +258,9 @@ Terms: `Certification Data`, `FedRAMP Independent Assessment`, `Incident`, `Quar
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CLA-RFR` SHOULD — Recommended FedRAMP Rules for Class A
+### `FRC-CLA-RFR` SHOULD: Recommended FedRAMP Rules for Class A
 
 Providers seeking a Class A FedRAMP Certification SHOULD address the following additional recommended FedRAMP Class A rules (if applicable):
 
@@ -281,9 +281,9 @@ Terms: `Certification Data`, `Certification Package`, `Drift`, `Incident`, `Init
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSO-FCP` MUST — FedRAMP Certification Profile
+### `FRC-CSO-FCP` MUST: FedRAMP Certification Profile
 
 Providers MUST identify a target FedRAMP Certification Profile and apply all relevant FedRAMP Practices to the cloud service offering.
 
@@ -293,9 +293,9 @@ Affects: Providers
 
 Note: Information resources (including third-party information resources) MAY vary by security category as appropriate to the type of information handled by or impacted by the information resource.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSO-JSN` MUST — FedRAMP JSON Schemas
+### `FRC-CSO-JSN` MUST: FedRAMP JSON Schemas
 
 Providers MUST supply machine-readable information in JSON documents that are valid against the corresponding JSON schema when a rule contains a FedRAMP JSON schema, UNLESS otherwise specified in the rule.
 
@@ -305,9 +305,9 @@ Affects: Providers
 
 Note: FedRAMP JSON schemas are designed to be lightweight and flexible to establish a minimum set of structured information while allowing providers to improve on the format and structure of the information as needed to meet their needs and the needs of their customers.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSO-MRA` MUST — Maintain Responsibility and Accountability
+### `FRC-CSO-MRA` MUST: Maintain Responsibility and Accountability
 
 Providers MUST maintain responsibility and accountability for the accuracy and completeness of all information in the FedRAMP Certification Package, especially when they engage a third party (such as an independent assessor, advisory service, or external tools) to supply information on their behalf.
 
@@ -315,9 +315,9 @@ Terms: `Certification Package`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSO-PKG` MUST — FedRAMP Certification Package
+### `FRC-CSO-PKG` MUST: FedRAMP Certification Package
 
 Providers seeking a Certification MUST supply a complete FedRAMP Certification Package to FedRAMP for initial certification; the FedRAMP Certification Package MUST include at least the following information:
 
@@ -330,9 +330,9 @@ Terms: `Certification Package`, `Cloud Service Offering`, `FedRAMP Certification
 
 Affects: Providers
 
-Recent update: 2026-06-25 — Removed dangling mention of Class B from a last-minute merger of rules; apologies for confusion, this rule applies to all classes.
+Recent update (2026-06-25): Removed dangling mention of Class B from a last-minute merger of rules; apologies for confusion, this rule applies to all classes.
 
-### `FRC-CSO-POP` MUST NOT — Pick One Program Certification Type
+### `FRC-CSO-POP` MUST NOT: Pick One Program Certification Type
 
 Providers MUST NOT seek both FedRAMP Rev5 Program Certification and FedRAMP 20x Program Certification for the same cloud service offering; pick one type.
 
@@ -342,11 +342,11 @@ Affects: Providers
 
 Note: This rule does not prevent a provider from seeking and maintaining a FedRAMP Rev5 Agency Certification and a FedRAMP 20x Program Certification for the same cloud service offering, however, doing so is strongly discouraged due to the increased complexity and risk of confusion for all parties.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ## 20X
 
-### `FRC-CSX-MAS` SHOULD — Application within MAS
+### `FRC-CSX-MAS` SHOULD: Application within MAS
 
 Providers SHOULD apply ALL Key Security Indicators to ALL aspects of their cloud service offering that are within the FedRAMP Minimum Assessment Scope.
 
@@ -354,9 +354,9 @@ Terms: `Cloud Service Offering`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSX-MOT` VARIES BY CLASS — Metrics Over Time for Key Security Indicators
+### `FRC-CSX-MOT` VARIES BY CLASS: Metrics Over Time for Key Security Indicators
 
 Varies by certification class:
 
@@ -371,9 +371,9 @@ Affects: Providers
 
 Note: For initial FedRAMP Certification, providers will need to have mechanisms in place and agree to meet this requirement in the event the cloud service has not been operating with related metrics available for the required period prior to applying for initial certification.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSX-VVK` VARIES BY CLASS — Automated Verification and Validation of Key Security Indicators
+### `FRC-CSX-VVK` VARIES BY CLASS: Automated Verification and Validation of Key Security Indicators
 
 Varies by certification class:
 
@@ -386,9 +386,9 @@ Terms: `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSX-VVR` VARIES BY CLASS — Automated Verification and Validation of FedRAMP Rules
+### `FRC-CSX-VVR` VARIES BY CLASS: Automated Verification and Validation of FedRAMP Rules
 
 Varies by certification class:
 
@@ -403,11 +403,11 @@ Affects: Providers
 
 Note: Different rules will be easy to automate for different providers, depending on the implementation, so FedRAMP generally leaves this implementation up to providers based on what makes the most sense for their own business and approach.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ## REV5
 
-### `FRC-CSF-ACP` MUST — Assign Control Parameters
+### `FRC-CSF-ACP` MUST: Assign Control Parameters
 
 Providers MUST assign all organization-defined control parameters, following FedRAMP Rev5 Controls Guidance, and ensure that all control parameter assignments are documented in the Security Decision Record (SDR).
 
@@ -415,9 +415,9 @@ Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSF-BSL` MUST — FedRAMP Rev5 Baselines
+### `FRC-CSF-BSL` MUST: FedRAMP Rev5 Baselines
 
 Varies by certification class:
 
@@ -429,17 +429,17 @@ Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSF-FFG` MUST — Follow FedRAMP Rev5 Controls Guidance
+### `FRC-CSF-FFG` MUST: Follow FedRAMP Rev5 Controls Guidance
 
 Providers MUST follow FedRAMP Rev5 Controls Guidance for the implementation and documentation of all applicable controls.
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `FRC-CSF-RDY` MUST — FedRAMP Ready Conversion
+### `FRC-CSF-RDY` MUST: FedRAMP Ready Conversion
 
 Providers with FedRAMP Rev5 Ready status MUST convert to a FedRAMP Certification by whichever of the follow dates is later: the expiration of their annual assessment or November 17, 2026 (the legacy FedRAMP Ready status will be entirely removed on December 31, 2027).
 
@@ -448,4 +448,4 @@ Affects: Providers
 Note: The simplest conversion in most cases would be to a FedRAMP 20x Class A Certification.
 Cloud services that do not wish to convert or do not meet conversion criteria will be renamed Legacy FedRAMP Ready and otherwise retired from FedRAMP Ready.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

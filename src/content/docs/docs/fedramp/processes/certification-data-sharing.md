@@ -1,6 +1,6 @@
 ---
-title: Certification Data Sharing — FedRAMP Process
-description: Official Consolidated Rules summary for the CDS FedRAMP process, including applicability and requirements.
+title: "Certification Data Sharing: FedRAMP Process"
+description: "Official Consolidated Rules summary for the CDS FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,16 +30,16 @@ The Certification Data Sharing rules allow providers to store and share FedRAMP 
 
 ## Rule Subsets
 
-- `CSF` — Rev5-Specific Provider Responsibilities: These rules apply to providers for FedRAMP Rev5 Certifications. · types: Rev5 · classes: B, C, D
-- `CSO` — General Provider Responsibilities: These rules apply to providers for FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
-- `TRC` — FedRAMP-Compatible Trust Centers: These rules apply to trust centers that are FedRAMP-compatible. · types: 20x, Rev5 · classes: B, C, D
-- `UTC` — Using a Trust Center: These rules apply to providers that are using a FedRAMP-compatible trust center instead of USDA Connect; they DO NOT apply to providers using USDA Connect. · types: 20x, Rev5 · classes: B, C, D
+- `CSF` · Rev5-Specific Provider Responsibilities: These rules apply to providers for FedRAMP Rev5 Certifications. · types: Rev5 · classes: B, C, D
+- `CSO` · General Provider Responsibilities: These rules apply to providers for FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
+- `TRC` · FedRAMP-Compatible Trust Centers: These rules apply to trust centers that are FedRAMP-compatible. · types: 20x, Rev5 · classes: B, C, D
+- `UTC` · Using a Trust Center: These rules apply to providers that are using a FedRAMP-compatible trust center instead of USDA Connect; they DO NOT apply to providers using USDA Connect. · types: 20x, Rev5 · classes: B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `CDS-CSO-AVR` VARIES BY CLASS — Availability Reporting
+### `CDS-CSO-AVR` VARIES BY CLASS: Availability Reporting
 
 Varies by certification class:
 
@@ -54,9 +54,9 @@ Affects: Providers
 
 Note: This service may be separate from the trust center.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-CBF` MUST — Consistency Between Formats
+### `CDS-CSO-CBF` MUST: Consistency Between Formats
 
 Providers MUST use automation to ensure information remains consistent between human-readable and machine-readable formats when FedRAMP Certification Data is provided in both formats.
 
@@ -64,9 +64,9 @@ Terms: `Certification Data`, `Machine-Readable`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-FID` MUST — Always Include FedRAMP ID
+### `CDS-CSO-FID` MUST: Always Include FedRAMP ID
 
 Providers MUST always include the FedRAMP ID of the related cloud service offering in all FedRAMP Certification Data once assigned, including all reports, notifications, and other communication that results from FedRAMP rules.
 
@@ -77,9 +77,9 @@ Affects: Providers
 Note: The FedRAMP ID is supplied by FedRAMP after a cloud service offering is registered to be listed on the FedRAMP Marketplace - providers will need to use a placeholder until the FedRAMP ID is assigned.
 Many providers have multiple cloud service offerings or use internal names that don't align to public materials; using the FedRAMP ID ensures we can easily align the communication with a specific cloud service offering.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-FRC` MUST — FedRAMP Certification Reports
+### `CDS-CSO-FRC` MUST: FedRAMP Certification Reports
 
 Providers MUST include FedRAMP Certification Reports with their FedRAMP Certification Data without inappropriate modifications, and make such reports available within 2 weeks of receiving the materials from FedRAMP.
 
@@ -91,9 +91,9 @@ Structured timeframe: `2` weeks
 
 Note: FedRAMP provides Certification Reports for all cloud service offerings following the Program Certification path as part of the initial and ongoing FedRAMP Certification process, and may provide Certification Reports for cloud service offerings following the Agency Certification path.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-HAD` MUST — Historical FedRAMP Certification Data
+### `CDS-CSO-HAD` MUST: Historical FedRAMP Certification Data
 
 Providers MUST supply snapshots of FedRAMP Certification Data aligned to Ongoing Certification Reports to all necessary parties; these snapshots MUST be available for the duration of FedRAMP Certification.
 
@@ -103,9 +103,9 @@ Affects: Providers
 
 Note: Historical snapshots do not need to be reconstructed for periods before the provider's first Ongoing Certification Report, but should be maintained for all subsequent Ongoing Certification Reports.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-IRP` MUST — Include Relevant Policies
+### `CDS-CSO-IRP` MUST: Include Relevant Policies
 
 Providers MUST supply all relevant policies and procedures in the FedRAMP Certification Data, including a human-readable and machine-readable reference that explains at least the following about each included policy and procedure:
 
@@ -122,9 +122,9 @@ Terms: `Certification Data`, `FedRAMP Practices`, `Machine-Readable`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-PSM` VARIES BY CLASS — Per-Service Certification Materials
+### `CDS-CSO-PSM` VARIES BY CLASS: Per-Service Certification Materials
 
 Varies by certification class:
 
@@ -138,9 +138,9 @@ Affects: Providers
 Note: Providers determine what they consider to be separate services, based on maximizing the customer experience for agencies who may only adopt some services and not others.
 Providers are encouraged to provide a single comprehensive set of materials for all shared aspects of the service offering and only provide separate materials for unique aspects of each service to minimize the burden on providers and agencies.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-PUB` MUST — Public Information
+### `CDS-CSO-PUB` MUST: Public Information
 
 Providers MUST publicly share up-to-date information about the cloud service offering in both human-readable and JSON formats, including at least the following information that is available and applicable:
 
@@ -168,9 +168,9 @@ Affects: Providers
 
 Note: Generally, this information should be available on a public webpage or publicly shared in a FedRAMP-compatible trust center.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-RIS` MUST — Responsible Information Sharing
+### `CDS-CSO-RIS` MUST: Responsible Information Sharing
 
 Providers MUST provide sufficient information in FedRAMP Certification Data to support agency authorization decisions but SHOULD NOT include sensitive information that would likely enable a threat actor to gain unauthorized access, cause harm, disrupt operations, or otherwise have a negative adverse impact on the cloud service offering.
 
@@ -180,9 +180,9 @@ Affects: Providers
 
 Note: This is not a license to exclude accurate risk information, but specifics that would likely lead to compromise should be abstracted. A breach of confidentiality with FedRAMP Certification Data should be anticipated by a secure cloud service provider.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-RPS` MAY — Responsible Public Package Sharing
+### `CDS-CSO-RPS` MAY: Responsible Public Package Sharing
 
 Providers MAY responsibly share some or all of the information in a FedRAMP Certification Package publicly or with other parties if the provider determines doing so will NOT likely have an adverse effect on the cloud service offering.
 
@@ -190,9 +190,9 @@ Terms: `Certification Package`, `Cloud Service Offering`, `Likely`, `Responsibly
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-SVC` MUST — Public Service List
+### `CDS-CSO-SVC` MUST: Public Service List
 
 Providers MUST publicly share a detailed list of specific services and their security categories that are included in the cloud service offering using clear feature or service names that align with standard public marketing materials; this list MUST be complete enough for a potential customer to determine which services are and are not included in the FedRAMP Minimum Assessment Scope without requesting access to underlying FedRAMP Certification Data.
 
@@ -200,9 +200,9 @@ Terms: `Certification Data`, `Cloud Service Offering`, `Security Category`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-CSO-UTC` MUST — Use Trust Centers
+### `CDS-CSO-UTC` MUST: Use Trust Centers
 
 Providers MUST use a FedRAMP-compatible trust center to store and share FedRAMP Certification Data with all necessary parties.
 
@@ -212,9 +212,9 @@ Affects: Providers
 
 Note: Rules for FedRAMP-Compatible Trust Centers are explained in the Certification Data Sharing Rules under the FedRAMP-Compatible Trust Centers section (id: CDS-TRC).
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-TRC-AAI` MUST — Agency Access Inventory
+### `CDS-TRC-AAI` MUST: Agency Access Inventory
 
 Trust centers MUST maintain an inventory and history of federal agency users or systems with access to FedRAMP Certification Data and MUST make this information available to FedRAMP upon request.
 
@@ -222,9 +222,9 @@ Terms: `Certification Data`, `Trust Center`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-TRC-ACL` MUST — Access Logging
+### `CDS-TRC-ACL` MUST: Access Logging
 
 Trust centers MUST log access to FedRAMP Certification Data and store summaries of access for at least six months; such information, as it pertains to specific parties, SHOULD be made available upon request by those parties.
 
@@ -232,9 +232,9 @@ Terms: `Certification Data`, `Trust Center`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-TRC-HMR` SHOULD — Human and Machine-Readable Certification Data
+### `CDS-TRC-HMR` SHOULD: Human and Machine-Readable Certification Data
 
 Trust centers SHOULD make FedRAMP Certification Data available to view and download in both human-readable and machine-readable formats.
 
@@ -242,9 +242,9 @@ Terms: `Certification Data`, `Machine-Readable`, `Trust Center`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-TRC-PAC` MUST — Programmatic Access
+### `CDS-TRC-PAC` MUST: Programmatic Access
 
 Trust centers MUST provide documented programmatic access to all FedRAMP Certification Data, including programmatic access to human-readable materials.
 
@@ -252,9 +252,9 @@ Terms: `Certification Data`, `Trust Center`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-TRC-SSM` SHOULD — Self-Service Access Management
+### `CDS-TRC-SSM` SHOULD: Self-Service Access Management
 
 Trust centers SHOULD include features that encourage all necessary parties to provision and manage access to FedRAMP Certification Data for their users and services directly.
 
@@ -262,9 +262,9 @@ Terms: `All Necessary Parties`, `Certification Data`, `Trust Center`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-TRC-USH` MUST — Uninterrupted Sharing
+### `CDS-TRC-USH` MUST: Uninterrupted Sharing
 
 Trust centers MUST share FedRAMP Certification Data with all necessary parties without interruption.
 
@@ -274,9 +274,9 @@ Affects: Providers
 
 Note: "Without interruption" means that parties should not have to request manual approval each time they need to access FedRAMP Certification Data or go through a complicated process. The preferred way of ensuring access without interruption is to use on-demand just-in-time access provisioning.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-UTC-AAD` MUST — Agency Access Denial
+### `CDS-UTC-AAD` MUST: Agency Access Denial
 
 Providers MUST notify FedRAMP within 5 business days of denying an agency access request for FedRAMP Certification Data.
 
@@ -286,9 +286,9 @@ Affects: Providers
 
 Structured timeframe: `5` bizdays
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CDS-UTC-AGA` SHOULD — Agency Access
+### `CDS-UTC-AGA` SHOULD: Agency Access
 
 Providers SHOULD supply access to the FedRAMP Certification Package with agencies upon request.
 
@@ -296,11 +296,11 @@ Terms: `Certification Package`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ## REV5
 
-### `CDS-CSF-TCM` MUST — Trust Center Migration
+### `CDS-CSF-TCM` MUST: Trust Center Migration
 
 Providers MUST notify all necessary parties when migrating to a trust center and MUST provide information in their existing USDA Connect Community Portal secure folders explaining how to use the trust center to obtain FedRAMP Certification Data.
 
@@ -308,4 +308,4 @@ Terms: `All Necessary Parties`, `Certification Data`, `Trust Center`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

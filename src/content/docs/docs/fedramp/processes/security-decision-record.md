@@ -1,6 +1,6 @@
 ---
-title: Security Decision Record — FedRAMP Process
-description: Official Consolidated Rules summary for the SDR FedRAMP process, including applicability and requirements.
+title: "Security Decision Record: FedRAMP Process"
+description: "Official Consolidated Rules summary for the SDR FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,15 +30,15 @@ The Security Decision Record replaced a traditional System Security Plan with a 
 
 ## Rule Subsets
 
-- `CSF` — Rev5-Specific Provider Responsibilities: These rules apply to providers for FedRAMP Rev5 Certifications. · types: Rev5 · classes: B, C, D
-- `CSO` — General Provider Responsibilities: These rules apply to providers for FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
-- `CSX` — 20x-Specific Provider Responsibilities: These rules apply to providers for FedRAMP 20x Certifications. · types: 20x · classes: B, C, D
+- `CSF` · Rev5-Specific Provider Responsibilities: These rules apply to providers for FedRAMP Rev5 Certifications. · types: Rev5 · classes: B, C, D
+- `CSO` · General Provider Responsibilities: These rules apply to providers for FedRAMP Certifications of any type. · types: 20x, Rev5 · classes: B, C, D
+- `CSX` · 20x-Specific Provider Responsibilities: These rules apply to providers for FedRAMP 20x Certifications. · types: 20x · classes: B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `SDR-CSO-FRR` MUST — FedRAMP Rules
+### `SDR-CSO-FRR` MUST: FedRAMP Rules
 
 Providers MUST supply a Security Decision Record, in both human-readable and JSON formats, that includes at least all of the following information for each applicable FedRAMP rule:
 
@@ -55,9 +55,9 @@ Terms: `Artifacts`, `Security Decision Record (SDR)`, `Validation`, `Verificatio
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SDR-CSO-MTD` MUST — Security Decision Record Metadata
+### `SDR-CSO-MTD` MUST: Security Decision Record Metadata
 
 Providers MUST also include the following basic metadata in their Security Decision Record:
 
@@ -70,11 +70,11 @@ Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ## 20X
 
-### `SDR-CSX-KMT` VARIES BY CLASS — Key Security Indicator Metrics
+### `SDR-CSX-KMT` VARIES BY CLASS: Key Security Indicator Metrics
 
 Varies by certification class:
 
@@ -94,9 +94,9 @@ Terms: `Security Decision Record (SDR)`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `SDR-CSX-KSI` MUST — Key Security Indicators
+### `SDR-CSX-KSI` MUST: Key Security Indicators
 
 Providers MUST also include short and simple high-level summaries of at least the following for each applicable Key Security Indicator:
 
@@ -111,11 +111,11 @@ Terms: `Persistently`, `Validation`, `Verification`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
 ## REV5
 
-### `SDR-CSF-CTF` MUST — Rev5 Controls
+### `SDR-CSF-CTF` MUST: Rev5 Controls
 
 Providers MUST also include short and simple high-level summaries of at least the following for each applicable Rev5 Control:
 
@@ -134,4 +134,4 @@ Terms: `Artifacts`, `Cloud Service Offering`, `Validation`, `Verification`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

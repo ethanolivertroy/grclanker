@@ -1,6 +1,6 @@
 ---
-title: FedRAMP Recognition of Independent Assessment Services — FedRAMP Process
-description: Official Consolidated Rules summary for the REC FedRAMP process, including applicability and requirements.
+title: "FedRAMP Recognition of Independent Assessment Services: FedRAMP Process"
+description: "Official Consolidated Rules summary for the REC FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,14 +30,14 @@ The FedRAMP Recognition of independent assessment services rules explain the req
 
 ## Rule Subsets
 
-- `FRP` — FedRAMP Responsibilities: These rules apply to FedRAMP when evaluating independent assessment services for initial or ongoing FedRAMP Recognition.
-- `IAS` — General Independent Assessor Responsibilities: These rules apply to independent assessment services seeking to obtain or maintain FedRAMP Recognition.
+- `FRP` · FedRAMP Responsibilities: These rules apply to FedRAMP when evaluating independent assessment services for initial or ongoing FedRAMP Recognition.
+- `IAS` · General Independent Assessor Responsibilities: These rules apply to independent assessment services seeking to obtain or maintain FedRAMP Recognition.
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `REC-FRP-DRD` MUST NOT — Double Revocation Disqualification
+### `REC-FRP-DRD` MUST NOT: Double Revocation Disqualification
 
 FedRAMP MUST NOT restore FedRAMP Recognition for an assessor after FedRAMP has revoked that assessor's FedRAMP Recognition 2 times.
 
@@ -45,9 +45,9 @@ Terms: `FedRAMP Recognized`
 
 Affects: FedRAMP
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-FRP-FOC` MUST — Foreign Ownership Collection
+### `REC-FRP-FOC` MUST: Foreign Ownership Collection
 
 FedRAMP MUST maintain a process to collect foreign ownership, control, or influence declarations from FedRAMP Recognized assessors and updates to those declarations.
 
@@ -55,9 +55,9 @@ Terms: `FedRAMP Recognized`
 
 Affects: FedRAMP
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-FRP-RAO` MUST NOT — Recognized Assessors Only
+### `REC-FRP-RAO` MUST NOT: Recognized Assessors Only
 
 FedRAMP MUST NOT accept verification, validation, or other attestations from independent assessors who are not FedRAMP Recognized.
 
@@ -65,9 +65,9 @@ Terms: `FedRAMP Recognized`, `Validation`, `Verification`
 
 Affects: FedRAMP
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-ACC` MUST — A2LA Accreditation
+### `REC-IAS-ACC` MUST: A2LA Accreditation
 
 Assessors MUST obtain and maintain accreditation through the American Association for Laboratory Accreditation (A2LA) Cybersecurity Inspection Body Program to qualify for FedRAMP Recognition.
 
@@ -77,9 +77,9 @@ Affects: Assessors
 
 Note: FedRAMP will remove FedRAMP Recognition immediately after the American Association for Laboratory Accreditation notifies FedRAMP that an assessor's accreditation has lapsed.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-ADA` MUST — Actually Do Assessments
+### `REC-IAS-ADA` MUST: Actually Do Assessments
 
 Assessors MUST complete at least 2 initial or ongoing assessments for Class B, C, or D FedRAMP Certifications every 2 years to maintain FedRAMP Recognition.
 
@@ -91,9 +91,9 @@ Structured timeframe: `2` years
 
 Note: For a newly FedRAMP Recognized Assessor, this rule applies beginning on the initial date of FedRAMP Recognition if that date is later than 2026-06-01.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-AFI` MUST — Annual Foreign Interest Reports
+### `REC-IAS-AFI` MUST: Annual Foreign Interest Reports
 
 Assessors MUST report information relating to any foreign interest, foreign influence, or foreign control of the independent assessment service to FedRAMP annually.
 
@@ -101,9 +101,9 @@ Affects: Assessors
 
 Structured timeframe: `1` years
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-ANR` MUST — Annual Surveillance Assessment
+### `REC-IAS-ANR` MUST: Annual Surveillance Assessment
 
 Assessors MUST achieve a favorable annual surveillance assessment by the American Association for Laboratory Accreditation (A2LA) to maintain FedRAMP Recognition.
 
@@ -113,17 +113,17 @@ Affects: Assessors
 
 Structured timeframe: `1` years
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-CAP` MUST — Corrective Action Plan
+### `REC-IAS-CAP` MUST: Corrective Action Plan
 
 Assessors MUST supply a corrective action plan when FedRAMP requires one for performance standards deficiencies or organizational risks.
 
 Affects: Assessors
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-CFI` MUST — Changes in Foreign Interest
+### `REC-IAS-CFI` MUST: Changes in Foreign Interest
 
 Assessors MUST report updated information relating to any foreign interest, foreign influence, or foreign control of the independent assessment service within 48 hours of any change in foreign ownership or control.
 
@@ -131,17 +131,17 @@ Affects: Assessors
 
 Structured timeframe: `48` hours
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-INV` MUST — Invalid Deliverables
+### `REC-IAS-INV` MUST: Invalid Deliverables
 
 Assessors MUST treat deliverables prepared, performed, or submitted by personnel who do not meet required role qualifications as invalid for FedRAMP purposes.
 
 Affects: Assessors
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-PSC` MUST — Policy and Standards Compliance
+### `REC-IAS-PSC` MUST: Policy and Standards Compliance
 
 Assessors MUST maintain compliance with the latest American Association for Laboratory Accreditation (A2LA) R311 - Specific Requirements - Federal Risk and Authorization Management Program to maintain FedRAMP Recognition.
 
@@ -149,9 +149,9 @@ Terms: `FedRAMP Recognized`
 
 Affects: Assessors
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-PST` MUST — Performance Standards
+### `REC-IAS-PST` MUST: Performance Standards
 
 Assessors MUST meet FedRAMP performance standards for assessor deliverables to support independent, risk-based reviews by FedRAMP and federal agencies, including at least:
 
@@ -168,9 +168,9 @@ Terms: `Cloud Service Offering`
 
 Affects: Assessors
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-RAR` MUST — Re-entry after Revocation
+### `REC-IAS-RAR` MUST: Re-entry after Revocation
 
 Assessors MUST satisfy all American Association for Laboratory Accreditation (A2LA) re-entry conditions before regaining FedRAMP Recognition after revocation.
 
@@ -180,9 +180,9 @@ Affects: Assessors
 
 Note: A revocation may require extended time in revoked status while the assessor demonstrates acceptable performance in the A2LA Cybersecurity Inspection Body Program before seeking FedRAMP Recognition again.
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-RAS` MUST — Full A2LA Reassessment
+### `REC-IAS-RAS` MUST: Full A2LA Reassessment
 
 Assessors MUST achieve a favorable full reassessment by the American Association for Laboratory Accreditation (A2LA) at least once every 2 years to maintain FedRAMP Recognition.
 
@@ -192,17 +192,17 @@ Affects: Assessors
 
 Structured timeframe: `2` years
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-RQU` MUST — Roles and Qualifications
+### `REC-IAS-RQU` MUST: Roles and Qualifications
 
 Assessors MUST staff FedRAMP assessments with all roles required by the American Association for Laboratory Accreditation (A2LA) R311, including personnel who meet the qualifications for each role, unless FedRAMP publishes a specific exception for a limited pilot or other explicitly scoped process.
 
 Affects: Assessors
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `REC-IAS-SEP` MUST NOT — Advisory Separation
+### `REC-IAS-SEP` MUST NOT: Advisory Separation
 
 Assessors MUST NOT perform a FedRAMP independent assessment of the same cloud service offering within 2 years after supplying advisory or consulting services for that offering, unless FedRAMP publishes a specific exception for a limited pilot or other explicitly scoped process.
 
@@ -212,4 +212,4 @@ Affects: Assessors
 
 Structured timeframe: `2` years
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.

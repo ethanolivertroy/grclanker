@@ -1,6 +1,6 @@
 ---
-title: Cryptographic Module Use — FedRAMP Process
-description: Official Consolidated Rules summary for the CMU FedRAMP process, including applicability and requirements.
+title: "Cryptographic Module Use: FedRAMP Process"
+description: "Official Consolidated Rules summary for the CMU FedRAMP process, including applicability and requirements."
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
@@ -30,13 +30,13 @@ The Cryptographic Module Use rules clarify how providers should select and use c
 
 ## Rule Subsets
 
-- `CSO` — Cloud Service Provider Responsibilities: These rules apply to providers for FedRAMP Certifications. · types: 20x, Rev5 · classes: B, C, D
+- `CSO` · Cloud Service Provider Responsibilities: These rules apply to providers for FedRAMP Certifications. · types: 20x, Rev5 · classes: B, C, D
 
 ## Requirements and Recommendations
 
 ## BOTH
 
-### `CMU-CSO-CAT` SHOULD — Configuration of Agency Tenants
+### `CMU-CSO-CAT` SHOULD: Configuration of Agency Tenants
 
 Providers SHOULD configure agency tenants by default to use cryptographic services that use cryptographic modules or update streams of cryptographic modules with active validations under the NIST Cryptographic Module Validation Program when such modules are available.
 
@@ -44,9 +44,9 @@ Terms: `Validation`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CMU-CSO-CMD` MUST — Cryptographic Module Documentation
+### `CMU-CSO-CMD` MUST: Cryptographic Module Documentation
 
 Providers MUST document the cryptographic modules used in each service (or groups of services that use the same modules) where cryptographic services are used to protect federal customer data, including whether these modules are validated under the NIST Cryptographic Module Validation Program or are update streams of such modules.
 
@@ -54,9 +54,9 @@ Terms: `Federal Customer Data`, `Validation`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
-### `CMU-CSO-UVM` VARIES BY CLASS — Using Validated Cryptographic Modules
+### `CMU-CSO-UVM` VARIES BY CLASS: Using Validated Cryptographic Modules
 
 Varies by certification class:
 
@@ -69,4 +69,4 @@ Terms: `Federal Customer Data`, `Validation`
 
 Affects: Providers
 
-Recent update: 2026-06-24 — Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
