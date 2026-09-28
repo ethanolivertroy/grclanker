@@ -139,6 +139,7 @@ function checkPrefix(id: string): string {
 function semanticStem(title: string): string {
   return title
     .toLowerCase()
+    .replaceAll(/\bcompleteness\b/g, "coverage")
     .replaceAll(/\bstatus\b/g, "state")
     .replaceAll(/\b(?:label|verdict|outcome)\b/g, "result")
     .replaceAll(/[^a-z0-9]+/g, "_")
