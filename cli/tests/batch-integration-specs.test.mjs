@@ -130,6 +130,7 @@ function ratioWitnesses(condition, desired, constants) {
   const delta = Math.abs(Number(threshold.value)) >= 2 ? 1 : 0.1;
   const scaledTargets = [
     0,
+    condition.scale ?? 1,
     Number(threshold.value) - delta,
     Number(threshold.value),
     Number(threshold.value) + delta,
