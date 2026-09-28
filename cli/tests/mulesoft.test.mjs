@@ -822,6 +822,59 @@ test("checkMulesoftAccess reports a healthy organization when every surface is r
   }
 });
 
+test("checkMulesoftAccess uses documented permission or capability guidance for every access surface", async () => {
+  const result = await checkMulesoftAccess(healthyBundleClient());
+
+  // Verified against the current official permission catalog and the product-specific guidance:
+  // https://docs.mulesoft.com/access-management/permissions-by-product
+  // https://docs.mulesoft.com/access-management/business-groups
+  // https://docs.mulesoft.com/access-management/troubleshooting-anypoint-platform-access
+  // https://docs.mulesoft.com/mq/mq-apis
+  // https://docs.mulesoft.com/anypoint-security/asm-permission-concept
+  const expectedPermissionsBySurface = {
+    current_user: "Any authenticated principal (profile scope)",
+    organization: "Access Management: membership in the target business group (organization visibility follows membership)",
+    identity_providers: "Access Management: Organization Administrator (identity provider settings)",
+    members: "Access Management: Organization Administrator (user management)",
+    mfa_exempt_users: "Access Management: Organization Administrator (user management)",
+    role_groups: "Access Management: Organization Administrator (roles and permissions)",
+    environments: "Access Management: any permission scoped to the target environment (environment visibility follows scoped access)",
+    connected_applications: "Access Management: root Organization Administrator (connected applications)",
+    organization_hierarchy: "Access Management: membership in the target business group (organization visibility follows membership)",
+    api_manager_apis: "API Manager: View APIs Configuration",
+    exchange_assets: "Exchange: Exchange Viewer",
+    cloudhub_applications: "Runtime Manager: Read Applications",
+    cloudhub_alerts: "Runtime Manager: Read Alerts",
+    vpcs: "Runtime Manager: CloudHub Network Viewer",
+    load_balancers: "Runtime Manager: CloudHub Network Viewer",
+    hybrid_servers: "Runtime Manager: Read Servers",
+    audit_platforms: "Access Management: Audit Log Viewer",
+    audit_query: "Access Management: Audit Log Viewer",
+    mq_regions: "Anypoint MQ: environment-scoped MQ access (the Admin API documents no dedicated region-view permission)",
+    secret_groups: "Secrets Manager: Manage secret groups (includes read access; no narrower secret-group viewer permission is documented)",
+  };
+  assert.deepEqual(
+    Object.fromEntries(result.surfaces.map((surface) => [surface.name, surface.permission])),
+    expectedPermissionsBySurface,
+  );
+
+  const removedPermissionNames = [
+    "View Organization",
+    "View Users",
+    "View Role Groups",
+    "View Environment",
+    "View Connected Applications",
+    "CloudHub Network: CloudHub Network Viewer",
+    "Audit Log: Audit Log Viewer",
+    "Anypoint MQ: MQ Viewer",
+    "Secrets Manager: Read Secret Groups",
+  ];
+  const accessOutput = JSON.stringify(result);
+  for (const removedPermissionName of removedPermissionNames) {
+    assert.ok(!accessOutput.includes(removedPermissionName), `removed permission name returned: ${removedPermissionName}`);
+  }
+});
+
 test("checkMulesoftAccess reports limited access and missing permissions when surfaces are forbidden", async () => {
   const forbidden = (permissionLabel) => async () => {
     throw new MulesoftApiError(403, `Anypoint request failed (403 Forbidden) for ${permissionLabel}`);
@@ -849,8 +902,8 @@ test("checkMulesoftAccess reports limited access and missing permissions when su
   assert.ok(result.surfaces.some((surface) => surface.name === "cloudhub_applications" && surface.status === "skipped"));
   assert.ok(result.missingPermissions.some((permission) => /Audit Log Viewer/.test(permission)));
   assert.ok(result.missingPermissions.some((permission) => /CloudHub Network Viewer/.test(permission)));
-  assert.ok(result.missingPermissions.some((permission) => /View Connected Applications/.test(permission)));
-  assert.match(result.recommendedNextStep, /Grant the connected app or user these read permissions/);
+  assert.ok(result.missingPermissions.some((permission) => /root Organization Administrator \(connected applications\)/.test(permission)));
+  assert.match(result.recommendedNextStep, /Review these documented permission or access requirements/);
   assert.ok(result.notes.some((note) => note.includes("No environment was readable")));
 });
 
