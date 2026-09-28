@@ -19,6 +19,15 @@ import { chmod, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { ZipArchive } from "archiver";
 import { Type } from "@sinclair/typebox";
+import {
+  hydrateBatchFrameworkMappings,
+  withIntegrationToolContracts,
+} from "./batch-spec-builder.js";
+import {
+  AZURE_AUTH_RESOLVER,
+  readResolverEnvironment,
+} from "./auth-resolver-contracts.js";
+import { AZURE_SPEC } from "./azure.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -355,6 +364,24 @@ export const AZURE_CONTROL_MAPPINGS: Record<number, ControlMapping> = {
   24: { name: "Network Watcher", fedramp: "AU-12, SI-4", cmmc: "AU.L2-3.3.1", soc2: "CC7.2", cis_azure: "6.4, 6.5", pci_dss: "10.2.1", disa_stig: "SRG-APP-000089", irap: "ISM-0580", ismap: "8.1.3" },
   25: { name: "Azure Policy", fedramp: "CM-2, CM-6", cmmc: "CM.L2-3.4.2", soc2: "CC6.1, CC8.1", cis_azure: "n/a", pci_dss: "6.3.1", disa_stig: "SRG-APP-000383", irap: "ISM-1490", ismap: "6.3.2" },
 };
+
+hydrateBatchFrameworkMappings(AZURE_SPEC, Object.fromEntries(AZURE_SPEC.checks.map((check) => {
+  const mapping = AZURE_CONTROL_MAPPINGS[check.controlNumbers[0]];
+  const values = (key: AzureFramework): string[] => {
+    const entry = mapping?.[key];
+    return !entry || entry === "n/a" ? [] : entry.split(",").map((value) => value.trim());
+  };
+  return [check.id, {
+    fedramp: values("fedramp"),
+    cmmc: values("cmmc"),
+    soc2: values("soc2"),
+    cis: values("cis_azure"),
+    pci_dss: values("pci_dss"),
+    disa_stig: values("disa_stig"),
+    irap: values("irap"),
+    ismap: values("ismap"),
+  }];
+})));
 
 function frameworkMappings(control: number): string[] {
   const mapping = AZURE_CONTROL_MAPPINGS[control];
@@ -1597,6 +1624,7 @@ export function resolveAzureConfiguration(
   env: NodeJS.ProcessEnv = process.env,
   commandRunner: AzureCommandRunner = defaultCommandRunner,
 ): AzureResolvedConfig {
+  env = readResolverEnvironment(AZURE_AUTH_RESOLVER, env);
   const sourceChain: string[] = [];
   const cloud = resolveAzureCloud(asString(input.authority_host) ?? asString(env.AZURE_AUTHORITY_HOST), {
     graphHost: asString(env.AZURE_GRAPH_HOST),
@@ -3608,6 +3636,7 @@ const maxMailboxesParam = Type.Optional(Type.Number({ description: `Maximum memb
 const maxAssignmentsParam = Type.Optional(Type.Number({ description: "Maximum ARM role assignments to sample. Defaults to 500.", default: 500 }));
 
 export function registerAzureTools(pi: any): void {
+  pi = withIntegrationToolContracts(pi, AZURE_SPEC);
   pi.registerTool({
     name: "azure_check_access",
     label: "Check Azure audit access",

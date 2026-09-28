@@ -1,0 +1,183 @@
+import {
+  buildBatchIntegrationSpec,
+  buildBatchOutputContract,
+} from "./batch-spec-builder.js";
+import {
+  batch2Checks,
+  restSurface,
+  type Batch2CheckRow,
+} from "./batch2-spec-helpers.js";
+import { GCP_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
+
+const ASSET_DOCS = "https://cloud.google.com/asset-inventory/docs/reference/rest";
+const surfaces = [
+  restSurface("organization", "cloudresourcemanager.googleapis.com/v1/organizations/{organization}", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/organizations/get", ["name", "displayName", "state"]),
+  restSurface("projects", "cloudasset.googleapis.com/v1/{scope}:searchAllResources", "Cloud Asset Inventory", ASSET_DOCS, ["name", "displayName", "state", "project"]),
+  restSurface("iam-policies", "cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies", "Cloud Asset Inventory", ASSET_DOCS, ["resource", "policy.bindings.role", "policy.bindings.members"]),
+  restSurface("service-accounts", "iam.googleapis.com/v1/projects/{project}/serviceAccounts", "IAM", "https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts/list", ["name", "email", "disabled"]),
+  restSurface("service-account-keys", "iam.googleapis.com/v1/projects/{project}/serviceAccounts/{account}/keys", "IAM", "https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts.keys/list", ["name", "keyType", "validAfterTime", "validBeforeTime"]),
+  restSurface("logging", "logging.googleapis.com/v2/{resource}", "Cloud Logging", "https://cloud.google.com/logging/docs/reference/v2/rest", ["name", "disabled", "destination", "retentionDays", "timestamp"]),
+  restSurface("security-command-center", "securitycenter.googleapis.com/v1/organizations/{organization}/{resource}", "Security Command Center", "https://cloud.google.com/security-command-center/docs/reference/rest", ["name", "state", "category", "severity"]),
+  restSurface("effective-org-policy", "cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy", "Cloud Resource Manager", "https://cloud.google.com/resource-manager/reference/rest/v1/projects/getEffectiveOrgPolicy", ["constraint", "booleanPolicy.enforced", "listPolicy"]),
+  restSurface("compute", "compute.googleapis.com/compute/v1/projects/{project}/{resource}", "Compute Engine", "https://cloud.google.com/compute/docs/reference/rest/v1", ["name", "metadata", "shieldedInstanceConfig", "networkInterfaces", "logConfig", "sslPolicy", "securityPolicy"]),
+  restSurface("binary-authorization", "binaryauthorization.googleapis.com/v1/projects/{project}/policy", "Binary Authorization", "https://cloud.google.com/binary-authorization/docs/reference/rest/v1/projects/getPolicy", ["defaultAdmissionRule", "clusterAdmissionRules", "kubernetesNamespaceAdmissionRules", "serviceAccountAdmissionRules", "istioServiceIdentityAdmissionRules"]),
+  restSurface("storage", "storage.googleapis.com/storage/v1/b?project={project}", "Cloud Storage", "https://cloud.google.com/storage/docs/json_api/v1/buckets/list", ["name", "iamConfiguration", "encryption"]),
+  restSurface("kms", "cloudasset.googleapis.com/v1/{scope}/assets?assetTypes=cloudkms.googleapis.com/CryptoKey", "Cloud Asset Inventory", ASSET_DOCS, ["name", "resource.data.rotationPeriod", "resource.data.nextRotationTime"]),
+  restSurface("dns", "dns.googleapis.com/dns/v1/projects/{project}/managedZones", "Cloud DNS", "https://cloud.google.com/dns/docs/reference/rest/v1/managedZones/list", ["name", "dnssecConfig.state"]),
+  restSurface("api-keys", "apikeys.googleapis.com/v2/projects/{project}/locations/global/keys", "API Keys", "https://cloud.google.com/api-keys/docs/reference/rest/v2/projects.locations.keys/list", ["name", "restrictions"]),
+  restSurface("access-context-manager", "accesscontextmanager.googleapis.com/v1/{resource}", "Access Context Manager", "https://cloud.google.com/access-context-manager/docs/reference/rest/v1", ["name", "parent", "status.resources", "spec.resources"]),
+] as const;
+
+type Row = readonly [
+  string,
+  number,
+  string,
+  Batch2CheckRow["severity"],
+  readonly string[],
+  Batch2CheckRow["emptyOutcome"],
+  Batch2CheckRow["violationOutcome"]?,
+];
+
+const rows: readonly Row[] = [
+  ["GCP-IAM-01", 2, "Privileged IAM bindings", "high", ["iam-policies"], "manual"],
+  ["GCP-IAM-02", 1, "Service account key rotation", "high", ["projects", "service-accounts", "service-account-keys"], "pass"],
+  ["GCP-IAM-03", 1, "User-managed service account key minimization", "medium", ["projects", "service-accounts", "service-account-keys"], "manual", "warn"],
+  ["GCP-IAM-04", 14, "Cross-project service account access", "medium", ["iam-policies"], "manual", "warn"],
+  ["GCP-IAM-05", 13, "Default service account privilege", "high", ["iam-policies"], "manual"],
+  ["GCP-LOG-01", 5, "Admin Activity visibility", "medium", ["projects", "logging"], "manual", "warn"],
+  ["GCP-LOG-02", 5, "Data Access logging coverage", "high", ["projects", "logging"], "manual"],
+  ["GCP-LOG-03", 5, "Log sink coverage", "high", ["projects", "logging"], "manual"],
+  ["GCP-LOG-04", 5, "Log bucket retention", "medium", ["projects", "logging"], "manual"],
+  ["GCP-LOG-05", 5, "Security Command Center visibility", "info", ["organization", "security-command-center"], "warn", "warn"],
+  ["GCP-ORG-01", 6, "Organization visibility", "medium", ["organization", "projects"], "warn", "warn"],
+  ["GCP-ORG-02", 6, "Domain-restricted sharing", "high", ["effective-org-policy"], "manual", "warn"],
+  ["GCP-ORG-03", 6, "Service account key creation restriction", "high", ["effective-org-policy"], "manual"],
+  ["GCP-ORG-04", 6, "Service account key upload restriction", "high", ["effective-org-policy"], "manual", "warn"],
+  ["GCP-ORG-05", 12, "Serial port and Shielded VM guardrails", "medium", ["effective-org-policy"], "manual"],
+  ["GCP-ORG-06", 11, "OS Login enforcement", "high", ["effective-org-policy", "compute"], "manual"],
+  ["GCP-ORG-07", 8, "Binary Authorization admission policy", "medium", ["projects", "binary-authorization"], "manual"],
+  ["GCP-ORG-08", 12, "Shielded VM and serial port instance configuration", "medium", ["projects", "compute"], "manual"],
+  ["GCP-DATA-01", 15, "Uniform bucket-level access", "high", ["projects", "storage"], "manual"],
+  ["GCP-DATA-02", 3, "Public resource exposure", "critical", ["iam-policies"], "manual"],
+  ["GCP-DATA-03", 7, "KMS key rotation", "medium", ["kms"], "manual"],
+  ["GCP-DATA-04", 16, "Customer-managed encryption keys", "medium", ["projects", "storage", "compute"], "manual", "warn"],
+  ["GCP-DATA-05", 17, "Cloud DNS DNSSEC", "medium", ["projects", "dns"], "manual"],
+  ["GCP-DATA-06", 20, "API key restrictions", "high", ["projects", "api-keys"], "pass"],
+  ["GCP-DATA-07", 21, "VPC Service Controls perimeters", "medium", ["organization", "access-context-manager"], "manual", "warn"],
+  ["GCP-NET-01", 4, "Firewall rules open to the internet on administrative ports", "high", ["projects", "compute"], "manual"],
+  ["GCP-NET-02", 9, "VPC flow logs", "medium", ["projects", "compute"], "manual"],
+  ["GCP-NET-03", 22, "Private Google Access", "low", ["projects", "compute"], "manual", "warn"],
+  ["GCP-NET-04", 10, "Cloud NAT coverage and external IP usage", "medium", ["projects", "compute"], "manual", "warn"],
+  ["GCP-NET-05", 18, "Load balancer SSL policies", "high", ["projects", "compute"], "manual"],
+  ["GCP-NET-06", 19, "Cloud Armor on external backend services", "medium", ["projects", "compute"], "manual", "warn"],
+] as const;
+
+function owner(id: string): string {
+  if (id.startsWith("GCP-IAM-")) return "gcp_assess_identity";
+  if (id.startsWith("GCP-LOG-")) return "gcp_assess_logging_detection";
+  if (id.startsWith("GCP-ORG-")) return "gcp_assess_org_guardrails";
+  if (id.startsWith("GCP-DATA-")) return "gcp_assess_data_protection";
+  return "gcp_assess_network_security";
+}
+
+const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome, violationOutcome]) => ({
+  id,
+  control,
+  title,
+  severity,
+  owner: owner(id),
+  surfaces: sourceSurfaces,
+  emptyOutcome,
+  violationOutcome,
+  decision: `From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return ${violationOutcome ?? "fail"} when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record.`,
+})));
+const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
+
+export const GCP_RUNTIME_BEHAVIOR = [
+  "Project-scoped APIs are sampled from the complete collected project inventory up to the configured project cap; reaching any project, page, key, finding, or asset cap marks dependent evidence partial.",
+  "Security Command Center is organization-scoped and remains manual when no organization ID is configured.",
+  "Rendered arrays are capped presentation samples; verdict counts are computed before those arrays are sliced.",
+] as const;
+
+export const GCP_SPEC = buildBatchIntegrationSpec({
+  slug: "gcp-sec-inspector",
+  displayName: "GCP Security Inspector",
+  vendor: "Google Cloud",
+  category: "cloud",
+  summary: "Portable contract for the shipped Google Cloud identity, logging, organization, data-protection, and network assessments.",
+  sourceModule: "cli/extensions/grc-tools/gcp.ts",
+  baseServices: [...new Set(surfaces.map((surface) => surface.service))],
+  authentication: GCP_AUTH_RESOLVER,
+  permissions: [
+    { id: "cloud-platform", kind: "oauth-scope", value: "https://www.googleapis.com/auth/cloud-platform", unlocks: surfaces.map((surface) => surface.id), notes: "OAuth scope only; IAM permissions still govern every read." },
+    { id: "viewer-security-reviewer", kind: "role", value: "Viewer plus service-specific security, logging, asset, IAM, and organization read permissions", unlocks: surfaces.map((surface) => surface.id) },
+  ],
+  surfaces,
+  checks,
+  tools: {
+    gcp_check_access: [],
+    gcp_assess_identity: idsFor("gcp_assess_identity"),
+    gcp_assess_logging_detection: idsFor("gcp_assess_logging_detection"),
+    gcp_assess_org_guardrails: idsFor("gcp_assess_org_guardrails"),
+    gcp_assess_data_protection: idsFor("gcp_assess_data_protection"),
+    gcp_assess_network_security: idsFor("gcp_assess_network_security"),
+    gcp_export_audit_bundle: checks.map((check) => check.id),
+  },
+  pagination: [{
+    surfaceIds: surfaces.filter((surface) => !["organization", "effective-org-policy", "binary-authorization"].includes(surface.id)).map((surface) => surface.id),
+    cursorFields: ["nextPageToken"],
+    pageSize: null,
+    itemCap: null,
+    pageCap: 250,
+    totalSemantics: "Completion requires exhausting nextPageToken and remaining below every configured project, key, finding, asset, and resource cap; presentation slices never establish completion.",
+    stopConditions: ["No nextPageToken", "Repeated page token", "Empty page with nextPageToken", "250-page cap", "Configured project or resource cap"],
+  }],
+  rateLimit: {
+    documentedLimit: "API and quota-project specific",
+    retryHeaders: ["Retry-After"],
+    retryableStatuses: [429, 500, 502, 503, 504],
+    backoffPolicy: "Honor bounded Retry-After and retry transient responses with bounded exponential delay; exhausted reads remain unreadable.",
+  },
+  runtimeBehavior: GCP_RUNTIME_BEHAVIOR,
+  knownGaps: ["Organization-wide enumeration is bounded by explicit runtime caps and some organization-policy checks use a configured or sampled project as their effective-policy target."],
+  sensitiveFields: ["private_key", "client_secret", "refresh_token", "access_token", "authorization", "cookie"],
+  credentialFormats: ["OAuth bearer tokens", "service-account private keys", "authorized-user refresh tokens"],
+  output: buildBatchOutputContract({
+    files: [
+      "QUICK_REFERENCE.md",
+      "README.md",
+      "metadata.json",
+      "core_data/access.json",
+      "core_data/identity.json",
+      "core_data/logging-detection.json",
+      "core_data/org-guardrails.json",
+      "core_data/data-protection.json",
+      "core_data/network-security.json",
+      "analysis/identity.json",
+      "analysis/logging-detection.json",
+      "analysis/org-guardrails.json",
+      "analysis/data-protection.json",
+      "analysis/network-security.json",
+      "analysis/identity.md",
+      "analysis/logging-detection.md",
+      "analysis/org-guardrails.md",
+      "analysis/data-protection.md",
+      "analysis/network-security.md",
+      "analysis/findings.json",
+      "analysis/category_summaries.json",
+      "compliance/executive_summary.md",
+      "compliance/unified_compliance_matrix.md",
+      "compliance/frameworks/fedramp.md",
+      "compliance/frameworks/cmmc.md",
+      "compliance/frameworks/soc2.md",
+      "compliance/frameworks/cis_gcp.md",
+      "compliance/frameworks/pci_dss.md",
+      "compliance/frameworks/disa_stig.md",
+      "compliance/frameworks/irap.md",
+      "compliance/frameworks/ismap.md",
+    ],
+    conditionalFiles: ["_errors.log"],
+    overwritePolicy: "Allocate a new gcp-audit-<UTC timestamp> directory and numeric suffix when either directory or paired archive exists.",
+    archivePairing: "Create <allocated-directory>.zip beside the allocated GCP audit directory.",
+  }),
+});

@@ -1,10 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerAwsTools } from "./aws.js";
 import { AWS_SPEC } from "./aws.spec.js";
+import { registerAzureTools } from "./azure.js";
+import { AZURE_SPEC } from "./azure.spec.js";
 import { registerBoxTools } from "./box.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { registerDuoTools } from "./duo.js";
 import { DUO_SPEC } from "./duo.spec.js";
+import { registerGcpTools } from "./gcp.js";
+import { GCP_SPEC } from "./gcp.spec.js";
 import { registerGwsTools } from "./gws.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import type { IntegrationSpecContract } from "./spec-model.js";
@@ -38,6 +42,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     registerTools: registerAwsTools,
   },
   {
+    contract: AZURE_SPEC,
+    narrativePath: "specs/narratives/azure.md",
+    outputPath: "specs/azure-sec-inspector.spec.md",
+    registerTools: registerAzureTools,
+  },
+  {
     contract: BOX_SPEC,
     narrativePath: "specs/narratives/box.md",
     outputPath: "specs/box-sec-inspector.spec.md",
@@ -48,6 +58,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/duo.md",
     outputPath: "specs/duo-sec-inspector.spec.md",
     registerTools: registerDuoTools,
+  },
+  {
+    contract: GCP_SPEC,
+    narrativePath: "specs/narratives/gcp.md",
+    outputPath: "specs/gcp-sec-inspector.spec.md",
+    registerTools: registerGcpTools,
   },
   {
     contract: GWS_SPEC,
