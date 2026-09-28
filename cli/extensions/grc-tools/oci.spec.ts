@@ -109,7 +109,7 @@ const rows: readonly Row[] = [
   ["OCI-IAM-05", 5, "Compartment hierarchy depth", "medium", ["identity-compartments"]],
   ["OCI-IAM-06", 6, "IAM password expiration (manual)", "medium", [], true],
   ["OCI-LOG-01", 7, "Cloud Guard enabled and active targets", "high", ["cloud-guard-configuration", "cloud-guard-targets"]],
-  ["OCI-LOG-02", 8, "Open Cloud Guard problems", "high", ["cloud-guard-configuration", "cloud-guard-problems"]],
+  ["OCI-LOG-02", 8, "Open Cloud Guard problems", "high", ["cloud-guard-configuration", "cloud-guard-targets", "cloud-guard-problems"]],
   ["OCI-LOG-03", 9, "Responder recipe activation", "medium", ["cloud-guard-configuration", "cloud-guard-responder-recipes"]],
   ["OCI-LOG-04", 10, "Audit event visibility", "medium", ["audit-event-inventory"]],
   ["OCI-LOG-05", 11, "Event rules for critical operations", "medium", ["identity-compartments", "event-rule-inventory"]],
@@ -135,7 +135,7 @@ export const OCI_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCom
   "OCI-IAM-04": [ociSource("identity-compartments", ON), ociSource("identity-policies", OTF)],
   "OCI-IAM-05": [ociSource("identity-compartments", ON)],
   "OCI-LOG-01": [ociSource("cloud-guard-configuration", ON), ociSource("cloud-guard-targets", ON)],
-  "OCI-LOG-02": [ociSource("cloud-guard-configuration", ON), ociSource("cloud-guard-problems", ON)],
+  "OCI-LOG-02": [ociSource("cloud-guard-configuration", ON), ociSource("cloud-guard-targets", ON), ociSource("cloud-guard-problems", ON)],
   "OCI-LOG-03": [ociSource("cloud-guard-configuration", ON), ociSource("cloud-guard-responder-recipes", ON)],
   "OCI-LOG-04": [ociSource("audit-event-inventory", ON)],
   "OCI-LOG-05": [ociSource("identity-compartments", ON), ociSource("event-rule-inventory", OTF)],
@@ -185,7 +185,7 @@ const decisionPredicate: Readonly<Record<string, string>> = {
   "OCI-IAM-05": "Fail when the complete ACTIVE compartment inventory contains no non-root compartment whose compartmentId names either another returned compartment or the tenancy OCID. Pass when at least one such non-root compartment exists; maximum parent-chain depth is reported as evidence but does not change the verdict.",
   "OCI-IAM-06": "Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting.",
   "OCI-LOG-01": "Fail when the Cloud Guard configuration status is not ENABLED or no ACTIVE target exists; pass only when both reads are complete and affirmative.",
-  "OCI-LOG-02": "Pass on a complete empty open-problem inventory; fail when any unresolved Cloud Guard problem is HIGH or CRITICAL and warn for lower-risk open problems.",
+  "OCI-LOG-02": "Fail when any unresolved Cloud Guard problem is HIGH or CRITICAL and warn for lower-risk open problems, regardless of Cloud Guard configuration or target readability. A readable empty open-problem inventory passes only when configuration status is ENABLED and the readable target inventory contains at least one ACTIVE target; otherwise it is manual.",
   "OCI-LOG-03": "Fail when no ACTIVE responder recipe exists or no returned responder rule has details.isEnabled=true.",
   "OCI-LOG-04": "Warn when the complete audit query returns no event; pass when at least one event with eventTime is visible.",
   "OCI-LOG-05": "Normalize each Events rule condition to lowercase text. A rule covers critical operations when that text contains `com.oraclecloud.identitycontrolplane`, `com.oraclecloud.virtualnetwork`, `policy`, `identity`, or `network`; fail when no enabled ACTIVE rule matches, and warn when rule collection is partial.",
@@ -213,7 +213,12 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
           numeric_required: "Boolean from passwordPolicy.isNumericCharactersRequired; only literal true satisfies the complexity predicate.",
           special_required: "Boolean from passwordPolicy.isSpecialCharactersRequired; only literal true satisfies the complexity predicate.",
         }
-      : batch2GenericDecisionInputs(decisionPredicate[id]);
+      : id === "OCI-LOG-02"
+        ? {
+            ...batch2GenericDecisionInputs(decisionPredicate[id]),
+            evidence_readable: "Boolean. True when `oci cloud-guard problem list` is readable and either at least one OPEN problem exists or both `oci cloud-guard configuration get` returns status ENABLED and `oci cloud-guard target list` is readable with at least one ACTIVE target. An unreadable problem list is always false. Configuration or target failure does not make this false when an OPEN problem already proves fail or warn; false, null, or missing requires manual review.",
+          }
+        : batch2GenericDecisionInputs(decisionPredicate[id]);
   return {
     id,
     control,

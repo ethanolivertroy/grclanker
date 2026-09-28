@@ -2573,7 +2573,16 @@ export async function assessOciLoggingDetection(
         targets: readEvidence("cloud-guard target list", targetsRead, { active_targets: activeTargets.length, total_targets: targets.items.length }),
         cloud_guard_configuration: cloudGuardEvidence,
       },
-      ociDecisionFacts(problems.ok && (openProblems.length > 0 || (cloudGuardConfig.ok && cloudGuardEnabled)), true, problems.items.length, highRiskProblems.length, openProblems.length - highRiskProblems.length),
+      ociDecisionFacts(
+        problems.ok && (
+          openProblems.length > 0
+          || (cloudGuardConfig.ok && cloudGuardEnabled && targets.ok && activeTargets.length > 0)
+        ),
+        true,
+        problems.items.length,
+        highRiskProblems.length,
+        openProblems.length - highRiskProblems.length,
+      ),
     ),
     finding(
       "OCI-LOG-03",
