@@ -109,6 +109,12 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
 
 test("batch 3 completeness names exact datasets and all six collection failure modes", () => {
   const expectedModes = ["denied", "error", "missing-required-field", "not-collected", "not-configured", "truncated"];
+  const parentTruncationNoChange = new Set([
+    "TENABLE-11.groups",
+    "TENABLE-11.permissions",
+    "TENABLE-19.asset-export-jobs",
+    "TENABLE-19.vuln-export-jobs",
+  ]);
   let contracts = 0;
   let sources = 0;
   for (const [spec] of batch) {
@@ -126,9 +132,13 @@ test("batch 3 completeness names exact datasets and all six collection failure m
         for (const source of contract.sources) {
           sources += 1;
           assert.ok(surfaceIds.has(source.surfaceId), `${check.id}.${name}.${source.surfaceId}`);
-          assert.deepEqual([...source.falseWhen].sort(), expectedModes);
+          const sourceKey = `${check.id}.${source.surfaceId}`;
+          const expectedFalseWhen = parentTruncationNoChange.has(sourceKey)
+            ? expectedModes.filter((mode) => mode !== "truncated")
+            : expectedModes;
+          assert.deepEqual([...source.falseWhen].sort(), expectedFalseWhen, sourceKey);
           assert.match(contract.semantics, new RegExp(`${source.surfaceId} sets evidence_complete false on`));
-          for (const mode of source.falseWhen) {
+          for (const mode of expectedModes) {
             assert.match(contract.semantics, new RegExp(`\\b${mode}\\b`), `${check.id}.${name}.${source.surfaceId}.${mode}`);
           }
         }

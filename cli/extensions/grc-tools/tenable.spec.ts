@@ -4,11 +4,12 @@ import {
 } from "./batch-spec-builder.js";
 import { restSurface } from "./batch2-spec-helpers.js";
 import { TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
-import { BATCH3_FRAMEWORK_FILES, batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://developer.tenable.com/reference/navigate";
 const surface = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") =>
   restSurface(id, path, path.startsWith("/rest/") ? "Tenable Security Center REST API" : "Tenable Vulnerability Management REST API", DOCS, fields, method);
+const NON_TRUNCATION_FAILURES = ["error", "denied", "not-collected", "not-configured", "missing-required-field"] as const;
 
 const surfaces = [
   surface("server-properties", "/server/properties", ["plugin_set", "loaded_plugin_set", "server_version", "license"]),
@@ -57,7 +58,21 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "TENABLE-08", control: 8, title: "Plugin update currency", severity: "high", owner: "tenable_assess_sensor_coverage", surfaces: ["scanners", "server-properties", "sc-scanners"], predicate: "Count scanners whose plugin feed age exceeds plugin_stale_hours or whose plugin set is absent.", constants: { default_plugin_stale_hours: 24 } },
   { id: "TENABLE-09", control: 9, title: "Network zone configuration", severity: "medium", owner: "tenable_assess_sensor_coverage", surfaces: ["networks", "scanners"], predicate: "Count network zones without an assigned readable scanner or referencing a missing scanner." },
   { id: "TENABLE-10", control: 10, title: "User role and permission audit", severity: "high", owner: "tenable_assess_access_control", surfaces: ["users", "roles", "groups", "sc-users"], predicate: "Count active users inactive beyond inactive_user_days and administrator users above max_admins; unknown last-login fields require review.", constants: { default_inactive_user_days: 90, default_max_admins: 5 } },
-  { id: "TENABLE-11", control: 11, title: "Access group review", severity: "high", owner: "tenable_assess_access_control", surfaces: ["access-groups", "groups", "permissions"], predicate: "Count access groups granting all-assets access without a constrained rule or permissions with unrestricted subjects; unreadable user-group membership prevents a clean permission inventory from passing." },
+  {
+    id: "TENABLE-11",
+    control: 11,
+    title: "Access group review",
+    severity: "high",
+    owner: "tenable_assess_access_control",
+    surfaces: ["access-groups", "groups", "permissions"],
+    predicate: "Count access groups granting all-assets access without a constrained rule or permissions with unrestricted subjects; unreadable user-group membership prevents a clean permission inventory from passing.",
+    completenessSources: [
+      batch3Source("access-groups"),
+      batch3Source("groups", NON_TRUNCATION_FAILURES),
+      batch3Source("permissions", NON_TRUNCATION_FAILURES),
+    ],
+    completenessSemantics: "For TENABLE-11, access-groups sets evidence_complete false on truncated, error, denied, not-collected, not-configured, and missing-required-field. groups sets evidence_complete false on error, denied, not-collected, not-configured, and missing-required-field; truncated leaves it unchanged when rows were delivered. permissions sets evidence_complete false on error, denied, not-collected, not-configured, and missing-required-field; truncated leaves it unchanged when delivered rows prove the shipped parent outcome. Finding previews and exported samples never establish source cardinality.",
+  },
   { id: "TENABLE-12", control: 12, title: "Managed credential hygiene", severity: "high", owner: "tenable_assess_access_control", surfaces: ["credentials"], predicate: "Count managed credential metadata records with no type or modification timestamp; empty readable inventory requires review." },
   { id: "TENABLE-13", control: 13, title: "Scan exclusion audit", severity: "medium", owner: "tenable_assess_scan_program", surfaces: ["exclusions"], predicate: "Count enabled permanent exclusions, broad member ranges, and exclusions without a readable justification or expiry.", emptyOutcome: "pass" },
   { id: "TENABLE-14", control: 14, title: "Vulnerability prioritization (VPR)", severity: "high", owner: "tenable_assess_vulnerability_management", surfaces: ["vuln-export", "vuln-export-status", "vuln-export-chunks"], predicate: "Count open critical or high vulnerabilities without a numeric VPR score; an export with no evaluable records requires manual review." },
@@ -65,7 +80,20 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "TENABLE-16", control: 16, title: "Asset tagging strategy", severity: "medium", owner: "tenable_assess_sensor_coverage", surfaces: ["asset-export", "asset-export-status", "asset-export-chunks", "tag-categories", "tag-values"], predicate: "Compute assets carrying at least one tag divided by the complete asset export; ratios below tagged_threshold violate.", constants: { default_tagged_threshold: 0.9 } },
   { id: "TENABLE-17", control: 17, title: "Compliance audit templates", severity: "high", owner: "tenable_assess_scan_program", surfaces: ["scan-templates", "scans", "policies"], predicate: "Count the absence of a compliance audit template and the absence of an enabled recurring scan using one." },
   { id: "TENABLE-18", control: 18, title: "Audit log review", severity: "medium", owner: "tenable_assess_access_control", surfaces: ["audit-events"], predicate: "Count sensitive administrative events inside audit_lookback_days; an empty readable event window is review evidence, not proof that review occurs.", emptyOutcome: "warn", constants: { default_audit_lookback_days: 30 } },
-  { id: "TENABLE-19", control: 19, title: "Export and reporting automation", severity: "medium", owner: "tenable_assess_vulnerability_management", surfaces: ["vuln-export-jobs", "asset-export-jobs"], predicate: "Count the absence of a completed or scheduled vulnerability or asset export job." },
+  {
+    id: "TENABLE-19",
+    control: 19,
+    title: "Export and reporting automation",
+    severity: "medium",
+    owner: "tenable_assess_vulnerability_management",
+    surfaces: ["vuln-export-jobs", "asset-export-jobs"],
+    predicate: "Count the absence of a completed or scheduled vulnerability or asset export job.",
+    completenessSources: [
+      batch3Source("vuln-export-jobs", NON_TRUNCATION_FAILURES),
+      batch3Source("asset-export-jobs", NON_TRUNCATION_FAILURES),
+    ],
+    completenessSemantics: "For TENABLE-19, vuln-export-jobs sets evidence_complete false on error, denied, not-collected, not-configured, and missing-required-field; truncated leaves it unchanged when observed external jobs span at least two days. asset-export-jobs sets evidence_complete false on error, denied, not-collected, not-configured, and missing-required-field; truncated has the same no-change effect, matching the shipped parent. Finding previews and exported samples never establish source cardinality.",
+  },
   { id: "TENABLE-20", control: 20, title: "Target group management", severity: "medium", owner: "tenable_assess_scan_program", surfaces: ["target-groups"], predicate: "Count target groups with empty, broad, overlapping, or unparseable member definitions.", emptyOutcome: "pass" },
 ] as const;
 
@@ -135,7 +163,11 @@ export const TENABLE_SPEC = buildBatchIntegrationSpec({
     backoffPolicy: "Retry four times with Retry-After when present and bounded exponential backoff otherwise; export polling uses a separate five-minute deadline.",
   },
   runtimeBehavior: TENABLE_RUNTIME_BEHAVIOR,
-  knownGaps: ["Tenable Security Center contributes schedule, scanner, feed, and user equivalents only; cloud-only exports and access-group controls remain manual for Security Center-only tenants."],
+  knownGaps: [
+    "Tenable Security Center contributes schedule, scanner, feed, and user equivalents only; cloud-only exports and access-group controls remain manual for Security Center-only tenants.",
+    "TENABLE-11 preserves the shipped parent behavior in which a clean permission result can pass when the permissions or user-group inventory is truncated; a broad permission observed in the loaded rows still fails. This partial-pass exception is a report-only runtime candidate; the spec binding does not harden it.",
+    "TENABLE-19 preserves the shipped parent behavior in which external export jobs observed on at least two days can pass when either export-job listing is truncated. This partial-pass exception is a report-only runtime candidate; the spec binding does not harden it.",
+  ],
   sensitiveFields: ["access_key", "secret_key", "x-apikey", "authorization", "cookie", "password", "credentials", "username"],
   credentialFormats: ["Tenable X-ApiKeys headers", "Security Center x-apikey headers", "managed credential payloads", "URL user information"],
   output: buildBatchOutputContract({

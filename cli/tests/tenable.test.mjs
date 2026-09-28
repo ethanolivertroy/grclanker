@@ -915,7 +915,17 @@ test("control 11 treats the tenant-wide All Users group as broad, alongside AllU
   assert.equal(byId(await runAll(clientsFor(readOnly)), "TENABLE-11").status, "pass");
 });
 
-test("control 11 preserves a proved broad-permission failure when the permission inventory is truncated", async () => {
+test("control 11 preserves parent truncation outcomes and keeps proved broad-permission failures first", async () => {
+  const cleanPermissions = await collectTenableAccessControlData(clientsFor(healthyRoutes()), { now: NOW });
+  cleanPermissions.permissions.truncated = true;
+  cleanPermissions.permissions.total = cleanPermissions.permissions.data.length + 1;
+  assert.equal(byId([assessTenableAccessControl(cleanPermissions, { now: NOW })], "TENABLE-11").status, "pass");
+
+  const cleanGroups = await collectTenableAccessControlData(clientsFor(healthyRoutes()), { now: NOW });
+  cleanGroups.groups.truncated = true;
+  cleanGroups.groups.total = cleanGroups.groups.data.length + 1;
+  assert.equal(byId([assessTenableAccessControl(cleanGroups, { now: NOW })], "TENABLE-11").status, "pass");
+
   const routes = healthyRoutes();
   routes["GET /api/v3/access-control/permissions"] = {
     permissions: [
@@ -929,6 +939,22 @@ test("control 11 preserves a proved broad-permission failure when the permission
   const finding = byId([assessTenableAccessControl(data, { now: NOW })], "TENABLE-11");
   assert.equal(finding.status, "fail");
   assert.equal(finding.evidence.broad_permissions, null);
+});
+
+test("control 16 warns rather than becoming manual when loaded tag categories are truncated", async () => {
+  const data = await collectTenableSensorCoverageData(clientsFor(healthyRoutes()), { now: NOW });
+  data.tagCategories.truncated = true;
+  data.tagCategories.total = data.tagCategories.data.length + 1;
+
+  assert.equal(byId([assessTenableSensorCoverage(data, { now: NOW })], "TENABLE-16").status, "warn");
+});
+
+test("control 19 preserves the parent pass for observed two-day activity in a truncated job listing", async () => {
+  const data = await collectTenableVulnerabilityData(clientsFor(healthyRoutes()), { now: NOW });
+  data.assetExportJobs.truncated = true;
+  data.assetExportJobs.total = data.assetExportJobs.data.length + 1;
+
+  assert.equal(byId([assessTenableVulnerabilityManagement(data, { now: NOW })], "TENABLE-19").status, "pass");
 });
 
 test("control 19 ignores this tool's own export shape and only counts jobs within the documented three-day window", async () => {

@@ -2984,7 +2984,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const complete = !partial
         && evidence.access_groups_truncated !== true
         && !statusIsIncomplete("access_groups_status")
-        && evidence.user_groups !== null
+        && (evidence.user_groups !== null || evidence.groups_readable === true)
         && evidence.caller_is_administrator === true;
       return fact(permissions, value("broad_permission_count") ?? count("broad_permissions"), count("legacy_access_group_count") + (complete ? 0 : 1), complete);
     }
@@ -3013,7 +3013,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "TENABLE-16": {
       const assets = value("asset_count") ?? 0;
-      const categories = value("tag_category_count");
+      const categories = value("tag_category_count") ?? value("tag_category_count_read");
       if (assets === 0 || categories === undefined) return {};
       const ratio = value("tagged_ratio") ?? 0;
       const threshold = value("threshold") ?? 0;
@@ -3033,8 +3033,8 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const jobs = value("external_export_jobs_in_window") ?? 0;
       const days = count("external_export_days");
       if (jobs === 0) return {};
-      const complete = evidence.vuln_export_jobs_listed !== null
-        && evidence.asset_export_jobs_listed !== null
+      const complete = (evidence.vuln_export_jobs_listed !== null || value("vuln_export_jobs_read") !== undefined)
+        && (evidence.asset_export_jobs_listed !== null || value("asset_export_jobs_read") !== undefined)
         && evidence.caller_is_administrator === true;
       return fact(jobs, 0, days < 2 || !complete ? 1 : 0, complete);
     }
@@ -3975,7 +3975,10 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       tag_value_count: countOrNull(data.tagValues),
       tag_values_truncated: data.tagValues.status === "ok" ? data.tagValues.truncated : null,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }, "", { inventory_truncated: data.assetExport.truncated }));
+    }, "", {
+      inventory_truncated: data.assetExport.truncated,
+      tag_category_count_read: data.tagCategories.status === "ok" ? categories.length : undefined,
+    }));
   }
 
   const licensedAgents = asNumber(asObject(asObject(data.serverProperties.data)?.license)?.agents);
@@ -4448,7 +4451,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       {
         broad_permission_count: broad.length,
         caller_is_administrator: callerIsAdministrator,
-        inventory_truncated: data.permissions.truncated,
+        groups_readable: data.groups.status === "ok",
       },
     ));
   }
@@ -4809,7 +4812,11 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       asset_export_jobs_listed: countOrNull(data.assetExportJobs),
       excluded_own_exports: [...ownUuids],
       excluded_own_shaped_jobs: ownShaped.map((job) => asString(job.uuid)).slice(0, 50),
-    }, "", { caller_is_administrator: callerIsAdministrator }));
+    }, "", {
+      asset_export_jobs_read: data.assetExportJobs.status === "ok" ? data.assetExportJobs.data.length : undefined,
+      caller_is_administrator: callerIsAdministrator,
+      vuln_export_jobs_read: data.vulnExportJobs.status === "ok" ? data.vulnExportJobs.data.length : undefined,
+    }));
   }
 
   const errors = [
