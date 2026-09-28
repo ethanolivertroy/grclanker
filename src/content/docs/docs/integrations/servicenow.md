@@ -1,6 +1,6 @@
 ---
 title: ServiceNow
-description: Read-only ServiceNow instance security inspection covering identity, ACLs, platform hardening, and operations governance with evidence-gated verdicts and an exportable audit bundle.
+description: Read-only ServiceNow security inspector covering identity, ACLs, platform hardening, and operations governance, with evidence-gated verdicts and audit bundles.
 ---
 
 grclanker ships six native ServiceNow tools that inspect an instance through the Table API and the Aggregate API. They never write to the instance. Every verdict is evidence-gated: a forbidden, ACL-filtered, truncated, or empty read never produces a pass on its own.

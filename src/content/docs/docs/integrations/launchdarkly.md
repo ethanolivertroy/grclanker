@@ -1,6 +1,6 @@
 ---
 title: LaunchDarkly
-description: Read-only LaunchDarkly account security inspector covering identity, access control, environment governance, flag hygiene, and monitoring integrations across 25 spec controls.
+description: Read-only LaunchDarkly security inspector covering identity, access control, environment governance, flag hygiene, and monitoring across 25 controls.
 ---
 
 The LaunchDarkly integration audits a LaunchDarkly account through the REST API v2 and maps what it finds to the 25 controls in `specs/launchdarkly-sec-inspector.spec.md`. Every tool is read-only: the inspector never creates, updates, or deletes anything in the account, and access tokens are redacted from errors, output, and exported bundles.

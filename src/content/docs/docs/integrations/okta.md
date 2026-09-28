@@ -1,6 +1,6 @@
 ---
 title: Okta
-description: Read-only Okta security inspection covering authentication, admin access, integrations, and monitoring, mapped to FedRAMP, DISA STIG, IRAP, ISMAP, SOC 2, and PCI-DSS, with an OSCAL assessment-results export.
+description: Read-only Okta security inspector covering authentication, admin access, integrations, and monitoring, with framework mappings and OSCAL assessment results.
 ---
 
 The Okta integration inspects an Okta org through the Okta Management API and reports posture findings for the controls defined in `specs/okta-sec-inspector.spec.md`. Every tool is read-only: nothing is created, changed, or deleted in the tenant, and no tenant data is written to disk unless you run `okta_export_audit_bundle`.

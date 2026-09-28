@@ -1,6 +1,6 @@
 ---
 title: Box
-description: Read-only Box Enterprise security inspection covering identity, sharing, data governance, and Shield monitoring, mapped to FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP.
+description: Read-only Box Enterprise security inspector covering identity, sharing, data governance, and Shield monitoring, mapped to eight frameworks including FedRAMP.
 ---
 
 The Box integration inspects a Box Enterprise tenant through the Box Content API and reports posture findings for the 25 controls defined in `specs/box-sec-inspector.spec.md`. Every tool is read-only: nothing is created, changed, or deleted in the tenant.

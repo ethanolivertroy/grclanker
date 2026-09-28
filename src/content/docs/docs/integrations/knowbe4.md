@@ -1,6 +1,6 @@
 ---
 title: KnowBe4
-description: Read-only inspection of KnowBe4 KMSAT phishing simulations, training campaigns, user risk, and account governance through the Reporting API, with optional PhishER GraphQL enrichment.
+description: Read-only KnowBe4 KMSAT inspector covering phishing simulations, training campaigns, user risk, and account governance, with optional PhishER enrichment.
 ---
 
 The KnowBe4 integration audits a KnowBe4 Security Awareness Training (KMSAT) account against the twenty controls in `specs/knowbe4-sec-inspector.spec.md`. It reads phishing security tests and recipients, training campaigns and enrollments, users, groups, and account settings through the KnowBe4 Reporting API, and optionally reads PhishER messages through the PhishER GraphQL API. Every tool is read-only; nothing in this integration creates, changes, or deletes KnowBe4 data.

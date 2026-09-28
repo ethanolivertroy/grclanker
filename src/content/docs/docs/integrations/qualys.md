@@ -1,6 +1,6 @@
 ---
 title: Qualys
-description: Read-only Qualys scanning program inspector covering scan coverage, asset inventory, vulnerability management, and administration hygiene with framework-mapped findings and an exportable audit bundle.
+description: Read-only Qualys subscription inspector covering scan coverage, asset inventory, vulnerability management, and administration, with an exportable audit bundle.
 ---
 
 The Qualys integration audits the health of a Qualys subscription itself: whether scans are scheduled and authenticated, whether the asset inventory is complete and tagged, whether vulnerabilities are remediated inside SLA, and whether users, reports, and activity logs are managed. It never launches scans, edits configuration, or modifies the subscription.

@@ -1,6 +1,6 @@
 ---
 title: Salesforce
-description: Read-only Salesforce security inspector covering Health Check, session and password policy, MFA, permissions, sharing, connected apps, login forensics, audit trail, encryption, and certificates with FedRAMP, CMMC, SOC 2, CIS, PCI-DSS, STIG, IRAP, and ISMAP mappings.
+description: Read-only Salesforce security inspector covering Health Check, session and password policy, MFA, permissions, sharing, connected apps, and audit trail.
 ---
 
 The Salesforce inspector audits one org through the REST API (SOQL), the Tooling API, and the Metadata API `listMetadata` and `readMetadata` calls. Every tool is read-only: nothing is created, updated, or deleted in the org.
