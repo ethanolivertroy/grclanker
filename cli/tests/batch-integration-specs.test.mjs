@@ -61,14 +61,6 @@ const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|
 const ABSENT = Symbol("absent");
 const DEFINED = Symbol("defined");
 
-function alternativeValues(value, domains) {
-  if (typeof value === "boolean") return [!value];
-  if (typeof value === "number") return domains.numbers.filter((candidate) => candidate !== value);
-  if (typeof value === "string") return domains.strings.filter((candidate) => candidate !== value);
-  if (value === null) return [0];
-  return ["__different"];
-}
-
 function mergeAssignments(left, right) {
   const merged = new Map(left);
   for (const [name, value] of right) {
@@ -109,60 +101,48 @@ function operandState(operand, constants) {
 function comparisonWitnesses(condition, desired, constants, domains) {
   const left = operandState(condition.left, constants);
   const right = operandState(condition.right, constants);
-  const equal = condition.op === "eq" ? desired : !desired;
-  if (condition.op === "eq" || condition.op === "ne") {
-    if (left.known && right.known) {
-      return Object.is(left.value, right.value) === equal ? [new Map()] : [];
+  const leftValues = left.known
+    ? [left.value]
+    : [...domains.numbers, ...domains.strings, null, "__not_numeric__"];
+  const rightValues = right.known
+    ? [right.value]
+    : [...domains.numbers, ...domains.strings, null, "__not_numeric__"];
+  return leftValues.flatMap((leftValue) => rightValues.flatMap((rightValue) => {
+    const assignment = new Map();
+    if (!left.known) assignment.set(left.path, leftValue);
+    if (!right.known) assignment.set(right.path, rightValue);
+    const facts = { ...constants, ...rawFacts(assignment) };
+    return evaluateVerdictCondition(condition, facts) === desired ? [assignment] : [];
+  }));
+}
+
+function ratioWitnesses(condition, desired, constants) {
+  const numerator = operandState(condition.numerator, constants);
+  const denominator = operandState(condition.denominator, constants);
+  const threshold = operandState(condition.threshold, constants);
+  if (!threshold.known) throw new Error("Ratio witness thresholds must be constants or literal values");
+  const delta = Math.abs(Number(threshold.value)) >= 2 ? 1 : 0.1;
+  const scaledTargets = [
+    Number(threshold.value) - delta,
+    Number(threshold.value),
+    Number(threshold.value) + delta,
+  ];
+  const denominators = denominator.known ? [denominator.value] : [1, 2, 3, 10, 100];
+  const candidates = [];
+  for (const denominatorValue of denominators) {
+    const numeratorValues = numerator.known
+      ? [numerator.value]
+      : scaledTargets.map((target) => (target / (condition.scale ?? 1)) * Number(denominatorValue));
+    for (const numeratorValue of numeratorValues) {
+      const assignment = new Map();
+      if (!numerator.known) assignment.set(numerator.path, numeratorValue);
+      if (!denominator.known) assignment.set(denominator.path, denominatorValue);
+      const facts = { ...constants, ...rawFacts(assignment) };
+      if (evaluateVerdictCondition(condition, facts) === desired) candidates.push(assignment);
     }
-    if (!left.known && right.known) {
-      const values = equal ? [right.value] : alternativeValues(right.value, domains);
-      return values.map((value) => new Map([[left.path, value]]));
-    }
-    if (left.known && !right.known) {
-      const values = equal ? [left.value] : alternativeValues(left.value, domains);
-      return values.map((value) => new Map([[right.path, value]]));
-    }
-    const pairs = domains.numbers.flatMap((leftValue) => domains.numbers
-      .filter((rightValue) => Object.is(leftValue, rightValue) === equal)
-      .map((rightValue) => [leftValue, rightValue]));
-    return pairs.map(([leftValue, rightValue]) => new Map([
-      [left.path, leftValue],
-      [right.path, rightValue],
-    ]));
   }
-  const comparison = condition.op === "gt" ? "gt" : "lte";
-  if (left.known && right.known) {
-    const actual = comparison === "gt"
-      ? Number(left.value) > Number(right.value)
-      : Number(left.value) <= Number(right.value);
-    return actual === desired ? [new Map()] : [];
-  }
-  if (!left.known && right.known) {
-    const threshold = Number(right.value);
-    const values = domains.numbers.filter((value) => (
-      (comparison === "gt" ? value > threshold : value <= threshold) === desired
-    ));
-    if (!desired) values.push("__not_numeric__");
-    return values.map((value) => new Map([[left.path, value]]));
-  }
-  if (left.known && !right.known) {
-    const threshold = Number(left.value);
-    const values = domains.numbers.filter((value) => (
-      (comparison === "gt" ? threshold > value : threshold <= value) === desired
-    ));
-    if (!desired) values.push("__not_numeric__");
-    return values.map((value) => new Map([[right.path, value]]));
-  }
-  const pairs = domains.numbers.flatMap((leftValue) => domains.numbers
-    .filter((rightValue) => (
-      (comparison === "gt" ? leftValue > rightValue : leftValue <= rightValue) === desired
-    ))
-    .map((rightValue) => [leftValue, rightValue]));
-  if (!desired) pairs.push(["__not_numeric__", 0]);
-  return pairs.map(([leftValue, rightValue]) => new Map([
-    [left.path, leftValue],
-    [right.path, rightValue],
-  ]));
+  if (!desired && !numerator.known) candidates.push(new Map([[numerator.path, null]]));
+  return candidates;
 }
 
 function conditionWitnesses(condition, desired, constants, domains) {
@@ -188,8 +168,12 @@ function conditionWitnesses(condition, desired, constants, domains) {
     case "eq":
     case "ne":
     case "gt":
+    case "gte":
+    case "lt":
     case "lte":
       return comparisonWitnesses(condition, desired, constants, domains);
+    case "ratio":
+      return ratioWitnesses(condition, desired, constants);
     case "defined": {
       const operand = operandState(condition.operand, constants);
       if (operand.known) return (operand.value !== undefined) === desired ? [new Map()] : [];
@@ -232,6 +216,9 @@ function witnessDomains(branches, constants) {
     if (condition.left?.kind === "value") add(condition.left.value);
     if (condition.right?.kind === "value") add(condition.right.value);
     if (condition.operand?.kind === "value") add(condition.operand.value);
+    if (condition.numerator?.kind === "value") add(condition.numerator.value);
+    if (condition.denominator?.kind === "value") add(condition.denominator.value);
+    if (condition.threshold?.kind === "value") add(condition.threshold.value);
     for (const child of condition.conditions ?? []) walk(child);
     if (condition.condition) walk(condition.condition);
   };
@@ -291,8 +278,8 @@ test("every batch tool definition carries adjacent non-enumerable metadata witho
   }
 });
 
-test("Okta, Slack, and Zoom execute declared derived facts with ordered first-match precedence", () => {
-  for (const spec of [OKTA_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+test("Okta, Duo, GWS, Box, Slack, and Zoom execute declared derived facts with ordered first-match precedence", () => {
+  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
     for (const check of spec.checks) {
       assert.ok(Object.keys(check.derivedFactRules ?? {}).length > 0, `${check.id}: executable derived facts`);
       assert.ok(check.criteria.rules.every((entry) => entry.condition.op === "eq"), `${check.id}: outcomes consume derived branches`);
@@ -325,9 +312,9 @@ test("Okta, Slack, and Zoom execute declared derived facts with ordered first-ma
   }
 });
 
-test("Okta, Slack, and Zoom decision inputs contain no preselected conclusion tokens", () => {
+test("Okta, Duo, GWS, Box, Slack, and Zoom decision inputs contain no preselected conclusion tokens", () => {
   const forbidden = /(?:^|_)(?:status|label|verdict|outcome|compliance|compliant|availability|available|enforcement|enforced)(?:_|$)/;
-  for (const spec of [OKTA_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
+  for (const spec of [OKTA_SPEC, DUO_SPEC, GWS_SPEC, BOX_SPEC, SLACK_SPEC, ZOOM_SPEC]) {
     for (const check of spec.checks) {
       for (const inputName of check.evidenceFields) {
         assert.doesNotMatch(inputName, forbidden, `${check.id}: ${inputName}`);
@@ -453,15 +440,15 @@ test("Duo executable rules ignore legacy status and use complete evidence with o
     complete: true,
     user_count: 26,
     known_enrollment_count: 26,
+    enrolled_user_count: 26,
     bypass_user_count: 0,
     unenrolled_user_count: 0,
-    enrollment_percent: 100,
   };
-  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", base, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", base), "Pass");
   assert.equal(materializeBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
     ...base,
     bypass_user_count: 1,
-  }, "Pass"), "Fail", "mutating evidence changes the verdict while the legacy status is held constant");
+  }), "Fail", "mutating primitive evidence changes the verdict");
   assert.equal(evaluateBatchCheckVerdict(DUO_SPEC, "DUO-AUTH-008", {
     ...base,
     complete: false,
@@ -478,15 +465,13 @@ test("GWS executable rules ignore legacy status and use complete evidence with o
     readable: true,
     complete: true,
     active_user_count: 100,
-    enforced_user_count: 98,
-    coverage: 0.98,
+    two_step_required_user_count: 98,
   };
-  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", base, "Fail"), "Pass");
+  assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", base), "Pass");
   assert.equal(materializeBatchCheckVerdict(GWS_SPEC, "GWS-ID-002", {
     ...base,
-    enforced_user_count: 84,
-    coverage: 0.84,
-  }, "Pass"), "Fail", "mutating directory evidence changes the verdict while the legacy status is held constant");
+    two_step_required_user_count: 84,
+  }), "Fail", "mutating primitive directory counts changes the verdict");
   assert.equal(evaluateBatchCheckVerdict(GWS_SPEC, "GWS-MON-002", {
     readable: true,
     complete: false,
@@ -505,7 +490,7 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
   const legacyStatus = "pass";
   const passwordFacts = {
     settings_readable: true,
-    setting_unused: false,
+    unused_setting_count: 0,
     minimum_length: 14,
     required_minimum_length: 14,
     weak_password_prevention: true,
@@ -521,16 +506,17 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
   const inactivityFacts = {
     users_readable: true,
     events_readable: true,
-    complete: true,
+    users_truncated: false,
+    user_count: 100,
+    admin_count: 1,
+    events_truncated: false,
     active_user_count: 100,
     inactive_user_count: 25,
-    inactive_ratio: 0.25,
   };
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-24", inactivityFacts), "warn");
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-24", {
     ...inactivityFacts,
     inactive_user_count: 26,
-    inactive_ratio: 0.26,
   }), "fail", "the greater-than-25-percent boundary uses the full inventory count");
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-05", {
     allowlist_readable: true,
@@ -542,11 +528,13 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
     stale_entry_count: 0,
     undated_entry_count: 0,
     exempt_target_count: 0,
-    allowlist_required: true,
+    external_status: "limit_collaboration_to_allowlisted_domains",
   }), "fail", "a public-domain violation precedes partial evidence");
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-17", {
     users_readable: true,
-    complete: true,
+    users_truncated: false,
+    user_count: 26,
+    admin_count: 1,
     privileged_user_count: 26,
     max_admins: 25,
   }), "warn", "the complete 26-user inventory, not a 25-item evidence sample, controls the result");
