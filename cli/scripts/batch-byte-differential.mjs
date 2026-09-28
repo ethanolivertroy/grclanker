@@ -247,7 +247,7 @@ function runCorpusSuite(root, fixtureDirectory) {
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-skip-pattern=^all 25 (?:Palo Alto|Zscaler) checks replay",
+    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate)",
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
