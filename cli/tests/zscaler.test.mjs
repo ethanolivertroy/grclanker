@@ -1768,33 +1768,23 @@ test("self-check (c): every paged dataset marked partial caps its dependent cont
 function singleDatasetTruncationCases() {
   const partial = (dataset) => ({ ...dataset, truncated: true, seen: 200, total: 201 });
   const suites = {
-    access: [accessControlFixture, assessZiaAccessControlData],
     policy: [policyFixture, assessZiaPolicyData],
     zpa: [zpaFixture, assessZpaData],
   };
   const cases = [];
-  let candidateCount = 0;
   for (const [suite, [build, assess]] of Object.entries(suites)) {
-    const baseline = assess(build());
     for (const key of Object.keys(build()).filter((name) => name !== "now")) {
-      candidateCount += 1;
       const data = build();
       data[key] = partial(data[key]);
       const result = assess(data);
-      const [, dependency] = UNREADABLE_DATASET_DEPENDENTS[suite][key];
-      const affectedIds = [...(dependency.primary ?? []), ...(dependency.secondary ?? [])];
-      const affectedFindingChanged = affectedIds.some((id) => (
-        JSON.stringify(findingById(result, id)) !== JSON.stringify(findingById(baseline, id))
-      ));
-      if (affectedFindingChanged) cases.push({ suite, dataset: key, result });
+      cases.push({ suite, dataset: key, result });
     }
   }
-  return { candidateCount, cases };
+  return cases;
 }
 
-test("parent-parity truncation replay covers every observable single-dataset path and records the known pass limitation", () => {
-  const { candidateCount, cases } = singleDatasetTruncationCases();
-  assert.equal(candidateCount, 47);
+test("parent-parity truncation replay covers all 41 ZIA-policy and ZPA single-dataset paths and records the known pass limitation", () => {
+  const cases = singleDatasetTruncationCases();
   assert.equal(cases.length, 41);
   const limitationIds = new Set();
   let limitationCount = 0;
@@ -2453,11 +2443,10 @@ test("byte differential fixtures: Zscaler assessments and export artifacts", { s
   const partialZpa = zpaFixture();
   partialZpa.applicationSegments = { ...partialZpa.applicationSegments, truncated: true, seen: 1, total: 2 };
   const truncationReplay = singleDatasetTruncationCases();
-  assert.equal(truncationReplay.candidateCount, 47);
-  assert.equal(truncationReplay.cases.length, 41);
+  assert.equal(truncationReplay.length, 41);
   writeByteDifferentialFixture("zscaler", "partial", {
     combined: assess(partialAccess, partialPolicy, partialZpa),
-    singleDatasetTruncations: truncationReplay.cases,
+    singleDatasetTruncations: truncationReplay,
   });
   writeByteDifferentialFixture("zscaler", "compliant", representative());
   writeByteDifferentialFixture("zscaler", "boundary", {

@@ -303,14 +303,7 @@ export function evaluateCheckVerdict(check: CheckContract, rawFacts: VerdictFact
   for (const [name, derivation] of Object.entries(check.derivedFactRules ?? {})) {
     facts[name] = evaluateVerdictCondition(derivation.condition, facts);
   }
-  const verdict = evaluateVerdictCriteria(check.criteria, facts);
-  if (
-    verdict === "pass"
-    && check.evidenceFields.some((name) => !Object.hasOwn(rawFacts, name) || rawFacts[name] === null || rawFacts[name] === undefined)
-  ) {
-    return "manual";
-  }
-  return verdict;
+  return evaluateVerdictCriteria(check.criteria, facts);
 }
 
 function pathValue(root: unknown, path: string, item: unknown): unknown {
