@@ -1397,6 +1397,12 @@ test("remedial training preserves the parent pass for an empty test list with re
   assert.equal(nothingDue.status, "pass");
   assert.equal(nothingDue.evidence.recipient_reads_complete, false);
   assert.match(nothingDue.summary, /No users failed the 1 sampled phishing security tests/);
+
+  snapshot.securityTestRecipients.data = [];
+  const emptyWindow = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 10);
+  assert.equal(emptyWindow.status, "warn");
+  assert.equal(emptyWindow.evidence.sampled_security_tests.length, 0);
+  assert.match(emptyWindow.summary, /No phishing security tests ran in the last 90 days/);
 });
 
 test("late enrollment failures remain proved against the users read from a truncated inventory", async () => {
