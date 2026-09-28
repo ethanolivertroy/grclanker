@@ -27,6 +27,10 @@ The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. 
 - [Cursor Agent SDK](/docs/getting-started/agent-sdk/) documents schema conversion, read effects, approval-gated writers, dry runs, and local serving.
 - [Flue Runtime](/docs/getting-started/flue-runtime/) documents the bundled runner, the official CLI, local models, persistence, and credential-safe activity logs.
 
+## What's new
+
+[What's New](/docs/changelog/) lists what the next release adds on top of the `v0.0.1` bundle and how to run it from source today.
+
 ## Shipped surface
 
 - 241 domain tools and 7 compute backend tools, grouped in the [tool catalog](/docs/tools/catalog/).

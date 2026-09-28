@@ -5,6 +5,7 @@ export const docsSections = [
     title: 'Getting Started',
     items: [
       { label: 'Overview', slug: '' },
+      { label: "What's New", slug: 'changelog' },
       { label: 'Installation', slug: 'getting-started/installation' },
       { label: 'Quick Start', slug: 'getting-started/quick-start' },
       { label: 'Setup', slug: 'getting-started/setup' },
