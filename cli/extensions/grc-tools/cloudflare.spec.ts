@@ -148,6 +148,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
           },
           decisionRules: [
             batch2Rule("manual", batch2Ne("evidence_readable", true)),
+            batch2Rule("manual", batch2Eq("member_count", 0)),
             batch2Rule("fail", batch2ComparePaths("gt", "super_administrator_count", "maximum_super_administrator_count")),
             batch2Rule("warn", batch2Any(
               batch2Ne("evidence_complete", true),
