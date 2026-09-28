@@ -4361,6 +4361,35 @@ function formatAssessmentText(result: MulesoftAssessmentResult): string {
   ].join("\n");
 }
 
+export type MulesoftAssessmentToolDetails = {
+  tool: string;
+  category: MulesoftAssessmentCategory;
+  title: string;
+  summary: JsonRecord;
+  findings: MulesoftFinding[];
+  errors: string[];
+  snapshot_keys: string[];
+};
+
+/**
+ * Native tool `details` for the assessment tools. Pi persists `details` in the session log and
+ * renders them in the UI (the Agent SDK and Flue adapters drop them from model context), so this
+ * is an explicit allowlist rather than a spread of the result: raw snapshots grow with tenant
+ * size and belong in the export bundle's core_data/, so only their dataset names are carried.
+ * The text content is still rendered from the full result and is unaffected.
+ */
+export function mulesoftAssessmentToolDetails(tool: string, result: MulesoftAssessmentResult): MulesoftAssessmentToolDetails {
+  return {
+    tool,
+    category: result.category,
+    title: result.title,
+    summary: result.summary,
+    findings: result.findings,
+    errors: result.errors,
+    snapshot_keys: Object.keys(result.snapshots),
+  };
+}
+
 function statusCounts(findings: MulesoftFinding[]): Record<MulesoftFindingStatus, number> {
   const counts: Record<MulesoftFindingStatus, number> = { pass: 0, warn: 0, fail: 0, manual: 0 };
   for (const item of findings) counts[item.status] += 1;
@@ -4764,7 +4793,7 @@ export function registerMulesoftTools(pi: any): void {
     async execute(_toolCallId: string, args: IdentityAccessArgs) {
       try {
         const result = await assessMulesoftIdentityAccess(createClient(args), toIdentityOptions(args));
-        return textResult(formatAssessmentText(result), { tool: "mulesoft_assess_identity_access", ...result });
+        return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_identity_access", result));
       } catch (error) {
         return errorResult(
           `MuleSoft identity and access assessment failed: ${errorMessage(error)}`,
@@ -4784,7 +4813,7 @@ export function registerMulesoftTools(pi: any): void {
     async execute(_toolCallId: string, args: ApiGatewayArgs) {
       try {
         const result = await assessMulesoftApiGateway(createClient(args), toApiGatewayOptions(args));
-        return textResult(formatAssessmentText(result), { tool: "mulesoft_assess_api_gateway", ...result });
+        return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_api_gateway", result));
       } catch (error) {
         return errorResult(
           `MuleSoft API gateway assessment failed: ${errorMessage(error)}`,
@@ -4804,7 +4833,7 @@ export function registerMulesoftTools(pi: any): void {
     async execute(_toolCallId: string, args: RuntimeInfrastructureArgs) {
       try {
         const result = await assessMulesoftRuntimeInfrastructure(createClient(args), toRuntimeOptions(args));
-        return textResult(formatAssessmentText(result), { tool: "mulesoft_assess_runtime_infrastructure", ...result });
+        return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_runtime_infrastructure", result));
       } catch (error) {
         return errorResult(
           `MuleSoft runtime infrastructure assessment failed: ${errorMessage(error)}`,
@@ -4824,7 +4853,7 @@ export function registerMulesoftTools(pi: any): void {
     async execute(_toolCallId: string, args: AuditMonitoringArgs) {
       try {
         const result = await assessMulesoftAuditMonitoring(createClient(args), toAuditOptions(args));
-        return textResult(formatAssessmentText(result), { tool: "mulesoft_assess_audit_monitoring", ...result });
+        return textResult(formatAssessmentText(result), mulesoftAssessmentToolDetails("mulesoft_assess_audit_monitoring", result));
       } catch (error) {
         return errorResult(
           `MuleSoft audit and monitoring assessment failed: ${errorMessage(error)}`,
