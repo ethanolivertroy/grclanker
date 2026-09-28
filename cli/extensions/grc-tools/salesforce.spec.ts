@@ -249,13 +249,13 @@ const SALESFORCE_EXECUTABLE_DECISIONS: Readonly<Record<string, SalesforceExecuta
     rules: [rule("manual", ne("readable", true)), rule("fail", ne("has_my_domain", true)), rule("manual", ne("can_only_login_with_my_domain_url_present", true)), rule("pass", all(eq("prevent_legacy_login", true), eq("require_domain_for_api", true))), rule("warn", eq("prevent_legacy_login", true)), rule("fail", { op: "always" })],
   },
   "SF-19": {
-    inputs: input("settings_readable", "setup_user_flag", "nonsetup_user_flag", "setup_user_headerless_flag", "nonsetup_user_headerless_flag", "disabled_count"),
+    inputs: input("settings_readable", "setup_flag", "nonsetup_sfdc_flag", "nonsetup_user_flag", "nonsetup_user_headerless_flag", "disabled_count"),
     rules: [
       rule("manual", ne("settings_readable", true)),
-      rule("pass", all(eq("setup_user_flag", true), eq("nonsetup_user_flag", true), eq("setup_user_headerless_flag", true), eq("nonsetup_user_headerless_flag", true))),
+      rule("pass", all(eq("setup_flag", true), eq("nonsetup_sfdc_flag", true), eq("nonsetup_user_flag", true), eq("nonsetup_user_headerless_flag", true))),
       rule("fail", gte("disabled_count", 2)),
       rule("warn", eq("disabled_count", 1)),
-      rule("manual", any(not(defined("setup_user_flag")), not(defined("nonsetup_user_flag")), not(defined("setup_user_headerless_flag")), not(defined("nonsetup_user_headerless_flag")))),
+      rule("manual", any(not(defined("setup_flag")), not(defined("nonsetup_sfdc_flag")), not(defined("nonsetup_user_flag")), not(defined("nonsetup_user_headerless_flag")))),
       rule("manual", { op: "always" }),
     ],
   },

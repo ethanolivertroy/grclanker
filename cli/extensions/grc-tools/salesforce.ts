@@ -2388,9 +2388,9 @@ function assessSalesforcePlatformDataWithDecisionContext(data: SalesforcePlatfor
   const clickjackDisabled = Object.entries(clickjackFlags).filter(([, value]) => value === false).map(([key]) => key);
   recordSalesforceDecisionFacts(19, {
     settings_readable: settingsReadable,
-    setup_user_flag: clickjackFlags.enable_clickjack_setup_user,
+    setup_flag: clickjackFlags.enable_clickjack_setup,
+    nonsetup_sfdc_flag: clickjackFlags.enable_clickjack_nonsetup_sfdc,
     nonsetup_user_flag: clickjackFlags.enable_clickjack_nonsetup_user,
-    setup_user_headerless_flag: clickjackFlags.enable_clickjack_setup_user_headerless,
     nonsetup_user_headerless_flag: clickjackFlags.enable_clickjack_nonsetup_user_headerless,
     disabled_count: clickjackDisabled.length,
   });
