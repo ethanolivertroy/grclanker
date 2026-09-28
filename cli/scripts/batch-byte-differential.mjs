@@ -21,7 +21,14 @@ const mainWorktree = join(runRoot, "main");
 const mainFixtures = join(runRoot, "fixtures-main");
 const branchFixtures = join(runRoot, "fixtures-branch");
 const exportRoot = join(runRoot, "exports");
-const testFiles = ["okta.test.mjs", "slack.test.mjs", "zoom.test.mjs"];
+const testFiles = [
+  "okta.test.mjs",
+  "duo.test.mjs",
+  "gws.test.mjs",
+  "box.test.mjs",
+  "slack.test.mjs",
+  "zoom.test.mjs",
+];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -40,6 +47,9 @@ function run(command, args, options = {}) {
 function instrumentedMainTest(source) {
   return source
     .replace(/^import \{ OKTA_SPEC \} from .*okta\.spec\.js";\n/m, "")
+    .replace(/^import \{ DUO_SPEC \} from .*duo\.spec\.js";\n/m, "")
+    .replace(/^import \{ GWS_SPEC \} from .*gws\.spec\.js";\n/m, "")
+    .replace(/^import \{ BOX_SPEC \} from .*box\.spec\.js";\n/m, "")
     .replace(/^import \{ SLACK_SPEC \} from .*slack\.spec\.js";\n/m, "")
     .replace(/^import \{ ZOOM_SPEC \} from .*zoom\.spec\.js";\n/m, "")
     .replace(

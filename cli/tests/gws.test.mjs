@@ -41,6 +41,12 @@ import {
 } from "../dist/extensions/grc-tools/gws.js";
 import { GWS_SPEC } from "../dist/extensions/grc-tools/gws.spec.js";
 import { assertBundlePathsMatchSpec } from "./helpers/bundle-contents.mjs";
+import {
+  byteDifferentialEnabled,
+  prepareByteDifferentialExportRoot,
+  snapshotExportBundle,
+  writeByteDifferentialFixture,
+} from "./helpers/byte-differential-fixtures.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LOGIN = new Date(Date.now() - 2 * DAY_MS).toISOString();
@@ -2547,4 +2553,120 @@ test("resolveSecureOutputPath rejects traversal and symlink parents", () => {
   symlinkSync(outside, symlinkParent);
 
   assert.throws(() => resolveSecureOutputPath(base, "symlink-parent/file.txt"), /symlinked parent directory/);
+});
+
+test("byte differential fixtures: GWS assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {
+  const config = createSampleConfig();
+  const assessmentsFor = async (collector) => assessAll(await collectGwsAuditData(collector), config);
+
+  writeByteDifferentialFixture("gws", "representative", await assessmentsFor(createFakeCollector()));
+
+  const deny = async () => {
+    throw new GwsApiError(
+      403,
+      "403 Forbidden: Request had insufficient authentication scopes.",
+      "https://admin.googleapis.com/denied",
+    );
+  };
+  writeByteDifferentialFixture("gws", "denied", await assessmentsFor(createFakeCollector({
+    collectUsers: deny,
+    collectRoles: deny,
+    collectRoleAssignments: deny,
+    collectActivities: deny,
+    collectAlerts: deny,
+    collectTwoStepPolicies: deny,
+    listUserTokens: deny,
+  })));
+
+  const absent = async () => null;
+  writeByteDifferentialFixture("gws", "missing-null", await assessmentsFor(createFakeCollector({
+    collectUsers: absent,
+    collectRoles: absent,
+    collectRoleAssignments: absent,
+    collectActivities: absent,
+    collectAlerts: absent,
+    collectTwoStepPolicies: absent,
+    listUserTokens: absent,
+  })));
+
+  const compliantUsers = createUsers()
+    .filter((user) => user.id !== "u-dormant")
+    .map((user) => ({ ...user, isEnforcedIn2Sv: true }));
+  const truncated = (items) => collection(items, { truncated: true, pages: 3 });
+  const partialCollector = createFakeCollector({
+    collectUsers: async () => truncated(compliantUsers),
+    collectRoleAssignments: async () => truncated([createRoleAssignments()[0]]),
+    collectActivities: async (applicationName) => {
+      if (applicationName === "login") return truncated([activity("login", "user@example.com", ["login_success"])]);
+      if (applicationName === "admin") return truncated(createAdminActivities());
+      return truncated(createTokenActivities());
+    },
+    collectAlerts: deny,
+    collectTwoStepPolicies: async () => truncated(createTwoStepPolicies()),
+    listUserTokens: async (userKey) => {
+      if (userKey === "super@example.com") return deny();
+      return userKey === "user@example.com" ? createTokens()[userKey] : [];
+    },
+  });
+  writeByteDifferentialFixture("gws", "partial", await assessmentsFor(partialCollector));
+
+  const compliant = createFakeCollector({
+    collectUsers: async () => collection([
+      { ...createUsers()[0] },
+      { ...createUsers()[1], isEnforcedIn2Sv: true },
+      { ...createUsers()[2] },
+      { ...createUsers()[3], isEnforcedIn2Sv: true, isEnrolledIn2Sv: true, lastLoginTime: RECENT_LOGIN },
+    ]),
+    collectRoleAssignments: async () => collection([
+      { roleAssignmentId: "ra-0", roleId: "1", assignedTo: "u-super", assigneeType: "USER", scopeType: "CUSTOMER" },
+      { roleAssignmentId: "ra-1", roleId: "2", assignedTo: "u-delegated", assigneeType: "USER", scopeType: "CUSTOMER" },
+    ]),
+    collectActivities: async (applicationName) => {
+      if (applicationName === "login") return collection([activity("login", "user@example.com", ["login_success"])]);
+      if (applicationName === "admin") return collection(createAdminActivities());
+      return collection(createTokenActivities());
+    },
+    collectAlerts: async () => collection([createAlerts()[1]]),
+    listUserTokens: async (userKey) => (userKey === "user@example.com" ? createTokens()[userKey] : []),
+  });
+  writeByteDifferentialFixture("gws", "compliant", await assessmentsFor(compliant));
+
+  const identityAt = (required, total) => {
+    const users = Array.from({ length: total }, (_, index) => ({
+      id: `boundary-${required}-${total}-${index}`,
+      primaryEmail: `boundary-${index}@example.com`,
+      isAdmin: false,
+      isDelegatedAdmin: false,
+      suspended: false,
+      archived: false,
+      isEnforcedIn2Sv: index < required,
+      isEnrolledIn2Sv: index < required,
+      lastLoginTime: RECENT_LOGIN,
+    }));
+    return assessGwsIdentity({
+      users: dataset(users),
+      roles: dataset(createRoles()),
+      roleAssignments: dataset([]),
+      loginActivities: dataset(createLoginActivities()),
+      twoStepPolicies: dataset(createTwoStepPolicies()),
+    }, config);
+  };
+  const monitoringAt = (openAlerts) => assessGwsMonitoring({
+    loginActivities: dataset(createLoginActivities()),
+    adminActivities: dataset(createAdminActivities()),
+    tokenActivities: dataset(createTokenActivities()),
+    alerts: dataset(Array.from({ length: Math.max(openAlerts, 1) }, (_, index) => ({
+      alertId: `boundary-alert-${openAlerts}-${index}`,
+      type: "Data exfiltration",
+      status: index < openAlerts ? "NOT_STARTED" : "CLOSED",
+    }))),
+  }, config);
+  writeByteDifferentialFixture("gws", "boundary", {
+    activeTwoStepCoverage: [84, 85, 97, 98].map((required) => identityAt(required, 100)),
+    openAlerts: [3, 4, 10, 11].map(monitoringAt),
+  });
+
+  const exportRoot = prepareByteDifferentialExportRoot("gws");
+  const exported = await exportGwsAuditBundle(createFakeCollector(), config, exportRoot);
+  writeByteDifferentialFixture("gws", "export", snapshotExportBundle(exported));
 });
