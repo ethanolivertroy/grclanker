@@ -26,6 +26,8 @@ const HUB_LINKED = [
 
 const EXTERNAL_TIMEOUT_MS = 10000;
 const EXTERNAL_CONCURRENCY = 8;
+// Bot walls and rate limits, not proof that a page is gone.
+const BLOCKED_STATUSES = new Set([401, 403, 429, 999]);
 
 function walk(dir) {
   return readdirSync(dir).flatMap((name) => {
@@ -84,7 +86,8 @@ function pageUrl(file) {
 }
 
 // Mirrors Workers static assets `html_handling: auto-trailing-slash`, which
-// serves /a/b from /a/b.html or /a/b/index.html.
+// serves /a/b from /a/b.html or /a/b/index.html. Anything else gets the
+// `not_found_handling: 404-page` response, so a miss here is a broken link.
 function resolveTarget(pathname, files) {
   const candidates = pathname.endsWith('/')
     ? [`${pathname}index.html`]
@@ -126,7 +129,9 @@ for (const [url, page] of pages) {
     if (SKIP_SCHEMES.test(ref)) continue;
     if (EXTERNAL.test(ref)) {
       if (/\b(preconnect|dns-prefetch)\b/.test(rel)) continue;
-      const href = new URL(ref, ORIGIN).href;
+      const target = new URL(ref, ORIGIN);
+      target.hash = '';
+      const href = target.href;
       if (!external.has(href)) external.set(href, new Set());
       external.get(href).add(page.file);
       continue;
@@ -215,10 +220,12 @@ async function reportExternal(urls) {
   };
   await Promise.all(Array.from({ length: EXTERNAL_CONCURRENCY }, worker));
 
-  const groups = { broken: [], redirected: [], ok: [] };
+  const groups = { broken: [], blocked: [], redirected: [], ok: [] };
   for (const [url, result] of [...results].sort(([a], [b]) => a.localeCompare(b))) {
     const where = [...urls.get(url)].sort().join(', ');
-    if (result.error || result.status >= 400) {
+    if (BLOCKED_STATUSES.has(result.status)) {
+      groups.blocked.push(`${result.status} ${url}`);
+    } else if (result.error || result.status >= 400) {
       groups.broken.push(`${result.error ?? result.status} ${url}\n      on ${where}`);
     } else if (result.finalUrl !== url) {
       groups.redirected.push(`${result.status} ${url} -> ${result.finalUrl}`);
@@ -228,9 +235,10 @@ async function reportExternal(urls) {
   }
   console.log(
     `\ncheck-links --external: ${results.size} URLs, ${groups.ok.length} ok, ` +
-    `${groups.redirected.length} redirected, ${groups.broken.length} broken or unreachable (reported, not failed)`,
+    `${groups.redirected.length} redirected, ${groups.blocked.length} blocked or rate-limited, ` +
+    `${groups.broken.length} broken or unreachable (reported, not failed)`,
   );
-  for (const title of ['broken', 'redirected']) {
+  for (const title of ['broken', 'blocked', 'redirected']) {
     if (groups[title].length === 0) continue;
     console.log(`\n  ${title}:`);
     for (const line of groups[title]) console.log(`    ${line}`);
