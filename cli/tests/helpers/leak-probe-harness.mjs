@@ -875,7 +875,20 @@ function schemeCasingCells(options, canaries) {
     mustKeep: ["upstream rejected Bearer"],
     sinks: "error",
   }));
-  cells.push(cell("fixed prose lowercase bearer responsibilities", "bearer responsibilities remain with the presenting party", { mustKeep: ["bearer responsibilities remain with the presenting party"] }));
+  cells.push(cell("alphabetic lowercase bearer value in bare server prose", `upstream rejected bearer ${alphabeticBearer}`, {
+    planted: [alphabeticBearer],
+    mustKeep: ["upstream rejected bearer"],
+    sinks: "error",
+  }));
+  cells.push(cell("alphabetic mixed-case Bearer value in bare server prose", `upstream rejected bEaReR ${alphabeticBearer}`, {
+    planted: [alphabeticBearer],
+    mustKeep: ["upstream rejected bEaReR"],
+    sinks: "error",
+  }));
+  cells.push(cell("fixed prose lowercase bearer responsibilities", "bearer responsibilities remain with the presenting party", {
+    mustKeep: ["bearer responsibilities remain with the presenting party"],
+    sinks: "data",
+  }));
   cells.push(cell('fixed prose Bearer realm="api"', 'Bearer realm="api"', { mustKeep: ['Bearer realm="api"'] }));
   cells.push(cell("proof parameter behind realm", `Digest realm="api", nonce="n", response="${canaries.tokens[7]}"`, {
     planted: [canaries.tokens[7]],

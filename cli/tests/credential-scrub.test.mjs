@@ -270,8 +270,6 @@ const MUST_KEEP = [
   "team canary-empty-team-zq has no custom role; token canary-noexpiry-token-zq has no expiry",
   "Basic authentication is disabled for this deployment",
   "an Owner token for a complete inventory",
-  "authentication with bearer tokens is required",
-  "bearer responsibilities remain with the presenting party",
   "InvalidAuthenticationToken: Access token has expired.",
   "Config precedence resolved from: environment-token -> config-base-url -> config-file-present.",
   "Unable to read LaunchDarkly config file /tmp/grclanker-dogrc-dir-gCpdGy (EISDIR)",
@@ -363,7 +361,7 @@ test("scrub boundary guard 1, quoted carriers: a quoted header or pair value is 
   assert.ok(QUOTED_CARRIERS.filter(([label]) => label.startsWith("compound line")).length >= 14, "the compound-line pins are present");
 });
 
-test("scrub boundary guard 1, quoted carriers: the reported forms, a plain word in quotes included, come out with the value gone and the quotes and scheme kept", () => {
+test("scrub boundary guard 1, quoted carriers: Bearer is strict in every casing and compact context while structured prose stays", () => {
   const scrubber = createCredentialScrubber();
   assert.equal(scrubber.scrub('Cookie: sid="prod-cookie"'), `Cookie: ${REDACTED}`);
   assert.equal(scrubber.scrub('X-Api-Key: "prod-key"'), `X-Api-Key: "${REDACTED}"`);
@@ -374,7 +372,30 @@ test("scrub boundary guard 1, quoted carriers: the reported forms, a plain word 
   assert.equal(scrubber.scrub('X-Api-Key: ""'), 'X-Api-Key: ""', "an empty quoted value has nothing to remove");
   assert.equal(scrubber.scrub("upstream rejected Bearer abcdefghijk"), `upstream rejected Bearer ${REDACTED}`);
   assert.equal(scrubber.scrub("upstream rejected BEARER abcdefghijk"), `upstream rejected BEARER ${REDACTED}`);
-  assert.equal(scrubber.scrub("bearer responsibilities remain with the presenting party"), "bearer responsibilities remain with the presenting party", "lowercase bearer remains an ordinary English noun");
+  for (const [text, expected] of [
+    ["upstream rejected bearer abc123", `upstream rejected bearer ${REDACTED}`],
+    ["upstream rejected bearer abcdefghijklmnopqrstu", `upstream rejected bearer ${REDACTED}`],
+    ['upstream rejected bearer "alphabetic"', `upstream rejected bearer "${REDACTED}"`],
+    ["upstream rejected bEaReR abcdefghijk", `upstream rejected bEaReR ${REDACTED}`],
+    ["message=Bearer abcdefghijk", `message=Bearer ${REDACTED}`],
+    ["error:bearer abcdefghijk", `error:bearer ${REDACTED}`],
+  ]) {
+    assert.equal(scrubber.scrub(text), expected, text);
+  }
+  assert.deepEqual(
+    scrubber.scrubData({
+      person: "Bearer Anderson",
+      room: "Bearer Bonds Desk",
+      responsibility: "bearer responsibilities remain with the presenting party",
+      requirement: "authentication with bearer tokens is required",
+    }),
+    {
+      person: "Bearer Anderson",
+      room: "Bearer Bonds Desk",
+      responsibility: "bearer responsibilities remain with the presenting party",
+      requirement: "authentication with bearer tokens is required",
+    },
+  );
 });
 
 test("scrub boundary guard 1, quoted carriers: a closing quote on the line wins over the following-header cut, which applies only to a value left unterminated", () => {

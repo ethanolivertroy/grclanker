@@ -669,11 +669,9 @@ test("CodeRabbit r4078025849 (#63): a scheme word in front of a credential-named
     [`X-Auth-Token: Bearer ${token}`, `X-Auth-Token: Bearer ${REDACTED}`],
     [`"Authorization": "Bearer ${token}"`, `"Authorization": "Bearer ${REDACTED}"`],
     [`request failed\\x0aAuthorization: Bearer ${token} see the log`, `request failed\\x0aAuthorization: Bearer ${REDACTED} see the log`],
-    // Fixed texts: a setting key keeps a scheme word, and a scheme word in prose keeps its plain word.
-    ["token_type: bearer token expected", "token_type: bearer token expected"],
+    // Fixed texts without an ambiguous Bearer value remain unchanged.
     ["token_type: Bearer", "token_type: Bearer"],
     ['{"access_token":"abc","token_type":"Bearer","expires_in":3600}', `{"access_token":"${REDACTED}","token_type":"Bearer","expires_in":3600}`],
-    ["authentication with bearer tokens is required", "authentication with bearer tokens is required"],
     ["the snowflake account was suspended", "the snowflake account was suspended"],
     ["failed to negotiate TLS with the upstream", "failed to negotiate TLS with the upstream"],
     // Scrubbed text is a fixed point: a scheme word that only a marker follows is left as it is.
@@ -685,6 +683,15 @@ test("CodeRabbit r4078025849 (#63): a scheme word in front of a credential-named
     assert.equal(scrubDataText(text), expected, text);
     assert.equal(redactSecretValues(text), expected, text);
     assert.equal(scrubErrorText(expected), expected, `idempotent: ${text}`);
+  }
+  for (const [text, expectedError] of [
+    ["token_type: bearer token expected", `token_type: bearer ${REDACTED} expected`],
+    ["authentication with bearer tokens is required", `authentication with bearer ${REDACTED} is required`],
+  ]) {
+    assert.equal(scrubErrorText(text), expectedError, text);
+    assert.equal(scrubDataText(text), text, text);
+    assert.equal(redactSecretValues(text), text, text);
+    assert.equal(scrubErrorText(expectedError), expectedError, `idempotent: ${text}`);
   }
 });
 

@@ -193,7 +193,7 @@ test("vendor token prefixes are removed even when the long-token rule is off", (
   }
 });
 
-test("scheme-carried values are removed whatever their casing or entropy; capitalized Bearer is strict while lowercase prose and challenges remain", () => {
+test("scheme-carried values are removed whatever their casing or entropy; Bearer is strict in error text while data prose and challenges remain", () => {
   assert.equal(scrubDataText(`Authorization: Bearer ${CANARY.bearer} rejected`), `Authorization: Bearer ${REDACTED} rejected`, "a lowercase word that continues into a token is a token");
   assert.equal(scrubDataText(`proxy replayed Basic ${CANARY.basic}`), `proxy replayed Basic ${REDACTED}`);
   assert.equal(scrubDataText("SSWS 00abcDEF123ghiJKL456 rejected"), `SSWS ${REDACTED} rejected`);
@@ -215,12 +215,22 @@ test("scheme-carried values are removed whatever their casing or entropy; capita
   }
   assert.equal(scrubErrorText("upstream rejected Bearer abcdefghijk"), `upstream rejected Bearer ${REDACTED}`);
   assert.equal(scrubErrorText("upstream rejected BEARER abcdefghijk"), `upstream rejected BEARER ${REDACTED}`);
+  for (const [text, expected] of [
+    ["upstream rejected bearer abc123", `upstream rejected bearer ${REDACTED}`],
+    ["upstream rejected bearer abcdefghijklmnopqrstu", `upstream rejected bearer ${REDACTED}`],
+    ['upstream rejected bearer "alphabetic"', `upstream rejected bearer "${REDACTED}"`],
+    ["upstream rejected bEaReR abcdefghijk", `upstream rejected bEaReR ${REDACTED}`],
+    ["message=Bearer abcdefghijk", `message=Bearer ${REDACTED}`],
+    ["error:bearer abcdefghijk", `error:bearer ${REDACTED}`],
+  ]) {
+    assert.equal(scrubErrorText(text), expected, text);
+  }
   assert.equal(scrubDataText("person Bearer Anderson remains visible"), "person Bearer Anderson remains visible");
-  for (const scrub of [scrubErrorText, scrubDataText]) assert.equal(scrub("bearer responsibilities remain with the presenting party"), "bearer responsibilities remain with the presenting party");
+  assert.equal(scrubDataText("bearer responsibilities remain with the presenting party"), "bearer responsibilities remain with the presenting party");
+  assert.equal(scrubErrorText("bearer responsibilities remain with the presenting party"), `bearer ${REDACTED} remain with the presenting party`);
   // The prose exemption, derived from the 121 distinct continuations the integrations' fixed texts put after a scheme word.
   for (const prose of [
     "Basic authentication is disabled for this tenant.",
-    "authentication with bearer tokens is required",
     "the token authentication flow failed",
     "Digest access authentication",
     "third-party OAuth sign-in (codes 1, 11) and Zoom-held passwords",
@@ -236,6 +246,8 @@ test("scheme-carried values are removed whatever their casing or entropy; capita
     assert.equal(scrubErrorText(prose), prose);
     assert.equal(scrubDataText(prose), prose);
   }
+  assert.equal(scrubDataText("authentication with bearer tokens is required"), "authentication with bearer tokens is required");
+  assert.equal(scrubErrorText("authentication with bearer tokens is required"), `authentication with bearer ${REDACTED} is required`);
   // Codex P1 on #78 (r4076357751): a peer may spell a scheme in lowercase, so `basic`, `token`,
   // `digest`, `oauth`, and `splunk` carry a value too, but as English words they take only a value
   // that cannot be a word or a name (a digit, a symbol, or mixed casing inside the word, at least 8
@@ -262,7 +274,6 @@ test("scheme-carried values are removed whatever their casing or entropy; capita
     'basic "authentication" is on',
     "digest access authentication",
     "a splunk deployment-server role",
-    "bearer responsibilities remain with the presenting party",
   ]) {
     assert.equal(scrubErrorText(prose), prose, prose);
     assert.equal(scrubDataText(prose), prose, prose);
@@ -305,13 +316,13 @@ test("#78 row B: every scheme word carries in any casing on both sides, Snowflak
     "Snowflake account locked",
     "NEGOTIATE authentication is disabled",
     "token canary-noexpiry-token-zq has no expiry",
-    "bearer responsibilities remain with the presenting party",
     "Authorization: SNOWFLAKE",
     "Authorization: aws4-hmac-sha256",
   ]) {
     assert.equal(scrubErrorText(prose), prose, prose);
     assert.equal(scrubDataText(prose), prose, prose);
   }
+  assert.equal(scrubDataText("bearer responsibilities remain with the presenting party"), "bearer responsibilities remain with the presenting party");
   // A SigV4 header loses its whole auth-param list (credential scope, signed headers, and signature) and keeps the scheme word.
   const sigv4 = "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024";
   assert.equal(scrubErrorText(sigv4), `Authorization: AWS4-HMAC-SHA256 ${REDACTED}`);
@@ -395,7 +406,6 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
     "tokens: 3 of 5 rotated",
     "tokens: none are stale",
     "user_session: 3 active sessions",
-    "token_type: bearer token expected",
     "secrets: unreadable (GET /v1/secrets failed with 403 Forbidden)",
     "secrets: not collected",
     "sdk-keys: 3 of 5 rotated",
@@ -404,6 +414,8 @@ test("credential-named pairs lose any nonempty value whatever its shape, compoun
     assert.equal(scrubErrorText(prose), prose);
     assert.equal(scrubDataText(prose), prose);
   }
+  assert.equal(scrubErrorText("token_type: bearer token expected"), `token_type: bearer ${REDACTED} expected`);
+  assert.equal(scrubDataText("token_type: bearer token expected"), "token_type: bearer token expected");
   // A scheme word standing alone after such a key is the whole value and stays (`token_type: Bearer`).
   for (const text of ["token_type: Bearer", '{"access_token":"abc","token_type":"Bearer","expires_in":3600}', "X-Token-Type: Bearer"]) {
     assert.equal(scrubErrorText(text), text.replace('"abc"', `"${REDACTED}"`), text);
@@ -542,7 +554,6 @@ test("a carrier after a two-character JSON escape is recognised through every en
   // The escape is a boundary, not a carrier: prose after it stays, as after a raw line break.
   for (const text of [
     "request failed\\nno token was sent",
-    "request failed\\nauthentication with bearer tokens is required",
     "request failed\\ttokens: 3 of 5 rotated",
     "request failed\\rInvalidAuthenticationToken: Access token has expired.",
     "config read from C:\\\\Users\\\\ops\\\\token-store\\\\settings.json",

@@ -134,7 +134,6 @@ const PROSE_CONTINUATION_PHRASES = Object.freeze([
   "api keys: 40 seen, total unknown",
   "secrets: not collected",
   "secrets: unreadable (GET /v1/secrets failed with 403 Forbidden: non-JSON body (text/html, 19 bytes))",
-  "token_type: bearer token expected",
   "token_type: Bearer",
   '{"token_type":"Bearer","expires_in":3600}',
   "user_session: 3 active sessions",
@@ -392,6 +391,8 @@ test("the prose-continuation phrases the generic pair rule exempts survive the s
     assertSurvivesScrub(scrubError(new Error(phrase)).message, `${phrase} through scrubError`);
     assertSurvivesScrub(describeErrorBody("application/json", JSON.stringify({ message: phrase })), `${phrase} through describeErrorBody`);
   }
+  assert.equal(scrubDataText("token_type: bearer token expected"), "token_type: bearer token expected");
+  assert.equal(scrubErrorText("token_type: bearer token expected"), `token_type: bearer ${REDACTED} expected`);
   for (const [text, expected] of [
     ["secrets: truncated", `secrets: ${REDACTED}`],
     ["client_token: expired", `client_token: ${REDACTED}`],
@@ -435,14 +436,11 @@ test("the scheme phrases main rendered intact come back from every sink with onl
   // as `{"detail":"Authorization: Bearer"[REDACTED]` because the quote that closes the enclosing JSON
   // string was read as a value opener. A quote followed by the structure after a string is not one.
   const phrases = [
-    "the bearer token is missing",
-    "authentication with bearer tokens is required",
     "bearer-token authentication is required",
     "Basic authentication is disabled for this deployment",
     "Basic (deprecated) and Basic (full access) modes",
     "Token request failed",
     "Token inventory: 3 of 5 keys have no expiry",
-    "OAuth bearer token",
     "OAuth sign-in",
     "OAuth service-app client ID",
     "the OAuth 2.0 device flow",
@@ -456,7 +454,6 @@ test("the scheme phrases main rendered intact come back from every sink with onl
     "Authorization: Bearer",
     "Authorization: Bearer\nnext line starts here",
     "the token authentication flow failed",
-    "bearer tokens expire after one hour",
     "Basic auth is deprecated",
     "Token expiry is not enforced",
     "X-Api-Key:",
@@ -491,6 +488,9 @@ test("the scheme phrases main rendered intact come back from every sink with onl
     for (const [name, sink, frame] of sinks) {
       assert.equal(sink(phrase), frame(phrase), `${name} changed ${JSON.stringify(phrase)}`);
     }
+  }
+  for (const phrase of ["the bearer token is missing", "authentication with bearer tokens is required", "OAuth bearer token", "bearer tokens expire after one hour"]) {
+    assert.equal(scrubDataText(phrase), phrase, `scrubDataText changed ${JSON.stringify(phrase)}`);
   }
   // The same quote read at a value position inside JSON structure, in every carrier class.
   for (const text of [

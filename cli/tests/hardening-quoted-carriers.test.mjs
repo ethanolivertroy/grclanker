@@ -91,7 +91,6 @@ const MUST_KEEP = Object.freeze([
   "Authorization: Bearer",
   '"cookies": ["consent", "theme"]',
   "Basic authentication is disabled for this deployment",
-  "authentication with bearer tokens is required",
   "bearer-token authentication is required",
   "third-party OAuth sign-in (codes 1, 11) and Zoom-held passwords",
   "the OAuth 2.0 device flow",
@@ -175,6 +174,8 @@ test("quoted carriers: every must-keep row comes back unchanged from every scrub
       assert.equal(scrub(text), text, `${scrubName} changed ${JSON.stringify(text)}`);
     }
   }
+  assert.equal(scrubDataText("authentication with bearer tokens is required"), "authentication with bearer tokens is required");
+  assert.equal(scrubErrorText("authentication with bearer tokens is required"), `authentication with bearer ${REDACTED} is required`);
   // A quoted or bare value under a header or key that `isCredentialKey` classifies is a carrier value
   // whatever its shape (review of #78, gap 1; main at 02967cc redacted this too).
   for (const [text, expected] of [["cookies: enabled", `cookies: ${REDACTED}`]]) {

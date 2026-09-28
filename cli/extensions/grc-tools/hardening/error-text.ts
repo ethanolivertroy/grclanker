@@ -97,9 +97,9 @@ export interface ScrubErrorTextOptions {
   /** Apply the long-token rule (see `LONG_TOKEN_MIN_LENGTH`). On unless set to false. */
   longTokens?: boolean;
   /**
-   * Treat capitalized or mixed-case `Bearer <b64token>` as a credential even when the value is
-   * purely alphabetic. On for error text; off for structured data, where the same words can be a
-   * person's display name. Exact lowercase `bearer` remains available as an ordinary English noun.
+   * Treat `Bearer <b64token>` in any scheme casing as a credential even when the value is purely
+   * alphabetic. On for error text; off for structured data, where the same words can be a person's
+   * display name.
    */
   strictBearer?: boolean;
 }
@@ -244,9 +244,9 @@ const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 // Authorization schemes in free text (`Bearer <value>`, `Basic <base64>`, Okta `SSWS`, GitHub `Token`,
 // Splunk `Splunk`, Snowflake `Snowflake`, SigV4 `AWS4-HMAC-SHA256`), in any casing (a peer's error text
 // or a log may spell one `BEARER`, `bEaReR`, `negotiate`, or `API-KEY`): the value
-// goes whatever its casing or entropy. An exact lowercase `bearer` can be the English noun ("bearer
-// responsibilities"), but every other casing of Bearer carries any RFC 6750 b64token, including a
-// purely alphabetic value. The other schemes keep a one-plain-word prose exemption ("Basic
+// goes whatever its casing or entropy. Bearer carries any RFC 6750 b64token, including a purely
+// alphabetic value, in every casing because auth-scheme matching is case-insensitive. The other
+// schemes keep a one-plain-word prose exemption ("Basic
 // authentication is disabled", "Token request failed", "OAuth bearer token", "Splunk Enterprise"). The
 // exemption is derived from the fixed texts the integrations emit after these words (121 distinct
 // continuations across every integration source): every one is a single word of letters in one
@@ -254,7 +254,7 @@ const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 // sign-in", "OAuth service-app"), a dotted version ("OAuth 2.0"), or an auth-param of a challenge
 // (`Bearer realm="api"`, `error="invalid_token"`). A value with a digit, a symbol, or mixed casing
 // inside a word is never prose. "token", "basic", "digest", "oauth", "splunk", "negotiate", and
-// "bearer", "snowflake" in lowercase are English words as often as schemes ("token canary-noexpiry-token-zq has
+// "snowflake" in lowercase are English words as often as schemes ("token canary-noexpiry-token-zq has
 // no expiry" names a LaunchDarkly token; "basic authentication is disabled"; "failed to negotiate
 // tls"), yet a peer's error text may spell a scheme in lowercase ("replayed basic dXNlcjpwYXNz
 // upstream"), so the lowercase spellings of the English words are weaker carriers: the
@@ -268,7 +268,7 @@ const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 // credential; in `"Basic ", "token"` inside a JSON document the quote after the scheme word closes
 // one string rather than opening a value.
 const SCHEME_WORD_PATTERN = new RegExp(String.raw`${NAME_START}(?:Bearer|Basic|Token|Digest|OAuth|Negotiate|NTLM|SSWS|ApiKey|Api-Key|Splunk|Snowflake|AWS4-HMAC-SHA256)(?![A-Za-z0-9_-])[ \t]+`, "gi");
-const LOWERCASE_SCHEME_WORDS = new Set(["bearer", "basic", "token", "digest", "oauth", "splunk", "negotiate", "snowflake"]);
+const LOWERCASE_SCHEME_WORDS = new Set(["basic", "token", "digest", "oauth", "splunk", "negotiate", "snowflake"]);
 const SCHEME_BARE_VALUE_PATTERN = /[A-Za-z0-9][A-Za-z0-9._~+/=-]{3,}/y;
 const SCHEME_VALUE_MIN_LENGTH = 4;
 const LOWERCASE_SCHEME_VALUE_MIN_LENGTH = 8;
@@ -566,9 +566,8 @@ function continuesAsProse(text: string, separator: string, value: string, valueE
 
 /**
  * A bare value after an authorization scheme word in free text is the credential whatever its casing
- * or entropy. An exact lowercase `bearer` keeps the English-word policy, while every other Bearer
- * spelling is strict. The other schemes except the shapes the fixed texts put there (see
- * `SCHEME_WORD_PATTERN`): one plain
+ * or entropy. Bearer is strict in every casing. The other schemes except the shapes the fixed texts
+ * put there (see `SCHEME_WORD_PATTERN`): one plain
  * word or hyphenated compound of lowercase words shorter than `PLAIN_WORD_MAX_LENGTH` ("Basic
  * authentication", "Splunk Enterprise", "SSWS API", "OAuth sign-in"), a dotted version ("OAuth 2.0"),
  * or an auth-param of a challenge (`Bearer realm="api"`). Anything with a digit, a symbol, or mixed
@@ -1148,8 +1147,7 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
 function readSchemeValue(text: string, valueStart: number, carrier: RegExpExecArray, strictBearerMode = true): ValueReplacement | null {
   const scheme = carrier[0].trim();
   const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(scheme);
-  const pairValue = carrier.index > 0 && (text[carrier.index - 1] === "=" || text[carrier.index - 1] === ":");
-  const strictBearer = strictBearerMode && !pairValue && scheme.toLowerCase() === "bearer" && !lowercaseScheme;
+  const strictBearer = strictBearerMode && scheme.toLowerCase() === "bearer";
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);

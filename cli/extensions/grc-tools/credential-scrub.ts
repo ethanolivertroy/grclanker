@@ -68,9 +68,9 @@ export interface ScrubTextOptions {
    */
   shapes?: boolean;
   /**
-   * Treat capitalized or mixed-case `Bearer <b64token>` as a credential even when the value is
-   * purely alphabetic. On for error text; off for structured data, where `Bearer Anderson` can be a
-   * person's display name. Exact lowercase `bearer` remains available as an ordinary English noun.
+   * Treat `Bearer <b64token>` in any scheme casing as a credential even when the value is purely
+   * alphabetic. On for error text; off for structured data, where `Bearer Anderson` can be a
+   * person's display name.
    */
   strictBearer?: boolean;
 }
@@ -369,9 +369,9 @@ const SCHEME_TOKEN_PATTERN = /^[A-Za-z][A-Za-z0-9-]*$/;
 const PROOF_PARAM_WORDS: ReadonlySet<string> = new Set(["response", "signature", "sig", "mac", "hmac", "assertion"]);
 
 // Authorization scheme values in free text (`Bearer <value>`, `Basic <value>`, `Token <value>`, `ApiKey <value>`,
-// `Digest <value>`): an exact lowercase `bearer` can be the English noun ("bearer responsibilities"), but every other
-// casing of Bearer is treated as the scheme and carries any RFC 6750 b64token, including a purely alphabetic value.
-// Values after the other schemes go whatever their shape unless one plain word makes the phrase prose ("Basic
+// `Digest <value>`): Bearer carries any RFC 6750 b64token, including a purely alphabetic value, in every casing because
+// auth-scheme matching is case-insensitive. Values after the other schemes go whatever their shape unless one plain
+// word makes the phrase prose ("Basic
 // authentication is disabled", "an Owner token for a complete inventory", "Digest access authentication"). A bare value
 // starts with a letter or digit and is at least four characters, so an arrow or a dash after the word
 // ("environment-token -> config") is punctuation, not a credential; a quoted value (`Bearer "token"`) is delimited by
@@ -1038,8 +1038,7 @@ function readSchemeValue(text: string, valueStart: number, carrier: RegExpExecAr
   const scheme = carrier[1];
   const conventional = CAPITALISED_SCHEMES.get(scheme.toLowerCase());
   if (conventional !== undefined && scheme !== conventional) return null;
-  const pairValue = carrier.index > 0 && (text[carrier.index - 1] === "=" || text[carrier.index - 1] === ":");
-  const strictBearer = strictBearerMode && !pairValue && scheme.toLowerCase() === "bearer" && scheme !== "bearer";
+  const strictBearer = strictBearerMode && scheme.toLowerCase() === "bearer";
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);
