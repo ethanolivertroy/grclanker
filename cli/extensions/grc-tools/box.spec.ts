@@ -91,6 +91,7 @@ const eq = (name: string, entry: PortableValue): VerdictCondition => compare("eq
 const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne", name, entry);
 const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
 const gte = (name: string, entry: PortableValue): VerdictCondition => compare("gte", name, entry);
+const lt = (name: string, entry: PortableValue): VerdictCondition => compare("lt", name, entry);
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const rule = (status: VerdictRule["status"], condition: VerdictCondition, note?: string): VerdictRule => ({
