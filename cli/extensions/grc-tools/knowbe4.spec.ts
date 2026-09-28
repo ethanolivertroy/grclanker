@@ -161,7 +161,10 @@ const rows: readonly Batch3CheckRow[] = [
     },
     decisionRules: [
       batch2Rule("manual", batch2Ne("knowbe4_10_remediation_reads_succeeded", true)),
-      batch2Rule("pass", batch2Eq("knowbe4_10_no_remediation_due", true), "Preserves the inherited clean sampled exception when no failed user is due for remediation."),
+      batch2Rule("pass", batch2All(
+        batch2Eq("knowbe4_10_no_remediation_due", true),
+        batch2Eq("knowbe4_10_recipient_and_enrollment_reads_complete", true),
+      ), "Preserves the inherited clean sampled exception only when no failed user is due and no runtime collection decorator marked the evidence incomplete."),
       batch2Rule("warn", batch2Not(batch2Defined("knowbe4_10_remediated_percent"))),
       batch2Rule("fail", batch2All(
         batch2Gt("knowbe4_10_failed_user_count", 0),
