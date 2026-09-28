@@ -2339,10 +2339,16 @@ export function resolvePaloaltoConfiguration(
     throw new Error("Configure Prisma Cloud (PRISMA_API_URL, PRISMA_ACCESS_KEY_ID, PRISMA_SECRET_KEY) and/or PAN-OS (PANOS_HOST plus PANOS_API_KEY or PANOS_USERNAME and PANOS_PASSWORD).");
   }
 
-  const verifyTlsRaw = typeof input.verify_tls === "boolean"
-    ? input.verify_tls
-    : asBoolean(env.PANOS_VERIFY_TLS) ?? asBoolean(configFile.PANOS_VERIFY_TLS);
-  const verifyTls = verifyTlsRaw !== false;
+  // Treat an invalid value at a higher-precedence source as the secure default
+  // instead of falling through to a lower-precedence opt-out. Config files accept
+  // both the environment-style key and the argument-style alias, as pick() does.
+  const configVerifyTls = configFile.PANOS_VERIFY_TLS ?? configFile.verify_tls;
+  const verifyTlsRaw = input.verify_tls !== undefined
+    ? asBoolean(input.verify_tls)
+    : env.PANOS_VERIFY_TLS !== undefined
+      ? asBoolean(env.PANOS_VERIFY_TLS)
+      : asBoolean(configVerifyTls);
+  const verifyTls = verifyTlsRaw ?? true;
   if (!verifyTls) sourceChain.push("tls-verification-disabled");
 
   return {

@@ -456,6 +456,37 @@ test("resolvePaloaltoConfiguration prefers args over env over config file and su
   assert.ok(fromArgs.sourceChain.includes("arguments-prisma-access-key"));
 });
 
+test("resolvePaloaltoConfiguration honors config-file TLS settings with secure precedence and defaults", () => {
+  const base = createTempBase("grclanker-paloalto-tls-config-");
+  const configFile = join(base, "paloalto.json");
+  const resolveWith = (fileSetting, envSetting, argSetting) => {
+    writeFileSync(configFile, JSON.stringify({
+      PANOS_HOST: "fw.example.com",
+      PANOS_API_KEY: "key",
+      ...fileSetting,
+    }));
+    return resolvePaloaltoConfiguration(
+      argSetting === undefined ? { config_file: configFile } : { config_file: configFile, verify_tls: argSetting },
+      envSetting === undefined ? {} : { PANOS_VERIFY_TLS: envSetting },
+    ).verifyTls;
+  };
+
+  assert.equal(resolveWith({ verify_tls: false }), false, "argument-style config key accepts a JSON boolean");
+  assert.equal(resolveWith({ verify_tls: true }), true, "argument-style config key enables verification");
+  assert.equal(resolveWith({ PANOS_VERIFY_TLS: "off" }), false, "environment-style config key accepts documented false aliases");
+  assert.equal(resolveWith({ PANOS_VERIFY_TLS: "yes" }), true, "environment-style config key accepts documented true aliases");
+
+  assert.equal(resolveWith({ verify_tls: false }, "true"), true, "environment overrides config");
+  assert.equal(resolveWith({ verify_tls: true }, "false"), false, "environment can explicitly opt out over config");
+  assert.equal(resolveWith({ verify_tls: true }, "true", false), false, "argument overrides environment and config");
+  assert.equal(resolveWith({ verify_tls: false }, "false", true), true, "argument can restore verification");
+
+  assert.equal(resolveWith({ verify_tls: "invalid" }), true, "invalid config values fail closed");
+  assert.equal(resolveWith({ verify_tls: false }, "invalid"), true, "invalid environment values do not expose a config opt-out");
+  assert.equal(resolveWith({ verify_tls: false }, "false", "invalid"), true, "invalid argument values do not expose lower-precedence opt-outs");
+  assert.equal(resolveWith({}), true, "the default keeps TLS verification enabled");
+});
+
 test("resolvePaloaltoConfiguration allows a single product and rejects incomplete credentials", () => {
   const prismaOnly = resolvePaloaltoConfiguration({}, { PRISMA_ACCESS_KEY_ID: "k", PRISMA_SECRET_KEY: "s" });
   assert.equal(prismaOnly.prisma.apiUrl, "https://api.prismacloud.io");
