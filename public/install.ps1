@@ -320,7 +320,7 @@ try {
   }
 
   Write-Host ""
-  Write-Host "  Ready. Run grclanker to start." -ForegroundColor Green
+  Write-Host "  Ready. Run grclanker setup to start." -ForegroundColor Green
   Write-Host ""
 } finally {
   if (Test-Path $TempRoot) {
