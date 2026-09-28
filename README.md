@@ -144,7 +144,7 @@ investigate CVE-2021-44228
 map our vuln evidence to FedRAMP RA-5
 ```
 
-CMVP questions (for example "is BoringCrypto FIPS validated?") are in scope, but the `cmvp_*` lookups currently fail on both the `0.0.1` bundle and `main`: the CMVP data API they read returns 404.
+CMVP questions such as "is BoringCrypto FIPS validated?" are in scope too, through the `cmvp_*` tools.
 
 On `main`, the native cloud and SaaS tools answer directly in the same session, for example:
 
@@ -165,7 +165,7 @@ Built-in workflow rails, as slash commands inside a session or as `grclanker inv
 
 In the `0.0.1` release bundle:
 
-- 8 domain tools: `cmvp_search_modules`, `cmvp_search_historical`, `cmvp_search_in_process`, `cmvp_get_module`, `kevs_search`, `kevs_recent`, `kevs_check_ransomware`, and `kevs_get_epss` (the `cmvp_*` lookups currently return a 404 from their data API)
+- 8 domain tools: `cmvp_search_modules`, `cmvp_search_historical`, `cmvp_search_in_process`, `cmvp_get_module`, `kevs_search`, `kevs_recent`, `kevs_check_ransomware`, and `kevs_get_epss`
 - 7 compute backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) routed through the selected compute backend
 - 2 bundled agent personas: `auditor` and `verifier`
 - 4 workflow commands
