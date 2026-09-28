@@ -1,12 +1,16 @@
 import { spawnSync } from "node:child_process";
 import {
+  closeSync,
   cpSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -388,51 +392,63 @@ function filesUnder(root, relativePath = "") {
   }).sort();
 }
 
-function describeJsonlMismatches(expected, actual, limit = 25) {
-  let expectedStart = 0;
-  let actualStart = 0;
-  let mismatchCount = 0;
-  const descriptions = [];
-  const seenDescriptions = new Set();
-  while (expectedStart < expected.length || actualStart < actual.length) {
-    const expectedNewline = expected.indexOf(0x0a, expectedStart);
-    const actualNewline = actual.indexOf(0x0a, actualStart);
-    const expectedEnd = expectedNewline === -1 ? expected.length : expectedNewline;
-    const actualEnd = actualNewline === -1 ? actual.length : actualNewline;
-    const expectedLine = expected.subarray(expectedStart, expectedEnd);
-    const actualLine = actual.subarray(actualStart, actualEnd);
-    if (!expectedLine.equals(actualLine)) {
-      mismatchCount += 1;
-      if (descriptions.length < limit) {
-        try {
-          const expectedRecord = JSON.parse(expectedLine.toString("utf8"));
-          const actualRecord = JSON.parse(actualLine.toString("utf8"));
-          const expectedStatuses = new Map((expectedRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
-          const actualStatuses = new Map((actualRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
-          const statusChanges = [...new Set([...expectedStatuses.keys(), ...actualStatuses.keys()])]
-            .filter((id) => expectedStatuses.get(id) !== actualStatuses.get(id))
-            .map((id) => `${id}:${expectedStatuses.get(id) ?? "<missing>"}->${actualStatuses.get(id) ?? "<missing>"}`);
-          const description =
-            `${expectedRecord.name ?? actualRecord.name ?? "<unnamed>"}`
-            + (statusChanges.length > 0 ? ` [${statusChanges.join(", ")}]` : " [serialized evidence differs]");
-          if (!seenDescriptions.has(description)) {
-            seenDescriptions.add(description);
-            descriptions.push(description);
-          }
-        } catch {
-          if (!seenDescriptions.has("<unparseable record>")) {
-            seenDescriptions.add("<unparseable record>");
-            descriptions.push("<unparseable record>");
+const COMPARE_CHUNK_BYTES = 1024 * 1024;
+
+function firstByteMismatch(expectedPath, actualPath) {
+  const expectedSize = statSync(expectedPath).size;
+  const actualSize = statSync(actualPath).size;
+  const expectedDescriptor = openSync(expectedPath, "r");
+  const actualDescriptor = openSync(actualPath, "r");
+  const expectedBuffer = Buffer.allocUnsafe(COMPARE_CHUNK_BYTES);
+  const actualBuffer = Buffer.allocUnsafe(COMPARE_CHUNK_BYTES);
+  let offset = 0;
+  try {
+    while (offset < Math.min(expectedSize, actualSize)) {
+      const length = Math.min(COMPARE_CHUNK_BYTES, expectedSize - offset, actualSize - offset);
+      const expectedRead = readSync(expectedDescriptor, expectedBuffer, 0, length, offset);
+      const actualRead = readSync(actualDescriptor, actualBuffer, 0, length, offset);
+      if (expectedRead !== actualRead) return { actualSize, expectedSize, offset };
+      const expectedChunk = expectedBuffer.subarray(0, expectedRead);
+      const actualChunk = actualBuffer.subarray(0, actualRead);
+      if (!expectedChunk.equals(actualChunk)) {
+        for (let index = 0; index < expectedRead; index += 1) {
+          if (expectedChunk[index] !== actualChunk[index]) {
+            return { actualSize, expectedSize, offset: offset + index };
           }
         }
       }
+      offset += expectedRead;
     }
-    expectedStart = expectedEnd + (expectedNewline === -1 ? 0 : 1);
-    actualStart = actualEnd + (actualNewline === -1 ? 0 : 1);
+  } finally {
+    closeSync(expectedDescriptor);
+    closeSync(actualDescriptor);
   }
-  return mismatchCount === 0
-    ? ""
-    : `\n${mismatchCount} JSONL records differ; first ${descriptions.length}: ${descriptions.join("; ")}`;
+  return expectedSize === actualSize ? undefined : { actualSize, expectedSize, offset };
+}
+
+function readFileRange(path, start, length) {
+  const descriptor = openSync(path, "r");
+  const buffer = Buffer.alloc(length);
+  try {
+    const bytesRead = readSync(descriptor, buffer, 0, length, start);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function readJsonlRecordAt(path, offset) {
+  const size = statSync(path).size;
+  const windowStart = Math.max(0, offset - COMPARE_CHUNK_BYTES);
+  const windowLength = Math.min(size - windowStart, COMPARE_CHUNK_BYTES * 2);
+  const window = readFileRange(path, windowStart, windowLength);
+  const relativeOffset = offset - windowStart;
+  const precedingNewline = window.lastIndexOf(0x0a, Math.max(0, relativeOffset - 1));
+  const followingNewline = window.indexOf(0x0a, relativeOffset);
+  if (followingNewline === -1) return undefined;
+  const lineStart = precedingNewline + 1;
+  if (lineStart === 0 && windowStart !== 0) return undefined;
+  return window.subarray(lineStart, followingNewline);
 }
 
 function compareTrees(expectedRoot, actualRoot, label) {
@@ -442,28 +458,34 @@ function compareTrees(expectedRoot, actualRoot, label) {
     throw new Error(`${label} path mismatch\nmain: ${expectedPaths.join(", ")}\nbranch: ${actualPaths.join(", ")}`);
   }
   for (const path of expectedPaths) {
-    const expected = readFileSync(join(expectedRoot, path));
-    const actual = readFileSync(join(actualRoot, path));
-    if (!actual.equals(expected)) {
-      let offset = 0;
-      while (offset < expected.length && offset < actual.length && expected[offset] === actual[offset]) offset += 1;
+    const expectedPath = join(expectedRoot, path);
+    const actualPath = join(actualRoot, path);
+    const mismatch = firstByteMismatch(expectedPath, actualPath);
+    if (mismatch) {
+      const { actualSize, expectedSize, offset } = mismatch;
       const contextStart = Math.max(0, offset - 160);
-      const contextEnd = offset + 320;
-      const mainContext = expected.subarray(contextStart, contextEnd).toString("utf8");
-      const branchContext = actual.subarray(contextStart, contextEnd).toString("utf8");
-      const lineStart = path.endsWith(".jsonl") ? expected.lastIndexOf(0x0a, Math.max(0, offset - 1)) + 1 : -1;
-      const lineEnd = path.endsWith(".jsonl") ? expected.indexOf(0x0a, offset) : -1;
+      const mainContext = readFileRange(expectedPath, contextStart, 480).toString("utf8");
+      const branchContext = readFileRange(actualPath, contextStart, 480).toString("utf8");
       let recordName = "";
-      if (lineStart >= 0 && lineEnd > lineStart) {
+      let statusChanges = "";
+      if (path.endsWith(".jsonl")) {
         try {
-          recordName = `, record=${JSON.parse(expected.subarray(lineStart, lineEnd).toString("utf8")).name}`;
+          const expectedRecord = JSON.parse(readJsonlRecordAt(expectedPath, offset).toString("utf8"));
+          const actualRecord = JSON.parse(readJsonlRecordAt(actualPath, offset).toString("utf8"));
+          recordName = `, record=${expectedRecord.name}`;
+          const expectedStatuses = new Map((expectedRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const actualStatuses = new Map((actualRecord.value?.findings ?? []).map((finding) => [finding.id, finding.status]));
+          const changes = [...new Set([...expectedStatuses.keys(), ...actualStatuses.keys()])]
+            .filter((id) => expectedStatuses.get(id) !== actualStatuses.get(id))
+            .map((id) => `${id}:${expectedStatuses.get(id) ?? "<missing>"}->${actualStatuses.get(id) ?? "<missing>"}`);
+          if (changes.length > 0) statusChanges = `\nstatus changes: ${changes.join(", ")}`;
         } catch {
           recordName = ", record=<unparseable>";
         }
       }
       throw new Error(
-        `${label} byte mismatch for ${path} (main=${expected.length} bytes, branch=${actual.length} bytes, first offset=${offset}${recordName})`
-        + (path.endsWith(".jsonl") ? describeJsonlMismatches(expected, actual) : "")
+        `${label} byte mismatch for ${path} (main=${expectedSize} bytes, branch=${actualSize} bytes, first offset=${offset}${recordName})`
+        + statusChanges
         + `\nmain context: ${JSON.stringify(mainContext)}`
         + `\nbranch context: ${JSON.stringify(branchContext)}`,
       );
@@ -472,20 +494,46 @@ function compareTrees(expectedRoot, actualRoot, label) {
   return expectedPaths;
 }
 
+function countBufferOccurrences(path, needle) {
+  const descriptor = openSync(path, "r");
+  const chunk = Buffer.allocUnsafe(COMPARE_CHUNK_BYTES);
+  const needleBuffer = Buffer.from(needle);
+  let count = 0;
+  let overlap = Buffer.alloc(0);
+  let position = 0;
+  try {
+    while (true) {
+      const bytesRead = readSync(descriptor, chunk, 0, chunk.length, position);
+      if (bytesRead === 0) break;
+      const haystack = overlap.length === 0
+        ? chunk.subarray(0, bytesRead)
+        : Buffer.concat([overlap, chunk.subarray(0, bytesRead)]);
+      let index = haystack.indexOf(needleBuffer);
+      while (index !== -1) {
+        count += 1;
+        index = haystack.indexOf(needleBuffer, index + needleBuffer.length);
+      }
+      overlap = haystack.subarray(Math.max(0, haystack.length - needleBuffer.length + 1));
+      position += bytesRead;
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return count;
+}
+
 function corpusCallCount(root, paths) {
-  return paths.reduce((total, path) => total + readFileSync(join(root, path), "utf8").trim().split("\n").filter(Boolean).length, 0);
+  return paths.reduce((total, path) => total + countBufferOccurrences(join(root, path), "\n"), 0);
 }
 
 function corpusSweepCounts(root, paths) {
   const counts = { truncated: 0, denied: 0, empty: 0, pairwise: 0 };
   for (const path of paths) {
-    for (const line of readFileSync(join(root, path), "utf8").trim().split("\n").filter(Boolean)) {
-      const name = JSON.parse(line).name;
-      for (const mode of ["truncated", "denied", "empty"]) {
-        if (name.includes(`::sweep::${mode}::`)) counts[mode] += 1;
-      }
-      if (name.includes("::pairwise::")) counts.pairwise += 1;
+    const corpusPath = join(root, path);
+    for (const mode of ["truncated", "denied", "empty"]) {
+      counts[mode] += countBufferOccurrences(corpusPath, `::sweep::${mode}::`);
     }
+    counts.pairwise += countBufferOccurrences(corpusPath, "::pairwise::");
   }
   return counts;
 }
