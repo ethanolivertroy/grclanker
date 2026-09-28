@@ -140,7 +140,7 @@ test("batch 2 threshold metadata is exhaustive and renders immutable defaults", 
     "OCI-GRD-05:minimum_rsa_key_bytes": 512,
     "OCI-GRD-06:long_lived_preauthenticated_request_days": 30,
     "OCI-IAM-01:minimum_password_length_required": 14,
-    "OCI-IAM-03:maximum_credential_age_days": 365,
+    "OCI-IAM-03:default_maximum_credential_age_days": 90,
     "OCI-LOG-06:minimum_audit_retention_days": 365,
     "PA-01:default_minimum_pass_rate_percent": 90,
     "PA-01:warning_margin_percentage_points": 20,
@@ -151,6 +151,7 @@ test("batch 2 threshold metadata is exhaustive and renders immutable defaults", 
     "ZS-07:default_maximum_super_administrators": 5,
     "ZS-11:default_stale_connector_days": 30,
     "ZS-13:default_maximum_timeout_hours": 24,
+    "ZS-21:default_stale_service_edge_days": 30,
     "ZS-24:default_certificate_expiry_warning_days": 30,
     "ZS-25:maximum_security_allowlist_urls": 100,
   });
@@ -159,13 +160,16 @@ test("batch 2 threshold metadata is exhaustive and renders immutable defaults", 
 test("batch 2 generic decisions use complete source counts and preserve violation precedence", () => {
   for (const [spec] of batch) {
     for (const check of spec.checks.filter((candidate) => candidate.evidenceFields.includes("violation_count"))) {
-      const complete = {
+      const candidateFacts = {
         evidence_readable: true,
         evidence_complete: true,
         inventory_count: 26,
         violation_count: 0,
         review_count: 0,
       };
+      const complete = Object.fromEntries(
+        Object.entries(candidateFacts).filter(([name]) => check.evidenceFields.includes(name)),
+      );
       assert.equal(evaluateCheckVerdict(check, complete), "pass", `${check.id}: complete 26-record inventory`);
       assert.equal(evaluateCheckVerdict(check, { ...complete, evidence_complete: false }), "warn", `${check.id}: partial cannot pass`);
       const violationRule = check.criteria.rules.find((rule) => ["fail", "warn"].includes(rule.status) && (
@@ -198,9 +202,9 @@ test("portable numeric operands reject booleans and numeric strings", () => {
 test("batch 2 configurable and numeric decision boundaries execute below, equal, and above", () => {
   const cases = [];
   const add = (spec, id, facts, expected) => cases.push({ spec, id, facts, expected });
-  const azureBase = { readable: true, complete: true, inventory_count: 20 };
+  const azureBase = { readable: true, complete: true };
   for (const [without_mfa_ratio, expected] of [[0.09, "warn"], [0.1, "warn"], [0.11, "fail"]]) {
-    add(AZURE_SPEC, "AZURE-ID-03", { ...azureBase, without_mfa_count: 1, without_mfa_ratio }, expected);
+    add(AZURE_SPEC, "AZURE-ID-03", { ...azureBase, inventory_count: 20, without_mfa_count: 1, without_mfa_ratio }, expected);
   }
   for (const [privileged_assignment_count, expected] of [[5, "pass"], [6, "warn"], [11, "fail"]]) {
     add(AZURE_SPEC, "AZURE-ID-04", { ...azureBase, global_admin_count: 0, privileged_assignment_count }, expected);

@@ -18,6 +18,7 @@ import { OCI_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 const OCI_DOCS = "https://docs.oracle.com/en-us/iaas/api/";
 export const OCI_AUDIT_RETENTION_REQUIRED_DAYS = 365;
 export const OCI_KEY_ROTATION_MAX_DAYS = 365;
+export const OCI_DEFAULT_CREDENTIAL_STALE_DAYS = 90;
 export const OCI_BASTION_MAX_TTL_SECONDS = 10_800;
 export const OCI_KEY_MIN_AES_BYTES = 32;
 export const OCI_KEY_MIN_RSA_BYTES = 512;
@@ -110,7 +111,7 @@ function owner(id: string): string {
 
 const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
   "OCI-IAM-01": { minimum_password_length_required: OCI_MIN_PASSWORD_LENGTH },
-  "OCI-IAM-03": { maximum_credential_age_days: OCI_KEY_ROTATION_MAX_DAYS },
+  "OCI-IAM-03": { default_maximum_credential_age_days: OCI_DEFAULT_CREDENTIAL_STALE_DAYS },
   "OCI-LOG-06": { minimum_audit_retention_days: OCI_AUDIT_RETENTION_REQUIRED_DAYS },
   "OCI-GRD-01": { sensitive_ingress_ports: OCI_SENSITIVE_PORTS },
   "OCI-GRD-02": { sensitive_ingress_ports: OCI_SENSITIVE_PORTS },
@@ -130,7 +131,7 @@ const decisionConstants = (id: string): Batch2CheckRow["constants"] => ({
 const decisionPredicate: Readonly<Record<string, string>> = {
   "OCI-IAM-01": `Fail when passwordPolicy.minimumPasswordLength is below ${OCI_MIN_PASSWORD_LENGTH} or any of passwordPolicy.isLowercaseCharactersRequired, isUppercaseCharactersRequired, isNumericCharactersRequired, and isSpecialCharactersRequired is not literally true. No reuse or lockout field participates in this finding.`,
   "OCI-IAM-02": "Fail when any active console-password-capable IAM user has isMfaActivated other than true; pass only after the complete user inventory has no such user.",
-  "OCI-IAM-03": `Fail when any active API key, customer secret key, or auth token has no usable timeCreated or is older than ${OCI_KEY_ROTATION_MAX_DAYS} days.`,
+  "OCI-IAM-03": `Fail when any active API key, customer secret key, or auth token has no usable timeCreated or is older than stale_days. stale_days defaults to ${OCI_DEFAULT_CREDENTIAL_STALE_DAYS} and is clamped to 1 through 3650 days.`,
   "OCI-IAM-04": "Warn when an IAM policy statement grants any verb to any-user or grants manage to a broad subject or resource scope; retain the complete policy and statement counts.",
   "OCI-IAM-05": "Fail when no non-root compartment exists; otherwise evaluate the complete ACTIVE compartment parent graph and warn for an unresolvable parent or a hierarchy deeper than the runtime baseline.",
   "OCI-IAM-06": "Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting.",

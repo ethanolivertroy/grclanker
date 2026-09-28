@@ -2133,13 +2133,76 @@ test("byte differential fixtures: Cloudflare assessments and export artifacts", 
   }), { maxSuperAdmins });
   const defaultBoundaries = await Promise.all([1, 2, 3].map((count) => superAdministratorsAt(count)));
   const overrideBoundaries = await Promise.all([4, 5, 6].map((count) => superAdministratorsAt(count, 5)));
-  assert.equal(defaultBoundaries.length + overrideBoundaries.length, 6);
+  const configuredThresholdBoundaries = await Promise.all([0, 1, 2].map((maxSuperAdmins) => (
+    assessCloudflareIdentity(fixtureClient("compliant"), { maxSuperAdmins })
+  )));
+  const hstsAt = (maxAge) => assessCloudflareZoneSecurity(fixtureClient("compliant", {
+    async getZoneSettings() {
+      return compliantSettings().map((setting) => setting.id === "security_header"
+        ? { ...setting, value: { strict_transport_security: { enabled: true, max_age: maxAge, include_subdomains: true, preload: true, nosniff: true } } }
+        : setting);
+    },
+  }));
+  const certificateAt = (days) => assessCloudflareZoneSecurity(fixtureClient("compliant", {
+    async listCertificatePacks() {
+      return {
+        items: [{
+          id: "boundary-pack",
+          type: "universal",
+          status: "active",
+          certificates: [{
+            id: "boundary-certificate",
+            status: "active",
+            expires_on: new Date(Date.now() + days * 86_400_000).toISOString(),
+          }],
+        }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  }));
+  const auditEventAt = (days) => assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listAuditLogs(_accountId, lookbackDays) {
+      assert.equal(lookbackDays, 30);
+      return {
+        items: [{ id: "boundary-event", when: new Date(Date.now() - days * 86_400_000).toISOString(), action: { type: "change_setting", result: true } }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  }));
+  const ipAccessRuleAt = (days) => assessCloudflareTrafficControls(fixtureClient("compliant", {
+    async listIpAccessRules() {
+      return {
+        items: [{
+          id: "boundary-ip-rule",
+          mode: "block",
+          notes: "Boundary rule",
+          modified_on: new Date(Date.now() - days * 86_400_000).toISOString(),
+          configuration: { target: "ip", value: "198.51.100.1" },
+        }],
+        truncated: false,
+        totalCount: 1,
+      };
+    },
+  }));
+  const hstsMaxAgeSeconds = await Promise.all([15_551_999, 15_552_000, 15_552_001].map(hstsAt));
+  const certificateExpiryDays = await Promise.all([29, 30, 31].map(certificateAt));
+  const auditEventAgeDays = await Promise.all([29, 30, 31].map(auditEventAt));
+  const ipAccessRuleAgeDays = await Promise.all([364, 365, 366].map(ipAccessRuleAt));
+  assert.equal(
+    defaultBoundaries.length + overrideBoundaries.length + configuredThresholdBoundaries.length
+      + hstsMaxAgeSeconds.length + certificateExpiryDays.length + auditEventAgeDays.length + ipAccessRuleAgeDays.length,
+    21,
+  );
   writeByteDifferentialFixture("cloudflare", "boundary", {
-    superAdministrators: await Promise.all([0, 1, 2].map((maxSuperAdmins) => (
-      assessCloudflareIdentity(fixtureClient("compliant"), { maxSuperAdmins })
-    ))),
+    superAdministrators: configuredThresholdBoundaries,
     superAdministratorDefaultThreshold: defaultBoundaries,
     superAdministratorOverrideFive: overrideBoundaries,
+    hstsMaxAgeSeconds,
+    certificateExpiryDays,
+    auditEventAgeDays,
+    ipAccessRuleAgeDays,
   });
 
   const exportRoot = prepareByteDifferentialExportRoot("cloudflare");

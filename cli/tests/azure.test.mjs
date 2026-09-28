@@ -2396,6 +2396,14 @@ test("byte differential fixtures: Azure assessments and export artifacts", { ski
       return Array.from({ length: count }, (_, index) => ({ id: `boundary-member-${index}` }));
     },
   }, compliantClient()));
+  const identityWithUnregisteredMfaUsers = async (count) => assessAzureIdentity(clientWith({
+    async listUserRegistrationDetails() {
+      return Array.from({ length: 100 }, (_, index) => ({
+        userPrincipalName: `boundary-user-${index}@example.com`,
+        isMfaRegistered: index >= count,
+      }));
+    },
+  }, compliantClient()));
   const identityWithCredential = async (remainingDays, lifetimeDays) => {
     const end = new Date(NOW.getTime() + remainingDays * 24 * 60 * 60 * 1000).toISOString();
     const start = new Date(new Date(end).getTime() - lifetimeDays * 24 * 60 * 60 * 1000).toISOString();
@@ -2452,8 +2460,9 @@ test("byte differential fixtures: Azure assessments and export artifacts", { ski
     },
   }, compliantClient()));
   const boundary = {
-    secureScore: await Promise.all([0, 49, 50, 74, 75].map(scoreAt)),
-    globalAdministrators: await Promise.all([4, 5].map((count) => identityWithRoleMembers("Global Administrator", count))),
+    secureScore: await Promise.all([0, 49, 50, 74, 75, 76].map(scoreAt)),
+    mfaUnregisteredPercent: await Promise.all([9, 10, 11].map(identityWithUnregisteredMfaUsers)),
+    globalAdministrators: await Promise.all([3, 4, 5].map((count) => identityWithRoleMembers("Global Administrator", count))),
     privilegedAssignments: await Promise.all([5, 6, 10, 11].map((count) => identityWithRoleMembers("Privileged Role Administrator", count))),
     credentialExpiryDays: await Promise.all([29, 30, 31].map((days) => identityWithCredential(days, 365))),
     credentialLifetimeDays: await Promise.all([729, 730, 731].map((days) => identityWithCredential(365, days))),
@@ -2463,7 +2472,7 @@ test("byte differential fixtures: Azure assessments and export artifacts", { ski
     contributorAssignments: await Promise.all([4, 5, 6].map((count) => subscriptionAssignments("Contributor", count))),
     workspaceRetentionDays: await Promise.all([89, 90, 91].map(retentionAt)),
   };
-  assert.equal(Object.values(boundary).reduce((total, values) => total + values.length, 0), 32);
+  assert.equal(Object.values(boundary).reduce((total, values) => total + values.length, 0), 37);
   writeByteDifferentialFixture("azure", "boundary", {
     ...boundary,
   });
