@@ -524,8 +524,10 @@ function renderCompletenessSemantics(
     return `For ${check.id}, this fact has no vendor dataset dependency. ${contract.semantics}`;
   }
   const sourceText = contract.sources.map((source) => {
-    const falseModes = source.falseWhen.length > 0 ? source.falseWhen.join(", ") : "none";
-    return `\`${source.surfaceId}\`: false on ${falseModes}; other failure modes do not change this fact`;
+    if (source.falseWhen.length === 0) {
+      return `\`${source.surfaceId}\`: does not lower this fact for any declared failure mode`;
+    }
+    return `\`${source.surfaceId}\`: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact`;
   }).join("; ");
   return `For ${check.id}, ${contract.semantics} Exact source-state effects: ${sourceText}`;
 }

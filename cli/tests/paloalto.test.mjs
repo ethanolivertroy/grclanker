@@ -436,6 +436,7 @@ const PALOALTO_SOURCE_INPUTS = {
   "panos-zone-config": ["panos", "/network"],
   "panos-device-config": ["panos", "/deviceconfig"],
   "panos-globalprotect-config": ["panos", "/vsys"],
+  "panos-system-info": ["panos-system", "show system info"],
   "panos-ha-state": ["panos-ha", "ha"],
 };
 
@@ -488,6 +489,11 @@ test("all 25 Palo Alto checks replay every declared configured-source failure mo
           if (["error", "denied", "not-collected", "missing-required-field"].includes(mode)) prisma.compute.failed = [runtimeName];
         } else if (kind === "panos-ha") {
           if (["error", "denied", "not-collected"].includes(mode)) panos[0].haStateFailed = true;
+        } else if (kind === "panos-system") {
+          if (["error", "denied", "not-collected"].includes(mode)) {
+            panos[0].reachable = false;
+            panos[0].systemInfo = {};
+          }
         } else if (["error", "denied", "not-collected"].includes(mode)) {
           panos[0].failedXpaths = [runtimeName];
         }
@@ -501,7 +507,7 @@ test("all 25 Palo Alto checks replay every declared configured-source failure mo
       }
     }
   }
-  assert.equal(replays, 220);
+  assert.equal(replays, 280);
 
   const panosOnly = await capturePaloaltoCompleteness(null, [panosSnapshot()]);
   const prismaOnly = await capturePaloaltoCompleteness(prismaSnapshot(), []);
