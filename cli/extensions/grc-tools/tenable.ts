@@ -26,6 +26,11 @@ import {
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
+import {
+  batch3RuntimeFacts,
+  batch3SetCompleteness,
+  batch3UnavailableFacts,
+} from "./batch3-spec-helpers.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { TENABLE_SPEC } from "./tenable.spec.js";
 
@@ -2856,6 +2861,7 @@ function tenableEvidenceCount(evidence: JsonRecord, name: string): number {
 }
 
 function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
+  const contractId = id.endsWith("-SC") ? id.slice(0, -3) : id;
   const value = (name: string) => asNumber(evidence[name]);
   const count = (...names: string[]) => names.reduce((total, name) => total + tenableEvidenceCount(evidence, name), 0);
   const statusIsIncomplete = (...names: string[]) => names.some((name) => {
@@ -2864,14 +2870,17 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
   });
   const partial = evidence.inventory_truncated === true
     || count("unevaluable_records", "asset_unevaluable_records") > 0;
-  const fact = (inventoryCount: number, violationCount = 0, reviewCount = 0, complete = !partial) => ({
-    evidence_readable: true,
-    evidence_complete: complete,
-    inventory_count: inventoryCount,
-    violation_count: violationCount,
-    review_count: reviewCount,
-  });
-  if (evidence.not_collected === true) return {};
+  const sourceReadsSucceeded = evidence.not_collected !== true
+    && !Object.hasOwn(evidence, "collection_error");
+  const fact = (inventoryCount: number, violationCount = 0, reviewCount = 0, complete = !partial) =>
+    batch3RuntimeFacts(contractId, {
+      readable: sourceReadsSucceeded,
+      complete,
+      population: inventoryCount,
+      failureMatches: violationCount,
+      reviewMatches: reviewCount,
+    });
+  if (!sourceReadsSucceeded) return batch3UnavailableFacts(contractId);
 
   switch (id) {
     case "TENABLE-02-SC": {
@@ -2921,21 +2930,21 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-03": {
       const assets = value("asset_count") ?? 0;
       const expected = value("expected_asset_count");
-      if (assets > 0 && expected === undefined) return {};
+      if (assets > 0 && expected === undefined) return batch3UnavailableFacts(contractId);
       const coverageFailure = expected !== undefined && expected > 0 && (value("fresh_assets") ?? 0) / expected < 0.95 ? 1 : 0;
       const complete = !partial && !statusIsIncomplete("networks_status");
       return fact(assets, assets === 0 ? 1 : coverageFailure, complete ? 0 : 1, complete);
     }
     case "TENABLE-04": {
       const assets = value("asset_count") ?? 0;
-      if (assets === 0) return {};
+      if (assets === 0) return batch3UnavailableFacts(contractId);
       const coverage = value("coverage_ratio");
       const threshold = value("threshold");
       return fact(assets, coverage !== undefined && threshold !== undefined && coverage < threshold ? 1 : 0, partial ? 1 : 0);
     }
     case "TENABLE-05": {
       const agents = value("agent_count");
-      if (agents === undefined || agents === 0) return {};
+      if (agents === undefined || agents === 0) return batch3UnavailableFacts(contractId);
       const unhealthy = count("offline_agents", "stale_connect_agents");
       const complete = !partial && !statusIsIncomplete("server_properties_status");
       return fact(agents, unhealthy / agents > 0.1 ? unhealthy : 0, count("undated_agents", "outdated_agents_count") + (complete ? 0 : 1), complete);
@@ -2943,13 +2952,13 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-06": {
       const agents = value("agent_count");
       const groups = value("agent_group_count");
-      if (agents === undefined || agents === 0 || groups === undefined || statusIsIncomplete("agent_groups_status")) return {};
+      if (agents === undefined || agents === 0 || groups === undefined || statusIsIncomplete("agent_groups_status")) return batch3UnavailableFacts(contractId);
       const ungrouped = value("ungrouped_agents_count") ?? 0;
       return fact(agents, groups === 0 || ungrouped / agents > 0.1 ? Math.max(1, ungrouped) : 0, ungrouped, !partial);
     }
     case "TENABLE-07": {
       const scanners = value("linked_scanner_count");
-      if (scanners === undefined || scanners === 0) return {};
+      if (scanners === undefined || scanners === 0) return batch3UnavailableFacts(contractId);
       const violations = count("unlinked", "off", "stale_connect");
       const reviews = count("undated", "outdated") + (evidence.caller_is_administrator === true ? 0 : 1) + (partial ? 1 : 0);
       return fact(scanners, violations, reviews, !partial && evidence.caller_is_administrator === true);
@@ -2959,19 +2968,19 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const evaluated = count("evaluated_scanners");
       const threshold = value("threshold_hours") ?? 0;
       const stale = count("stale_scanners");
-      if (age === undefined || (age <= threshold && stale === 0 && (statusIsIncomplete("scanners_status") || evaluated === 0))) return {};
+      if (age === undefined || (age <= threshold && stale === 0 && (statusIsIncomplete("scanners_status") || evaluated === 0))) return batch3UnavailableFacts(contractId);
       const reviews = count("undated_scanners", "stale_online_agents") + (statusIsIncomplete("agents_status") || partial ? 1 : 0);
       return fact(evaluated, age > threshold || stale > 0 ? Math.max(1, stale) : 0, reviews, !statusIsIncomplete("agents_status") && !partial);
     }
     case "TENABLE-09": {
       const networks = value("network_count");
-      if (networks === undefined || networks === 0) return {};
+      if (networks === undefined || networks === 0) return batch3UnavailableFacts(contractId);
       return fact(networks, value("networks_without_scanners") ?? 0, (value("networks_without_scanner_count") ?? 0) + (partial ? 1 : 0), !partial);
     }
     case "TENABLE-10": {
       const users = value("user_count") ?? 0;
       const enabled = value("enabled_users");
-      if (users === 0 || enabled === undefined || enabled === 0 || evidence.caller_is_administrator === false) return {};
+      if (users === 0 || enabled === undefined || enabled === 0 || evidence.caller_is_administrator === false) return batch3UnavailableFacts(contractId);
       const admins = count("administrators");
       const violations = count("administrators_without_strong_auth", "inactive_users") + (admins > (value("max_admins") ?? 0) ? admins - (value("max_admins") ?? 0) : 0);
       const reviews = count("never_logged_in_users", "stale_api_key_users", "locked_out_users", "repeated_login_failures", "users_without_enabled_flag")
@@ -2980,7 +2989,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "TENABLE-11": {
       const permissions = value("permission_count");
-      if (permissions === undefined || permissions === 0) return {};
+      if (permissions === undefined || permissions === 0) return batch3UnavailableFacts(contractId);
       const complete = !partial
         && evidence.access_groups_truncated !== true
         && !statusIsIncomplete("access_groups_status")
@@ -2990,20 +2999,20 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "TENABLE-12": {
       const credentials = value("credential_count");
-      if (credentials === undefined || credentials === 0) return {};
+      if (credentials === undefined || credentials === 0) return batch3UnavailableFacts(contractId);
       return fact(credentials, 0, count("unused_credentials_count", "older_than_one_year_count", "undated_credentials") + (partial ? 1 : 0), !partial);
     }
     case "TENABLE-13":
       return fact(value("exclusion_count") ?? 0, count("permanent_exclusions_count", "broad_exclusions_count"), count("undocumented_exclusions_count") + (partial ? 1 : 0), !partial);
     case "TENABLE-14": {
       const open = value("open_findings") ?? 0;
-      if ((value("asset_count") ?? 0) === 0 || open === 0) return {};
+      if ((value("asset_count") ?? 0) === 0 || open === 0) return batch3UnavailableFacts(contractId);
       const coverage = value("vpr_coverage") ?? 0;
       const complete = !partial && evidence.caller_is_administrator === true;
       return fact(open, 0, coverage < 0.5 || !complete ? 1 : 0, complete);
     }
     case "TENABLE-15": {
-      if ((value("asset_count") ?? 0) === 0) return {};
+      if ((value("asset_count") ?? 0) === 0) return batch3UnavailableFacts(contractId);
       const open = tenableEvidenceCount(evidence, "open_by_severity");
       const overdue = asObject(evidence.overdue_by_severity) ?? {};
       const severe = (asNumber(overdue.critical) ?? 0) + (asNumber(overdue.high) ?? 0);
@@ -3014,7 +3023,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-16": {
       const assets = value("asset_count") ?? 0;
       const categories = value("tag_category_count") ?? value("tag_category_count_read");
-      if (assets === 0 || categories === undefined) return {};
+      if (assets === 0 || categories === undefined) return batch3UnavailableFacts(contractId);
       const ratio = value("tagged_ratio") ?? 0;
       const threshold = value("threshold") ?? 0;
       const complete = !partial
@@ -3032,7 +3041,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-19": {
       const jobs = value("external_export_jobs_in_window") ?? 0;
       const days = count("external_export_days");
-      if (jobs === 0) return {};
+      if (jobs === 0) return batch3UnavailableFacts(contractId);
       const complete = (evidence.vuln_export_jobs_listed !== null || value("vuln_export_jobs_read") !== undefined)
         && (evidence.asset_export_jobs_listed !== null || value("asset_export_jobs_read") !== undefined)
         && evidence.caller_is_administrator === true;
@@ -3044,7 +3053,7 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       return fact(groups === 0 && nonAdministrator ? 1 : groups, 0, count("stale_or_undated_groups", "overlapping_targets") + (nonAdministrator ? 1 : 0), !nonAdministrator);
     }
     default:
-      return {};
+      return batch3UnavailableFacts(contractId);
   }
 }
 

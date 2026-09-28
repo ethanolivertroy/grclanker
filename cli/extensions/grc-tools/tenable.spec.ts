@@ -7,8 +7,49 @@ import { TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://developer.tenable.com/reference/navigate";
-const surface = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") =>
-  restSurface(id, path, path.startsWith("/rest/") ? "Tenable Security Center REST API" : "Tenable Vulnerability Management REST API", DOCS, fields, method);
+const surface = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") => {
+  const securityCenter = path.startsWith("/rest/");
+  const parameters = path === "/assets/export"
+    ? [{ name: "chunk_size", location: "form-body" as const, required: true, value: "10000" }]
+    : path === "/vulns/export"
+      ? [
+          { name: "num_assets", location: "form-body" as const, required: true, value: "5000" },
+          { name: "include_plugin_output", location: "form-body" as const, required: true, value: "false" },
+          { name: "filters.since", location: "form-body" as const, required: true, value: "Unix seconds for now minus vuln_lookback_days." },
+          { name: "filters.state", location: "form-body" as const, required: true, value: "open, reopened, fixed" },
+        ]
+      : path.includes("{export_uuid}")
+        ? [
+            { name: "export_uuid", location: "path" as const, required: true, value: "Identifier returned by the corresponding export POST." },
+            ...(path.includes("{chunk_id}")
+              ? [{ name: "chunk_id", location: "path" as const, required: true, value: "Each ID reported in chunks_available, bounded by max_chunks." }]
+              : [
+                  { name: "poll_interval_ms", location: "client" as const, required: true, value: "1000 milliseconds unless injected by the caller." },
+                  { name: "poll_deadline_ms", location: "client" as const, required: true, value: "300000 milliseconds unless injected by the caller." },
+                ]),
+          ]
+        : path.includes("{policy_id}") || path.includes("{scan_id}")
+          ? [{ name: path.includes("{policy_id}") ? "policy_id" : "scan_id", location: "path" as const, required: true, value: "Identifier returned by the parent inventory." }]
+          : [
+              { name: "offset", location: "query" as const, required: false, value: "Returned pagination offset; omitted on the first page." },
+              { name: "limit", location: "query" as const, required: false, value: "Concrete endpoint page size, normally 1000." },
+            ];
+  return restSurface(
+    id,
+    path,
+    securityCenter ? "Tenable Security Center REST API" : "Tenable Vulnerability Management REST API",
+    DOCS,
+    fields,
+    method,
+    {
+      headers: securityCenter
+        ? ["x-apikey: accesskey=<resolved>; secretkey=<resolved>", "Accept: application/json"]
+        : ["X-ApiKeys: accessKey=<resolved>; secretKey=<resolved>", "Accept: application/json", "Content-Type: application/json for export POST requests"],
+      parameters,
+      responseShape: `JSON ${method === "POST" ? "export workflow" : "resource"} document containing ${fields.join(", ")}.`,
+    },
+  );
+};
 const NON_TRUNCATION_FAILURES = ["error", "denied", "not-collected", "not-configured", "missing-required-field"] as const;
 
 const surfaces = [

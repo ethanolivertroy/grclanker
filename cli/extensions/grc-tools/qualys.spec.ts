@@ -7,8 +7,35 @@ import { QUALYS_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { BATCH3_FRAMEWORK_FILES, batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://docs.qualys.com/en/vm/api/";
-const vm = (id: string, path: string, fields: readonly string[]) =>
-  restSurface(id, path, path.startsWith("/qps/") ? "Qualys QPS REST API" : path.startsWith("/msp/") ? "Qualys Administration API" : "Qualys VM/PC API v2", DOCS, fields);
+const vm = (id: string, path: string, fields: readonly string[]) => {
+  const qps = path.startsWith("/qps/");
+  const administration = path.startsWith("/msp/");
+  return restSurface(
+    id,
+    path,
+    qps ? "Qualys QPS REST API" : administration ? "Qualys Administration API" : "Qualys VM/PC API v2",
+    DOCS,
+    fields,
+    qps ? "POST" : "GET",
+    qps
+      ? {
+          headers: ["Authorization: Basic or Bearer according to the resolved mode", "X-Requested-With: grclanker", "Accept: application/json", "Content-Type: application/json"],
+          parameters: [
+            { name: "ServiceRequest.preferences.limitResults", location: "form-body", required: true, value: "100, 500, or the remaining configured cap selected by the concrete collector." },
+            { name: "ServiceRequest.preferences.startFromId", location: "form-body", required: false, value: "Last returned object ID when hasMoreRecords is true." },
+            { name: "ServiceRequest.filters.Criteria", location: "form-body", required: false, value: "Exact check-specific field/operator/value criteria; omitted only for unfiltered searches." },
+          ],
+          responseShape: `JSON ServiceResponse containing data, hasMoreRecords, lastId, and projected ${fields.join(", ")} members.`,
+        }
+      : {
+          headers: ["Authorization: Basic or Bearer according to the resolved mode", "X-Requested-With: grclanker", "Accept: application/xml"],
+          parameters: administration
+            ? [{ name: "request", location: "query", required: false, value: "The Administration user-list endpoint accepts no action selector in the shipped collector." }]
+            : [{ name: "action", location: "query", required: true, value: "list" }],
+          responseShape: `Qualys VM/PC API v2 XML response parsed from the documented DTD; projected ${fields.join(", ")} members.`,
+        },
+  );
+};
 
 const surfaces = [
   vm("scheduled-scans", "/api/2.0/fo/schedule/scan/", ["ID", "TITLE", "ACTIVE", "SCHEDULE", "OPTION_PROFILE", "ASSET_GROUPS"]),

@@ -8,7 +8,21 @@ import { batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://developer.knowbe4.com/rest/reporting";
 const kb = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") =>
-  restSurface(id, path, path.startsWith("/graphql") ? "KnowBe4 PhishER Product API GraphQL" : "KnowBe4 Reporting API v1", DOCS, fields, method);
+  restSurface(id, path, path.startsWith("/graphql") ? "KnowBe4 PhishER Product API GraphQL" : "KnowBe4 Reporting API v1", DOCS, fields, method, {
+    headers: ["Authorization: Bearer <resolved product-specific token>", "Accept: application/json", ...(method === "POST" ? ["Content-Type: application/json"] : [])],
+    parameters: method === "POST"
+      ? [
+          { name: "query", location: "form-body", required: true, value: `Named ${path.replace("/graphql ", "")} GraphQL query.` },
+          { name: "variables.pagination", location: "form-body", required: true, value: "page=1, perPage=100, then each returned nextPageKey until exhaustion." },
+        ]
+      : [
+          ...(path.includes("{group_id}") ? [{ name: "group_id", location: "path" as const, required: true, value: "Group ID returned by /v1/groups." }] : []),
+          ...(path.includes("{pst_id}") ? [{ name: "pst_id", location: "path" as const, required: true, value: "Security-test ID returned by /v1/phishing/security_tests." }] : []),
+          { name: "page", location: "query", required: false, value: "One-based page number advanced through same-origin Link rel=next." },
+          { name: "per_page", location: "query", required: false, value: "500 unless the remaining configured inventory cap is smaller." },
+        ],
+    responseShape: `JSON ${method === "POST" ? "GraphQL data envelope" : "Reporting API resource or list"} containing ${fields.join(", ")}.`,
+  });
 const surfaces = [
   kb("account", "/v1/account", ["name", "subscription_level", "number_of_seats", "current_risk_score", "sso_enabled", "admins"]),
   kb("risk-history", "/v1/account/risk_score_history?full=true", ["date", "risk_score"]),

@@ -18,6 +18,7 @@ import {
   type IntegrationSpecContract,
   type PermissionKind,
   type PortableValue,
+  type RequestParameterContract,
   type VerdictCondition,
   type VerdictOperand,
   type VerdictRule,
@@ -44,6 +45,10 @@ export interface BatchSurfaceDefinition {
   service: string;
   documentationUrl: string;
   fields: readonly string[];
+  clientRegion?: string;
+  headers?: readonly string[];
+  parameters?: readonly RequestParameterContract[];
+  responseShape?: string;
 }
 
 export interface BatchCheckDefinition {
@@ -608,10 +613,10 @@ export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): Inte
     fieldsConsumed: surface.fields,
     projectionStage: "The collector projects the response to the listed verdict fields before evidence export.",
     request: {
-      clientRegion: `Use the configured ${surface.service} origin; never follow a server link to a different origin.`,
-      headers: ["Authorization appropriate to the selected authentication mode", "Accept: application/json"],
-      parameters: [],
-      responseShape: `A JSON object or list containing only the documented ${surface.fields.join(", ")} members consumed by verdicts.`,
+      clientRegion: surface.clientRegion ?? `Use the configured ${surface.service} origin; never follow a server link to a different origin.`,
+      headers: surface.headers ?? ["Authorization appropriate to the selected authentication mode", "Accept: application/json"],
+      parameters: surface.parameters ?? [],
+      responseShape: surface.responseShape ?? `A JSON object or list containing only the documented ${surface.fields.join(", ")} members consumed by verdicts.`,
     },
     intent: "read" as const,
   }));
@@ -741,15 +746,11 @@ export function evaluateBatchRuntimeCheckVerdict(
   checkId: string,
   collectedFacts: Readonly<Record<string, unknown>>,
 ): EvaluatedFindingStatus {
-  const check = checkContract(spec, checkId);
-  const declaredFacts = Object.fromEntries(
-    Object.entries(collectedFacts).filter(([name]) => check.evidenceFields.includes(name)),
-  );
   BATCH_DECISION_CAPTURE.getStore()?.push({
     integration: spec.identity.slug,
-    checks: new Map([[checkId, declaredFacts]]),
+    checks: new Map([[checkId, collectedFacts]]),
   });
-  return evaluateCheckVerdict(check, declaredFacts);
+  return evaluateCheckVerdict(checkContract(spec, checkId), collectedFacts);
 }
 
 export function assertBatchCheckVerdict<T extends string>(

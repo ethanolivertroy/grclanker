@@ -261,6 +261,7 @@ export function restSurface(
   documentationUrl: string,
   fields: readonly string[],
   method: "GET" | "POST" = "GET",
+  request: Partial<Pick<BatchSurfaceDefinition, "clientRegion" | "headers" | "parameters" | "responseShape">> = {},
 ): BatchSurfaceDefinition {
-  return { id, path: pathValue, service, documentationUrl, fields, method };
+  return { id, path: pathValue, service, documentationUrl, fields, method, ...request };
 }

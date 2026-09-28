@@ -8,7 +8,19 @@ import { batch3Checks, type Batch3CheckRow } from "./batch3-spec-helpers.js";
 
 const DOCS = "https://docs.veracode.com/r/c_rest_api";
 const surface = (id: string, path: string, fields: readonly string[]) =>
-  restSurface(id, path, "Veracode HMAC-signed REST API", DOCS, fields);
+  restSurface(id, path, "Veracode HMAC-signed REST API", DOCS, fields, "GET", {
+    headers: ["Authorization: VERACODE-HMAC-SHA-256 signed over the exact GET host, path, and query", "Accept: application/json"],
+    parameters: [
+      ...(path.includes("{guid}") ? [{ name: "guid", location: "path" as const, required: true, value: "Application GUID returned by /appsec/v1/applications." }] : []),
+      ...(path.includes("{id}") ? [{ name: "id", location: "path" as const, required: true, value: "Workspace ID returned by /srcclr/v3/workspaces." }] : []),
+      ...(path.includes("{user_id}") ? [{ name: "user_id", location: "path" as const, required: true, value: "User ID returned by /api/authn/v2/users." }] : []),
+      ...(path.includes("{analysis_id}") ? [{ name: "analysis_id", location: "path" as const, required: true, value: "Analysis ID returned by /was/configservice/v1/analyses." }] : []),
+      ...(path.includes("{scan_id}") ? [{ name: "scan_id", location: "path" as const, required: true, value: "Scan ID returned by the dynamic-analysis scan inventory." }] : []),
+      { name: "page", location: "query" as const, required: false, value: "Zero-based HAL page number for list endpoints." },
+      { name: "size", location: "query" as const, required: false, value: "100 for list endpoints." },
+    ],
+    responseShape: `HAL JSON object or documented single resource containing ${fields.join(", ")}.`,
+  });
 const surfaces = [
   surface("self", "/api/authn/v2/users/self", ["user_id", "user_name", "roles", "teams", "active"]),
   surface("self-api-credentials", "/api/authn/v2/api_credentials", ["api_id", "expiration_ts", "last_used_ts"]),
