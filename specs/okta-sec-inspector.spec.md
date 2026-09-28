@@ -504,7 +504,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-INTEG-003` | 3 | warn | any of (`complete` does not equal true; `risky_inactive_count` is greater than 0) |  |
 | `OKTA-INTEG-003` | 4 | pass | always |  |
 | `OKTA-INTEG-003` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `OKTA-INTEG-004` | 1 | manual | `policy_readable` equals false |  |
+| `OKTA-INTEG-004` | 1 | manual | `policy_readable` does not equal true |  |
 | `OKTA-INTEG-004` | 2 | fail | all of (`risk_aware_rule_count` equals 0; `custom_zone_count` equals 0) |  |
 | `OKTA-INTEG-004` | 3 | warn | any of (`complete` does not equal true; `risk_aware_rule_count` equals 0) |  |
 | `OKTA-INTEG-004` | 4 | pass | `risk_aware_rule_count` is greater than 0 |  |

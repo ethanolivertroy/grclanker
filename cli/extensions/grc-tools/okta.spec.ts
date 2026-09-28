@@ -371,7 +371,7 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
   "OKTA-INTEG-004": {
     inputs: input("policy_readable", "complete", "risk_aware_rule_count", "custom_zone_count"),
     rules: ordered({
-      manual: eq("policy_readable", false),
+      manual: ne("policy_readable", true),
       fail: all(eq("risk_aware_rule_count", 0), eq("custom_zone_count", 0)),
       warn: any(incomplete, eq("risk_aware_rule_count", 0)),
       pass: gt("risk_aware_rule_count", 0),
