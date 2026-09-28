@@ -2,409 +2,1107 @@
 slug: "gcp-sec-inspector"
 name: "GCP Security Inspector"
 vendor: "Google Cloud"
-category: "cloud-infrastructure"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+category: "cloud"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# gcp-sec-inspector
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-Multi-framework security compliance audit tool for Google Cloud Platform.
+# GCP Security Inspector
 
-## grclanker implementation
+Portable contract for the shipped Google Cloud identity, logging, organization, data-protection, and network assessments.
 
-The spec ships as native grclanker tools in `cli/extensions/grc-tools/gcp.ts` with tests in `cli/tests/gcp.test.mjs` and the integration guide at `src/content/docs/docs/integrations/gcp.md`:
+## Purpose
 
-- `gcp_check_access`, `gcp_assess_identity`, `gcp_assess_logging_detection`, `gcp_assess_org_guardrails`, `gcp_assess_data_protection`, `gcp_assess_network_security`, `gcp_export_audit_bundle`
-- Authentication: explicit token, service account key or ADC JSON via `GCP_CREDENTIALS_FILE` or `GOOGLE_APPLICATION_CREDENTIALS` (OAuth 2.0 JWT bearer flow signed with `node:crypto`), the ADC well-known file, then `gcloud auth print-access-token`; `GCP_ORG_ID` is accepted as an alias of `GCP_ORGANIZATION_ID`
-- Verdicts follow the grclanker verdict-safety rules: forbidden, errored, empty, API-disabled, or partial inventories never pass
-- Live smoke: `npm --prefix cli run test:gcp:live`
+Give security and compliance teams a read-only, repeatable view of Google Cloud identity, logging, organization guardrails, data protection, and network posture without treating an unreadable API or sampled project set as compliance.
 
-## Overview
+## Design guidance
 
-gcp-sec-inspector is a command-line tool that audits Google Cloud Platform environments against multiple security compliance frameworks. It leverages GCP's security and asset management APIs to evaluate infrastructure configurations, IAM policies, encryption settings, and organizational constraints, then maps findings to FedRAMP, CMMC 2.0, SOC 2, CIS Benchmarks, PCI-DSS, DISA STIG, IRAP, and ISMAP controls.
+Use a dedicated least-privilege audit principal and an explicit organization or project scope. Preserve quota, API-enablement, IAM-denial, project-cap, and pagination limits as evidence. Verdicts use complete collector counts; rendered arrays are only presentation samples.
 
-GCP's security posture is governed by a hierarchy of organization policies, folder-level overrides, and project-level settings. gcp-sec-inspector traverses this hierarchy to identify misconfigurations, policy drift, and compliance gaps that manual reviews miss. SCC Premium provides the compliance manager integration, but the core audit capabilities work with standard APIs and Cloud Asset Inventory as the primary data source.
+## Shared integration contract
 
-## APIs & SDKs
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-### Security Command Center (securitycenter.googleapis.com)
+## Known runtime gaps
 
-The central hub for security findings and asset visibility across the organization.
+- Project-scoped APIs are sampled from the complete collected project inventory up to the configured project cap; reaching any project, page, key, finding, or asset cap marks dependent evidence partial.
+- Security Command Center is organization-scoped and remains manual when no organization ID is configured.
+- Rendered arrays are capped presentation samples; verdict counts are computed before those arrays are sliced.
+- Organization-wide enumeration is bounded by explicit runtime caps and some organization-policy checks use a configured or sampled project as their effective-policy target.
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET organizations/{org}/sources/-/findings` | List all security findings |
-| `GET organizations/{org}/assets` | List all assets with security marks |
-| `GET organizations/{org}/sources` | List finding sources (SCC, third-party) |
-| `POST organizations/{org}/findings:group` | Group findings by category/severity |
-| `GET organizations/{org}/notificationConfigs` | Pub/Sub notification configs |
-| `GET organizations/{org}/securityHealthAnalyticsSettings/customModules` | Custom SHA modules |
-| `GET organizations/{org}/complianceReports` | Compliance posture reports (Premium) |
+## Tools
 
-**Note:** SCC Premium tier is required for compliance manager, continuous exports, and container threat detection. Standard tier provides Security Health Analytics and Web Security Scanner only.
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `gcp_check_access` | Validate read-only GCP audit access across Cloud Resource Manager, Cloud Asset Inventory, IAM, Logging, Compute Engine, Cloud Storage, Cloud KMS, and Security Command Center surfaces. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `gcp_assess_identity` | Assess GCP IAM posture across privileged bindings, service account key rotation, user-managed keys, cross-project access, and default service account privilege. | `GCP-IAM-01`, `GCP-IAM-02`, `GCP-IAM-03`, `GCP-IAM-04`, `GCP-IAM-05` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `gcp_assess_logging_detection` | Assess GCP Logging coverage (Admin Activity, Data Access, sinks, bucket retention) with Security Command Center visibility reported for context only. | `GCP-LOG-01`, `GCP-LOG-02`, `GCP-LOG-03`, `GCP-LOG-04`, `GCP-LOG-05` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `gcp_assess_org_guardrails` | Assess GCP organization and project guardrails: domain-restricted sharing, service account key constraints, serial port and Shielded VM policies, OS Login, Binary Authorization, and instance hardening. | `GCP-ORG-01`, `GCP-ORG-02`, `GCP-ORG-03`, `GCP-ORG-04`, `GCP-ORG-05`, `GCP-ORG-06`, `GCP-ORG-07`, `GCP-ORG-08` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `gcp_assess_data_protection` | Assess GCP data protection: uniform bucket-level access, public IAM exposure, KMS key rotation, CMEK on buckets and disks, Cloud DNS DNSSEC, API key restrictions, and VPC Service Controls perimeters. | `GCP-DATA-01`, `GCP-DATA-02`, `GCP-DATA-03`, `GCP-DATA-04`, `GCP-DATA-05`, `GCP-DATA-06`, `GCP-DATA-07` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `gcp_assess_network_security` | Assess GCP network security: internet-open firewall rules on admin ports, VPC flow logs, Private Google Access, Cloud NAT and external IPs, load balancer SSL policies, and Cloud Armor coverage. | `GCP-NET-01`, `GCP-NET-02`, `GCP-NET-03`, `GCP-NET-04`, `GCP-NET-05`, `GCP-NET-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `gcp_export_audit_bundle` | Export a GCP audit bundle with core_data snapshots, analysis JSON, compliance reports per framework, a quick reference, an error log when reads fail, and a zip archive. | `GCP-IAM-01`, `GCP-IAM-02`, `GCP-IAM-03`, `GCP-IAM-04`, `GCP-IAM-05`, `GCP-LOG-01`, `GCP-LOG-02`, `GCP-LOG-03`, `GCP-LOG-04`, `GCP-LOG-05`, `GCP-ORG-01`, `GCP-ORG-02`, `GCP-ORG-03`, `GCP-ORG-04`, `GCP-ORG-05`, `GCP-ORG-06`, `GCP-ORG-07`, `GCP-ORG-08`, `GCP-DATA-01`, `GCP-DATA-02`, `GCP-DATA-03`, `GCP-DATA-04`, `GCP-DATA-05`, `GCP-DATA-06`, `GCP-DATA-07`, `GCP-NET-01`, `GCP-NET-02`, `GCP-NET-03`, `GCP-NET-04`, `GCP-NET-05`, `GCP-NET-06` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
 
-### Cloud Asset Inventory (cloudasset.googleapis.com)
+### Parameters
 
-The workhorse API for IAM analysis and resource discovery across all projects.
+#### `gcp_check_access`
 
-| Endpoint | Purpose |
-|----------|---------|
-| `POST v1/{scope}:searchAllResources` | Search resources across org/folder/project |
-| `POST v1/{scope}:searchAllIamPolicies` | Search IAM policy bindings across scope |
-| `POST v1/{scope}:analyzeIamPolicy` | Determine who has what access to what |
-| `POST v1/{scope}:analyzeIamPolicyLongrunning` | Async IAM analysis for large orgs |
-| `POST v1/{scope}:batchGetEffectiveIamPolicies` | Effective policies after inheritance |
-| `POST v1/{scope}:exportAssets` | Export asset snapshot to BigQuery/GCS |
-| `GET v1/{scope}:queryAssets` | SQL-like asset queries |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `organization_id` | string | no | GCP organization ID to audit. Defaults to GCP_ORGANIZATION_ID or GCP_ORG_ID. |
+| `project_id` | string | no | GCP project ID for project-scoped fallback or focused checks. Defaults to GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT. |
+| `access_token` | string | no | Explicit OAuth bearer token. Defaults to GCP_ACCESS_TOKEN, then a credentials file, then gcloud auth print-access-token. |
+| `credentials_file` | string | no | Path to a service account key or ADC JSON file. Defaults to GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the ADC well-known file. |
 
-### Cloud IAM (iam.googleapis.com)
+#### `gcp_assess_identity`
 
-Service account lifecycle, key management, and custom role definitions.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `organization_id` | string | no | GCP organization ID to audit. Defaults to GCP_ORGANIZATION_ID or GCP_ORG_ID. |
+| `project_id` | string | no | GCP project ID for project-scoped fallback or focused checks. Defaults to GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT. |
+| `access_token` | string | no | Explicit OAuth bearer token. Defaults to GCP_ACCESS_TOKEN, then a credentials file, then gcloud auth print-access-token. |
+| `credentials_file` | string | no | Path to a service account key or ADC JSON file. Defaults to GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the ADC well-known file. |
+| `max_projects` | number | no | Maximum projects to sample. Defaults to 20. |
+| `project_limit` | number | no | Alias of max_projects; when the cap truncates the inventory every dependent finding is flagged as partial. |
+| `stale_days` | number | no | Staleness threshold in days for service account keys. Defaults to 90. |
+| `max_keys` | number | no | Maximum service account keys to inspect. Defaults to 200. |
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET v1/projects/{project}/serviceAccounts` | List service accounts |
-| `GET v1/projects/{project}/serviceAccounts/{sa}/keys` | List SA keys (check age) |
-| `POST v1/projects/{project}/serviceAccounts/{sa}:getIamPolicy` | SA-level IAM bindings |
-| `GET v1/projects/{project}/roles` | List custom roles |
-| `GET v1/roles` | List predefined roles |
-| `GET v1/permissions` | Query permissions metadata |
-| `GET v1/projects/{project}/serviceAccounts/{sa}` | SA details (disabled status) |
+#### `gcp_assess_logging_detection`
 
-### Cloud Audit Logs (logging.googleapis.com)
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `organization_id` | string | no | GCP organization ID to audit. Defaults to GCP_ORGANIZATION_ID or GCP_ORG_ID. |
+| `project_id` | string | no | GCP project ID for project-scoped fallback or focused checks. Defaults to GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT. |
+| `access_token` | string | no | Explicit OAuth bearer token. Defaults to GCP_ACCESS_TOKEN, then a credentials file, then gcloud auth print-access-token. |
+| `credentials_file` | string | no | Path to a service account key or ADC JSON file. Defaults to GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the ADC well-known file. |
+| `max_projects` | number | no | Maximum projects to sample. Defaults to 20. |
+| `project_limit` | number | no | Alias of max_projects; when the cap truncates the inventory every dependent finding is flagged as partial. |
+| `max_findings` | number | no | Maximum Security Command Center findings to sample. Defaults to 200. |
 
-Three log streams: Admin Activity (always on, 400-day retention), Data Access (opt-in, 30-day default), and System Events (always on).
+#### `gcp_assess_org_guardrails`
 
-| Endpoint | Purpose |
-|----------|---------|
-| `POST v2/entries:list` | Query log entries |
-| `GET v2/projects/{project}/sinks` | List log sinks (routing) |
-| `GET v2/projects/{project}/metrics` | Log-based metrics |
-| `GET v2/{resource}/cmekSettings` | CMEK config for log buckets |
-| `GET v2/projects/{project}/locations/{loc}/buckets` | Log bucket configs |
-| `GET v2/{resource}/settings` | Org/folder/project logging settings |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `organization_id` | string | no | GCP organization ID to audit. Defaults to GCP_ORGANIZATION_ID or GCP_ORG_ID. |
+| `project_id` | string | no | GCP project ID for project-scoped fallback or focused checks. Defaults to GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT. |
+| `access_token` | string | no | Explicit OAuth bearer token. Defaults to GCP_ACCESS_TOKEN, then a credentials file, then gcloud auth print-access-token. |
+| `credentials_file` | string | no | Path to a service account key or ADC JSON file. Defaults to GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the ADC well-known file. |
+| `max_projects` | number | no | Maximum projects to sample. Defaults to 20. |
+| `project_limit` | number | no | Alias of max_projects; when the cap truncates the inventory every dependent finding is flagged as partial. |
+| `max_assets` | number | no | Maximum resources to inventory per list. Defaults to 2000; truncation downgrades verdicts. |
 
-### Organization Policy (cloudresourcemanager.googleapis.com)
+#### `gcp_assess_data_protection`
 
-Hierarchical policy constraints that flow from org to folder to project.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `organization_id` | string | no | GCP organization ID to audit. Defaults to GCP_ORGANIZATION_ID or GCP_ORG_ID. |
+| `project_id` | string | no | GCP project ID for project-scoped fallback or focused checks. Defaults to GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT. |
+| `access_token` | string | no | Explicit OAuth bearer token. Defaults to GCP_ACCESS_TOKEN, then a credentials file, then gcloud auth print-access-token. |
+| `credentials_file` | string | no | Path to a service account key or ADC JSON file. Defaults to GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the ADC well-known file. |
+| `max_projects` | number | no | Maximum projects to sample. Defaults to 20. |
+| `project_limit` | number | no | Alias of max_projects; when the cap truncates the inventory every dependent finding is flagged as partial. |
+| `max_assets` | number | no | Maximum resources to inventory per list. Defaults to 2000; truncation downgrades verdicts. |
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET v1/organizations/{org}` | Organization metadata |
-| `POST v2/{resource}/policies` | List effective policies |
-| `GET v2/{resource}/policies/{constraint}` | Get specific policy |
-| `GET v2/organizations/{org}/constraints` | List available constraints |
-| `POST v1/projects/{project}:getEffectiveOrgPolicy` | Effective policy after inheritance |
-| `GET v1/folders/{folder}` | Folder metadata |
+#### `gcp_assess_network_security`
 
-### Cloud KMS (cloudkms.googleapis.com)
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `organization_id` | string | no | GCP organization ID to audit. Defaults to GCP_ORGANIZATION_ID or GCP_ORG_ID. |
+| `project_id` | string | no | GCP project ID for project-scoped fallback or focused checks. Defaults to GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT. |
+| `access_token` | string | no | Explicit OAuth bearer token. Defaults to GCP_ACCESS_TOKEN, then a credentials file, then gcloud auth print-access-token. |
+| `credentials_file` | string | no | Path to a service account key or ADC JSON file. Defaults to GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the ADC well-known file. |
+| `max_projects` | number | no | Maximum projects to sample. Defaults to 20. |
+| `project_limit` | number | no | Alias of max_projects; when the cap truncates the inventory every dependent finding is flagged as partial. |
+| `max_assets` | number | no | Maximum resources to inventory per list. Defaults to 2000; truncation downgrades verdicts. |
 
-Key management, rotation policies, and IAM bindings for encryption keys.
+#### `gcp_export_audit_bundle`
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET v1/projects/{project}/locations/{loc}/keyRings` | List key rings |
-| `GET v1/{keyRing}/cryptoKeys` | List crypto keys |
-| `GET v1/{cryptoKey}/cryptoKeyVersions` | Key version lifecycle |
-| `GET v1/{cryptoKey}:getIamPolicy` | Key-level IAM bindings |
-| `GET v1/{cryptoKey}` | Key details (rotation period, purpose) |
-| `GET v1/{cryptoKey}/cryptoKeyVersions/{version}` | Version state (enabled/disabled/destroyed) |
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `organization_id` | string | no | GCP organization ID to audit. Defaults to GCP_ORGANIZATION_ID or GCP_ORG_ID. |
+| `project_id` | string | no | GCP project ID for project-scoped fallback or focused checks. Defaults to GCP_PROJECT_ID or GOOGLE_CLOUD_PROJECT. |
+| `access_token` | string | no | Explicit OAuth bearer token. Defaults to GCP_ACCESS_TOKEN, then a credentials file, then gcloud auth print-access-token. |
+| `credentials_file` | string | no | Path to a service account key or ADC JSON file. Defaults to GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, or the ADC well-known file. |
+| `max_projects` | number | no | Maximum projects to sample. Defaults to 20. |
+| `project_limit` | number | no | Alias of max_projects; when the cap truncates the inventory every dependent finding is flagged as partial. |
+| `max_assets` | number | no | Maximum resources to inventory per list. Defaults to 2000; truncation downgrades verdicts. |
+| `output_dir` | string | no | Output root. Defaults to ./export/gcp. |
+| `stale_days` | number | no | Staleness threshold in days for service account keys. Defaults to 90. |
+| `max_keys` | number | no | Maximum service account keys to inspect. Defaults to 200. |
+| `max_findings` | number | no | Maximum Security Command Center findings to sample. Defaults to 200. |
 
-### Binary Authorization (binaryauthorization.googleapis.com)
-
-Container image verification policies for GKE and Cloud Run.
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET v1/projects/{project}/policy` | Get Binary Auth policy |
-| `GET v1/projects/{project}/attestors` | List attestors |
-| `GET v1/projects/{project}/attestors/{attestor}` | Attestor details |
-
-### SDKs and CLI Tools
-
-| Tool | Usage |
-|------|-------|
-| `google-cloud-securitycenter` | Python SDK for SCC findings and assets |
-| `google-cloud-asset` | Python SDK for Cloud Asset Inventory |
-| `google-cloud-iam` | Python SDK for IAM service accounts and roles |
-| `google-cloud-logging` | Python SDK for Cloud Audit Logs |
-| `google-cloud-kms` | Python SDK for Cloud KMS |
-| `google-cloud-resource-manager` | Python SDK for Org Policy |
-| `gcloud` | CLI for all GCP services |
 
 ## Authentication
 
-### Service Account (recommended for automation)
+Supported modes:
 
-```bash
-export GCP_CREDENTIALS_FILE=/path/to/service-account-key.json
-export GCP_PROJECT_ID=my-project-id
-export GCP_ORG_ID=123456789012
-```
+- Explicit OAuth access token
+- Service-account application default credentials
+- Authorized-user application default credentials
+- gcloud access token
 
-### Application Default Credentials (ADC)
+Credential precedence, highest first:
 
-```bash
-gcloud auth application-default login
-export GCP_PROJECT_ID=my-project-id
-export GCP_ORG_ID=123456789012
-```
+1. Explicit tool arguments
+2. GCP and GOOGLE_* environment variables
+3. Application Default Credentials file
+4. gcloud auth print-access-token
 
-### Required IAM Roles
+Environment variables: `APPDATA`, `CLOUDSDK_CONFIG`, `GCP_ORGANIZATION_ID`, `GCP_ORG_ID`, `GCP_ACCESS_TOKEN`, `GOOGLE_OAUTH_ACCESS_TOKEN`, `GOOGLE_ACCESS_TOKEN`, `GCP_CREDENTIALS_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`
 
-| Role | Purpose |
-|------|---------|
-| `roles/securitycenter.findingsViewer` | Read SCC findings |
-| `roles/cloudasset.viewer` | Cloud Asset Inventory queries |
-| `roles/iam.securityReviewer` | IAM policy and role review |
-| `roles/logging.viewer` | Audit log access |
-| `roles/orgpolicy.policyViewer` | Organization policy review |
-| `roles/cloudkms.viewer` | KMS key and rotation review |
-| `roles/binaryauthorization.policyViewer` | Binary Auth policy review |
+Configuration locations: Explicit credentials_file, GCP_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, Application Default Credentials well-known path
 
-The tool validates required permissions at startup and reports which audit modules can run based on the authenticated principal's access.
+Credential and deployment variants: Organization scope, Project scope, Service-account JWT bearer exchange, Authorized-user refresh-token exchange
 
-## Security Controls
+Configuration fields: `type`, `client_email`, `private_key`, `token_uri`, `project_id`, `client_id`, `client_secret`, `refresh_token`
 
-| # | Control | API Source | Description |
-|---|---------|-----------|-------------|
-| 1 | Service Account Key Rotation | IAM | SA keys older than 90 days; prefer Workload Identity Federation |
-| 2 | Overprivileged IAM Roles | Asset Inventory | Principals with Owner/Editor at org/folder level; unused permissions |
-| 3 | Public Resource Exposure | Asset Inventory, SCC | GCS buckets, BigQuery datasets, Compute instances with public access |
-| 4 | VPC Firewall Rules | Asset Inventory | Overly permissive ingress rules (0.0.0.0/0), unused rules |
-| 5 | Audit Logging Configuration | Logging | Data Access logs enabled per service; log sink destinations |
-| 6 | Organization Policy Constraints | Org Policy | Required constraints enforced (e.g., domain-restricted sharing) |
-| 7 | KMS Key Rotation | KMS | Key rotation period configured and within policy (<=365 days) |
-| 8 | Binary Authorization | Binary Auth | Policy enforcement mode; attestor configuration for GKE/Cloud Run |
-| 9 | VPC Flow Logs | Asset Inventory | Flow logs enabled on all subnets with appropriate retention |
-| 10 | Cloud NAT Configuration | Asset Inventory | NAT gateways properly configured; no direct public IPs |
-| 11 | OS Login Enforcement | Org Policy, Asset Inventory | OS Login required for Compute instances; 2FA enforcement |
-| 12 | Serial Port Disabled | Org Policy, Asset Inventory | Serial port access disabled on Compute instances |
-| 13 | Default Service Account Usage | IAM, Asset Inventory | Resources using default compute/App Engine SA instead of custom |
-| 14 | Cross-Project Access | Asset Inventory | IAM bindings granting access across project boundaries |
-| 15 | Uniform Bucket-Level Access | Asset Inventory | GCS buckets using uniform (not fine-grained) access control |
-| 16 | Customer-Managed Encryption Keys (CMEK) | KMS, Asset Inventory | CMEK usage for sensitive resources; Google-managed key detection |
-| 17 | DNS Security (DNSSEC) | Asset Inventory | DNSSEC enabled on Cloud DNS managed zones |
-| 18 | Load Balancer SSL Policies | Asset Inventory | TLS 1.2+ minimum; restricted/modern cipher profiles |
-| 19 | Cloud Armor WAF | Asset Inventory | Cloud Armor policies attached to backend services |
-| 20 | API Key Restrictions | IAM | API keys with application and API restrictions configured |
-| 21 | VPC Service Controls | Asset Inventory | Service perimeters configured for sensitive projects |
-| 22 | Private Google Access | Asset Inventory | Subnets configured for Private Google Access |
-| 23 | Shielded VM Configuration | Asset Inventory | vTPM, Secure Boot, integrity monitoring enabled |
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
 
-## Compliance Framework Mappings
+Credential refresh: POST the credential token_uri with a JWT bearer assertion or refresh_token grant.
 
-| # | Control | FedRAMP | CMMC 2.0 | SOC 2 | CIS GCP | PCI-DSS 4.0 | DISA STIG | IRAP | ISMAP |
-|---|---------|---------|----------|-------|---------|-------------|-----------|------|-------|
-| 1 | SA Key Rotation | IA-5(1) | L2: IA.L2-3.5.10 | CC6.1 | 1.17 | 8.3.9 | SRG-APP-000516 | ISM-1590 | 8.1.1 |
-| 2 | Overprivileged IAM | AC-6(1) | L2: AC.L2-3.1.5 | CC6.3 | 1.1-1.5 | 7.2.1 | SRG-APP-000033 | ISM-1508 | 7.1.1 |
-| 3 | Public Resources | AC-3, SC-7 | L2: AC.L2-3.1.3 | CC6.1 | 5.1, 6.2 | 1.3.1 | SRG-APP-000142 | ISM-1037 | 1.3.1 |
-| 4 | VPC Firewall Rules | SC-7(5) | L2: SC.L2-3.13.5 | CC6.6 | 3.6-3.9 | 1.3.2 | SRG-APP-000142 | ISM-1416 | 1.3.2 |
-| 5 | Audit Logging | AU-2, AU-3 | L2: AU.L2-3.3.1 | CC7.2 | 2.1-2.4 | 10.2.1 | SRG-APP-000089 | ISM-0580 | 10.2.1 |
-| 6 | Org Policy Constraints | CM-7 | L2: CM.L2-3.4.7 | CC6.1 | 1.14-1.15 | 2.2.1 | SRG-APP-000141 | ISM-1467 | 2.2.1 |
-| 7 | KMS Key Rotation | SC-12(1) | L2: SC.L2-3.13.10 | CC6.1 | 1.18 | 3.6.4 | SRG-APP-000514 | ISM-0457 | 3.6.4 |
-| 8 | Binary Authorization | SI-7 | L2: SI.L2-3.14.1 | CC7.1 | 6.13 | 6.3.2 | SRG-APP-000131 | ISM-1657 | 6.3.2 |
-| 9 | VPC Flow Logs | AU-12 | L2: AU.L2-3.3.1 | CC7.2 | 3.1 | 10.6.1 | SRG-APP-000089 | ISM-0580 | 10.6.1 |
-| 10 | Cloud NAT Config | SC-7 | L2: SC.L2-3.13.1 | CC6.6 | 3.10 | 1.3.4 | SRG-APP-000142 | ISM-1037 | 1.3.4 |
-| 11 | OS Login Enforcement | IA-2(1) | L2: IA.L2-3.5.3 | CC6.1 | 4.4 | 8.3.1 | SRG-APP-000149 | ISM-1401 | 8.3.1 |
-| 12 | Serial Port Disabled | CM-7 | L2: CM.L2-3.4.7 | CC6.1 | 4.5 | 2.2.2 | SRG-APP-000141 | ISM-1467 | 2.2.2 |
-| 13 | Default SA Usage | AC-6(5) | L2: AC.L2-3.1.6 | CC6.3 | 1.6 | 7.2.2 | SRG-APP-000340 | ISM-1508 | 7.2.2 |
-| 14 | Cross-Project Access | AC-3 | L2: AC.L2-3.1.3 | CC6.3 | 1.8 | 7.2.1 | SRG-APP-000033 | ISM-1508 | 7.2.1 |
-| 15 | Uniform Bucket Access | AC-3 | L2: AC.L2-3.1.2 | CC6.1 | 5.2 | 7.2.1 | SRG-APP-000033 | ISM-0988 | 7.2.1 |
-| 16 | CMEK Usage | SC-28(1) | L2: SC.L2-3.13.16 | CC6.1 | 1.18 | 3.4.1 | SRG-APP-000231 | ISM-0457 | 3.4.1 |
-| 17 | DNS Security | SC-20 | L2: SC.L2-3.13.15 | CC6.1 | 3.3 | -- | SRG-APP-000516 | ISM-1590 | -- |
-| 18 | LB SSL Policies | SC-8 | L2: SC.L2-3.13.8 | CC6.1 | 3.11 | 4.1.1 | SRG-APP-000014 | ISM-1139 | 4.1.1 |
-| 19 | Cloud Armor WAF | SC-7(5) | L2: SC.L2-3.13.5 | CC6.6 | 3.12 | 6.6 | SRG-APP-000142 | ISM-1416 | 6.6 |
-| 20 | API Key Restrictions | AC-3 | L2: AC.L2-3.1.2 | CC6.1 | 1.12-1.13 | 7.2.1 | SRG-APP-000033 | ISM-0988 | 7.2.1 |
-| 21 | VPC Service Controls | AC-4 | L2: AC.L2-3.1.3 | CC6.6 | 3.14 | 1.3.1 | SRG-APP-000038 | ISM-1037 | 1.3.1 |
-| 22 | Private Google Access | SC-7 | L2: SC.L2-3.13.1 | CC6.6 | 3.2 | 1.3.4 | SRG-APP-000142 | ISM-1037 | 1.3.4 |
-| 23 | Shielded VM Config | SI-7(1) | L2: SI.L2-3.14.1 | CC7.1 | 4.8-4.9 | 2.2.1 | SRG-APP-000131 | ISM-1657 | 2.2.1 |
+## Permissions
 
-## Existing Tools
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| oauth-scope | `https://www.googleapis.com/auth/cloud-platform` | `organization`, `projects`, `iam-policies`, `service-accounts`, `service-account-keys`, `logging`, `security-command-center`, `effective-org-policy`, `compute`, `binary-authorization`, `storage`, `kms`, `dns`, `api-keys`, `access-context-manager` | OAuth scope only; IAM permissions still govern every read. |
+| role | `Viewer plus service-specific security, logging, asset, IAM, and organization read permissions` | `organization`, `projects`, `iam-policies`, `service-accounts`, `service-account-keys`, `logging`, `security-command-center`, `effective-org-policy`, `compute`, `binary-authorization`, `storage`, `kms`, `dns`, `api-keys`, `access-context-manager` |  |
 
-| Tool | Notes |
-|------|-------|
-| [ScoutSuite](https://github.com/nccgroup/ScoutSuite) | Multi-cloud audit (AWS/GCP/Azure). Python-based. Broad coverage but no compliance framework mapping. |
-| [Forseti Security](https://github.com/forseti-security/forseti-security) | Google-maintained GCP scanner. Archived January 2025. Succeeded by SCC Premium. |
-| [Steampipe GCP Mod](https://hub.steampipe.io/mods/turbot/gcp_compliance) | SQL-based compliance checks. CIS GCP Benchmark coverage. Requires Steampipe runtime. |
-| [Prowler](https://github.com/prowler-cloud/prowler) | Multi-cloud security tool. GCP support added in v3. CIS checks. |
-| [CloudSploit](https://github.com/aquasecurity/cloudsploit) | Aqua Security. Open-source cloud scanner with GCP plugins. |
+## API surfaces
 
-**Gap:** No existing open-source tool maps GCP findings to FedRAMP, CMMC 2.0, DISA STIG, IRAP, and ISMAP simultaneously. gcp-sec-inspector fills this multi-framework mapping gap.
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `organization` | HTTP | `GET cloudresourcemanager.googleapis.com/v1/organizations/{organization}` | Cloud Resource Manager | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `displayName`, `state` | [Official documentation](https://cloud.google.com/resource-manager/reference/rest/v1/organizations/get) |
+| `projects` | HTTP | `GET cloudasset.googleapis.com/v1/{scope}:searchAllResources` | Cloud Asset Inventory | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `displayName`, `state`, `project` | [Official documentation](https://cloud.google.com/asset-inventory/docs/reference/rest) |
+| `iam-policies` | HTTP | `GET cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies` | Cloud Asset Inventory | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `resource`, `policy.bindings.role`, `policy.bindings.members` | [Official documentation](https://cloud.google.com/asset-inventory/docs/reference/rest) |
+| `service-accounts` | HTTP | `GET iam.googleapis.com/v1/projects/{project}/serviceAccounts` | IAM | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `email`, `disabled` | [Official documentation](https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts/list) |
+| `service-account-keys` | HTTP | `GET iam.googleapis.com/v1/projects/{project}/serviceAccounts/{account}/keys` | IAM | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `keyType`, `validAfterTime`, `validBeforeTime` | [Official documentation](https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts.keys/list) |
+| `logging` | HTTP | `GET logging.googleapis.com/v2/{resource}` | Cloud Logging | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `disabled`, `destination`, `retentionDays`, `timestamp` | [Official documentation](https://cloud.google.com/logging/docs/reference/v2/rest) |
+| `security-command-center` | HTTP | `GET securitycenter.googleapis.com/v1/organizations/{organization}/{resource}` | Security Command Center | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `state`, `category`, `severity` | [Official documentation](https://cloud.google.com/security-command-center/docs/reference/rest) |
+| `effective-org-policy` | HTTP | `GET cloudresourcemanager.googleapis.com/v1/projects/{project}:getEffectiveOrgPolicy` | Cloud Resource Manager | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `constraint`, `booleanPolicy.enforced`, `listPolicy` | [Official documentation](https://cloud.google.com/resource-manager/reference/rest/v1/projects/getEffectiveOrgPolicy) |
+| `compute` | HTTP | `GET compute.googleapis.com/compute/v1/projects/{project}/{resource}` | Compute Engine | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `metadata`, `shieldedInstanceConfig`, `networkInterfaces`, `logConfig`, `sslPolicy`, `securityPolicy` | [Official documentation](https://cloud.google.com/compute/docs/reference/rest/v1) |
+| `binary-authorization` | HTTP | `GET binaryauthorization.googleapis.com/v1/projects/{project}/policy` | Binary Authorization | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `defaultAdmissionRule`, `clusterAdmissionRules`, `kubernetesNamespaceAdmissionRules`, `serviceAccountAdmissionRules`, `istioServiceIdentityAdmissionRules` | [Official documentation](https://cloud.google.com/binary-authorization/docs/reference/rest/v1/projects/getPolicy) |
+| `storage` | HTTP | `GET storage.googleapis.com/storage/v1/b?project={project}` | Cloud Storage | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `iamConfiguration`, `encryption` | [Official documentation](https://cloud.google.com/storage/docs/json_api/v1/buckets/list) |
+| `kms` | HTTP | `GET cloudasset.googleapis.com/v1/{scope}/assets?assetTypes=cloudkms.googleapis.com/CryptoKey` | Cloud Asset Inventory | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `resource.data.rotationPeriod`, `resource.data.nextRotationTime` | [Official documentation](https://cloud.google.com/asset-inventory/docs/reference/rest) |
+| `dns` | HTTP | `GET dns.googleapis.com/dns/v1/projects/{project}/managedZones` | Cloud DNS | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `dnssecConfig.state` | [Official documentation](https://cloud.google.com/dns/docs/reference/rest/v1/managedZones/list) |
+| `api-keys` | HTTP | `GET apikeys.googleapis.com/v2/projects/{project}/locations/global/keys` | API Keys | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `restrictions` | [Official documentation](https://cloud.google.com/api-keys/docs/reference/rest/v2/projects.locations.keys/list) |
+| `access-context-manager` | HTTP | `GET accesscontextmanager.googleapis.com/v1/{resource}` | Access Context Manager | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `name`, `parent`, `status.resources`, `spec.resources` | [Official documentation](https://cloud.google.com/access-context-manager/docs/reference/rest/v1) |
 
-## Architecture
+### Request construction
 
-Package structure mirroring the okta-inspector pattern:
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `organization` | client | Use the configured Cloud Resource Manager origin; never follow a server link to a different origin. | yes |
+| `organization` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `organization` | response | A JSON object or list containing only the documented name, displayName, state members consumed by verdicts. | yes |
+| `projects` | client | Use the configured Cloud Asset Inventory origin; never follow a server link to a different origin. | yes |
+| `projects` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `projects` | response | A JSON object or list containing only the documented name, displayName, state, project members consumed by verdicts. | yes |
+| `iam-policies` | client | Use the configured Cloud Asset Inventory origin; never follow a server link to a different origin. | yes |
+| `iam-policies` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `iam-policies` | response | A JSON object or list containing only the documented resource, policy.bindings.role, policy.bindings.members members consumed by verdicts. | yes |
+| `service-accounts` | client | Use the configured IAM origin; never follow a server link to a different origin. | yes |
+| `service-accounts` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `service-accounts` | response | A JSON object or list containing only the documented name, email, disabled members consumed by verdicts. | yes |
+| `service-account-keys` | client | Use the configured IAM origin; never follow a server link to a different origin. | yes |
+| `service-account-keys` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `service-account-keys` | response | A JSON object or list containing only the documented name, keyType, validAfterTime, validBeforeTime members consumed by verdicts. | yes |
+| `logging` | client | Use the configured Cloud Logging origin; never follow a server link to a different origin. | yes |
+| `logging` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `logging` | response | A JSON object or list containing only the documented name, disabled, destination, retentionDays, timestamp members consumed by verdicts. | yes |
+| `security-command-center` | client | Use the configured Security Command Center origin; never follow a server link to a different origin. | yes |
+| `security-command-center` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `security-command-center` | response | A JSON object or list containing only the documented name, state, category, severity members consumed by verdicts. | yes |
+| `effective-org-policy` | client | Use the configured Cloud Resource Manager origin; never follow a server link to a different origin. | yes |
+| `effective-org-policy` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `effective-org-policy` | response | A JSON object or list containing only the documented constraint, booleanPolicy.enforced, listPolicy members consumed by verdicts. | yes |
+| `compute` | client | Use the configured Compute Engine origin; never follow a server link to a different origin. | yes |
+| `compute` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `compute` | response | A JSON object or list containing only the documented name, metadata, shieldedInstanceConfig, networkInterfaces, logConfig, sslPolicy, securityPolicy members consumed by verdicts. | yes |
+| `binary-authorization` | client | Use the configured Binary Authorization origin; never follow a server link to a different origin. | yes |
+| `binary-authorization` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `binary-authorization` | response | A JSON object or list containing only the documented defaultAdmissionRule, clusterAdmissionRules, kubernetesNamespaceAdmissionRules, serviceAccountAdmissionRules, istioServiceIdentityAdmissionRules members consumed by verdicts. | yes |
+| `storage` | client | Use the configured Cloud Storage origin; never follow a server link to a different origin. | yes |
+| `storage` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `storage` | response | A JSON object or list containing only the documented name, iamConfiguration, encryption members consumed by verdicts. | yes |
+| `kms` | client | Use the configured Cloud Asset Inventory origin; never follow a server link to a different origin. | yes |
+| `kms` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `kms` | response | A JSON object or list containing only the documented name, resource.data.rotationPeriod, resource.data.nextRotationTime members consumed by verdicts. | yes |
+| `dns` | client | Use the configured Cloud DNS origin; never follow a server link to a different origin. | yes |
+| `dns` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `dns` | response | A JSON object or list containing only the documented name, dnssecConfig.state members consumed by verdicts. | yes |
+| `api-keys` | client | Use the configured API Keys origin; never follow a server link to a different origin. | yes |
+| `api-keys` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `api-keys` | response | A JSON object or list containing only the documented name, restrictions members consumed by verdicts. | yes |
+| `access-context-manager` | client | Use the configured Access Context Manager origin; never follow a server link to a different origin. | yes |
+| `access-context-manager` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `access-context-manager` | response | A JSON object or list containing only the documented name, parent, status.resources, spec.resources members consumed by verdicts. | yes |
 
-```
-gcp-sec-inspector/
-├── spec.md
-├── pyproject.toml
-├── src/
-│   └── gcp_sec_inspector/
-│       ├── __init__.py
-│       ├── __main__.py          # Entry point
-│       ├── cli.py               # Click CLI definition
-│       ├── client.py            # GCP API client wrapper (auth, retry, pagination)
-│       ├── collector.py         # Data collection from all 7 API surfaces
-│       ├── engine.py            # Audit engine orchestrating controls
-│       ├── models.py            # Pydantic models for findings and controls
-│       ├── output.py            # Console output formatting
-│       ├── analyzers/
-│       │   ├── __init__.py
-│       │   ├── base.py          # Base analyzer interface
-│       │   ├── common.py        # Shared analysis utilities
-│       │   ├── fedramp.py       # FedRAMP AC/AU/IA/SC family mapping
-│       │   ├── cmmc.py          # CMMC 2.0 Level 2 practice mapping
-│       │   ├── soc2.py          # SOC 2 Trust Services Criteria mapping
-│       │   ├── cis.py           # CIS GCP Benchmark checks
-│       │   ├── pci_dss.py       # PCI-DSS 4.0 requirement mapping
-│       │   ├── stig.py          # DISA STIG SRG mapping
-│       │   ├── irap.py          # IRAP ISM control mapping
-│       │   └── ismap.py         # ISMAP control mapping
-│       └── reporters/
-│           ├── __init__.py
-│           ├── base.py          # Base reporter interface
-│           ├── executive.py     # Executive summary with pass/fail/warn counts
-│           ├── fedramp.py       # FedRAMP POA&M format
-│           ├── cmmc.py          # CMMC assessment report format
-│           ├── soc2.py          # SOC 2 evidence format
-│           ├── cis.py           # CIS Benchmark scoring
-│           ├── pci_dss.py       # PCI-DSS ROC evidence format
-│           ├── stig.py          # STIG Checklist (.ckl) format
-│           ├── irap.py          # IRAP assessment format
-│           ├── ismap.py         # ISMAP assessment format
-│           ├── matrix.py        # Cross-framework control matrix
-│           └── validation.py    # Finding validation and deduplication
-└── tests/
-    ├── conftest.py
-    ├── test_client.py
-    ├── test_collector.py
-    ├── test_engine.py
-    └── test_analyzers/
-        ├── test_fedramp.py
-        ├── test_cmmc.py
-        └── ...
-```
+## Pagination
 
-### Key Design Decisions
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `projects`, `iam-policies`, `service-accounts`, `service-account-keys`, `logging`, `security-command-center`, `compute`, `storage`, `kms`, `dns`, `api-keys`, `access-context-manager` | `nextPageToken` | service default | caller limit | 250 | Completion requires exhausting nextPageToken and remaining below every configured project, key, finding, asset, and resource cap; presentation slices never establish completion. | No nextPageToken; Repeated page token; Empty page with nextPageToken; 250-page cap; Configured project or resource cap |
 
-- **Hierarchical traversal:** Org policies are evaluated at org, folder, and project levels. The collector walks the resource hierarchy and tracks effective policy at each node.
-- **Asset Inventory first:** Cloud Asset Inventory is the primary data source. SCC findings supplement but are not required (handles orgs without SCC Premium).
-- **Incremental collection:** Resource snapshots can be cached and diffed against previous runs to show compliance drift.
-- **Parallel collection:** API calls across independent services run concurrently with configurable rate limiting per API.
+## Rate limits
 
-## CLI Interface
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| GCP Security Inspector | API and quota-project specific | `Retry-After` | 429, 500, 502, 503, 504 | Honor bounded Retry-After and retry transient responses with bounded exponential delay; exhausted reads remain unreadable. |
 
-```bash
-# Full org-wide audit with all frameworks
-gcp-sec-inspector audit --org-id 123456789012 --all-frameworks
+## Checks
 
-# Audit specific project only
-gcp-sec-inspector audit --project-id my-project --framework fedramp
+### Control coverage
 
-# Audit with specific controls
-gcp-sec-inspector audit --org-id 123456789012 --controls 1,2,3,5,7
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | User-managed service account key minimization | GCP-IAM-02, GCP-IAM-03 | Evaluate the ordered first-match rules for GCP-IAM-02, GCP-IAM-03 below. |
+| 2 | Privileged IAM bindings | GCP-IAM-01 | Evaluate the ordered first-match rules for GCP-IAM-01 below. |
+| 3 | Public resource exposure | GCP-DATA-02 | Evaluate the ordered first-match rules for GCP-DATA-02 below. |
+| 4 | Firewall rules open to the internet on administrative ports | GCP-NET-01 | Evaluate the ordered first-match rules for GCP-NET-01 below. |
+| 5 | Security Command Center visibility | GCP-LOG-01, GCP-LOG-02, GCP-LOG-03, GCP-LOG-04, GCP-LOG-05 | Evaluate the ordered first-match rules for GCP-LOG-01, GCP-LOG-02, GCP-LOG-03, GCP-LOG-04, GCP-LOG-05 below. |
+| 6 | Service account key upload restriction | GCP-ORG-01, GCP-ORG-02, GCP-ORG-03, GCP-ORG-04 | Evaluate the ordered first-match rules for GCP-ORG-01, GCP-ORG-02, GCP-ORG-03, GCP-ORG-04 below. |
+| 7 | KMS key rotation | GCP-DATA-03 | Evaluate the ordered first-match rules for GCP-DATA-03 below. |
+| 8 | Binary Authorization admission policy | GCP-ORG-07 | Evaluate the ordered first-match rules for GCP-ORG-07 below. |
+| 9 | VPC flow logs | GCP-NET-02 | Evaluate the ordered first-match rules for GCP-NET-02 below. |
+| 10 | Cloud NAT coverage and external IP usage | GCP-NET-04 | Evaluate the ordered first-match rules for GCP-NET-04 below. |
+| 11 | OS Login enforcement | GCP-ORG-06 | Evaluate the ordered first-match rules for GCP-ORG-06 below. |
+| 12 | Shielded VM and serial port instance configuration | GCP-ORG-05, GCP-ORG-08 | Evaluate the ordered first-match rules for GCP-ORG-05, GCP-ORG-08 below. |
+| 13 | Default service account privilege | GCP-IAM-05 | Evaluate the ordered first-match rules for GCP-IAM-05 below. |
+| 14 | Cross-project service account access | GCP-IAM-04 | Evaluate the ordered first-match rules for GCP-IAM-04 below. |
+| 15 | Uniform bucket-level access | GCP-DATA-01 | Evaluate the ordered first-match rules for GCP-DATA-01 below. |
+| 16 | Customer-managed encryption keys | GCP-DATA-04 | Evaluate the ordered first-match rules for GCP-DATA-04 below. |
+| 17 | Cloud DNS DNSSEC | GCP-DATA-05 | Evaluate the ordered first-match rules for GCP-DATA-05 below. |
+| 18 | Load balancer SSL policies | GCP-NET-05 | Evaluate the ordered first-match rules for GCP-NET-05 below. |
+| 19 | Cloud Armor on external backend services | GCP-NET-06 | Evaluate the ordered first-match rules for GCP-NET-06 below. |
+| 20 | API key restrictions | GCP-DATA-06 | Evaluate the ordered first-match rules for GCP-DATA-06 below. |
+| 21 | VPC Service Controls perimeters | GCP-DATA-07 | Evaluate the ordered first-match rules for GCP-DATA-07 below. |
+| 22 | Private Google Access | GCP-NET-03 | Evaluate the ordered first-match rules for GCP-NET-03 below. |
 
-# Generate CMMC Level 2 assessment report
-gcp-sec-inspector report --framework cmmc --level 2 --output cmmc-report.json
+### Finding notes
 
-# Generate cross-framework compliance matrix
-gcp-sec-inspector matrix --org-id 123456789012 --output matrix.html
+These notes explain intent only. The ordered rule table is normative.
 
-# Check IAM permissions before running
-gcp-sec-inspector check-permissions --org-id 123456789012
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `GCP-IAM-01` | high | `gcp_assess_identity` | `iam-policies` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Privileged IAM bindings is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-IAM-02` | high | `gcp_assess_identity` | `projects`, `service-accounts`, `service-account-keys` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Service account key rotation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-IAM-03` | medium | `gcp_assess_identity` | `projects`, `service-accounts`, `service-account-keys` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for User-managed service account key minimization is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-IAM-04` | medium | `gcp_assess_identity` | `iam-policies` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Cross-project service account access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-IAM-05` | high | `gcp_assess_identity` | `iam-policies` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Default service account privilege is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-LOG-01` | medium | `gcp_assess_logging_detection` | `projects`, `logging` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Admin Activity visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-LOG-02` | high | `gcp_assess_logging_detection` | `projects`, `logging` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Data Access logging coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-LOG-03` | high | `gcp_assess_logging_detection` | `projects`, `logging` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Log sink coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-LOG-04` | medium | `gcp_assess_logging_detection` | `projects`, `logging` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Log bucket retention is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-LOG-05` | info | `gcp_assess_logging_detection` | `organization`, `security-command-center` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Security Command Center visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-01` | medium | `gcp_assess_org_guardrails` | `organization`, `projects` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Organization visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-02` | high | `gcp_assess_org_guardrails` | `effective-org-policy` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Domain-restricted sharing is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-03` | high | `gcp_assess_org_guardrails` | `effective-org-policy` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Service account key creation restriction is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-04` | high | `gcp_assess_org_guardrails` | `effective-org-policy` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Service account key upload restriction is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-05` | medium | `gcp_assess_org_guardrails` | `effective-org-policy` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Serial port and Shielded VM guardrails is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-06` | high | `gcp_assess_org_guardrails` | `effective-org-policy`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for OS Login enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-07` | medium | `gcp_assess_org_guardrails` | `projects`, `binary-authorization` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Binary Authorization admission policy is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-ORG-08` | medium | `gcp_assess_org_guardrails` | `projects`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Shielded VM and serial port instance configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-DATA-01` | high | `gcp_assess_data_protection` | `projects`, `storage` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Uniform bucket-level access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-DATA-02` | critical | `gcp_assess_data_protection` | `iam-policies` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Public resource exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-DATA-03` | medium | `gcp_assess_data_protection` | `kms` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for KMS key rotation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-DATA-04` | medium | `gcp_assess_data_protection` | `projects`, `storage`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Customer-managed encryption keys is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-DATA-05` | medium | `gcp_assess_data_protection` | `projects`, `dns` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Cloud DNS DNSSEC is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-DATA-06` | high | `gcp_assess_data_protection` | `projects`, `api-keys` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for API key restrictions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-DATA-07` | medium | `gcp_assess_data_protection` | `organization`, `access-context-manager` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for VPC Service Controls perimeters is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-NET-01` | high | `gcp_assess_network_security` | `projects`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Firewall rules open to the internet on administrative ports is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-NET-02` | medium | `gcp_assess_network_security` | `projects`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for VPC flow logs is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-NET-03` | low | `gcp_assess_network_security` | `projects`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Private Google Access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-NET-04` | medium | `gcp_assess_network_security` | `projects`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Cloud NAT coverage and external IP usage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-NET-05` | high | `gcp_assess_network_security` | `projects`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Load balancer SSL policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `GCP-NET-06` | medium | `gcp_assess_network_security` | `projects`, `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | Complete readable evidence satisfies the violation branch, which has first-match precedence: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | The required evidence for Cloud Armor on external backend services is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
 
-# Export findings to SCC (write findings back)
-gcp-sec-inspector export --format scc --org-id 123456789012
+### Ordered decision rules
 
-# List available controls
-gcp-sec-inspector controls --framework fedramp
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
 
-# Diff against previous audit
-gcp-sec-inspector diff --baseline baseline.json --current current.json
-```
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `GCP-IAM-01` | 1 | manual | `gcp_iam_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-IAM-01` | 2 | fail | `gcp_iam_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-IAM-01` | 3 | manual | `gcp_iam_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-IAM-01` | 4 | warn | `gcp_iam_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-IAM-01` | 5 | pass | `gcp_iam_01_branch_05_matches` equals true |  |
+| `GCP-IAM-01` | 6 | manual | `gcp_iam_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-IAM-02` | 1 | manual | `gcp_iam_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-IAM-02` | 2 | fail | `gcp_iam_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-IAM-02` | 3 | pass | `gcp_iam_02_branch_03_matches` equals true |  |
+| `GCP-IAM-02` | 4 | warn | `gcp_iam_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-IAM-02` | 5 | pass | `gcp_iam_02_branch_05_matches` equals true |  |
+| `GCP-IAM-02` | 6 | manual | `gcp_iam_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-IAM-03` | 1 | manual | `gcp_iam_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-IAM-03` | 2 | warn | `gcp_iam_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-IAM-03` | 3 | manual | `gcp_iam_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-IAM-03` | 4 | warn | `gcp_iam_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-IAM-03` | 5 | pass | `gcp_iam_03_branch_05_matches` equals true |  |
+| `GCP-IAM-03` | 6 | manual | `gcp_iam_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-IAM-04` | 1 | manual | `gcp_iam_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-IAM-04` | 2 | warn | `gcp_iam_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-IAM-04` | 3 | manual | `gcp_iam_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-IAM-04` | 4 | warn | `gcp_iam_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-IAM-04` | 5 | pass | `gcp_iam_04_branch_05_matches` equals true |  |
+| `GCP-IAM-04` | 6 | manual | `gcp_iam_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-IAM-05` | 1 | manual | `gcp_iam_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-IAM-05` | 2 | fail | `gcp_iam_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-IAM-05` | 3 | manual | `gcp_iam_05_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-IAM-05` | 4 | warn | `gcp_iam_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-IAM-05` | 5 | pass | `gcp_iam_05_branch_05_matches` equals true |  |
+| `GCP-IAM-05` | 6 | manual | `gcp_iam_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-LOG-01` | 1 | manual | `gcp_log_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-LOG-01` | 2 | warn | `gcp_log_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-LOG-01` | 3 | manual | `gcp_log_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-LOG-01` | 4 | warn | `gcp_log_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-LOG-01` | 5 | pass | `gcp_log_01_branch_05_matches` equals true |  |
+| `GCP-LOG-01` | 6 | manual | `gcp_log_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-LOG-02` | 1 | manual | `gcp_log_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-LOG-02` | 2 | fail | `gcp_log_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-LOG-02` | 3 | manual | `gcp_log_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-LOG-02` | 4 | warn | `gcp_log_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-LOG-02` | 5 | pass | `gcp_log_02_branch_05_matches` equals true |  |
+| `GCP-LOG-02` | 6 | manual | `gcp_log_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-LOG-03` | 1 | manual | `gcp_log_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-LOG-03` | 2 | fail | `gcp_log_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-LOG-03` | 3 | manual | `gcp_log_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-LOG-03` | 4 | warn | `gcp_log_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-LOG-03` | 5 | pass | `gcp_log_03_branch_05_matches` equals true |  |
+| `GCP-LOG-03` | 6 | manual | `gcp_log_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-LOG-04` | 1 | manual | `gcp_log_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-LOG-04` | 2 | fail | `gcp_log_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-LOG-04` | 3 | manual | `gcp_log_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-LOG-04` | 4 | warn | `gcp_log_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-LOG-04` | 5 | pass | `gcp_log_04_branch_05_matches` equals true |  |
+| `GCP-LOG-04` | 6 | manual | `gcp_log_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-LOG-05` | 1 | manual | `gcp_log_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-LOG-05` | 2 | warn | `gcp_log_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-LOG-05` | 3 | warn | `gcp_log_05_branch_03_matches` equals true |  |
+| `GCP-LOG-05` | 4 | warn | `gcp_log_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-LOG-05` | 5 | pass | `gcp_log_05_branch_05_matches` equals true |  |
+| `GCP-LOG-05` | 6 | manual | `gcp_log_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-01` | 1 | manual | `gcp_org_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-01` | 2 | warn | `gcp_org_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-01` | 3 | warn | `gcp_org_01_branch_03_matches` equals true |  |
+| `GCP-ORG-01` | 4 | warn | `gcp_org_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-01` | 5 | pass | `gcp_org_01_branch_05_matches` equals true |  |
+| `GCP-ORG-01` | 6 | manual | `gcp_org_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-02` | 1 | manual | `gcp_org_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-02` | 2 | warn | `gcp_org_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-02` | 3 | manual | `gcp_org_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-ORG-02` | 4 | warn | `gcp_org_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-02` | 5 | pass | `gcp_org_02_branch_05_matches` equals true |  |
+| `GCP-ORG-02` | 6 | manual | `gcp_org_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-03` | 1 | manual | `gcp_org_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-03` | 2 | fail | `gcp_org_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-03` | 3 | manual | `gcp_org_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-ORG-03` | 4 | warn | `gcp_org_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-03` | 5 | pass | `gcp_org_03_branch_05_matches` equals true |  |
+| `GCP-ORG-03` | 6 | manual | `gcp_org_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-04` | 1 | manual | `gcp_org_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-04` | 2 | warn | `gcp_org_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-04` | 3 | manual | `gcp_org_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-ORG-04` | 4 | warn | `gcp_org_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-04` | 5 | pass | `gcp_org_04_branch_05_matches` equals true |  |
+| `GCP-ORG-04` | 6 | manual | `gcp_org_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-05` | 1 | manual | `gcp_org_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-05` | 2 | fail | `gcp_org_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-05` | 3 | manual | `gcp_org_05_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-ORG-05` | 4 | warn | `gcp_org_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-05` | 5 | pass | `gcp_org_05_branch_05_matches` equals true |  |
+| `GCP-ORG-05` | 6 | manual | `gcp_org_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-06` | 1 | manual | `gcp_org_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-06` | 2 | fail | `gcp_org_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-06` | 3 | manual | `gcp_org_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-ORG-06` | 4 | warn | `gcp_org_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-06` | 5 | pass | `gcp_org_06_branch_05_matches` equals true |  |
+| `GCP-ORG-06` | 6 | manual | `gcp_org_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-07` | 1 | manual | `gcp_org_07_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-07` | 2 | fail | `gcp_org_07_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-07` | 3 | manual | `gcp_org_07_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-ORG-07` | 4 | warn | `gcp_org_07_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-07` | 5 | pass | `gcp_org_07_branch_05_matches` equals true |  |
+| `GCP-ORG-07` | 6 | manual | `gcp_org_07_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-ORG-08` | 1 | manual | `gcp_org_08_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-ORG-08` | 2 | fail | `gcp_org_08_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-ORG-08` | 3 | manual | `gcp_org_08_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-ORG-08` | 4 | warn | `gcp_org_08_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-ORG-08` | 5 | pass | `gcp_org_08_branch_05_matches` equals true |  |
+| `GCP-ORG-08` | 6 | manual | `gcp_org_08_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-DATA-01` | 1 | manual | `gcp_data_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-DATA-01` | 2 | fail | `gcp_data_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-DATA-01` | 3 | manual | `gcp_data_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-DATA-01` | 4 | warn | `gcp_data_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-DATA-01` | 5 | pass | `gcp_data_01_branch_05_matches` equals true |  |
+| `GCP-DATA-01` | 6 | manual | `gcp_data_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-DATA-02` | 1 | manual | `gcp_data_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-DATA-02` | 2 | fail | `gcp_data_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-DATA-02` | 3 | manual | `gcp_data_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-DATA-02` | 4 | warn | `gcp_data_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-DATA-02` | 5 | pass | `gcp_data_02_branch_05_matches` equals true |  |
+| `GCP-DATA-02` | 6 | manual | `gcp_data_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-DATA-03` | 1 | manual | `gcp_data_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-DATA-03` | 2 | fail | `gcp_data_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-DATA-03` | 3 | manual | `gcp_data_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-DATA-03` | 4 | warn | `gcp_data_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-DATA-03` | 5 | pass | `gcp_data_03_branch_05_matches` equals true |  |
+| `GCP-DATA-03` | 6 | manual | `gcp_data_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-DATA-04` | 1 | manual | `gcp_data_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-DATA-04` | 2 | warn | `gcp_data_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-DATA-04` | 3 | manual | `gcp_data_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-DATA-04` | 4 | warn | `gcp_data_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-DATA-04` | 5 | pass | `gcp_data_04_branch_05_matches` equals true |  |
+| `GCP-DATA-04` | 6 | manual | `gcp_data_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-DATA-05` | 1 | manual | `gcp_data_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-DATA-05` | 2 | fail | `gcp_data_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-DATA-05` | 3 | manual | `gcp_data_05_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-DATA-05` | 4 | warn | `gcp_data_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-DATA-05` | 5 | pass | `gcp_data_05_branch_05_matches` equals true |  |
+| `GCP-DATA-05` | 6 | manual | `gcp_data_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-DATA-06` | 1 | manual | `gcp_data_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-DATA-06` | 2 | fail | `gcp_data_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-DATA-06` | 3 | pass | `gcp_data_06_branch_03_matches` equals true |  |
+| `GCP-DATA-06` | 4 | warn | `gcp_data_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-DATA-06` | 5 | pass | `gcp_data_06_branch_05_matches` equals true |  |
+| `GCP-DATA-06` | 6 | manual | `gcp_data_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-DATA-07` | 1 | manual | `gcp_data_07_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-DATA-07` | 2 | warn | `gcp_data_07_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-DATA-07` | 3 | manual | `gcp_data_07_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-DATA-07` | 4 | warn | `gcp_data_07_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-DATA-07` | 5 | pass | `gcp_data_07_branch_05_matches` equals true |  |
+| `GCP-DATA-07` | 6 | manual | `gcp_data_07_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-NET-01` | 1 | manual | `gcp_net_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-NET-01` | 2 | fail | `gcp_net_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-NET-01` | 3 | manual | `gcp_net_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-NET-01` | 4 | warn | `gcp_net_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-NET-01` | 5 | pass | `gcp_net_01_branch_05_matches` equals true |  |
+| `GCP-NET-01` | 6 | manual | `gcp_net_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-NET-02` | 1 | manual | `gcp_net_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-NET-02` | 2 | fail | `gcp_net_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-NET-02` | 3 | manual | `gcp_net_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-NET-02` | 4 | warn | `gcp_net_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-NET-02` | 5 | pass | `gcp_net_02_branch_05_matches` equals true |  |
+| `GCP-NET-02` | 6 | manual | `gcp_net_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-NET-03` | 1 | manual | `gcp_net_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-NET-03` | 2 | warn | `gcp_net_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-NET-03` | 3 | manual | `gcp_net_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-NET-03` | 4 | warn | `gcp_net_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-NET-03` | 5 | pass | `gcp_net_03_branch_05_matches` equals true |  |
+| `GCP-NET-03` | 6 | manual | `gcp_net_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-NET-04` | 1 | manual | `gcp_net_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-NET-04` | 2 | warn | `gcp_net_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-NET-04` | 3 | manual | `gcp_net_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-NET-04` | 4 | warn | `gcp_net_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-NET-04` | 5 | pass | `gcp_net_04_branch_05_matches` equals true |  |
+| `GCP-NET-04` | 6 | manual | `gcp_net_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-NET-05` | 1 | manual | `gcp_net_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-NET-05` | 2 | fail | `gcp_net_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-NET-05` | 3 | manual | `gcp_net_05_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-NET-05` | 4 | warn | `gcp_net_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-NET-05` | 5 | pass | `gcp_net_05_branch_05_matches` equals true |  |
+| `GCP-NET-05` | 6 | manual | `gcp_net_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `GCP-NET-06` | 1 | manual | `gcp_net_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `GCP-NET-06` | 2 | warn | `gcp_net_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `GCP-NET-06` | 3 | manual | `gcp_net_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `GCP-NET-06` | 4 | warn | `gcp_net_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `GCP-NET-06` | 5 | pass | `gcp_net_06_branch_05_matches` equals true |  |
+| `GCP-NET-06` | 6 | manual | `gcp_net_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
 
-### Output Formats
+### Derived decision facts
 
-- `json` -- machine-readable findings with control mappings
-- `html` -- interactive dashboard with charts and drill-down
-- `csv` -- spreadsheet-compatible for GRC tools
-- `ckl` -- DISA STIG Checklist format
-- `oscal` -- NIST OSCAL assessment results
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `GCP-IAM-01` | `gcp_iam_01_branch_01_matches` | GCP-IAM-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-IAM-01` | `gcp_iam_01_branch_02_matches` | GCP-IAM-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-IAM-01` | `gcp_iam_01_branch_03_matches` | GCP-IAM-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-IAM-01` | `gcp_iam_01_branch_04_matches` | GCP-IAM-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-IAM-01` | `gcp_iam_01_branch_05_matches` | GCP-IAM-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-IAM-01` | `gcp_iam_01_branch_06_matches` | GCP-IAM-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-IAM-02` | `gcp_iam_02_branch_01_matches` | GCP-IAM-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-IAM-02` | `gcp_iam_02_branch_02_matches` | GCP-IAM-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-IAM-02` | `gcp_iam_02_branch_03_matches` | GCP-IAM-02 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `GCP-IAM-02` | `gcp_iam_02_branch_04_matches` | GCP-IAM-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-IAM-02` | `gcp_iam_02_branch_05_matches` | GCP-IAM-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-IAM-02` | `gcp_iam_02_branch_06_matches` | GCP-IAM-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-IAM-03` | `gcp_iam_03_branch_01_matches` | GCP-IAM-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-IAM-03` | `gcp_iam_03_branch_02_matches` | GCP-IAM-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-IAM-03` | `gcp_iam_03_branch_03_matches` | GCP-IAM-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-IAM-03` | `gcp_iam_03_branch_04_matches` | GCP-IAM-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-IAM-03` | `gcp_iam_03_branch_05_matches` | GCP-IAM-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-IAM-03` | `gcp_iam_03_branch_06_matches` | GCP-IAM-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-IAM-04` | `gcp_iam_04_branch_01_matches` | GCP-IAM-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-IAM-04` | `gcp_iam_04_branch_02_matches` | GCP-IAM-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-IAM-04` | `gcp_iam_04_branch_03_matches` | GCP-IAM-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-IAM-04` | `gcp_iam_04_branch_04_matches` | GCP-IAM-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-IAM-04` | `gcp_iam_04_branch_05_matches` | GCP-IAM-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-IAM-04` | `gcp_iam_04_branch_06_matches` | GCP-IAM-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-IAM-05` | `gcp_iam_05_branch_01_matches` | GCP-IAM-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-IAM-05` | `gcp_iam_05_branch_02_matches` | GCP-IAM-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-IAM-05` | `gcp_iam_05_branch_03_matches` | GCP-IAM-05 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-IAM-05` | `gcp_iam_05_branch_04_matches` | GCP-IAM-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-IAM-05` | `gcp_iam_05_branch_05_matches` | GCP-IAM-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-IAM-05` | `gcp_iam_05_branch_06_matches` | GCP-IAM-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-LOG-01` | `gcp_log_01_branch_01_matches` | GCP-LOG-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-LOG-01` | `gcp_log_01_branch_02_matches` | GCP-LOG-01 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-LOG-01` | `gcp_log_01_branch_03_matches` | GCP-LOG-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-LOG-01` | `gcp_log_01_branch_04_matches` | GCP-LOG-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-LOG-01` | `gcp_log_01_branch_05_matches` | GCP-LOG-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-LOG-01` | `gcp_log_01_branch_06_matches` | GCP-LOG-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-LOG-02` | `gcp_log_02_branch_01_matches` | GCP-LOG-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-LOG-02` | `gcp_log_02_branch_02_matches` | GCP-LOG-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-LOG-02` | `gcp_log_02_branch_03_matches` | GCP-LOG-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-LOG-02` | `gcp_log_02_branch_04_matches` | GCP-LOG-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-LOG-02` | `gcp_log_02_branch_05_matches` | GCP-LOG-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-LOG-02` | `gcp_log_02_branch_06_matches` | GCP-LOG-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-LOG-03` | `gcp_log_03_branch_01_matches` | GCP-LOG-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-LOG-03` | `gcp_log_03_branch_02_matches` | GCP-LOG-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-LOG-03` | `gcp_log_03_branch_03_matches` | GCP-LOG-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-LOG-03` | `gcp_log_03_branch_04_matches` | GCP-LOG-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-LOG-03` | `gcp_log_03_branch_05_matches` | GCP-LOG-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-LOG-03` | `gcp_log_03_branch_06_matches` | GCP-LOG-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-LOG-04` | `gcp_log_04_branch_01_matches` | GCP-LOG-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-LOG-04` | `gcp_log_04_branch_02_matches` | GCP-LOG-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-LOG-04` | `gcp_log_04_branch_03_matches` | GCP-LOG-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-LOG-04` | `gcp_log_04_branch_04_matches` | GCP-LOG-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-LOG-04` | `gcp_log_04_branch_05_matches` | GCP-LOG-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-LOG-04` | `gcp_log_04_branch_06_matches` | GCP-LOG-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-LOG-05` | `gcp_log_05_branch_01_matches` | GCP-LOG-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-LOG-05` | `gcp_log_05_branch_02_matches` | GCP-LOG-05 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-LOG-05` | `gcp_log_05_branch_03_matches` | GCP-LOG-05 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `GCP-LOG-05` | `gcp_log_05_branch_04_matches` | GCP-LOG-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-LOG-05` | `gcp_log_05_branch_05_matches` | GCP-LOG-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-LOG-05` | `gcp_log_05_branch_06_matches` | GCP-LOG-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-01` | `gcp_org_01_branch_01_matches` | GCP-ORG-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-01` | `gcp_org_01_branch_02_matches` | GCP-ORG-01 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-01` | `gcp_org_01_branch_03_matches` | GCP-ORG-01 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `GCP-ORG-01` | `gcp_org_01_branch_04_matches` | GCP-ORG-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-01` | `gcp_org_01_branch_05_matches` | GCP-ORG-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-01` | `gcp_org_01_branch_06_matches` | GCP-ORG-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-02` | `gcp_org_02_branch_01_matches` | GCP-ORG-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-02` | `gcp_org_02_branch_02_matches` | GCP-ORG-02 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-02` | `gcp_org_02_branch_03_matches` | GCP-ORG-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-ORG-02` | `gcp_org_02_branch_04_matches` | GCP-ORG-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-02` | `gcp_org_02_branch_05_matches` | GCP-ORG-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-02` | `gcp_org_02_branch_06_matches` | GCP-ORG-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-03` | `gcp_org_03_branch_01_matches` | GCP-ORG-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-03` | `gcp_org_03_branch_02_matches` | GCP-ORG-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-03` | `gcp_org_03_branch_03_matches` | GCP-ORG-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-ORG-03` | `gcp_org_03_branch_04_matches` | GCP-ORG-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-03` | `gcp_org_03_branch_05_matches` | GCP-ORG-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-03` | `gcp_org_03_branch_06_matches` | GCP-ORG-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-04` | `gcp_org_04_branch_01_matches` | GCP-ORG-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-04` | `gcp_org_04_branch_02_matches` | GCP-ORG-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-04` | `gcp_org_04_branch_03_matches` | GCP-ORG-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-ORG-04` | `gcp_org_04_branch_04_matches` | GCP-ORG-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-04` | `gcp_org_04_branch_05_matches` | GCP-ORG-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-04` | `gcp_org_04_branch_06_matches` | GCP-ORG-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-05` | `gcp_org_05_branch_01_matches` | GCP-ORG-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-05` | `gcp_org_05_branch_02_matches` | GCP-ORG-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-05` | `gcp_org_05_branch_03_matches` | GCP-ORG-05 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-ORG-05` | `gcp_org_05_branch_04_matches` | GCP-ORG-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-05` | `gcp_org_05_branch_05_matches` | GCP-ORG-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-05` | `gcp_org_05_branch_06_matches` | GCP-ORG-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-06` | `gcp_org_06_branch_01_matches` | GCP-ORG-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-06` | `gcp_org_06_branch_02_matches` | GCP-ORG-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-06` | `gcp_org_06_branch_03_matches` | GCP-ORG-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-ORG-06` | `gcp_org_06_branch_04_matches` | GCP-ORG-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-06` | `gcp_org_06_branch_05_matches` | GCP-ORG-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-06` | `gcp_org_06_branch_06_matches` | GCP-ORG-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-07` | `gcp_org_07_branch_01_matches` | GCP-ORG-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-07` | `gcp_org_07_branch_02_matches` | GCP-ORG-07 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-07` | `gcp_org_07_branch_03_matches` | GCP-ORG-07 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-ORG-07` | `gcp_org_07_branch_04_matches` | GCP-ORG-07 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-07` | `gcp_org_07_branch_05_matches` | GCP-ORG-07 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-07` | `gcp_org_07_branch_06_matches` | GCP-ORG-07 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-ORG-08` | `gcp_org_08_branch_01_matches` | GCP-ORG-08 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-ORG-08` | `gcp_org_08_branch_02_matches` | GCP-ORG-08 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-ORG-08` | `gcp_org_08_branch_03_matches` | GCP-ORG-08 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-ORG-08` | `gcp_org_08_branch_04_matches` | GCP-ORG-08 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-ORG-08` | `gcp_org_08_branch_05_matches` | GCP-ORG-08 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-ORG-08` | `gcp_org_08_branch_06_matches` | GCP-ORG-08 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-DATA-01` | `gcp_data_01_branch_01_matches` | GCP-DATA-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-DATA-01` | `gcp_data_01_branch_02_matches` | GCP-DATA-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-DATA-01` | `gcp_data_01_branch_03_matches` | GCP-DATA-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-DATA-01` | `gcp_data_01_branch_04_matches` | GCP-DATA-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-DATA-01` | `gcp_data_01_branch_05_matches` | GCP-DATA-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-DATA-01` | `gcp_data_01_branch_06_matches` | GCP-DATA-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-DATA-02` | `gcp_data_02_branch_01_matches` | GCP-DATA-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-DATA-02` | `gcp_data_02_branch_02_matches` | GCP-DATA-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-DATA-02` | `gcp_data_02_branch_03_matches` | GCP-DATA-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-DATA-02` | `gcp_data_02_branch_04_matches` | GCP-DATA-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-DATA-02` | `gcp_data_02_branch_05_matches` | GCP-DATA-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-DATA-02` | `gcp_data_02_branch_06_matches` | GCP-DATA-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-DATA-03` | `gcp_data_03_branch_01_matches` | GCP-DATA-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-DATA-03` | `gcp_data_03_branch_02_matches` | GCP-DATA-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-DATA-03` | `gcp_data_03_branch_03_matches` | GCP-DATA-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-DATA-03` | `gcp_data_03_branch_04_matches` | GCP-DATA-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-DATA-03` | `gcp_data_03_branch_05_matches` | GCP-DATA-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-DATA-03` | `gcp_data_03_branch_06_matches` | GCP-DATA-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-DATA-04` | `gcp_data_04_branch_01_matches` | GCP-DATA-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-DATA-04` | `gcp_data_04_branch_02_matches` | GCP-DATA-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-DATA-04` | `gcp_data_04_branch_03_matches` | GCP-DATA-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-DATA-04` | `gcp_data_04_branch_04_matches` | GCP-DATA-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-DATA-04` | `gcp_data_04_branch_05_matches` | GCP-DATA-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-DATA-04` | `gcp_data_04_branch_06_matches` | GCP-DATA-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-DATA-05` | `gcp_data_05_branch_01_matches` | GCP-DATA-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-DATA-05` | `gcp_data_05_branch_02_matches` | GCP-DATA-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-DATA-05` | `gcp_data_05_branch_03_matches` | GCP-DATA-05 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-DATA-05` | `gcp_data_05_branch_04_matches` | GCP-DATA-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-DATA-05` | `gcp_data_05_branch_05_matches` | GCP-DATA-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-DATA-05` | `gcp_data_05_branch_06_matches` | GCP-DATA-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-DATA-06` | `gcp_data_06_branch_01_matches` | GCP-DATA-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-DATA-06` | `gcp_data_06_branch_02_matches` | GCP-DATA-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-DATA-06` | `gcp_data_06_branch_03_matches` | GCP-DATA-06 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `GCP-DATA-06` | `gcp_data_06_branch_04_matches` | GCP-DATA-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-DATA-06` | `gcp_data_06_branch_05_matches` | GCP-DATA-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-DATA-06` | `gcp_data_06_branch_06_matches` | GCP-DATA-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-DATA-07` | `gcp_data_07_branch_01_matches` | GCP-DATA-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-DATA-07` | `gcp_data_07_branch_02_matches` | GCP-DATA-07 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-DATA-07` | `gcp_data_07_branch_03_matches` | GCP-DATA-07 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-DATA-07` | `gcp_data_07_branch_04_matches` | GCP-DATA-07 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-DATA-07` | `gcp_data_07_branch_05_matches` | GCP-DATA-07 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-DATA-07` | `gcp_data_07_branch_06_matches` | GCP-DATA-07 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-NET-01` | `gcp_net_01_branch_01_matches` | GCP-NET-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-NET-01` | `gcp_net_01_branch_02_matches` | GCP-NET-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-NET-01` | `gcp_net_01_branch_03_matches` | GCP-NET-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-NET-01` | `gcp_net_01_branch_04_matches` | GCP-NET-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-NET-01` | `gcp_net_01_branch_05_matches` | GCP-NET-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-NET-01` | `gcp_net_01_branch_06_matches` | GCP-NET-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-NET-02` | `gcp_net_02_branch_01_matches` | GCP-NET-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-NET-02` | `gcp_net_02_branch_02_matches` | GCP-NET-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-NET-02` | `gcp_net_02_branch_03_matches` | GCP-NET-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-NET-02` | `gcp_net_02_branch_04_matches` | GCP-NET-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-NET-02` | `gcp_net_02_branch_05_matches` | GCP-NET-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-NET-02` | `gcp_net_02_branch_06_matches` | GCP-NET-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-NET-03` | `gcp_net_03_branch_01_matches` | GCP-NET-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-NET-03` | `gcp_net_03_branch_02_matches` | GCP-NET-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-NET-03` | `gcp_net_03_branch_03_matches` | GCP-NET-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-NET-03` | `gcp_net_03_branch_04_matches` | GCP-NET-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-NET-03` | `gcp_net_03_branch_05_matches` | GCP-NET-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-NET-03` | `gcp_net_03_branch_06_matches` | GCP-NET-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-NET-04` | `gcp_net_04_branch_01_matches` | GCP-NET-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-NET-04` | `gcp_net_04_branch_02_matches` | GCP-NET-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-NET-04` | `gcp_net_04_branch_03_matches` | GCP-NET-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-NET-04` | `gcp_net_04_branch_04_matches` | GCP-NET-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-NET-04` | `gcp_net_04_branch_05_matches` | GCP-NET-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-NET-04` | `gcp_net_04_branch_06_matches` | GCP-NET-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-NET-05` | `gcp_net_05_branch_01_matches` | GCP-NET-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-NET-05` | `gcp_net_05_branch_02_matches` | GCP-NET-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-NET-05` | `gcp_net_05_branch_03_matches` | GCP-NET-05 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-NET-05` | `gcp_net_05_branch_04_matches` | GCP-NET-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-NET-05` | `gcp_net_05_branch_05_matches` | GCP-NET-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-NET-05` | `gcp_net_05_branch_06_matches` | GCP-NET-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `GCP-NET-06` | `gcp_net_06_branch_01_matches` | GCP-NET-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `GCP-NET-06` | `gcp_net_06_branch_02_matches` | GCP-NET-06 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `GCP-NET-06` | `gcp_net_06_branch_03_matches` | GCP-NET-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `GCP-NET-06` | `gcp_net_06_branch_04_matches` | GCP-NET-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `GCP-NET-06` | `gcp_net_06_branch_05_matches` | GCP-NET-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `GCP-NET-06` | `gcp_net_06_branch_06_matches` | GCP-NET-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 
-## Build Sequence
+### Criterion constants
 
-### Phase 1: Foundation
-- Project scaffolding (pyproject.toml, src layout, CI)
-- GCP authentication (service account, ADC)
-- API client with retry, pagination, and rate limiting
-- Pydantic models for findings and controls
+| Finding | Name | Value |
+|---|---|---|
+| `GCP-IAM-01` | `requiredEvidenceReadable` | true |
+| `GCP-IAM-01` | `requiredEvidenceComplete` | true |
+| `GCP-IAM-02` | `requiredEvidenceReadable` | true |
+| `GCP-IAM-02` | `requiredEvidenceComplete` | true |
+| `GCP-IAM-03` | `requiredEvidenceReadable` | true |
+| `GCP-IAM-03` | `requiredEvidenceComplete` | true |
+| `GCP-IAM-04` | `requiredEvidenceReadable` | true |
+| `GCP-IAM-04` | `requiredEvidenceComplete` | true |
+| `GCP-IAM-05` | `requiredEvidenceReadable` | true |
+| `GCP-IAM-05` | `requiredEvidenceComplete` | true |
+| `GCP-LOG-01` | `requiredEvidenceReadable` | true |
+| `GCP-LOG-01` | `requiredEvidenceComplete` | true |
+| `GCP-LOG-02` | `requiredEvidenceReadable` | true |
+| `GCP-LOG-02` | `requiredEvidenceComplete` | true |
+| `GCP-LOG-03` | `requiredEvidenceReadable` | true |
+| `GCP-LOG-03` | `requiredEvidenceComplete` | true |
+| `GCP-LOG-04` | `requiredEvidenceReadable` | true |
+| `GCP-LOG-04` | `requiredEvidenceComplete` | true |
+| `GCP-LOG-05` | `requiredEvidenceReadable` | true |
+| `GCP-LOG-05` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-01` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-01` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-02` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-02` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-03` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-03` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-04` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-04` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-05` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-05` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-06` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-06` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-07` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-07` | `requiredEvidenceComplete` | true |
+| `GCP-ORG-08` | `requiredEvidenceReadable` | true |
+| `GCP-ORG-08` | `requiredEvidenceComplete` | true |
+| `GCP-DATA-01` | `requiredEvidenceReadable` | true |
+| `GCP-DATA-01` | `requiredEvidenceComplete` | true |
+| `GCP-DATA-02` | `requiredEvidenceReadable` | true |
+| `GCP-DATA-02` | `requiredEvidenceComplete` | true |
+| `GCP-DATA-03` | `requiredEvidenceReadable` | true |
+| `GCP-DATA-03` | `requiredEvidenceComplete` | true |
+| `GCP-DATA-04` | `requiredEvidenceReadable` | true |
+| `GCP-DATA-04` | `requiredEvidenceComplete` | true |
+| `GCP-DATA-05` | `requiredEvidenceReadable` | true |
+| `GCP-DATA-05` | `requiredEvidenceComplete` | true |
+| `GCP-DATA-06` | `requiredEvidenceReadable` | true |
+| `GCP-DATA-06` | `requiredEvidenceComplete` | true |
+| `GCP-DATA-07` | `requiredEvidenceReadable` | true |
+| `GCP-DATA-07` | `requiredEvidenceComplete` | true |
+| `GCP-NET-01` | `requiredEvidenceReadable` | true |
+| `GCP-NET-01` | `requiredEvidenceComplete` | true |
+| `GCP-NET-02` | `requiredEvidenceReadable` | true |
+| `GCP-NET-02` | `requiredEvidenceComplete` | true |
+| `GCP-NET-03` | `requiredEvidenceReadable` | true |
+| `GCP-NET-03` | `requiredEvidenceComplete` | true |
+| `GCP-NET-04` | `requiredEvidenceReadable` | true |
+| `GCP-NET-04` | `requiredEvidenceComplete` | true |
+| `GCP-NET-05` | `requiredEvidenceReadable` | true |
+| `GCP-NET-05` | `requiredEvidenceComplete` | true |
+| `GCP-NET-06` | `requiredEvidenceReadable` | true |
+| `GCP-NET-06` | `requiredEvidenceComplete` | true |
 
-### Phase 2: Core Collection
-- Cloud Asset Inventory integration (resources, IAM policies)
-- IAM service account and key enumeration
-- Organization Policy constraint evaluation
-- Audit log configuration checks
+### Illustrative criterion notes
 
-### Phase 3: Security Controls
-- Implement controls 1-12 (IAM, network, logging, org policy)
-- Implement controls 13-23 (encryption, DNS, WAF, VM hardening)
-- SCC findings integration (optional Premium enrichment)
-- KMS and Binary Authorization checks
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
 
-### Phase 4: Compliance Mapping
-- FedRAMP control family mapping
-- CMMC 2.0 practice mapping
-- SOC 2, CIS, PCI-DSS mapping
-- DISA STIG, IRAP, ISMAP mapping
-- Cross-framework compliance matrix
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `GCP-IAM-01` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-IAM-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-IAM-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-IAM-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-IAM-02` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-IAM-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-IAM-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-IAM-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-IAM-03` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-IAM-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-IAM-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-IAM-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-IAM-04` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-IAM-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-IAM-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-IAM-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-IAM-05` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-IAM-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-IAM-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-IAM-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-LOG-01` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-LOG-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-LOG-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-LOG-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-LOG-02` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-LOG-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-LOG-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-LOG-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-LOG-03` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-LOG-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-LOG-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-LOG-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-LOG-04` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-LOG-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-LOG-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-LOG-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-LOG-05` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-LOG-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-LOG-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-LOG-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-01` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-02` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-03` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-04` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-05` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-06` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-07` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-07` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-ORG-08` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-ORG-08` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-ORG-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-ORG-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-DATA-01` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-DATA-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-DATA-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-DATA-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-DATA-02` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-DATA-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-DATA-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-DATA-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-DATA-03` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-DATA-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-DATA-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-DATA-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-DATA-04` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-DATA-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-DATA-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-DATA-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-DATA-05` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-DATA-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-DATA-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-DATA-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-DATA-06` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-DATA-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-DATA-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-DATA-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-DATA-07` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-DATA-07` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-DATA-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-DATA-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-NET-01` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-NET-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-NET-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-NET-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-NET-02` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-NET-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-NET-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-NET-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-NET-03` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-NET-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-NET-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-NET-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-NET-04` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-NET-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-NET-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-NET-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-NET-05` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-NET-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return fail when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-NET-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-NET-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `GCP-NET-06` | compliant | All required source reads are complete and this derivation returns pass: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `GCP-NET-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: From the complete declared GCP inventories, return manual when the primary inventory was not readable or no project scope was inventoried; apply the check's explicit empty-inventory outcome; return warn when the complete violation count is positive; return warn for unknown records or partial collection; and return pass only when all required reads are complete with no violation or review record. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `GCP-NET-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `GCP-NET-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
 
-### Phase 5: Reporting & Polish
-- Executive summary reporter
-- Framework-specific report formats (POA&M, CKL, OSCAL)
-- HTML dashboard with interactive charts
-- Compliance drift detection (baseline diffing)
-- Test suite with mocked API responses
+### Compliance framework mappings
 
-## Status
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | User-managed service account key minimization | IA-5(1) | IA.L2-3.5.10 | CC6.1 | 1.17 | 8.3.9 | SRG-APP-000516 | ISM-1590 | 8.1.1 |
+| 2 | Privileged IAM bindings | AC-6(1) | AC.L2-3.1.5 | CC6.3 | 1.1-1.5 | 7.2.1 | SRG-APP-000033 | ISM-1508 | 7.1.1 |
+| 3 | Public resource exposure | AC-3, SC-7 | AC.L2-3.1.3 | CC6.1 | 5.1, 6.2 | 1.3.1 | SRG-APP-000142 | ISM-1037 | 1.3.1 |
+| 4 | Firewall rules open to the internet on administrative ports | SC-7(5) | SC.L2-3.13.5 | CC6.6 | 3.6-3.9 | 1.3.2 | SRG-APP-000142 | ISM-1416 | 1.3.2 |
+| 5 | Security Command Center visibility | AU-2, AU-3 | AU.L2-3.3.1 | CC7.2 | 2.1-2.4 | 10.2.1 | SRG-APP-000089 | ISM-0580 | 10.2.1 |
+| 6 | Service account key upload restriction | CM-7 | CM.L2-3.4.7 | CC6.1 | 1.14-1.15 | 2.2.1 | SRG-APP-000141 | ISM-1467 | 2.2.1 |
+| 7 | KMS key rotation | SC-12(1) | SC.L2-3.13.10 | CC6.1 | 1.18 | 3.6.4 | SRG-APP-000514 | ISM-0457 | 3.6.4 |
+| 8 | Binary Authorization admission policy | SI-7 | SI.L2-3.14.1 | CC7.1 | 6.13 | 6.3.2 | SRG-APP-000131 | ISM-1657 | 6.3.2 |
+| 9 | VPC flow logs | AU-12 | AU.L2-3.3.1 | CC7.2 | 3.1 | 10.6.1 | SRG-APP-000089 | ISM-0580 | 10.6.1 |
+| 10 | Cloud NAT coverage and external IP usage | SC-7 | SC.L2-3.13.1 | CC6.6 | 3.10 | 1.3.4 | SRG-APP-000142 | ISM-1037 | 1.3.4 |
+| 11 | OS Login enforcement | IA-2(1) | IA.L2-3.5.3 | CC6.1 | 4.4 | 8.3.1 | SRG-APP-000149 | ISM-1401 | 8.3.1 |
+| 12 | Shielded VM and serial port instance configuration | CM-7 | CM.L2-3.4.7 | CC6.1 | 4.5 | 2.2.2 | SRG-APP-000141 | ISM-1467 | 2.2.2 |
+| 13 | Default service account privilege | AC-6(5) | AC.L2-3.1.6 | CC6.3 | 1.6 | 7.2.2 | SRG-APP-000340 | ISM-1508 | 7.2.2 |
+| 14 | Cross-project service account access | AC-3 | AC.L2-3.1.3 | CC6.3 | 1.8 | 7.2.1 | SRG-APP-000033 | ISM-1508 | 7.2.1 |
+| 15 | Uniform bucket-level access | AC-3 | AC.L2-3.1.2 | CC6.1 | 5.2 | 7.2.1 | SRG-APP-000033 | ISM-0988 | 7.2.1 |
+| 16 | Customer-managed encryption keys | SC-28(1) | SC.L2-3.13.16 | CC6.1 | 1.18 | 3.4.1 | SRG-APP-000231 | ISM-0457 | 3.4.1 |
+| 17 | Cloud DNS DNSSEC | SC-20 | SC.L2-3.13.15 | CC6.1 | 3.3 | - | SRG-APP-000516 | ISM-1590 | - |
+| 18 | Load balancer SSL policies | SC-8 | SC.L2-3.13.8 | CC6.1 | 3.11 | 4.1.1 | SRG-APP-000014 | ISM-1139 | 4.1.1 |
+| 19 | Cloud Armor on external backend services | SC-7(5) | SC.L2-3.13.5 | CC6.6 | 3.12 | 6.6 | SRG-APP-000142 | ISM-1416 | 6.6 |
+| 20 | API key restrictions | AC-3 | AC.L2-3.1.2 | CC6.1 | 1.12-1.13 | 7.2.1 | SRG-APP-000033 | ISM-0988 | 7.2.1 |
+| 21 | VPC Service Controls perimeters | AC-4 | AC.L2-3.1.3 | CC6.6 | 3.14 | 1.3.1 | SRG-APP-000038 | ISM-1037 | 1.3.1 |
+| 22 | Private Google Access | SC-7 | SC.L2-3.13.1 | CC6.6 | 3.2 | 1.3.4 | SRG-APP-000142 | ISM-1037 | 1.3.4 |
 
-Implemented in grclanker as of 2026-09-21 (TypeScript, `cli/extensions/grc-tools/gcp.ts`).
+## Collection states
 
-### What shipped
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
 
-- 31 findings across five assess tools cover all 23 controls: `GCP-IAM-01..05`, `GCP-LOG-01..05`, `GCP-ORG-01..08`, `GCP-DATA-01..07`, `GCP-NET-01..06`. The finding-to-control map is in the integration guide's coverage table.
-- Multi-project scope: projects are enumerated with Cloud Asset Inventory `searchAllResources` under the organization, capped by `project_limit` (alias `max_projects`, default 20). A truncated inventory, a denied project, or a disabled API downgrades every dependent finding to `warn` or `manual` with seen and total counts.
-- Dependent inventories: every finding names the datasets it reads (`GCP_INVENTORIES`, one dataset name and endpoint per API surface). When any of them is unreadable (403, 401, or an error), fully or for one project, the finding drops below `pass` even if its primary inventory was complete: `manual` when the unreadable dataset is the one the finding scores, `warn` otherwise. The summary names the dataset and endpoint, `evidence.unreadable_inventories` carries each entry with its scope and error, and every count or list derived from the unreadable dataset is rendered as `null` rather than zero or empty, in finding evidence and in the assessment-level summaries alike, whether the dataset is the one the finding scores or a dependent one; summary sentences state the unreadable dataset instead of a zero-count clause. A table-driven test makes each of the 35 inventory surfaces unreadable in turn (fully, and for one of two projects where the read is per project), asserts that exactly the dependent findings demote, cross-checks the surfaces against `GCP_INVENTORIES`, fails on any request that matches no surface, and asserts the `null` rendering for every evidence field and summary counter that a source map ties to the denied surface.
-- Collection status: `evidence.truncated`, `denied_projects`, `unreachable_scopes`, and the summary-level `projects_truncated`, `sources_truncated`, and `findings_truncated` are three-valued. They are `null` whenever the scan they describe was denied or never ran and carry `false`, `0`, or `[]` only when that scan ran to completion, so no status says complete about a call that never happened. A read skipped because its upstream discovery failed (a per-project scan under a denied project inventory, an effective org policy read with no project, service account keys with no account list, perimeters with no access policy list or no organization ID, Security Command Center without an organization ID) is recorded with `status: "not_collected"`, names the upstream call and the status that call returned, and never attributes an HTTP status to the call it did not make. `core_data/` writes a `{status, dataset, endpoint, scope, error, data: null}` marker in place of a denied or never-collected dataset, never `[]`, and lists the same entry in the snapshot's `unreadable_inventories`. The sweep records the HTTP status of every request and asserts, on every row (each surface at 403, 401, and 500, fully and per project, plus a zero-scope row with no configured project and a denied project inventory) and on the exported bundle, that every completeness claim, every attributed status code, every `was not called` clause, and every marker matches the recorder.
-- OS Login (`GCP-ORG-06`) is scored from project and instance metadata on every existing resource. `constraints/compute.requireOsLogin` protects newly created projects and rejects future disabling but never enables OS Login on existing projects or instances, so an enforced constraint is reported in the summary and is never sufficient for `pass`; a project without `enable-oslogin=TRUE` in `commonInstanceMetadata` or an instance overriding it fails and is named.
-- Export bundle: `core_data/` (projected snapshots: identifiers plus the documented fields each control reads, never whole resources, metadata values, labels, key material, or other free-form values; a status marker, never `[]`, for a dataset that was denied or not collected), `analysis/` (`findings.json`, `category_summaries.json`, per-category JSON and markdown, with evidence limited to derived values), `compliance/` (`executive_summary.md`, `unified_compliance_matrix.md`, `frameworks/<framework>.md` for the eight frameworks in the mapping table), `QUICK_REFERENCE.md`, `_errors.log` only when collection partially failed, and a zip named after the allocated directory (`-2`, `-3` on rerun).
-- Pagination: every list follows `nextPageToken` to completion; a list cut short by its item cap, a repeating cursor, or the 250-page budget is recorded as truncated and downgrades its findings to `warn` with `N seen, total unknown`. This applies to every paginated surface, including service accounts, log sinks, log buckets, Security Command Center sources, access policies, and service perimeters.
-- Error text: a response body is never copied into an error string. A failed request is described by its HTTP status, method, and endpoint plus the documented `google.rpc.Status` fields (`error.status`, a scrubbed `error.message`, `error.details[]` `@type` name and `reason`) or, for any other body, `non-JSON error body (<content type>; N bytes)`; the token endpoint is described by the RFC 6749 `error` and scrubbed `error_description` fields the same way. Silent-success class: a 2xx whose body is not a JSON object (an HTML page, an empty body, a whitespace-only body, with or without a content type) throws a `GcpApiError` carrying the observed status and `non-JSON response body` or `empty response body` with the content type and byte count, so the surface is unreadable (errors, `unreadable_inventories`, `core_data` markers, access probe `not_readable`) and never an empty inventory; no endpoint is exempt because the proto3 JSON mapping encodes an all-default response message and `google.protobuf.Empty` as `{}` (protobuf.dev/programming-guides/json) and the Compute and Storage list responses always carry `kind`. Every error string is created through `GcpApiError` (or `describeError` for values thrown outside the client) and scrubbed there by the exported `scrubErrorText`: configured credentials and the exchanged token by exact match, `Bearer` and `Basic` values, `ya29.`, `AIza`, `GOCSPX-`, `1//`, and JWT shapes, `Cookie` and `Set-Cookie` values, credential name-value pairs quoted or not, embedded URL userinfo, query, and fragment, and a long-token rule (16+ characters with a digit or mixed case, not made of words: snake_case, camelCase, and PascalCase identifiers without digits such as `PreconditionFailure` survive) that is on for error text and off for data values. The bundle writer scrubs every file again, `.md` files and `_errors.log` included, without the long-token rule. Any cap on the message runs after the scrub, and `shortError` abbreviates a status-less note at a word boundary so an endpoint is quoted whole or not at all.
-- Credential loaders: `parseGcpCredentialsJson` and the file reader read and parse in two guarded steps and never interpolate the parser or filesystem message (V8 quotes the ten characters around a fault, which for a malformed `private_key` line is key material). A parse failure throws `invalid JSON in <path>` (a position only when the runtime attaches a structured one), a read failure `unable to read <path> (<code>)` with the code validated against `^E[A-Z0-9_]{1,30}$`, and an unsupported `type` is echoed only when it has an identifier shape; every loader message passes the scrub with the long-token rule off, since a path is a data value.
-- Tests: a four-fixture false-pass self-check (all endpoints 403, all lists empty, partial inventory including Compute `unreachables[]` and `warning.code` `UNREACHABLE` scopes, fully compliant organization) plus regression tests for the credential chain, JWT signing, encoded query strings, pagination (cap exits, repeating cursors, page budget), violation detection, bundle layout, bundle secret hygiene (a seeded secret in every collected object must be absent from every bundle file and zip entry, and a shapeless configured token plus an `AIza` key planted in the organization display name must be absent from every file and zip entry, which fails when the writer's scrub is bypassed), credential-loader hygiene (a malformed service account file whose `private_key` line carries a fake PEM header and `ya29.` token, with `JSON.parse` as the positive control quoting the key body, plus EISDIR, ENOENT, and non-standard thrown values, asserting the fixed descriptions only), silent-success hygiene (every `GCP_INVENTORIES` surface answered with a 200 HTML page, an empty `application/json` body, an empty body with no content type, and a whitespace-only body, asserting the direct call throws with the marker, no finding fails, every dependent is manual or warn with the marker or a not-collected entry, derived `core_data` datasets are markers, the access probe is not readable, and no HTTP status other than 200 is named anywhere), error-body hygiene (a unit test on `scrubErrorText` for every shape and for benign operator text, a `GcpApiError` test for every body class, and a walk that fails every `GCP_INVENTORIES` surface with four canary-bearing body shapes and asserts no canary reaches any finding, summary, `unreadable_inventories` entry, `core_data` marker, errors array, bundle file, zip entry, or thrown error while each failure is disclosed with status, endpoint, and content type and length or the documented fields), the per-inventory sweep with its request recorder (null rendering, status-field and attributed-status matching, snapshot markers, the zero-scope row), a `core_data/` walk of a bundle exported under a denied project inventory (a marker for every denied or blocked dataset and no `[]` where the compliant bundle has rows), a project-only fixture (organization, Security Command Center, and perimeter reads not attempted and rendered `not_collected`), and secure output paths.
-- Compute-backed findings read the documented partial-view signals (`unreachables[]`, per-scope `UNREACHABLE` warnings), match SSL policies by full global or regional path, count IPv6 access configs as external addresses, read both `logConfig.enable` and `enableFlowLogs`, judge NAT coverage per subnetwork from `sourceSubnetworkIpRangesToNat`, evaluate every Binary Authorization rule map, and include `H2C` backends.
-- Log sink coverage (`GCP-LOG-03`) counts only sinks whose documented `LogSink.disabled` flag is not true; disabled sinks export nothing, so a project whose sinks are all disabled fails and the disabled sinks are named in evidence.
+## Integration-specific scrubbing
 
-### Deviations from this spec, following the official documentation
+Shared contract version: 1.1.
 
-- Cloud Asset Inventory `searchAllResources` and `searchAllIamPolicies` are `GET` requests with query parameters (`scope`, `query`, `assetTypes`, `pageSize` max 500, `pageToken`), not `POST` as listed in the API table.
-- Cloud KMS keys are inventoried through Cloud Asset Inventory `assets.list` with `assetTypes=cloudkms.googleapis.com/CryptoKey` and `contentType=RESOURCE` instead of per-location `keyRings.list` and `cryptoKeys.list`, because the KMS list APIs require an explicit location per call.
-- API keys are read from the API Keys API (`apikeys.googleapis.com/v2`), not IAM as the control table states.
-- Cloud NAT, firewall, subnetwork, SSL policy, backend service, disk, and instance data come from the Compute Engine API (`list` and `aggregatedList`) rather than Cloud Asset Inventory, so the read works with only the Compute API enabled in the target project.
-- Security Command Center is visibility only (`GCP-LOG-05`); it never scores a control. The `assets`, `findings:group`, `notificationConfigs`, custom module, and compliance report endpoints are not called.
-- Effective organization policies are read with the v1 `projects.getEffectiveOrgPolicy` method (`booleanPolicy.enforced`, `listPolicy`) against the first inventoried project; the v2 `policies` endpoints are not used.
-- The tool is read-only: the `export --format scc` write-back, HTML dashboard, CKL and OSCAL output, and baseline diffing described under CLI Interface and Output Formats are not implemented.
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
 
-### What remains (deferrals)
+Sensitive fields and values: private_key, client_secret, refresh_token, access_token, authorization, cookie
 
-- Control 2: unused permission analysis (Policy Intelligence recommender) is not evaluated; only owner/editor-style bindings are scored.
-- Control 4: unused firewall rule detection (Firewall Insights) is not evaluated.
-- Control 8: attestor configuration is not evaluated; only the default admission rule is scored.
-- Control 11: OS Login 2FA enforcement is not evaluated.
-- Folder-scoped inventory (`GCP_FOLDER_ID`) is not supported; scope is an organization or a single project.
-- Object ACLs on non-uniform buckets are not inspected; public exposure relies on IAM policy search.
+Credential formats: OAuth bearer tokens, service-account private keys, authorized-user refresh tokens
+
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
+
+Integration-specific rules:
+
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `organization` | `name`, `displayName`, `state` |
+| `projects` | `name`, `displayName`, `state`, `project` |
+| `iam-policies` | `resource`, `policy.bindings.role`, `policy.bindings.members` |
+| `service-accounts` | `name`, `email`, `disabled` |
+| `service-account-keys` | `name`, `keyType`, `validAfterTime`, `validBeforeTime` |
+| `logging` | `name`, `disabled`, `destination`, `retentionDays`, `timestamp` |
+| `security-command-center` | `name`, `state`, `category`, `severity` |
+| `effective-org-policy` | `constraint`, `booleanPolicy.enforced`, `listPolicy` |
+| `compute` | `name`, `metadata`, `shieldedInstanceConfig`, `networkInterfaces`, `logConfig`, `sslPolicy`, `securityPolicy` |
+| `binary-authorization` | `defaultAdmissionRule`, `clusterAdmissionRules`, `kubernetesNamespaceAdmissionRules`, `serviceAccountAdmissionRules`, `istioServiceIdentityAdmissionRules` |
+| `storage` | `name`, `iamConfiguration`, `encryption` |
+| `kms` | `name`, `resource.data.rotationPeriod`, `resource.data.nextRotationTime` |
+| `dns` | `name`, `dnssecConfig.state` |
+| `api-keys` | `name`, `restrictions` |
+| `access-context-manager` | `name`, `parent`, `status.resources`, `spec.resources` |
+
+## Export layout
+
+Required paths:
+
+- `QUICK_REFERENCE.md`
+- `README.md`
+- `metadata.json`
+- `core_data/access.json`
+- `core_data/identity.json`
+- `core_data/logging-detection.json`
+- `core_data/org-guardrails.json`
+- `core_data/data-protection.json`
+- `core_data/network-security.json`
+- `analysis/identity.json`
+- `analysis/logging-detection.json`
+- `analysis/org-guardrails.json`
+- `analysis/data-protection.json`
+- `analysis/network-security.json`
+- `analysis/identity.md`
+- `analysis/logging-detection.md`
+- `analysis/org-guardrails.md`
+- `analysis/data-protection.md`
+- `analysis/network-security.md`
+- `analysis/findings.json`
+- `analysis/category_summaries.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/frameworks/fedramp.md`
+- `compliance/frameworks/cmmc.md`
+- `compliance/frameworks/soc2.md`
+- `compliance/frameworks/cis_gcp.md`
+- `compliance/frameworks/pci_dss.md`
+- `compliance/frameworks/disa_stig.md`
+- `compliance/frameworks/irap.md`
+- `compliance/frameworks/ismap.md`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `README.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/identity.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/logging-detection.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/org-guardrails.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/data-protection.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/network-security.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/logging-detection.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/org-guardrails.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/data-protection.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/network-security.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity.md` | markdown | Always. | Runtime assessment or finding records. | UTF-8 text. |
+| `analysis/logging-detection.md` | markdown | Always. | Runtime assessment or finding records. | UTF-8 text. |
+| `analysis/org-guardrails.md` | markdown | Always. | Runtime assessment or finding records. | UTF-8 text. |
+| `analysis/data-protection.md` | markdown | Always. | Runtime assessment or finding records. | UTF-8 text. |
+| `analysis/network-security.md` | markdown | Always. | Runtime assessment or finding records. | UTF-8 text. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/category_summaries.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/fedramp.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/cmmc.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/soc2.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/cis_gcp.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/pci_dss.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/disa_stig.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/irap.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/frameworks/ismap.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `framework mappings`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+
+#### bundle_result
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+#### assessment
+
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
+
+#### pagination_state
+
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
+
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
+
+Overwrite policy: Allocate a new gcp-audit-<UTC timestamp> directory and numeric suffix when either directory or paired archive exists.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create <allocated-directory>.zip beside the allocated GCP audit directory.

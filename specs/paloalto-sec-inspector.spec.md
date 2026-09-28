@@ -1,460 +1,932 @@
 ---
 slug: "paloalto-sec-inspector"
-name: "Palo Alto Security Inspector"
+name: "Palo Alto Networks Security Inspector"
 vendor: "Palo Alto Networks"
-category: "security-network-infrastructure"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+category: "cloud-and-network-security"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# paloalto-sec-inspector -- Architecture Specification
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-## 1. Overview
+# Palo Alto Networks Security Inspector
 
-Palo Alto Networks is a leading cybersecurity platform that provides network security (PAN-OS firewalls and Panorama), cloud security (Prisma Cloud CSPM/CWPP/CIEM), and security operations (Cortex XSIAM/XSOAR). Organizations operating in regulated industries depend on Palo Alto products to enforce network segmentation, threat prevention, encryption policies, workload protection, and cloud security posture management.
+Portable contract for the shipped Prisma Cloud CSPM, Prisma Cloud Compute, and PAN-OS assessments.
 
-**paloalto-sec-inspector** is a security compliance inspector that programmatically audits Palo Alto Networks environments across three primary surfaces:
+## Purpose
 
-1. **Prisma Cloud CSPM** -- Cloud Security Posture Management: compliance posture, policy enforcement, alert configuration, IAM analysis, asset inventory, and cloud account governance.
-2. **Prisma Cloud CWPP** -- Cloud Workload Protection Platform: container image vulnerabilities, host compliance, runtime defense policies, defender deployment, and registry scanning.
-3. **PAN-OS Firewalls / Panorama** -- Network security device configuration: security rules, zone segmentation, threat prevention profiles, SSL/TLS decryption, GlobalProtect VPN, WildFire analysis, URL filtering, admin roles, and logging.
+Give security and compliance teams a read-only, repeatable view of Prisma Cloud CSPM, Prisma Cloud Compute, and PAN-OS posture without treating an unconfigured product or unreadable device subtree as compliant.
 
-The tool produces compliance-mapped audit reports against FedRAMP, CMMC 2.0, SOC 2, CIS Benchmarks, PCI-DSS 4.0, DISA STIG, IRAP, and ISMAP frameworks.
+## Design guidance
 
-### 1.1 grclanker implementation
+Use dedicated read-only credentials for each configured product. Preserve per-product configuration, host failures, pagination limits, and unreadable XML subtrees as evidence. Treat every bundle as sensitive network-security material even after credential redaction.
 
-The shipped implementation lives in `cli/extensions/grc-tools/paloalto.ts` and registers these read-only tools:
+## Shared integration contract
 
-- `paloalto_check_access`: probes every Prisma Cloud and PAN-OS read surface and reports missing permissions
-- `paloalto_assess_cloud_posture`: controls 1-6 through the Prisma Cloud CSPM API and controls 7-11, 24, and 25 through the Prisma Cloud Compute API (manual findings when the Compute console is not configured or reachable)
-- `paloalto_assess_firewall_policy`: controls 12-14 through the PAN-OS XML API
-- `paloalto_assess_threat_prevention`: controls 16-18, 21, and 22
-- `paloalto_assess_device_hardening`: controls 15, 19, 20, and 23, plus HA state and software version findings
-- `paloalto_export_audit_bundle`: raw snapshots, normalized findings, executive summary, unified compliance matrix, per-framework reports, and a zip archive
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-Regression coverage is in `cli/tests/paloalto.test.mjs`; the live smoke script is `npm --prefix cli run test:paloalto:live`; the integration guide is `src/content/docs/docs/integrations/paloalto.md`.
+## Known runtime gaps
 
-## 2. APIs & SDKs
+- Prisma Cloud CSPM, Prisma Cloud Compute, and each PAN-OS device are independent products; a product without credentials emits explicit manual findings rather than empty compliant inventories.
+- PAN-OS XML responses are projected to the exact configuration subtrees used by each finding and credential-bearing values are scrubbed before tool or bundle output.
+- Paged alert and Compute inventories retain total and truncation state; displayed records do not decide verdicts.
+- Controls whose required Prisma Compute product or PAN-OS subtree is not configured remain manual and identify the missing evidence.
 
-### 2.1 Prisma Cloud CSPM API
+## Tools
 
-**Base URL:** `https://api<N>.prismacloud.io` (region-dependent; check `Administration > API URLs` in console)
-
-| Category | Key Endpoints | Method |
-|---|---|---|
-| Authentication | `/login` | POST |
-| Alerts | `/alert`, `/v2/alert`, `/alert/policy` | GET/POST |
-| Compliance Posture | `/compliance/posture`, `/compliance/posture/trend`, `/compliance/posture/{complianceId}` | GET/POST |
-| Compliance Standards | `/compliance`, `/compliance/{complianceId}/requirement`, `/compliance/{complianceId}/requirement/{requirementId}/section` | GET |
-| Asset Inventory | `/v2/inventory`, `/filter/inventory`, `/inventory/trend` | GET/POST |
-| Cloud Accounts | `/cloud`, `/cloud/{cloudType}/{id}`, `/cloud/name` | GET/POST/PUT |
-| IAM | `/api/v1/permission`, `/api/v1/permission/access`, `/iam/query` | GET/POST |
-| Policy | `/policy`, `/v2/policy`, `/policy/{policyId}` | GET/POST/PUT/DELETE |
-| Settings | `/settings/{type}`, `/ip_allowlist_login` | GET/PUT |
-| User Roles | `/user/role`, `/user/role/{id}` | GET/POST/PUT/DELETE |
-| Resource Scan Info | `/resource/scan_info` | POST |
-| Reports | `/report`, `/report/{id}/download` | GET/POST |
-| Vulnerabilities Dashboard | `/v2/vulnerabilities/dashboard` | POST |
-| Integrations | `/integration`, `/integration/{id}` | GET/POST/PUT/DELETE |
-| Audit Logs | `/audit/redlock`, `/audit/logs` | GET |
-| Account Groups | `/cloud/group`, `/cloud/group/{id}` | GET/POST/PUT/DELETE |
-
-### 2.2 Prisma Cloud CWPP (Compute) API
-
-**Base URL:** `https://<CONSOLE>/api/v<VERSION>` (port 8083 for self-hosted; SaaS path from CSPM console)
-
-| Category | Key Endpoints | Method |
-|---|---|---|
-| Authentication | `/api/v1/authenticate` (or use CSPM JWT) | POST |
-| Images | `/images`, `/images/names`, `/images/scan` | GET/POST |
-| Containers | `/containers`, `/containers/scan`, `/containers/count` | GET/POST |
-| Hosts | `/hosts`, `/hosts/scan`, `/hosts/info` | GET/POST |
-| Vulnerabilities | `/stats/vulnerabilities`, `/vms`, `/serverless` | GET |
-| Compliance | `/compliance`, `/compliance/download`, `/compliance/progress` | GET |
-| Defenders | `/defenders`, `/defenders/summary`, `/defenders/names` | GET |
-| Runtime | `/audits/runtime/container`, `/audits/runtime/host`, `/policies/runtime/container` | GET |
-| Registry | `/registry`, `/registry/scan`, `/registry/names` | GET/POST |
-| Policies | `/policies/compliance/container`, `/policies/compliance/host`, `/policies/vulnerability/images` | GET/PUT |
-| Collections | `/collections`, `/collections/{id}` | GET/POST/PUT/DELETE |
-| CI/CD Scans | `/scans`, `/scans/{id}` | GET |
-| Custom Rules | `/custom-rules`, `/custom-rules/{id}` | GET/POST/PUT/DELETE |
-| Cloud Discovery | `/cloud/discovery`, `/cloud/discovery/entities` | GET |
-| Trust | `/trust/data` | GET |
-| Settings | `/settings/system`, `/settings/defender` | GET/PUT |
-
-### 2.3 PAN-OS XML API (Firewalls & Panorama)
-
-**Base URL:** `https://<FIREWALL_IP>/api/` or `https://<PANORAMA_IP>/api/`
-
-| Request Type | Action | Description |
-|---|---|---|
-| `type=config` | `action=get` | Retrieve running/candidate configuration XPath |
-| `type=config` | `action=show` | Show active configuration XPath |
-| `type=config` | `action=set` | Set configuration element |
-| `type=config` | `action=edit` | Replace configuration element |
-| `type=config` | `action=delete` | Delete configuration element |
-| `type=op` | N/A | Execute operational mode command |
-| `type=report` | N/A | Generate/retrieve reports |
-| `type=log` | `log-type=traffic/threat/system/config/url` | Retrieve log entries |
-| `type=export` | N/A | Export configuration, certificates, logs |
-| `type=import` | N/A | Import configuration, certificates |
-| `type=user-id` | N/A | User-ID agent operations |
-| `type=commit` | N/A | Commit candidate configuration |
-| `type=keygen` | N/A | Generate API key |
-
-**Key Configuration XPaths (for audit):**
-
-| XPath | What It Returns |
-|---|---|
-| `/config/devices/entry/vsys/entry/rulebase/security/rules` | Security policy rules |
-| `/config/devices/entry/vsys/entry/zone` | Zone configuration |
-| `/config/devices/entry/vsys/entry/profiles/virus` | Antivirus profiles |
-| `/config/devices/entry/vsys/entry/profiles/spyware` | Anti-spyware profiles |
-| `/config/devices/entry/vsys/entry/profiles/vulnerability` | Vulnerability protection profiles |
-| `/config/devices/entry/vsys/entry/profiles/url-filtering` | URL filtering profiles |
-| `/config/devices/entry/vsys/entry/profiles/file-blocking` | File blocking profiles |
-| `/config/devices/entry/vsys/entry/profiles/wildfire-analysis` | WildFire analysis profiles |
-| `/config/devices/entry/vsys/entry/profile-group` | Security profile groups |
-| `/config/shared/ssl-tls-service-profile` | SSL/TLS service profiles |
-| `/config/shared/ssl-decrypt` | SSL decryption rules |
-| `/config/devices/entry/vsys/entry/rulebase/decryption/rules` | Decryption policy rules |
-| `/config/shared/global-protect` | GlobalProtect configuration |
-| `/config/shared/log-settings` | Logging configuration |
-| `/config/mgt-config/users` | Admin user accounts |
-| `/config/devices/entry/deviceconfig/system` | System settings (NTP, DNS, banners) |
-| `/config/devices/entry/deviceconfig/setting` | Device settings (idle timeout, etc.) |
-
-### 2.4 PAN-OS REST API (PAN-OS 9.0+)
-
-**Base URL:** `https://<FIREWALL_IP>/restapi/v<VERSION>/`
-
-| Endpoint | Description |
-|---|---|
-| `/restapi/v10.2/Objects/Addresses` | Address objects |
-| `/restapi/v10.2/Objects/AddressGroups` | Address groups |
-| `/restapi/v10.2/Policies/SecurityRules` | Security policy rules |
-| `/restapi/v10.2/Policies/NATRules` | NAT rules |
-| `/restapi/v10.2/Policies/DecryptionRules` | Decryption rules |
-| `/restapi/v10.2/Network/Zones` | Network zones |
-| `/restapi/v10.2/Network/Interfaces` | Network interfaces |
-| `/restapi/v10.2/Device/Administrators` | Admin accounts |
-| `/restapi/v10.2/Device/SystemSettings` | System settings |
-
-### 2.5 SDKs and CLIs
-
-| Tool | Language | Description |
-|---|---|---|
-| `pan-os-python` | Python | Official PAN-OS SDK; classes for `Firewall`, `Panorama`, `SecurityRule`, `Zone`, `AddressObject`, `SecurityProfileGroup` |
-| `prismacloud-api` (PyPI) | Python | Official Prisma Cloud SDK for CSPM, CWPP, and CCS APIs |
-| `pango` | Go | Community PAN-OS SDK for Go |
-| `prismacloud-cli` | Python | CLI tool wrapping Prisma Cloud APIs |
-| `pan-python` | Python | Low-level PAN-OS and WildFire API library |
-| Terraform Provider `panos` | HCL/Go | Infrastructure as Code for PAN-OS |
-| Terraform Provider `prismacloud` | HCL/Go | IaC for Prisma Cloud |
-| Checkov | Python | Open-source IaC scanner (Bridgecrew / Prisma Cloud) with 750+ policies |
-
-## 3. Authentication
-
-### 3.1 Prisma Cloud (CSPM + CWPP)
-
-| Parameter | Source | Description |
-|---|---|---|
-| `PRISMA_API_URL` | Env var | Tenant API base URL (e.g., `https://api2.prismacloud.io`) |
-| `PRISMA_ACCESS_KEY_ID` | Env var | Access Key ID generated in `Settings > Access Keys` |
-| `PRISMA_SECRET_KEY` | Env var | Corresponding secret key |
-
-**Flow:**
-1. POST `{PRISMA_API_URL}/login` with `{"username": "<ACCESS_KEY_ID>", "password": "<SECRET_KEY>"}`.
-2. Response returns a JWT token (valid 10 minutes).
-3. Include `x-redlock-auth: <JWT>` header on subsequent CSPM requests.
-4. For CWPP/Compute, use the same JWT or authenticate separately at the Compute console endpoint.
-
-### 3.2 PAN-OS (Firewall / Panorama)
-
-| Parameter | Source | Description |
-|---|---|---|
-| `PANOS_HOST` | Env var | Firewall or Panorama management IP/hostname |
-| `PANOS_API_KEY` | Env var | Pre-generated API key |
-| `PANOS_USERNAME` | Env var (alt) | Admin username (for key generation) |
-| `PANOS_PASSWORD` | Env var (alt) | Admin password (for key generation) |
-
-**Flow (API Key):**
-1. Generate key: GET `https://<HOST>/api/?type=keygen&user=<USER>&password=<PASS>`.
-2. Response XML contains `<key>LUFRPT...</key>`.
-3. Include `key=<API_KEY>` query parameter on all subsequent requests.
-
-**Flow (pan-os-python SDK):**
-```python
-from panos.firewall import Firewall
-fw = Firewall('10.0.0.1', api_key='LUFRPT...')
-# or
-fw = Firewall('10.0.0.1', 'admin', 'password')
-```
-
-## 4. Security Controls
-
-| # | Control Name | Description | API Source |
+| Tool | Purpose | Finding IDs | Result shape |
 |---|---|---|---|
-| 1 | CSPM Compliance Posture | Verify overall compliance scores across enabled standards (CIS, NIST, SOC 2, PCI-DSS, HIPAA) | CSPM: `/compliance/posture` |
-| 2 | Alert Policy Coverage | Ensure critical alert rules are enabled and not dismissed; verify alert rule severity mappings | CSPM: `/alert/policy`, `/v2/alert` |
-| 3 | IAM Overprivileged Access | Identify overprivileged IAM entities across cloud accounts using effective permissions analysis | CSPM: `/api/v1/permission`, `/iam/query` |
-| 4 | Cloud Account Governance | Verify all cloud accounts are onboarded, monitored, and assigned to account groups | CSPM: `/cloud`, `/cloud/group` |
-| 5 | Network Exposure Analysis | Detect publicly exposed resources, unrestricted security groups, and open ports | CSPM: `/v2/inventory`, policy rules |
-| 6 | Encryption-at-Rest Verification | Confirm storage volumes, databases, and object stores use encryption with customer-managed keys | CSPM: compliance policies |
-| 7 | Container Image Vulnerability | Scan deployed and registry container images for critical/high CVEs and ensure thresholds are enforced | CWPP: `/images`, `/stats/vulnerabilities` |
-| 8 | Host Compliance Posture | Verify CIS benchmark compliance for Linux/Windows hosts monitored by Defenders | CWPP: `/compliance`, `/hosts` |
-| 9 | Runtime Protection Policies | Confirm runtime defense policies are enabled for containers and hosts (process, network, filesystem) | CWPP: `/policies/runtime/container`, `/audits/runtime` |
-| 10 | Defender Deployment Coverage | Ensure Defenders are deployed on all hosts/clusters and are connected and up-to-date | CWPP: `/defenders`, `/defenders/summary` |
-| 11 | Registry Scanning Configuration | Verify container registries are configured for periodic scanning with vulnerability thresholds | CWPP: `/registry`, `/settings/registry` |
-| 12 | Firewall Security Rule Audit | Analyze security rules for overly permissive rules (any/any), shadowed rules, and missing logging | PAN-OS: `/rulebase/security/rules` |
-| 13 | Zone Segmentation Verification | Confirm proper zone architecture: inter-zone rules enforce least privilege, intra-zone traffic is denied by default | PAN-OS: `/zone`, `/rulebase/security/rules` |
-| 14 | SSL/TLS Decryption Coverage | Verify decryption policies cover required traffic categories; audit certificate configuration and exemptions | PAN-OS: `/rulebase/decryption/rules`, `/ssl-decrypt` |
-| 15 | GlobalProtect VPN Configuration | Audit portal/gateway config: MFA, certificate auth, HIP profiles, split-tunnel policies, idle timeout | PAN-OS: `/global-protect` |
-| 16 | Threat Prevention Profiles | Verify antivirus, anti-spyware, and vulnerability protection profiles use strict/best-practice settings and are applied to all rules | PAN-OS: `/profiles/virus`, `/profiles/spyware`, `/profiles/vulnerability` |
-| 17 | WildFire Analysis Configuration | Confirm WildFire profiles forward all file types, all applications; verify WildFire cloud connectivity | PAN-OS: `/profiles/wildfire-analysis` |
-| 18 | URL Filtering Enforcement | Validate URL filtering profiles block high-risk categories; check credential phishing protections | PAN-OS: `/profiles/url-filtering` |
-| 19 | Admin Role & Access Audit | Verify least-privilege admin roles, enforce MFA for admin access, check password complexity, audit superuser count | PAN-OS: `/mgt-config/users`; CSPM: `/user/role` |
-| 20 | Logging & SIEM Integration | Confirm all rules log at session end/start, syslog/Panorama forwarding is configured, log retention meets requirements | PAN-OS: `/log-settings`; CSPM: `/integration` |
-| 21 | Data Loss Prevention | Verify DLP policies are configured for sensitive data patterns in Prisma Cloud and file blocking on PAN-OS | CSPM: DLP policies; PAN-OS: `/profiles/file-blocking` |
-| 22 | File Blocking Policies | Ensure dangerous file types (PE, ELF, scripts) are blocked across all zones | PAN-OS: `/profiles/file-blocking` |
-| 23 | System Hardening | Verify NTP sync, DNS settings, login banner, idle timeout, SNMP community strings, permitted IPs for management | PAN-OS: `/deviceconfig/system`, `/deviceconfig/setting` |
-| 24 | Cloud Discovery & Shadow IT | Detect unprotected cloud assets, unmanaged registries, and serverless functions not covered by Defenders | CWPP: `/cloud/discovery` |
-| 25 | CI/CD Pipeline Security | Verify CI/CD image scanning is integrated, vulnerability gates are enforced, and admission control is configured | CWPP: `/scans`, admission policies |
+| `paloalto_check_access` | Validate read-only access to Prisma Cloud CSPM (compliance posture, alert rules, alerts, policies, cloud accounts, roles, integrations) and PAN-OS firewalls or Panorama (system info, HA state, configuration subtrees) and report which surfaces are missing permissions. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `paloalto_assess_cloud_posture` | Assess Prisma Cloud CSPM posture: compliance pass rate, alert rule coverage, IAM overprivilege alerts, cloud account governance, network exposure alerts, and encryption-at-rest policies (spec controls 1-6), with manual evidence findings for the Compute controls 7-11, 24, and 25. | `PA-01`, `PA-02`, `PA-03`, `PA-04`, `PA-05`, `PA-06`, `PA-07`, `PA-08`, `PA-09`, `PA-10`, `PA-11`, `PA-24`, `PA-25` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `paloalto_assess_firewall_policy` | Assess PAN-OS firewall or Panorama security policy hygiene: any/any and shadowed rules, missing session-end logging, zone segmentation and zone protection, default rule actions, and SSL/TLS decryption coverage (spec controls 12-14). | `PA-12`, `PA-13`, `PA-14` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `paloalto_assess_threat_prevention` | Assess PAN-OS threat prevention profiles (antivirus, anti-spyware, vulnerability protection), WildFire analysis, URL filtering and credential phishing protection, data loss prevention across Prisma Cloud and PAN-OS, and file blocking (spec controls 16-18, 21, 22). | `PA-16`, `PA-17`, `PA-18`, `PA-21`, `PA-22` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `paloalto_assess_device_hardening` | Assess GlobalProtect configuration, admin roles and password complexity across PAN-OS and Prisma Cloud, logging and SIEM forwarding, system hardening (NTP, DNS, banner, idle timeout, SNMP, management services), HA state, and software versions (spec controls 15, 19, 20, 23). | `PA-15`, `PA-19`, `PA-20`, `PA-23` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `paloalto_export_audit_bundle` | Export a Palo Alto Networks audit bundle with redacted Prisma Cloud and PAN-OS snapshots (core_data/, credential-bearing values replaced with [REDACTED]), normalized findings (analysis/), executive summary, unified compliance matrix and per-framework reports (compliance/), QUICK_REFERENCE.md, an _errors.log when collection partially failed, and a zip archive. | `PA-01`, `PA-02`, `PA-03`, `PA-04`, `PA-05`, `PA-06`, `PA-07`, `PA-08`, `PA-09`, `PA-10`, `PA-11`, `PA-12`, `PA-13`, `PA-14`, `PA-15`, `PA-16`, `PA-17`, `PA-18`, `PA-19`, `PA-20`, `PA-21`, `PA-22`, `PA-23`, `PA-24`, `PA-25` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
 
-## 5. Compliance Framework Mappings
+### Parameters
 
-| # | Control | FedRAMP | CMMC 2.0 | SOC 2 | CIS | PCI-DSS 4.0 | DISA STIG | IRAP | ISMAP |
+#### `paloalto_check_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
+| `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
+| `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
+| `panos_api_key` | string | no | Pre-generated PAN-OS API key. Defaults to PANOS_API_KEY. |
+| `panos_username` | string | no | PAN-OS admin username for type=keygen. Defaults to PANOS_USERNAME. |
+| `panos_password` | string | no | PAN-OS admin password for type=keygen. Defaults to PANOS_PASSWORD. |
+| `config_file` | string | no | JSON config file with the same keys as the environment variables. Defaults to PALOALTO_CONFIG_FILE or ~/.grclanker/paloalto.json. |
+| `verify_tls` | boolean | no | Verify device TLS certificates. Defaults to true; set false only for lab devices with self-signed certificates (PANOS_VERIFY_TLS). |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+
+#### `paloalto_assess_cloud_posture`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
+| `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
+| `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
+| `panos_api_key` | string | no | Pre-generated PAN-OS API key. Defaults to PANOS_API_KEY. |
+| `panos_username` | string | no | PAN-OS admin username for type=keygen. Defaults to PANOS_USERNAME. |
+| `panos_password` | string | no | PAN-OS admin password for type=keygen. Defaults to PANOS_PASSWORD. |
+| `config_file` | string | no | JSON config file with the same keys as the environment variables. Defaults to PALOALTO_CONFIG_FILE or ~/.grclanker/paloalto.json. |
+| `verify_tls` | boolean | no | Verify device TLS certificates. Defaults to true; set false only for lab devices with self-signed certificates (PANOS_VERIFY_TLS). |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `alert_limit` | number | no | Maximum open alerts to sample from the last 30 days. Defaults to 500. |
+| `min_compliance_pass_rate` | number | no | Minimum compliance pass rate percentage before warning. Defaults to 90. |
+
+#### `paloalto_assess_firewall_policy`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
+| `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
+| `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
+| `panos_api_key` | string | no | Pre-generated PAN-OS API key. Defaults to PANOS_API_KEY. |
+| `panos_username` | string | no | PAN-OS admin username for type=keygen. Defaults to PANOS_USERNAME. |
+| `panos_password` | string | no | PAN-OS admin password for type=keygen. Defaults to PANOS_PASSWORD. |
+| `config_file` | string | no | JSON config file with the same keys as the environment variables. Defaults to PALOALTO_CONFIG_FILE or ~/.grclanker/paloalto.json. |
+| `verify_tls` | boolean | no | Verify device TLS certificates. Defaults to true; set false only for lab devices with self-signed certificates (PANOS_VERIFY_TLS). |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+
+#### `paloalto_assess_threat_prevention`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
+| `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
+| `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
+| `panos_api_key` | string | no | Pre-generated PAN-OS API key. Defaults to PANOS_API_KEY. |
+| `panos_username` | string | no | PAN-OS admin username for type=keygen. Defaults to PANOS_USERNAME. |
+| `panos_password` | string | no | PAN-OS admin password for type=keygen. Defaults to PANOS_PASSWORD. |
+| `config_file` | string | no | JSON config file with the same keys as the environment variables. Defaults to PALOALTO_CONFIG_FILE or ~/.grclanker/paloalto.json. |
+| `verify_tls` | boolean | no | Verify device TLS certificates. Defaults to true; set false only for lab devices with self-signed certificates (PANOS_VERIFY_TLS). |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+
+#### `paloalto_assess_device_hardening`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
+| `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
+| `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
+| `panos_api_key` | string | no | Pre-generated PAN-OS API key. Defaults to PANOS_API_KEY. |
+| `panos_username` | string | no | PAN-OS admin username for type=keygen. Defaults to PANOS_USERNAME. |
+| `panos_password` | string | no | PAN-OS admin password for type=keygen. Defaults to PANOS_PASSWORD. |
+| `config_file` | string | no | JSON config file with the same keys as the environment variables. Defaults to PALOALTO_CONFIG_FILE or ~/.grclanker/paloalto.json. |
+| `verify_tls` | boolean | no | Verify device TLS certificates. Defaults to true; set false only for lab devices with self-signed certificates (PANOS_VERIFY_TLS). |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_superusers` | number | no | Maximum acceptable superuser or System Admin accounts before failing. Defaults to 3. |
+
+#### `paloalto_export_audit_bundle`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `prisma_api_url` | string | no | Prisma Cloud API URL for the tenant region (for example https://api2.prismacloud.io). Defaults to PRISMA_API_URL. |
+| `prisma_access_key_id` | string | no | Prisma Cloud access key ID. Defaults to PRISMA_ACCESS_KEY_ID. |
+| `prisma_secret_key` | string | no | Prisma Cloud secret key. Defaults to PRISMA_SECRET_KEY. |
+| `panos_hosts` | string | no | Comma-separated PAN-OS firewall or Panorama hostnames or IPs. Defaults to PANOS_HOST. |
+| `panos_api_key` | string | no | Pre-generated PAN-OS API key. Defaults to PANOS_API_KEY. |
+| `panos_username` | string | no | PAN-OS admin username for type=keygen. Defaults to PANOS_USERNAME. |
+| `panos_password` | string | no | PAN-OS admin password for type=keygen. Defaults to PANOS_PASSWORD. |
+| `config_file` | string | no | JSON config file with the same keys as the environment variables. Defaults to PALOALTO_CONFIG_FILE or ~/.grclanker/paloalto.json. |
+| `verify_tls` | boolean | no | Verify device TLS certificates. Defaults to true; set false only for lab devices with self-signed certificates (PANOS_VERIFY_TLS). |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `output_dir` | string | no | Output root. Defaults to ./export/paloalto. |
+| `alert_limit` | number | no | Maximum open alerts to sample. Defaults to 500. |
+| `min_compliance_pass_rate` | number | no | Minimum compliance pass rate percentage before warning. Defaults to 90. |
+| `max_superusers` | number | no | Maximum acceptable superuser accounts before failing. Defaults to 3. |
+
+
+## Authentication
+
+Supported modes:
+
+- Prisma Cloud access key and secret key
+- Prisma Cloud Compute token exchange
+- PAN-OS API key
+- PAN-OS username and password key generation
+
+Credential precedence, highest first:
+
+1. Explicit tool arguments
+2. Palo Alto environment variables
+3. Palo Alto JSON config file
+
+Environment variables: `PALOALTO_CONFIG_FILE`, `PRISMA_ACCESS_KEY_ID`, `PRISMA_SECRET_KEY`, `PRISMA_API_URL`, `PRISMA_COMPUTE_URL`, `PANOS_HOST`, `PANOS_API_KEY`, `PANOS_USERNAME`, `PANOS_PASSWORD`, `PANOS_VERIFY_TLS`, `PALOALTO_TIMEOUT`
+
+Configuration locations: ~/.config/grclanker/paloalto.json, Explicit path from config_file or PALOALTO_CONFIG_FILE
+
+Credential and deployment variants: Prisma Cloud CSPM, Prisma Cloud Compute, One or more PAN-OS devices, Per-client PAN-OS TLS verification override
+
+Configuration fields: `PRISMA_ACCESS_KEY_ID`, `prisma_access_key_id`, `PRISMA_SECRET_KEY`, `prisma_secret_key`, `PRISMA_API_URL`, `prisma_api_url`, `PRISMA_COMPUTE_URL`, `prisma_compute_url`, `PANOS_HOST`, `panos_hosts`, `PANOS_API_KEY`, `panos_api_key`, `PANOS_USERNAME`, `panos_username`, `PANOS_PASSWORD`, `panos_password`, `PANOS_VERIFY_TLS`
+
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
+
+Credential refresh: POST /login for Prisma Cloud or Prisma Compute; POST /api/?type=keygen for PAN-OS username/password authentication.
+
+## Permissions
+
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| role | `Prisma Cloud read access to compliance, alerts, policies, accounts, roles, integrations, and configured Compute surfaces` | `prisma-cspm`, `prisma-compute` |  |
+| role | `PAN-OS XML API operational and configuration read access` | `panos-operational`, `panos-configuration` |  |
+
+## API surfaces
+
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `prisma-cspm` | HTTP | `GET /{compliance\|alert\|policy\|cloud\|user\|integration} read endpoints` | Prisma Cloud CSPM | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `compliance`, `severity`, `status`, `policy`, `cloudAccount`, `role`, `integration` | [Official documentation](https://pan.dev/prisma-cloud/api/cspm/) |
+| `prisma-compute` | HTTP | `GET /api/v1/{defenders\|policies\|registry\|stats\|cloud-discovery\|ci-scans}` | Prisma Cloud Compute | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `rules`, `collections`, `effect`, `status`, `specifications`, `vulnerabilities` | [Official documentation](https://pan.dev/compute/api/) |
+| `panos-operational` | HTTP | `GET /api/?type=op&cmd={system-info\|high-availability}` | PAN-OS XML API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `hostname`, `sw-version`, `app-version`, `threat-version`, `ha` | [Official documentation](https://docs.paloaltonetworks.com/pan-os/11-2/pan-os-panorama-api) |
+| `panos-configuration` | HTTP | `GET /api/?type=config&action=get&xpath={configuration subtree}` | PAN-OS XML API | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `security rules`, `zones`, `decryption rules`, `profiles`, `administrators`, `logging`, `deviceconfig` | [Official documentation](https://docs.paloaltonetworks.com/pan-os/11-2/pan-os-panorama-api) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `prisma-cspm` | client | Use the configured Prisma Cloud CSPM origin; never follow a server link to a different origin. | yes |
+| `prisma-cspm` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `prisma-cspm` | response | A JSON object or list containing only the documented compliance, severity, status, policy, cloudAccount, role, integration members consumed by verdicts. | yes |
+| `prisma-compute` | client | Use the configured Prisma Cloud Compute origin; never follow a server link to a different origin. | yes |
+| `prisma-compute` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `prisma-compute` | response | A JSON object or list containing only the documented rules, collections, effect, status, specifications, vulnerabilities members consumed by verdicts. | yes |
+| `panos-operational` | client | Use the configured PAN-OS XML API origin; never follow a server link to a different origin. | yes |
+| `panos-operational` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `panos-operational` | response | A JSON object or list containing only the documented hostname, sw-version, app-version, threat-version, ha members consumed by verdicts. | yes |
+| `panos-configuration` | client | Use the configured PAN-OS XML API origin; never follow a server link to a different origin. | yes |
+| `panos-configuration` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `panos-configuration` | response | A JSON object or list containing only the documented security rules, zones, decryption rules, profiles, administrators, logging, deviceconfig members consumed by verdicts. | yes |
+
+## Pagination
+
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `prisma-cspm`, `prisma-compute` | `offset`, `limit`, `total`, `next` | service default | caller limit | none | Completion requires reaching the reported total or an exhausted page without hitting the configured alert or product cap. | Reported total reached; Short or empty final page; Repeated cursor; Configured item cap |
+
+## Rate limits
+
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Palo Alto Networks Security Inspector | Tenant, product, and endpoint specific | `Retry-After` | 429, 500, 502, 503, 504 | Honor bounded Retry-After and retry transient requests with bounded exponential delay; exhausted reads remain unreadable. |
+
+## Checks
+
+### Control coverage
+
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | CSPM compliance posture | PA-01 | Evaluate the ordered first-match rules for PA-01 below. |
+| 2 | Alert policy coverage | PA-02 | Evaluate the ordered first-match rules for PA-02 below. |
+| 3 | IAM overprivileged access | PA-03 | Evaluate the ordered first-match rules for PA-03 below. |
+| 4 | Cloud account governance | PA-04 | Evaluate the ordered first-match rules for PA-04 below. |
+| 5 | Network exposure analysis | PA-05 | Evaluate the ordered first-match rules for PA-05 below. |
+| 6 | Encryption at rest verification | PA-06 | Evaluate the ordered first-match rules for PA-06 below. |
+| 7 | Container image vulnerability | PA-07 | Evaluate the ordered first-match rules for PA-07 below. |
+| 8 | Host compliance posture | PA-08 | Evaluate the ordered first-match rules for PA-08 below. |
+| 9 | Runtime protection policies | PA-09 | Evaluate the ordered first-match rules for PA-09 below. |
+| 10 | Defender deployment coverage | PA-10 | Evaluate the ordered first-match rules for PA-10 below. |
+| 11 | Registry scanning configuration | PA-11 | Evaluate the ordered first-match rules for PA-11 below. |
+| 12 | Firewall security rule audit | PA-12 | Evaluate the ordered first-match rules for PA-12 below. |
+| 13 | Zone segmentation verification | PA-13 | Evaluate the ordered first-match rules for PA-13 below. |
+| 14 | SSL/TLS decryption coverage | PA-14 | Evaluate the ordered first-match rules for PA-14 below. |
+| 15 | GlobalProtect VPN configuration | PA-15 | Evaluate the ordered first-match rules for PA-15 below. |
+| 16 | Threat prevention profiles | PA-16 | Evaluate the ordered first-match rules for PA-16 below. |
+| 17 | WildFire analysis configuration | PA-17 | Evaluate the ordered first-match rules for PA-17 below. |
+| 18 | URL filtering enforcement | PA-18 | Evaluate the ordered first-match rules for PA-18 below. |
+| 19 | Admin role and access audit | PA-19 | Evaluate the ordered first-match rules for PA-19 below. |
+| 20 | Logging and SIEM integration | PA-20 | Evaluate the ordered first-match rules for PA-20 below. |
+| 21 | Data loss prevention | PA-21 | Evaluate the ordered first-match rules for PA-21 below. |
+| 22 | File blocking policies | PA-22 | Evaluate the ordered first-match rules for PA-22 below. |
+| 23 | System hardening | PA-23 | Evaluate the ordered first-match rules for PA-23 below. |
+| 24 | Cloud discovery and shadow IT | PA-24 | Evaluate the ordered first-match rules for PA-24 below. |
+| 25 | CI/CD pipeline security | PA-25 | Evaluate the ordered first-match rules for PA-25 below. |
+
+### Finding notes
+
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `PA-01` | high | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate CSPM compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate CSPM compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate CSPM compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for CSPM compliance posture is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-02` | high | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Alert policy coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Alert policy coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Alert policy coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Alert policy coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-03` | high | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate IAM overprivileged access from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate IAM overprivileged access from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate IAM overprivileged access from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for IAM overprivileged access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-04` | medium | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Cloud account governance from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Cloud account governance from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Cloud account governance from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Cloud account governance is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-05` | critical | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Network exposure analysis from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Network exposure analysis from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Network exposure analysis from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Network exposure analysis is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-06` | high | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Encryption at rest verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Encryption at rest verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Encryption at rest verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Encryption at rest verification is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-07` | high | `paloalto_assess_cloud_posture` | `prisma-compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Container image vulnerability from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Container image vulnerability from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Container image vulnerability from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Container image vulnerability is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-08` | medium | `paloalto_assess_cloud_posture` | `prisma-compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Host compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Host compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Host compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Host compliance posture is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-09` | high | `paloalto_assess_cloud_posture` | `prisma-compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Runtime protection policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Runtime protection policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Runtime protection policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Runtime protection policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-10` | high | `paloalto_assess_cloud_posture` | `prisma-compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Defender deployment coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Defender deployment coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Defender deployment coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Defender deployment coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-11` | medium | `paloalto_assess_cloud_posture` | `prisma-compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Registry scanning configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Registry scanning configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Registry scanning configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Registry scanning configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-12` | critical | `paloalto_assess_firewall_policy` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Firewall security rule audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Firewall security rule audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Firewall security rule audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Firewall security rule audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-13` | high | `paloalto_assess_firewall_policy` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Zone segmentation verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Zone segmentation verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Zone segmentation verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Zone segmentation verification is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-14` | high | `paloalto_assess_firewall_policy` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate SSL/TLS decryption coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate SSL/TLS decryption coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate SSL/TLS decryption coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for SSL/TLS decryption coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-15` | high | `paloalto_assess_device_hardening` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate GlobalProtect VPN configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate GlobalProtect VPN configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate GlobalProtect VPN configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for GlobalProtect VPN configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-16` | high | `paloalto_assess_threat_prevention` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Threat prevention profiles from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Threat prevention profiles from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Threat prevention profiles from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Threat prevention profiles is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-17` | medium | `paloalto_assess_threat_prevention` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate WildFire analysis configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate WildFire analysis configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate WildFire analysis configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for WildFire analysis configuration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-18` | high | `paloalto_assess_threat_prevention` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate URL filtering enforcement from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate URL filtering enforcement from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate URL filtering enforcement from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for URL filtering enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-19` | high | `paloalto_assess_device_hardening` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Admin role and access audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Admin role and access audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Admin role and access audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Admin role and access audit is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-20` | high | `paloalto_assess_device_hardening` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Logging and SIEM integration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Logging and SIEM integration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Logging and SIEM integration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Logging and SIEM integration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-21` | high | `paloalto_assess_threat_prevention` | `prisma-cspm`, `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Data loss prevention from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Data loss prevention from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Data loss prevention from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Data loss prevention is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-22` | medium | `paloalto_assess_threat_prevention` | `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate File blocking policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate File blocking policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate File blocking policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for File blocking policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-23` | medium | `paloalto_assess_device_hardening` | `panos-operational`, `panos-configuration` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate System hardening from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate System hardening from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate System hardening from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for System hardening is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-24` | medium | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Cloud discovery and shadow IT from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Cloud discovery and shadow IT from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Cloud discovery and shadow IT from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for Cloud discovery and shadow IT is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `PA-25` | high | `paloalto_assess_cloud_posture` | `prisma-cspm` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate CI/CD pipeline security from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate CI/CD pipeline security from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate CI/CD pipeline security from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | The required evidence for CI/CD pipeline security is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `PA-01` | 1 | manual | `pa_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-01` | 2 | fail | `pa_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-01` | 3 | manual | `pa_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-01` | 4 | warn | `pa_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-01` | 5 | pass | `pa_01_branch_05_matches` equals true |  |
+| `PA-01` | 6 | manual | `pa_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-02` | 1 | manual | `pa_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-02` | 2 | fail | `pa_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-02` | 3 | manual | `pa_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-02` | 4 | warn | `pa_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-02` | 5 | pass | `pa_02_branch_05_matches` equals true |  |
+| `PA-02` | 6 | manual | `pa_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-03` | 1 | manual | `pa_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-03` | 2 | fail | `pa_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-03` | 3 | manual | `pa_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-03` | 4 | warn | `pa_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-03` | 5 | pass | `pa_03_branch_05_matches` equals true |  |
+| `PA-03` | 6 | manual | `pa_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-04` | 1 | manual | `pa_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-04` | 2 | fail | `pa_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-04` | 3 | manual | `pa_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-04` | 4 | warn | `pa_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-04` | 5 | pass | `pa_04_branch_05_matches` equals true |  |
+| `PA-04` | 6 | manual | `pa_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-05` | 1 | manual | `pa_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-05` | 2 | fail | `pa_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-05` | 3 | manual | `pa_05_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-05` | 4 | warn | `pa_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-05` | 5 | pass | `pa_05_branch_05_matches` equals true |  |
+| `PA-05` | 6 | manual | `pa_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-06` | 1 | manual | `pa_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-06` | 2 | fail | `pa_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-06` | 3 | manual | `pa_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-06` | 4 | warn | `pa_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-06` | 5 | pass | `pa_06_branch_05_matches` equals true |  |
+| `PA-06` | 6 | manual | `pa_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-07` | 1 | manual | `pa_07_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-07` | 2 | fail | `pa_07_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-07` | 3 | manual | `pa_07_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-07` | 4 | warn | `pa_07_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-07` | 5 | pass | `pa_07_branch_05_matches` equals true |  |
+| `PA-07` | 6 | manual | `pa_07_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-08` | 1 | manual | `pa_08_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-08` | 2 | fail | `pa_08_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-08` | 3 | manual | `pa_08_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-08` | 4 | warn | `pa_08_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-08` | 5 | pass | `pa_08_branch_05_matches` equals true |  |
+| `PA-08` | 6 | manual | `pa_08_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-09` | 1 | manual | `pa_09_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-09` | 2 | fail | `pa_09_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-09` | 3 | manual | `pa_09_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-09` | 4 | warn | `pa_09_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-09` | 5 | pass | `pa_09_branch_05_matches` equals true |  |
+| `PA-09` | 6 | manual | `pa_09_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-10` | 1 | manual | `pa_10_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-10` | 2 | fail | `pa_10_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-10` | 3 | manual | `pa_10_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-10` | 4 | warn | `pa_10_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-10` | 5 | pass | `pa_10_branch_05_matches` equals true |  |
+| `PA-10` | 6 | manual | `pa_10_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-11` | 1 | manual | `pa_11_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-11` | 2 | fail | `pa_11_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-11` | 3 | manual | `pa_11_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-11` | 4 | warn | `pa_11_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-11` | 5 | pass | `pa_11_branch_05_matches` equals true |  |
+| `PA-11` | 6 | manual | `pa_11_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-12` | 1 | manual | `pa_12_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-12` | 2 | fail | `pa_12_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-12` | 3 | manual | `pa_12_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-12` | 4 | warn | `pa_12_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-12` | 5 | pass | `pa_12_branch_05_matches` equals true |  |
+| `PA-12` | 6 | manual | `pa_12_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-13` | 1 | manual | `pa_13_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-13` | 2 | fail | `pa_13_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-13` | 3 | manual | `pa_13_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-13` | 4 | warn | `pa_13_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-13` | 5 | pass | `pa_13_branch_05_matches` equals true |  |
+| `PA-13` | 6 | manual | `pa_13_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-14` | 1 | manual | `pa_14_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-14` | 2 | fail | `pa_14_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-14` | 3 | manual | `pa_14_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-14` | 4 | warn | `pa_14_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-14` | 5 | pass | `pa_14_branch_05_matches` equals true |  |
+| `PA-14` | 6 | manual | `pa_14_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-15` | 1 | manual | `pa_15_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-15` | 2 | fail | `pa_15_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-15` | 3 | manual | `pa_15_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-15` | 4 | warn | `pa_15_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-15` | 5 | pass | `pa_15_branch_05_matches` equals true |  |
+| `PA-15` | 6 | manual | `pa_15_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-16` | 1 | manual | `pa_16_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-16` | 2 | fail | `pa_16_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-16` | 3 | manual | `pa_16_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-16` | 4 | warn | `pa_16_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-16` | 5 | pass | `pa_16_branch_05_matches` equals true |  |
+| `PA-16` | 6 | manual | `pa_16_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-17` | 1 | manual | `pa_17_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-17` | 2 | fail | `pa_17_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-17` | 3 | manual | `pa_17_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-17` | 4 | warn | `pa_17_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-17` | 5 | pass | `pa_17_branch_05_matches` equals true |  |
+| `PA-17` | 6 | manual | `pa_17_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-18` | 1 | manual | `pa_18_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-18` | 2 | fail | `pa_18_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-18` | 3 | manual | `pa_18_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-18` | 4 | warn | `pa_18_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-18` | 5 | pass | `pa_18_branch_05_matches` equals true |  |
+| `PA-18` | 6 | manual | `pa_18_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-19` | 1 | manual | `pa_19_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-19` | 2 | fail | `pa_19_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-19` | 3 | manual | `pa_19_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-19` | 4 | warn | `pa_19_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-19` | 5 | pass | `pa_19_branch_05_matches` equals true |  |
+| `PA-19` | 6 | manual | `pa_19_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-20` | 1 | manual | `pa_20_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-20` | 2 | fail | `pa_20_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-20` | 3 | manual | `pa_20_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-20` | 4 | warn | `pa_20_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-20` | 5 | pass | `pa_20_branch_05_matches` equals true |  |
+| `PA-20` | 6 | manual | `pa_20_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-21` | 1 | manual | `pa_21_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-21` | 2 | fail | `pa_21_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-21` | 3 | manual | `pa_21_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-21` | 4 | warn | `pa_21_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-21` | 5 | pass | `pa_21_branch_05_matches` equals true |  |
+| `PA-21` | 6 | manual | `pa_21_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-22` | 1 | manual | `pa_22_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-22` | 2 | fail | `pa_22_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-22` | 3 | manual | `pa_22_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-22` | 4 | warn | `pa_22_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-22` | 5 | pass | `pa_22_branch_05_matches` equals true |  |
+| `PA-22` | 6 | manual | `pa_22_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-23` | 1 | manual | `pa_23_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-23` | 2 | fail | `pa_23_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-23` | 3 | manual | `pa_23_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-23` | 4 | warn | `pa_23_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-23` | 5 | pass | `pa_23_branch_05_matches` equals true |  |
+| `PA-23` | 6 | manual | `pa_23_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-24` | 1 | manual | `pa_24_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-24` | 2 | fail | `pa_24_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-24` | 3 | manual | `pa_24_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-24` | 4 | warn | `pa_24_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-24` | 5 | pass | `pa_24_branch_05_matches` equals true |  |
+| `PA-24` | 6 | manual | `pa_24_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-25` | 1 | manual | `pa_25_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `PA-25` | 2 | fail | `pa_25_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `PA-25` | 3 | manual | `pa_25_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `PA-25` | 4 | warn | `pa_25_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `PA-25` | 5 | pass | `pa_25_branch_05_matches` equals true |  |
+| `PA-25` | 6 | manual | `pa_25_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `PA-01` | `pa_01_branch_01_matches` | PA-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-01` | `pa_01_branch_02_matches` | PA-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-01` | `pa_01_branch_03_matches` | PA-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-01` | `pa_01_branch_04_matches` | PA-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-01` | `pa_01_branch_05_matches` | PA-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-01` | `pa_01_branch_06_matches` | PA-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-02` | `pa_02_branch_01_matches` | PA-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-02` | `pa_02_branch_02_matches` | PA-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-02` | `pa_02_branch_03_matches` | PA-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-02` | `pa_02_branch_04_matches` | PA-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-02` | `pa_02_branch_05_matches` | PA-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-02` | `pa_02_branch_06_matches` | PA-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-03` | `pa_03_branch_01_matches` | PA-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-03` | `pa_03_branch_02_matches` | PA-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-03` | `pa_03_branch_03_matches` | PA-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-03` | `pa_03_branch_04_matches` | PA-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-03` | `pa_03_branch_05_matches` | PA-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-03` | `pa_03_branch_06_matches` | PA-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-04` | `pa_04_branch_01_matches` | PA-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-04` | `pa_04_branch_02_matches` | PA-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-04` | `pa_04_branch_03_matches` | PA-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-04` | `pa_04_branch_04_matches` | PA-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-04` | `pa_04_branch_05_matches` | PA-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-04` | `pa_04_branch_06_matches` | PA-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-05` | `pa_05_branch_01_matches` | PA-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-05` | `pa_05_branch_02_matches` | PA-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-05` | `pa_05_branch_03_matches` | PA-05 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-05` | `pa_05_branch_04_matches` | PA-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-05` | `pa_05_branch_05_matches` | PA-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-05` | `pa_05_branch_06_matches` | PA-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-06` | `pa_06_branch_01_matches` | PA-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-06` | `pa_06_branch_02_matches` | PA-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-06` | `pa_06_branch_03_matches` | PA-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-06` | `pa_06_branch_04_matches` | PA-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-06` | `pa_06_branch_05_matches` | PA-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-06` | `pa_06_branch_06_matches` | PA-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-07` | `pa_07_branch_01_matches` | PA-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-07` | `pa_07_branch_02_matches` | PA-07 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-07` | `pa_07_branch_03_matches` | PA-07 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-07` | `pa_07_branch_04_matches` | PA-07 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-07` | `pa_07_branch_05_matches` | PA-07 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-07` | `pa_07_branch_06_matches` | PA-07 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-08` | `pa_08_branch_01_matches` | PA-08 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-08` | `pa_08_branch_02_matches` | PA-08 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-08` | `pa_08_branch_03_matches` | PA-08 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-08` | `pa_08_branch_04_matches` | PA-08 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-08` | `pa_08_branch_05_matches` | PA-08 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-08` | `pa_08_branch_06_matches` | PA-08 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-09` | `pa_09_branch_01_matches` | PA-09 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-09` | `pa_09_branch_02_matches` | PA-09 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-09` | `pa_09_branch_03_matches` | PA-09 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-09` | `pa_09_branch_04_matches` | PA-09 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-09` | `pa_09_branch_05_matches` | PA-09 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-09` | `pa_09_branch_06_matches` | PA-09 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-10` | `pa_10_branch_01_matches` | PA-10 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-10` | `pa_10_branch_02_matches` | PA-10 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-10` | `pa_10_branch_03_matches` | PA-10 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-10` | `pa_10_branch_04_matches` | PA-10 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-10` | `pa_10_branch_05_matches` | PA-10 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-10` | `pa_10_branch_06_matches` | PA-10 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-11` | `pa_11_branch_01_matches` | PA-11 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-11` | `pa_11_branch_02_matches` | PA-11 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-11` | `pa_11_branch_03_matches` | PA-11 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-11` | `pa_11_branch_04_matches` | PA-11 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-11` | `pa_11_branch_05_matches` | PA-11 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-11` | `pa_11_branch_06_matches` | PA-11 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-12` | `pa_12_branch_01_matches` | PA-12 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-12` | `pa_12_branch_02_matches` | PA-12 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-12` | `pa_12_branch_03_matches` | PA-12 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-12` | `pa_12_branch_04_matches` | PA-12 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-12` | `pa_12_branch_05_matches` | PA-12 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-12` | `pa_12_branch_06_matches` | PA-12 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-13` | `pa_13_branch_01_matches` | PA-13 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-13` | `pa_13_branch_02_matches` | PA-13 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-13` | `pa_13_branch_03_matches` | PA-13 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-13` | `pa_13_branch_04_matches` | PA-13 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-13` | `pa_13_branch_05_matches` | PA-13 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-13` | `pa_13_branch_06_matches` | PA-13 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-14` | `pa_14_branch_01_matches` | PA-14 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-14` | `pa_14_branch_02_matches` | PA-14 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-14` | `pa_14_branch_03_matches` | PA-14 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-14` | `pa_14_branch_04_matches` | PA-14 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-14` | `pa_14_branch_05_matches` | PA-14 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-14` | `pa_14_branch_06_matches` | PA-14 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-15` | `pa_15_branch_01_matches` | PA-15 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-15` | `pa_15_branch_02_matches` | PA-15 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-15` | `pa_15_branch_03_matches` | PA-15 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-15` | `pa_15_branch_04_matches` | PA-15 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-15` | `pa_15_branch_05_matches` | PA-15 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-15` | `pa_15_branch_06_matches` | PA-15 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-16` | `pa_16_branch_01_matches` | PA-16 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-16` | `pa_16_branch_02_matches` | PA-16 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-16` | `pa_16_branch_03_matches` | PA-16 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-16` | `pa_16_branch_04_matches` | PA-16 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-16` | `pa_16_branch_05_matches` | PA-16 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-16` | `pa_16_branch_06_matches` | PA-16 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-17` | `pa_17_branch_01_matches` | PA-17 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-17` | `pa_17_branch_02_matches` | PA-17 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-17` | `pa_17_branch_03_matches` | PA-17 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-17` | `pa_17_branch_04_matches` | PA-17 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-17` | `pa_17_branch_05_matches` | PA-17 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-17` | `pa_17_branch_06_matches` | PA-17 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-18` | `pa_18_branch_01_matches` | PA-18 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-18` | `pa_18_branch_02_matches` | PA-18 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-18` | `pa_18_branch_03_matches` | PA-18 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-18` | `pa_18_branch_04_matches` | PA-18 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-18` | `pa_18_branch_05_matches` | PA-18 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-18` | `pa_18_branch_06_matches` | PA-18 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-19` | `pa_19_branch_01_matches` | PA-19 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-19` | `pa_19_branch_02_matches` | PA-19 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-19` | `pa_19_branch_03_matches` | PA-19 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-19` | `pa_19_branch_04_matches` | PA-19 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-19` | `pa_19_branch_05_matches` | PA-19 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-19` | `pa_19_branch_06_matches` | PA-19 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-20` | `pa_20_branch_01_matches` | PA-20 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-20` | `pa_20_branch_02_matches` | PA-20 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-20` | `pa_20_branch_03_matches` | PA-20 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-20` | `pa_20_branch_04_matches` | PA-20 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-20` | `pa_20_branch_05_matches` | PA-20 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-20` | `pa_20_branch_06_matches` | PA-20 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-21` | `pa_21_branch_01_matches` | PA-21 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-21` | `pa_21_branch_02_matches` | PA-21 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-21` | `pa_21_branch_03_matches` | PA-21 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-21` | `pa_21_branch_04_matches` | PA-21 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-21` | `pa_21_branch_05_matches` | PA-21 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-21` | `pa_21_branch_06_matches` | PA-21 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-22` | `pa_22_branch_01_matches` | PA-22 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-22` | `pa_22_branch_02_matches` | PA-22 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-22` | `pa_22_branch_03_matches` | PA-22 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-22` | `pa_22_branch_04_matches` | PA-22 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-22` | `pa_22_branch_05_matches` | PA-22 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-22` | `pa_22_branch_06_matches` | PA-22 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-23` | `pa_23_branch_01_matches` | PA-23 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-23` | `pa_23_branch_02_matches` | PA-23 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-23` | `pa_23_branch_03_matches` | PA-23 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-23` | `pa_23_branch_04_matches` | PA-23 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-23` | `pa_23_branch_05_matches` | PA-23 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-23` | `pa_23_branch_06_matches` | PA-23 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-24` | `pa_24_branch_01_matches` | PA-24 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-24` | `pa_24_branch_02_matches` | PA-24 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-24` | `pa_24_branch_03_matches` | PA-24 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-24` | `pa_24_branch_04_matches` | PA-24 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-24` | `pa_24_branch_05_matches` | PA-24 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-24` | `pa_24_branch_06_matches` | PA-24 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-25` | `pa_25_branch_01_matches` | PA-25 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-25` | `pa_25_branch_02_matches` | PA-25 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `PA-25` | `pa_25_branch_03_matches` | PA-25 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `PA-25` | `pa_25_branch_04_matches` | PA-25 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-25` | `pa_25_branch_05_matches` | PA-25 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-25` | `pa_25_branch_06_matches` | PA-25 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `PA-01` | `requiredEvidenceReadable` | true |
+| `PA-01` | `requiredEvidenceComplete` | true |
+| `PA-02` | `requiredEvidenceReadable` | true |
+| `PA-02` | `requiredEvidenceComplete` | true |
+| `PA-03` | `requiredEvidenceReadable` | true |
+| `PA-03` | `requiredEvidenceComplete` | true |
+| `PA-04` | `requiredEvidenceReadable` | true |
+| `PA-04` | `requiredEvidenceComplete` | true |
+| `PA-05` | `requiredEvidenceReadable` | true |
+| `PA-05` | `requiredEvidenceComplete` | true |
+| `PA-06` | `requiredEvidenceReadable` | true |
+| `PA-06` | `requiredEvidenceComplete` | true |
+| `PA-07` | `requiredEvidenceReadable` | true |
+| `PA-07` | `requiredEvidenceComplete` | true |
+| `PA-08` | `requiredEvidenceReadable` | true |
+| `PA-08` | `requiredEvidenceComplete` | true |
+| `PA-09` | `requiredEvidenceReadable` | true |
+| `PA-09` | `requiredEvidenceComplete` | true |
+| `PA-10` | `requiredEvidenceReadable` | true |
+| `PA-10` | `requiredEvidenceComplete` | true |
+| `PA-11` | `requiredEvidenceReadable` | true |
+| `PA-11` | `requiredEvidenceComplete` | true |
+| `PA-12` | `requiredEvidenceReadable` | true |
+| `PA-12` | `requiredEvidenceComplete` | true |
+| `PA-13` | `requiredEvidenceReadable` | true |
+| `PA-13` | `requiredEvidenceComplete` | true |
+| `PA-14` | `requiredEvidenceReadable` | true |
+| `PA-14` | `requiredEvidenceComplete` | true |
+| `PA-15` | `requiredEvidenceReadable` | true |
+| `PA-15` | `requiredEvidenceComplete` | true |
+| `PA-16` | `requiredEvidenceReadable` | true |
+| `PA-16` | `requiredEvidenceComplete` | true |
+| `PA-17` | `requiredEvidenceReadable` | true |
+| `PA-17` | `requiredEvidenceComplete` | true |
+| `PA-18` | `requiredEvidenceReadable` | true |
+| `PA-18` | `requiredEvidenceComplete` | true |
+| `PA-19` | `requiredEvidenceReadable` | true |
+| `PA-19` | `requiredEvidenceComplete` | true |
+| `PA-20` | `requiredEvidenceReadable` | true |
+| `PA-20` | `requiredEvidenceComplete` | true |
+| `PA-21` | `requiredEvidenceReadable` | true |
+| `PA-21` | `requiredEvidenceComplete` | true |
+| `PA-22` | `requiredEvidenceReadable` | true |
+| `PA-22` | `requiredEvidenceComplete` | true |
+| `PA-23` | `requiredEvidenceReadable` | true |
+| `PA-23` | `requiredEvidenceComplete` | true |
+| `PA-24` | `requiredEvidenceReadable` | true |
+| `PA-24` | `requiredEvidenceComplete` | true |
+| `PA-25` | `requiredEvidenceReadable` | true |
+| `PA-25` | `requiredEvidenceComplete` | true |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `PA-01` | compliant | All required source reads are complete and this derivation returns pass: Evaluate CSPM compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate CSPM compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-02` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Alert policy coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Alert policy coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-03` | compliant | All required source reads are complete and this derivation returns pass: Evaluate IAM overprivileged access from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate IAM overprivileged access from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-04` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Cloud account governance from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Cloud account governance from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-05` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Network exposure analysis from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Network exposure analysis from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-06` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Encryption at rest verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Encryption at rest verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-07` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Container image vulnerability from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-07` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Container image vulnerability from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-08` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Host compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-08` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Host compliance posture from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-09` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Runtime protection policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-09` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Runtime protection policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-10` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Defender deployment coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-10` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Defender deployment coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-10` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-10` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-11` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Registry scanning configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-11` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Registry scanning configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-11` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-11` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-12` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Firewall security rule audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-12` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Firewall security rule audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-12` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-12` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-13` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Zone segmentation verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-13` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Zone segmentation verification from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-13` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-13` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-14` | compliant | All required source reads are complete and this derivation returns pass: Evaluate SSL/TLS decryption coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-14` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate SSL/TLS decryption coverage from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-14` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-14` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-15` | compliant | All required source reads are complete and this derivation returns pass: Evaluate GlobalProtect VPN configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-15` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate GlobalProtect VPN configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-15` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-15` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-16` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Threat prevention profiles from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-16` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Threat prevention profiles from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-16` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-16` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-17` | compliant | All required source reads are complete and this derivation returns pass: Evaluate WildFire analysis configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-17` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate WildFire analysis configuration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-17` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-17` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-18` | compliant | All required source reads are complete and this derivation returns pass: Evaluate URL filtering enforcement from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-18` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate URL filtering enforcement from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-18` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-18` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-19` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Admin role and access audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-19` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Admin role and access audit from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-19` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-19` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-20` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Logging and SIEM integration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-20` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Logging and SIEM integration from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-20` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-20` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-21` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Data loss prevention from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-21` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Data loss prevention from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-21` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-21` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-22` | compliant | All required source reads are complete and this derivation returns pass: Evaluate File blocking policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-22` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate File blocking policies from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-22` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-22` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-23` | compliant | All required source reads are complete and this derivation returns pass: Evaluate System hardening from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-23` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate System hardening from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-23` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-23` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-24` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Cloud discovery and shadow IT from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-24` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Cloud discovery and shadow IT from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-24` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-24` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `PA-25` | compliant | All required source reads are complete and this derivation returns pass: Evaluate CI/CD pipeline security from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `PA-25` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate CI/CD pipeline security from complete Prisma Cloud or PAN-OS raw inventories: unreadable product surfaces remain manual, a proved violation takes precedence over partial companion reads, partial or review records warn, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `PA-25` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `PA-25` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | CSPM Compliance Posture | CA-7, RA-5 | C.2.4, C.3.4 | CC7.1 | CIS CSC 4 | 6.3, 11.3 | V-XXXXX | ISM-1526 | 8.1.1 |
-| 2 | Alert Policy Coverage | SI-4, IR-5 | C.2.1, C.5.3 | CC7.2, CC7.3 | CIS CSC 6 | 10.4, 12.10 | V-XXXXX | ISM-0120 | 8.2.1 |
-| 3 | IAM Overprivileged Access | AC-6, AC-2 | C.1.1, C.1.4 | CC6.1, CC6.3 | CIS CSC 5, 6 | 7.1, 7.2 | V-XXXXX | ISM-1506 | 6.1.1 |
-| 4 | Cloud Account Governance | CA-2, CM-8 | C.2.2, C.4.1 | CC6.6, CC8.1 | CIS CSC 1 | 2.4, 12.5 | V-XXXXX | ISM-1555 | 4.1.1 |
-| 5 | Network Exposure Analysis | SC-7, AC-4 | C.3.13, C.4.6 | CC6.1, CC6.6 | CIS CSC 9, 12 | 1.2, 1.3 | V-XXXXX | ISM-1416 | 7.1.1 |
-| 6 | Encryption at Rest | SC-28, SC-12 | C.3.8, C.3.10 | CC6.1, CC6.7 | CIS CSC 3 | 3.4, 3.5 | V-XXXXX | ISM-0457 | 7.2.1 |
-| 7 | Container Image Vuln | RA-5, SI-2 | C.3.4, C.5.2 | CC7.1 | CIS CSC 7 | 6.3, 11.3 | V-XXXXX | ISM-1143 | 8.1.2 |
-| 8 | Host Compliance Posture | CM-6, CM-2 | C.2.3, C.3.1 | CC6.1, CC8.1 | CIS CSC 4 | 2.2, 2.3 | V-XXXXX | ISM-1407 | 5.1.1 |
-| 9 | Runtime Protection | SI-4, SI-7 | C.5.3, C.5.2 | CC7.2 | CIS CSC 8 | 11.5 | V-XXXXX | ISM-1233 | 8.3.1 |
-| 10 | Defender Deployment | SI-4, CM-8 | C.2.4, C.5.1 | CC6.1, CC7.1 | CIS CSC 1, 2 | 11.4 | V-XXXXX | ISM-1034 | 8.1.3 |
-| 11 | Registry Scanning | RA-5, CM-3 | C.3.4, C.5.2 | CC7.1, CC8.1 | CIS CSC 7 | 6.3 | V-XXXXX | ISM-1143 | 8.1.4 |
-| 12 | Firewall Rule Audit | AC-4, SC-7 | C.3.13, C.4.6 | CC6.1, CC6.6 | CIS CSC 9 | 1.2, 1.3 | V-207184 | ISM-1416 | 7.1.2 |
-| 13 | Zone Segmentation | SC-7, AC-4 | C.3.12, C.3.13 | CC6.1, CC6.6 | CIS CSC 12 | 1.2, 1.4 | V-207187 | ISM-1181 | 7.1.3 |
-| 14 | SSL/TLS Decryption | SC-8, SI-4 | C.3.8, C.5.3 | CC6.1, CC6.7 | CIS CSC 9 | 4.1, 4.2 | V-207190 | ISM-0490 | 7.2.2 |
-| 15 | GlobalProtect Config | IA-2, AC-17 | C.1.1, C.3.7 | CC6.1, CC6.2 | CIS CSC 13 | 8.3, 8.4 | V-207193 | ISM-1504 | 6.2.1 |
-| 16 | Threat Prevention | SI-3, SI-4 | C.5.2, C.5.3 | CC6.8, CC7.1 | CIS CSC 8, 10 | 5.2, 5.3 | V-207196 | ISM-1288 | 8.2.2 |
-| 17 | WildFire Analysis | SI-3, SI-4 | C.5.2, C.5.3 | CC6.8, CC7.1 | CIS CSC 8, 10 | 5.2 | V-207199 | ISM-1288 | 8.2.3 |
-| 18 | URL Filtering | SC-7, SI-4 | C.3.13, C.5.3 | CC6.1, CC6.8 | CIS CSC 9 | 1.2, 6.2 | V-207202 | ISM-0261 | 7.3.1 |
-| 19 | Admin Role Audit | AC-2, AC-6 | C.1.1, C.1.4 | CC6.1, CC6.3 | CIS CSC 5, 6 | 7.1, 8.2 | V-207205 | ISM-1506 | 6.1.2 |
-| 20 | Logging & SIEM | AU-2, AU-6 | C.3.1, C.3.3 | CC7.2, CC7.3 | CIS CSC 6, 8 | 10.1, 10.2 | V-207208 | ISM-0580 | 8.4.1 |
-| 21 | Data Loss Prevention | SC-28, SI-4 | C.3.8, C.5.3 | CC6.1, CC6.7 | CIS CSC 3 | 3.4, 3.5 | V-XXXXX | ISM-0457 | 7.2.3 |
-| 22 | File Blocking | SI-3, SC-7 | C.5.2, C.5.3 | CC6.8 | CIS CSC 8, 10 | 5.2 | V-XXXXX | ISM-1288 | 8.2.4 |
-| 23 | System Hardening | CM-6, CM-7 | C.2.3, C.3.1 | CC6.1, CC8.1 | CIS CSC 4 | 2.2, 2.3 | V-207211 | ISM-0380 | 5.1.2 |
-| 24 | Cloud Discovery | CM-8, RA-5 | C.2.2, C.2.4 | CC6.1, CC7.1 | CIS CSC 1 | 11.2 | V-XXXXX | ISM-1034 | 4.1.2 |
-| 25 | CI/CD Pipeline Security | SA-11, CM-3 | C.3.4, C.5.2 | CC8.1 | CIS CSC 7 | 6.3, 6.5 | V-XXXXX | ISM-1143 | 9.1.1 |
+| 1 | CSPM compliance posture | CA-7, RA-5 | C.2.4, C.3.4 | CC7.1 | CIS CSC 4 | 6.3, 11.3 | V-XXXXX | ISM-1526 | 8.1.1 |
+| 2 | Alert policy coverage | SI-4, IR-5 | C.2.1, C.5.3 | CC7.2, CC7.3 | CIS CSC 6 | 10.4, 12.10 | V-XXXXX | ISM-0120 | 8.2.1 |
+| 3 | IAM overprivileged access | AC-6, AC-2 | C.1.1, C.1.4 | CC6.1, CC6.3 | CIS CSC 5, CIS CSC 6 | 7.1, 7.2 | V-XXXXX | ISM-1506 | 6.1.1 |
+| 4 | Cloud account governance | CA-2, CM-8 | C.2.2, C.4.1 | CC6.6, CC8.1 | CIS CSC 1 | 2.4, 12.5 | V-XXXXX | ISM-1555 | 4.1.1 |
+| 5 | Network exposure analysis | SC-7, AC-4 | C.3.13, C.4.6 | CC6.1, CC6.6 | CIS CSC 9, CIS CSC 12 | 1.2, 1.3 | V-XXXXX | ISM-1416 | 7.1.1 |
+| 6 | Encryption at rest verification | SC-28, SC-12 | C.3.8, C.3.10 | CC6.1, CC6.7 | CIS CSC 3 | 3.4, 3.5 | V-XXXXX | ISM-0457 | 7.2.1 |
+| 7 | Container image vulnerability | RA-5, SI-2 | C.3.4, C.5.2 | CC7.1 | CIS CSC 7 | 6.3, 11.3 | V-XXXXX | ISM-1143 | 8.1.2 |
+| 8 | Host compliance posture | CM-6, CM-2 | C.2.3, C.3.1 | CC6.1, CC8.1 | CIS CSC 4 | 2.2, 2.3 | V-XXXXX | ISM-1407 | 5.1.1 |
+| 9 | Runtime protection policies | SI-4, SI-7 | C.5.3, C.5.2 | CC7.2 | CIS CSC 8 | 11.5 | V-XXXXX | ISM-1233 | 8.3.1 |
+| 10 | Defender deployment coverage | SI-4, CM-8 | C.2.4, C.5.1 | CC6.1, CC7.1 | CIS CSC 1, CIS CSC 2 | 11.4 | V-XXXXX | ISM-1034 | 8.1.3 |
+| 11 | Registry scanning configuration | RA-5, CM-3 | C.3.4, C.5.2 | CC7.1, CC8.1 | CIS CSC 7 | 6.3 | V-XXXXX | ISM-1143 | 8.1.4 |
+| 12 | Firewall security rule audit | AC-4, SC-7 | C.3.13, C.4.6 | CC6.1, CC6.6 | CIS CSC 9 | 1.2, 1.3 | V-207184 | ISM-1416 | 7.1.2 |
+| 13 | Zone segmentation verification | SC-7, AC-4 | C.3.12, C.3.13 | CC6.1, CC6.6 | CIS CSC 12 | 1.2, 1.4 | V-207187 | ISM-1181 | 7.1.3 |
+| 14 | SSL/TLS decryption coverage | SC-8, SI-4 | C.3.8, C.5.3 | CC6.1, CC6.7 | CIS CSC 9 | 4.1, 4.2 | V-207190 | ISM-0490 | 7.2.2 |
+| 15 | GlobalProtect VPN configuration | IA-2, AC-17 | C.1.1, C.3.7 | CC6.1, CC6.2 | CIS CSC 13 | 8.3, 8.4 | V-207193 | ISM-1504 | 6.2.1 |
+| 16 | Threat prevention profiles | SI-3, SI-4 | C.5.2, C.5.3 | CC6.8, CC7.1 | CIS CSC 8, CIS CSC 10 | 5.2, 5.3 | V-207196 | ISM-1288 | 8.2.2 |
+| 17 | WildFire analysis configuration | SI-3, SI-4 | C.5.2, C.5.3 | CC6.8, CC7.1 | CIS CSC 8, CIS CSC 10 | 5.2 | V-207199 | ISM-1288 | 8.2.3 |
+| 18 | URL filtering enforcement | SC-7, SI-4 | C.3.13, C.5.3 | CC6.1, CC6.8 | CIS CSC 9 | 1.2, 6.2 | V-207202 | ISM-0261 | 7.3.1 |
+| 19 | Admin role and access audit | AC-2, AC-6 | C.1.1, C.1.4 | CC6.1, CC6.3 | CIS CSC 5, CIS CSC 6 | 7.1, 8.2 | V-207205 | ISM-1506 | 6.1.2 |
+| 20 | Logging and SIEM integration | AU-2, AU-6 | C.3.1, C.3.3 | CC7.2, CC7.3 | CIS CSC 6, CIS CSC 8 | 10.1, 10.2 | V-207208 | ISM-0580 | 8.4.1 |
+| 21 | Data loss prevention | SC-28, SI-4 | C.3.8, C.5.3 | CC6.1, CC6.7 | CIS CSC 3 | 3.4, 3.5 | V-XXXXX | ISM-0457 | 7.2.3 |
+| 22 | File blocking policies | SI-3, SC-7 | C.5.2, C.5.3 | CC6.8 | CIS CSC 8, CIS CSC 10 | 5.2 | V-XXXXX | ISM-1288 | 8.2.4 |
+| 23 | System hardening | CM-6, CM-7 | C.2.3, C.3.1 | CC6.1, CC8.1 | CIS CSC 4 | 2.2, 2.3 | V-207211 | ISM-0380 | 5.1.2 |
+| 24 | Cloud discovery and shadow IT | CM-8, RA-5 | C.2.2, C.2.4 | CC6.1, CC7.1 | CIS CSC 1 | 11.2 | V-XXXXX | ISM-1034 | 4.1.2 |
+| 25 | CI/CD pipeline security | SA-11, CM-3 | C.3.4, C.5.2 | CC8.1 | CIS CSC 7 | 6.3, 6.5 | V-XXXXX | ISM-1143 | 9.1.1 |
 
-## 6. Existing Tools
+## Collection states
 
-| Tool | Description | Relevance |
-|---|---|---|
-| [Checkov](https://github.com/bridgecrewio/checkov) | Open-source IaC security scanner by Bridgecrew (now Prisma Cloud); 750+ built-in policies for Terraform, CloudFormation, Kubernetes, Docker | Reference for CSPM policy logic; can be invoked alongside paloalto-sec-inspector for IaC scanning |
-| [ScoutSuite](https://github.com/nccgroup/ScoutSuite) | Multi-cloud security auditing tool by NCC Group; generates HTML reports from API-gathered cloud configuration data | Reference for cloud posture data collection patterns and report generation |
-| [pan-os-python](https://github.com/PaloAltoNetworks/pan-os-python) | Official PAN-OS SDK for Python; object model for Firewall, Panorama, SecurityRule, Zone, etc. | Primary SDK for PAN-OS configuration auditing; use as data collection layer |
-| [prismacloud-api-python](https://github.com/PaloAltoNetworks/prismacloud-api-python) | Official Prisma Cloud Python SDK for CSPM, CWPP, and CCS APIs with reference scripts | SDK for Prisma Cloud data collection |
-| [prismacloud-cli](https://pypi.org/project/prismacloud-cli/) | CLI tool wrapping Prisma Cloud APIs for operational workflows | Reference for CLI patterns and API interaction |
-| [pango](https://github.com/PaloAltoNetworks/pango) | Go library for PAN-OS (community/Palo Alto); alternative to pan-os-python for Go implementations | Potential Go SDK for PAN-OS auditing if building in Go |
-| [Iron-Skillet](https://github.com/PaloAltoNetworks/iron-skillet) | Day-one security best practice configuration templates for PAN-OS | Reference for security baseline comparison |
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
 
-## 7. Architecture
+## Integration-specific scrubbing
 
-The project mirrors the structure of [okta-inspector-py](https://github.com/hackIDLE/okta-inspector-py):
+Shared contract version: 1.1.
 
-```
-paloalto-sec-inspector/
-├── spec.md
-├── pyproject.toml
-├── src/
-│   └── paloalto_inspector/
-│       ├── __init__.py
-│       ├── __main__.py
-│       ├── cli.py                  # Click/Typer CLI entrypoint
-│       ├── client.py               # API client abstraction (Prisma Cloud + PAN-OS)
-│       ├── clients/
-│       │   ├── __init__.py
-│       │   ├── prisma_cspm.py      # Prisma Cloud CSPM API client
-│       │   ├── prisma_cwpp.py      # Prisma Cloud CWPP/Compute API client
-│       │   └── panos.py            # PAN-OS XML/REST API client
-│       ├── collector.py            # Orchestrates data collection across all clients
-│       ├── engine.py               # Compliance evaluation engine
-│       ├── models.py               # Data models (controls, findings, severities)
-│       ├── output.py               # Output formatting (JSON, table, summary)
-│       ├── analyzers/
-│       │   ├── __init__.py
-│       │   ├── base.py             # Base analyzer class
-│       │   ├── common.py           # Shared control evaluation logic
-│       │   ├── cspm.py             # Prisma Cloud CSPM controls (1-6)
-│       │   ├── cwpp.py             # Prisma Cloud CWPP controls (7-11, 24-25)
-│       │   ├── panos.py            # PAN-OS controls (12-18, 21-23)
-│       │   ├── cross_platform.py   # Cross-platform controls (19-20)
-│       │   ├── fedramp.py          # FedRAMP-specific evaluation
-│       │   ├── cmmc.py             # CMMC 2.0-specific evaluation
-│       │   ├── soc2.py             # SOC 2-specific evaluation
-│       │   ├── pci_dss.py          # PCI-DSS 4.0-specific evaluation
-│       │   ├── stig.py             # DISA STIG-specific evaluation
-│       │   ├── irap.py             # IRAP-specific evaluation
-│       │   └── ismap.py            # ISMAP-specific evaluation
-│       └── reporters/
-│           ├── __init__.py
-│           ├── base.py             # Base reporter class
-│           ├── executive.py        # Executive summary reporter
-│           ├── matrix.py           # Cross-framework compliance matrix
-│           ├── fedramp.py          # FedRAMP SSP-ready output
-│           ├── cmmc.py             # CMMC assessment report
-│           ├── soc2.py             # SOC 2 evidence report
-│           ├── pci_dss.py          # PCI-DSS compliance report
-│           ├── stig.py             # DISA STIG checklist (CKL format)
-│           ├── irap.py             # IRAP assessment report
-│           ├── ismap.py            # ISMAP assessment report
-│           └── validation.py       # Finding validation and dedup
-├── tests/
-│   ├── conftest.py
-│   ├── test_cspm_analyzer.py
-│   ├── test_cwpp_analyzer.py
-│   ├── test_panos_analyzer.py
-│   ├── test_engine.py
-│   └── testdata/
-│       ├── prisma_compliance_posture.json
-│       ├── prisma_alerts.json
-│       ├── cwpp_images.json
-│       ├── cwpp_defenders.json
-│       ├── panos_security_rules.xml
-│       ├── panos_zones.xml
-│       └── panos_system_config.xml
-└── COPYING
-```
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
 
-**Key design decisions:**
-- **Multiple clients** (`clients/` subpackage) because the tool interfaces with three distinct APIs (CSPM, CWPP, PAN-OS), each with different auth and transport.
-- **Analyzer per domain** (`cspm.py`, `cwpp.py`, `panos.py`) plus cross-platform analyzers for controls that span APIs (e.g., admin roles exist in both Prisma Cloud and PAN-OS).
-- **Framework-specific analyzers** map the 25 controls to specific framework requirements with detailed evidence collection.
-- **Reporter per framework** generates framework-specific output formats (e.g., STIG CKL XML, FedRAMP SSP narrative).
+Sensitive fields and values: accessKey, secretKey, apiKey, password, authorization, cookie, token
 
-## 8. CLI Interface
+Credential formats: Prisma access and secret keys, Prisma Compute bearer tokens, PAN-OS API keys, PAN-OS administrator passwords
 
-```bash
-# Full audit across all three surfaces
-paloalto-inspector audit \
-  --prisma-url "$PRISMA_API_URL" \
-  --prisma-access-key "$PRISMA_ACCESS_KEY_ID" \
-  --prisma-secret-key "$PRISMA_SECRET_KEY" \
-  --panos-host "$PANOS_HOST" \
-  --panos-api-key "$PANOS_API_KEY" \
-  --format json \
-  --output report.json
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
 
-# CSPM-only audit
-paloalto-inspector audit --scope cspm \
-  --prisma-url "$PRISMA_API_URL" \
-  --prisma-access-key "$PRISMA_ACCESS_KEY_ID" \
-  --prisma-secret-key "$PRISMA_SECRET_KEY" \
-  --framework fedramp \
-  --format table
+Integration-specific rules:
 
-# CWPP-only audit (containers and hosts)
-paloalto-inspector audit --scope cwpp \
-  --prisma-url "$PRISMA_API_URL" \
-  --prisma-access-key "$PRISMA_ACCESS_KEY_ID" \
-  --prisma-secret-key "$PRISMA_SECRET_KEY" \
-  --controls 7,8,9,10,11
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
 
-# PAN-OS firewall audit
-paloalto-inspector audit --scope panos \
-  --panos-host 10.0.0.1 \
-  --panos-api-key "$PANOS_API_KEY" \
-  --framework stig \
-  --format stig-ckl \
-  --output firewall-stig.ckl
+Projected fields by surface:
 
-# Panorama-managed multi-firewall audit
-paloalto-inspector audit --scope panos \
-  --panos-host panorama.corp.com \
-  --panos-api-key "$PANOS_API_KEY" \
-  --panorama \
-  --device-group "Production-DG" \
-  --format json
+| Surface | Allowed fields |
+|---|---|
+| `prisma-cspm` | `compliance`, `severity`, `status`, `policy`, `cloudAccount`, `role`, `integration` |
+| `prisma-compute` | `rules`, `collections`, `effect`, `status`, `specifications`, `vulnerabilities` |
+| `panos-operational` | `hostname`, `sw-version`, `app-version`, `threat-version`, `ha` |
+| `panos-configuration` | `security rules`, `zones`, `decryption rules`, `profiles`, `administrators`, `logging`, `deviceconfig` |
 
-# Generate executive summary
-paloalto-inspector report executive \
-  --input report.json \
-  --format html
+## Export layout
 
-# Generate compliance matrix
-paloalto-inspector report matrix \
-  --input report.json \
-  --frameworks fedramp,cmmc,pci-dss \
-  --format csv
+Required paths:
 
-# List available controls
-paloalto-inspector controls list --scope all
+- `QUICK_REFERENCE.md`
+- `metadata.json`
+- `core_data/access.json`
+- `analysis/findings.json`
+- `analysis/cloud_posture.json`
+- `analysis/firewall_policy.json`
+- `analysis/threat_prevention.json`
+- `analysis/device_hardening.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp.md`
+- `compliance/cmmc.md`
+- `compliance/soc2.md`
+- `compliance/cis.md`
+- `compliance/pci-dss.md`
+- `compliance/disa-stig.md`
+- `compliance/irap.md`
+- `compliance/ismap.md`
 
-# Validate connectivity
-paloalto-inspector test-connection \
-  --prisma-url "$PRISMA_API_URL" \
-  --prisma-access-key "$PRISMA_ACCESS_KEY_ID" \
-  --prisma-secret-key "$PRISMA_SECRET_KEY" \
-  --panos-host "$PANOS_HOST" \
-  --panos-api-key "$PANOS_API_KEY"
-```
+Conditional paths:
 
-## 9. Build Sequence
+- `core_data/prisma_cloud.json`
+- `core_data/panos_{host}.json`
+- `_errors.log`
 
-| Phase | Scope | Deliverables |
-|---|---|---|
-| **Phase 1: Foundation** | Project scaffold, models, CLI skeleton | `pyproject.toml`, `models.py`, `cli.py`, `engine.py`, `output.py` |
-| **Phase 2: PAN-OS Client** | PAN-OS XML/REST API client, auth, connection test | `clients/panos.py`, `test_connection` command |
-| **Phase 3: PAN-OS Analyzers** | Controls 12-18, 21-23 (firewall/Panorama auditing) | `analyzers/panos.py`, test fixtures, `testdata/*.xml` |
-| **Phase 4: Prisma CSPM Client** | CSPM API client, JWT auth, compliance posture collection | `clients/prisma_cspm.py` |
-| **Phase 5: CSPM Analyzers** | Controls 1-6 (cloud posture, IAM, encryption, alerts) | `analyzers/cspm.py`, `testdata/prisma_*.json` |
-| **Phase 6: CWPP Client** | Compute API client, image/host/defender collection | `clients/prisma_cwpp.py` |
-| **Phase 7: CWPP Analyzers** | Controls 7-11, 24-25 (container, host, runtime, CI/CD) | `analyzers/cwpp.py`, `testdata/cwpp_*.json` |
-| **Phase 8: Cross-Platform** | Controls 19-20 (admin roles, logging spanning APIs) | `analyzers/cross_platform.py` |
-| **Phase 9: Framework Analyzers** | Framework-specific mapping and evidence logic | `analyzers/{fedramp,cmmc,soc2,pci_dss,stig,irap,ismap}.py` |
-| **Phase 10: Reporters** | Framework-specific report generation | `reporters/` (all framework reporters, matrix, executive) |
-| **Phase 11: Testing & Polish** | Integration tests, CI pipeline, documentation | `tests/`, CI config, README |
+### Artifact schemas
 
-## 10. Status
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/cloud_posture.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/firewall_policy.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/threat_prevention.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/device_hardening.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci-dss.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa-stig.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `core_data/prisma_cloud.json` | json | When Prisma Cloud credentials are configured and a Prisma snapshot is collected. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/panos_{host}.json` | json | Once for each configured PAN-OS host whose snapshot collection was attempted. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `_errors.log` | text | When any Prisma Cloud or PAN-OS collection error was recorded. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 
-**Implemented in grclanker (TypeScript) as native tools; the standalone Python/Go layout in sections 7-9 was not built.**
+### Record schemas
 
-What shipped:
+#### finding
 
-- Prisma Cloud CSPM client with `POST /login` JWT auth, re-login on `401`, `429`/`5xx` retry with backoff, timeouts, pagination for `GET /v2/alert` (`pageToken`/`nextPageToken`), and secret redaction in errors
-- PAN-OS XML API client with `type=keygen` (credentials in the POST body), `X-PAN-KEY` header auth, a dependency-free XML parser, `type=op` show commands, and `type=config&action=show` subtree collection for firewalls and Panorama
-- Prisma Cloud Compute client: console located through `PRISMA_COMPUTE_URL` or the CSPM `GET /meta_info` field `twistlockUrl`, authenticated with `POST /api/v1/authenticate` (access key credentials, Bearer token) with fallback to the CSPM JWT in `x-redlock-auth`; `limit`/`offset` paging with recorded truncation; read endpoints `/defenders`, `/policies/runtime/container`, `/policies/compliance/container`, `/policies/compliance/host`, `/policies/vulnerability/images`, `/settings/registry`, `/registry`, `/images`, `/stats/vulnerabilities`, `/stats/compliance`, `/cloud/discovery`, `/scans`
-- All 25 controls emit a finding: controls 1-6, 7-11, 24, and 12-23 are evaluated from API evidence; control 25 evaluates CI scan results but caps at `warn` because admission control has no verified public read endpoint; when a product or the Compute console is not configured its controls become `manual` findings naming the missing credential or URL
-- Verdict-safety rules are enforced by an evidence gate on every finding: unreadable or forbidden evidence forces `manual`, empty inventories are `fail` or `manual` per control intent (stated in the summary), scoped-out or unlicensed controls are `manual`, undated items cap at `warn`, partial inventories (unreachable device, truncated alert or Compute page) cap at `warn` with seen and total counts, enabling flags must be read as true, alert pagination runs to completion or records truncation, and export reruns never overwrite a prior bundle
-- TLS verification opt-out (`PANOS_VERIFY_TLS=false`) is scoped to the PAN-OS clients through a dedicated `node:https` transport; `NODE_TLS_REJECT_UNAUTHORIZED` is never set
-- Evidence bundle with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip archive
+- `id`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `framework mappings`
 
-Deviations from this spec, following the official documentation:
+#### collection_marker
 
-- Compliance posture uses `GET /v2/compliance/posture` (documented V2 endpoint) rather than `/compliance/posture`
-- Alert rules use `GET /v2/alert/rule`. `GET /alert/policy` is documented ("List Alert Counts By Policy", Alerts.json) but returns open alert counts grouped by policy, not the alert rule configuration (enabled state, scan targets, notification channels) that control 2 evaluates; the open critical alerts side of control 2 comes from `GET /v2/alert`, which carries the same policy grouping per alert
-- IAM overprivilege (control 3) is evaluated from IAM-type policies (`GET /v2/policy`) and open `iam` alerts (`GET /v2/alert`) rather than the documented `POST /api/v1/permission` ("Get Permissions", IAMMicroService.json) and `GET /api/v1/permission/alert/search` ("Get IAM Query"). The choice is deliberate: the permission endpoint executes a caller-supplied IAM RQL query and returns raw permission rows, so the tool would have to hard-code its own definition of "overprivileged" in RQL that cannot be validated without a licensed CIEM tenant, while the built-in IAM policies already encode Palo Alto Networks' overprivilege detections and their open alerts are the tenant's own verdict. `GET /api/v1/permission/alert/search` only returns the RQL behind a single alert ID, so it is not an inventory source. The `/iam/query` path in section 2.1 has no page in the current reference
-- Audit log retrieval is documented as `POST /audit/api/v1/log`, not `/audit/redlock`; the implementation does not need audit logs
-- The Prisma Cloud JWT is refreshed by logging in again; `GET /auth_token/extend` is documented and could replace that
-- The SIEM check in control 20 reads `GET /api/v1/tenant/{prismaId}/integration` ("List Integrations", IntegrationsMicroService.json), which returns the push integrations (Splunk, Amazon SQS, webhook, ServiceNow, Microsoft Teams, and so on); `prismaId` is taken from `customerNames[].prismaId` in the login response. The section 2.1 path `GET /integration` ("List All Integrations", IntegrationsPull.json) is documented but only returns the Okta, Qualys, and Tenable pull integrations, so it is used only as a fallback when the login response carries no `prismaId`. A failure on either surface makes the Prisma Cloud half of PA-20 manual and is written to `_errors.log`
-- The PAN-OS REST API (section 2.4) is not used; every device read goes through the XML API so one client covers PAN-OS 9.x through 11.x and Panorama
-- Compute endpoints are called under `/api/v1/` (the documented paths carry a version segment such as `/api/v34.04/`); `/audits/runtime/container`, `/defenders/summary`, `/compliance`, and `/hosts` from section 4 are not needed because the policy and stats endpoints carry the verdict evidence
-- Control 7 reads `GET /stats/vulnerabilities` as the documented array of `types.VulnerabilityStats`, summing the `cves.critical` and `cves.high` distributions of the `images`, `registryImages`, `containers`, `hosts`, and `functions` members, and combines that with `vulnerabilityDistribution` on the `GET /images` scan results (the stricter count drives the verdict)
-- Control 8 uses `GET /stats/compliance` (documented `types.ComplianceStats`) for the compliance rate instead of a per-host `/compliance` listing; the rate is derived from `rules[]` (or `categories[]` when rules carry no totals) as `1 - sum(failed) / sum(total)`, since the schema exposes no precomputed rate. Controls 8 and 9 also require `GET /defenders` to be readable and at least one Defender with `connected=true`, because a compliance or prevent-effect rule with an unknown Defender population is not verified enforcement
-- The supplementary PAN-OS software version finding (`PA-SW-01`) and HA state finding (`PA-HA-01`) are mapped to control 23 (system hardening, CM-6 and CM-7) and listed in a separate section of the unified compliance matrix, which keeps exactly one row per numbered control
-- Control 25: the admission control policy read endpoint could not be located on the public pan.dev CWPP reference (https://pan.dev/prisma-cloud/api/cwpp/), so admission rules stay a manual review inside the finding and the verdict caps at `warn`
-- The CSPM `GET /meta_info` reference page is not published on pan.dev; the PCEE access guide (https://pan.dev/prisma-cloud/api/cwpp/access-api-saas/) documents copying the console path from Compute > Manage > System > Utilities, which `PRISMA_COMPUTE_URL` carries
+- `collected`
+- `status`
+- `endpoint`
+- `error`
 
-What remains:
+#### bundle_result
 
-- Admission control (OPA) evidence for control 25 once a public read endpoint is documented
-- WildFire cloud connectivity (`show wildfire status`), GlobalProtect HIP requirements, admin MFA enforcement details, and log retention quotas are surfaced as review notes rather than automated checks
-- Framework-specific output formats such as STIG CKL XML
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+#### assessment
+
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
+
+#### pagination_state
+
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
+
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
+
+Overwrite policy: Allocate a new Palo Alto audit directory and numeric suffix without overwriting an existing directory or archive.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create <allocated-directory>.zip beside the allocated Palo Alto audit directory.

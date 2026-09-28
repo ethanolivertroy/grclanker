@@ -2,352 +2,946 @@
 slug: "cloudflare-sec-inspector"
 name: "Cloudflare Security Inspector"
 vendor: "Cloudflare"
-category: "security-network-infrastructure"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/cloudflare-sec-inspector"
+category: "edge-security"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# Cloudflare Security Inspector — Architecture Specification
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
 
-## 1. Overview
+# Cloudflare Security Inspector
 
-**cloudflare-sec-inspector** is a security compliance inspection tool for Cloudflare environments. It audits WAF configurations, Zero Trust access policies, SSL/TLS settings, DDoS protections, DNS security, API token permissions, and account-level security controls across all zones and accounts via the Cloudflare API v4. The tool produces structured findings mapped to major compliance frameworks, enabling security teams to identify misconfigurations, enforce defense-in-depth, and maintain continuous compliance posture.
+Portable contract for the shipped Cloudflare identity, zone-security, and traffic-control assessments.
 
-Written in Go with a hybrid CLI/TUI architecture, it supports both automated pipeline execution (JSON/SARIF output) and interactive exploration of findings.
+## Purpose
 
-## 2. APIs & SDKs
+Give security and compliance teams a read-only, repeatable view of Cloudflare identity, zone, edge, and Zero Trust controls without treating an unlicensed, denied, or unreadable feature as compliant.
 
-### Cloudflare API v4
+## Design guidance
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /client/v4/zones` | List all zones in the account |
-| `GET /client/v4/zones/{zone_id}/settings` | Zone-level security settings (SSL, HSTS, TLS, etc.) |
-| `GET /client/v4/zones/{zone_id}/firewall/rules` | Firewall rules inventory |
-| `GET /client/v4/zones/{zone_id}/firewall/waf/packages` | WAF managed rulesets |
-| `GET /client/v4/zones/{zone_id}/firewall/waf/packages/{pkg_id}/groups` | WAF rule groups |
-| `GET /client/v4/zones/{zone_id}/rulesets` | Zone rulesets (new WAF engine) |
-| `GET /client/v4/zones/{zone_id}/dns_records` | DNS records for DNSSEC and record audit |
-| `GET /client/v4/zones/{zone_id}/dnssec` | DNSSEC status |
-| `GET /client/v4/zones/{zone_id}/ssl/certificate_packs` | SSL certificate inventory |
-| `GET /client/v4/zones/{zone_id}/ssl/universal/settings` | Universal SSL settings |
-| `GET /client/v4/zones/{zone_id}/bot_management` | Bot management configuration |
-| `GET /client/v4/zones/{zone_id}/rate_limits` | Rate limiting rules |
-| `GET /client/v4/zones/{zone_id}/pagerules` | Page rules (security-relevant) |
-| `GET /client/v4/accounts/{account_id}/access/apps` | Zero Trust Access applications |
-| `GET /client/v4/accounts/{account_id}/access/policies` | Zero Trust Access policies |
-| `GET /client/v4/accounts/{account_id}/access/identity_providers` | Identity provider config |
-| `GET /client/v4/accounts/{account_id}/gateway/rules` | Gateway (SWG) rules |
-| `GET /client/v4/accounts/{account_id}/audit_logs` | Account audit log |
-| `GET /client/v4/accounts/{account_id}/members` | Account member roles |
-| `GET /client/v4/user/tokens` | API token inventory |
-| `GET /client/v4/user/tokens/verify` | Verify current token permissions |
-| `GET /client/v4/accounts/{account_id}/firewall/access_rules/rules` | IP access rules |
+Prefer a scoped API token over a Global API Key. Select an account explicitly when more than one is visible. Preserve plan limitations, per-zone read failures, pagination state, and configured sampling caps as evidence.
 
-**Base URL:** `https://api.cloudflare.com`
+## Shared integration contract
 
-### SDKs and Libraries
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
 
-| Name | Language | Notes |
-|------|----------|-------|
-| `cloudflare-go` | Go | Official Go SDK |
-| `cloudflare` (python-cloudflare) | Python | Community Python SDK |
-| `wrangler` | Node.js | Workers CLI with API access |
-| `flarectl` | Go | Official CLI tool |
-| Terraform Provider (`cloudflare`) | HCL | Official IaC provider |
+## Known runtime gaps
 
-## 3. Authentication
+- Account context is explicit or discovered only when exactly one readable account is visible; ambiguous or unreadable account context keeps account checks manual.
+- Zone findings aggregate per-zone judgments, and a proved failing zone has precedence over warnings while any unreadable sampled zone prevents pass.
+- Every paged result retains seen, reported total, page count, and truncation; finding evidence arrays are presentation samples only.
+- Feature and plan ambiguity is preserved as manual evidence where the API cannot distinguish an unlicensed feature from an empty configuration.
 
-### API Token (Recommended)
+## Tools
 
-```
-Authorization: Bearer <api-token>
-```
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `cloudflare_check_access` | Validate read-only Cloudflare access across token verification, accounts, zones, zone settings, DNSSEC, rulesets, members, Zero Trust apps, and audit logs. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `cloudflare_assess_identity` | Assess Cloudflare authentication method, token verification and scoping, API token expiration, member privilege concentration, Zero Trust Access coverage, and identity provider posture. | `CF-IAM-01`, `CF-IAM-02`, `CF-IAM-03`, `CF-IAM-04`, `CF-IAM-05`, `CF-IAM-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `cloudflare_assess_zone_security` | Assess Cloudflare zone security across WAF managed and custom rulesets, HTTP DDoS sensitivity, strict SSL, minimum TLS, HSTS, HTTPS enforcement, DNSSEC, Universal SSL certificates, Authenticated Origin Pulls, Browser Integrity Check, email obfuscation, security header transform rules, and DNS origin exposure. | `CF-ZONE-01`, `CF-ZONE-02`, `CF-ZONE-03`, `CF-ZONE-04`, `CF-ZONE-05`, `CF-ZONE-06`, `CF-ZONE-07`, `CF-ZONE-08`, `CF-ZONE-09`, `CF-ZONE-10`, `CF-ZONE-11`, `CF-ZONE-12`, `CF-ZONE-13`, `CF-ZONE-14`, `CF-ZONE-15` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `cloudflare_assess_traffic_controls` | Assess Cloudflare traffic and edge control posture across rate limiting rulesets, page rules, bot management, account audit logs, IP access rules, and Gateway policies. | `CF-TRF-01`, `CF-TRF-02`, `CF-TRF-03`, `CF-TRF-04`, `CF-TRF-05`, `CF-TRF-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `cloudflare_export_audit_bundle` | Export a Cloudflare audit package with access checks, identity, zone security, and traffic-control findings, per-framework compliance reports, JSON analysis, raw core data, an errors log on partial failure, and a zip archive. | `CF-IAM-01`, `CF-IAM-02`, `CF-IAM-03`, `CF-IAM-04`, `CF-IAM-05`, `CF-IAM-06`, `CF-ZONE-01`, `CF-ZONE-02`, `CF-ZONE-03`, `CF-ZONE-04`, `CF-ZONE-05`, `CF-ZONE-06`, `CF-ZONE-07`, `CF-ZONE-08`, `CF-ZONE-09`, `CF-ZONE-10`, `CF-ZONE-11`, `CF-ZONE-12`, `CF-ZONE-13`, `CF-ZONE-14`, `CF-ZONE-15`, `CF-TRF-01`, `CF-TRF-02`, `CF-TRF-03`, `CF-TRF-04`, `CF-TRF-05`, `CF-TRF-06` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
 
-- Scoped tokens with specific zone/account permissions
-- Created via Cloudflare Dashboard > My Profile > API Tokens
-- Supports fine-grained permission control
+### Parameters
 
-### Global API Key (Legacy)
+#### `cloudflare_check_access`
 
-```
-X-Auth-Email: user@example.com
-X-Auth-Key: <global-api-key>
-```
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_token` | string | no | Cloudflare API token. Defaults to CLOUDFLARE_API_TOKEN. |
+| `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
+| `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
+| `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
 
-- Full account access, not recommended for production use
-- The inspector will warn if a global API key is detected
+#### `cloudflare_assess_identity`
 
-### Required Token Permissions
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_token` | string | no | Cloudflare API token. Defaults to CLOUDFLARE_API_TOKEN. |
+| `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
+| `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
+| `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `max_super_admins` | number | no | Maximum acceptable Super Administrator assignments before failing. Defaults to 2. |
+| `member_limit` | number | no | Maximum account members to inspect. Defaults to 200. |
+| `token_limit` | number | no | Maximum API tokens to inspect. Defaults to 200. |
+| `zone_limit` | number | no | Maximum zones to sample. Defaults to 20. |
 
-| Permission | Scope | Purpose |
-|------------|-------|---------|
-| Zone Settings: Read | All zones | Read zone security settings |
-| Firewall Services: Read | All zones | WAF, firewall rules, rate limits |
-| Zone: Read | All zones | Zone listing and metadata |
-| DNS: Read | All zones | DNSSEC and DNS record audit |
-| SSL and Certificates: Read | All zones | TLS/SSL configuration |
-| Access: Apps and Policies: Read | Account | Zero Trust app/policy audit |
-| Account Settings: Read | Account | Member roles, audit logs |
-| API Tokens: Read | User | Token inventory and permissions |
-| Bot Management: Read | All zones | Bot management config |
-| Page Rules: Read | All zones | Page rule security review |
+#### `cloudflare_assess_zone_security`
 
-### Configuration
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_token` | string | no | Cloudflare API token. Defaults to CLOUDFLARE_API_TOKEN. |
+| `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
+| `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
+| `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `zone_limit` | number | no | Maximum zones to sample. Defaults to 20. |
 
-```bash
-export CLOUDFLARE_API_TOKEN="your-api-token"
-# Or for global key (not recommended):
-# export CLOUDFLARE_API_KEY="your-global-key"
-# export CLOUDFLARE_EMAIL="user@example.com"
-export CLOUDFLARE_ACCOUNT_ID="your-account-id"  # Optional: scope to specific account
-```
+#### `cloudflare_assess_traffic_controls`
 
-Alternatively, configure via `~/.cloudflare-sec-inspector/config.yaml` or CLI flags.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_token` | string | no | Cloudflare API token. Defaults to CLOUDFLARE_API_TOKEN. |
+| `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
+| `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
+| `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `zone_limit` | number | no | Maximum zones to sample. Defaults to 20. |
+| `audit_limit` | number | no | Maximum audit log entries to inspect. Defaults to 200. |
 
-## 4. Security Controls
+#### `cloudflare_export_audit_bundle`
 
-1. **WAF Managed Rules Enabled** — Verify Cloudflare WAF managed rulesets (OWASP, Cloudflare Managed) are enabled on all zones.
-2. **WAF Custom Rules** — Audit custom WAF rules for appropriate blocking actions and coverage of common attack vectors.
-3. **DDoS Protection Settings** — Verify L3/L4 and L7 DDoS protection is enabled with appropriate sensitivity levels.
-4. **Bot Management Configuration** — Check that bot management or Super Bot Fight Mode is enabled and configured appropriately.
-5. **SSL/TLS Mode Full Strict** — Ensure all zones use "Full (Strict)" SSL mode, not "Flexible" or "Off".
-6. **Minimum TLS Version** — Verify minimum TLS version is set to 1.2 or higher across all zones.
-7. **HSTS Enabled** — Confirm HTTP Strict Transport Security is enabled with appropriate max-age (>= 6 months), includeSubDomains, and preload.
-8. **DNSSEC Enabled** — Verify DNSSEC is active on all zones to prevent DNS spoofing.
-9. **Zero Trust Access Policies** — Audit Access applications and policies for proper identity provider integration and policy coverage.
-10. **Zero Trust Identity Providers** — Verify Access identity providers are configured with SSO/MFA-capable providers.
-11. **Audit Logging Active** — Confirm account audit logs are being generated and retained.
-12. **API Token Permissions Scoped** — Detect API tokens with overly broad permissions; flag use of Global API Key.
-13. **API Token Expiration** — Identify API tokens without expiration dates set.
-14. **Account Member Roles** — Audit member roles for least-privilege; detect excessive Super Administrator assignments.
-15. **Page Rules Security** — Review page rules for security-degrading configurations (e.g., SSL disabled, cache everything on sensitive paths).
-16. **Rate Limiting Rules** — Verify rate limiting is configured on authentication endpoints and sensitive API paths.
-17. **IP Access Rules** — Audit IP allowlist/blocklist rules for appropriateness and staleness.
-18. **Origin Certificate Validation** — Check that authenticated origin pulls are enabled for origin server verification.
-19. **Browser Integrity Check** — Verify Browser Integrity Check is enabled to block requests with suspicious headers.
-20. **Email Address Obfuscation** — Confirm email obfuscation is enabled to prevent harvesting.
-21. **Always Use HTTPS** — Verify "Always Use HTTPS" is enabled on all zones.
-22. **Automatic HTTPS Rewrites** — Check that automatic HTTPS rewrites are enabled to fix mixed content.
-23. **Security Headers** — Audit transform rules for security headers (X-Frame-Options, CSP, X-Content-Type-Options).
-24. **Gateway SWG Policies** — Review Cloudflare Gateway policies for DNS/HTTP filtering rules and security categories.
-25. **Universal SSL Status** — Verify Universal SSL certificates are active and not disabled on any zone.
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `api_token` | string | no | Cloudflare API token. Defaults to CLOUDFLARE_API_TOKEN. |
+| `api_key` | string | no | Legacy Cloudflare Global API Key. Defaults to CLOUDFLARE_API_KEY. |
+| `email` | string | no | Cloudflare account email for Global API Key auth. Defaults to CLOUDFLARE_EMAIL. |
+| `account_id` | string | no | Cloudflare account ID for account-scoped checks. Defaults to CLOUDFLARE_ACCOUNT_ID. |
+| `base_url` | string | no | Cloudflare API base URL. Defaults to https://api.cloudflare.com/client/v4. |
+| `timeout_seconds` | number | no | HTTP timeout in seconds. Defaults to 30. |
+| `output_dir` | string | no | Output root. Defaults to ./export/cloudflare. |
+| `max_super_admins` | number | no | Maximum acceptable Super Administrator assignments before failing. Defaults to 2. |
+| `member_limit` | number | no | Maximum account members to inspect. Defaults to 200. |
+| `token_limit` | number | no | Maximum API tokens to inspect. Defaults to 200. |
+| `zone_limit` | number | no | Maximum zones to sample. Defaults to 20. |
+| `audit_limit` | number | no | Maximum audit log entries to inspect. Defaults to 200. |
 
-## 5. Compliance Framework Mappings
 
-| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | STIG | IRAP | ISMAP |
-|---|---------|---------|------|-------|-----|---------|------|------|-------|
-| 1 | WAF Managed Rules | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.1 | 6.6 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 2 | WAF Custom Rules | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.2 | 6.6 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 3 | DDoS Protection | SC-5 | SC.L2-3.13.6 | CC6.6 | 9.3 | 6.5.10 | SRG-APP-000246 | ISM-1020 | CPS-11 |
-| 4 | Bot Management | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.4 | 6.6 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 5 | SSL/TLS Full Strict | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.1 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
-| 6 | Minimum TLS Version | SC-8(1) | SC.L2-3.13.8 | CC6.7 | 3.2 | 4.1 | SRG-APP-000219 | ISM-1369 | CPS-09 |
-| 7 | HSTS Enabled | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.3 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
-| 8 | DNSSEC Enabled | SC-20 | SC.L2-3.13.15 | CC6.7 | 3.4 | — | SRG-APP-000516 | ISM-1183 | CPS-09 |
-| 9 | Zero Trust Access Policies | AC-3 | AC.L2-3.1.2 | CC6.1 | 1.1 | 7.2.1 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 10 | Zero Trust IdP Config | IA-2 | AC.L2-3.1.1 | CC6.1 | 1.2 | 8.3.1 | SRG-APP-000148 | ISM-1557 | CPS-04 |
-| 11 | Audit Logging | AU-2 | AU.L2-3.3.1 | CC7.2 | 8.1 | 10.2.1 | SRG-APP-000089 | ISM-0580 | CPS-10 |
-| 12 | API Token Scoping | AC-6 | AC.L2-3.1.5 | CC6.3 | 5.1 | 7.2.1 | SRG-APP-000340 | ISM-0432 | CPS-07 |
-| 13 | API Token Expiration | IA-5(1) | IA.L2-3.5.8 | CC6.1 | 5.2 | 8.6.3 | SRG-APP-000175 | ISM-1590 | CPS-05 |
-| 14 | Member Role Audit | AC-2 | AC.L2-3.1.1 | CC6.3 | 6.1 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
-| 15 | Page Rules Security | CM-6 | CM.L2-3.4.2 | CC8.1 | 10.1 | 2.2 | SRG-APP-000386 | ISM-0380 | CPS-12 |
-| 16 | Rate Limiting | SC-5 | SC.L2-3.13.6 | CC6.6 | 9.5 | 6.5.10 | SRG-APP-000246 | ISM-1020 | CPS-11 |
-| 17 | IP Access Rules | SC-7(5) | SC.L2-3.13.1 | CC6.6 | 9.6 | 1.3.2 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 18 | Origin Certificate Auth | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.5 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
+## Authentication
+
+Supported modes:
+
+- Cloudflare API token
+- Global API key with account email
+
+Credential precedence, highest first:
+
+1. Explicit tool arguments
+2. CLOUDFLARE_* environment variables
+
+Environment variables: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_API_KEY`, `CLOUDFLARE_EMAIL`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_BASE_URL`, `CLOUDFLARE_TIMEOUT`
+
+Configuration locations: (none)
+
+Credential and deployment variants: Explicit account ID, Single visible account discovery, Custom same-origin API base URL
+
+Configuration fields: None
+
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
+
+## Permissions
+
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| oauth-scope | `Token, Account, Zone, DNS, SSL, WAF, Zero Trust, audit-log, and firewall read permissions required by each declared surface` | `token-and-account`, `members-and-tokens`, `zero-trust-identity`, `zones-and-settings`, `zone-rules-and-certificates`, `traffic-and-account-controls` |  |
+| plan | `The account or zone plan must expose the assessed WAF, bot, Access, Gateway, audit-log, and certificate features` | `zero-trust-identity`, `zones-and-settings`, `zone-rules-and-certificates`, `traffic-and-account-controls` |  |
+
+## API surfaces
+
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `token-and-account` | HTTP | `GET /user/tokens/verify and /accounts/{account_id}` | Cloudflare API v4 | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `status`, `expires_on`, `id`, `name`, `settings` | [Official documentation](https://developers.cloudflare.com/api/resources/) |
+| `members-and-tokens` | HTTP | `GET /accounts/{account_id}/{members\|tokens}` | Cloudflare API v4 | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `status`, `roles`, `policies`, `expires_on`, `modified_on` | [Official documentation](https://developers.cloudflare.com/api/resources/) |
+| `zero-trust-identity` | HTTP | `GET /accounts/{account_id}/access/{apps\|policies\|identity_providers}` | Cloudflare API v4 | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `name`, `type`, `decision`, `include`, `exclude`, `require` | [Official documentation](https://developers.cloudflare.com/api/resources/) |
+| `zones-and-settings` | HTTP | `GET /zones and /zones/{zone_id}/settings` | Cloudflare API v4 | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `id`, `name`, `status`, `plan`, `value` | [Official documentation](https://developers.cloudflare.com/api/resources/) |
+| `zone-rules-and-certificates` | HTTP | `GET /zones/{zone_id}/{rulesets\|dnssec\|ssl\|origin_tls_client_auth\|dns_records}` | Cloudflare API v4 | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `phase`, `kind`, `rules`, `status`, `enabled`, `expires_on`, `content`, `proxied` | [Official documentation](https://developers.cloudflare.com/api/resources/) |
+| `traffic-and-account-controls` | HTTP | `GET /accounts/{account_id}/{audit_logs\|firewall/access_rules/rules\|gateway/rules}` | Cloudflare API v4 | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `action`, `when`, `mode`, `notes`, `modified_on`, `enabled`, `filters` | [Official documentation](https://developers.cloudflare.com/api/resources/) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `token-and-account` | client | Use the configured Cloudflare API v4 origin; never follow a server link to a different origin. | yes |
+| `token-and-account` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `token-and-account` | response | A JSON object or list containing only the documented status, expires_on, id, name, settings members consumed by verdicts. | yes |
+| `members-and-tokens` | client | Use the configured Cloudflare API v4 origin; never follow a server link to a different origin. | yes |
+| `members-and-tokens` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `members-and-tokens` | response | A JSON object or list containing only the documented id, status, roles, policies, expires_on, modified_on members consumed by verdicts. | yes |
+| `zero-trust-identity` | client | Use the configured Cloudflare API v4 origin; never follow a server link to a different origin. | yes |
+| `zero-trust-identity` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `zero-trust-identity` | response | A JSON object or list containing only the documented id, name, type, decision, include, exclude, require members consumed by verdicts. | yes |
+| `zones-and-settings` | client | Use the configured Cloudflare API v4 origin; never follow a server link to a different origin. | yes |
+| `zones-and-settings` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `zones-and-settings` | response | A JSON object or list containing only the documented id, name, status, plan, value members consumed by verdicts. | yes |
+| `zone-rules-and-certificates` | client | Use the configured Cloudflare API v4 origin; never follow a server link to a different origin. | yes |
+| `zone-rules-and-certificates` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `zone-rules-and-certificates` | response | A JSON object or list containing only the documented phase, kind, rules, status, enabled, expires_on, content, proxied members consumed by verdicts. | yes |
+| `traffic-and-account-controls` | client | Use the configured Cloudflare API v4 origin; never follow a server link to a different origin. | yes |
+| `traffic-and-account-controls` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `traffic-and-account-controls` | response | A JSON object or list containing only the documented action, when, mode, notes, modified_on, enabled, filters members consumed by verdicts. | yes |
+
+## Pagination
+
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `token-and-account`, `members-and-tokens`, `zero-trust-identity`, `zones-and-settings`, `zone-rules-and-certificates`, `traffic-and-account-controls` | `result_info.page`, `result_info.total_pages`, `result_info.total_count` | service default | caller limit | none | Completion requires reaching result_info.total_pages or total_count without a repeated or empty advancing page and remaining below every configured zone, member, token, or audit cap. | Reported final page; Reported total reached; Repeated page; Empty advancing page; Configured item cap |
+
+## Rate limits
+
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| Cloudflare Security Inspector | Endpoint and account-plan specific | `Retry-After`, `Ratelimit`, `Ratelimit-Policy` | 429, 500, 502, 503, 504 | Honor bounded Retry-After and use bounded retries for transient responses; exhausted reads remain unreadable. |
+
+## Checks
+
+### Control coverage
+
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | WAF managed rulesets deployed | CF-ZONE-01 | Evaluate the ordered first-match rules for CF-ZONE-01 below. |
+| 2 | WAF custom rules with blocking actions | CF-ZONE-06 | Evaluate the ordered first-match rules for CF-ZONE-06 below. |
+| 3 | HTTP DDoS protection sensitivity | CF-ZONE-07 | Evaluate the ordered first-match rules for CF-ZONE-07 below. |
+| 4 | Bot and automated traffic controls | CF-TRF-03 | Evaluate the ordered first-match rules for CF-TRF-03 below. |
+| 5 | SSL mode Full (Strict) | CF-ZONE-02 | Evaluate the ordered first-match rules for CF-ZONE-02 below. |
+| 6 | Minimum TLS version | CF-ZONE-03 | Evaluate the ordered first-match rules for CF-ZONE-03 below. |
+| 7 | HSTS enforcement | CF-ZONE-04 | Evaluate the ordered first-match rules for CF-ZONE-04 below. |
+| 8 | DNSSEC enabled | CF-ZONE-05 | Evaluate the ordered first-match rules for CF-ZONE-05 below. |
+| 9 | Zero Trust Access app and policy coverage | CF-IAM-04 | Evaluate the ordered first-match rules for CF-IAM-04 below. |
+| 10 | Zero Trust identity provider coverage | CF-IAM-05 | Evaluate the ordered first-match rules for CF-IAM-05 below. |
+| 11 | Account audit log visibility | CF-TRF-04 | Evaluate the ordered first-match rules for CF-TRF-04 below. |
+| 12 | Authentication method hygiene | CF-IAM-01 | Evaluate the ordered first-match rules for CF-IAM-01 below. |
+| 13 | API token expiration | CF-IAM-02, CF-IAM-06 | Evaluate the ordered first-match rules for CF-IAM-02, CF-IAM-06 below. |
+| 14 | Account member privilege concentration | CF-IAM-03 | Evaluate the ordered first-match rules for CF-IAM-03 below. |
+| 15 | Page rule security regressions | CF-TRF-02 | Evaluate the ordered first-match rules for CF-TRF-02 below. |
+| 16 | Rate limiting coverage | CF-TRF-01 | Evaluate the ordered first-match rules for CF-TRF-01 below. |
+| 17 | IP access rules | CF-TRF-05 | Evaluate the ordered first-match rules for CF-TRF-05 below. |
+| 18 | Authenticated Origin Pulls | CF-ZONE-11 | Evaluate the ordered first-match rules for CF-ZONE-11 below. |
+| 19 | Browser Integrity Check | CF-ZONE-12 | Evaluate the ordered first-match rules for CF-ZONE-12 below. |
+| 20 | Email Address Obfuscation | CF-ZONE-13 | Evaluate the ordered first-match rules for CF-ZONE-13 below. |
+| 21 | Always Use HTTPS | CF-ZONE-08 | Evaluate the ordered first-match rules for CF-ZONE-08 below. |
+| 22 | Automatic HTTPS Rewrites | CF-ZONE-09 | Evaluate the ordered first-match rules for CF-ZONE-09 below. |
+| 23 | Security headers via transform rules | CF-ZONE-14 | Evaluate the ordered first-match rules for CF-ZONE-14 below. |
+| 24 | Gateway SWG policies | CF-TRF-06 | Evaluate the ordered first-match rules for CF-TRF-06 below. |
+| 25 | Universal SSL and certificate validity | CF-ZONE-10 | Evaluate the ordered first-match rules for CF-ZONE-10 below. |
+| 27 | DNS record origin exposure | CF-ZONE-15 | Evaluate the ordered first-match rules for CF-ZONE-15 below. |
+
+### Finding notes
+
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `CF-IAM-01` | high | `cloudflare_assess_identity` | `token-and-account` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Authentication method hygiene from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Authentication method hygiene from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Authentication method hygiene from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Authentication method hygiene is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-IAM-02` | high | `cloudflare_assess_identity` | `token-and-account` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Current token verification and scoping from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Current token verification and scoping from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Current token verification and scoping from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Current token verification and scoping is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-IAM-03` | medium | `cloudflare_assess_identity` | `members-and-tokens` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Account member privilege concentration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Account member privilege concentration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Account member privilege concentration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Account member privilege concentration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-IAM-04` | high | `cloudflare_assess_identity` | `zero-trust-identity` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Zero Trust Access app and policy coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Zero Trust Access app and policy coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Zero Trust Access app and policy coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Zero Trust Access app and policy coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-IAM-05` | medium | `cloudflare_assess_identity` | `zero-trust-identity` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Zero Trust identity provider coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Zero Trust identity provider coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Zero Trust identity provider coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Zero Trust identity provider coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-IAM-06` | medium | `cloudflare_assess_identity` | `members-and-tokens` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate API token expiration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate API token expiration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate API token expiration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for API token expiration is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-01` | high | `cloudflare_assess_zone_security` | `zones-and-settings`, `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate WAF managed rulesets deployed from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate WAF managed rulesets deployed from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate WAF managed rulesets deployed from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for WAF managed rulesets deployed is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-02` | high | `cloudflare_assess_zone_security` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate SSL mode Full (Strict) from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate SSL mode Full (Strict) from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate SSL mode Full (Strict) from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for SSL mode Full (Strict) is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-03` | medium | `cloudflare_assess_zone_security` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Minimum TLS version from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Minimum TLS version from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Minimum TLS version from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Minimum TLS version is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-04` | medium | `cloudflare_assess_zone_security` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate HSTS enforcement from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate HSTS enforcement from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate HSTS enforcement from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for HSTS enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-05` | medium | `cloudflare_assess_zone_security` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate DNSSEC enabled from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate DNSSEC enabled from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate DNSSEC enabled from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for DNSSEC enabled is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-06` | medium | `cloudflare_assess_zone_security` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate WAF custom rules with blocking actions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate WAF custom rules with blocking actions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate WAF custom rules with blocking actions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for WAF custom rules with blocking actions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-07` | high | `cloudflare_assess_zone_security` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate HTTP DDoS protection sensitivity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate HTTP DDoS protection sensitivity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate HTTP DDoS protection sensitivity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for HTTP DDoS protection sensitivity is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-08` | medium | `cloudflare_assess_zone_security` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Always Use HTTPS from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Always Use HTTPS from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Always Use HTTPS from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Always Use HTTPS is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-09` | low | `cloudflare_assess_zone_security` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Automatic HTTPS Rewrites from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Automatic HTTPS Rewrites from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Automatic HTTPS Rewrites from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Automatic HTTPS Rewrites is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-10` | medium | `cloudflare_assess_zone_security` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Universal SSL and certificate validity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Universal SSL and certificate validity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Universal SSL and certificate validity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Universal SSL and certificate validity is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-11` | medium | `cloudflare_assess_zone_security` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Authenticated Origin Pulls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Authenticated Origin Pulls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Authenticated Origin Pulls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Authenticated Origin Pulls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-12` | low | `cloudflare_assess_zone_security` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Browser Integrity Check from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Browser Integrity Check from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Browser Integrity Check from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Browser Integrity Check is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-13` | low | `cloudflare_assess_zone_security` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Email Address Obfuscation from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Email Address Obfuscation from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Email Address Obfuscation from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Email Address Obfuscation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-14` | medium | `cloudflare_assess_zone_security` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Security headers via transform rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Security headers via transform rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Security headers via transform rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Security headers via transform rules is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-ZONE-15` | low | `cloudflare_assess_zone_security` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate DNS record origin exposure from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate DNS record origin exposure from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate DNS record origin exposure from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for DNS record origin exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-TRF-01` | medium | `cloudflare_assess_traffic_controls` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Rate limiting coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Rate limiting coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Rate limiting coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Rate limiting coverage is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-TRF-02` | medium | `cloudflare_assess_traffic_controls` | `zone-rules-and-certificates` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Page rule security regressions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Page rule security regressions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Page rule security regressions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Page rule security regressions is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-TRF-03` | medium | `cloudflare_assess_traffic_controls` | `zones-and-settings` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Bot and automated traffic controls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Bot and automated traffic controls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Bot and automated traffic controls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Bot and automated traffic controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-TRF-04` | high | `cloudflare_assess_traffic_controls` | `traffic-and-account-controls` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Account audit log visibility from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Account audit log visibility from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Account audit log visibility from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Account audit log visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-TRF-05` | medium | `cloudflare_assess_traffic_controls` | `traffic-and-account-controls` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate IP access rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate IP access rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate IP access rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for IP access rules is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `CF-TRF-06` | medium | `cloudflare_assess_traffic_controls` | `traffic-and-account-controls` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Evaluate Gateway SWG policies from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Evaluate Gateway SWG policies from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Evaluate Gateway SWG policies from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | The required evidence for Gateway SWG policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `CF-IAM-01` | 1 | manual | `cf_iam_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-IAM-01` | 2 | fail | `cf_iam_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-IAM-01` | 3 | manual | `cf_iam_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-IAM-01` | 4 | warn | `cf_iam_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-IAM-01` | 5 | pass | `cf_iam_01_branch_05_matches` equals true |  |
+| `CF-IAM-01` | 6 | manual | `cf_iam_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-IAM-02` | 1 | manual | `cf_iam_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-IAM-02` | 2 | fail | `cf_iam_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-IAM-02` | 3 | manual | `cf_iam_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-IAM-02` | 4 | warn | `cf_iam_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-IAM-02` | 5 | pass | `cf_iam_02_branch_05_matches` equals true |  |
+| `CF-IAM-02` | 6 | manual | `cf_iam_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-IAM-03` | 1 | manual | `cf_iam_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-IAM-03` | 2 | fail | `cf_iam_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-IAM-03` | 3 | manual | `cf_iam_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-IAM-03` | 4 | warn | `cf_iam_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-IAM-03` | 5 | pass | `cf_iam_03_branch_05_matches` equals true |  |
+| `CF-IAM-03` | 6 | manual | `cf_iam_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-IAM-04` | 1 | manual | `cf_iam_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-IAM-04` | 2 | fail | `cf_iam_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-IAM-04` | 3 | manual | `cf_iam_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-IAM-04` | 4 | warn | `cf_iam_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-IAM-04` | 5 | pass | `cf_iam_04_branch_05_matches` equals true |  |
+| `CF-IAM-04` | 6 | manual | `cf_iam_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-IAM-05` | 1 | manual | `cf_iam_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-IAM-05` | 2 | fail | `cf_iam_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-IAM-05` | 3 | fail | `cf_iam_05_branch_03_matches` equals true |  |
+| `CF-IAM-05` | 4 | warn | `cf_iam_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-IAM-05` | 5 | pass | `cf_iam_05_branch_05_matches` equals true |  |
+| `CF-IAM-05` | 6 | manual | `cf_iam_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-IAM-06` | 1 | manual | `cf_iam_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-IAM-06` | 2 | fail | `cf_iam_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-IAM-06` | 3 | manual | `cf_iam_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-IAM-06` | 4 | warn | `cf_iam_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-IAM-06` | 5 | pass | `cf_iam_06_branch_05_matches` equals true |  |
+| `CF-IAM-06` | 6 | manual | `cf_iam_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-01` | 1 | manual | `cf_zone_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-01` | 2 | fail | `cf_zone_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-01` | 3 | manual | `cf_zone_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-01` | 4 | warn | `cf_zone_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-01` | 5 | pass | `cf_zone_01_branch_05_matches` equals true |  |
+| `CF-ZONE-01` | 6 | manual | `cf_zone_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-02` | 1 | manual | `cf_zone_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-02` | 2 | fail | `cf_zone_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-02` | 3 | manual | `cf_zone_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-02` | 4 | warn | `cf_zone_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-02` | 5 | pass | `cf_zone_02_branch_05_matches` equals true |  |
+| `CF-ZONE-02` | 6 | manual | `cf_zone_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-03` | 1 | manual | `cf_zone_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-03` | 2 | fail | `cf_zone_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-03` | 3 | manual | `cf_zone_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-03` | 4 | warn | `cf_zone_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-03` | 5 | pass | `cf_zone_03_branch_05_matches` equals true |  |
+| `CF-ZONE-03` | 6 | manual | `cf_zone_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-04` | 1 | manual | `cf_zone_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-04` | 2 | fail | `cf_zone_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-04` | 3 | manual | `cf_zone_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-04` | 4 | warn | `cf_zone_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-04` | 5 | pass | `cf_zone_04_branch_05_matches` equals true |  |
+| `CF-ZONE-04` | 6 | manual | `cf_zone_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-05` | 1 | manual | `cf_zone_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-05` | 2 | fail | `cf_zone_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-05` | 3 | manual | `cf_zone_05_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-05` | 4 | warn | `cf_zone_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-05` | 5 | pass | `cf_zone_05_branch_05_matches` equals true |  |
+| `CF-ZONE-05` | 6 | manual | `cf_zone_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-06` | 1 | manual | `cf_zone_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-06` | 2 | fail | `cf_zone_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-06` | 3 | manual | `cf_zone_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-06` | 4 | warn | `cf_zone_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-06` | 5 | pass | `cf_zone_06_branch_05_matches` equals true |  |
+| `CF-ZONE-06` | 6 | manual | `cf_zone_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-07` | 1 | manual | `cf_zone_07_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-07` | 2 | fail | `cf_zone_07_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-07` | 3 | manual | `cf_zone_07_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-07` | 4 | warn | `cf_zone_07_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-07` | 5 | pass | `cf_zone_07_branch_05_matches` equals true |  |
+| `CF-ZONE-07` | 6 | manual | `cf_zone_07_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-08` | 1 | manual | `cf_zone_08_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-08` | 2 | fail | `cf_zone_08_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-08` | 3 | manual | `cf_zone_08_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-08` | 4 | warn | `cf_zone_08_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-08` | 5 | pass | `cf_zone_08_branch_05_matches` equals true |  |
+| `CF-ZONE-08` | 6 | manual | `cf_zone_08_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-09` | 1 | manual | `cf_zone_09_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-09` | 2 | fail | `cf_zone_09_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-09` | 3 | manual | `cf_zone_09_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-09` | 4 | warn | `cf_zone_09_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-09` | 5 | pass | `cf_zone_09_branch_05_matches` equals true |  |
+| `CF-ZONE-09` | 6 | manual | `cf_zone_09_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-10` | 1 | manual | `cf_zone_10_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-10` | 2 | fail | `cf_zone_10_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-10` | 3 | manual | `cf_zone_10_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-10` | 4 | warn | `cf_zone_10_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-10` | 5 | pass | `cf_zone_10_branch_05_matches` equals true |  |
+| `CF-ZONE-10` | 6 | manual | `cf_zone_10_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-11` | 1 | manual | `cf_zone_11_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-11` | 2 | fail | `cf_zone_11_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-11` | 3 | manual | `cf_zone_11_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-11` | 4 | warn | `cf_zone_11_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-11` | 5 | pass | `cf_zone_11_branch_05_matches` equals true |  |
+| `CF-ZONE-11` | 6 | manual | `cf_zone_11_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-12` | 1 | manual | `cf_zone_12_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-12` | 2 | fail | `cf_zone_12_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-12` | 3 | manual | `cf_zone_12_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-12` | 4 | warn | `cf_zone_12_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-12` | 5 | pass | `cf_zone_12_branch_05_matches` equals true |  |
+| `CF-ZONE-12` | 6 | manual | `cf_zone_12_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-13` | 1 | manual | `cf_zone_13_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-13` | 2 | fail | `cf_zone_13_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-13` | 3 | manual | `cf_zone_13_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-13` | 4 | warn | `cf_zone_13_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-13` | 5 | pass | `cf_zone_13_branch_05_matches` equals true |  |
+| `CF-ZONE-13` | 6 | manual | `cf_zone_13_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-14` | 1 | manual | `cf_zone_14_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-14` | 2 | fail | `cf_zone_14_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-14` | 3 | manual | `cf_zone_14_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-14` | 4 | warn | `cf_zone_14_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-14` | 5 | pass | `cf_zone_14_branch_05_matches` equals true |  |
+| `CF-ZONE-14` | 6 | manual | `cf_zone_14_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-ZONE-15` | 1 | manual | `cf_zone_15_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-ZONE-15` | 2 | fail | `cf_zone_15_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-ZONE-15` | 3 | manual | `cf_zone_15_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-ZONE-15` | 4 | warn | `cf_zone_15_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-ZONE-15` | 5 | pass | `cf_zone_15_branch_05_matches` equals true |  |
+| `CF-ZONE-15` | 6 | manual | `cf_zone_15_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-TRF-01` | 1 | manual | `cf_trf_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-TRF-01` | 2 | fail | `cf_trf_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-TRF-01` | 3 | manual | `cf_trf_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-TRF-01` | 4 | warn | `cf_trf_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-TRF-01` | 5 | pass | `cf_trf_01_branch_05_matches` equals true |  |
+| `CF-TRF-01` | 6 | manual | `cf_trf_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-TRF-02` | 1 | manual | `cf_trf_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-TRF-02` | 2 | fail | `cf_trf_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-TRF-02` | 3 | manual | `cf_trf_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-TRF-02` | 4 | warn | `cf_trf_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-TRF-02` | 5 | pass | `cf_trf_02_branch_05_matches` equals true |  |
+| `CF-TRF-02` | 6 | manual | `cf_trf_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-TRF-03` | 1 | manual | `cf_trf_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-TRF-03` | 2 | fail | `cf_trf_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-TRF-03` | 3 | manual | `cf_trf_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-TRF-03` | 4 | warn | `cf_trf_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-TRF-03` | 5 | pass | `cf_trf_03_branch_05_matches` equals true |  |
+| `CF-TRF-03` | 6 | manual | `cf_trf_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-TRF-04` | 1 | manual | `cf_trf_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-TRF-04` | 2 | fail | `cf_trf_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-TRF-04` | 3 | manual | `cf_trf_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-TRF-04` | 4 | warn | `cf_trf_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-TRF-04` | 5 | pass | `cf_trf_04_branch_05_matches` equals true |  |
+| `CF-TRF-04` | 6 | manual | `cf_trf_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-TRF-05` | 1 | manual | `cf_trf_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-TRF-05` | 2 | fail | `cf_trf_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-TRF-05` | 3 | pass | `cf_trf_05_branch_03_matches` equals true |  |
+| `CF-TRF-05` | 4 | warn | `cf_trf_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-TRF-05` | 5 | pass | `cf_trf_05_branch_05_matches` equals true |  |
+| `CF-TRF-05` | 6 | manual | `cf_trf_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `CF-TRF-06` | 1 | manual | `cf_trf_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `CF-TRF-06` | 2 | fail | `cf_trf_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `CF-TRF-06` | 3 | manual | `cf_trf_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `CF-TRF-06` | 4 | warn | `cf_trf_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `CF-TRF-06` | 5 | pass | `cf_trf_06_branch_05_matches` equals true |  |
+| `CF-TRF-06` | 6 | manual | `cf_trf_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `CF-IAM-01` | `cf_iam_01_branch_01_matches` | CF-IAM-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-IAM-01` | `cf_iam_01_branch_02_matches` | CF-IAM-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-IAM-01` | `cf_iam_01_branch_03_matches` | CF-IAM-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-IAM-01` | `cf_iam_01_branch_04_matches` | CF-IAM-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-IAM-01` | `cf_iam_01_branch_05_matches` | CF-IAM-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-IAM-01` | `cf_iam_01_branch_06_matches` | CF-IAM-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-IAM-02` | `cf_iam_02_branch_01_matches` | CF-IAM-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-IAM-02` | `cf_iam_02_branch_02_matches` | CF-IAM-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-IAM-02` | `cf_iam_02_branch_03_matches` | CF-IAM-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-IAM-02` | `cf_iam_02_branch_04_matches` | CF-IAM-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-IAM-02` | `cf_iam_02_branch_05_matches` | CF-IAM-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-IAM-02` | `cf_iam_02_branch_06_matches` | CF-IAM-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-IAM-03` | `cf_iam_03_branch_01_matches` | CF-IAM-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-IAM-03` | `cf_iam_03_branch_02_matches` | CF-IAM-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-IAM-03` | `cf_iam_03_branch_03_matches` | CF-IAM-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-IAM-03` | `cf_iam_03_branch_04_matches` | CF-IAM-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-IAM-03` | `cf_iam_03_branch_05_matches` | CF-IAM-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-IAM-03` | `cf_iam_03_branch_06_matches` | CF-IAM-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-IAM-04` | `cf_iam_04_branch_01_matches` | CF-IAM-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-IAM-04` | `cf_iam_04_branch_02_matches` | CF-IAM-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-IAM-04` | `cf_iam_04_branch_03_matches` | CF-IAM-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-IAM-04` | `cf_iam_04_branch_04_matches` | CF-IAM-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-IAM-04` | `cf_iam_04_branch_05_matches` | CF-IAM-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-IAM-04` | `cf_iam_04_branch_06_matches` | CF-IAM-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-IAM-05` | `cf_iam_05_branch_01_matches` | CF-IAM-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-IAM-05` | `cf_iam_05_branch_02_matches` | CF-IAM-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-IAM-05` | `cf_iam_05_branch_03_matches` | CF-IAM-05 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `CF-IAM-05` | `cf_iam_05_branch_04_matches` | CF-IAM-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-IAM-05` | `cf_iam_05_branch_05_matches` | CF-IAM-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-IAM-05` | `cf_iam_05_branch_06_matches` | CF-IAM-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-IAM-06` | `cf_iam_06_branch_01_matches` | CF-IAM-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-IAM-06` | `cf_iam_06_branch_02_matches` | CF-IAM-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-IAM-06` | `cf_iam_06_branch_03_matches` | CF-IAM-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-IAM-06` | `cf_iam_06_branch_04_matches` | CF-IAM-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-IAM-06` | `cf_iam_06_branch_05_matches` | CF-IAM-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-IAM-06` | `cf_iam_06_branch_06_matches` | CF-IAM-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-01` | `cf_zone_01_branch_01_matches` | CF-ZONE-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-01` | `cf_zone_01_branch_02_matches` | CF-ZONE-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-01` | `cf_zone_01_branch_03_matches` | CF-ZONE-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-01` | `cf_zone_01_branch_04_matches` | CF-ZONE-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-01` | `cf_zone_01_branch_05_matches` | CF-ZONE-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-01` | `cf_zone_01_branch_06_matches` | CF-ZONE-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-02` | `cf_zone_02_branch_01_matches` | CF-ZONE-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-02` | `cf_zone_02_branch_02_matches` | CF-ZONE-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-02` | `cf_zone_02_branch_03_matches` | CF-ZONE-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-02` | `cf_zone_02_branch_04_matches` | CF-ZONE-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-02` | `cf_zone_02_branch_05_matches` | CF-ZONE-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-02` | `cf_zone_02_branch_06_matches` | CF-ZONE-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-03` | `cf_zone_03_branch_01_matches` | CF-ZONE-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-03` | `cf_zone_03_branch_02_matches` | CF-ZONE-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-03` | `cf_zone_03_branch_03_matches` | CF-ZONE-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-03` | `cf_zone_03_branch_04_matches` | CF-ZONE-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-03` | `cf_zone_03_branch_05_matches` | CF-ZONE-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-03` | `cf_zone_03_branch_06_matches` | CF-ZONE-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-04` | `cf_zone_04_branch_01_matches` | CF-ZONE-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-04` | `cf_zone_04_branch_02_matches` | CF-ZONE-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-04` | `cf_zone_04_branch_03_matches` | CF-ZONE-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-04` | `cf_zone_04_branch_04_matches` | CF-ZONE-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-04` | `cf_zone_04_branch_05_matches` | CF-ZONE-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-04` | `cf_zone_04_branch_06_matches` | CF-ZONE-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-05` | `cf_zone_05_branch_01_matches` | CF-ZONE-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-05` | `cf_zone_05_branch_02_matches` | CF-ZONE-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-05` | `cf_zone_05_branch_03_matches` | CF-ZONE-05 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-05` | `cf_zone_05_branch_04_matches` | CF-ZONE-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-05` | `cf_zone_05_branch_05_matches` | CF-ZONE-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-05` | `cf_zone_05_branch_06_matches` | CF-ZONE-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-06` | `cf_zone_06_branch_01_matches` | CF-ZONE-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-06` | `cf_zone_06_branch_02_matches` | CF-ZONE-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-06` | `cf_zone_06_branch_03_matches` | CF-ZONE-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-06` | `cf_zone_06_branch_04_matches` | CF-ZONE-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-06` | `cf_zone_06_branch_05_matches` | CF-ZONE-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-06` | `cf_zone_06_branch_06_matches` | CF-ZONE-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-07` | `cf_zone_07_branch_01_matches` | CF-ZONE-07 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-07` | `cf_zone_07_branch_02_matches` | CF-ZONE-07 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-07` | `cf_zone_07_branch_03_matches` | CF-ZONE-07 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-07` | `cf_zone_07_branch_04_matches` | CF-ZONE-07 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-07` | `cf_zone_07_branch_05_matches` | CF-ZONE-07 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-07` | `cf_zone_07_branch_06_matches` | CF-ZONE-07 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-08` | `cf_zone_08_branch_01_matches` | CF-ZONE-08 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-08` | `cf_zone_08_branch_02_matches` | CF-ZONE-08 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-08` | `cf_zone_08_branch_03_matches` | CF-ZONE-08 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-08` | `cf_zone_08_branch_04_matches` | CF-ZONE-08 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-08` | `cf_zone_08_branch_05_matches` | CF-ZONE-08 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-08` | `cf_zone_08_branch_06_matches` | CF-ZONE-08 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-09` | `cf_zone_09_branch_01_matches` | CF-ZONE-09 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-09` | `cf_zone_09_branch_02_matches` | CF-ZONE-09 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-09` | `cf_zone_09_branch_03_matches` | CF-ZONE-09 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-09` | `cf_zone_09_branch_04_matches` | CF-ZONE-09 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-09` | `cf_zone_09_branch_05_matches` | CF-ZONE-09 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-09` | `cf_zone_09_branch_06_matches` | CF-ZONE-09 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-10` | `cf_zone_10_branch_01_matches` | CF-ZONE-10 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-10` | `cf_zone_10_branch_02_matches` | CF-ZONE-10 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-10` | `cf_zone_10_branch_03_matches` | CF-ZONE-10 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-10` | `cf_zone_10_branch_04_matches` | CF-ZONE-10 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-10` | `cf_zone_10_branch_05_matches` | CF-ZONE-10 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-10` | `cf_zone_10_branch_06_matches` | CF-ZONE-10 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-11` | `cf_zone_11_branch_01_matches` | CF-ZONE-11 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-11` | `cf_zone_11_branch_02_matches` | CF-ZONE-11 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-11` | `cf_zone_11_branch_03_matches` | CF-ZONE-11 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-11` | `cf_zone_11_branch_04_matches` | CF-ZONE-11 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-11` | `cf_zone_11_branch_05_matches` | CF-ZONE-11 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-11` | `cf_zone_11_branch_06_matches` | CF-ZONE-11 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-12` | `cf_zone_12_branch_01_matches` | CF-ZONE-12 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-12` | `cf_zone_12_branch_02_matches` | CF-ZONE-12 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-12` | `cf_zone_12_branch_03_matches` | CF-ZONE-12 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-12` | `cf_zone_12_branch_04_matches` | CF-ZONE-12 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-12` | `cf_zone_12_branch_05_matches` | CF-ZONE-12 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-12` | `cf_zone_12_branch_06_matches` | CF-ZONE-12 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-13` | `cf_zone_13_branch_01_matches` | CF-ZONE-13 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-13` | `cf_zone_13_branch_02_matches` | CF-ZONE-13 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-13` | `cf_zone_13_branch_03_matches` | CF-ZONE-13 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-13` | `cf_zone_13_branch_04_matches` | CF-ZONE-13 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-13` | `cf_zone_13_branch_05_matches` | CF-ZONE-13 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-13` | `cf_zone_13_branch_06_matches` | CF-ZONE-13 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-14` | `cf_zone_14_branch_01_matches` | CF-ZONE-14 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-14` | `cf_zone_14_branch_02_matches` | CF-ZONE-14 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-14` | `cf_zone_14_branch_03_matches` | CF-ZONE-14 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-14` | `cf_zone_14_branch_04_matches` | CF-ZONE-14 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-14` | `cf_zone_14_branch_05_matches` | CF-ZONE-14 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-14` | `cf_zone_14_branch_06_matches` | CF-ZONE-14 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-ZONE-15` | `cf_zone_15_branch_01_matches` | CF-ZONE-15 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-ZONE-15` | `cf_zone_15_branch_02_matches` | CF-ZONE-15 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-ZONE-15` | `cf_zone_15_branch_03_matches` | CF-ZONE-15 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-ZONE-15` | `cf_zone_15_branch_04_matches` | CF-ZONE-15 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-ZONE-15` | `cf_zone_15_branch_05_matches` | CF-ZONE-15 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-ZONE-15` | `cf_zone_15_branch_06_matches` | CF-ZONE-15 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-TRF-01` | `cf_trf_01_branch_01_matches` | CF-TRF-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-TRF-01` | `cf_trf_01_branch_02_matches` | CF-TRF-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-TRF-01` | `cf_trf_01_branch_03_matches` | CF-TRF-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-TRF-01` | `cf_trf_01_branch_04_matches` | CF-TRF-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-TRF-01` | `cf_trf_01_branch_05_matches` | CF-TRF-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-TRF-01` | `cf_trf_01_branch_06_matches` | CF-TRF-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-TRF-02` | `cf_trf_02_branch_01_matches` | CF-TRF-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-TRF-02` | `cf_trf_02_branch_02_matches` | CF-TRF-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-TRF-02` | `cf_trf_02_branch_03_matches` | CF-TRF-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-TRF-02` | `cf_trf_02_branch_04_matches` | CF-TRF-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-TRF-02` | `cf_trf_02_branch_05_matches` | CF-TRF-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-TRF-02` | `cf_trf_02_branch_06_matches` | CF-TRF-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-TRF-03` | `cf_trf_03_branch_01_matches` | CF-TRF-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-TRF-03` | `cf_trf_03_branch_02_matches` | CF-TRF-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-TRF-03` | `cf_trf_03_branch_03_matches` | CF-TRF-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-TRF-03` | `cf_trf_03_branch_04_matches` | CF-TRF-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-TRF-03` | `cf_trf_03_branch_05_matches` | CF-TRF-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-TRF-03` | `cf_trf_03_branch_06_matches` | CF-TRF-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-TRF-04` | `cf_trf_04_branch_01_matches` | CF-TRF-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-TRF-04` | `cf_trf_04_branch_02_matches` | CF-TRF-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-TRF-04` | `cf_trf_04_branch_03_matches` | CF-TRF-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-TRF-04` | `cf_trf_04_branch_04_matches` | CF-TRF-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-TRF-04` | `cf_trf_04_branch_05_matches` | CF-TRF-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-TRF-04` | `cf_trf_04_branch_06_matches` | CF-TRF-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-TRF-05` | `cf_trf_05_branch_01_matches` | CF-TRF-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-TRF-05` | `cf_trf_05_branch_02_matches` | CF-TRF-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-TRF-05` | `cf_trf_05_branch_03_matches` | CF-TRF-05 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `CF-TRF-05` | `cf_trf_05_branch_04_matches` | CF-TRF-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-TRF-05` | `cf_trf_05_branch_05_matches` | CF-TRF-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-TRF-05` | `cf_trf_05_branch_06_matches` | CF-TRF-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `CF-TRF-06` | `cf_trf_06_branch_01_matches` | CF-TRF-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `CF-TRF-06` | `cf_trf_06_branch_02_matches` | CF-TRF-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `CF-TRF-06` | `cf_trf_06_branch_03_matches` | CF-TRF-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `CF-TRF-06` | `cf_trf_06_branch_04_matches` | CF-TRF-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `CF-TRF-06` | `cf_trf_06_branch_05_matches` | CF-TRF-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `CF-TRF-06` | `cf_trf_06_branch_06_matches` | CF-TRF-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `CF-IAM-01` | `requiredEvidenceReadable` | true |
+| `CF-IAM-01` | `requiredEvidenceComplete` | true |
+| `CF-IAM-02` | `requiredEvidenceReadable` | true |
+| `CF-IAM-02` | `requiredEvidenceComplete` | true |
+| `CF-IAM-03` | `requiredEvidenceReadable` | true |
+| `CF-IAM-03` | `requiredEvidenceComplete` | true |
+| `CF-IAM-04` | `requiredEvidenceReadable` | true |
+| `CF-IAM-04` | `requiredEvidenceComplete` | true |
+| `CF-IAM-05` | `requiredEvidenceReadable` | true |
+| `CF-IAM-05` | `requiredEvidenceComplete` | true |
+| `CF-IAM-06` | `requiredEvidenceReadable` | true |
+| `CF-IAM-06` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-01` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-01` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-02` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-02` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-03` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-03` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-04` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-04` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-05` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-05` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-06` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-06` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-07` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-07` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-08` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-08` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-09` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-09` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-10` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-10` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-11` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-11` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-12` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-12` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-13` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-13` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-14` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-14` | `requiredEvidenceComplete` | true |
+| `CF-ZONE-15` | `requiredEvidenceReadable` | true |
+| `CF-ZONE-15` | `requiredEvidenceComplete` | true |
+| `CF-TRF-01` | `requiredEvidenceReadable` | true |
+| `CF-TRF-01` | `requiredEvidenceComplete` | true |
+| `CF-TRF-02` | `requiredEvidenceReadable` | true |
+| `CF-TRF-02` | `requiredEvidenceComplete` | true |
+| `CF-TRF-03` | `requiredEvidenceReadable` | true |
+| `CF-TRF-03` | `requiredEvidenceComplete` | true |
+| `CF-TRF-04` | `requiredEvidenceReadable` | true |
+| `CF-TRF-04` | `requiredEvidenceComplete` | true |
+| `CF-TRF-05` | `requiredEvidenceReadable` | true |
+| `CF-TRF-05` | `requiredEvidenceComplete` | true |
+| `CF-TRF-06` | `requiredEvidenceReadable` | true |
+| `CF-TRF-06` | `requiredEvidenceComplete` | true |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `CF-IAM-01` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Authentication method hygiene from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-IAM-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Authentication method hygiene from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-IAM-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-IAM-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-IAM-02` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Current token verification and scoping from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-IAM-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Current token verification and scoping from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-IAM-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-IAM-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-IAM-03` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Account member privilege concentration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-IAM-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Account member privilege concentration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-IAM-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-IAM-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-IAM-04` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Zero Trust Access app and policy coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-IAM-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Zero Trust Access app and policy coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-IAM-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-IAM-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-IAM-05` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Zero Trust identity provider coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-IAM-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Zero Trust identity provider coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-IAM-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-IAM-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-IAM-06` | compliant | All required source reads are complete and this derivation returns pass: Evaluate API token expiration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-IAM-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate API token expiration from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-IAM-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-IAM-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-01` | compliant | All required source reads are complete and this derivation returns pass: Evaluate WAF managed rulesets deployed from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate WAF managed rulesets deployed from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-02` | compliant | All required source reads are complete and this derivation returns pass: Evaluate SSL mode Full (Strict) from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate SSL mode Full (Strict) from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-03` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Minimum TLS version from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Minimum TLS version from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-04` | compliant | All required source reads are complete and this derivation returns pass: Evaluate HSTS enforcement from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate HSTS enforcement from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-05` | compliant | All required source reads are complete and this derivation returns pass: Evaluate DNSSEC enabled from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate DNSSEC enabled from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-06` | compliant | All required source reads are complete and this derivation returns pass: Evaluate WAF custom rules with blocking actions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate WAF custom rules with blocking actions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-07` | compliant | All required source reads are complete and this derivation returns pass: Evaluate HTTP DDoS protection sensitivity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-07` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate HTTP DDoS protection sensitivity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-07` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-07` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-08` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Always Use HTTPS from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-08` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Always Use HTTPS from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-08` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-08` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-09` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Automatic HTTPS Rewrites from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-09` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Automatic HTTPS Rewrites from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-09` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-09` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-10` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Universal SSL and certificate validity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-10` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Universal SSL and certificate validity from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-10` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-10` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-11` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Authenticated Origin Pulls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-11` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Authenticated Origin Pulls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-11` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-11` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-12` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Browser Integrity Check from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-12` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Browser Integrity Check from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-12` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-12` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-13` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Email Address Obfuscation from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-13` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Email Address Obfuscation from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-13` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-13` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-14` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Security headers via transform rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-14` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Security headers via transform rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-14` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-14` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-ZONE-15` | compliant | All required source reads are complete and this derivation returns pass: Evaluate DNS record origin exposure from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-ZONE-15` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate DNS record origin exposure from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-ZONE-15` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-ZONE-15` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-TRF-01` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Rate limiting coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-TRF-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Rate limiting coverage from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-TRF-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-TRF-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-TRF-02` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Page rule security regressions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-TRF-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Page rule security regressions from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-TRF-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-TRF-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-TRF-03` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Bot and automated traffic controls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-TRF-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Bot and automated traffic controls from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-TRF-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-TRF-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-TRF-04` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Account audit log visibility from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-TRF-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Account audit log visibility from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-TRF-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-TRF-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-TRF-05` | compliant | All required source reads are complete and this derivation returns pass: Evaluate IP access rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-TRF-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate IP access rules from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-TRF-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-TRF-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `CF-TRF-06` | compliant | All required source reads are complete and this derivation returns pass: Evaluate Gateway SWG policies from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `CF-TRF-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: Evaluate Gateway SWG policies from the complete Cloudflare account or zone inventories: unreadable dependencies and ambiguous feature availability remain manual, a proved insecure record takes precedence, partial lists or review records warn, and pass requires complete readable evidence with no violating zone or account. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `CF-TRF-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `CF-TRF-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | WAF managed rulesets deployed | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.1 | 6.6 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 2 | WAF custom rules with blocking actions | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.2 | 6.6 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 3 | HTTP DDoS protection sensitivity | SC-5 | SC.L2-3.13.6 | CC6.6 | 9.3 | 6.5.10 | SRG-APP-000246 | ISM-1020 | CPS-11 |
+| 4 | Bot and automated traffic controls | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.4 | 6.6 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 5 | SSL mode Full (Strict) | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.1 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
+| 6 | Minimum TLS version | SC-8(1) | SC.L2-3.13.8 | CC6.7 | 3.2 | 4.1 | SRG-APP-000219 | ISM-1369 | CPS-09 |
+| 7 | HSTS enforcement | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.3 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
+| 8 | DNSSEC enabled | SC-20 | SC.L2-3.13.15 | CC6.7 | 3.4 | - | SRG-APP-000516 | ISM-1183 | CPS-09 |
+| 9 | Zero Trust Access app and policy coverage | AC-3 | AC.L2-3.1.2 | CC6.1 | 1.1 | 7.2.1 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 10 | Zero Trust identity provider coverage | IA-2 | AC.L2-3.1.1 | CC6.1 | 1.2 | 8.3.1 | SRG-APP-000148 | ISM-1557 | CPS-04 |
+| 11 | Account audit log visibility | AU-2 | AU.L2-3.3.1 | CC7.2 | 8.1 | 10.2.1 | SRG-APP-000089 | ISM-0580 | CPS-10 |
+| 12 | Authentication method hygiene | AC-6 | AC.L2-3.1.5 | CC6.3 | 5.1 | 7.2.1 | SRG-APP-000340 | ISM-0432 | CPS-07 |
+| 13 | API token expiration | IA-5(1) | IA.L2-3.5.8 | CC6.1 | 5.2 | 8.6.3 | SRG-APP-000175 | ISM-1590 | CPS-05 |
+| 14 | Account member privilege concentration | AC-2 | AC.L2-3.1.1 | CC6.3 | 6.1 | 7.2.2 | SRG-APP-000033 | ISM-0432 | CPS-07 |
+| 15 | Page rule security regressions | CM-6 | CM.L2-3.4.2 | CC8.1 | 10.1 | 2.2 | SRG-APP-000386 | ISM-0380 | CPS-12 |
+| 16 | Rate limiting coverage | SC-5 | SC.L2-3.13.6 | CC6.6 | 9.5 | 6.5.10 | SRG-APP-000246 | ISM-1020 | CPS-11 |
+| 17 | IP access rules | SC-7(5) | SC.L2-3.13.1 | CC6.6 | 9.6 | 1.3.2 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 18 | Authenticated Origin Pulls | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.5 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
 | 19 | Browser Integrity Check | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.7 | 6.6 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 20 | Email Obfuscation | SC-7 | SC.L2-3.13.1 | CC6.7 | 3.6 | — | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 20 | Email Address Obfuscation | SC-7 | SC.L2-3.13.1 | CC6.7 | 3.6 | - | SRG-APP-000383 | ISM-1148 | CPS-11 |
 | 21 | Always Use HTTPS | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.7 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
-| 22 | HTTPS Rewrites | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.8 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
-| 23 | Security Headers | SC-7 | SC.L2-3.13.1 | CC6.7 | 9.8 | 6.5.10 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 24 | Gateway SWG Policies | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.9 | 1.3.1 | SRG-APP-000383 | ISM-1148 | CPS-11 |
-| 25 | Universal SSL Status | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.9 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
+| 22 | Automatic HTTPS Rewrites | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.8 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
+| 23 | Security headers via transform rules | SC-7 | SC.L2-3.13.1 | CC6.7 | 9.8 | 6.5.10 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 24 | Gateway SWG policies | SC-7 | SC.L2-3.13.1 | CC6.6 | 9.9 | 1.3.1 | SRG-APP-000383 | ISM-1148 | CPS-11 |
+| 25 | Universal SSL and certificate validity | SC-8 | SC.L2-3.13.8 | CC6.7 | 3.9 | 4.1 | SRG-APP-000219 | ISM-0490 | CPS-09 |
+| 27 | DNS record origin exposure | - | - | - | - | - | - | - | - |
 
-## 6. Existing Tools
+## Collection states
 
-| Tool | Type | Limitations |
-|------|------|-------------|
-| Cloudflare Security Center | Built-in | Focuses on security insights for managed zones, not comprehensive compliance mapping |
-| Cloudflare Terraform Provider | IaC | Enforces desired state but no compliance drift detection or reporting |
-| flarectl | CLI | Management tool, no security assessment capability |
-| ScoutSuite (Cloudflare module) | Scanner | Limited Cloudflare coverage, focused primarily on cloud IaaS |
-| cf-terraforming | Tool | Generates Terraform from existing config, no security analysis |
-| Prowler (limited) | Scanner | Minimal Cloudflare support |
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
 
-**Gap:** No existing tool provides automated, comprehensive security posture assessment of Cloudflare zone and account configurations mapped to compliance frameworks. cloudflare-sec-inspector fills this gap with deep coverage of WAF, Zero Trust, TLS, and DNS security controls.
+## Integration-specific scrubbing
 
-## 7. Architecture
+Shared contract version: 1.1.
 
-```
-cloudflare-sec-inspector/
-├── cmd/
-│   └── cloudflare-sec-inspector/
-│       └── main.go                 # Entrypoint, CLI bootstrap
-├── internal/
-│   ├── analyzers/
-│   │   ├── analyzer.go             # Analyzer interface and registry
-│   │   ├── waf.go                  # WAF managed rules and custom rules
-│   │   ├── ddos.go                 # DDoS protection settings
-│   │   ├── bots.go                 # Bot management configuration
-│   │   ├── tls.go                  # SSL/TLS mode, min version, HSTS, certs
-│   │   ├── dns.go                  # DNSSEC, DNS records audit
-│   │   ├── access.go               # Zero Trust Access apps, policies, IdPs
-│   │   ├── gateway.go              # Gateway SWG policy review
-│   │   ├── audit.go                # Audit logging checks
-│   │   ├── tokens.go               # API token permissions and expiration
-│   │   ├── members.go              # Account member role audit
-│   │   ├── pagerules.go            # Page rules security review
-│   │   ├── ratelimit.go            # Rate limiting rule audit
-│   │   ├── iprules.go              # IP access rules audit
-│   │   ├── origin.go               # Origin certificate and auth pulls
-│   │   ├── headers.go              # Security headers and browser checks
-│   │   └── https.go                # HTTPS enforcement and rewrites
-│   ├── client/
-│   │   ├── client.go               # Cloudflare API v4 client
-│   │   ├── auth.go                 # Token and global key auth
-│   │   ├── ratelimit.go            # Rate limiter (1200 req/5min default)
-│   │   ├── pagination.go           # Cursor-based pagination handler
-│   │   └── zones.go                # Zone discovery and filtering
-│   ├── config/
-│   │   ├── config.go               # Configuration loading and validation
-│   │   └── redact.go               # Credential redaction for logging
-│   ├── models/
-│   │   ├── zone.go                 # Zone and zone settings models
-│   │   ├── firewall.go             # WAF, firewall rule, rate limit models
-│   │   ├── access.go               # Zero Trust app, policy, IdP models
-│   │   ├── member.go               # Account member and role models
-│   │   ├── token.go                # API token model
-│   │   └── finding.go              # Finding severity/status model
-│   ├── reporters/
-│   │   ├── reporter.go             # Reporter interface
-│   │   ├── json.go                 # JSON output
-│   │   ├── sarif.go                # SARIF 2.1.0 output
-│   │   ├── csv.go                  # CSV output
-│   │   ├── table.go                # Terminal table output
-│   │   └── html.go                 # HTML report with charts
-│   └── tui/
-│       ├── app.go                  # Bubble Tea TUI application
-│       ├── views.go                # Finding detail views
-│       └── styles.go               # Lip Gloss styling
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── spec.md
-└── README.md
-```
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
 
-### Key Design Decisions
+Sensitive fields and values: api_token, api_key, authorization, x-auth-key, x-auth-email, cookie
 
-- **Zone-aware scanning**: Iterates all zones (or filtered subset) and applies zone-level analyzers per zone
-- **Rate limiting**: Cloudflare allows 1200 requests per 5 minutes; built-in token bucket rate limiter with zone-count-aware pacing
-- **Dual auth support**: Supports both scoped API tokens (recommended) and global API key (warns if detected)
-- **Account + Zone scope**: Separates account-level checks (members, Access, tokens) from zone-level checks (WAF, TLS, DNS)
+Credential formats: Cloudflare API tokens, Cloudflare Global API keys, session cookies
 
-## 8. CLI Interface
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
 
-```
-cloudflare-sec-inspector [command] [flags]
+Integration-specific rules:
 
-Commands:
-  scan        Run all or selected security analyzers
-  list        List available analyzers and their descriptions
-  version     Print version information
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
 
-Scan Flags:
-  --api-token string       Cloudflare API token (env: CLOUDFLARE_API_TOKEN)
-  --api-key string         Cloudflare Global API key (env: CLOUDFLARE_API_KEY)
-  --email string           Cloudflare account email (env: CLOUDFLARE_EMAIL)
-  --account-id string      Scope to specific account (env: CLOUDFLARE_ACCOUNT_ID)
-  --zone strings           Scan specific zones by name or ID (default: all zones)
-  --exclude-zone strings   Exclude zones by name or ID
-  --analyzers strings      Run specific analyzers (comma-separated)
-  --exclude strings        Exclude specific analyzers
-  --severity string        Minimum severity to report: critical,high,medium,low,info
-  --format string          Output format: table,json,sarif,csv,html (default "table")
-  --output string          Output file path (default: stdout)
-  --tui                    Launch interactive TUI
-  --no-color               Disable colored output
-  --config string          Path to config file (default "~/.cloudflare-sec-inspector/config.yaml")
-  --timeout duration       API request timeout (default 30s)
-  --verbose                Enable verbose logging
-```
+Projected fields by surface:
 
-### Usage Examples
+| Surface | Allowed fields |
+|---|---|
+| `token-and-account` | `status`, `expires_on`, `id`, `name`, `settings` |
+| `members-and-tokens` | `id`, `status`, `roles`, `policies`, `expires_on`, `modified_on` |
+| `zero-trust-identity` | `id`, `name`, `type`, `decision`, `include`, `exclude`, `require` |
+| `zones-and-settings` | `id`, `name`, `status`, `plan`, `value` |
+| `zone-rules-and-certificates` | `phase`, `kind`, `rules`, `status`, `enabled`, `expires_on`, `content`, `proxied` |
+| `traffic-and-account-controls` | `action`, `when`, `mode`, `notes`, `modified_on`, `enabled`, `filters` |
 
-```bash
-# Full scan of all zones
-cloudflare-sec-inspector scan
+## Export layout
 
-# Scan specific zone
-cloudflare-sec-inspector scan --zone example.com
+Required paths:
 
-# TLS and WAF checks only
-cloudflare-sec-inspector scan --analyzers tls,waf
+- `README.md`
+- `QUICK_REFERENCE.md`
+- `metadata.json`
+- `core_data/access.json`
+- `core_data/accounts.json`
+- `core_data/zones.json`
+- `analysis/identity.json`
+- `analysis/zone-security.json`
+- `analysis/traffic-controls.json`
+- `analysis/findings.json`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis/cis_compliance_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/disa_stig_compliance_report.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
 
-# Generate SARIF for CI/CD pipeline
-cloudflare-sec-inspector scan --format sarif --output results.sarif
+Conditional paths:
 
-# JSON output for specific account
-cloudflare-sec-inspector scan --account-id abc123 --format json
+- `_errors.log`
 
-# Interactive TUI
-cloudflare-sec-inspector scan --tui
-```
+### Artifact schemas
 
-## 9. Build Sequence
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `README.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/accounts.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/zones.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/zone-security.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/traffic-controls.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis/cis_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/disa_stig_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
 
-```bash
-# Prerequisites
-go 1.22+
+### Record schemas
 
-# Clone and build
-git clone https://github.com/hackIDLE/cloudflare-sec-inspector.git
-cd cloudflare-sec-inspector
-go mod download
-go build -ldflags "-s -w -X main.version=$(git describe --tags --always)" \
-  -o bin/cloudflare-sec-inspector ./cmd/cloudflare-sec-inspector/
+#### finding
 
-# Run tests
-go test ./...
+- `id`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `framework mappings`
 
-# Build Docker image
-docker build -t cloudflare-sec-inspector .
+#### collection_marker
 
-# Run via Docker
-docker run --rm \
-  -e CLOUDFLARE_API_TOKEN \
-  cloudflare-sec-inspector scan --format json
-```
+- `collected`
+- `status`
+- `endpoint`
+- `error`
 
-### Makefile Targets
+#### bundle_result
 
-```
-make build       # Build binary
-make test        # Run tests
-make lint        # Run golangci-lint
-make docker      # Build Docker image
-make release     # Build for all platforms (linux/darwin/windows, amd64/arm64)
-```
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
 
-### grclanker implementation
+#### assessment
 
-The shipped implementation is TypeScript inside the grclanker CLI rather than the Go layout above:
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
 
-- `cli/extensions/grc-tools/cloudflare.ts`: `cloudflare_check_access`, `cloudflare_assess_identity`, `cloudflare_assess_zone_security`, `cloudflare_assess_traffic_controls`, `cloudflare_export_audit_bundle`
-- `cli/tests/cloudflare.test.mjs`: mocked coverage, verdict-safety regressions, request-path assertions, and the four false-pass self-check fixtures
-- `cli/scripts/cloudflare-live-smoke.mjs` with `npm --prefix cli run test:cloudflare:live`
-- `src/content/docs/docs/integrations/cloudflare.md`: integration guide with the control coverage and endpoint tables
+#### pagination_state
 
-WAF, DDoS, rate limiting, and security header controls are judged through the rulesets API (`GET /zones/{zone_id}/rulesets/phases/{phase}/entrypoint` for `http_request_firewall_managed`, `http_request_firewall_custom`, `ddos_l7`, `http_ratelimit`, and `http_response_headers_transform`). The deprecated `firewall/rules` and `rate_limits` endpoints are read only when the corresponding rulesets read fails, count as evidence only, and never produce a pass; `firewall/waf/packages` is not used. Zone settings are read individually through `GET /zones/{zone_id}/settings/{setting_id}` because the get-all form is deprecated. Per-hostname Authenticated Origin Pulls associations are enumerated through `GET /zones/{zone_id}/origin_tls_client_auth/hostnames` (OpenAPI operation `per-hostname-authenticated-origin-pull-list-hostname-associations`, `per_page` up to 1000, `status=all`), which the published OpenAPI schema defines even though the rendered API site publishes only the per-hostname get and update pages. Page rules are requested with `status=active` because the documented default is `disabled`. Findings use four statuses: pass, warn, fail, and manual.
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
 
-## 10. Status
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
 
-Implemented in grclanker as of 2026-09-21.
+Overwrite policy: Allocate a new Cloudflare audit directory and numeric suffix without overwriting an existing directory or paired archive.
 
-Shipped: 25 of 25 spec controls have a finding. Controls 1, 2, 5 through 10, 12 through 23, and 25 are automated from documented fields, including zone-level and per-hostname Authenticated Origin Pulls for control 18. Control 3 (DDoS) passes on an override ruleset with acceptable sensitivity or on the managed `ddos_l7` ruleset listed for the zone with no override, and is manual otherwise. Control 24 (Gateway) fails on zero policies when `GET /accounts/{account_id}/gateway` returns a `gateway_tag` and is manual when Gateway licensing cannot be proven. Control 4 (Enterprise Bot Management) and control 11 (retention) fall back to a manual finding that names the plan (from `GET /zones/{zone_id}/subscription` `rate_plan.public_name`) or the evidence to collect. The export bundle writes `core_data/`, `analysis/`, `compliance/` with one report per framework in the mapping table, `QUICK_REFERENCE.md`, `_errors.log` on partial failure, and a zip named after the allocated directory.
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
 
-Remaining: SARIF, CSV, and HTML reporters and the interactive TUI from the original Go design are not part of the grclanker tools. DDoS L3/L4 (Magic Transit) posture and audit log retention settings stay manual because the API exposes no list or setting for them.
+Archive pairing: Create <allocated-directory>.zip beside the allocated Cloudflare audit directory.
