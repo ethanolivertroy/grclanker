@@ -432,12 +432,11 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `PA-24` | 4 | warn | `pa_24_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
 | `PA-24` | 5 | pass | `pa_24_branch_05_matches` equals true |  |
 | `PA-24` | 6 | manual | `pa_24_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
-| `PA-25` | 1 | manual | `pa_25_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
-| `PA-25` | 2 | fail | `pa_25_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
-| `PA-25` | 3 | manual | `pa_25_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
-| `PA-25` | 4 | warn | `pa_25_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
-| `PA-25` | 5 | pass | `pa_25_branch_05_matches` equals true |  |
-| `PA-25` | 6 | manual | `pa_25_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `PA-25` | 1 | manual | `pa_25_branch_01_matches` equals true |  |
+| `PA-25` | 2 | fail | `pa_25_branch_02_matches` equals true |  |
+| `PA-25` | 3 | warn | `pa_25_branch_03_matches` equals true |  |
+| `PA-25` | 4 | pass | `pa_25_branch_04_matches` equals true |  |
+| `PA-25` | 5 | manual | `pa_25_branch_05_matches` equals true |  |
 
 ### Derived decision facts
 
@@ -585,12 +584,11 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `PA-24` | `pa_24_branch_04_matches` | PA-24 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
 | `PA-24` | `pa_24_branch_05_matches` | PA-24 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
 | `PA-24` | `pa_24_branch_06_matches` | PA-24 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `PA-25` | `pa_25_branch_01_matches` | PA-25 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `PA-25` | `pa_25_branch_01_matches` | PA-25 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `evidence_readable` does not equal true. |
 | `PA-25` | `pa_25_branch_02_matches` | PA-25 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
-| `PA-25` | `pa_25_branch_03_matches` | PA-25 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
-| `PA-25` | `pa_25_branch_04_matches` | PA-25 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
-| `PA-25` | `pa_25_branch_05_matches` | PA-25 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
-| `PA-25` | `pa_25_branch_06_matches` | PA-25 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `PA-25` | `pa_25_branch_03_matches` | PA-25 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `PA-25` | `pa_25_branch_04_matches` | PA-25 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `PA-25` | `pa_25_branch_05_matches` | PA-25 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 
 ### Criterion constants
 

@@ -88,7 +88,7 @@ const completePassRules = [
 
 const checks = batch2Checks(titles.map((title, index) => {
   const control = index + 1;
-  const decisionRules = control === 10
+  const decisionRules = control === 10 || control === 25
     ? [
         batch2Rule("manual", batch2Ne("evidence_readable", true)),
         batch2Rule("fail", batch2Gt("violation_count", 0)),

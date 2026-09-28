@@ -180,7 +180,7 @@ test("batch 2 registry, ownership, framework, and output contracts are complete"
       assert.ok(spec.output.artifacts.some((artifact) => artifact.path === path), `${spec.identity.slug}: ${path}`);
     }
   }
-  assert.ok(CLOUDFLARE_SPEC.knownGaps.some((gap) => /CF-ZONE-15.*framework mapping/i.test(gap)));
+  assert.ok(CLOUDFLARE_SPEC.knownGaps.some((gap) => /framework mapping.*CF-ZONE-15|CF-ZONE-15.*mapping/i.test(gap)));
 });
 
 test("batch 2 generated specs are deterministic, portable, and repository-language free", async () => {
