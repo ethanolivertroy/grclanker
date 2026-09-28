@@ -137,7 +137,12 @@ const ordered = (branches: {
   rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
 ];
 const input = (...names: string[]): Readonly<Record<string, string>> => Object.fromEntries(
-  names.map((name) => [name, `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete collector state before evidence samples are capped.`]),
+  names.map((name) => [
+    name,
+    name === "external_collaboration_setting_value"
+      ? "Raw Box enterprise_configuration.content_and_sharing.external_collaboration_status value, retained without translating it to an outcome."
+      : `Runtime-owned ${name.replaceAll("_", " ")} derived from the complete collector state before evidence samples are capped.`,
+  ]),
 );
 const manual = (): BoxExecutableDecision => ({ inputs: {}, rules: [rule("manual", { op: "always" })] });
 
@@ -202,29 +207,29 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
     ],
   },
   "BOX-04": {
-    inputs: input("settings_readable", "allowlist_readable", "unused_setting_count", "external_status", "allowlist_entry_count"),
+    inputs: input("settings_readable", "allowlist_readable", "unused_setting_count", "external_collaboration_setting_value", "allowlist_entry_count"),
     rules: [
       rule("manual", all(ne("settings_readable", true), any(ne("allowlist_readable", true), eq("allowlist_entry_count", 0)))),
       rule("warn", gt("unused_setting_count", 0)),
-      rule("fail", eq("external_status", "enable_external_collaboration")),
+      rule("fail", eq("external_collaboration_setting_value", "enable_external_collaboration")),
       rule("warn", any(
         ne("settings_readable", true),
         ne("allowlist_readable", true),
-        all(eq("external_status", "limit_collaboration_to_allowlisted_domains"), eq("allowlist_entry_count", 0)),
+        all(eq("external_collaboration_setting_value", "limit_collaboration_to_allowlisted_domains"), eq("allowlist_entry_count", 0)),
         all(
-          ne("external_status", "limit_collaboration_to_users_within_enterprise"),
-          ne("external_status", "limit_collaboration_to_allowlisted_domains"),
+          ne("external_collaboration_setting_value", "limit_collaboration_to_users_within_enterprise"),
+          ne("external_collaboration_setting_value", "limit_collaboration_to_allowlisted_domains"),
         ),
       )),
       rule("pass", any(
-        eq("external_status", "limit_collaboration_to_users_within_enterprise"),
-        all(eq("external_status", "limit_collaboration_to_allowlisted_domains"), gt("allowlist_entry_count", 0)),
+        eq("external_collaboration_setting_value", "limit_collaboration_to_users_within_enterprise"),
+        all(eq("external_collaboration_setting_value", "limit_collaboration_to_allowlisted_domains"), gt("allowlist_entry_count", 0)),
       )),
       rule("manual", { op: "always" }),
     ],
   },
   "BOX-05": {
-    inputs: input("allowlist_readable", "config_readable", "exempt_targets_readable", "complete", "external_status", "allowlist_entry_count", "public_domain_count", "stale_entry_count", "undated_entry_count", "exempt_target_count"),
+    inputs: input("allowlist_readable", "config_readable", "exempt_targets_readable", "complete", "external_collaboration_setting_value", "allowlist_entry_count", "public_domain_count", "stale_entry_count", "undated_entry_count", "exempt_target_count"),
     rules: ordered({
       manual: ne("allowlist_readable", true),
       fail: gt("public_domain_count", 0),
@@ -232,7 +237,7 @@ const BOX_EXECUTABLE_DECISIONS: Readonly<Record<string, BoxExecutableDecision>> 
         ne("complete", true),
         ne("config_readable", true),
         ne("exempt_targets_readable", true),
-        all(eq("allowlist_entry_count", 0), eq("external_status", "limit_collaboration_to_allowlisted_domains")),
+        all(eq("allowlist_entry_count", 0), eq("external_collaboration_setting_value", "limit_collaboration_to_allowlisted_domains")),
         gt("stale_entry_count", 0),
         gt("undated_entry_count", 0),
         gt("exempt_target_count", 0),

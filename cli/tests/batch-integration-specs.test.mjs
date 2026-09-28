@@ -129,6 +129,7 @@ function ratioWitnesses(condition, desired, constants) {
   if (!threshold.known) throw new Error("Ratio witness thresholds must be constants or literal values");
   const delta = Math.abs(Number(threshold.value)) >= 2 ? 1 : 0.1;
   const scaledTargets = [
+    0,
     Number(threshold.value) - delta,
     Number(threshold.value),
     Number(threshold.value) + delta,
@@ -534,7 +535,7 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
     stale_entry_count: 0,
     undated_entry_count: 0,
     exempt_target_count: 0,
-    external_status: "limit_collaboration_to_allowlisted_domains",
+    external_collaboration_setting_value: "limit_collaboration_to_allowlisted_domains",
   }), "fail", "a public-domain violation precedes partial evidence");
   assert.equal(evaluateBatchCheckVerdict(BOX_SPEC, "BOX-17", {
     users_readable: true,
