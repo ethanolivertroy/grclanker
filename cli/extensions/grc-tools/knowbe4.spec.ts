@@ -156,7 +156,13 @@ const rows: readonly Batch3CheckRow[] = [
           },
         ),
       )),
-      batch2Rule("pass", { op: "always" }),
+      batch2Rule("pass", batch2All(
+        batch2Eq("knowbe4_06_security_test_sources_readable", true),
+        batch2Eq("knowbe4_06_recipient_population_complete", true),
+        batch2Gt("knowbe4_06_security_test_count", 0),
+        batch2Defined("knowbe4_06_current_phish_prone_percent"),
+        batch2Defined("knowbe4_06_configured_max_phish_prone_percent"),
+      ), "A missing baseline is allowed because the current raw percentage and configured ceiling independently establish compliance."),
     ],
   },
   {
