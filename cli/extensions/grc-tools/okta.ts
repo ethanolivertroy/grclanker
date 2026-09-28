@@ -3304,7 +3304,7 @@ function buildFinding(
   const definition = OKTA_CHECKS[id];
   const facts = OKTA_DECISION_CONTEXT.getStore()?.get(id);
   if (!facts) throw new Error(`${id} has no runtime decision facts`);
-  status = materializeBatchCheckVerdict(OKTA_SPEC, id, facts, status);
+  status = materializeBatchCheckVerdict(OKTA_SPEC, id, facts);
   return {
     id: definition.id,
     title: definition.title,
@@ -3887,18 +3887,15 @@ export function assessOktaAuthentication(
   };
   recordOktaDecisionFacts("OKTA-AUTH-003", {
     ...passwordDecisionBase,
-    compliant_policy_count: complexityPass.length,
-    all_policies_compliant: complexityPass.length === passwordPolicies.length,
+    gap_count: passwordPolicies.length - complexityPass.length,
   });
   recordOktaDecisionFacts("OKTA-AUTH-004", {
     ...passwordDecisionBase,
-    compliant_policy_count: ageHistoryPass.length,
-    all_policies_compliant: ageHistoryPass.length === passwordPolicies.length,
+    gap_count: passwordPolicies.length - ageHistoryPass.length,
   });
   recordOktaDecisionFacts("OKTA-AUTH-005", {
     ...passwordDecisionBase,
-    compliant_policy_count: lockoutPass.length,
-    all_policies_compliant: lockoutPass.length === passwordPolicies.length,
+    gap_count: passwordPolicies.length - lockoutPass.length,
   });
   if (data.passwordPolicies.error) {
     const evidence = "Export Security > Authentication > Password policies and record complexity, age, history, and lockout settings.";
@@ -4565,7 +4562,7 @@ export function assessOktaAdminAccess(
     stale_active_count: staleActiveUsers.length,
     never_activated_count: neverActivatedUsers.length,
     unknown_activity_count: neverSignedInUsers.length,
-    attention_status_count: attentionCount,
+    attention_state_count: attentionCount,
   });
   if (data.users.error) {
     findings.push(
@@ -4625,7 +4622,7 @@ export function assessOktaAdminAccess(
     support_readable: !supportError,
     third_party_readable: !thirdPartyError,
     support_present: Boolean(support),
-    support_disabled: supportState === "DISABLED",
+    support_state: supportState ?? "",
     third_party_admin: thirdPartyAdmin ?? null,
   });
   if (supportError) {
@@ -5441,8 +5438,7 @@ export function assessOktaMonitoring(
     contact_count: contacts.length,
     technical_contact_present: Boolean(technicalContact),
     technical_user_assigned: Boolean(technicalUserId),
-    technical_status_known: technicalStatus !== "",
-    technical_user_active: technicalStatus === "ACTIVE",
+    technical_user_state: technicalStatus,
     technical_lookup_failed: technicalLookupFailed,
   });
   if (data.orgContacts.error && contacts.length === 0) {
