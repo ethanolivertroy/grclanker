@@ -17,6 +17,10 @@ const EPSS_URL = "https://api.first.org/data/v1/epss";
 // 4-hour cache for KEV (updates about weekly), 1-hour for EPSS.
 const KEV_TTL = 4 * 60 * 60 * 1000;
 
+const DEFAULT_SEARCH_LIMIT = 10;
+// Each rendered entry is about 11 lines and 1.1 KB with EPSS, so 50 keeps a broad search near 60 KB.
+const MAX_SEARCH_LIMIT = 50;
+
 interface KevVulnerability {
   cveID: string;
   vendorProject: string;
@@ -242,8 +246,8 @@ export function registerKevsTools(pi: any): void {
       }),
       limit: Type.Optional(
         Type.Number({
-          description: "Max results to return (default: 10).",
-          default: 10,
+          description: `Maximum results to show (default: ${DEFAULT_SEARCH_LIMIT}). Values below 1 use the default; values above ${MAX_SEARCH_LIMIT} are capped at ${MAX_SEARCH_LIMIT}, so narrow the query instead of raising it.`,
+          default: DEFAULT_SEARCH_LIMIT,
         }),
       ),
     }),
@@ -259,18 +263,19 @@ export function registerKevsTools(pi: any): void {
       try {
         const catalog = await cachedFetch<KevCatalog>(KEV_URL, KEV_TTL);
         const normalizedQuery = args.query.toLowerCase();
-        const limit = args.limit ?? 10;
+        const requestedLimit = Math.trunc(args.limit ?? DEFAULT_SEARCH_LIMIT);
+        const limit = requestedLimit < 1 ? DEFAULT_SEARCH_LIMIT : Math.min(requestedLimit, MAX_SEARCH_LIMIT);
 
-        const matches = catalog.vulnerabilities
-          .filter(
-            (vulnerability) =>
-              vulnerability.cveID.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.vendorProject.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.product.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.vulnerabilityName.toLowerCase().includes(normalizedQuery) ||
-              vulnerability.shortDescription.toLowerCase().includes(normalizedQuery),
-          )
-          .slice(0, limit);
+        const allMatches = catalog.vulnerabilities.filter(
+          (vulnerability) =>
+            vulnerability.cveID.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.vendorProject.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.product.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.vulnerabilityName.toLowerCase().includes(normalizedQuery) ||
+            vulnerability.shortDescription.toLowerCase().includes(normalizedQuery),
+        );
+        const matches = allMatches.slice(0, limit);
+        const capped = requestedLimit > MAX_SEARCH_LIMIT && allMatches.length > MAX_SEARCH_LIMIT;
 
         if (matches.length === 0) {
           return textResult(
@@ -280,16 +285,20 @@ export function registerKevsTools(pi: any): void {
         }
 
         const epssScores = await fetchEpss(matches.map((vulnerability) => vulnerability.cveID));
+        const heading = capped
+          ? `Showing ${matches.length} of ${allMatches.length} KEV entries matching "${args.query}" ` +
+            `(catalog size: ${catalog.count}). Results are capped at ${MAX_SEARCH_LIMIT}; ` +
+            `narrow the query to a CVE ID, vendor, or product to see the rest.`
+          : `Found ${matches.length} KEV entr${matches.length === 1 ? "y" : "ies"} matching "${args.query}" ` +
+            `(catalog size: ${catalog.count}):`;
         return textResult(
-          `Found ${matches.length} KEV entr${matches.length === 1 ? "y" : "ies"} matching "${args.query}" ` +
-            `(catalog size: ${catalog.count}):\n\n` +
+          `${heading}\n\n` +
             matches
               .map((vulnerability) => formatKev(vulnerability, epssScores.get(vulnerability.cveID)))
               .join("\n\n"),
-          {
-            query: args.query,
-            count: matches.length,
-          },
+          capped
+            ? { query: args.query, count: matches.length, total_matches: allMatches.length, capped: true }
+            : { query: args.query, count: matches.length },
         );
       } catch (error) {
         return errorResult(
