@@ -2764,7 +2764,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     summary = `Only ${coverage ?? 0}% of ${active.size} active users were tested in the last ${lookbackDays} days (policy minimum ${minCoveragePct}%).`;
   }
 
-  return withInventoryCaveats(finding(2, "high", summary, {
+  const evidence = {
     active_users: whenComplete(snapshot.activeUsers, active.size),
     users_read: active.size,
     tested_users: complete ? tested.size : null,
@@ -2776,6 +2776,18 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     unsampled_security_tests: unsampled,
     recipient_reads_complete: recipients.anyRead ? recipients.complete : null,
     untested_user_sample: complete ? sampleLabels(untested, redact) : null,
+  };
+  const violationCount = testsInWindow.length === 0
+    || (complete && coverage !== undefined && coverage < minCoveragePct)
+    ? 1
+    : 0;
+  const reviewCount = violationCount === 0 && (samples.length === 0 || !complete) ? 1 : 0;
+  return withInventoryCaveats(finding(2, "high", summary, evidence, undefined, {
+    evidence_readable: true,
+    evidence_complete: true,
+    inventory_count: active.size,
+    violation_count: violationCount,
+    review_count: reviewCount,
   }), snapshot, reads);
 }
 

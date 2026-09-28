@@ -1352,6 +1352,18 @@ test("report-rate failures remain proved when the security-test inventory is tru
   assert.match(reportRate.summary, /Only 10%.*Truncated listing: security_tests/);
 });
 
+test("an empty truncated security-test read still proves the no-test coverage failure", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["phishing"], now: NOW });
+  snapshot.securityTests.data = [];
+  snapshot.securityTests.truncated = true;
+  snapshot.securityTests.total = undefined;
+  snapshot.securityTests.limit = 20_000;
+
+  const coverage = findingFor(assessKnowbe4PhishingProgram(snapshot, { now: NOW }), 2);
+  assert.equal(coverage.status, "fail");
+  assert.match(coverage.summary, /No phishing security tests ran.*Truncated listing: security_tests/);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });
