@@ -9,12 +9,9 @@ Use a spec to inspect, extend, or reimplement an integration. Specs document des
 All specs are available as raw markdown. Point your agent at any URL below.
 
 - [Ansible AAP Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/ansible-sec-inspector.spec.md): Community spec for auditing Ansible Automation Platform security posture
-- [Azure Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/azure-sec-inspector.spec.md): Azure subscriptions and M365 tenants via Graph API, ARM, Defender for Cloud
-- [Cloudflare Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/cloudflare-sec-inspector.spec.md): WAF configs, Zero Trust policies, SSL/TLS, DNS security
 - [CrowdStrike Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/crowdstrike-sec-inspector.spec.md): Falcon EDR prevention policies, sensor deployment, device control
 - [Datadog Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/datadog-sec-inspector.spec.md): RBAC, API key management, log pipelines, security monitoring
 - [Elastic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/elastic-sec-inspector.spec.md): Authentication realms, TLS configs, RBAC, field/document-level security
-- [GCP Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/gcp-sec-inspector.spec.md): GCP infrastructure, IAM policies, encryption, org constraints
 - [GitHub Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/github-sec-inspector.spec.md): Enterprise Cloud SSO, branch protection, code security, Actions workflows
 - [grclanker Compute Backends](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/grclanker-compute-backends.spec.md): Portable runtime contract for isolated local and remote compute backends
 - [Google Workspace Operator Bridge](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/gws-operator-bridge.spec.md): Read-only and preview-first Google Workspace operator workflows
@@ -22,31 +19,34 @@ All specs are available as raw markdown. Point your agent at any URL below.
 - [LaunchDarkly Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/launchdarkly-sec-inspector.spec.md): IAM, feature flag hygiene, API token lifecycle
 - [MuleSoft Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/mulesoft-sec-inspector.spec.md): Anypoint Platform IAM, API gateway policies, runtime security
 - [New Relic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/newrelic-sec-inspector.spec.md): Authentication, user access controls, API key management
-- [OCI Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/oci-sec-inspector.spec.md): OCI IAM, networking, Cloud Guard posture, vault key management
 - [PagerDuty Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/pagerduty-sec-inspector.spec.md): Authentication settings, user roles, access controls
-- [Palo Alto Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/paloalto-sec-inspector.spec.md): Prisma Cloud CSPM/CWPP and PAN-OS firewalls
 - [Qualys Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/qualys-sec-inspector.spec.md): Vuln management configs, compliance profiles, scan coverage
 - [Snowflake Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/snowflake-sec-inspector.spec.md): IAM, network security, data protection policies, encryption
 - [Splunk Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/splunk-sec-inspector.spec.md): Authentication, authorization, server settings, data pipelines
 - [Sumo Logic Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/sumologic-sec-inspector.spec.md): Authentication policies, access controls, data governance
 - [Tenable Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/tenable-sec-inspector.spec.md): Scan policies, asset coverage, credential audits
 - [Veracode Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/veracode-sec-inspector.spec.md): Scan coverage, policy compliance, flaw aging, SCA library health
-- [Zscaler Security Inspector](https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/zscaler-sec-inspector.spec.md): ZIA and ZPA URL filtering, DLP policies, SSL inspection
 
 <!-- generated integration registry start -->
 ### Generated portable contracts
 
 - [AWS Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md): Read-only AWS posture inspection across identity, logging, detection, organization guardrails, data protection, and network security.
+- [Azure Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/azure-sec-inspector.spec.md): Portable contract for the shipped Microsoft Entra ID, Microsoft Graph, and Azure Resource Manager security assessments.
 - [Box Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/box-sec-inspector.spec.md): Portable contract for the shipped Box identity, sharing, governance, Shield, and monitoring assessments.
+- [Cloudflare Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/cloudflare-sec-inspector.spec.md): Portable contract for the shipped Cloudflare identity, zone-security, and traffic-control assessments.
 - [Duo Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/duo-sec-inspector.spec.md): Portable contract for the shipped Duo authentication, administrator, protected-application, and monitoring assessments.
+- [GCP Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/gcp-sec-inspector.spec.md): Portable contract for the shipped Google Cloud identity, logging, organization, data-protection, and network assessments.
 - [Google Workspace Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/gws-inspector-go.spec.md): Portable contract for the shipped Google Workspace tenant inspector, distinct from the gws operator bridge.
+- [OCI Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/oci-sec-inspector.spec.md): Portable contract for the shipped OCI identity, Cloud Guard, Audit, networking, Vault, Object Storage, and Compute assessments.
 - [Okta Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/okta-sec-inspector.spec.md): Portable contract for the shipped read-only Okta identity, administrator, integration, and monitoring assessments.
+- [Palo Alto Networks Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/paloalto-sec-inspector.spec.md): Portable contract for the shipped Prisma Cloud CSPM, Prisma Cloud Compute, and PAN-OS assessments.
 - [Salesforce Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/salesforce-sec-inspector.spec.md): Portable contract for the shipped Salesforce platform, identity, data-protection, and monitoring assessments.
 - [ServiceNow Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/servicenow-sec-inspector.spec.md): Portable contract for the shipped ServiceNow identity, hardening, access-control, and operations-governance assessments.
 - [Slack Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/slack-sec-inspector.spec.md): Portable contract for the shipped Slack Enterprise Grid identity, administration, app, channel, and monitoring assessments.
 - [Webex Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/webex-sec-inspector.spec.md): Read-only Webex organization posture inspection across identity, collaboration governance, meetings, hybrid services, and devices.
 - [Zendesk Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zendesk-sec-inspector.spec.md): Portable contract for the shipped Zendesk authentication, access-control, data-protection, and integration assessments.
 - [Zoom Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zoom-sec-inspector.spec.md): Portable contract for the shipped Zoom identity, collaboration-governance, and meeting-security assessments.
+- [Zscaler Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zscaler-sec-inspector.spec.md): Portable contract for the shipped ZIA administrative and policy assessments and ZPA zero-trust access assessment.
 <!-- generated integration registry end -->
 
 ## Docs

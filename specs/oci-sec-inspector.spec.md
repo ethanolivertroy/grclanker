@@ -1,375 +1,840 @@
 ---
 slug: "oci-sec-inspector"
 name: "OCI Security Inspector"
-vendor: "Oracle"
-category: "cloud-infrastructure"
-language: "typescript"
-status: "implemented"
-version: "1.0"
-last_updated: "2026-09-21"
-source_repo: "https://github.com/hackIDLE/grclanker"
+vendor: "Oracle Cloud Infrastructure"
+category: "cloud"
+language: "language-neutral"
+status: "generated"
+version: "1.0.0"
+last_updated: "2026-09-27"
+source_repo: "https://github.com/ethanolivertroy/grclanker"
+implementation_kind: "security-inspector"
 ---
 
-# OCI Security Inspector - Architecture Specification
-
-## 1. Overview
-
-OCI Security Inspector is a security compliance inspection tool for Oracle Cloud Infrastructure (OCI). It audits IAM policies, networking configurations, Cloud Guard posture, vault key management, audit logging, and bastion access controls across OCI tenancies and compartments. The tool produces structured findings mapped to major compliance frameworks, enabling continuous compliance monitoring for organizations running workloads on OCI.
-
-Written in Go with a hybrid CLI/TUI architecture, it performs read-only inspection of OCI resources using official REST APIs and produces machine-readable JSON and human-readable reports.
-
-### grclanker implementation
-
-The shipped implementation lives in `cli/extensions/grc-tools/oci.ts` as six native tools (`oci_check_access`, `oci_assess_identity`, `oci_assess_logging_detection`, `oci_assess_tenancy_guardrails`, `oci_assess_compute_and_storage`, `oci_export_audit_bundle`). It keeps the OCI CLI (API-key profile from `~/.oci/config`) as the authenticated transport and implements assessment, verdict-safety, and export natively. Every command, flag, and field is cited to the OCI CLI command reference and the REST API reference in `OCI_SURFACE_DOCS`. The integration guide is `src/content/docs/docs/integrations/oci.md`.
-
-## 2. APIs & SDKs
-
-### OCI REST APIs
-
-| Service | Base Path | Key Endpoints | Purpose |
-|---------|-----------|---------------|---------|
-| IAM | `/20160918` | `/users`, `/groups`, `/policies`, `/compartments`, `/authenticationPolicies`, `/identityProviders`, `/mfaTotpDevices` | Identity, access policies, MFA |
-| Audit | `/20190901` | `/auditEvents` | Audit log retrieval and retention config |
-| Cloud Guard | `/20200131` | `/detectorRecipes`, `/problems`, `/responderRecipes`, `/targets`, `/managedLists` | Threat detection posture |
-| Bastion | `/20210331` | `/bastions`, `/sessions` | Bastion host and session management |
-| Networking (VCN) | `/20160918` | `/vcns`, `/subnets`, `/securityLists`, `/networkSecurityGroups`, `/nsgSecurityRules`, `/internetGateways`, `/routeTables` | Network security posture |
-| Vault (KMS) | `/20180608` | `/vaults`, `/keys`, `/keyVersions` | Key management and rotation |
-| Object Storage | `/20160918` (namespace) | `/n/{namespace}/b` (buckets), `/n/{namespace}/b/{bucket}/preauthenticatedRequests` | Bucket public access, PAR audit |
-| Compute | `/20160918` | `/instances`, `/images`, `/vnicAttachments` | Instance metadata service version |
-| Block Storage | `/20160918` | `/volumes`, `/bootVolumes`, `/volumeBackupPolicies` | Volume encryption settings |
-| Budget | `/20190111` | `/budgets`, `/alertRules` | Cost alerting configuration |
-| OS Management | `/20190801` | `/managedInstances`, `/scheduledJobs` | Patch compliance |
-| Events | `/20181201` | `/rules` | Event rule configuration |
-
-### SDKs and Libraries
-
-| SDK | Language | Package | Notes |
-|-----|----------|---------|-------|
-| OCI SDK for Go | Go | `github.com/oracle/oci-go-sdk/v65` | Official Oracle SDK; used for all API calls |
-| OCI CLI | Python | `oci-cli` (pip) | Reference for API behavior and testing |
-| OCI Terraform Provider | Go | `github.com/oracle/terraform-provider-oci` | Reference for resource models |
-
-### API Rate Limits
-
-- Most OCI APIs enforce per-tenancy rate limits (varies by service, typically 10-20 requests/second)
-- List operations return paginated results via `opc-next-page` header
-- SDK handles retries with exponential backoff via `common.ConfigureClientWithRetries`
-
-## 3. Authentication
-
-### Supported Authentication Methods
-
-| Method | Config Source | Use Case |
-|--------|-------------|----------|
-| API Key Signing | `~/.oci/config` profile (tenancy, user, fingerprint, key_file, region) | Developer workstations, CI/CD |
-| Instance Principal | Instance metadata service (automatic) | Running on OCI compute instances |
-| Resource Principal | `OCI_RESOURCE_PRINCIPAL_*` environment variables | OCI Functions, Container Instances |
-| Session Token | `~/.oci/config` with `security_token_file` | OCI CLI session-based auth |
-| Delegation Token | `OCI_DELEGATION_TOKEN_FILE` environment variable | Cloud Shell |
-
-### API Key Signing Details
-
-OCI uses RSA key pair signing (not bearer tokens). Each API request is signed with:
-- HTTP method, path, date, host, and content headers
-- Signing algorithm: `rsa-sha256`
-- Key: User's PEM private key (2048-bit or 4096-bit RSA)
-- The `Authorization` header follows the HTTP Signature scheme
-
-### Required IAM Policies (Minimum Permissions)
-
-```
-Allow group SecurityInspectors to inspect all-resources in tenancy
-Allow group SecurityInspectors to read audit-events in tenancy
-Allow group SecurityInspectors to read cloud-guard-family in tenancy
-Allow group SecurityInspectors to read bastion-family in tenancy
-Allow group SecurityInspectors to read vaults in tenancy
-Allow group SecurityInspectors to read keys in tenancy
-Allow group SecurityInspectors to read buckets in tenancy
-Allow group SecurityInspectors to read budget-family in tenancy
-```
-
-### Configuration Precedence
-
-1. CLI flags (`--config-file`, `--profile`, `--region`)
-2. Environment variables (`OCI_CONFIG_FILE`, `OCI_CLI_PROFILE`, `OCI_REGION`)
-3. Default config file `~/.oci/config` with `[DEFAULT]` profile
-
-## 4. Security Controls
-
-1. **IAM password policy strength** - Verify authentication policy enforces minimum length (14+), complexity, and expiration (90 days max)
-2. **MFA enforcement for console users** - Check that all IAM users with console access have MFA TOTP devices enrolled and activated
-3. **API key age and rotation** - Identify API keys older than 90 days; flag keys older than 180 days as critical
-4. **Customer secret key rotation** - Verify S3-compatible access keys are rotated within 90-day windows
-5. **Auth token rotation** - Check SWIFT/auth token age does not exceed 90 days
-6. **IAM policy least privilege** - Analyze policy statements for overly broad permissions (`manage all-resources`, wildcards in resource types)
-7. **Compartment structure depth** - Verify tenancy uses compartment hierarchy (not flat) for resource isolation
-8. **Cloud Guard enabled and active** - Confirm Cloud Guard is enabled in the root compartment with detector recipes assigned to targets
-9. **Cloud Guard open problems** - Enumerate unresolved Cloud Guard problems by severity (CRITICAL, HIGH, MEDIUM, LOW)
-10. **Responder recipe activation** - Verify Cloud Guard responder recipes are in ACTIVE state with appropriate responder rules enabled
-11. **Audit log retention** - Verify audit retention period is set to 365 days (maximum)
-12. **Event rules for critical operations** - Confirm event rules exist for IAM changes, network changes, and policy modifications
-13. **Security list ingress rules** - Analyze security lists for overly permissive ingress (0.0.0.0/0 on sensitive ports: 22, 3389, 1433, 3306, 5432)
-14. **NSG rules analysis** - Check network security group rules for unrestricted inbound access from any source
-15. **Internet gateway exposure** - Identify VCNs with internet gateways and verify associated subnets have appropriate security lists
-16. **Bastion session controls** - Verify bastion service configurations enforce maximum session TTL and restrict allowed CIDR blocks
-17. **Bastion active sessions** - Enumerate active bastion sessions and flag long-running or unusual sessions
-18. **Vault key rotation** - Check that KMS master encryption keys have been rotated within the last 365 days
-19. **Vault key algorithm strength** - Verify vault keys use AES-256 or RSA-4096 (flag weaker algorithms)
-20. **Object Storage public access** - Identify buckets with `publicAccessType` set to `ObjectRead` or `ObjectReadWithoutList`
-21. **Pre-authenticated request audit** - List active pre-authenticated requests (PARs) and flag those with no expiration or distant expiration dates
-22. **Block volume encryption** - Verify all block volumes and boot volumes use customer-managed encryption keys (not Oracle-managed)
-23. **Instance metadata service v2** - Check that compute instances require IMDSv2 (`areLegacyImdsEndpointsDisabled: true`)
-24. **Budget alert rules** - Verify at least one budget with alert rules exists at the tenancy or compartment level
-25. **OS Management patching compliance** - Check managed instances for outstanding security patches and update compliance status
-
-## 5. Compliance Framework Mappings
-
-| # | Control | FedRAMP | CMMC | SOC 2 | CIS OCI | PCI-DSS | STIG | IRAP | ISMAP |
-|---|---------|---------|------|-------|---------|---------|------|------|-------|
-| 1 | IAM password policy | IA-5 | L2 3.5.7 | CC6.1 | 1.1 | 8.3.6 | SRG-APP-000166 | ISM-0421 | AM-03 |
-| 2 | MFA enforcement | IA-2(1) | L2 3.5.3 | CC6.1 | 1.2 | 8.4.2 | SRG-APP-000149 | ISM-1401 | AM-04 |
-| 3 | API key rotation | IA-5(1) | L2 3.5.8 | CC6.1 | 1.7 | 8.6.3 | SRG-APP-000174 | ISM-1590 | AM-05 |
-| 4 | Customer secret key rotation | IA-5(1) | L2 3.5.8 | CC6.1 | 1.8 | 8.6.3 | SRG-APP-000174 | ISM-1590 | AM-05 |
-| 5 | Auth token rotation | IA-5(1) | L2 3.5.8 | CC6.1 | 1.9 | 8.6.3 | SRG-APP-000174 | ISM-1590 | AM-05 |
-| 6 | Policy least privilege | AC-6 | L2 3.1.5 | CC6.3 | 1.14 | 7.2.1 | SRG-APP-000340 | ISM-0432 | AC-01 |
-| 7 | Compartment structure | AC-4 | L2 3.13.1 | CC6.1 | 1.3 | 1.3.1 | SRG-APP-000039 | ISM-1416 | AC-02 |
-| 8 | Cloud Guard enabled | SI-4 | L2 3.14.6 | CC7.2 | 3.1 | 11.5.1 | SRG-APP-000516 | ISM-0120 | SO-01 |
-| 9 | Cloud Guard open problems | SI-4(5) | L2 3.14.7 | CC7.3 | 3.2 | 11.5.1.1 | SRG-APP-000516 | ISM-0123 | SO-02 |
-| 10 | Responder recipe activation | IR-4 | L2 3.6.1 | CC7.4 | 3.3 | 12.10.5 | SRG-APP-000516 | ISM-0125 | IR-01 |
-| 11 | Audit log retention | AU-11 | L2 3.3.1 | CC7.2 | 3.4 | 10.7.1 | SRG-APP-000515 | ISM-0859 | LG-01 |
-| 12 | Event rules | AU-12 | L2 3.3.1 | CC7.2 | 3.5 | 10.6.1 | SRG-APP-000492 | ISM-0580 | LG-02 |
-| 13 | Security list ingress | SC-7 | L2 3.13.1 | CC6.6 | 2.1 | 1.3.1 | SRG-APP-000142 | ISM-1416 | NW-01 |
-| 14 | NSG rules analysis | SC-7 | L2 3.13.1 | CC6.6 | 2.2 | 1.3.2 | SRG-APP-000142 | ISM-1416 | NW-01 |
-| 15 | Internet gateway exposure | SC-7(5) | L2 3.13.6 | CC6.6 | 2.3 | 1.3.1 | SRG-APP-000383 | ISM-1417 | NW-02 |
-| 16 | Bastion session controls | AC-17 | L2 3.1.12 | CC6.1 | 2.8 | 8.6.1 | SRG-APP-000190 | ISM-1506 | AC-03 |
-| 17 | Bastion active sessions | AC-17(1) | L2 3.1.12 | CC6.2 | 2.9 | 8.6.1 | SRG-APP-000190 | ISM-1506 | AC-03 |
-| 18 | Vault key rotation | SC-12(1) | L2 3.13.10 | CC6.1 | 4.1 | 3.6.4 | SRG-APP-000514 | ISM-0490 | CR-01 |
-| 19 | Vault key algorithm strength | SC-13 | L2 3.13.11 | CC6.1 | 4.2 | 3.6.1 | SRG-APP-000514 | ISM-0457 | CR-02 |
-| 20 | Object Storage public access | AC-3 | L2 3.1.1 | CC6.1 | 5.1 | 1.3.6 | SRG-APP-000033 | ISM-0405 | DS-01 |
-| 21 | Pre-authenticated request audit | AC-3 | L2 3.1.2 | CC6.1 | 5.2 | 7.2.2 | SRG-APP-000033 | ISM-0405 | DS-02 |
-| 22 | Block volume encryption | SC-28 | L2 3.13.16 | CC6.1 | 4.3 | 3.4.1 | SRG-APP-000429 | ISM-1080 | CR-03 |
-| 23 | Instance metadata v2 | CM-7 | L2 3.4.7 | CC6.1 | 2.10 | 2.2.1 | SRG-APP-000141 | ISM-1418 | CM-01 |
-| 24 | Budget alert rules | SA-10 | L2 3.12.4 | CC3.1 | 6.1 | 12.5.2 | SRG-APP-000516 | ISM-1211 | GM-01 |
-| 25 | OS Management patching | SI-2 | L2 3.14.1 | CC7.1 | 7.1 | 6.3.3 | SRG-APP-000456 | ISM-1143 | VM-01 |
-
-## 6. Existing Tools
-
-| Tool | Type | Coverage | Limitations |
-|------|------|----------|-------------|
-| **OCI Cloud Guard** | Native service | Threat detection, configuration drift | Requires Cloud Guard enablement; limited custom rules; no offline/export capability |
-| **OCI Security Zones** | Native service | Preventive controls for compartments | Binary allow/deny only; no audit reporting; limited to zone-enabled compartments |
-| **Oracle Cloud Compliance** | Native service | Compliance posture dashboard | Console-only; no CLI/API export; limited framework mappings |
-| **Steampipe OCI Plugin** | Open source | SQL-based querying of OCI resources | Requires Steampipe runtime; no built-in compliance logic; query-only |
-| **Prowler (OCI support)** | Open source | Multi-cloud security assessment | OCI support is limited and newer; fewer OCI-specific checks than AWS |
-| **ScoutSuite** | Open source | Multi-cloud auditing | OCI support is experimental; limited service coverage |
-| **oci-auditing (custom scripts)** | Community | Various OCI audit scripts | Fragmented; no unified reporting; maintenance varies |
-
-### Differentiation
-
-OCI Security Inspector provides a unified, Go-based CLI tool with deep OCI API coverage, structured findings output, and direct compliance framework mappings across eight frameworks. Unlike Cloud Guard (which requires OCI console access), this tool runs externally and produces portable compliance reports.
-
-## 7. Architecture
-
-```
-oci-sec-inspector/
-├── cmd/
-│   └── oci-sec-inspector/
-│       └── main.go                   # Entry point, CLI parsing, TUI initialization
-├── internal/
-│   ├── analyzers/
-│   │   ├── analyzer.go               # Analyzer interface and registry
-│   │   ├── iam.go                    # Controls 1-6: IAM password policy, MFA, key rotation, policies
-│   │   ├── compartment.go            # Control 7: Compartment structure analysis
-│   │   ├── cloudguard.go             # Controls 8-10: Cloud Guard status, problems, responders
-│   │   ├── audit.go                  # Controls 11-12: Audit retention, event rules
-│   │   ├── networking.go             # Controls 13-15: Security lists, NSGs, internet gateways
-│   │   ├── bastion.go                # Controls 16-17: Bastion config and session analysis
-│   │   ├── vault.go                  # Controls 18-19: Key rotation, algorithm strength
-│   │   ├── storage.go                # Controls 20-22: Object Storage, PARs, block volume encryption
-│   │   ├── compute.go                # Control 23: IMDSv2 enforcement
-│   │   ├── budget.go                 # Control 24: Budget alert rules
-│   │   └── osmanagement.go           # Control 25: Patch compliance
-│   ├── reporters/
-│   │   ├── reporter.go               # Reporter interface
-│   │   ├── json.go                   # JSON output (findings array, SARIF-compatible option)
-│   │   ├── csv.go                    # CSV tabular output
-│   │   ├── html.go                   # Styled HTML report with severity breakdown
-│   │   └── compliance.go             # Compliance matrix report (framework-mapped)
-│   ├── client/
-│   │   ├── oci.go                    # OCI SDK client wrapper, auth provider selection
-│   │   ├── pagination.go             # Generic paginated list helper
-│   │   └── ratelimit.go              # Per-service rate limiter
-│   ├── config/
-│   │   ├── config.go                 # Configuration struct and loader
-│   │   └── defaults.go               # Default thresholds (key age, retention days, etc.)
-│   ├── models/
-│   │   ├── finding.go                # Finding struct (severity, control, resource, evidence)
-│   │   ├── severity.go               # Severity levels: CRITICAL, HIGH, MEDIUM, LOW, INFO
-│   │   └── compliance.go             # Compliance mapping structs
-│   └── tui/
-│       ├── app.go                    # Bubble Tea TUI application
-│       ├── views.go                  # TUI view components
-│       └── styles.go                 # Lip Gloss styling
-├── pkg/
-│   └── version/
-│       └── version.go                # Build version, commit, date (ldflags)
-├── configs/
-│   ├── controls.yaml                 # Control definitions and framework mappings
-│   └── thresholds.yaml               # Configurable thresholds (key age, scan intervals)
-├── go.mod
-├── go.sum
-├── Makefile
-├── Dockerfile
-├── spec.md
-└── README.md
-```
-
-### Key Design Decisions
-
-- **OCI Go SDK**: Uses `github.com/oracle/oci-go-sdk/v65` for all API interactions with native auth provider support
-- **Compartment recursion**: Analyzers walk the full compartment tree by default; `--compartment-ocid` limits scope
-- **Parallel execution**: Analyzers run concurrently across compartments using worker pools (`--concurrency` flag)
-- **Finding model**: Each finding includes resource OCID, compartment path, severity, control ID, evidence, and remediation guidance
-
-## 8. CLI Interface
-
-```
-oci-sec-inspector [command] [flags]
-
-Commands:
-  scan          Run security inspection across OCI tenancy
-  report        Generate report from saved scan results
-  list          List available controls, frameworks, or compartments
-  version       Print version information
-
-Scan Flags:
-  --config-file string        OCI config file path (default "~/.oci/config")
-  --profile string            OCI config profile name (default "DEFAULT")
-  --region string             OCI region override (default: from config)
-  --compartment-ocid string   Limit scan to specific compartment (default: tenancy root)
-  --recurse                   Recursively scan child compartments (default: true)
-  --controls string           Comma-separated control IDs to run (default: all)
-  --exclude-controls string   Comma-separated control IDs to skip
-  --severity string           Minimum severity to report: CRITICAL,HIGH,MEDIUM,LOW,INFO (default: LOW)
-  --concurrency int           Number of parallel analyzer workers (default: 5)
-  --timeout duration          Maximum scan duration (default: 30m)
-
-Output Flags:
-  --output string             Output format: json, csv, html, compliance, table (default: table)
-  --output-file string        Write output to file (default: stdout)
-  --sarif                     Output in SARIF format for CI integration
-  --quiet                     Suppress progress output, print only results
-
-Global Flags:
-  --log-level string          Log level: debug, info, warn, error (default: info)
-  --no-color                  Disable colored output
-  --tui                       Launch interactive TUI mode
-```
-
-### Usage Examples
-
-```bash
-# Full tenancy scan with JSON output
-oci-sec-inspector scan --output json --output-file findings.json
-
-# Scan specific compartment, networking controls only
-oci-sec-inspector scan --compartment-ocid ocid1.compartment.oc1..xxx \
-  --controls 13,14,15 --output table
-
-# High severity and above, using non-default profile
-oci-sec-inspector scan --profile PROD --severity HIGH --output html \
-  --output-file report.html
-
-# Interactive TUI mode
-oci-sec-inspector --tui
-
-# List available controls
-oci-sec-inspector list controls
-
-# Generate compliance matrix from previous scan
-oci-sec-inspector report --input findings.json --output compliance \
-  --frameworks fedramp,pci-dss
-```
-
-## 9. Build Sequence
-
-```bash
-# 1. Initialize Go module
-go mod init github.com/hackIDLE/oci-sec-inspector
-
-# 2. Add dependencies
-go get github.com/oracle/oci-go-sdk/v65@latest
-go get github.com/spf13/cobra@latest
-go get github.com/charmbracelet/bubbletea@latest
-go get github.com/charmbracelet/lipgloss@latest
-go get gopkg.in/yaml.v3@latest
-go get go.uber.org/zap@latest
-
-# 3. Build
-go build -ldflags "-X pkg/version.Version=$(git describe --tags --always) \
-  -X pkg/version.Commit=$(git rev-parse HEAD) \
-  -X pkg/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -o bin/oci-sec-inspector ./cmd/oci-sec-inspector
-
-# 4. Run tests
-go test ./... -v -race -coverprofile=coverage.out
-
-# 5. Lint
-golangci-lint run ./...
-
-# 6. Docker build
-docker build -t oci-sec-inspector:latest .
-
-# 7. Cross-compile
-GOOS=linux GOARCH=amd64 go build -o bin/oci-sec-inspector-linux-amd64 ./cmd/oci-sec-inspector
-GOOS=darwin GOARCH=arm64 go build -o bin/oci-sec-inspector-darwin-arm64 ./cmd/oci-sec-inspector
-GOOS=windows GOARCH=amd64 go build -o bin/oci-sec-inspector-windows-amd64.exe ./cmd/oci-sec-inspector
-```
-
-### Makefile Targets
-
-| Target | Description |
-|--------|-------------|
-| `make build` | Build binary for current platform |
-| `make test` | Run tests with race detection |
-| `make lint` | Run golangci-lint |
-| `make docker` | Build Docker image |
-| `make release` | Cross-compile for linux/darwin/windows |
-| `make clean` | Remove build artifacts |
-
-## 10. Status
-
-Implemented in grclanker (TypeScript) on 2026-09-21; the Go/TUI architecture in sections 7-9 remains the original design reference and was not built.
-
-### Shipped
-
-- 21 findings across four assess tools covering controls 1-23: OCI-IAM-01..06, OCI-LOG-01..06 (OCI-LOG-04 is supporting audit-event evidence), OCI-GRD-01..06, OCI-CMP-01..03.
-- Verdict safety: unreadable or denied surfaces (including the documented `NotAuthorizedOrNotFound` response) render `manual`; empty inventories never pass by default; compartment caps, denied compartments, item caps, and undated items withhold `pass`; every enabling flag is read explicitly; the CLI `--all` flag pages to completion; bundle reruns allocate `-2`, `-3` and never overwrite. A finding that reads more than one inventory demotes when any of them is incomplete (OCI-GRD-02 and OCI-GRD-03 consult the security list inventory for their vacuous-empty verdict and warn when it is partial), and every demoted summary names the failing CLI command and the compartments it could not read; a table-driven test makes each of the 33 client surfaces unreadable in turn (fully and per compartment) and asserts the dependent findings drop below pass and name the surface while unrelated findings keep passing.
-- Evidence bundle with `core_data/`, `analysis/`, `compliance/` (executive summary, unified matrix, one report per framework in section 5), `QUICK_REFERENCE.md`, and `_errors.log` on partial collection.
-- Bundle secret hygiene: credential-bearing fields (`accessUri`, `keyValue`, `token`, `key`, secrets, passwords, private keys, key material, wrapped keys, `userData`, `authorization`) are replaced with `[redacted]` at finding creation, PEM blocks, PAR URIs, the OCI request-signing `Signature` parameter list, standalone `keyId`/`signingKeyId`/`signature` values (assignment and JSON-colon forms), and `token`/`secret`/`password`/`pass_phrase`/`key_file`/`access_uri` assignments are scrubbed from all strings including CLI errors, raw compartment snapshots are projected to the four documented fields the verdicts read, and the config file path is redacted from `metadata.json` and `access.json`; a regression test writes a bundle from `FAKE_`-marked fixtures and asserts no marker survives in any file or zip entry.
-- Cap truncation: `max_compartments`, `max_keys`, `max_policies`, and `max_buckets` each record the cap hit, report seen versus total, and withhold `pass`; one regression test per cap drives it to the cap.
-- CLI error text: a failing `oci` process never has its stderr or stdout echoed. The runner raises `OciCommandError`, whose message keeps only the documented `ServiceError` fields (`status`, `code`, `message`, `opc-request-id`) after scrubbing, or otherwise a descriptor with the command words, exit code, and stderr and stdout byte counts. One exported scrub, `scrubErrorText`, runs once where every error string is created (the `OciCommandError` constructor and `errorMessage`), before the 500-character `ServiceError` message cap and the 1000-character `errorMessage` cap so no fragment of a secret can straddle a cap; it strips embedded URL queries and fragments, Bearer, Basic, cookie, api key, session, access, refresh, and id token, client secret, password, `Signature`, and `keyId` shapes (quoted or not), and any unlabeled run of 16 or more token characters that contains a digit or a `+` in free text, while `kmsKeyId`, `masterKeyId`, `--key-id`, and OCIDs stay readable. The bundle sink is a second layer in data mode: `scrubAssessmentForBundle` and the export path apply `redactSensitiveText` (the same patterns with the long-token rule off) to every finding summary, errors array entry, and access-check error, so identifiers such as a compartment named `prod-us-east-2026` survive in `_errors.log`, the per-area errors arrays, and the executive summary while `token=` shapes are still redacted there. An `opc-request-id` is disclosed only when it matches a documented layout, the CLI's `32hex(/32hex){0,2}` form or the UUID form shown in `usingapi.htm`; any other value behind the label is dropped from the disclosure. Residuals: a value that matches a documented layout and is deliberately placed directly behind an `opc-request-id=` label stays readable (no OCI secret has the bare 32-hex shape; the identity-domain OAuth client secret has the UUID shape), which is exfiltration rather than accidental echo; an unlabeled token of 16 or more characters with no digit or `+` is not redacted by the long-token rule; the in-memory errors arrays and assessment summary statuses wrap compartment names (and, in one informational line, vault display names) around each cause verbatim as tenant data, and the sink redacts assignment shapes inside them for the bundle. A table-driven walk drives all 33 client surfaces through three failure shapes and asserts no canary reaches a finding, summary, errors array, bundle file, zip entry, or thrown error, and that each failure is disclosed.
-- Silent success (2xx non-protocol body): `runJson` requires exit-0 stdout to be the documented `{ "data": ... }` JSON document. Empty stdout, whitespace-only stdout, non-JSON stdout, and a JSON document without a `data` member each raise `OciCommandError` with a marker naming the command and the observed stdout state (`oci iam compartment list exited 0 with empty stdout (no JSON document)`, `... with whitespace-only stdout (N bytes, no JSON document)`, `... with a JSON document that has no data member (N bytes)`, `... but printed N bytes of non-JSON stdout (withheld)`), never echoing stdout or naming a status code; `collect()` records it as an unreadable surface so the access check reports `not_readable`, `core_data` carries the marker, and dependent findings render `manual` or `warn` with `null` counts, never an empty inventory. Previously the first three shapes were read as empty lists and produced six hard verdicts per shape (IAM-05 fail, IAM-03 pass, LOG-01 fail, LOG-03 fail, LOG-05 fail, GRD-02 pass). The OCI CLI has printed nothing for an empty list on some versions (oracle/oci-cli issue 204), but no docs.oracle.com page documents that for any command, so no command's empty stdout is treated as a documented empty result. Two tests spawn a fake `oci` through the default `execFileSync` runner: all surfaces per shape (10 of 10 access surfaces `not_readable`, 0 of 21 findings pass or fail, every error carries the marker) and each named surface per shape (the dependent finding drops below pass, the summary and an errors entry name the command), with HTML stdout kept as the control.
-- Live smoke script `cli/scripts/oci-live-smoke.mjs` (`npm --prefix cli run test:oci:live`).
-
-### Deviations from this spec (docs win over spec)
-
-- Control 1 expiration: the IAM `PasswordPolicy` datatype exposes no expiration setting, so expiration is a separate always-manual finding (OCI-IAM-06); length and complexity are judged from the documented fields.
-- Control 2 uses the documented `User.isMfaActivated` field instead of enumerating TOTP devices per user.
-- Control 9 uses `ProblemSummary.riskLevel` and `lifecycleDetail=OPEN` (the API has no `severity` field on problems).
-- Control 19 key length lives on `Key.keyShape` (GetKey), not on `KeySummary`, so every ENABLED key is fetched with `oci kms management key get --key-id --endpoint` (capped by `max_keys`). `KeyShape.length` is documented in bytes (AES 16/24/32, RSA 256/384/512, ECDSA 32/48/66): AES below 32 bytes and RSA below 512 bytes fail. The control text names only AES-256 and RSA-4096, so ECDSA keys pass on any documented `curveId` (NIST_P256, NIST_P384, NIST_P521) and fail when the curve is missing or undocumented. A denied key get renders the key inventory partial: warn when some keys were read, manual when none were.
-- Control 16: a bastion whose `clientCidrBlockAllowList` contains `0.0.0.0/0` or `::/0` and whose `maxSessionTtlInSeconds` exceeds 3 hours fails; either condition alone warns.
-- Control 14: `SecurityRule.isValid` is read into the NSG evidence (count of rules with `isValid=false`, flag on each permissive rule).
-- `OCI-LOG-04` (audit event visibility) is supporting evidence for control 11, not a numbered control, so it carries no framework mappings.
-- Controls 6, 12, 13, 14, 15, 16, 18, 20, 22, 23: the list APIs have no subtree parameter, so resources are listed per accessible compartment up to `max_compartments`.
-- Control 20: `BucketSummary` omits `publicAccessType`, so each bucket is fetched with `GetBucket` up to `max_buckets`.
-- Control 16: `BastionSummary` omits TTL and CIDR fields, so each bastion is fetched with `GetBastion`.
-- Control 21: `timeExpires` is present on every PAR by API contract; "no expiration" cannot occur and long-lived PARs (more than 30 days out) warn instead.
-- Output formats: SARIF and the JSON/CSV/HTML CLI outputs are out of scope; findings are JSON in `analysis/findings.json`.
-
-### Deferred
-
-- Control 24 budgets and alert rules (`oci budgets budget budget list`, `oci budgets budget alert-rule list`).
-- Control 25 OS Management patching: the current API reference index lists only OS Management Hub (`osmh`, `/20220901`); the legacy OS Management Service (`/20190801`) is no longer in the reference and should not be targeted.
-- Auth modes: session token (`security_token_file`), instance principal, resource principal, delegation token.
-- Unfolding controls 3-5 (OCI-IAM-03), 16-17 (OCI-GRD-04), 18-19 (OCI-GRD-05), and 20-21 (OCI-GRD-06) into one finding each; today each folded control is judged and reported as separate evidence buckets inside the shared finding.
+<!-- generated integration spec -->
+> Generated from the executable integration registry, registered tool definitions, and the adjacent narrative source. Edit those sources, not this file.
+
+# OCI Security Inspector
+
+Portable contract for the shipped OCI identity, Cloud Guard, Audit, networking, Vault, Object Storage, and Compute assessments.
+
+## Purpose
+
+Give security and compliance teams a read-only, repeatable view of OCI identity, Cloud Guard, Audit, networking, Vault, Object Storage, and Compute posture without treating a failed OCI CLI command as an empty inventory.
+
+## Design guidance
+
+Use a dedicated OCI audit profile with explicit tenancy, compartment, and region scope. Preserve command failures and every configured collection cap as evidence. Keep identity-domain settings manual when the classic IAM API does not expose them.
+
+## Shared integration contract
+
+This specification requires [shared integration contract version 1.1](./integration-contract.md). The raw contract is available at https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/integration-contract.md.
+
+## Known runtime gaps
+
+- The runtime invokes documented read-only OCI CLI commands and records command failures as unreadable evidence rather than empty arrays.
+- Compartment, credential, policy, bucket, key, and resource caps mark dependent checks partial; displayed records are capped independently from verdict counts.
+- Password expiration remains manual because the classic IAM PasswordPolicy datatype does not expose that identity-domain setting.
+- Identity-domain password expiration and controls without a decisive classic IAM field remain manual.
+
+## Tools
+
+| Tool | Purpose | Finding IDs | Result shape |
+|---|---|---|---|
+| `oci_check_access` | Validate OCI CLI-backed read-only access across IAM, Audit, Cloud Guard, Networking, Vault, Object Storage, and Compute surfaces. | None | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `oci_assess_identity` | Assess OCI IAM posture across password policy strength, MFA coverage, API and secret credential rotation, broad policies, and compartment hierarchy depth. | `OCI-IAM-01`, `OCI-IAM-02`, `OCI-IAM-03`, `OCI-IAM-04`, `OCI-IAM-05`, `OCI-IAM-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `oci_assess_logging_detection` | Assess OCI Cloud Guard enablement, targets, problems, and responder recipes, audit log retention, audit event visibility, and event rule coverage for critical tenancy changes. | `OCI-LOG-01`, `OCI-LOG-02`, `OCI-LOG-03`, `OCI-LOG-04`, `OCI-LOG-05`, `OCI-LOG-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `oci_assess_tenancy_guardrails` | Assess OCI network, bastion, vault, and object-storage guardrails across accessible compartments, including sensitive-port exposure, bastion controls, vault key hygiene, and public bucket risk. | `OCI-GRD-01`, `OCI-GRD-02`, `OCI-GRD-03`, `OCI-GRD-04`, `OCI-GRD-05`, `OCI-GRD-06` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `oci_assess_compute_and_storage` | Assess OCI compute instances for IMDSv2-only metadata access and block and boot volumes for customer-managed key encryption across accessible compartments and availability domains. | `OCI-CMP-01`, `OCI-CMP-02`, `OCI-CMP-03` | A text result whose structured details preserve the runtime assessment or access-check object byte-for-byte. |
+| `oci_export_audit_bundle` | Export an OCI audit package with access checks, identity, logging and detection, tenancy guardrail, and compute and storage findings, compliance reports, JSON analysis, and a zip archive. | `OCI-IAM-01`, `OCI-IAM-02`, `OCI-IAM-03`, `OCI-IAM-04`, `OCI-IAM-05`, `OCI-IAM-06`, `OCI-LOG-01`, `OCI-LOG-02`, `OCI-LOG-03`, `OCI-LOG-04`, `OCI-LOG-05`, `OCI-LOG-06`, `OCI-GRD-01`, `OCI-GRD-02`, `OCI-GRD-03`, `OCI-GRD-04`, `OCI-GRD-05`, `OCI-GRD-06`, `OCI-CMP-01`, `OCI-CMP-02`, `OCI-CMP-03` | A text result plus output directory, paired archive path, file count, finding count, and collection-error count. |
+
+### Parameters
+
+#### `oci_check_access`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `config_file` | string | no | OCI config file path. Defaults to OCI_CONFIG_FILE or ~/.oci/config. |
+| `profile` | string | no | OCI config profile. Defaults to OCI_CLI_PROFILE or DEFAULT. |
+| `region` | string | no | OCI region override. Defaults to OCI_REGION, config profile region, or us-ashburn-1. |
+| `tenancy_ocid` | string | no | Explicit OCI tenancy OCID. Defaults to OCI_TENANCY_OCID or config profile tenancy. |
+| `compartment_ocid` | string | no | Compartment OCID to scope audit event and access-check reads. Defaults to OCI_COMPARTMENT_OCID or the tenancy OCID. |
+
+#### `oci_assess_identity`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `config_file` | string | no | OCI config file path. Defaults to OCI_CONFIG_FILE or ~/.oci/config. |
+| `profile` | string | no | OCI config profile. Defaults to OCI_CLI_PROFILE or DEFAULT. |
+| `region` | string | no | OCI region override. Defaults to OCI_REGION, config profile region, or us-ashburn-1. |
+| `tenancy_ocid` | string | no | Explicit OCI tenancy OCID. Defaults to OCI_TENANCY_OCID or config profile tenancy. |
+| `compartment_ocid` | string | no | Compartment OCID to scope audit event and access-check reads. Defaults to OCI_COMPARTMENT_OCID or the tenancy OCID. |
+| `max_compartments` | number | no | Maximum accessible compartments to inspect for compartment-scoped resources. Defaults to 25; hitting the cap withholds pass verdicts. |
+| `stale_days` | number | no | Credential staleness threshold in days. Defaults to 90. |
+| `max_keys` | number | no | Maximum API/secret credentials to inspect. Defaults to 200. |
+| `max_policies` | number | no | Maximum IAM policies to inspect for broad statements. Defaults to 500. |
+
+#### `oci_assess_logging_detection`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `config_file` | string | no | OCI config file path. Defaults to OCI_CONFIG_FILE or ~/.oci/config. |
+| `profile` | string | no | OCI config profile. Defaults to OCI_CLI_PROFILE or DEFAULT. |
+| `region` | string | no | OCI region override. Defaults to OCI_REGION, config profile region, or us-ashburn-1. |
+| `tenancy_ocid` | string | no | Explicit OCI tenancy OCID. Defaults to OCI_TENANCY_OCID or config profile tenancy. |
+| `compartment_ocid` | string | no | Compartment OCID to scope audit event and access-check reads. Defaults to OCI_COMPARTMENT_OCID or the tenancy OCID. |
+| `max_compartments` | number | no | Maximum accessible compartments to inspect for compartment-scoped resources. Defaults to 25; hitting the cap withholds pass verdicts. |
+| `lookback_days` | number | no | Audit event lookback window in days. Defaults to 7. |
+
+#### `oci_assess_tenancy_guardrails`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `config_file` | string | no | OCI config file path. Defaults to OCI_CONFIG_FILE or ~/.oci/config. |
+| `profile` | string | no | OCI config profile. Defaults to OCI_CLI_PROFILE or DEFAULT. |
+| `region` | string | no | OCI region override. Defaults to OCI_REGION, config profile region, or us-ashburn-1. |
+| `tenancy_ocid` | string | no | Explicit OCI tenancy OCID. Defaults to OCI_TENANCY_OCID or config profile tenancy. |
+| `compartment_ocid` | string | no | Compartment OCID to scope audit event and access-check reads. Defaults to OCI_COMPARTMENT_OCID or the tenancy OCID. |
+| `max_compartments` | number | no | Maximum accessible compartments to inspect for compartment-scoped resources. Defaults to 25; hitting the cap withholds pass verdicts. |
+| `max_buckets` | number | no | Maximum buckets to fetch for public access and PAR checks. Defaults to 100. |
+| `max_keys` | number | no | Maximum ENABLED vault keys to fetch with kms key get across all vaults. Defaults to 200; hitting the cap withholds pass. |
+
+#### `oci_assess_compute_and_storage`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `config_file` | string | no | OCI config file path. Defaults to OCI_CONFIG_FILE or ~/.oci/config. |
+| `profile` | string | no | OCI config profile. Defaults to OCI_CLI_PROFILE or DEFAULT. |
+| `region` | string | no | OCI region override. Defaults to OCI_REGION, config profile region, or us-ashburn-1. |
+| `tenancy_ocid` | string | no | Explicit OCI tenancy OCID. Defaults to OCI_TENANCY_OCID or config profile tenancy. |
+| `compartment_ocid` | string | no | Compartment OCID to scope audit event and access-check reads. Defaults to OCI_COMPARTMENT_OCID or the tenancy OCID. |
+| `max_compartments` | number | no | Maximum accessible compartments to inspect for compartment-scoped resources. Defaults to 25; hitting the cap withholds pass verdicts. |
+
+#### `oci_export_audit_bundle`
+
+| Parameter | Kind | Required | Meaning |
+|---|---|---|---|
+| `config_file` | string | no | OCI config file path. Defaults to OCI_CONFIG_FILE or ~/.oci/config. |
+| `profile` | string | no | OCI config profile. Defaults to OCI_CLI_PROFILE or DEFAULT. |
+| `region` | string | no | OCI region override. Defaults to OCI_REGION, config profile region, or us-ashburn-1. |
+| `tenancy_ocid` | string | no | Explicit OCI tenancy OCID. Defaults to OCI_TENANCY_OCID or config profile tenancy. |
+| `compartment_ocid` | string | no | Compartment OCID to scope audit event and access-check reads. Defaults to OCI_COMPARTMENT_OCID or the tenancy OCID. |
+| `max_compartments` | number | no | Maximum accessible compartments to inspect for compartment-scoped resources. Defaults to 25; hitting the cap withholds pass verdicts. |
+| `output_dir` | string | no | Output root. Defaults to ./export/oci. |
+| `stale_days` | number | no | Credential staleness threshold in days. Defaults to 90. |
+| `max_keys` | number | no | Maximum API/secret credentials to inspect and, for the guardrail assessment, maximum ENABLED vault keys fetched with kms key get. Defaults to 200; hitting either cap withholds pass. |
+| `max_policies` | number | no | Maximum IAM policies to inspect for broad statements. Defaults to 500. |
+| `max_buckets` | number | no | Maximum buckets to fetch. Defaults to 100. |
+| `lookback_days` | number | no | Audit event lookback window in days. Defaults to 7. |
+
+
+## Authentication
+
+Supported modes:
+
+- OCI CLI configuration profile
+
+Credential precedence, highest first:
+
+1. Explicit tool arguments
+2. OCI_* environment variables
+3. Selected OCI CLI profile
+4. Runtime defaults
+
+Environment variables: `HOME`, `USERPROFILE`, `OCI_CONFIG_FILE`, `OCI_CLI_PROFILE`, `OCI_REGION`, `OCI_TENANCY_OCID`, `OCI_COMPARTMENT_OCID`
+
+Configuration locations: ~/.oci/config, Explicit path from config_file or OCI_CONFIG_FILE
+
+Credential and deployment variants: Named OCI CLI profile, Explicit tenancy or compartment scope, OCI region
+
+Configuration fields: `tenancy`, `region`, `user`, `fingerprint`, `key_file`, `pass_phrase`, `security_token_file`
+
+Malformed configuration: Reject malformed or ambiguous configuration before any request; never echo credential values.
+
+## Permissions
+
+| Kind | Permission, role, or plan | Unlocks | Notes |
+|---|---|---|---|
+| iam-action | `inspect/read the documented resources in the selected tenancy and compartments` | `identity`, `cloud-guard`, `audit-events`, `event-rules`, `networking`, `bastion`, `vault`, `object-storage`, `compute` |  |
+
+## API surfaces
+
+| ID | Interface | Read operation | Service or client | IAM action | Intent | Projection stage | Fields consumed | Reference |
+|---|---|---|---|---|---|---|---|---|
+| `identity` | HTTP | `GET oci iam {authentication-policy\|user\|compartment\|policy\|credential} read commands` | OCI CLI Identity | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `lifecycleState`, `isMfaActivated`, `capabilities.canUseConsolePassword`, `passwordPolicy`, `timeCreated`, `statements` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `cloud-guard` | HTTP | `GET oci cloud-guard {configuration\|target\|problem\|responder-recipe} read commands` | OCI CLI Cloud Guard | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `status`, `reportingRegion`, `lifecycleState`, `riskLevel`, `responderRules.details.isEnabled` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `audit-events` | HTTP | `GET oci audit {config get\|event list}` | OCI CLI Audit | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `retentionPeriodDays`, `eventId`, `eventTime` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `event-rules` | HTTP | `GET oci events rule list` | OCI CLI Events | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `displayName`, `condition`, `isEnabled`, `lifecycleState` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `networking` | HTTP | `GET oci network {security-list\|nsg\|internet-gateway} read commands` | OCI CLI Networking | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `ingressSecurityRules`, `direction`, `source`, `protocol`, `tcpOptions`, `isEnabled`, `lifecycleState` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `bastion` | HTTP | `GET oci bastion {bastion\|session} read commands` | OCI CLI Bastion | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `maxSessionTtlInSeconds`, `clientCidrBlockAllowList`, `sessionTtlInSeconds`, `lifecycleState` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `vault` | HTTP | `GET oci kms management {vault\|key\|key-version} read commands` | OCI CLI Vault | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `algorithm`, `protectionMode`, `keyShape`, `timeCreated`, `lifecycleState` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `object-storage` | HTTP | `GET oci os {bucket\|preauth-request} read commands` | OCI CLI Object Storage | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `publicAccessType`, `kmsKeyId`, `timeExpires`, `accessType` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+| `compute` | HTTP | `GET oci compute {instance\|volume\|boot-volume} read commands` | OCI CLI Compute | N/A | read | The collector projects the response to the listed verdict fields before evidence export. | `instanceOptions.areLegacyImdsEndpointsDisabled`, `kmsKeyId`, `availabilityDomain`, `lifecycleState` | [Official documentation](https://docs.oracle.com/en-us/iaas/api/) |
+
+### Request construction
+
+| Surface | Input | Exact value or rule | Required |
+|---|---|---|---|
+| `identity` | client | Use the configured OCI CLI Identity origin; never follow a server link to a different origin. | yes |
+| `identity` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `identity` | response | A JSON object or list containing only the documented lifecycleState, isMfaActivated, capabilities.canUseConsolePassword, passwordPolicy, timeCreated, statements members consumed by verdicts. | yes |
+| `cloud-guard` | client | Use the configured OCI CLI Cloud Guard origin; never follow a server link to a different origin. | yes |
+| `cloud-guard` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `cloud-guard` | response | A JSON object or list containing only the documented status, reportingRegion, lifecycleState, riskLevel, responderRules.details.isEnabled members consumed by verdicts. | yes |
+| `audit-events` | client | Use the configured OCI CLI Audit origin; never follow a server link to a different origin. | yes |
+| `audit-events` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `audit-events` | response | A JSON object or list containing only the documented retentionPeriodDays, eventId, eventTime members consumed by verdicts. | yes |
+| `event-rules` | client | Use the configured OCI CLI Events origin; never follow a server link to a different origin. | yes |
+| `event-rules` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `event-rules` | response | A JSON object or list containing only the documented displayName, condition, isEnabled, lifecycleState members consumed by verdicts. | yes |
+| `networking` | client | Use the configured OCI CLI Networking origin; never follow a server link to a different origin. | yes |
+| `networking` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `networking` | response | A JSON object or list containing only the documented ingressSecurityRules, direction, source, protocol, tcpOptions, isEnabled, lifecycleState members consumed by verdicts. | yes |
+| `bastion` | client | Use the configured OCI CLI Bastion origin; never follow a server link to a different origin. | yes |
+| `bastion` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `bastion` | response | A JSON object or list containing only the documented maxSessionTtlInSeconds, clientCidrBlockAllowList, sessionTtlInSeconds, lifecycleState members consumed by verdicts. | yes |
+| `vault` | client | Use the configured OCI CLI Vault origin; never follow a server link to a different origin. | yes |
+| `vault` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `vault` | response | A JSON object or list containing only the documented algorithm, protectionMode, keyShape, timeCreated, lifecycleState members consumed by verdicts. | yes |
+| `object-storage` | client | Use the configured OCI CLI Object Storage origin; never follow a server link to a different origin. | yes |
+| `object-storage` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `object-storage` | response | A JSON object or list containing only the documented publicAccessType, kmsKeyId, timeExpires, accessType members consumed by verdicts. | yes |
+| `compute` | client | Use the configured OCI CLI Compute origin; never follow a server link to a different origin. | yes |
+| `compute` | headers | Authorization appropriate to the selected authentication mode; Accept: application/json | yes |
+| `compute` | response | A JSON object or list containing only the documented instanceOptions.areLegacyImdsEndpointsDisabled, kmsKeyId, availabilityDomain, lifecycleState members consumed by verdicts. | yes |
+
+## Pagination
+
+| Surfaces | Cursor or marker | Page size | Item cap | Page cap | Total semantics | Stop conditions |
+|---|---|---|---|---|---|---|
+| `identity`, `cloud-guard`, `audit-events`, `event-rules`, `networking`, `bastion`, `vault`, `object-storage`, `compute` | `opc-next-page`, `CLI --all` | service default | caller limit | none | CLI --all must exhaust opc-next-page; configured compartment, credential, policy, key, and bucket caps are explicit partial states. | No opc-next-page; Configured item cap; Command failure; Dependent parent inventory unreadable |
+
+## Rate limits
+
+| Scope | Documented limit | Retry headers | Retryable statuses | Policy |
+|---|---|---|---|---|
+| OCI Security Inspector | Service and tenancy specific | `opc-request-id`, `Retry-After` | 429, 500, 502, 503, 504 | The OCI CLI owns service retry behavior; an exhausted command remains unreadable and is not replayed as an empty result. |
+
+## Checks
+
+### Control coverage
+
+| # | Control | Finding | Verdict semantics |
+|---|---|---|---|
+| 1 | IAM password policy length and complexity | OCI-IAM-01 | Evaluate the ordered first-match rules for OCI-IAM-01 below. |
+| 2 | Console MFA enforcement | OCI-IAM-02 | Evaluate the ordered first-match rules for OCI-IAM-02 below. |
+| 3 | API key, customer secret key, and auth token rotation | OCI-IAM-03 | Evaluate the ordered first-match rules for OCI-IAM-03 below. |
+| 4 | Broad IAM policies | OCI-IAM-04 | Evaluate the ordered first-match rules for OCI-IAM-04 below. |
+| 5 | Compartment hierarchy depth | OCI-IAM-05 | Evaluate the ordered first-match rules for OCI-IAM-05 below. |
+| 6 | IAM password expiration (manual) | OCI-IAM-06 | Evaluate the ordered first-match rules for OCI-IAM-06 below. |
+| 7 | Cloud Guard enabled and active targets | OCI-LOG-01 | Evaluate the ordered first-match rules for OCI-LOG-01 below. |
+| 8 | Open Cloud Guard problems | OCI-LOG-02 | Evaluate the ordered first-match rules for OCI-LOG-02 below. |
+| 9 | Responder recipe activation | OCI-LOG-03 | Evaluate the ordered first-match rules for OCI-LOG-03 below. |
+| 10 | Audit event visibility | OCI-LOG-04 | Evaluate the ordered first-match rules for OCI-LOG-04 below. |
+| 11 | Event rules for critical operations | OCI-LOG-05 | Evaluate the ordered first-match rules for OCI-LOG-05 below. |
+| 12 | Audit log retention | OCI-LOG-06 | Evaluate the ordered first-match rules for OCI-LOG-06 below. |
+| 13 | Security list ingress exposure | OCI-GRD-01 | Evaluate the ordered first-match rules for OCI-GRD-01 below. |
+| 14 | Network security group ingress exposure | OCI-GRD-02 | Evaluate the ordered first-match rules for OCI-GRD-02 below. |
+| 15 | Internet gateway exposure | OCI-GRD-03 | Evaluate the ordered first-match rules for OCI-GRD-03 below. |
+| 16 | Bastion controls | OCI-GRD-04 | Evaluate the ordered first-match rules for OCI-GRD-04 below. |
+| 17 | Vault key rotation and algorithm | OCI-GRD-05 | Evaluate the ordered first-match rules for OCI-GRD-05 below. |
+| 18 | Object storage public access and pre-authenticated requests | OCI-GRD-06 | Evaluate the ordered first-match rules for OCI-GRD-06 below. |
+| 19 | IMDSv2-only instance metadata access | OCI-CMP-01 | Evaluate the ordered first-match rules for OCI-CMP-01 below. |
+| 20 | Block volume customer-managed encryption | OCI-CMP-02 | Evaluate the ordered first-match rules for OCI-CMP-02 below. |
+| 21 | Boot volume customer-managed encryption | OCI-CMP-03 | Evaluate the ordered first-match rules for OCI-CMP-03 below. |
+
+### Finding notes
+
+These notes explain intent only. The ordered rule table is normative.
+
+| Finding | Severity | Owning tool | Sources | Evidence fields | Pass note | Warn note | Fail note | Manual note |
+|---|---|---|---|---|---|---|---|---|
+| `OCI-IAM-01` | high | `oci_assess_identity` | `identity` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for IAM password policy length and complexity; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for IAM password policy length and complexity; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for IAM password policy length and complexity; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for IAM password policy length and complexity is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-IAM-02` | high | `oci_assess_identity` | `identity` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Console MFA enforcement; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Console MFA enforcement; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Console MFA enforcement; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Console MFA enforcement is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-IAM-03` | high | `oci_assess_identity` | `identity` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for API key, customer secret key, and auth token rotation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for API key, customer secret key, and auth token rotation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for API key, customer secret key, and auth token rotation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for API key, customer secret key, and auth token rotation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-IAM-04` | high | `oci_assess_identity` | `identity` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Broad IAM policies; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Broad IAM policies; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Broad IAM policies; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Broad IAM policies is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-IAM-05` | medium | `oci_assess_identity` | `identity` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Compartment hierarchy depth; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Compartment hierarchy depth; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Compartment hierarchy depth; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Compartment hierarchy depth is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-IAM-06` | medium | `oci_assess_identity` | None | None | Complete readable evidence satisfies the compliant branch of this derivation: Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting. | The required evidence for IAM password expiration (manual) is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-LOG-01` | high | `oci_assess_logging_detection` | `cloud-guard` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Cloud Guard enabled and active targets; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Cloud Guard enabled and active targets; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Cloud Guard enabled and active targets; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Cloud Guard enabled and active targets is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-LOG-02` | high | `oci_assess_logging_detection` | `cloud-guard` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Open Cloud Guard problems; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Open Cloud Guard problems; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Open Cloud Guard problems; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Open Cloud Guard problems is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-LOG-03` | medium | `oci_assess_logging_detection` | `cloud-guard` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Responder recipe activation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Responder recipe activation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Responder recipe activation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Responder recipe activation is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-LOG-04` | medium | `oci_assess_logging_detection` | `audit-events` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Audit event visibility; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Audit event visibility; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Audit event visibility; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Audit event visibility is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-LOG-05` | medium | `oci_assess_logging_detection` | `event-rules` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Event rules for critical operations; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Event rules for critical operations; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Event rules for critical operations; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Event rules for critical operations is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-LOG-06` | high | `oci_assess_logging_detection` | `audit-events` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Audit log retention; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Audit log retention; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Audit log retention; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Audit log retention is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-GRD-01` | critical | `oci_assess_tenancy_guardrails` | `networking` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Security list ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Security list ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Security list ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Security list ingress exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-GRD-02` | critical | `oci_assess_tenancy_guardrails` | `networking` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Network security group ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Network security group ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Network security group ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Network security group ingress exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-GRD-03` | medium | `oci_assess_tenancy_guardrails` | `networking` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Internet gateway exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Internet gateway exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Internet gateway exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Internet gateway exposure is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-GRD-04` | medium | `oci_assess_tenancy_guardrails` | `bastion` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Bastion controls; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Bastion controls; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Bastion controls; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Bastion controls is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-GRD-05` | high | `oci_assess_tenancy_guardrails` | `vault` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Vault key rotation and algorithm; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Vault key rotation and algorithm; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Vault key rotation and algorithm; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Vault key rotation and algorithm is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-GRD-06` | high | `oci_assess_tenancy_guardrails` | `object-storage` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Object storage public access and pre-authenticated requests; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Object storage public access and pre-authenticated requests; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Object storage public access and pre-authenticated requests; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Object storage public access and pre-authenticated requests is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-CMP-01` | high | `oci_assess_compute_and_storage` | `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for IMDSv2-only instance metadata access; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for IMDSv2-only instance metadata access; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for IMDSv2-only instance metadata access; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for IMDSv2-only instance metadata access is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-CMP-02` | medium | `oci_assess_compute_and_storage` | `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Block volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Block volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Block volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Block volume customer-managed encryption is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+| `OCI-CMP-03` | medium | `oci_assess_compute_and_storage` | `compute` | `evidence_readable`, `evidence_complete`, `inventory_count`, `violation_count`, `review_count` | Complete readable evidence satisfies the compliant branch of this derivation: Use complete OCI CLI result cardinalities for Boot volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Readable evidence satisfies a review branch, or an otherwise-compliant required source is partial: Use complete OCI CLI result cardinalities for Boot volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | Complete readable evidence satisfies the violation branch, which has first-match precedence: Use complete OCI CLI result cardinalities for Boot volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | The required evidence for Boot volume customer-managed encryption is absent, null, denied, unreadable, not requested, or otherwise insufficient for an automated verdict. |
+
+### Ordered decision rules
+
+Rules are evaluated from lowest order number to highest. The first matching condition determines the finding status; later rules are not evaluated.
+
+| Finding | Order | Outcome | First-match condition | Explanatory note |
+|---|---|---|---|---|
+| `OCI-IAM-01` | 1 | manual | `oci_iam_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-IAM-01` | 2 | fail | `oci_iam_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-IAM-01` | 3 | manual | `oci_iam_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-IAM-01` | 4 | warn | `oci_iam_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-IAM-01` | 5 | pass | `oci_iam_01_branch_05_matches` equals true |  |
+| `OCI-IAM-01` | 6 | manual | `oci_iam_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-IAM-02` | 1 | manual | `oci_iam_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-IAM-02` | 2 | fail | `oci_iam_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-IAM-02` | 3 | manual | `oci_iam_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-IAM-02` | 4 | warn | `oci_iam_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-IAM-02` | 5 | pass | `oci_iam_02_branch_05_matches` equals true |  |
+| `OCI-IAM-02` | 6 | manual | `oci_iam_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-IAM-03` | 1 | manual | `oci_iam_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-IAM-03` | 2 | fail | `oci_iam_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-IAM-03` | 3 | manual | `oci_iam_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-IAM-03` | 4 | warn | `oci_iam_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-IAM-03` | 5 | pass | `oci_iam_03_branch_05_matches` equals true |  |
+| `OCI-IAM-03` | 6 | manual | `oci_iam_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-IAM-04` | 1 | manual | `oci_iam_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-IAM-04` | 2 | warn | `oci_iam_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-IAM-04` | 3 | manual | `oci_iam_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-IAM-04` | 4 | warn | `oci_iam_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-IAM-04` | 5 | pass | `oci_iam_04_branch_05_matches` equals true |  |
+| `OCI-IAM-04` | 6 | manual | `oci_iam_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-IAM-05` | 1 | manual | `oci_iam_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-IAM-05` | 2 | fail | `oci_iam_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-IAM-05` | 3 | fail | `oci_iam_05_branch_03_matches` equals true |  |
+| `OCI-IAM-05` | 4 | warn | `oci_iam_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-IAM-05` | 5 | pass | `oci_iam_05_branch_05_matches` equals true |  |
+| `OCI-IAM-05` | 6 | manual | `oci_iam_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-IAM-06` | 1 | manual | `oci_iam_06_branch_01_matches` equals true | The shipped runtime has no decisive read surface for this check. |
+| `OCI-LOG-01` | 1 | manual | `oci_log_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-LOG-01` | 2 | fail | `oci_log_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-LOG-01` | 3 | manual | `oci_log_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-LOG-01` | 4 | warn | `oci_log_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-LOG-01` | 5 | pass | `oci_log_01_branch_05_matches` equals true |  |
+| `OCI-LOG-01` | 6 | manual | `oci_log_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-LOG-02` | 1 | manual | `oci_log_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-LOG-02` | 2 | fail | `oci_log_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-LOG-02` | 3 | pass | `oci_log_02_branch_03_matches` equals true |  |
+| `OCI-LOG-02` | 4 | warn | `oci_log_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-LOG-02` | 5 | pass | `oci_log_02_branch_05_matches` equals true |  |
+| `OCI-LOG-02` | 6 | manual | `oci_log_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-LOG-03` | 1 | manual | `oci_log_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-LOG-03` | 2 | fail | `oci_log_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-LOG-03` | 3 | manual | `oci_log_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-LOG-03` | 4 | warn | `oci_log_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-LOG-03` | 5 | pass | `oci_log_03_branch_05_matches` equals true |  |
+| `OCI-LOG-03` | 6 | manual | `oci_log_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-LOG-04` | 1 | manual | `oci_log_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-LOG-04` | 2 | fail | `oci_log_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-LOG-04` | 3 | warn | `oci_log_04_branch_03_matches` equals true |  |
+| `OCI-LOG-04` | 4 | warn | `oci_log_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-LOG-04` | 5 | pass | `oci_log_04_branch_05_matches` equals true |  |
+| `OCI-LOG-04` | 6 | manual | `oci_log_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-LOG-05` | 1 | manual | `oci_log_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-LOG-05` | 2 | fail | `oci_log_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-LOG-05` | 3 | fail | `oci_log_05_branch_03_matches` equals true |  |
+| `OCI-LOG-05` | 4 | warn | `oci_log_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-LOG-05` | 5 | pass | `oci_log_05_branch_05_matches` equals true |  |
+| `OCI-LOG-05` | 6 | manual | `oci_log_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-LOG-06` | 1 | manual | `oci_log_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-LOG-06` | 2 | fail | `oci_log_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-LOG-06` | 3 | manual | `oci_log_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-LOG-06` | 4 | warn | `oci_log_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-LOG-06` | 5 | pass | `oci_log_06_branch_05_matches` equals true |  |
+| `OCI-LOG-06` | 6 | manual | `oci_log_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-GRD-01` | 1 | manual | `oci_grd_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-GRD-01` | 2 | fail | `oci_grd_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-GRD-01` | 3 | manual | `oci_grd_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-GRD-01` | 4 | warn | `oci_grd_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-GRD-01` | 5 | pass | `oci_grd_01_branch_05_matches` equals true |  |
+| `OCI-GRD-01` | 6 | manual | `oci_grd_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-GRD-02` | 1 | manual | `oci_grd_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-GRD-02` | 2 | fail | `oci_grd_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-GRD-02` | 3 | manual | `oci_grd_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-GRD-02` | 4 | warn | `oci_grd_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-GRD-02` | 5 | pass | `oci_grd_02_branch_05_matches` equals true |  |
+| `OCI-GRD-02` | 6 | manual | `oci_grd_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-GRD-03` | 1 | manual | `oci_grd_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-GRD-03` | 2 | warn | `oci_grd_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-GRD-03` | 3 | manual | `oci_grd_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-GRD-03` | 4 | warn | `oci_grd_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-GRD-03` | 5 | pass | `oci_grd_03_branch_05_matches` equals true |  |
+| `OCI-GRD-03` | 6 | manual | `oci_grd_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-GRD-04` | 1 | manual | `oci_grd_04_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-GRD-04` | 2 | fail | `oci_grd_04_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-GRD-04` | 3 | manual | `oci_grd_04_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-GRD-04` | 4 | warn | `oci_grd_04_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-GRD-04` | 5 | pass | `oci_grd_04_branch_05_matches` equals true |  |
+| `OCI-GRD-04` | 6 | manual | `oci_grd_04_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-GRD-05` | 1 | manual | `oci_grd_05_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-GRD-05` | 2 | fail | `oci_grd_05_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-GRD-05` | 3 | manual | `oci_grd_05_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-GRD-05` | 4 | warn | `oci_grd_05_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-GRD-05` | 5 | pass | `oci_grd_05_branch_05_matches` equals true |  |
+| `OCI-GRD-05` | 6 | manual | `oci_grd_05_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-GRD-06` | 1 | manual | `oci_grd_06_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-GRD-06` | 2 | fail | `oci_grd_06_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-GRD-06` | 3 | manual | `oci_grd_06_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-GRD-06` | 4 | warn | `oci_grd_06_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-GRD-06` | 5 | pass | `oci_grd_06_branch_05_matches` equals true |  |
+| `OCI-GRD-06` | 6 | manual | `oci_grd_06_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-CMP-01` | 1 | manual | `oci_cmp_01_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-CMP-01` | 2 | fail | `oci_cmp_01_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-CMP-01` | 3 | manual | `oci_cmp_01_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-CMP-01` | 4 | warn | `oci_cmp_01_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-CMP-01` | 5 | pass | `oci_cmp_01_branch_05_matches` equals true |  |
+| `OCI-CMP-01` | 6 | manual | `oci_cmp_01_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-CMP-02` | 1 | manual | `oci_cmp_02_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-CMP-02` | 2 | fail | `oci_cmp_02_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-CMP-02` | 3 | manual | `oci_cmp_02_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-CMP-02` | 4 | warn | `oci_cmp_02_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-CMP-02` | 5 | pass | `oci_cmp_02_branch_05_matches` equals true |  |
+| `OCI-CMP-02` | 6 | manual | `oci_cmp_02_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+| `OCI-CMP-03` | 1 | manual | `oci_cmp_03_branch_01_matches` equals true | Denied, unreadable, missing, null, malformed, or never-requested evidence cannot pass. |
+| `OCI-CMP-03` | 2 | fail | `oci_cmp_03_branch_02_matches` equals true | A violation proved by readable evidence has precedence over partial companion inventories. |
+| `OCI-CMP-03` | 3 | manual | `oci_cmp_03_branch_03_matches` equals true | This check's documented empty-inventory behavior requires manual confirmation. |
+| `OCI-CMP-03` | 4 | warn | `oci_cmp_03_branch_04_matches` equals true | Incomplete source cardinality or an explicit review condition prevents pass. |
+| `OCI-CMP-03` | 5 | pass | `oci_cmp_03_branch_05_matches` equals true |  |
+| `OCI-CMP-03` | 6 | manual | `oci_cmp_03_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
+
+### Derived decision facts
+
+| Finding | Input | Portable derivation |
+|---|---|---|
+| `OCI-IAM-01` | `oci_iam_01_branch_01_matches` | OCI-IAM-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-IAM-01` | `oci_iam_01_branch_02_matches` | OCI-IAM-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-IAM-01` | `oci_iam_01_branch_03_matches` | OCI-IAM-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-IAM-01` | `oci_iam_01_branch_04_matches` | OCI-IAM-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-IAM-01` | `oci_iam_01_branch_05_matches` | OCI-IAM-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-IAM-01` | `oci_iam_01_branch_06_matches` | OCI-IAM-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-IAM-02` | `oci_iam_02_branch_01_matches` | OCI-IAM-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-IAM-02` | `oci_iam_02_branch_02_matches` | OCI-IAM-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-IAM-02` | `oci_iam_02_branch_03_matches` | OCI-IAM-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-IAM-02` | `oci_iam_02_branch_04_matches` | OCI-IAM-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-IAM-02` | `oci_iam_02_branch_05_matches` | OCI-IAM-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-IAM-02` | `oci_iam_02_branch_06_matches` | OCI-IAM-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-IAM-03` | `oci_iam_03_branch_01_matches` | OCI-IAM-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-IAM-03` | `oci_iam_03_branch_02_matches` | OCI-IAM-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-IAM-03` | `oci_iam_03_branch_03_matches` | OCI-IAM-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-IAM-03` | `oci_iam_03_branch_04_matches` | OCI-IAM-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-IAM-03` | `oci_iam_03_branch_05_matches` | OCI-IAM-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-IAM-03` | `oci_iam_03_branch_06_matches` | OCI-IAM-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-IAM-04` | `oci_iam_04_branch_01_matches` | OCI-IAM-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-IAM-04` | `oci_iam_04_branch_02_matches` | OCI-IAM-04 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-IAM-04` | `oci_iam_04_branch_03_matches` | OCI-IAM-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-IAM-04` | `oci_iam_04_branch_04_matches` | OCI-IAM-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-IAM-04` | `oci_iam_04_branch_05_matches` | OCI-IAM-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-IAM-04` | `oci_iam_04_branch_06_matches` | OCI-IAM-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-IAM-05` | `oci_iam_05_branch_01_matches` | OCI-IAM-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-IAM-05` | `oci_iam_05_branch_02_matches` | OCI-IAM-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-IAM-05` | `oci_iam_05_branch_03_matches` | OCI-IAM-05 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `OCI-IAM-05` | `oci_iam_05_branch_04_matches` | OCI-IAM-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-IAM-05` | `oci_iam_05_branch_05_matches` | OCI-IAM-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-IAM-05` | `oci_iam_05_branch_06_matches` | OCI-IAM-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-IAM-06` | `oci_iam_06_branch_01_matches` | OCI-IAM-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-LOG-01` | `oci_log_01_branch_01_matches` | OCI-LOG-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-LOG-01` | `oci_log_01_branch_02_matches` | OCI-LOG-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-LOG-01` | `oci_log_01_branch_03_matches` | OCI-LOG-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-LOG-01` | `oci_log_01_branch_04_matches` | OCI-LOG-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-LOG-01` | `oci_log_01_branch_05_matches` | OCI-LOG-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-LOG-01` | `oci_log_01_branch_06_matches` | OCI-LOG-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-LOG-02` | `oci_log_02_branch_01_matches` | OCI-LOG-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-LOG-02` | `oci_log_02_branch_02_matches` | OCI-LOG-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-LOG-02` | `oci_log_02_branch_03_matches` | OCI-LOG-02 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `OCI-LOG-02` | `oci_log_02_branch_04_matches` | OCI-LOG-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-LOG-02` | `oci_log_02_branch_05_matches` | OCI-LOG-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-LOG-02` | `oci_log_02_branch_06_matches` | OCI-LOG-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-LOG-03` | `oci_log_03_branch_01_matches` | OCI-LOG-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-LOG-03` | `oci_log_03_branch_02_matches` | OCI-LOG-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-LOG-03` | `oci_log_03_branch_03_matches` | OCI-LOG-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-LOG-03` | `oci_log_03_branch_04_matches` | OCI-LOG-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-LOG-03` | `oci_log_03_branch_05_matches` | OCI-LOG-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-LOG-03` | `oci_log_03_branch_06_matches` | OCI-LOG-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-LOG-04` | `oci_log_04_branch_01_matches` | OCI-LOG-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-LOG-04` | `oci_log_04_branch_02_matches` | OCI-LOG-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-LOG-04` | `oci_log_04_branch_03_matches` | OCI-LOG-04 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `OCI-LOG-04` | `oci_log_04_branch_04_matches` | OCI-LOG-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-LOG-04` | `oci_log_04_branch_05_matches` | OCI-LOG-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-LOG-04` | `oci_log_04_branch_06_matches` | OCI-LOG-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-LOG-05` | `oci_log_05_branch_01_matches` | OCI-LOG-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-LOG-05` | `oci_log_05_branch_02_matches` | OCI-LOG-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-LOG-05` | `oci_log_05_branch_03_matches` | OCI-LOG-05 ordered branch 3 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`inventory_count` equals 0; `evidence_complete` equals true). |
+| `OCI-LOG-05` | `oci_log_05_branch_04_matches` | OCI-LOG-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-LOG-05` | `oci_log_05_branch_05_matches` | OCI-LOG-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-LOG-05` | `oci_log_05_branch_06_matches` | OCI-LOG-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-LOG-06` | `oci_log_06_branch_01_matches` | OCI-LOG-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-LOG-06` | `oci_log_06_branch_02_matches` | OCI-LOG-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-LOG-06` | `oci_log_06_branch_03_matches` | OCI-LOG-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-LOG-06` | `oci_log_06_branch_04_matches` | OCI-LOG-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-LOG-06` | `oci_log_06_branch_05_matches` | OCI-LOG-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-LOG-06` | `oci_log_06_branch_06_matches` | OCI-LOG-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-GRD-01` | `oci_grd_01_branch_01_matches` | OCI-GRD-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-GRD-01` | `oci_grd_01_branch_02_matches` | OCI-GRD-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-GRD-01` | `oci_grd_01_branch_03_matches` | OCI-GRD-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-GRD-01` | `oci_grd_01_branch_04_matches` | OCI-GRD-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-GRD-01` | `oci_grd_01_branch_05_matches` | OCI-GRD-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-GRD-01` | `oci_grd_01_branch_06_matches` | OCI-GRD-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-GRD-02` | `oci_grd_02_branch_01_matches` | OCI-GRD-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-GRD-02` | `oci_grd_02_branch_02_matches` | OCI-GRD-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-GRD-02` | `oci_grd_02_branch_03_matches` | OCI-GRD-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-GRD-02` | `oci_grd_02_branch_04_matches` | OCI-GRD-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-GRD-02` | `oci_grd_02_branch_05_matches` | OCI-GRD-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-GRD-02` | `oci_grd_02_branch_06_matches` | OCI-GRD-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-GRD-03` | `oci_grd_03_branch_01_matches` | OCI-GRD-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-GRD-03` | `oci_grd_03_branch_02_matches` | OCI-GRD-03 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-GRD-03` | `oci_grd_03_branch_03_matches` | OCI-GRD-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-GRD-03` | `oci_grd_03_branch_04_matches` | OCI-GRD-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-GRD-03` | `oci_grd_03_branch_05_matches` | OCI-GRD-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-GRD-03` | `oci_grd_03_branch_06_matches` | OCI-GRD-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-GRD-04` | `oci_grd_04_branch_01_matches` | OCI-GRD-04 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-GRD-04` | `oci_grd_04_branch_02_matches` | OCI-GRD-04 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-GRD-04` | `oci_grd_04_branch_03_matches` | OCI-GRD-04 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-GRD-04` | `oci_grd_04_branch_04_matches` | OCI-GRD-04 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-GRD-04` | `oci_grd_04_branch_05_matches` | OCI-GRD-04 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-GRD-04` | `oci_grd_04_branch_06_matches` | OCI-GRD-04 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-GRD-05` | `oci_grd_05_branch_01_matches` | OCI-GRD-05 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-GRD-05` | `oci_grd_05_branch_02_matches` | OCI-GRD-05 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-GRD-05` | `oci_grd_05_branch_03_matches` | OCI-GRD-05 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-GRD-05` | `oci_grd_05_branch_04_matches` | OCI-GRD-05 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-GRD-05` | `oci_grd_05_branch_05_matches` | OCI-GRD-05 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-GRD-05` | `oci_grd_05_branch_06_matches` | OCI-GRD-05 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-GRD-06` | `oci_grd_06_branch_01_matches` | OCI-GRD-06 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-GRD-06` | `oci_grd_06_branch_02_matches` | OCI-GRD-06 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-GRD-06` | `oci_grd_06_branch_03_matches` | OCI-GRD-06 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-GRD-06` | `oci_grd_06_branch_04_matches` | OCI-GRD-06 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-GRD-06` | `oci_grd_06_branch_05_matches` | OCI-GRD-06 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-GRD-06` | `oci_grd_06_branch_06_matches` | OCI-GRD-06 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-CMP-01` | `oci_cmp_01_branch_01_matches` | OCI-CMP-01 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-CMP-01` | `oci_cmp_01_branch_02_matches` | OCI-CMP-01 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-CMP-01` | `oci_cmp_01_branch_03_matches` | OCI-CMP-01 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-CMP-01` | `oci_cmp_01_branch_04_matches` | OCI-CMP-01 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-CMP-01` | `oci_cmp_01_branch_05_matches` | OCI-CMP-01 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-CMP-01` | `oci_cmp_01_branch_06_matches` | OCI-CMP-01 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-CMP-02` | `oci_cmp_02_branch_01_matches` | OCI-CMP-02 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-CMP-02` | `oci_cmp_02_branch_02_matches` | OCI-CMP-02 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-CMP-02` | `oci_cmp_02_branch_03_matches` | OCI-CMP-02 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-CMP-02` | `oci_cmp_02_branch_04_matches` | OCI-CMP-02 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-CMP-02` | `oci_cmp_02_branch_05_matches` | OCI-CMP-02 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-CMP-02` | `oci_cmp_02_branch_06_matches` | OCI-CMP-02 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+| `OCI-CMP-03` | `oci_cmp_03_branch_01_matches` | OCI-CMP-03 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_readable` does not equal true; not (`evidence_readable` is present and non-null)). |
+| `OCI-CMP-03` | `oci_cmp_03_branch_02_matches` | OCI-CMP-03 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `violation_count` is greater than 0. |
+| `OCI-CMP-03` | `oci_cmp_03_branch_03_matches` | OCI-CMP-03 ordered branch 3 (manual) is true exactly when its portable evidence condition matches. Computed as: `inventory_count` equals 0. |
+| `OCI-CMP-03` | `oci_cmp_03_branch_04_matches` | OCI-CMP-03 ordered branch 4 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`evidence_complete` does not equal true; `review_count` is greater than 0). |
+| `OCI-CMP-03` | `oci_cmp_03_branch_05_matches` | OCI-CMP-03 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`evidence_readable` equals true; `evidence_complete` equals true; `violation_count` equals 0; `review_count` equals 0). |
+| `OCI-CMP-03` | `oci_cmp_03_branch_06_matches` | OCI-CMP-03 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
+
+### Criterion constants
+
+| Finding | Name | Value |
+|---|---|---|
+| `OCI-IAM-01` | `requiredEvidenceReadable` | true |
+| `OCI-IAM-01` | `requiredEvidenceComplete` | true |
+| `OCI-IAM-02` | `requiredEvidenceReadable` | true |
+| `OCI-IAM-02` | `requiredEvidenceComplete` | true |
+| `OCI-IAM-03` | `requiredEvidenceReadable` | true |
+| `OCI-IAM-03` | `requiredEvidenceComplete` | true |
+| `OCI-IAM-04` | `requiredEvidenceReadable` | true |
+| `OCI-IAM-04` | `requiredEvidenceComplete` | true |
+| `OCI-IAM-05` | `requiredEvidenceReadable` | true |
+| `OCI-IAM-05` | `requiredEvidenceComplete` | true |
+| `OCI-IAM-06` | `requiredEvidenceReadable` | true |
+| `OCI-IAM-06` | `requiredEvidenceComplete` | true |
+| `OCI-LOG-01` | `requiredEvidenceReadable` | true |
+| `OCI-LOG-01` | `requiredEvidenceComplete` | true |
+| `OCI-LOG-02` | `requiredEvidenceReadable` | true |
+| `OCI-LOG-02` | `requiredEvidenceComplete` | true |
+| `OCI-LOG-03` | `requiredEvidenceReadable` | true |
+| `OCI-LOG-03` | `requiredEvidenceComplete` | true |
+| `OCI-LOG-04` | `requiredEvidenceReadable` | true |
+| `OCI-LOG-04` | `requiredEvidenceComplete` | true |
+| `OCI-LOG-05` | `requiredEvidenceReadable` | true |
+| `OCI-LOG-05` | `requiredEvidenceComplete` | true |
+| `OCI-LOG-06` | `requiredEvidenceReadable` | true |
+| `OCI-LOG-06` | `requiredEvidenceComplete` | true |
+| `OCI-GRD-01` | `requiredEvidenceReadable` | true |
+| `OCI-GRD-01` | `requiredEvidenceComplete` | true |
+| `OCI-GRD-02` | `requiredEvidenceReadable` | true |
+| `OCI-GRD-02` | `requiredEvidenceComplete` | true |
+| `OCI-GRD-03` | `requiredEvidenceReadable` | true |
+| `OCI-GRD-03` | `requiredEvidenceComplete` | true |
+| `OCI-GRD-04` | `requiredEvidenceReadable` | true |
+| `OCI-GRD-04` | `requiredEvidenceComplete` | true |
+| `OCI-GRD-05` | `requiredEvidenceReadable` | true |
+| `OCI-GRD-05` | `requiredEvidenceComplete` | true |
+| `OCI-GRD-06` | `requiredEvidenceReadable` | true |
+| `OCI-GRD-06` | `requiredEvidenceComplete` | true |
+| `OCI-CMP-01` | `requiredEvidenceReadable` | true |
+| `OCI-CMP-01` | `requiredEvidenceComplete` | true |
+| `OCI-CMP-02` | `requiredEvidenceReadable` | true |
+| `OCI-CMP-02` | `requiredEvidenceComplete` | true |
+| `OCI-CMP-03` | `requiredEvidenceReadable` | true |
+| `OCI-CMP-03` | `requiredEvidenceComplete` | true |
+
+### Illustrative criterion notes
+
+Examples are explanatory, not normative. The ordered first-match conditions above are the executable contract.
+
+| Finding | Case | Input condition | Expected | Reason |
+|---|---|---|---|---|
+| `OCI-IAM-01` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for IAM password policy length and complexity; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-IAM-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for IAM password policy length and complexity; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-IAM-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-IAM-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-IAM-02` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Console MFA enforcement; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-IAM-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Console MFA enforcement; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-IAM-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-IAM-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-IAM-03` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for API key, customer secret key, and auth token rotation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-IAM-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for API key, customer secret key, and auth token rotation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-IAM-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-IAM-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-IAM-04` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Broad IAM policies; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-IAM-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Broad IAM policies; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-IAM-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-IAM-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-IAM-05` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Compartment hierarchy depth; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-IAM-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Compartment hierarchy depth; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-IAM-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-IAM-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-IAM-06` | compliant | All required source reads are complete and this derivation returns pass: Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-IAM-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: Always return manual because the shipped OCI read surfaces do not expose the password-expiration setting. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-IAM-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-IAM-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-LOG-01` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Cloud Guard enabled and active targets; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-LOG-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Cloud Guard enabled and active targets; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-LOG-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-LOG-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-LOG-02` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Open Cloud Guard problems; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-LOG-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Open Cloud Guard problems; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-LOG-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-LOG-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-LOG-03` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Responder recipe activation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-LOG-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Responder recipe activation; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-LOG-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-LOG-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-LOG-04` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Audit event visibility; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-LOG-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Audit event visibility; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-LOG-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-LOG-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-LOG-05` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Event rules for critical operations; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-LOG-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Event rules for critical operations; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-LOG-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-LOG-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-LOG-06` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Audit log retention; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-LOG-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Audit log retention; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-LOG-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-LOG-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-GRD-01` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Security list ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-GRD-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Security list ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-GRD-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-GRD-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-GRD-02` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Network security group ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-GRD-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Network security group ingress exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-GRD-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-GRD-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-GRD-03` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Internet gateway exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-GRD-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Internet gateway exposure; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-GRD-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-GRD-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-GRD-04` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Bastion controls; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-GRD-04` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Bastion controls; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-GRD-04` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-GRD-04` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-GRD-05` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Vault key rotation and algorithm; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-GRD-05` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Vault key rotation and algorithm; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-GRD-05` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-GRD-05` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-GRD-06` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Object storage public access and pre-authenticated requests; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-GRD-06` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Object storage public access and pre-authenticated requests; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-GRD-06` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-GRD-06` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-CMP-01` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for IMDSv2-only instance metadata access; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-CMP-01` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for IMDSv2-only instance metadata access; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-CMP-01` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-CMP-01` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-CMP-02` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Block volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-CMP-02` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Block volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-CMP-02` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-CMP-02` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+| `OCI-CMP-03` | compliant | All required source reads are complete and this derivation returns pass: Use complete OCI CLI result cardinalities for Boot volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | pass | A pass is preserved only after the integration-specific evaluator has proved the compliant predicate from complete evidence. |
+| `OCI-CMP-03` | noncompliant | A complete source read satisfies the fail branch of this derivation: Use complete OCI CLI result cardinalities for Boot volume customer-managed encryption; a proved violating record takes precedence over partial collection, review records or incomplete scope warn, empty or unreadable required inventories remain manual, and pass requires complete readable evidence with no violation. | fail | A proven violation remains fail even when another dependent inventory is also partial because fail has first-match precedence. |
+| `OCI-CMP-03` | partial | At least one required inventory is capped, truncated, sampled, or incomplete and no proven violation exists. | warn | Incomplete coverage cannot prove compliance and is therefore retained as a warning or stricter outcome selected by runtime. |
+| `OCI-CMP-03` | unreadable | A required value is null, missing, denied, never requested, malformed, or unreadable. | manual | Unavailable evidence is not treated as an empty collection or a false negative and therefore never passes. |
+
+### Compliance framework mappings
+
+| # | Control | FedRAMP | CMMC | SOC 2 | CIS | PCI-DSS | DISA STIG | IRAP | ISMAP |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | IAM password policy length and complexity | IA-5 | 3.5.7 | CC6.1 | 1.1 | 8.3.6 | SRG-APP-000166 | ISM-0421 | AM-03 |
+| 2 | Console MFA enforcement | IA-2(1) | 3.5.3 | CC6.1 | 1.2 | 8.4.2 | SRG-APP-000149 | ISM-1401 | AM-04 |
+| 3 | API key, customer secret key, and auth token rotation | IA-5(1) | 3.5.8 | CC6.1 | 1.7, 1.8, 1.9 | 8.6.3 | SRG-APP-000174 | ISM-1590 | AM-05 |
+| 4 | Broad IAM policies | AC-6 | 3.1.5 | CC6.3 | 1.14 | 7.2.1 | SRG-APP-000340 | ISM-0432 | AC-01 |
+| 5 | Compartment hierarchy depth | AC-4 | 3.13.1 | CC6.1 | 1.3 | 1.3.1 | SRG-APP-000039 | ISM-1416 | AC-02 |
+| 6 | IAM password expiration (manual) | IA-5 | 3.5.7 | CC6.1 | 1.1 | 8.3.6 | SRG-APP-000166 | ISM-0421 | AM-03 |
+| 7 | Cloud Guard enabled and active targets | SI-4 | 3.14.6 | CC7.2 | 3.1 | 11.5.1 | SRG-APP-000516 | ISM-0120 | SO-01 |
+| 8 | Open Cloud Guard problems | SI-4(5) | 3.14.7 | CC7.3 | 3.2 | 11.5.1.1 | SRG-APP-000516 | ISM-0123 | SO-02 |
+| 9 | Responder recipe activation | IR-4 | 3.6.1 | CC7.4 | 3.3 | 12.10.5 | SRG-APP-000516 | ISM-0125 | IR-01 |
+| 10 | Audit event visibility | - | - | - | - | - | - | - | - |
+| 11 | Event rules for critical operations | AU-12 | 3.3.1 | CC7.2 | 3.5 | 10.6.1 | SRG-APP-000492 | ISM-0580 | LG-02 |
+| 12 | Audit log retention | AU-11 | 3.3.1 | CC7.2 | 3.4 | 10.7.1 | SRG-APP-000515 | ISM-0859 | LG-01 |
+| 13 | Security list ingress exposure | SC-7 | 3.13.1 | CC6.6 | 2.1 | 1.3.1 | SRG-APP-000142 | ISM-1416 | NW-01 |
+| 14 | Network security group ingress exposure | SC-7 | 3.13.1 | CC6.6 | 2.2 | 1.3.2 | SRG-APP-000142 | ISM-1416 | NW-01 |
+| 15 | Internet gateway exposure | SC-7(5) | 3.13.6 | CC6.6 | 2.3 | 1.3.1 | SRG-APP-000383 | ISM-1417 | NW-02 |
+| 16 | Bastion controls | AC-17, AC-17(1) | 3.1.12 | CC6.1, CC6.2 | 2.8, 2.9 | 8.6.1 | SRG-APP-000190 | ISM-1506 | AC-03 |
+| 17 | Vault key rotation and algorithm | SC-12(1), SC-13 | 3.13.10, 3.13.11 | CC6.1 | 4.1, 4.2 | 3.6.4, 3.6.1 | SRG-APP-000514 | ISM-0490, ISM-0457 | CR-01, CR-02 |
+| 18 | Object storage public access and pre-authenticated requests | AC-3 | 3.1.1, 3.1.2 | CC6.1 | 5.1, 5.2 | 1.3.6, 7.2.2 | SRG-APP-000033 | ISM-0405 | DS-01, DS-02 |
+| 19 | IMDSv2-only instance metadata access | CM-7 | 3.4.7 | CC6.1 | 2.10 | 2.2.1 | SRG-APP-000141 | ISM-1418 | CM-01 |
+| 20 | Block volume customer-managed encryption | SC-28 | 3.13.16 | CC6.1 | 4.3 | 3.4.1 | SRG-APP-000429 | ISM-1080 | CR-03 |
+| 21 | Boot volume customer-managed encryption | SC-28 | 3.13.16 | CC6.1 | 4.3 | 3.4.1 | SRG-APP-000429 | ISM-1080 | CR-03 |
+
+## Collection states
+
+| State | Required rendering |
+|---|---|
+| complete | complete: proven API exhaustion or a successful single-object read. |
+| truncated | truncated: preserve seen and total when available plus the exact stop reason. |
+| unreadable | unreadable: render data and counts as null and retain a scrubbed error envelope. |
+| denied | denied: render null evidence with the endpoint and HTTP status, never an empty inventory. |
+| not requested | not_requested: identify the unreadable parent dependency and do not invent an HTTP status. |
+| not configured | not_configured: identify the absent optional feature or credential without treating it as compliant. |
+
+## Integration-specific scrubbing
+
+Shared contract version: 1.1.
+
+Projection stage: Project records to verdict-consumed fields, scrub configured and discovered credentials, then scrub again at every report and archive write sink.
+
+Sensitive fields and values: key_file, pass_phrase, security_token_file, authorization, cookie, private_key
+
+Credential formats: OCI API signing keys, OCI security tokens, OCI CLI profile pass phrases
+
+Reviewed benign exceptions: Stable non-secret resource identifiers and public documentation URLs remain visible unless carried in a credential field.
+
+Integration-specific rules:
+
+- Withhold undocumented error bodies; retain only status, media type, byte length, and allowlisted vendor error codes.
+- Remove URL user information, queries, and fragments from evidence and reject off-origin pagination links.
+- Unavailable counts, arrays, maps, and negative flags are null rather than fabricated empty values.
+
+Projected fields by surface:
+
+| Surface | Allowed fields |
+|---|---|
+| `identity` | `lifecycleState`, `isMfaActivated`, `capabilities.canUseConsolePassword`, `passwordPolicy`, `timeCreated`, `statements` |
+| `cloud-guard` | `status`, `reportingRegion`, `lifecycleState`, `riskLevel`, `responderRules.details.isEnabled` |
+| `audit-events` | `retentionPeriodDays`, `eventId`, `eventTime` |
+| `event-rules` | `displayName`, `condition`, `isEnabled`, `lifecycleState` |
+| `networking` | `ingressSecurityRules`, `direction`, `source`, `protocol`, `tcpOptions`, `isEnabled`, `lifecycleState` |
+| `bastion` | `maxSessionTtlInSeconds`, `clientCidrBlockAllowList`, `sessionTtlInSeconds`, `lifecycleState` |
+| `vault` | `algorithm`, `protectionMode`, `keyShape`, `timeCreated`, `lifecycleState` |
+| `object-storage` | `publicAccessType`, `kmsKeyId`, `timeExpires`, `accessType` |
+| `compute` | `instanceOptions.areLegacyImdsEndpointsDisabled`, `kmsKeyId`, `availabilityDomain`, `lifecycleState` |
+
+## Export layout
+
+Required paths:
+
+- `README.md`
+- `QUICK_REFERENCE.md`
+- `metadata.json`
+- `core_data/access.json`
+- `core_data/compartments.json`
+- `analysis/findings.json`
+- `analysis/identity.json`
+- `analysis/logging-detection.json`
+- `analysis/tenancy-guardrails.json`
+- `analysis/compute-storage.json`
+- `analysis/summary.md`
+- `compliance/executive_summary.md`
+- `compliance/unified_compliance_matrix.md`
+- `compliance/fedramp/fedramp_compliance_report.md`
+- `compliance/cmmc/cmmc_compliance_report.md`
+- `compliance/soc2/soc2_compliance_report.md`
+- `compliance/cis_oci/cis_oci_benchmark_report.md`
+- `compliance/pci_dss/pci_dss_compliance_report.md`
+- `compliance/disa_stig/stig_compliance_checklist.md`
+- `compliance/irap/irap_compliance_report.md`
+- `compliance/ismap/ismap_compliance_report.md`
+
+Conditional paths:
+
+- `_errors.log`
+
+### Artifact schemas
+
+| Path | Format | Required when | Schema | Serialization |
+|---|---|---|---|---|
+| `README.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `QUICK_REFERENCE.md` | markdown | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+| `metadata.json` | json | Always. | The runtime-generated bundle metadata or operator guidance. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/access.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `core_data/compartments.json` | json | Always. | The projected runtime dataset or its explicit unavailable marker. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/findings.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/identity.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/logging-detection.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/tenancy-guardrails.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/compute-storage.json` | json | Always. | Runtime assessment or finding records. | UTF-8 JSON with two-space indentation and a trailing newline. |
+| `analysis/summary.md` | markdown | Always. | Runtime assessment or finding records. | UTF-8 text. |
+| `compliance/executive_summary.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/unified_compliance_matrix.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/fedramp/fedramp_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cmmc/cmmc_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/soc2/soc2_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/cis_oci/cis_oci_benchmark_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/pci_dss/pci_dss_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/disa_stig/stig_compliance_checklist.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/irap/irap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `compliance/ismap/ismap_compliance_report.md` | markdown | Always. | The runtime-generated human-readable compliance report. | UTF-8 text. |
+| `_errors.log` | text | Only under the runtime condition stated for this conditional file. | The runtime-generated bundle metadata or operator guidance. | UTF-8 text. |
+
+### Record schemas
+
+#### finding
+
+- `id`
+- `title`
+- `severity`
+- `status`
+- `summary`
+- `evidence`
+- `framework mappings`
+
+#### collection_marker
+
+- `collected`
+- `status`
+- `endpoint`
+- `error`
+
+#### bundle_result
+
+- `outputDir`
+- `zipPath`
+- `fileCount`
+- `findingCount`
+- `errorCount`
+
+#### assessment
+
+- `title or category`
+- `summary`
+- `findings`
+- `errors when collection was partial`
+
+#### pagination_state
+
+- `items or rows seen`
+- `reported total when available`
+- `pages`
+- `truncated`
+- `stop reason`
+
+JSON formatting: UTF-8 JSON with two-space indentation and a trailing newline.
+
+Overwrite policy: Allocate a new OCI audit directory and numeric suffix without overwriting either an existing directory or its paired archive.
+
+Path safety: Resolve beneath the configured output root and reject traversal, unsafe parents, files, and symbolic-link escapes.
+
+Archive pairing: Create <allocated-directory>.zip beside the allocated OCI audit directory.
