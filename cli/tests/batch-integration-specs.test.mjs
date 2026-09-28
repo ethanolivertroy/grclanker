@@ -142,6 +142,7 @@ function comparisonWitnesses(condition, desired, constants, numericDomain) {
     const values = numericDomain.filter((value) => (
       (comparison === "gt" ? value > threshold : value <= threshold) === desired
     ));
+    if (!desired) values.push("__not_numeric__");
     return values.map((value) => new Map([[left.path, value]]));
   }
   if (left.known && !right.known) {
@@ -149,6 +150,7 @@ function comparisonWitnesses(condition, desired, constants, numericDomain) {
     const values = numericDomain.filter((value) => (
       (comparison === "gt" ? threshold > value : threshold <= value) === desired
     ));
+    if (!desired) values.push("__not_numeric__");
     return values.map((value) => new Map([[right.path, value]]));
   }
   const pairs = numericDomain.flatMap((leftValue) => numericDomain
@@ -156,6 +158,7 @@ function comparisonWitnesses(condition, desired, constants, numericDomain) {
       (comparison === "gt" ? leftValue > rightValue : leftValue <= rightValue) === desired
     ))
     .map((rightValue) => [leftValue, rightValue]));
+  if (!desired) pairs.push(["__not_numeric__", 0]);
   return pairs.map(([leftValue, rightValue]) => new Map([
     [left.path, leftValue],
     [right.path, rightValue],
