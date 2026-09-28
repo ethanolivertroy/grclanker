@@ -308,7 +308,11 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
           ? path(path(node.left) === constant ? node.right : node.left)
           : path(node.candidates);
         assert.ok(observed && check.evidenceFields.includes(observed), `${check.id}.${constant}: raw collection fact`);
-        const match = Array.isArray(value) ? value[0] : value;
+        const match = constant === "shared_account_pattern"
+          ? "shared-admin"
+          : constant === "sensitive_exclusion_path_patterns"
+            ? "C:\\Windows"
+            : Array.isArray(value) ? value[0] : value;
         const missFacts = { ...baseline, [observed]: ["definitely-not-a-match"] };
         const matchFacts = { ...baseline, [observed]: [match] };
         assert.notEqual(

@@ -314,7 +314,7 @@ const rows: readonly Batch3CheckRow[] = [
     completeness: {
       qualys_c16_exclusion_sources_complete: {
         sources: [batch3Source("excluded-ips"), batch3Source("option-profiles")],
-        semantics: "QUALYS-C16 sets this fact true only after the excluded-host and option-profile XML lists both exhaust. Any truncated, error, denied, not-collected, not-configured, or missing-required-field state on either named source sets it false; a broad range already proved by excluded-ips still retains fail precedence. Finding previews and exported samples never establish source cardinality.",
+        semantics: "qualys_c16_exclusion_sources_complete is true only after the excluded-ips and option-profiles XML lists both exhaust. Any truncated, error, denied, not-collected, not-configured, or missing-required-field state on either named source sets it false; a broad range already proved by excluded-ips still retains fail precedence. Finding previews and exported samples never establish source cardinality.",
       },
     },
     decisionRules: [
