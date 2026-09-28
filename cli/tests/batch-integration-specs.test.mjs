@@ -306,8 +306,8 @@ function orderedBranchWitness(check, branchIndex) {
   const branches = Object.values(check.derivedFactRules ?? {});
   const domains = witnessDomains(branches, check.criteria.constants);
   const constraints = [
-    ...branches.slice(0, branchIndex).map((branch) => [branch.condition, false]),
     [branches[branchIndex].condition, true],
+    ...branches.slice(0, branchIndex).map((branch) => [branch.condition, false]),
   ];
   let candidates = [new Map()];
   for (const [condition, desired] of constraints) {
