@@ -222,7 +222,7 @@ function __corpusSweep(name, args, original) {
   }
 }
 function __corpusClientMethods(client) {
-  const domainReadMethod = /^(?:count|list|search|get(?:Device|Dynamic|Firewall|Sca|Self|Summary|User|Users))/;
+  const domainReadMethod = /^(?:list|search|get(?:Device|Dynamic|Firewall|Sca|Self|Summary|User|Users))/;
   const transportMethods = new Set([
     "get",
     "getByIds",
