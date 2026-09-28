@@ -33,7 +33,7 @@ const batch = [
   [ZENDESK_SPEC, ZENDESK_RUNTIME_BEHAVIOR],
   [ZOOM_SPEC, ZOOM_RUNTIME_BEHAVIOR],
 ];
-const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX)-/.test(check.id);
+const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK)-/.test(check.id);
 
 test("batch 1 publishes exactly the nine requested inspector contracts", () => {
   assert.deepEqual(batch.map(([spec]) => spec.identity.slug).sort(), [
@@ -290,6 +290,47 @@ test("Box executable rules ignore legacy status and preserve boundaries, precede
     privileged_user_count: 26,
     max_admins: 25,
   }), "warn", "the complete 26-user inventory, not a 25-item evidence sample, controls the result");
+});
+
+test("Slack executable rules ignore legacy status and preserve boundaries, precedence, and complete counts", () => {
+  const legacyStatus = "pass";
+  const uploadFacts = {
+    preferences_readable: true,
+    setting_present: true,
+    coverage_complete: true,
+    verdict: "pass",
+  };
+  assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-APP-06", uploadFacts), "pass");
+  assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-APP-06", {
+    ...uploadFacts,
+    verdict: "fail",
+  }), "fail", "mutating the preference evidence changes the verdict while the legacy status is held constant");
+  assert.equal(legacyStatus, "pass");
+  assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-MON-02", {
+    audit_readable: true,
+    audit_complete: true,
+    latest_age_known: true,
+    latest_age_days: 1,
+  }), "pass");
+  assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-MON-02", {
+    audit_readable: true,
+    audit_complete: true,
+    latest_age_known: true,
+    latest_age_days: 1.01,
+  }), "fail", "audit recency fails strictly above one day");
+  assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-ADMIN-01", {
+    teams_readable: true,
+    admin_inventory_count: 26,
+    complete: false,
+    excessive_admin_workspace_count: 1,
+  }), "fail", "a proven excessive-admin violation precedes partial evidence");
+  assert.equal(evaluateBatchCheckVerdict(SLACK_SPEC, "SLACK-ID-01", {
+    users_readable: true,
+    users_complete: false,
+    active_user_count: 26,
+    without_mfa_count: 0,
+    unknown_mfa_count: 0,
+  }), "warn", "the complete 26-user collector state, not a 25-item rendering sample, prevents pass");
 });
 
 test("runtime behavior statements are explicit and generator-visible", () => {
