@@ -1850,7 +1850,12 @@ function singleDatasetTruncationCases() {
       const data = build();
       data[key] = partial(data[key]);
       const result = assess(data);
-      if (JSON.stringify(result) !== JSON.stringify(baseline)) cases.push({ suite, dataset: key, result });
+      const [, dependency] = UNREADABLE_DATASET_DEPENDENTS[suite][key];
+      const affectedIds = [...(dependency.primary ?? []), ...(dependency.secondary ?? [])];
+      const affectedFindingChanged = affectedIds.some((id) => (
+        JSON.stringify(findingById(result, id)) !== JSON.stringify(findingById(baseline, id))
+      ));
+      if (affectedFindingChanged) cases.push({ suite, dataset: key, result });
     }
   }
   return { candidateCount, cases };
