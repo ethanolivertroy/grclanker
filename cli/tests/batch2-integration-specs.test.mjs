@@ -86,7 +86,7 @@ test("batch 2 executable decisions reject undeclared, missing, and null evidence
         new RegExp(`${check.id} received undeclared decision input`),
       );
       assert.deepEqual(
-        Object.keys(check.evidenceFieldDescriptions ?? {}).sort(),
+        Object.keys(check.evidenceFieldDefinitions ?? {}).sort(),
         [...check.evidenceFields].sort(),
         `${check.id}: every declared raw input has exactly one rendered description`,
       );
@@ -94,7 +94,7 @@ test("batch 2 executable decisions reject undeclared, missing, and null evidence
         if (!documentedRawVendorStatusFields.has(`${check.id}:${name}`)) {
           assert.doesNotMatch(name, forbidden, `${check.id}: ${name}`);
         }
-        const description = check.evidenceFieldDescriptions?.[name] ?? "";
+        const description = check.evidenceFieldDefinitions?.[name] ?? "";
         assert.ok(description.length >= 40, `${check.id}: ${name} has a substantive portable description`);
         assert.doesNotMatch(
           description,

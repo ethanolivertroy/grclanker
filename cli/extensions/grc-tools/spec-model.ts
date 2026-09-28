@@ -492,6 +492,8 @@ function renderOperand(operand: VerdictOperand): string {
       return `\`${operand.path}\`${"fallback" in operand ? ` (default ${JSON.stringify(operand.fallback)})` : ""}`;
     case "length":
       return `length of \`${operand.path}\``;
+    case "subtract":
+      return `(${renderOperand(operand.left)} minus ${renderOperand(operand.right)})`;
     default: {
       const unhandled: never = operand;
       return String(unhandled);
@@ -553,7 +555,19 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
 }
 
 function operandPaths(operand: VerdictOperand): string[] {
-  return operand.kind === "path" || operand.kind === "length" ? [operand.path] : [];
+  switch (operand.kind) {
+    case "path":
+    case "length":
+      return [operand.path];
+    case "subtract":
+      return [...operandPaths(operand.left), ...operandPaths(operand.right)];
+    case "value":
+      return [];
+    default: {
+      const unhandled: never = operand;
+      return [String(unhandled)];
+    }
+  }
 }
 
 export function verdictConditionPaths(condition: VerdictCondition): string[] {

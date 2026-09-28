@@ -19,7 +19,7 @@ const repoRoot = resolve(scriptDir, "..", "..");
 const runRoot = mkdtempSync(join(tmpdir(), "grclanker-byte-differential-"));
 // Immutable stack base integrated immediately before final validation. Update
 // this SHA only when a newer parent head is merged into this branch.
-const baselineRef = "31971602d230a9861fe6967b0126cd61d1440f49";
+const baselineRef = "0ae89670cdf4ae291a326e40ecc7daaadef09de0";
 const mainWorktree = join(runRoot, "stacked-parent");
 const mainFixtures = join(runRoot, "fixtures-stacked-parent");
 const branchFixtures = join(runRoot, "fixtures-branch");
@@ -364,6 +364,14 @@ try {
   runFixtureSuite(mainWorktree, mainFixtures);
   runFixtureSuite(repoRoot, branchFixtures);
 
+  const expectedFixturePaths = testFiles.flatMap((testFile) => {
+    const integration = testFile.replace(/\.test\.mjs$/, "");
+    return fixtureClasses.map((fixtureClass) => `${integration}/${fixtureClass}.json`);
+  }).sort();
+  const mainFixturePaths = filesUnder(mainFixtures);
+  if (JSON.stringify(mainFixturePaths) !== JSON.stringify(expectedFixturePaths)) {
+    throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
+  }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
   for (const integration of batch2Integrations) {
     const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
