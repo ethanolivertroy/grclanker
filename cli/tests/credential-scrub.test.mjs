@@ -378,6 +378,7 @@ test("scrub boundary guard 1, quoted carriers: Bearer is strict in every casing 
     ['upstream rejected bearer "alphabetic"', `upstream rejected bearer "${REDACTED}"`],
     ["upstream rejected bEaReR abcdefghijk", `upstream rejected bEaReR ${REDACTED}`],
     ["message=Bearer abcdefghijk", `message=Bearer ${REDACTED}`],
+    ["error=Bearer token", `error=Bearer ${REDACTED}`],
     ["error:bearer abcdefghijk", `error:bearer ${REDACTED}`],
   ]) {
     assert.equal(scrubber.scrub(text), expected, text);

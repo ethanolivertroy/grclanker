@@ -412,6 +412,7 @@ test("leak-probe harness: every planted row leaks against an identity scrubber a
     "alphabetic Bearer value in bare server prose",
     "alphabetic lowercase bearer value in bare server prose",
     "alphabetic mixed-case Bearer value in bare server prose",
+    "alphabetic Bearer value after compact error assignment",
   ]) {
     assert.ok(result.leaks.some((leak) => leak.label.startsWith(prefix)), `${prefix} leaks against identity`);
   }

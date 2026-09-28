@@ -221,6 +221,7 @@ test("scheme-carried values are removed whatever their casing or entropy; Bearer
     ['upstream rejected bearer "alphabetic"', `upstream rejected bearer "${REDACTED}"`],
     ["upstream rejected bEaReR abcdefghijk", `upstream rejected bEaReR ${REDACTED}`],
     ["message=Bearer abcdefghijk", `message=Bearer ${REDACTED}`],
+    ["error=Bearer token", `error=Bearer ${REDACTED}`],
     ["error:bearer abcdefghijk", `error:bearer ${REDACTED}`],
   ]) {
     assert.equal(scrubErrorText(text), expected, text);

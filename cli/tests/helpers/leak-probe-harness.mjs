@@ -885,6 +885,11 @@ function schemeCasingCells(options, canaries) {
     mustKeep: ["upstream rejected bEaReR"],
     sinks: "error",
   }));
+  cells.push(cell("alphabetic Bearer value after compact error assignment", `error=Bearer ${alphabeticBearer}`, {
+    planted: [alphabeticBearer],
+    mustKeep: ["error=Bearer"],
+    sinks: "error",
+  }));
   cells.push(cell("fixed prose lowercase bearer responsibilities", "bearer responsibilities remain with the presenting party", {
     mustKeep: ["bearer responsibilities remain with the presenting party"],
     sinks: "data",
