@@ -1410,6 +1410,17 @@ test("inactive-user failures remain proved against the users read from a truncat
   assert.match(inactive.summary, /7 of 8 active users.*Truncated listing: users/);
 });
 
+test("a recent callback test remains observed when its inventory is truncated", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["governance"], now: NOW });
+  snapshot.callbackSecurityTests.truncated = true;
+  snapshot.callbackSecurityTests.total = snapshot.callbackSecurityTests.data.length + 1;
+  snapshot.callbackSecurityTests.limit = 20_000;
+
+  const vishing = findingFor(assessKnowbe4AccountGovernance(snapshot, { now: NOW }), 16);
+  assert.equal(vishing.status, "warn");
+  assert.match(vishing.summary, /1 callback.*Truncated listing: callback_security_tests/);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });

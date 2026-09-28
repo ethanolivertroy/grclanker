@@ -4208,6 +4208,16 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
   // A test found in the window is a real observation; "none ran" is only known from a complete list.
   const status = recent.length > 0 ? "pass" : listComplete ? "fail" : "warn";
 
+  const evidence = {
+    callback_tests_in_window: whenComplete(snapshot.callbackSecurityTests, recent.length),
+    callback_tests_all_time: whenComplete(snapshot.callbackSecurityTests, allTime.length),
+    callback_tests_read: allTime.length,
+    latest_callback_test: allTime[0]
+      ? { pst_id: testId(allTime[0].test), name: testName(allTime[0].test), started_at: allTime[0].startedAt.toISOString() }
+      : null,
+    lookback_days: lookbackDays,
+    evaluation_note: "Vishing is evaluated through KnowBe4 callback phishing tests, the voice-channel simulation the Reporting API exposes via campaign_type=callback.",
+  };
   return withInventoryCaveats(finding(
     16,
     "low",
@@ -4216,15 +4226,14 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
       : status === "warn"
         ? `None of the ${allTime.length} callback (voice-channel) phishing security tests loaded started in the last ${lookbackDays} days; the listing was truncated, so a recent test may not have been read.`
         : `No callback (voice-channel) phishing security tests started in the last ${lookbackDays} days${allTime.length > 0 ? `; the last one started ${roundTo(daysBetween(allTime[0].startedAt, now))} days ago` : " and none have ever run"}.`,
+    evidence,
+    undefined,
     {
-      callback_tests_in_window: whenComplete(snapshot.callbackSecurityTests, recent.length),
-      callback_tests_all_time: whenComplete(snapshot.callbackSecurityTests, allTime.length),
-      callback_tests_read: allTime.length,
-      latest_callback_test: allTime[0]
-        ? { pst_id: testId(allTime[0].test), name: testName(allTime[0].test), started_at: allTime[0].startedAt.toISOString() }
-        : null,
-      lookback_days: lookbackDays,
-      evaluation_note: "Vishing is evaluated through KnowBe4 callback phishing tests, the voice-channel simulation the Reporting API exposes via campaign_type=callback.",
+      evidence_readable: true,
+      evidence_complete: true,
+      inventory_count: allTime.length,
+      violation_count: recent.length === 0 && listComplete ? 1 : 0,
+      review_count: recent.length === 0 && !listComplete ? 1 : 0,
     },
   ), snapshot, [{ inventory: "callback_security_tests", notChecked: "callback test dates were not available", essential: true }]);
 }
