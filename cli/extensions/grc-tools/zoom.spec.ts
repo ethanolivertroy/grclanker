@@ -153,12 +153,15 @@ const ZOOM_EXECUTABLE_DECISIONS: Readonly<Record<string, ZoomExecutableDecision>
       rule("manual", all(eq("setting_value", "role"), any(ne("roles_readable", true), eq("admin_role_count", 0)))),
       rule("fail", any(eq("setting_value", "none"), all(eq("setting_value", "role"), gt("uncovered_admin_role_count", 0)))),
       rule("warn", any(eq("setting_value", "group"), all(any(eq("setting_value", "all"), eq("setting_value", "role")), ne("roles_complete", true)))),
-      rule("pass", all(
-        any(eq("setting_value", "all"), eq("setting_value", "role")),
-        eq("roles_readable", true),
-        eq("roles_complete", true),
-        any(eq("setting_value", "all"), gt("admin_role_count", 0)),
-        eq("uncovered_admin_role_count", 0),
+      rule("pass", any(
+        all(eq("setting_value", "all"), eq("roles_readable", true), eq("roles_complete", true)),
+        all(
+          eq("setting_value", "role"),
+          eq("roles_readable", true),
+          eq("roles_complete", true),
+          gt("admin_role_count", 0),
+          eq("uncovered_admin_role_count", 0),
+        ),
       )),
       rule("manual", { op: "always" }),
     ],
