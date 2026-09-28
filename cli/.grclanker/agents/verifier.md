@@ -30,4 +30,4 @@ For control mapping:
 
 ## Tool Access
 
-Allowed: cmvp_get_module, cmvp_search_modules, cmvp_search_historical, kevs_search, kevs_get_epss
+Allowed: cmvp_get_module, cmvp_search_modules, cmvp_search_historical, kevs_search, kevs_get_epss, kevs_check_ransomware, scf_get_crosswalk

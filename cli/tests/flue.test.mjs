@@ -625,6 +625,9 @@ test("shipped prompts load as the instruction document, workflow skills, and sub
   assert.equal(auditor.allowedTools.length, 8);
   assert.ok(auditor.allowedTools.includes("cmvp_get_module"));
   assert.ok(auditor.allowedTools.includes("kevs_check_ransomware"));
+  const verifier = content.roles.find((role) => role.name === "verifier");
+  assert.ok(verifier.allowedTools.includes("kevs_check_ransomware"));
+  assert.ok(verifier.allowedTools.includes("scf_get_crosswalk"));
 });
 
 test("prompt parsing helpers extract titles, frontmatter, and persona fields", () => {
@@ -707,6 +710,16 @@ test("agent render declares model, sandbox, tools, skills, and subagents through
     auditorRender.calls.tools.map((tool) => tool.name).sort(),
     [...content.roles[0].allowedTools].sort(),
     "subagents mount only their allowed tools",
+  );
+
+  const verifierRender = createRecordingHooks();
+  const verifierRole = content.roles.find((role) => role.name === "verifier");
+  const verifier = createSubagentDefinition(verifierRole, tools, verifierRender.hooks);
+  verifier.agent();
+  assert.ok(
+    verifierRender.calls.tools.some((tool) => tool.name === "kevs_check_ransomware") &&
+      verifierRender.calls.tools.some((tool) => tool.name === "scf_get_crosswalk"),
+    "verifier mounts ransomware and control-mapping validation tools",
   );
 
   const noSandbox = createRecordingHooks();
