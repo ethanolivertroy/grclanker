@@ -245,16 +245,17 @@ const GWS_EXECUTABLE_DECISIONS: Readonly<Record<string, GwsExecutableDecision>> 
   },
   "GWS-INTEG-001": {
     inputs: input("users_readable", "complete", "sampled_user_count", "failed_read_count", "token_count"),
-    rules: ordered({
-      manual: any(
+    rules: [
+      rule("manual", any(
         ne("users_readable", true),
         eq("sampled_user_count", 0),
         { op: "eq", left: path("failed_read_count"), right: path("sampled_user_count") },
-        eq("token_count", 0),
-      ),
-      warn: any(incomplete, gt("failed_read_count", 0)),
-      pass: gt("token_count", 0),
-    }),
+      )),
+      rule("warn", any(incomplete, gt("failed_read_count", 0))),
+      rule("manual", eq("token_count", 0)),
+      rule("pass", gt("token_count", 0)),
+      rule("manual", { op: "always" }, "Unknown or contradictory evidence requires manual review."),
+    ],
   },
   "GWS-INTEG-002": {
     inputs: input("directory_readable", "complete", "privileged_user_count", "token_count", "failed_read_count", "privileged_token_count"),

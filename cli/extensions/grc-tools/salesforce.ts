@@ -2714,7 +2714,8 @@ function assessSalesforceIdentityDataWithDecisionContext(data: SalesforceIdentit
     set_count: permissionSets.length,
     elevated_set_count: elevated.length,
     assignments_readable: assignmentsReadable,
-    complete: !data.permissionSets.truncated && assignmentsReadable && !data.assignments.truncated,
+    complete: !data.permissionSets.truncated
+      && (elevated.length === 0 || assignmentsReadable && !data.assignments.truncated),
     assignee_count: assignees.size,
     max_admins: maxAdmins,
   });

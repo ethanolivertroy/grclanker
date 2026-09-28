@@ -821,6 +821,26 @@ test("verdict rule 2: empty inventories never pass and each summary states how e
   assert.match(findingById(integrations, "GWS-INTEG-001").summary, /could not be demonstrated/);
 });
 
+test("GWS-INTEG-001 keeps the legacy Partial finding when readable users yield no tokens and one token read fails", () => {
+  const finding = findingById(assessGwsIntegrations({
+    users: dataset(createUsers().slice(0, 3)),
+    roles: dataset(createRoles()),
+    roleAssignments: dataset(createRoleAssignments()),
+    tokenInventory: {
+      data: [],
+      seen: 3,
+      total: 3,
+      failed: 1,
+      error: "one@example.com: 403 Forbidden",
+      truncated: false,
+    },
+    tokenActivities: dataset(createTokenActivities()),
+  }, createSampleConfig()), "GWS-INTEG-001");
+  assert.equal(finding.status, "Partial");
+  assert.equal(finding.summary, "Third-party token inventory was only partially readable.");
+  assert.ok(finding.evidence.includes("Per-user token reads that failed: 1"));
+});
+
 test("verdict rule 2 (by intent): an empty sub-population inside a non-empty inventory may pass and says so", () => {
   const config = createSampleConfig();
   const admin = assessGwsAdminAccess({

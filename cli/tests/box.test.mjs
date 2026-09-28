@@ -2033,6 +2033,18 @@ test("assessBoxSharingCollaboration passes with restricted collaboration, links,
   assert.deepEqual(result.errors, []);
 });
 
+test("BOX-05 keeps the legacy pass when the allowlist is empty even when exempt users exist", async () => {
+  const result = await assessBoxSharingCollaboration(createStubClient({
+    ...hardenedFixture(),
+    allowlistEntries: [],
+    exemptTargets: [{ id: "exempt-1", type: "collaboration_whitelist_exempt_target", user: { id: "member-1", type: "user" } }],
+  }));
+  const finding = findingById(result, "BOX-05");
+  assert.equal(finding.status, "pass");
+  assert.equal(finding.summary, "No collaboration allowlist entries exist to audit.");
+  assert.equal(finding.evidence.exempt_targets, 1);
+});
+
 test("assessBoxSharingCollaboration fails open collaboration, public allowlist domains, open links, and missing terms", async () => {
   const result = await assessBoxSharingCollaboration(createStubClient(weakFixture()), { staleAllowlistDays: 365 });
   assertStatuses(result, {
