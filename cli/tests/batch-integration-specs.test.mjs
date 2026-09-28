@@ -59,6 +59,7 @@ const batch = [
 ];
 const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|ZD|SF|SNOW)-/.test(check.id);
 const ABSENT = Symbol("absent");
+const DEFINED = Symbol("defined");
 
 function alternativeValue(value) {
   if (typeof value === "boolean") return !value;
@@ -71,7 +72,15 @@ function alternativeValue(value) {
 function mergeAssignments(left, right) {
   const merged = new Map(left);
   for (const [name, value] of right) {
-    if (merged.has(name) && !Object.is(merged.get(name), value)) return undefined;
+    if (merged.has(name)) {
+      const existing = merged.get(name);
+      if (existing === DEFINED && value !== ABSENT) {
+        merged.set(name, value);
+        continue;
+      }
+      if (value === DEFINED && existing !== ABSENT) continue;
+      if (!Object.is(existing, value)) return undefined;
+    }
     merged.set(name, value);
   }
   return merged;
@@ -171,7 +180,7 @@ function conditionWitnesses(condition, desired, constants) {
     case "defined": {
       const operand = operandState(condition.operand, constants);
       if (operand.known) return (operand.value !== undefined) === desired ? [new Map()] : [];
-      return [new Map([[operand.path, desired ? 0 : ABSENT]])];
+      return [new Map([[operand.path, desired ? DEFINED : ABSENT]])];
     }
     case "matches": {
       const operand = operandState(condition.operand, constants);
@@ -187,7 +196,11 @@ function conditionWitnesses(condition, desired, constants) {
 }
 
 function rawFacts(assignment) {
-  return Object.fromEntries([...assignment].filter(([, value]) => value !== ABSENT));
+  return Object.fromEntries(
+    [...assignment]
+      .filter(([, value]) => value !== ABSENT)
+      .map(([name, value]) => [name, value === DEFINED ? 0 : value]),
+  );
 }
 
 function orderedBranchWitness(check, branchIndex) {
