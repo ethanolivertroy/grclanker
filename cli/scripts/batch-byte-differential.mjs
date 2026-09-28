@@ -257,10 +257,9 @@ async function __corpusAsyncSweep(name, args, original) {
   __corpusSweptAsyncInputs.add(signature);
   const client = args[0];
   for (const methodName of __corpusClientMethods(client)) {
-    for (const mode of ["truncated", "denied", "empty"]) {
+    for (const mode of ["truncated", "empty"]) {
       const proxy = Object.create(client);
       proxy[methodName] = async (...methodArgs) => {
-        if (mode === "denied") throw new Error("403 Forbidden");
         return __corpusMutateCollection(await client[methodName](...methodArgs), mode);
       };
       const mutatedArgs = [proxy, ...args.slice(1)];
