@@ -130,7 +130,9 @@ export function deriveDecisionRules(
   rules: readonly VerdictRule[],
 ): { rules: readonly VerdictRule[]; derivedFactRules: Readonly<Record<string, DerivedFactRule>> } {
   const derivedFactRules: Record<string, DerivedFactRule> = {};
-  const rewritten = rules.map((entry, index) => {
+  const unconditionalIndex = rules.findIndex((entry) => entry.condition.op === "always");
+  const reachableRules = unconditionalIndex >= 0 ? rules.slice(0, unconditionalIndex + 1) : rules;
+  const rewritten = reachableRules.map((entry, index) => {
     const name = `${checkId.toLowerCase().replaceAll("-", "_")}_branch_${String(index + 1).padStart(2, "0")}_matches`;
     derivedFactRules[name] = {
       description: `${checkId} ordered branch ${index + 1} (${entry.status}) is true exactly when its portable evidence condition matches.`,

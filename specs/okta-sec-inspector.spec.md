@@ -461,7 +461,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-AUTH-009` | 2 | fail | `okta_auth_009_branch_02_matches` equals true |  |
 | `OKTA-AUTH-009` | 3 | warn | `okta_auth_009_branch_03_matches` equals true |  |
 | `OKTA-AUTH-009` | 4 | pass | `okta_auth_009_branch_04_matches` equals true |  |
-| `OKTA-AUTH-009` | 5 | manual | `okta_auth_009_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-ADMIN-001` | 1 | manual | `okta_admin_001_branch_01_matches` equals true |  |
 | `OKTA-ADMIN-001` | 2 | fail | `okta_admin_001_branch_02_matches` equals true |  |
 | `OKTA-ADMIN-001` | 3 | warn | `okta_admin_001_branch_03_matches` equals true |  |
@@ -471,7 +470,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-ADMIN-002` | 2 | manual | `okta_admin_002_branch_02_matches` equals true |  |
 | `OKTA-ADMIN-002` | 3 | warn | `okta_admin_002_branch_03_matches` equals true |  |
 | `OKTA-ADMIN-002` | 4 | pass | `okta_admin_002_branch_04_matches` equals true |  |
-| `OKTA-ADMIN-002` | 5 | manual | `okta_admin_002_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-ADMIN-003` | 1 | manual | `okta_admin_003_branch_01_matches` equals true |  |
 | `OKTA-ADMIN-003` | 2 | warn | `okta_admin_003_branch_02_matches` equals true |  |
 | `OKTA-ADMIN-003` | 3 | pass | `okta_admin_003_branch_03_matches` equals true |  |
@@ -480,12 +478,10 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-ADMIN-004` | 2 | manual | `okta_admin_004_branch_02_matches` equals true |  |
 | `OKTA-ADMIN-004` | 3 | warn | `okta_admin_004_branch_03_matches` equals true |  |
 | `OKTA-ADMIN-004` | 4 | pass | `okta_admin_004_branch_04_matches` equals true |  |
-| `OKTA-ADMIN-004` | 5 | manual | `okta_admin_004_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-ADMIN-005` | 1 | fail | `okta_admin_005_branch_01_matches` equals true | A proven violation retains precedence over incomplete companion evidence. |
 | `OKTA-ADMIN-005` | 2 | manual | `okta_admin_005_branch_02_matches` equals true |  |
 | `OKTA-ADMIN-005` | 3 | warn | `okta_admin_005_branch_03_matches` equals true |  |
 | `OKTA-ADMIN-005` | 4 | pass | `okta_admin_005_branch_04_matches` equals true |  |
-| `OKTA-ADMIN-005` | 5 | manual | `okta_admin_005_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-ADMIN-006` | 1 | manual | `okta_admin_006_branch_01_matches` equals true |  |
 | `OKTA-ADMIN-006` | 2 | warn | `okta_admin_006_branch_02_matches` equals true |  |
 | `OKTA-ADMIN-006` | 3 | pass | `okta_admin_006_branch_03_matches` equals true |  |
@@ -495,7 +491,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-INTEG-001` | 3 | warn | `okta_integ_001_branch_03_matches` equals true |  |
 | `OKTA-INTEG-001` | 4 | info | `okta_integ_001_branch_04_matches` equals true |  |
 | `OKTA-INTEG-001` | 5 | pass | `okta_integ_001_branch_05_matches` equals true |  |
-| `OKTA-INTEG-001` | 6 | manual | `okta_integ_001_branch_06_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-INTEG-002` | 1 | manual | `okta_integ_002_branch_01_matches` equals true |  |
 | `OKTA-INTEG-002` | 2 | warn | `okta_integ_002_branch_02_matches` equals true |  |
 | `OKTA-INTEG-002` | 3 | pass | `okta_integ_002_branch_03_matches` equals true |  |
@@ -504,7 +499,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-INTEG-003` | 2 | manual | `okta_integ_003_branch_02_matches` equals true |  |
 | `OKTA-INTEG-003` | 3 | warn | `okta_integ_003_branch_03_matches` equals true |  |
 | `OKTA-INTEG-003` | 4 | pass | `okta_integ_003_branch_04_matches` equals true |  |
-| `OKTA-INTEG-003` | 5 | manual | `okta_integ_003_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-INTEG-004` | 1 | manual | `okta_integ_004_branch_01_matches` equals true |  |
 | `OKTA-INTEG-004` | 2 | fail | `okta_integ_004_branch_02_matches` equals true |  |
 | `OKTA-INTEG-004` | 3 | warn | `okta_integ_004_branch_03_matches` equals true |  |
@@ -540,7 +534,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-MON-005` | 1 | manual | `okta_mon_005_branch_01_matches` equals true |  |
 | `OKTA-MON-005` | 2 | warn | `okta_mon_005_branch_02_matches` equals true |  |
 | `OKTA-MON-005` | 3 | pass | `okta_mon_005_branch_03_matches` equals true |  |
-| `OKTA-MON-005` | 4 | manual | `okta_mon_005_branch_04_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-MON-006` | 1 | manual | `okta_mon_006_branch_01_matches` equals true |  |
 | `OKTA-MON-006` | 2 | warn | `okta_mon_006_branch_02_matches` equals true |  |
 | `OKTA-MON-006` | 3 | pass | `okta_mon_006_branch_03_matches` equals true |  |
@@ -549,7 +542,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-MON-007` | 2 | manual | `okta_mon_007_branch_02_matches` equals true |  |
 | `OKTA-MON-007` | 3 | warn | `okta_mon_007_branch_03_matches` equals true |  |
 | `OKTA-MON-007` | 4 | pass | `okta_mon_007_branch_04_matches` equals true |  |
-| `OKTA-MON-007` | 5 | manual | `okta_mon_007_branch_05_matches` equals true | Unknown or contradictory evidence requires manual review. |
 | `OKTA-MON-008` | 1 | manual | `okta_mon_008_branch_01_matches` equals true |  |
 | `OKTA-MON-008` | 2 | fail | `okta_mon_008_branch_02_matches` equals true |  |
 | `OKTA-MON-008` | 3 | warn | `okta_mon_008_branch_03_matches` equals true |  |
@@ -605,7 +597,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-AUTH-009` | `okta_auth_009_branch_02_matches` | OKTA-AUTH-009 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: any of (`authenticator_count` equals 0; all of (`federal_tenant` equals true; any of (`restricted_count` is greater than 0; all of (`okta_verify_active` equals true; `fips_required` equals false)))). |
 | `OKTA-AUTH-009` | `okta_auth_009_branch_03_matches` | OKTA-AUTH-009 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; all of (`federal_tenant` equals true; `okta_verify_active` equals false); all of (`federal_tenant` equals false; `restricted_count` is greater than 0)). |
 | `OKTA-AUTH-009` | `okta_auth_009_branch_04_matches` | OKTA-AUTH-009 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-AUTH-009` | `okta_auth_009_branch_05_matches` | OKTA-AUTH-009 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-ADMIN-001` | `okta_admin_001_branch_01_matches` | OKTA-ADMIN-001 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `privileged_user_count` equals 0). |
 | `OKTA-ADMIN-001` | `okta_admin_001_branch_02_matches` | OKTA-ADMIN-001 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: `super_admin_count` is greater than 5. |
 | `OKTA-ADMIN-001` | `okta_admin_001_branch_03_matches` | OKTA-ADMIN-001 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `super_admin_count` is greater than 2). |
@@ -615,7 +606,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-ADMIN-002` | `okta_admin_002_branch_02_matches` | OKTA-ADMIN-002 ordered branch 2 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `privileged_user_count` equals 0). |
 | `OKTA-ADMIN-002` | `okta_admin_002_branch_03_matches` | OKTA-ADMIN-002 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `unknown_activity_count` is greater than 0). |
 | `OKTA-ADMIN-002` | `okta_admin_002_branch_04_matches` | OKTA-ADMIN-002 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-ADMIN-002` | `okta_admin_002_branch_05_matches` | OKTA-ADMIN-002 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-ADMIN-003` | `okta_admin_003_branch_01_matches` | OKTA-ADMIN-003 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `privileged_group_count` equals 0). |
 | `OKTA-ADMIN-003` | `okta_admin_003_branch_02_matches` | OKTA-ADMIN-003 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `oversized_group_count` is greater than 0). |
 | `OKTA-ADMIN-003` | `okta_admin_003_branch_03_matches` | OKTA-ADMIN-003 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `oversized_group_count` equals 0. |
@@ -624,12 +614,10 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-ADMIN-004` | `okta_admin_004_branch_02_matches` | OKTA-ADMIN-004 ordered branch 2 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `privileged_user_count` equals 0; `inspected_user_count` equals 0). |
 | `OKTA-ADMIN-004` | `okta_admin_004_branch_03_matches` | OKTA-ADMIN-004 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `weak_factor_count` is greater than 0). |
 | `OKTA-ADMIN-004` | `okta_admin_004_branch_04_matches` | OKTA-ADMIN-004 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-ADMIN-004` | `okta_admin_004_branch_05_matches` | OKTA-ADMIN-004 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-ADMIN-005` | `okta_admin_005_branch_01_matches` | OKTA-ADMIN-005 ordered branch 1 (fail) is true exactly when its portable evidence condition matches. Computed as: any of (`stale_active_count` is greater than 0; `never_activated_count` is greater than 0). |
 | `OKTA-ADMIN-005` | `okta_admin_005_branch_02_matches` | OKTA-ADMIN-005 ordered branch 2 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `user_count` equals 0). |
 | `OKTA-ADMIN-005` | `okta_admin_005_branch_03_matches` | OKTA-ADMIN-005 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `unknown_activity_count` is greater than 0; `attention_state_count` is greater than 0). |
 | `OKTA-ADMIN-005` | `okta_admin_005_branch_04_matches` | OKTA-ADMIN-005 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-ADMIN-005` | `okta_admin_005_branch_05_matches` | OKTA-ADMIN-005 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-ADMIN-006` | `okta_admin_006_branch_01_matches` | OKTA-ADMIN-006 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`support_readable` does not equal true; `support_present` equals false). |
 | `OKTA-ADMIN-006` | `okta_admin_006_branch_02_matches` | OKTA-ADMIN-006 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`third_party_readable` equals false; `support_state` does not equal "DISABLED"; `third_party_admin` does not equal false). |
 | `OKTA-ADMIN-006` | `okta_admin_006_branch_03_matches` | OKTA-ADMIN-006 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: all of (`support_state` equals "DISABLED"; `third_party_admin` equals false). |
@@ -639,7 +627,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-INTEG-001` | `okta_integ_001_branch_03_matches` | OKTA-INTEG-001 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: `complete` does not equal true. |
 | `OKTA-INTEG-001` | `okta_integ_001_branch_04_matches` | OKTA-INTEG-001 ordered branch 4 (info) is true exactly when its portable evidence condition matches. Computed as: `active_origin_count` equals 0. |
 | `OKTA-INTEG-001` | `okta_integ_001_branch_05_matches` | OKTA-INTEG-001 ordered branch 5 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-INTEG-001` | `okta_integ_001_branch_06_matches` | OKTA-INTEG-001 ordered branch 6 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-INTEG-002` | `okta_integ_002_branch_01_matches` | OKTA-INTEG-002 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `zone_count` equals 0). |
 | `OKTA-INTEG-002` | `okta_integ_002_branch_02_matches` | OKTA-INTEG-002 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `custom_zone_count` equals 0). |
 | `OKTA-INTEG-002` | `okta_integ_002_branch_03_matches` | OKTA-INTEG-002 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `custom_zone_count` is greater than 0. |
@@ -648,7 +635,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-INTEG-003` | `okta_integ_003_branch_02_matches` | OKTA-INTEG-003 ordered branch 2 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `app_count` equals 0). |
 | `OKTA-INTEG-003` | `okta_integ_003_branch_03_matches` | OKTA-INTEG-003 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `risky_inactive_count` is greater than 0). |
 | `OKTA-INTEG-003` | `okta_integ_003_branch_04_matches` | OKTA-INTEG-003 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-INTEG-003` | `okta_integ_003_branch_05_matches` | OKTA-INTEG-003 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-INTEG-004` | `okta_integ_004_branch_01_matches` | OKTA-INTEG-004 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: `policy_readable` does not equal true. |
 | `OKTA-INTEG-004` | `okta_integ_004_branch_02_matches` | OKTA-INTEG-004 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: all of (`risk_aware_rule_count` equals 0; `custom_zone_count` equals 0). |
 | `OKTA-INTEG-004` | `okta_integ_004_branch_03_matches` | OKTA-INTEG-004 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `risk_aware_rule_count` equals 0). |
@@ -684,7 +670,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-MON-005` | `okta_mon_005_branch_01_matches` | OKTA-MON-005 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); all of (`token_count` equals 0; `ssws_auth` equals true)). |
 | `OKTA-MON-005` | `okta_mon_005_branch_02_matches` | OKTA-MON-005 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `stale_count` is greater than 0; `undated_count` is greater than 0). |
 | `OKTA-MON-005` | `okta_mon_005_branch_03_matches` | OKTA-MON-005 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-MON-005` | `okta_mon_005_branch_04_matches` | OKTA-MON-005 ordered branch 4 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-MON-006` | `okta_mon_006_branch_01_matches` | OKTA-MON-006 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (`readable` does not equal true; not (`readable` is present and non-null)). |
 | `OKTA-MON-006` | `okta_mon_006_branch_02_matches` | OKTA-MON-006 ordered branch 2 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `policy_count` equals 0). |
 | `OKTA-MON-006` | `okta_mon_006_branch_03_matches` | OKTA-MON-006 ordered branch 3 (pass) is true exactly when its portable evidence condition matches. Computed as: `policy_count` is greater than 0. |
@@ -693,7 +678,6 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-MON-007` | `okta_mon_007_branch_02_matches` | OKTA-MON-007 ordered branch 2 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); all of (`token_count` equals 0; `ssws_auth` equals true)). |
 | `OKTA-MON-007` | `okta_mon_007_branch_03_matches` | OKTA-MON-007 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `unrestricted_count` is greater than 0; `missing_expiry_count` is greater than 0; `long_window_count` is greater than 0). |
 | `OKTA-MON-007` | `okta_mon_007_branch_04_matches` | OKTA-MON-007 ordered branch 4 (pass) is true exactly when its portable evidence condition matches. Computed as: always. |
-| `OKTA-MON-007` | `okta_mon_007_branch_05_matches` | OKTA-MON-007 ordered branch 5 (manual) is true exactly when its portable evidence condition matches. Computed as: always. |
 | `OKTA-MON-008` | `okta_mon_008_branch_01_matches` | OKTA-MON-008 ordered branch 1 (manual) is true exactly when its portable evidence condition matches. Computed as: any of (any of (`readable` does not equal true; not (`readable` is present and non-null)); `contact_count` equals 0). |
 | `OKTA-MON-008` | `okta_mon_008_branch_02_matches` | OKTA-MON-008 ordered branch 2 (fail) is true exactly when its portable evidence condition matches. Computed as: any of (all of (`technical_lookup_failed` equals false; `technical_contact_present` equals false); all of (`technical_lookup_failed` equals false; `technical_user_assigned` equals false); all of (`technical_user_state` does not equal ""; `technical_user_state` does not equal "ACTIVE")). |
 | `OKTA-MON-008` | `okta_mon_008_branch_03_matches` | OKTA-MON-008 ordered branch 3 (warn) is true exactly when its portable evidence condition matches. Computed as: any of (`complete` does not equal true; `technical_lookup_failed` equals true; `technical_user_state` equals ""). |
