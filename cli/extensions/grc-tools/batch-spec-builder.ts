@@ -341,6 +341,12 @@ function renderExampleAssignment(
     }
     case "matches":
       return `${operandName(condition.operand)}="matching-value" matching /${condition.pattern}/${condition.flags ?? ""}`;
+    case "in":
+      return `${operandName(condition.candidate)}="matching-value"; ${operandName(condition.collection)}=["matching-value"]`;
+    case "intersects":
+      return `${operandName(condition.left)}=["matching-value"]; ${operandName(condition.right)}=["matching-value"]`;
+    case "matchesAny":
+      return `${operandName(condition.candidates)}=["matching-value"]; ${operandName(condition.patterns)}=["matching.*"]`;
     case "defined":
       return `${operandName(condition.operand)}=0 (defined)`;
     case "null":
