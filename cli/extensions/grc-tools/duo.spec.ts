@@ -1,6 +1,7 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
+  deriveDecisionRules,
   type BatchCheckDefinition,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
@@ -148,6 +149,20 @@ const ne = (name: string, entry: PortableValue): VerdictCondition => compare("ne
 const gt = (name: string, entry: PortableValue): VerdictCondition => compare("gt", name, entry);
 const gte = (name: string, entry: PortableValue): VerdictCondition => compare("gte", name, entry);
 const lte = (name: string, entry: PortableValue): VerdictCondition => compare("lte", name, entry);
+const ratio = (
+  comparator: "gt" | "gte" | "lt" | "lte",
+  numerator: string,
+  denominator: string,
+  threshold: number,
+  options: { scale?: number; roundDigits?: number } = {},
+): VerdictCondition => ({
+  op: "ratio",
+  numerator: path(numerator),
+  denominator: path(denominator),
+  comparator,
+  threshold: value(threshold),
+  ...options,
+});
 const all = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "and", conditions });
 const any = (...conditions: VerdictCondition[]): VerdictCondition => ({ op: "or", conditions });
 const notDefined = (name: string): VerdictCondition => ({
@@ -194,7 +209,8 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     }),
   },
   "DUO-AUTH-002": {
-    inputs: input("policy_readable", "allowed_list_exposed", "blocked_list_exposed", "explicitly_allowed_telephony_count", "blocked_telephony_count", "permitted_telephony_count"),
+    inputs: input("policy_readable", "allowed_list_exposed", "blocked_list_exposed", "explicitly_allowed_telephony_count", "blocked_telephony_count"),
+    constants: { telephony_method_count: 2 },
     rules: ordered({
       manual: any(
         ne("policy_readable", true),
@@ -202,11 +218,11 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
         all(ne("blocked_list_exposed", true), eq("explicitly_allowed_telephony_count", 0)),
       ),
       fail: all(
-        any(gt("explicitly_allowed_telephony_count", 0), gt("permitted_telephony_count", 0)),
+        any(gt("explicitly_allowed_telephony_count", 0), { op: "lt", left: path("blocked_telephony_count"), right: path("telephony_method_count") }),
         eq("blocked_telephony_count", 0),
       ),
-      warn: any(gt("explicitly_allowed_telephony_count", 0), gt("permitted_telephony_count", 0)),
-      pass: eq("permitted_telephony_count", 0),
+      warn: any(gt("explicitly_allowed_telephony_count", 0), { op: "lt", left: path("blocked_telephony_count"), right: path("telephony_method_count") }),
+      pass: { op: "eq", left: path("blocked_telephony_count"), right: path("telephony_method_count") },
     }),
   },
   "DUO-AUTH-003": {
@@ -261,36 +277,46 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     }),
   },
   "DUO-AUTH-008": {
-    inputs: input("readable", "complete", "user_count", "known_enrollment_count", "bypass_user_count", "unenrolled_user_count", "enrollment_percent"),
+    inputs: input("readable", "complete", "user_count", "known_enrollment_count", "enrolled_user_count", "bypass_user_count", "unenrolled_user_count"),
     constants: { warning_minimum_percent: 90 },
     rules: ordered({
       manual: any(unreadable, eq("user_count", 0), eq("known_enrollment_count", 0)),
       fail: any(
         gt("bypass_user_count", 0),
-        all(gt("unenrolled_user_count", 0), { op: "lt", left: path("enrollment_percent"), right: value(90) }),
+        all(
+          gt("unenrolled_user_count", 0),
+          ratio("lt", "enrolled_user_count", "known_enrollment_count", 90, { scale: 100, roundDigits: 1 }),
+        ),
       ),
       warn: any(incomplete, gt("unenrolled_user_count", 0)),
       pass: all(eq("bypass_user_count", 0), eq("unenrolled_user_count", 0)),
     }),
   },
   "DUO-AUTH-009": {
-    inputs: input("readable", "complete", "access_user_count", "inactive_user_count", "undated_user_count", "inactive_percent"),
+    inputs: input("readable", "complete", "access_user_count", "inactive_user_count", "undated_user_count"),
     constants: { inactive_days: 90, failure_percent: 10 },
     rules: ordered({
       manual: any(unreadable, eq("access_user_count", 0)),
-      fail: gt("inactive_percent", 10),
+      fail: ratio("gt", "inactive_user_count", "access_user_count", 10, { scale: 100, roundDigits: 1 }),
       warn: any(incomplete, gt("inactive_user_count", 0), gt("undated_user_count", 0)),
       pass: all(eq("inactive_user_count", 0), eq("undated_user_count", 0)),
     }),
   },
   "DUO-AUTH-010": {
-    inputs: input("readable", "complete", "enrolled_user_count", "webauthn_user_count", "deprecated_u2f_user_count", "adoption_percent"),
+    inputs: input("readable", "complete", "enrolled_user_count", "webauthn_user_count", "deprecated_u2f_user_count"),
     constants: { pass_minimum_percent: 75 },
     rules: ordered({
       manual: any(unreadable, eq("enrolled_user_count", 0)),
       fail: eq("webauthn_user_count", 0),
-      warn: any(incomplete, { op: "lt", left: path("adoption_percent"), right: value(75) }, gt("deprecated_u2f_user_count", 0)),
-      pass: all(gte("adoption_percent", 75), eq("deprecated_u2f_user_count", 0)),
+      warn: any(
+        incomplete,
+        ratio("lt", "webauthn_user_count", "enrolled_user_count", 75, { scale: 100, roundDigits: 1 }),
+        gt("deprecated_u2f_user_count", 0),
+      ),
+      pass: all(
+        ratio("gte", "webauthn_user_count", "enrolled_user_count", 75, { scale: 100, roundDigits: 1 }),
+        eq("deprecated_u2f_user_count", 0),
+      ),
     }),
   },
   "DUO-AUTH-011": {
@@ -298,24 +324,22 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     rules: [rule("manual", { op: "always" })],
   },
   "DUO-ADMIN-001": {
-    inputs: input("readable", "complete", "admin_count", "owner_count", "warning_owner_maximum"),
+    inputs: input("readable", "complete", "admin_count", "owner_count"),
     constants: { pass_maximum: 2 },
     rules: ordered({
       manual: any(unreadable, eq("admin_count", 0)),
-      fail: gt("owner_count", 0),
+      fail: all(gt("owner_count", 3), ratio("gt", "owner_count", "admin_count", 0.5)),
       warn: any(incomplete, gt("owner_count", 2)),
       pass: lte("owner_count", 2),
-    }).map((entry, index) => index === 1
-      ? rule("fail", { op: "gt", left: path("owner_count"), right: path("warning_owner_maximum") })
-      : entry),
+    }),
   },
   "DUO-ADMIN-002": {
-    inputs: input("readable", "strong_method_enabled", "weak_method_enabled"),
+    inputs: input("readable", "verified_push_enabled", "webauthn_enabled", "sms_enabled", "voice_enabled"),
     rules: ordered({
       manual: unreadable,
-      fail: ne("strong_method_enabled", true),
-      warn: eq("weak_method_enabled", true),
-      pass: eq("weak_method_enabled", false),
+      fail: all(ne("verified_push_enabled", true), ne("webauthn_enabled", true)),
+      warn: any(eq("sms_enabled", true), eq("voice_enabled", true)),
+      pass: all(ne("sms_enabled", true), ne("voice_enabled", true)),
     }),
   },
   "DUO-ADMIN-003": {
@@ -331,11 +355,11 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     }),
   },
   "DUO-ADMIN-004": {
-    inputs: input("readable", "complete", "admin_count", "stale_admin_count", "undated_admin_count", "stale_at_least_one_third"),
+    inputs: input("readable", "complete", "admin_count", "active_admin_count", "stale_admin_count", "undated_admin_count"),
     constants: { inactive_days: 90 },
     rules: ordered({
       manual: any(unreadable, eq("admin_count", 0)),
-      fail: eq("stale_at_least_one_third", true),
+      fail: ratio("gte", "stale_admin_count", "active_admin_count", 1 / 3),
       warn: any(incomplete, gt("stale_admin_count", 0), gt("undated_admin_count", 0)),
       pass: all(eq("stale_admin_count", 0), eq("undated_admin_count", 0)),
     }),
@@ -416,13 +440,43 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     }),
   },
   "DUO-INTEGRATIONS-006": {
-    inputs: input("policy_readable", "edition_sections_present", "satisfied_group_count"),
+    inputs: input(
+      "policy_readable",
+      "edition_sections_present",
+      "duo_desktop_platform_count",
+      "encryption_platform_count",
+      "full_disk_encryption_required",
+      "firewall_platform_count",
+      "system_password_platform_count",
+      "screen_lock_required",
+      "restricted_os_count",
+    ),
     constants: { requirement_group_count: 5 },
     rules: ordered({
       manual: any(ne("policy_readable", true), ne("edition_sections_present", true)),
-      fail: eq("satisfied_group_count", 0),
-      warn: { op: "lt", left: path("satisfied_group_count"), right: value(5) },
-      pass: eq("satisfied_group_count", 5),
+      fail: all(
+        eq("duo_desktop_platform_count", 0),
+        eq("encryption_platform_count", 0),
+        ne("full_disk_encryption_required", true),
+        eq("firewall_platform_count", 0),
+        eq("system_password_platform_count", 0),
+        ne("screen_lock_required", true),
+        eq("restricted_os_count", 0),
+      ),
+      warn: any(
+        eq("duo_desktop_platform_count", 0),
+        all(eq("encryption_platform_count", 0), ne("full_disk_encryption_required", true)),
+        eq("firewall_platform_count", 0),
+        all(eq("system_password_platform_count", 0), ne("screen_lock_required", true)),
+        eq("restricted_os_count", 0),
+      ),
+      pass: all(
+        gt("duo_desktop_platform_count", 0),
+        any(gt("encryption_platform_count", 0), eq("full_disk_encryption_required", true)),
+        gt("firewall_platform_count", 0),
+        any(gt("system_password_platform_count", 0), eq("screen_lock_required", true)),
+        gt("restricted_os_count", 0),
+      ),
     }),
   },
   "DUO-MON-001": {
@@ -460,7 +514,7 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
     }),
   },
   "DUO-MON-005": {
-    inputs: input("attempts_readable", "logs_readable", "counts_present", "complete", "attempt_count", "event_count", "located_event_count", "impossible_travel_count", "fraud_count", "denied_percent"),
+    inputs: input("attempts_readable", "logs_readable", "counts_present", "complete", "attempt_count", "denied_attempt_count", "event_count", "located_event_count", "impossible_travel_count", "fraud_count"),
     constants: { travel_window_minutes: 60, denied_warning_percent: 20 },
     rules: ordered({
       manual: any(
@@ -470,7 +524,12 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
         all(eq("impossible_travel_count", 0), eq("located_event_count", 0), gt("event_count", 0)),
       ),
       fail: gt("impossible_travel_count", 0),
-      warn: any(incomplete, all(eq("attempt_count", 0), eq("event_count", 0)), gt("fraud_count", 0), gt("denied_percent", 20)),
+      warn: any(
+        incomplete,
+        all(eq("attempt_count", 0), eq("event_count", 0)),
+        gt("fraud_count", 0),
+        ratio("gt", "denied_attempt_count", "attempt_count", 20, { scale: 100, roundDigits: 1 }),
+      ),
       pass: { op: "always" },
     }),
   },
@@ -478,19 +537,25 @@ const DUO_EXECUTABLE_DECISIONS: Readonly<Record<string, DuoExecutableDecision>> 
 
 const checks: BatchCheckDefinition[] = Object.entries(groups).flatMap(([groupName, titles]) => {
   const group = groupName as keyof typeof groups;
-  return titles.map((title, index) => ({
-    id: `DUO-${group}-${String(index + 1).padStart(3, "0")}`,
-    control: Object.values(groups).slice(0, Object.keys(groups).indexOf(group)).reduce((sum, entries) => sum + entries.length, 0) + index + 1,
-    title,
-    severity: /MFA|privileged|bypass|Critical|API integration/i.test(title) ? "high" : "medium",
-    owner: ownerFor(group),
-    surfaces: DUO_CHECK_SURFACES[`DUO-${group}-${String(index + 1).padStart(3, "0")}`],
-    evidenceFields: [...DUO_CHECK_SURFACES[`DUO-${group}-${String(index + 1).padStart(3, "0")}`], "complete_source_counts"],
-    decisionInputs: DUO_EXECUTABLE_DECISIONS[`DUO-${group}-${String(index + 1).padStart(3, "0")}`].inputs,
-    decisionConstants: DUO_EXECUTABLE_DECISIONS[`DUO-${group}-${String(index + 1).padStart(3, "0")}`].constants,
-    decisionRules: DUO_EXECUTABLE_DECISIONS[`DUO-${group}-${String(index + 1).padStart(3, "0")}`].rules,
-    decision: decisions[group][index],
-  }));
+  return titles.map((title, index) => {
+    const id = `DUO-${group}-${String(index + 1).padStart(3, "0")}`;
+    const decision = DUO_EXECUTABLE_DECISIONS[id];
+    const executable = deriveDecisionRules(id, decision.rules);
+    return {
+      id,
+      control: Object.values(groups).slice(0, Object.keys(groups).indexOf(group)).reduce((sum, entries) => sum + entries.length, 0) + index + 1,
+      title,
+      severity: /MFA|privileged|bypass|Critical|API integration/i.test(title) ? "high" : "medium",
+      owner: ownerFor(group),
+      surfaces: DUO_CHECK_SURFACES[id],
+      evidenceFields: [...DUO_CHECK_SURFACES[id], "complete_source_counts"],
+      decisionInputs: decision.inputs,
+      decisionConstants: decision.constants,
+      decisionRules: executable.rules,
+      derivedFactRules: executable.derivedFactRules,
+      decision: decisions[group][index],
+    };
+  });
 });
 
 const idsFor = (owner: string): string[] => checks.filter((check) => check.owner === owner).map((check) => check.id);

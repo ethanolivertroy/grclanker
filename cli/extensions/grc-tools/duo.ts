@@ -2951,23 +2951,21 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       ...unavailableFacts,
       user_count: users.length,
       known_enrollment_count: 0,
+      enrolled_user_count: 0,
       bypass_user_count: 0,
       unenrolled_user_count: 0,
-      enrollment_percent: 0,
     });
     recordDuoDecisionFacts("DUO-AUTH-009", {
       ...unavailableFacts,
       access_user_count: 0,
       inactive_user_count: 0,
       undated_user_count: 0,
-      inactive_percent: 0,
     });
     recordDuoDecisionFacts("DUO-AUTH-010", {
       ...unavailableFacts,
       enrolled_user_count: 0,
       webauthn_user_count: 0,
       deprecated_u2f_user_count: 0,
-      adoption_percent: 0,
     });
     findings.push(
       buildFinding("DUO-AUTH-008", "Manual", reason, usersEvidence, "Grant the audit principal Grant resource - Read and confirm the tenant has enrolled users."),
@@ -3000,9 +2998,9 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       complete: completeDuoDatasets(data.users),
       user_count: users.length,
       known_enrollment_count: enrollmentKnown.length,
+      enrolled_user_count: enrolledUsers.length,
       bypass_user_count: bypassUsers.length,
       unenrolled_user_count: unenrolledUsers.length,
-      enrollment_percent: enrollmentPercent,
     });
 
     if (enrollmentKnown.length === 0) {
@@ -3075,7 +3073,6 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       access_user_count: accessUsers.length,
       inactive_user_count: inactiveUsers.length,
       undated_user_count: undatedUsers.length,
-      inactive_percent: inactiveShare,
     });
     if (accessUsers.length === 0) {
       findings.push(
@@ -3148,7 +3145,6 @@ function assessUserPopulation(data: DuoAuthenticationData): DuoFinding[] {
       enrolled_user_count: enrolledUsers.length,
       webauthn_user_count: enrolledWithWebauthn.length,
       deprecated_u2f_user_count: u2fUsers.length,
-      adoption_percent: adoptionPercent,
     });
     if (enrolledUsers.length === 0) {
       findings.push(
@@ -3404,7 +3400,6 @@ export function assessDuoAuthentication(
     blocked_list_exposed: telephony.blockedExposed,
     explicitly_allowed_telephony_count: telephony.explicitlyAllowedTelephony.length,
     blocked_telephony_count: telephony.blockedTelephony.length,
-    permitted_telephony_count: telephony.permittedTelephony.length,
   });
   if (policyUnavailable) {
     findings.push(
@@ -3799,7 +3794,6 @@ export function assessDuoAdminAccess(
     complete: completeDuoDatasets(data.admins),
     admin_count: admins.length,
     owner_count: ownerCount,
-    warning_owner_maximum: Math.max(3, Math.ceil(admins.length / 2)),
   });
 
   if (admins.length === 0) {
@@ -3856,8 +3850,10 @@ export function assessDuoAdminAccess(
   const voiceEnabled = getBooleanish(allowed, "voice_enabled");
   recordDuoDecisionFacts("DUO-ADMIN-002", {
     readable: !data.allowedAdminAuthMethods.error && Object.keys(allowed).length > 0,
-    strong_method_enabled: Boolean(verifiedPushEnabled || webauthnEnabled),
-    weak_method_enabled: Boolean(smsEnabled || voiceEnabled),
+    verified_push_enabled: verifiedPushEnabled,
+    webauthn_enabled: webauthnEnabled,
+    sms_enabled: smsEnabled,
+    voice_enabled: voiceEnabled,
   });
   if (data.allowedAdminAuthMethods.error || Object.keys(allowed).length === 0) {
     findings.push(
@@ -3978,9 +3974,9 @@ export function assessDuoAdminAccess(
     readable: !data.admins.error,
     complete: completeDuoDatasets(data.admins),
     admin_count: admins.length,
+    active_admin_count: activeAdmins.length,
     stale_admin_count: staleAdmins.length,
     undated_admin_count: undatedAdmins.length,
-    stale_at_least_one_third: staleAdmins.length >= Math.max(1, Math.ceil(activeAdmins.length / 3)),
   });
   if (admins.length === 0) {
     findings.push(
@@ -4225,7 +4221,13 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
     recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
       policy_readable: false,
       edition_sections_present: false,
-      satisfied_group_count: 0,
+      duo_desktop_platform_count: 0,
+      encryption_platform_count: 0,
+      full_disk_encryption_required: false,
+      firewall_platform_count: 0,
+      system_password_platform_count: 0,
+      screen_lock_required: false,
+      restricted_os_count: 0,
     });
     return buildFinding(
       "DUO-INTEGRATIONS-006",
@@ -4255,7 +4257,13 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
     recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
       policy_readable: true,
       edition_sections_present: false,
-      satisfied_group_count: 0,
+      duo_desktop_platform_count: 0,
+      encryption_platform_count: 0,
+      full_disk_encryption_required: false,
+      firewall_platform_count: 0,
+      system_password_platform_count: 0,
+      screen_lock_required: false,
+      restricted_os_count: 0,
     });
     return buildFinding(
       "DUO-INTEGRATIONS-006",
@@ -4298,7 +4306,13 @@ function assessDeviceHealthDepth(data: DuoIntegrationData): DuoFinding {
   recordDuoDecisionFacts("DUO-INTEGRATIONS-006", {
     policy_readable: true,
     edition_sections_present: true,
-    satisfied_group_count: satisfied,
+    duo_desktop_platform_count: requiresDuoDesktop.length,
+    encryption_platform_count: enforceEncryption.length,
+    full_disk_encryption_required: requireEncryption,
+    firewall_platform_count: enforceFirewall.length,
+    system_password_platform_count: enforceSystemPassword.length,
+    screen_lock_required: requireScreenLock,
+    restricted_os_count: restrictedOs.length,
   });
 
   if (satisfied === checks.length) {
@@ -4714,11 +4728,11 @@ function assessAuthenticationAnomalies(data: DuoMonitoringData, config: DuoResol
     counts_present: Object.keys(counts).length > 0,
     complete: completeDuoDatasets(attempts, data.authenticationLogs),
     attempt_count: total,
+    denied_attempt_count: failure + fraud,
     event_count: data.authenticationLogs.data.length,
     located_event_count: locatedEvents,
     impossible_travel_count: anomalies.length,
     fraud_count: fraud,
-    denied_percent: failureShare,
   });
   if (!attempts || attempts.error) {
     return buildFinding(
