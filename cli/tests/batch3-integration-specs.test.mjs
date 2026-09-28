@@ -264,6 +264,10 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
         facts[left] = node.op === "gt" || node.op === "lt" ? boundary : node.op === "gte" ? boundary - 1 : boundary + 1;
       }
     }
+    if (check.id === "TENABLE-05") {
+      facts.tenable_05_agent_count = 100;
+      facts.tenable_05_unhealthy_agent_count = 0;
+    }
     return facts;
   };
   let numericBranches = 0;
