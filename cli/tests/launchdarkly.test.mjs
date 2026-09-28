@@ -2844,6 +2844,70 @@ async function runLaunchdarklyTool(toolName, fetchImpl, args) {
   }
 }
 
+test("registered tools normalize comma-separated lists only after schema-shaped preparation", async () => {
+  const fixture = ldFixture();
+  const run = httpLaunchdarkly(fixture);
+  const baseArgs = { token: TEST_TOKEN };
+
+  const identity = await runLaunchdarklyTool(
+    "launchdarkly_assess_identity",
+    run.fetchImpl,
+    { ...baseArgs, allowed_domains: "example.com, example.org" },
+  );
+  assert.notEqual(identity.isError, true, identity.content[0].text);
+  assert.deepEqual(finding(identity.details, "LD-24").evidence.allowed_domains, ["example.com", "example.org"]);
+
+  for (const name of [
+    "launchdarkly_assess_environment_governance",
+    "launchdarkly_assess_flag_hygiene",
+  ]) {
+    const result = await runLaunchdarklyTool(
+      name,
+      run.fetchImpl,
+      { ...baseArgs, project_keys: "web, missing" },
+    );
+    assert.notEqual(result.isError, true, result.content[0].text);
+  }
+  const projectFilters = run.log
+    .filter((entry) => entry.path === "/api/v2/projects")
+    .map((entry) => new URL(entry.url).searchParams.get("filter"));
+  assert.ok(projectFilters.length >= 2);
+  assert.ok(projectFilters.every((filter) => filter === "keys:web|missing"));
+
+  const monitoring = await runLaunchdarklyTool(
+    "launchdarkly_assess_monitoring_integrations",
+    run.fetchImpl,
+    { ...baseArgs, integration_keys: "datadog, splunk" },
+  );
+  assert.notEqual(monitoring.isError, true, monitoring.content[0].text);
+  assert.deepEqual(
+    finding(monitoring.details, "LD-20").evidence.probed_integration_keys,
+    ["datadog", "splunk"],
+  );
+
+  const exportRoot = createTempBase("grclanker-ld-list-args-");
+  const exported = await runLaunchdarklyTool(
+    "launchdarkly_export_audit_bundle",
+    run.fetchImpl,
+    {
+      ...baseArgs,
+      output_dir: exportRoot,
+      allowed_domains: "example.com, example.org",
+      project_keys: "web, missing",
+      integration_keys: "datadog, splunk",
+    },
+  );
+  assert.notEqual(exported.isError, true, exported.content[0].text);
+  const files = readBundleFiles(exported.details.output_dir);
+  const exportedIdentity = JSON.parse(files.get("analysis/identity.json"));
+  const exportedMonitoring = JSON.parse(files.get("analysis/monitoring_integrations.json"));
+  assert.deepEqual(finding(exportedIdentity, "LD-24").evidence.allowed_domains, ["example.com", "example.org"]);
+  assert.deepEqual(
+    finding(exportedMonitoring, "LD-20").evidence.probed_integration_keys,
+    ["datadog", "splunk"],
+  );
+});
+
 const LD_AREAS = [
   ["identity", assessLaunchdarklyIdentity],
   ["access_control", assessLaunchdarklyAccessControl],
