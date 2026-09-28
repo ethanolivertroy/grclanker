@@ -1,11 +1,13 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
+  type BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
 import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2Completeness,
   batch2ComparePaths,
   batch2Eq,
   batch2GenericDecisionInputs,
@@ -64,6 +66,15 @@ const rows: readonly Row[] = [
   ["CF-TRF-05", 17, "IP access rules", "medium", ["traffic-and-account-controls"]],
   ["CF-TRF-06", 24, "Gateway SWG policies", "medium", ["traffic-and-account-controls"]],
 ] as const;
+
+const CLOUDFLARE_TRUNCATION_ONLY = ["truncated"] as const;
+const cloudflareCompletenessSources = (
+  id: string,
+  sourceSurfaces: readonly string[],
+): readonly BatchCompletenessSourceDefinition[] => sourceSurfaces.map((surfaceId) => ({
+  surfaceId,
+  falseWhen: id === "CF-IAM-02" ? [] : CLOUDFLARE_TRUNCATION_ONLY,
+}));
 
 function owner(id: string): string {
   if (id.startsWith("CF-IAM-")) return "cloudflare_assess_identity";
@@ -182,6 +193,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
           ],
         }
       : {};
+  const decisionInputs = custom.decisionInputs ?? batch2GenericDecisionInputs(decisionPredicate[id]);
   return {
     id,
     control,
@@ -191,8 +203,15 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
     surfaces: sourceSurfaces,
     emptyOutcome: id === "CF-IAM-05" ? "fail" : id === "CF-TRF-05" ? "pass" : "manual",
     constants: decisionConstants(id),
-    decisionInputs: batch2GenericDecisionInputs(decisionPredicate[id]),
+    decisionInputs,
     ...custom,
+    completeness: batch2Completeness(
+      decisionInputs,
+      cloudflareCompletenessSources(id, sourceSurfaces),
+      id === "CF-IAM-02"
+        ? "true for current-token verification because both dependencies are single-object reads; pagination state does not change this primitive."
+        : `true for ${title} only when the account, zone, and per-zone inventories represented by the listed surfaces reach their declared ends without truncation.`,
+    ),
     decision: `${decisionPredicate[id]} Across zones, evaluator counts come from these raw predicates rather than rendered per-zone statuses; a proved violation has first-match precedence and incomplete or unreadable evidence cannot pass.`,
   };
 }));

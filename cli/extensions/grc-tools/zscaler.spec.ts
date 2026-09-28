@@ -1,11 +1,13 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
+  type BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
 import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2Completeness,
   batch2ComparePaths,
   batch2Eq,
   batch2GenericDecisionInputs,
@@ -36,6 +38,24 @@ const surfaces = [
   restSurface("zia-policy", "/api/v1/{urlFilteringRules|firewallFilteringRules|dlpEngines|sslInspectionRules|sandboxRules|locations}", "ZIA API", ZIA_DOCS, ["id", "name", "state", "action", "rank", "order", "destinations", "locations"]),
   restSurface("zpa-policy", "/mgmtconfig/v1/admin/customers/{customerId}/{application|policy|posture|connector|idp|admin|certificate} resources", "ZPA API", ZPA_DOCS, ["id", "name", "enabled", "operator", "action", "health", "modifiedTime", "expirationDate"]),
 ] as const;
+
+const ZSCALER_TRUNCATION_ONLY = ["truncated"] as const;
+const zscalerCompletenessSources = (
+  surfaceId: string,
+): readonly BatchCompletenessSourceDefinition[] => [{
+  surfaceId,
+  falseWhen: ZSCALER_TRUNCATION_ONLY,
+}];
+
+function zscalerCompletenessSemantics(control: number, title: string): string {
+  if (control === 4) {
+    return "true unless the location inventory is truncated; SSL-rule truncation is disclosed but does not change this primitive in the preserved current behavior.";
+  }
+  if (control === 25) {
+    return "true unless a companion inventory that the current capForUnreadableAll path recognizes is incomplete; the documented single-dataset truncation exceptions do not change this primitive.";
+  }
+  return `true for ${title} only when every dataset currently designated as completeness-gating for this finding reaches its final page; the documented truncation exceptions remain excluded.`;
+}
 
 const rows: ReadonlyArray<readonly [string, Batch2CheckRow["severity"], "zia_policy" | "zia_access_control" | "zpa"]> = [
   ["URL Filtering Policy Audit", "high", "zia_policy"],
@@ -236,17 +256,25 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
               ],
             }
           : {};
+  const id = `ZS-${String(control).padStart(2, "0")}`;
+  const surfaceId = area === "zpa" ? "zpa-policy" : area === "zia_policy" ? "zia-policy" : "zia-administration";
+  const decisionInputs = custom.decisionInputs ?? batch2GenericDecisionInputs(decisionPredicate[index]);
   return {
-    id: `ZS-${String(control).padStart(2, "0")}`,
+    id,
     control,
     title,
     severity,
     owner: owner(area),
-    surfaces: [area === "zpa" ? "zpa-policy" : area === "zia_policy" ? "zia-policy" : "zia-administration"],
+    surfaces: [surfaceId],
     emptyOutcome: "manual" as const,
     constants: decisionConstants(control),
-    decisionInputs: batch2GenericDecisionInputs(decisionPredicate[index]),
+    decisionInputs,
     ...custom,
+    completeness: batch2Completeness(
+      decisionInputs,
+      zscalerCompletenessSources(surfaceId),
+      zscalerCompletenessSemantics(control, title),
+    ),
     decision: `${decisionPredicate[index]} Missing product credentials and unreadable or ambiguous feature responses remain manual; a proved violation has first-match precedence. The known truncation exceptions are listed as runtime gaps rather than silently hardened.`,
   };
 }));

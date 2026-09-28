@@ -1,11 +1,13 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
+  type BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
 import {
   batch2All as all,
   batch2Any as any,
   batch2Checks,
+  batch2Completeness,
   batch2ComparePaths as comparePaths,
   batch2DecisionInputPaths,
   batch2Defined as defined,
@@ -132,6 +134,99 @@ const rows: readonly AzureRow[] = [
   ["AZURE-NP-03", 25, "Azure Policy compliance state", "medium", ["policy-summary"], "manual"],
   ["AZURE-NP-04", 24, "NSG flow logs enabled", "medium", ["network-security-groups", "network-watchers", "flow-logs"], "manual"],
 ] as const;
+
+const TRUNCATION_ONLY = ["truncated"] as const;
+const NO_COMPLETENESS_FAILURE_MODES = [] as const;
+const completenessSource = (
+  surfaceId: string,
+  falseWhen: BatchCompletenessSourceDefinition["falseWhen"],
+): BatchCompletenessSourceDefinition => ({ surfaceId, falseWhen });
+const AZURE_COMPLETENESS_SOURCES: Readonly<Record<string, readonly BatchCompletenessSourceDefinition[]>> = {
+  "AZURE-ID-01": [
+    completenessSource("conditional-access", TRUNCATION_ONLY),
+    completenessSource("security-defaults", NO_COMPLETENESS_FAILURE_MODES),
+  ],
+  "AZURE-ID-02": [
+    completenessSource("conditional-access", TRUNCATION_ONLY),
+    completenessSource("security-defaults", NO_COMPLETENESS_FAILURE_MODES),
+  ],
+  "AZURE-ID-03": [completenessSource("registration-details", TRUNCATION_ONLY)],
+  "AZURE-ID-04": [
+    completenessSource("directory-roles", TRUNCATION_ONLY),
+    completenessSource("directory-role-members", TRUNCATION_ONLY),
+  ],
+  "AZURE-ID-05": [completenessSource("service-principals", TRUNCATION_ONLY)],
+  "AZURE-ID-06": [
+    completenessSource("pim-eligibilities", TRUNCATION_ONLY),
+    completenessSource("pim-assignments", TRUNCATION_ONLY),
+  ],
+  "AZURE-ID-08": [completenessSource("guest-users", TRUNCATION_ONLY)],
+  "AZURE-ID-09": [completenessSource("conditional-access", TRUNCATION_ONLY)],
+  "AZURE-ID-10": [completenessSource("conditional-access", TRUNCATION_ONLY)],
+  "AZURE-ID-11": [
+    completenessSource("risky-users", TRUNCATION_ONLY),
+    completenessSource("risk-detections", TRUNCATION_ONLY),
+  ],
+  "AZURE-ID-12": [completenessSource("applications", TRUNCATION_ONLY)],
+  "AZURE-ID-13": [completenessSource("permission-grants", TRUNCATION_ONLY)],
+  "AZURE-MON-02": [completenessSource("directory-audits", NO_COMPLETENESS_FAILURE_MODES)],
+  "AZURE-MON-03": [completenessSource("sign-ins", NO_COMPLETENESS_FAILURE_MODES)],
+  "AZURE-MON-04": [completenessSource("defender-pricings", TRUNCATION_ONLY)],
+  "AZURE-MON-05": [completenessSource("diagnostic-settings", TRUNCATION_ONLY)],
+  "AZURE-MON-06": [
+    completenessSource("diagnostic-settings", NO_COMPLETENESS_FAILURE_MODES),
+    completenessSource("log-workspaces", TRUNCATION_ONLY),
+  ],
+  "AZURE-SUB-01": [
+    completenessSource("role-assignments", TRUNCATION_ONLY),
+    completenessSource("role-definitions", TRUNCATION_ONLY),
+  ],
+  "AZURE-SUB-02": [
+    completenessSource("role-assignments", TRUNCATION_ONLY),
+    completenessSource("role-definitions", TRUNCATION_ONLY),
+  ],
+  "AZURE-SUB-04": [completenessSource("network-watchers", NO_COMPLETENESS_FAILURE_MODES)],
+  "AZURE-SUB-05": [
+    completenessSource("role-assignments", TRUNCATION_ONLY),
+    completenessSource("role-definitions", TRUNCATION_ONLY),
+  ],
+  "AZURE-DP-01": [
+    completenessSource("compliance-policies", TRUNCATION_ONLY),
+    completenessSource("managed-devices", TRUNCATION_ONLY),
+    completenessSource("conditional-access", TRUNCATION_ONLY),
+  ],
+  "AZURE-DP-03": [completenessSource("sensitivity-labels", TRUNCATION_ONLY)],
+  "AZURE-DP-04": [completenessSource("key-vaults", TRUNCATION_ONLY)],
+  "AZURE-DP-05": [completenessSource("storage-accounts", TRUNCATION_ONLY)],
+  "AZURE-DP-06": [
+    completenessSource("member-users", TRUNCATION_ONLY),
+    completenessSource("message-rules", NO_COMPLETENESS_FAILURE_MODES),
+  ],
+  "AZURE-NP-01": [completenessSource("network-security-groups", TRUNCATION_ONLY)],
+  "AZURE-NP-02": [completenessSource("policy-assignments", TRUNCATION_ONLY)],
+  "AZURE-NP-04": [
+    completenessSource("network-security-groups", TRUNCATION_ONLY),
+    completenessSource("network-watchers", TRUNCATION_ONLY),
+    completenessSource("flow-logs", TRUNCATION_ONLY),
+  ],
+};
+
+function azureCompletenessSemantics(id: string, title: string): string {
+  switch (id) {
+    case "AZURE-MON-02":
+      return "true after a readable directory-audit response; pagination truncation is not represented by this primitive in the current assessment.";
+    case "AZURE-MON-03":
+      return "true after a readable sign-in response; pagination truncation is not represented by this primitive in the current assessment.";
+    case "AZURE-MON-06":
+      return "true when the Log Analytics workspace inventory is untruncated; diagnostic-settings truncation does not change this primitive in the preserved current behavior.";
+    case "AZURE-SUB-04":
+      return "true after a readable Network Watcher response; pagination truncation is not represented by this primitive in the current assessment.";
+    case "AZURE-DP-06":
+      return "true when the member-user inventory is untruncated; individual mailbox-rule read failures are represented by mailbox_unreadable_count instead.";
+    default:
+      return `true for ${title} only when every listed completeness-governing inventory reaches its declared end without a page, item, or child-read truncation.`;
+  }
+}
 
 interface AzureDecision {
   inputs: Readonly<Record<string, string>>;
@@ -476,22 +571,31 @@ const owner = (id: string): string => id.startsWith("AZURE-ID-")
         ? "azure_assess_data_protection"
         : "azure_assess_network_and_policy";
 
-const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome]) => ({
-  id,
-  control,
-  title,
-  severity,
-  owner: owner(id),
-  surfaces: sourceSurfaces,
-  manualOnly: sourceSurfaces.length === 0,
-  emptyOutcome,
-  decisionInputs: AZURE_DECISIONS[id]?.inputs ?? {},
-  decisionRules: AZURE_DECISIONS[id]?.rules,
-  constants: AZURE_DECISIONS[id]?.constants,
-  decision: sourceSurfaces.length === 0
-    ? `${id} always returns manual because no shipped Azure read surface exposes decisive evidence for ${title}.`
-    : `${id} evaluates the rendered ordered first-match predicates over these explicitly defined primitive values: ${Object.keys(AZURE_DECISIONS[id]?.inputs ?? {}).join(", ")}. The rendered constants and rule comparisons are the complete portable decision contract for ${title}.`,
-})));
+const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome]) => {
+  const decision = AZURE_DECISIONS[id];
+  const decisionInputs = decision?.inputs ?? {};
+  return {
+    id,
+    control,
+    title,
+    severity,
+    owner: owner(id),
+    surfaces: sourceSurfaces,
+    manualOnly: sourceSurfaces.length === 0,
+    emptyOutcome,
+    decisionInputs,
+    decisionRules: decision?.rules,
+    constants: decision?.constants,
+    completeness: batch2Completeness(
+      decisionInputs,
+      AZURE_COMPLETENESS_SOURCES[id],
+      azureCompletenessSemantics(id, title),
+    ),
+    decision: sourceSurfaces.length === 0
+      ? `${id} always returns manual because no shipped Azure read surface exposes decisive evidence for ${title}.`
+      : `${id} evaluates the rendered ordered first-match predicates over these explicitly defined primitive values: ${Object.keys(decisionInputs).join(", ")}. The rendered constants and rule comparisons are the complete portable decision contract for ${title}.`,
+  };
+}));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 
 export const AZURE_RUNTIME_BEHAVIOR = [

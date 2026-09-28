@@ -1,6 +1,8 @@
 import {
   deriveDecisionRules,
   type BatchCheckDefinition,
+  type BatchCompletenessDefinition,
+  type BatchCompletenessSourceDefinition,
   type PortableInputType,
   type BatchSurfaceDefinition,
 } from "./batch-spec-builder.js";
@@ -28,6 +30,7 @@ export interface Batch2CheckRow {
   constants?: Readonly<Record<string, PortableValue>>;
   decisionInputs?: Readonly<Record<string, string>>;
   decisionRules?: readonly VerdictRule[];
+  completeness?: Readonly<Record<string, BatchCompletenessDefinition>>;
 }
 
 export const batch2Value = (entry: PortableValue) => ({ kind: "value" as const, value: entry });
@@ -63,11 +66,30 @@ export function batch2GenericDecisionInputs(
 ): Readonly<Record<string, string>> {
   return {
     evidence_readable: "Boolean collector state. True only when every vendor response and raw field needed by this check was returned and parseable; false, null, or missing means the check cannot pass.",
-    evidence_complete: "Boolean collector state. True only when every required inventory exhausted pagination and configured collection caps; false, null, or missing means cardinality is a lower bound and cannot support pass.",
+    evidence_complete: "Boolean collector state defined by this check's structured completeness contract; false, null, or missing cannot support pass.",
     inventory_count: "Non-negative integer computed over the complete required vendor inventories before any evidence-display slicing. Zero retains the check-specific empty-inventory outcome; null or missing means cardinality is unknown.",
     violation_count: `Non-negative integer computed over the complete required vendor inventories before display slicing. It counts records satisfying this exact predicate: ${predicate}`,
     review_count: `Non-negative integer computed over the complete required vendor inventories before display slicing. It counts records satisfying the warning or manual-review branches of this exact predicate, excluding records already counted as violations: ${predicate}`,
   };
+}
+
+export function batch2Completeness(
+  decisionInputs: Readonly<Record<string, string>>,
+  sources: readonly BatchCompletenessSourceDefinition[] | undefined,
+  semantics: string | Readonly<Record<string, string>>,
+): Readonly<Record<string, BatchCompletenessDefinition>> | undefined {
+  const completenessInputs = Object.entries(decisionInputs).filter(([name]) => name.includes("complete"));
+  if (completenessInputs.length > 0 && sources === undefined) {
+    throw new Error(`Explicit completeness sources are required for ${completenessInputs.map(([name]) => name).join(", ")}`);
+  }
+  const declaredSources = sources ?? [];
+  const entries = completenessInputs
+    .map(([name]) => {
+      const definition = typeof semantics === "string" ? semantics : semantics[name];
+      if (!definition?.trim()) throw new Error(`Explicit completeness semantics are required for ${name}`);
+      return [name, { sources: declaredSources, semantics: definition }] as const;
+    });
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 function executableRules(row: Batch2CheckRow): readonly VerdictRule[] {
@@ -226,6 +248,7 @@ export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinit
       decisionConstants: row.constants,
       decisionRules: executable.rules,
       derivedFactRules: executable.derivedFactRules,
+      completeness: row.completeness,
       decision: row.decision,
     };
   });

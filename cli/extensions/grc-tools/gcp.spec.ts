@@ -1,11 +1,13 @@
 import {
   buildBatchIntegrationSpec,
   buildBatchOutputContract,
+  type BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
 import {
   batch2All,
   batch2Any,
   batch2Checks,
+  batch2Completeness,
   batch2Defined,
   batch2Eq,
   batch2GenericDecisionInputs,
@@ -92,6 +94,14 @@ const rows: readonly Row[] = [
   ["GCP-NET-05", 18, "Load balancer SSL policies", "high", ["projects", "compute"], "manual"],
   ["GCP-NET-06", 19, "Cloud Armor on external backend services", "medium", ["projects", "compute"], "manual", "warn"],
 ] as const;
+
+const GCP_COMPLETENESS_FAILURE_MODES = ["truncated", "error", "denied", "not-collected"] as const;
+const gcpCompletenessSources = (
+  sourceSurfaces: readonly string[],
+): readonly BatchCompletenessSourceDefinition[] => sourceSurfaces.map((surfaceId) => ({
+  surfaceId,
+  falseWhen: GCP_COMPLETENESS_FAILURE_MODES,
+}));
 
 function owner(id: string): string {
   if (id.startsWith("GCP-IAM-")) return "gcp_assess_identity";
@@ -221,20 +231,29 @@ const decisionPredicate: Readonly<Record<string, string>> = {
   "GCP-NET-06": `Warn when an external backend service using ${GCP_HTTP_BACKEND_PROTOCOLS.join(", ")} has no securityPolicy Cloud Armor reference.`,
 };
 
-const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome, violationOutcome]) => ({
-  id,
-  control,
-  title,
-  severity,
-  owner: owner(id),
-  surfaces: sourceSurfaces,
-  emptyOutcome,
-  violationOutcome,
-  constants: decisionConstants(id),
-  decisionInputs: batch2GenericDecisionInputs(decisionPredicate[id]),
-  ...customDecision(id),
-  decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
-})));
+const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfaces, emptyOutcome, violationOutcome]) => {
+  const custom = customDecision(id);
+  const decisionInputs = custom?.decisionInputs ?? batch2GenericDecisionInputs(decisionPredicate[id]);
+  return {
+    id,
+    control,
+    title,
+    severity,
+    owner: owner(id),
+    surfaces: sourceSurfaces,
+    emptyOutcome,
+    violationOutcome,
+    constants: decisionConstants(id),
+    decisionInputs,
+    ...custom,
+    completeness: batch2Completeness(
+      decisionInputs,
+      gcpCompletenessSources(sourceSurfaces),
+      `true for ${title} only when the organization or project scope and every listed dependent read are free of truncation, errors, denials, and not-collected states.`,
+    ),
+    decision: `${decisionPredicate[id]} Apply the check's explicit empty-inventory outcome; a proved violation returns ${violationOutcome ?? "fail"} with first-match precedence, and partial or unreadable evidence cannot pass.`,
+  };
+}));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);
 
 export const GCP_RUNTIME_BEHAVIOR = [
