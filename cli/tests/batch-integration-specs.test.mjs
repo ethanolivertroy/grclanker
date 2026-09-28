@@ -61,9 +61,9 @@ const usesExecutableEvidenceRules = (check) => /^(?:OKTA|DUO|GWS|BOX|SLACK|ZOOM|
 const ABSENT = Symbol("absent");
 const DEFINED = Symbol("defined");
 
-function alternativeValues(value) {
+function alternativeValues(value, numericDomain) {
   if (typeof value === "boolean") return [!value];
-  if (typeof value === "number") return [value + 1, value - 1];
+  if (typeof value === "number") return numericDomain.filter((candidate) => candidate !== value);
   if (typeof value === "string") return [`${value}__different`];
   if (value === null) return [0];
   return ["__different"];
@@ -106,7 +106,7 @@ function operandState(operand, constants) {
   return { known: false, path: operand.path };
 }
 
-function comparisonWitnesses(condition, desired, constants) {
+function comparisonWitnesses(condition, desired, constants, numericDomain) {
   const left = operandState(condition.left, constants);
   const right = operandState(condition.right, constants);
   const equal = condition.op === "eq" ? desired : !desired;
@@ -115,16 +115,16 @@ function comparisonWitnesses(condition, desired, constants) {
       return Object.is(left.value, right.value) === equal ? [new Map()] : [];
     }
     if (!left.known && right.known) {
-      const values = equal ? [right.value] : alternativeValues(right.value);
+      const values = equal ? [right.value] : alternativeValues(right.value, numericDomain);
       return values.map((value) => new Map([[left.path, value]]));
     }
     if (left.known && !right.known) {
-      const values = equal ? [left.value] : alternativeValues(left.value);
+      const values = equal ? [left.value] : alternativeValues(left.value, numericDomain);
       return values.map((value) => new Map([[right.path, value]]));
     }
-    const pairs = equal
-      ? [[0, 0]]
-      : [[0, 1], [0, -1], [1, 0], [-1, 0]];
+    const pairs = numericDomain.flatMap((leftValue) => numericDomain
+      .filter((rightValue) => Object.is(leftValue, rightValue) === equal)
+      .map((rightValue) => [leftValue, rightValue]));
     return pairs.map(([leftValue, rightValue]) => new Map([
       [left.path, leftValue],
       [right.path, rightValue],
@@ -139,52 +139,54 @@ function comparisonWitnesses(condition, desired, constants) {
   }
   if (!left.known && right.known) {
     const threshold = Number(right.value);
-    const values = comparison === "gt"
-      ? (desired ? [threshold + 1] : [threshold, threshold - 1])
-      : (desired ? [threshold, threshold - 1] : [threshold + 1]);
+    const values = numericDomain.filter((value) => (
+      (comparison === "gt" ? value > threshold : value <= threshold) === desired
+    ));
     return values.map((value) => new Map([[left.path, value]]));
   }
   if (left.known && !right.known) {
     const threshold = Number(left.value);
-    const values = comparison === "gt"
-      ? (desired ? [threshold - 1] : [threshold, threshold + 1])
-      : (desired ? [threshold, threshold + 1] : [threshold - 1]);
+    const values = numericDomain.filter((value) => (
+      (comparison === "gt" ? threshold > value : threshold <= value) === desired
+    ));
     return values.map((value) => new Map([[right.path, value]]));
   }
-  const pairs = comparison === "gt"
-    ? (desired ? [[1, 0]] : [[0, 0], [-1, 0]])
-    : (desired ? [[0, 0], [-1, 0]] : [[1, 0]]);
+  const pairs = numericDomain.flatMap((leftValue) => numericDomain
+    .filter((rightValue) => (
+      (comparison === "gt" ? leftValue > rightValue : leftValue <= rightValue) === desired
+    ))
+    .map((rightValue) => [leftValue, rightValue]));
   return pairs.map(([leftValue, rightValue]) => new Map([
     [left.path, leftValue],
     [right.path, rightValue],
   ]));
 }
 
-function conditionWitnesses(condition, desired, constants) {
+function conditionWitnesses(condition, desired, constants, numericDomain) {
   switch (condition.op) {
     case "always":
       return desired ? [new Map()] : [];
     case "not":
-      return conditionWitnesses(condition.condition, !desired, constants);
+      return conditionWitnesses(condition.condition, !desired, constants, numericDomain);
     case "and":
       if (desired) {
         return condition.conditions.reduce(
-          (candidates, child) => combineAssignments(candidates, conditionWitnesses(child, true, constants)),
+          (candidates, child) => combineAssignments(candidates, conditionWitnesses(child, true, constants, numericDomain)),
           [new Map()],
         );
       }
-      return condition.conditions.flatMap((child) => conditionWitnesses(child, false, constants));
+      return condition.conditions.flatMap((child) => conditionWitnesses(child, false, constants, numericDomain));
     case "or":
-      if (desired) return condition.conditions.flatMap((child) => conditionWitnesses(child, true, constants));
+      if (desired) return condition.conditions.flatMap((child) => conditionWitnesses(child, true, constants, numericDomain));
       return condition.conditions.reduce(
-        (candidates, child) => combineAssignments(candidates, conditionWitnesses(child, false, constants)),
+        (candidates, child) => combineAssignments(candidates, conditionWitnesses(child, false, constants, numericDomain)),
         [new Map()],
       );
     case "eq":
     case "ne":
     case "gt":
     case "lte":
-      return comparisonWitnesses(condition, desired, constants);
+      return comparisonWitnesses(condition, desired, constants, numericDomain);
     case "defined": {
       const operand = operandState(condition.operand, constants);
       if (operand.known) return (operand.value !== undefined) === desired ? [new Map()] : [];
@@ -211,15 +213,39 @@ function rawFacts(assignment) {
   );
 }
 
+function numericWitnessDomain(branches, constants) {
+  const values = new Set([-1, 0, 1]);
+  const add = (value) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return;
+    values.add(value - 1);
+    values.add(value);
+    values.add(value + 1);
+  };
+  for (const value of Object.values(constants)) add(value);
+  const walk = (condition) => {
+    if (condition.left?.kind === "value") add(condition.left.value);
+    if (condition.right?.kind === "value") add(condition.right.value);
+    if (condition.operand?.kind === "value") add(condition.operand.value);
+    for (const child of condition.conditions ?? []) walk(child);
+    if (condition.condition) walk(condition.condition);
+  };
+  for (const branch of branches) walk(branch.condition);
+  return [...values].sort((left, right) => left - right);
+}
+
 function orderedBranchWitness(check, branchIndex) {
   const branches = Object.values(check.derivedFactRules ?? {});
+  const numericDomain = numericWitnessDomain(branches, check.criteria.constants);
   const constraints = [
     ...branches.slice(0, branchIndex).map((branch) => [branch.condition, false]),
     [branches[branchIndex].condition, true],
   ];
   let candidates = [new Map()];
   for (const [condition, desired] of constraints) {
-    candidates = combineAssignments(candidates, conditionWitnesses(condition, desired, check.criteria.constants));
+    candidates = combineAssignments(
+      candidates,
+      conditionWitnesses(condition, desired, check.criteria.constants, numericDomain),
+    );
   }
   return candidates.map(rawFacts).find((facts) => constraints.every(([condition, desired]) => (
     evaluateVerdictCondition(condition, { ...check.criteria.constants, ...facts }) === desired
