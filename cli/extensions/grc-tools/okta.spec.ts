@@ -335,7 +335,7 @@ const OKTA_EXECUTABLE_DECISIONS: Readonly<Record<string, OktaExecutableDecision>
   "OKTA-ADMIN-006": {
     inputs: input("support_readable", "third_party_readable", "support_present", "support_disabled", "third_party_admin"),
     rules: ordered({
-      manual: any(eq("support_readable", false), eq("support_present", false)),
+      manual: any(ne("support_readable", true), eq("support_present", false)),
       warn: any(eq("third_party_readable", false), eq("support_disabled", false), ne("third_party_admin", false)),
       pass: all(eq("support_disabled", true), eq("third_party_admin", false)),
     }),

@@ -486,7 +486,7 @@ Rules are evaluated from lowest order number to highest. The first matching cond
 | `OKTA-ADMIN-005` | 3 | warn | any of (`complete` does not equal true; `unknown_activity_count` is greater than 0; `attention_status_count` is greater than 0) |  |
 | `OKTA-ADMIN-005` | 4 | pass | always |  |
 | `OKTA-ADMIN-005` | 5 | manual | always | Unknown or contradictory evidence requires manual review. |
-| `OKTA-ADMIN-006` | 1 | manual | any of (`support_readable` equals false; `support_present` equals false) |  |
+| `OKTA-ADMIN-006` | 1 | manual | any of (`support_readable` does not equal true; `support_present` equals false) |  |
 | `OKTA-ADMIN-006` | 2 | warn | any of (`third_party_readable` equals false; `support_disabled` equals false; `third_party_admin` does not equal false) |  |
 | `OKTA-ADMIN-006` | 3 | pass | all of (`support_disabled` equals true; `third_party_admin` equals false) |  |
 | `OKTA-ADMIN-006` | 4 | manual | always | Unknown or contradictory evidence requires manual review. |
