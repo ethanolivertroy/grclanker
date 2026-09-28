@@ -228,6 +228,7 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
                   batch2Gt("missing_malware_flag_count", 0),
                 )),
                 batch2Rule("warn", batch2Any(
+                  batch2Ne("evidence_complete", true),
                   batch2Ne("block_unscannable_files", true),
                   batch2Gt("allowlist_url_count", ZSCALER_MAX_SECURITY_ALLOWLIST_URLS),
                 )),

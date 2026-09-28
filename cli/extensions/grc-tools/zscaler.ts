@@ -2638,6 +2638,9 @@ function securityBaselineVerdict(data: ZiaPolicyData, evidenceNote: string): Zsc
   };
   const facts = {
     evidence_readable: true,
+    // Parent parity: single-dataset truncation is disclosed but does not gate
+    // this legacy verdict; capForUnreadableAll overrides this for failed reads.
+    evidence_complete: true,
     atp_setting_count: Object.keys(atp).length,
     malware_setting_count: Object.keys(malware).length,
     missing_atp_flag_count: missingAtp.length,
