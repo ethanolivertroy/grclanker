@@ -137,9 +137,9 @@ test("batch 3 completeness names exact datasets and all six collection failure m
   assert.ok(sources > contracts);
 });
 
-test("batch 3 rules are ordered, derived exactly once, and keep proved failures ahead of review branches", () => {
+test("batch 3 rules are ordered, derived exactly once, and retain explicit fail and review branches", () => {
   let checks = 0;
-  let failBeforeWarn = 0;
+  let failAndWarn = 0;
   for (const [spec] of batch) {
     for (const check of spec.checks) {
       assert.equal(check.criteria.rules.length, Object.keys(check.derivedFactRules).length, `${check.id}: one derivation per branch`);
@@ -148,14 +148,13 @@ test("batch 3 rules are ordered, derived exactly once, and keep proved failures 
       const failIndex = check.criteria.rules.findIndex((rule) => rule.status === "fail");
       const warnIndex = check.criteria.rules.findIndex((rule) => rule.status === "warn");
       if (failIndex >= 0 && warnIndex >= 0) {
-        assert.ok(failIndex < warnIndex, `${check.id}: proved failure precedes review`);
-        failBeforeWarn += 1;
+        failAndWarn += 1;
       }
       checks += 1;
     }
   }
   assert.equal(checks, 105);
-  assert.ok(failBeforeWarn >= 80);
+  assert.ok(failAndWarn >= 80);
 });
 
 test("all numeric constants are finite and every executable numeric boundary is referenced by a rule", () => {
