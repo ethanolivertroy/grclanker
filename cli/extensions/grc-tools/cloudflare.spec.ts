@@ -194,6 +194,9 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
         }
       : {};
   const decisionInputs = custom.decisionInputs ?? batch2GenericDecisionInputs(decisionPredicate[id]);
+  const aggregationSemantics = sourceSurfaces.some((surface) => surface.includes("zone"))
+    ? "Across zones, evaluator counts come from the named raw predicates rather than rendered per-zone statuses."
+    : "Evaluator counts come directly from the named account-level raw predicates and complete source inventories.";
   return {
     id,
     control,
@@ -212,7 +215,7 @@ const checks = batch2Checks(rows.map(([id, control, title, severity, sourceSurfa
         ? "true for current-token verification because both dependencies are single-object reads; pagination state does not change this primitive."
         : `true for ${title} only when the account, zone, and per-zone inventories represented by the listed surfaces reach their declared ends without truncation.`,
     ),
-    decision: `${decisionPredicate[id]} Across zones, evaluator counts come from these raw predicates rather than rendered per-zone statuses; a proved violation has first-match precedence and incomplete or unreadable evidence cannot pass.`,
+    decision: `${decisionPredicate[id]} ${aggregationSemantics} A proved violation has first-match precedence and incomplete or unreadable evidence cannot pass.`,
   };
 }));
 const idsFor = (tool: string): string[] => checks.filter((check) => check.owner === tool).map((check) => check.id);

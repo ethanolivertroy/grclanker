@@ -54,6 +54,8 @@ import {
   xmlText,
   xmlToJson,
 } from "../dist/extensions/grc-tools/paloalto.js";
+import { captureBatchDecisionFacts } from "../dist/extensions/grc-tools/batch-spec-builder.js";
+import { PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC } from "../dist/extensions/grc-tools/paloalto.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -408,6 +410,114 @@ function prismaSnapshot(overrides = {}) {
     errors: overrides.errors ?? [],
   };
 }
+
+const PALOALTO_SOURCE_INPUTS = {
+  "prisma-compliance-posture": ["cspm", "compliance posture"],
+  "prisma-alert-rules": ["cspm", "alert rules"],
+  "prisma-open-alerts": ["cspm", "open alerts"],
+  "prisma-policies": ["cspm", "policies"],
+  "prisma-cloud-accounts": ["cspm", "cloud accounts"],
+  "prisma-account-groups": ["cspm", "account groups"],
+  "prisma-user-roles": ["cspm", "user roles"],
+  "prisma-integrations": ["cspm", "integrations"],
+  "compute-vulnerability-image-policy": ["compute", "vulnerability image policy"],
+  "compute-images": ["compute", "images"],
+  "compute-vulnerability-stats": ["compute", "vulnerability stats"],
+  "compute-compliance-host-policy": ["compute", "compliance host policy"],
+  "compute-compliance-container-policy": ["compute", "compliance container policy"],
+  "compute-compliance-stats": ["compute", "compliance stats"],
+  "compute-defenders": ["compute", "defenders"],
+  "compute-runtime-container-policy": ["compute", "runtime container policy"],
+  "compute-registry-settings": ["compute", "registry settings"],
+  "compute-registry-scans": ["compute", "registry scans"],
+  "compute-cloud-discovery": ["compute", "cloud discovery"],
+  "compute-ci-scans": ["compute", "ci scans"],
+  "panos-policy-config": ["panos", "/vsys"],
+  "panos-zone-config": ["panos", "/network"],
+  "panos-device-config": ["panos", "/deviceconfig"],
+  "panos-globalprotect-config": ["panos", "/vsys"],
+  "panos-ha-state": ["panos-ha", "ha"],
+};
+
+function assessPaloaltoSnapshots(prisma, panos) {
+  assessPrismaCloudPosture(prisma);
+  assessPrismaCompute(prisma);
+  assessPanosFirewallPolicy(panos);
+  assessPanosThreatPrevention(panos);
+  assessDataLossPrevention(prisma, panos);
+  assessAdminAccess(prisma, panos);
+  assessLogging(prisma, panos);
+  assessPanosDeviceHardening(panos);
+}
+
+function paloaltoFactsByCheck(captures) {
+  const facts = new Map();
+  for (const capture of captures) {
+    assert.equal(capture.integration, PALOALTO_SPEC.identity.slug);
+    for (const [id, values] of capture.checks) facts.set(id, values);
+  }
+  return facts;
+}
+
+async function capturePaloaltoCompleteness(prisma = prismaSnapshot(), panos = [panosSnapshot()]) {
+  const { captures } = await captureBatchDecisionFacts(() => assessPaloaltoSnapshots(prisma, panos));
+  return paloaltoFactsByCheck(captures);
+}
+
+test("all 25 Palo Alto checks replay every declared configured-source failure mode and product absence", async () => {
+  const baseline = await capturePaloaltoCompleteness();
+  assert.equal(baseline.size, 25);
+  for (const check of PALOALTO_SPEC.checks) {
+    assert.equal(baseline.get(check.id)?.evidence_complete, true, `${check.id}: baseline complete`);
+  }
+
+  const modes = ["truncated", "error", "denied", "not-collected", "missing-required-field"];
+  let replays = 0;
+  for (const [checkId, sources] of Object.entries(PALOALTO_COMPLETENESS_SOURCES)) {
+    for (const source of sources) {
+      const [kind, runtimeName] = PALOALTO_SOURCE_INPUTS[source.surfaceId] ?? [];
+      assert.ok(kind && runtimeName, `${checkId}: fixture mapping for ${source.surfaceId}`);
+      for (const mode of modes) {
+        const prisma = prismaSnapshot();
+        const panos = [panosSnapshot()];
+        if (kind === "cspm") {
+          if (mode === "truncated" && runtimeName === "open alerts") prisma.alertsTruncated = true;
+          if (["error", "denied", "not-collected"].includes(mode)) prisma.failed = [runtimeName];
+          if (mode === "missing-required-field") prisma.unevaluable = { [runtimeName]: 1 };
+        } else if (kind === "compute") {
+          if (mode === "truncated") prisma.compute.truncated = [runtimeName];
+          if (["error", "denied", "not-collected"].includes(mode)) prisma.compute.failed = [runtimeName];
+          if (mode === "missing-required-field") prisma.compute.unevaluable = { [runtimeName]: 1 };
+        } else if (kind === "panos-ha") {
+          if (["error", "denied", "not-collected"].includes(mode)) panos[0].haStateFailed = true;
+        } else if (["error", "denied", "not-collected"].includes(mode)) {
+          panos[0].failedXpaths = [runtimeName];
+        }
+        const facts = await capturePaloaltoCompleteness(prisma, panos);
+        assert.equal(
+          facts.get(checkId)?.evidence_complete,
+          source.falseWhen.includes(mode) ? false : true,
+          `${checkId}/${source.surfaceId}/${mode}`,
+        );
+        replays += 1;
+      }
+    }
+  }
+  assert.equal(replays, 220);
+
+  const absent = await capturePaloaltoCompleteness(undefined, []);
+  assert.equal(absent.size, 25);
+  for (const check of PALOALTO_SPEC.checks) {
+    assert.equal(absent.get(check.id)?.evidence_complete, undefined, `${check.id}: required product not configured`);
+  }
+
+  const panosOnly = await capturePaloaltoCompleteness(undefined, [panosSnapshot()]);
+  const prismaOnly = await capturePaloaltoCompleteness(prismaSnapshot(), []);
+  for (const id of ["PA-19", "PA-20", "PA-21"]) {
+    assert.equal(panosOnly.get(id)?.evidence_complete, true, `${id}: CSPM unconfigured is omitted`);
+    assert.equal(prismaOnly.get(id)?.evidence_complete, true, `${id}: PAN-OS unconfigured is omitted`);
+  }
+});
 
 function byId(findings, id) {
   return findings.find((item) => item.id === id);
