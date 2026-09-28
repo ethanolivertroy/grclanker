@@ -191,12 +191,6 @@ test("all 68 numeric thresholds have below, equal, and above projected-fact boun
         const delta = Number.isInteger(threshold) ? 1 : 0.01;
         const values = [threshold - delta, threshold, threshold + delta];
         assert.ok(values[0] < values[1] && values[1] < values[2], `${check.id}.${name}: ordered boundary`);
-        const criteriaText = `${check.criteria.pass} ${check.criteria.warn} ${check.criteria.fail}`;
-        const semanticName = new RegExp(name.replace(/^default_/, "").replaceAll("_", ".{0,20}"), "i");
-        assert.ok(
-          semanticName.test(criteriaText) || criteriaText.includes(String(threshold)),
-          `${check.id}.${name}: threshold name or immutable value is rendered`,
-        );
         const baseFacts = {
           evidence_readable: true,
           evidence_complete: true,
@@ -269,6 +263,12 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
     assert.ok(markdown, entry.outputPath);
     assert.match(markdown, /Rules are evaluated from lowest order number to highest/);
     assert.match(markdown, /Portable derivation/);
+    for (const check of spec.checks) {
+      for (const [name, value] of Object.entries(check.criteria.constants)) {
+        if (typeof value !== "number") continue;
+        assert.match(markdown, new RegExp(`\\b${name}\\b[^\\n]*${String(value).replace(".", "\\.")}`));
+      }
+    }
     assert.doesNotMatch(
       markdown,
       /\b(?:TypeScript|ReadonlyArray|Type\.Object|defineGrcTool|prepareArguments|evaluateBatchRuntimeCheckVerdict|batch[23](?:Checks|Completeness)|cli\/extensions)\b/,
