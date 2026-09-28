@@ -98,6 +98,27 @@ export function batch3SetCompleteness(
   return { ...facts, [batch3FactNames(id).complete]: complete };
 }
 
+export function batch3SetReviewMinimum(
+  id: string,
+  facts: Readonly<Record<string, unknown>>,
+  minimum: number,
+): Readonly<Record<string, unknown>> {
+  const reviewName = batch3FactNames(id).reviewMatches;
+  const current = facts[reviewName];
+  return {
+    ...facts,
+    [reviewName]: Math.max(typeof current === "number" ? current : 0, minimum),
+  };
+}
+
+export function batch3SetPopulation(
+  id: string,
+  facts: Readonly<Record<string, unknown>>,
+  population: number | null,
+): Readonly<Record<string, unknown>> {
+  return { ...facts, [batch3FactNames(id).population]: population };
+}
+
 const ALL_INCOMPLETE_STATES = [
   "truncated",
   "error",

@@ -2886,36 +2886,34 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-02-SC": {
       const scans = value("sc_scan_count") ?? 0;
       const completed = value("sc_completed_results_in_window");
-      if (completed === undefined && scans > 0) return {};
+      if (completed === undefined && scans > 0) return batch3UnavailableFacts(contractId);
       return fact(scans, scans === 0 || (value("sc_recurring_scans") ?? 0) === 0 || completed === 0 ? 1 : 0);
     }
     case "TENABLE-07-SC": {
       const scanners = value("sc_scanner_count") ?? 0;
-      if (scanners === 0) return {};
+      if (scanners === 0) return batch3UnavailableFacts(contractId);
       const violations = count("sc_unhealthy", "sc_stale_checkin", "sc_stale_plugins") + (evidence.sc_feed_active_stale === true ? 1 : 0);
       const complete = evidence.sc_feed_readable === true;
       return fact(scanners, violations, count("sc_undated") + (complete ? 0 : 1), complete);
     }
     case "TENABLE-10-SC": {
       const users = value("sc_user_count") ?? 0;
-      if (users === 0) return {};
+      if (users === 0) return batch3UnavailableFacts(contractId);
       return fact(users, count("sc_inactive_users"), count("sc_never_logged_in", "sc_locked_users"));
     }
     case "TENABLE-01": {
       const scans = value("scan_count") ?? 0;
       if (scans === 0) return fact(0, 1, 0);
-      const policies = asRecords(evidence.policies_evaluated);
-      const unreadable = policies.filter((item) => ["unreadable", "unverified"].includes(asString(item.verdict) ?? "")).length;
       const violations = (value("discovery_only_scans") ?? 0) === scans && scans > 0
         ? 1
-        : policies.filter((item) => asString(item.verdict) === "fail").length;
+        : count("unsafe_policy_count");
       if (
         asString(evidence.policy_details_status) !== "ok"
-        || unreadable > 0
-        || (policies.length === 0 && count("scans_without_policy_id") === scans && scans > 0)
+        || count("unreadable_policy_count", "unverified_policy_count") > 0
+        || (count("policy_evaluation_count") === 0 && count("scans_without_policy_id") === scans && scans > 0)
         || (evidence.policy_details_truncated === true && violations === 0)
-      ) return {};
-      const reviews = policies.filter((item) => asString(item.verdict) === "warn").length
+      ) return batch3UnavailableFacts(contractId);
+      const reviews = count("review_policy_count")
         + count("scans_without_policy_id")
         + (evidence.caller_is_administrator === true ? 0 : 1)
         + (statusIsIncomplete("scan_templates_status", "policies_status") ? 1 : 0);
@@ -3152,7 +3150,7 @@ function withPartialView(item: TenableFinding, dataset: TenableDataset<unknown>)
   };
   const previousFacts = (item as TenableFindingWithFacts)[TENABLE_DECISION_FACTS] ?? {};
   const facts = dataset.truncated && item.id !== "TENABLE-07-SC"
-    ? { ...previousFacts, evidence_complete: false }
+    ? batch3SetCompleteness(item.id.endsWith("-SC") ? item.id.slice(0, -3) : item.id, previousFacts, false)
     : previousFacts;
   const contractId = item.id.endsWith("-SC") ? item.id.slice(0, -3) : item.id;
   const status = evaluateBatchRuntimeCheckVerdict(TENABLE_SPEC, contractId, facts) as TenableFindingStatus;
@@ -3522,6 +3520,26 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     const warningPolicies = evaluations.filter((item) => item.verdict === "warn");
     const unreadablePolicies = evaluations.filter((item) => item.verdict === "unreadable");
     const unverifiedPolicies = evaluations.filter((item) => item.verdict === "unverified");
+    const unsafePolicyCount = evaluations.filter((item) =>
+      item.safeChecks === "no"
+      || item.familiesEnabled + item.familiesMixed === 0
+        && item.familiesDisabled > 0).length;
+    const unreadablePolicyCount = data.policyDetails.data.filter((item) => item.status !== "ok").length;
+    const unverifiedPolicyCount = evaluations.filter((item) =>
+      item.safeChecks === null
+      || item.familiesEnabled + item.familiesDisabled + item.familiesMixed === 0).length;
+    const reviewPolicyCount = evaluations.filter((item) => {
+      const familyCount = item.familiesEnabled + item.familiesDisabled + item.familiesMixed;
+      return item.safeChecks !== null
+        && item.safeChecks !== "no"
+        && familyCount > 0
+        && (
+          item.safeChecks !== "yes"
+          || item.portscanRange === null
+          || !/^default$/i.test(item.portscanRange) && !portscanRangeIsFull(item.portscanRange)
+          || item.familiesDisabled > familyCount / 2
+        );
+    }).length;
     const scansWithoutPolicy = scans.filter((scan) => asString(scan.policy_id) === undefined);
     const describe = (items: PolicyEvaluation[]): string => items.slice(0, 10).map((item) => `${item.name} [${item.reasons.join("; ")}]`).join(", ");
     const scanTypes = Object.fromEntries(scans.reduce((map, scan) => {
@@ -3590,6 +3608,11 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
     }, "", {
       policies_status: data.policies.status,
       policy_details_truncated: data.policyDetails.truncated,
+      policy_evaluation_count: evaluations.length,
+      unsafe_policy_count: unsafePolicyCount,
+      unreadable_policy_count: unreadablePolicyCount,
+      unverified_policy_count: unverifiedPolicyCount,
+      review_policy_count: reviewPolicyCount,
     }));
 
     const recurring = scans.filter((scan) => scanIsEnabled(scan) && scanIsRecurring(scan));

@@ -26,6 +26,12 @@ import {
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
+import {
+  batch3RuntimeFacts,
+  batch3SetCompleteness,
+  batch3UnavailableFacts,
+  type Batch3RuntimeFactValues,
+} from "./batch3-spec-helpers.js";
 import { createCredentialScrubber, isBearerIdKey } from "./credential-scrub.js";
 import { KNOWBE4_SPEC } from "./knowbe4.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -2255,19 +2261,20 @@ function knowbe4EvidenceCount(evidence: JsonRecord, name: string): number {
 function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
   const count = (...names: string[]) => names.reduce((total, name) => total + knowbe4EvidenceCount(evidence, name), 0);
   const value = (name: string) => asNumber(evidence[name]);
-  const fact = (inventoryCount: number, violationCount = 0, reviewCount = 0, complete = true) => ({
-    evidence_readable: true,
-    evidence_complete: complete,
-    inventory_count: inventoryCount,
-    violation_count: violationCount,
-    review_count: reviewCount,
-  });
+  const fact = (inventoryCount: number, violationCount = 0, reviewCount = 0, complete = true) =>
+    batch3RuntimeFacts(id, {
+      readable: true,
+      complete,
+      population: inventoryCount,
+      failureMatches: violationCount,
+      reviewMatches: reviewCount,
+    });
   if (
     Object.prototype.hasOwnProperty.call(evidence, "collection_error")
     || asRecordArray(evidence.unreadable_inventories).length > 0
     || evidence.scoped_out_by_configuration === true
   ) {
-    return {};
+    return batch3UnavailableFacts(id);
   }
   if (evidence.user_list_empty === true) return fact(1, 0, 1);
   const observedViolation = evidence.violation_observed === true ? 1 : value("violation_observed") ?? 0;
@@ -2370,7 +2377,7 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       return fact(tests, tests === 0 ? 1 : count("gaps_over_threshold"), 0);
     }
     default:
-      return {};
+      return batch3UnavailableFacts(id);
   }
 }
 
@@ -2380,11 +2387,13 @@ function finding(
   summary: string,
   evidence?: JsonRecord,
   manualEvidence?: string,
-  decisionFacts?: Readonly<Record<string, unknown>>,
+  decisionValues?: Batch3RuntimeFactValues,
 ): Knowbe4Finding {
   const definition = controlById(number);
   const id = findingId(number);
-  const facts = decisionFacts ?? knowbe4DecisionFacts(id, evidence ?? {});
+  const facts = decisionValues
+    ? batch3RuntimeFacts(id, decisionValues)
+    : knowbe4DecisionFacts(id, evidence ?? {});
   const result: Knowbe4FindingWithFacts = {
     id,
     control: number,
@@ -2502,9 +2511,9 @@ function withInventoryCaveats(item: Knowbe4Finding, snapshot: Knowbe4Snapshot, r
   }
 
   const facts = essentialGap
-    ? {}
+    ? batch3UnavailableFacts(item.id)
     : gaps.length > 0 || verdictTruncated
-      ? { ...previousFacts, evidence_complete: false }
+      ? batch3SetCompleteness(item.id, previousFacts, false)
       : previousFacts;
   const status = evaluateBatchRuntimeCheckVerdict(KNOWBE4_SPEC, item.id, facts) as Knowbe4Finding["status"];
   // A truncated verdict inventory is always stated with seen versus total and the cap, whatever the verdict: a warn the
@@ -2802,11 +2811,11 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     : 0;
   const reviewCount = violationCount === 0 && (samples.length === 0 || !complete) ? 1 : 0;
   return withInventoryCaveats(finding(2, "high", summary, evidence, undefined, {
-    evidence_readable: true,
-    evidence_complete: true,
-    inventory_count: active.size,
-    violation_count: violationCount,
-    review_count: reviewCount,
+    readable: true,
+    complete: true,
+    population: active.size,
+    failureMatches: violationCount,
+    reviewMatches: reviewCount,
   }), snapshot, reads);
 }
 
@@ -2990,11 +2999,11 @@ function assessCampaignTargeting(snapshot: Knowbe4Snapshot, now: Date, lookbackD
     ? 1
     : 0;
   return withInventoryCaveats(finding(9, "medium", summary, evidence, undefined, {
-    evidence_readable: true,
-    evidence_complete: true,
-    inventory_count: activeCampaigns.length,
-    violation_count: violationCount,
-    review_count: 0,
+    readable: true,
+    complete: true,
+    population: activeCampaigns.length,
+    failureMatches: violationCount,
+    reviewMatches: 0,
   }), snapshot, [
     { inventory: "phishing_campaigns", notChecked: "the campaign target groups were not available", essential: true },
     { inventory: "security_tests", notChecked: "campaigns were classed as active from their status and last run alone, not from the tests that actually ran" },
@@ -3075,11 +3084,11 @@ function assessReportRate(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: nu
     ? 1
     : 0;
   return withInventoryCaveats(finding(19, "medium", summary, evidence, undefined, {
-    evidence_readable: true,
-    evidence_complete: true,
-    inventory_count: recent.length,
-    violation_count: violationCount,
-    review_count: reviewCount,
+    readable: true,
+    complete: true,
+    population: recent.length,
+    failureMatches: violationCount,
+    reviewMatches: reviewCount,
   }), snapshot, [
     SECURITY_TEST_READ,
     // PhishER enrichment is context: the rate itself comes from the security test counters, so the inbox only demotes when unreadable.
@@ -4235,11 +4244,11 @@ function assessVishingTests(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: 
     evidence,
     undefined,
     {
-      evidence_readable: true,
-      evidence_complete: true,
-      inventory_count: allTime.length > 0 || listComplete ? allTime.length : 1,
-      violation_count: recent.length === 0 && listComplete ? 1 : 0,
-      review_count: recent.length === 0 && !listComplete ? 1 : 0,
+      readable: true,
+      complete: true,
+      population: allTime.length > 0 || listComplete ? allTime.length : 1,
+      failureMatches: recent.length === 0 && listComplete ? 1 : 0,
+      reviewMatches: recent.length === 0 && !listComplete ? 1 : 0,
     },
   ), snapshot, [{ inventory: "callback_security_tests", notChecked: "callback test dates were not available", essential: true }]);
 }

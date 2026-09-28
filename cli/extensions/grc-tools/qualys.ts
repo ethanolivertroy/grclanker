@@ -24,6 +24,11 @@ import {
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
+import {
+  batch3RuntimeFacts,
+  batch3UnavailableFacts,
+  type Batch3RuntimeFactValues,
+} from "./batch3-spec-helpers.js";
 import { NextLinkError, readConfigText, resolveSameOriginUrl } from "./hardening/index.js";
 import { QUALYS_SPEC } from "./qualys.spec.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
@@ -1950,9 +1955,12 @@ function finding(
   severity: QualysFindingSeverity,
   summary: string,
   evidence: JsonRecord = {},
-  decisionFacts: Readonly<Record<string, unknown>> = {},
+  decisionValues?: Batch3RuntimeFactValues,
 ): QualysFinding {
   const id = `QUALYS-C${String(control).padStart(2, "0")}`;
+  const decisionFacts = decisionValues
+    ? batch3RuntimeFacts(id, decisionValues)
+    : batch3UnavailableFacts(id);
   return {
     id,
     control,
@@ -1975,16 +1983,16 @@ interface VerdictInput {
   scope: QualysViewScope;
   manualEvidence: string;
   unknownBuckets?: Record<string, number>;
-  decisionFacts?: Readonly<Record<string, unknown>>;
+  decisionFacts?: Batch3RuntimeFactValues;
 }
 
-function qualysDecisionFacts(inventoryCount: number, violationCount = 0, reviewCount = 0): Readonly<Record<string, unknown>> {
+function qualysDecisionFacts(inventoryCount: number, violationCount = 0, reviewCount = 0): Batch3RuntimeFactValues {
   return {
-    evidence_readable: true,
-    evidence_complete: true,
-    inventory_count: inventoryCount,
-    violation_count: violationCount,
-    review_count: reviewCount,
+    readable: true,
+    complete: true,
+    population: inventoryCount,
+    failureMatches: violationCount,
+    reviewMatches: reviewCount,
   };
 }
 
@@ -1995,12 +2003,14 @@ function guardedFinding(input: VerdictInput): QualysFinding {
   const unknownTotal = buckets.reduce((total, [, count]) => total + count, 0);
   const notes: string[] = [];
   let status = input.status;
-  let decisionFacts = input.decisionFacts ?? {};
+  let decisionFacts = input.decisionFacts;
 
   if (unreadable.length > 0) {
     const causes = unreadable.map((source) => `${source.name}${source.moduleUnavailable ? " (module unlicensed or role not permitted)" : ""}: ${shortenMessage(source.error ?? "", 120)}`);
     if (status !== "fail") status = "manual";
-    decisionFacts = status === "fail" ? { ...decisionFacts, evidence_complete: false } : {};
+    decisionFacts = status === "fail" && decisionFacts
+      ? { ...decisionFacts, complete: false }
+      : undefined;
     notes.push(`${status === "fail" ? "Additional evidence was not readable" : "Required evidence was not readable"}: ${causes.join("; ")}.`);
   }
   // A call blocked by an unreadable upstream is disclosed with the read it would have made; a call skipped because
@@ -2011,17 +2021,17 @@ function guardedFinding(input: VerdictInput): QualysFinding {
   }
   if (truncated.length > 0) {
     if (status === "pass") status = "warn";
-    decisionFacts = { ...decisionFacts, evidence_complete: false };
+    if (decisionFacts) decisionFacts = { ...decisionFacts, complete: false };
     notes.push(`Partial view: ${truncated.map((source) => `${source.name} ${source.truncationReason} (${source.data.length} seen${source.cap ? ` of cap ${source.cap}` : ""})`).join("; ")}.`);
   }
   if (unknownTotal > 0) {
     if (status === "pass") status = "warn";
-    decisionFacts = { ...decisionFacts, evidence_complete: false };
+    if (decisionFacts) decisionFacts = { ...decisionFacts, complete: false };
     notes.push(`${unknownTotal} records lack the date or flag needed to count as compliant (${buckets.map(([name, count]) => `${name}: ${count}`).join(", ")}) and were not counted as compliant.`);
   }
   if (input.scope.partial) {
     if (status === "pass") status = "warn";
-    decisionFacts = { ...decisionFacts, evidence_complete: false };
+    if (decisionFacts) decisionFacts = { ...decisionFacts, complete: false };
     notes.push(`Partial view: ${input.scope.note}`);
   }
 

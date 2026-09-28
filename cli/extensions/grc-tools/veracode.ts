@@ -25,6 +25,12 @@ import {
   hydrateBatchFrameworkMappings,
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
+import {
+  batch3RuntimeFacts,
+  batch3SetCompleteness,
+  batch3SetPopulation,
+  batch3UnavailableFacts,
+} from "./batch3-spec-helpers.js";
 import { errorResult, formatTable, textResult } from "./shared.js";
 import { VERACODE_SPEC } from "./veracode.spec.js";
 
@@ -1918,13 +1924,14 @@ function veracodeDecisionFacts(id: string, evidence: JsonRecord): Readonly<Recor
       .some((name) => Object.hasOwn(evidence, name) && evidence[name] === null)
     || asRecords(evidence.per_application).some((entry) => entry.list_complete === false)
   );
-  const fact = (population: number, violations: number, reviews: number) => ({
-    evidence_readable: true,
-    evidence_complete: !partial,
-    inventory_count: population,
-    violation_count: violations,
-    review_count: reviews,
-  });
+  const fact = (population: number, violations: number, reviews: number) =>
+    batch3RuntimeFacts(id, {
+      readable: true,
+      complete: !partial,
+      population,
+      failureMatches: violations,
+      reviewMatches: reviews,
+    });
   switch (id) {
     case "VERACODE-01":
       return fact(inventory("applications_seen"), counts("stale_applications", "applications_without_static_scan"), counts("applications_with_unpublished_latest_static_scan", "applications_without_static_scan_date"));
@@ -1973,12 +1980,12 @@ function veracodeDecisionFacts(id: string, evidence: JsonRecord): Readonly<Recor
     case "VERACODE-19":
       return fact(inventory("applications_seen"), counts("failed_scan_applications"), counts("applications_without_scans"));
     default:
-      return {};
+      return batch3UnavailableFacts(id);
   }
 }
 
 function veracodeCompleteFacts(id: string, evidence: JsonRecord, complete: boolean): Readonly<Record<string, unknown>> {
-  return { ...veracodeDecisionFacts(id, evidence), evidence_complete: complete };
+  return batch3SetCompleteness(id, veracodeDecisionFacts(id, evidence), complete);
 }
 
 function finding(
@@ -2013,7 +2020,7 @@ function manualFinding(
   return finding(number, severity, joinNotes(reason, ...caveats, `Manual evidence required: ${evidenceToCollect.join(" ")}`), {
     ...evidence,
     manual_evidence: evidenceToCollect,
-  }, {});
+  }, batch3UnavailableFacts(controlId(number)));
 }
 
 type UnreadableLinkedProjectList = { application: string; status: number | null; endpoint: string | null };
@@ -2808,7 +2815,11 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
     "high",
     joinNotes(`All ${openEvaluated} open unmitigated findings across ${readable.length} fully read applications are within their severity SLA.`, ...caveats),
     evidence,
-    { ...veracodeCompleteFacts("VERACODE-03", evidence, !caveats.some(Boolean)), inventory_count: findingsRead },
+    batch3SetPopulation(
+      "VERACODE-03",
+      veracodeCompleteFacts("VERACODE-03", evidence, !caveats.some(Boolean)),
+      findingsRead,
+    ),
   );
 }
 

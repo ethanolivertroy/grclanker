@@ -29,6 +29,7 @@ import {
 } from "./batch-spec-builder.js";
 import {
   batch3RuntimeFacts,
+  batch3SetReviewMinimum,
   batch3SetCompleteness,
   batch3UnavailableFacts,
   type Batch3RuntimeFactValues,
@@ -1067,7 +1068,7 @@ function withPartialInventory(
 function withUndatedItems(item: CrowdstrikeFinding, count: number, label: string, field: string): CrowdstrikeFinding {
   if (count <= 0) return item;
   const previousFacts = (item as CrowdstrikeFindingWithFacts)[CROWDSTRIKE_DECISION_FACTS] ?? {};
-  const facts = { ...previousFacts, review_count: Math.max(Number(previousFacts.review_count ?? 0), count) };
+  const facts = batch3SetReviewMinimum(item.id, previousFacts, count);
   const result: CrowdstrikeFindingWithFacts = {
     ...item,
     status: evaluateBatchRuntimeCheckVerdict(CROWDSTRIKE_SPEC, item.id, facts) as CrowdstrikeFinding["status"],
