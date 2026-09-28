@@ -2318,7 +2318,7 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "KNOWBE4-10": {
       const evaluated = value("failed_users_evaluated") ?? 0;
       const pct = value("remediated_pct");
-      return fact(evaluated, observedViolation > 0 && pct !== undefined && pct < 50 ? observedViolation : 0, pct === undefined || pct < 90 ? Math.max(1, observedViolation) : 0, evidence.recipient_reads_complete === true && pct !== undefined);
+      return fact(evaluated, observedViolation > 0 && pct !== undefined && pct < 50 ? observedViolation : 0, pct === undefined || pct < 90 ? Math.max(1, observedViolation) : 0, pct !== undefined);
     }
     case "KNOWBE4-11":
       return fact(value("modules_reviewed") ?? 0, count("retired_modules"), count("stale_modules", "undated_module_count"));

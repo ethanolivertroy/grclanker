@@ -36,6 +36,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 - PhishER is optional and independently authenticated; not configured is retained as a named collection state and cannot be mistaken for an empty message or rule inventory.
 - PII redaction changes exported labels only after counts and joins are computed from stable vendor identifiers.
 - The Reporting API exposes neither USB drop campaign execution nor a complete administrative-role directory on every subscription; unavailable fields remain manual.
+- KNOWBE4-10 preserves the shipped parent behavior when the security-test collection is empty but previously collected recipient samples remain present: a 90% or higher remediation rate can pass even though recipient_reads_complete is false. This contradictory snapshot is a report-only runtime candidate; the spec binding does not harden it.
 
 ## Tools
 

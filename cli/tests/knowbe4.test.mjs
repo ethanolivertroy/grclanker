@@ -1367,6 +1367,18 @@ test("an empty truncated security-test read still proves the no-test coverage fa
   assert.match(cadence.summary, /No phishing security tests have ever run.*Truncated listing: security_tests/);
 });
 
+test("remedial training preserves the parent pass for an empty test list with retained recipient samples", async () => {
+  const snapshot = await collectKnowbe4Snapshot(mockClient(healthyFixture()), { scopes: ["training"], now: NOW });
+  snapshot.securityTests.data = [];
+  snapshot.securityTests.truncated = false;
+  snapshot.securityTests.total = 0;
+
+  const remediation = findingFor(assessKnowbe4TrainingProgram(snapshot, { now: NOW }), 10);
+  assert.equal(remediation.status, "pass");
+  assert.equal(remediation.evidence.recipient_reads_complete, false);
+  assert.match(remediation.summary, /100%.*across all 3 tests in the window/);
+});
+
 test("assessKnowbe4AccountGovernance passes admin hygiene and callback tests while flagging manual controls", async () => {
   const client = mockClient(healthyFixture());
   const snapshot = await collectKnowbe4Snapshot(client, { scopes: ["governance"], now: NOW });
