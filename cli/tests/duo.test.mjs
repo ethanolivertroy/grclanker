@@ -2886,7 +2886,7 @@ test("byte differential fixtures: Duo assessments and export artifacts", { skip:
 
   const missingAuthentication = emptyAuthenticationData();
   missingAuthentication.settings = dataset(null);
-  missingAuthentication.globalPolicy = undefined;
+  missingAuthentication.globalPolicy = dataset(null);
   const missingAdmin = {
     settings: dataset(null),
     admins: dataset([]),
@@ -2896,7 +2896,7 @@ test("byte differential fixtures: Duo assessments and export artifacts", { skip:
   const missingIntegrations = {
     settings: dataset(null),
     policies: dataset([]),
-    globalPolicy: undefined,
+    globalPolicy: dataset(null),
     infoSummary: dataset(null),
     integrations: dataset([]),
   };
