@@ -26,6 +26,8 @@ const TAG_OBJECT = "c".repeat(40);
 const API = "https://api.github.com";
 const UPLOADS = "https://uploads.github.com";
 const REPO_PATH = `/repos/${REPO}`;
+const REPO_ID = 1194941512;
+const CANONICAL_PATH = `/repositories/${REPO_ID}`;
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -36,10 +38,13 @@ function json(status, data, headers = {}) {
 }
 
 // In-memory stand-in for the parts of the GitHub REST API the publisher calls.
-// Hooks let a test mutate state around a request to simulate concurrent writers.
+// Like GitHub, it serves /repositories/{id}/... and uses that form in next links
+// unless canonicalLinks is false. Hooks let a test mutate state around a request
+// to simulate concurrent writers.
 class FakeGitHub {
-  constructor({ pageSize = 100 } = {}) {
+  constructor({ pageSize = 100, canonicalLinks = true } = {}) {
     this.pageSize = pageSize;
+    this.canonicalLinks = canonicalLinks;
     this.nextId = 1000;
     this.releases = [];
     this.refs = new Map([[TAG, { type: "tag", sha: TAG_OBJECT }]]);
@@ -97,6 +102,9 @@ class FakeGitHub {
     const headers = {};
     if (start + this.pageSize < items.length) {
       const next = new URL(url);
+      if (this.canonicalLinks) {
+        next.pathname = next.pathname.replace(REPO_PATH, CANONICAL_PATH);
+      }
       next.searchParams.set("page", String(page + 1));
       headers.link = `<${next}>; rel="next", <${url.origin}${url.pathname}?page=1>; rel="first"`;
     }
@@ -136,6 +144,12 @@ class FakeGitHub {
         return json(422, { message: "Validation Failed", errors: [{ code: "already_exists", field: "name" }] });
       }
       return json(201, this.addAsset(release, name, Buffer.from(body)));
+    }
+    if (origin === API && path.startsWith(`${CANONICAL_PATH}/`)) {
+      path = `${REPO_PATH}${path.slice(CANONICAL_PATH.length)}`;
+    }
+    if (origin === API && method === "GET" && path === REPO_PATH) {
+      return json(200, { id: REPO_ID, full_name: REPO });
     }
     if (origin !== API || !path.startsWith(`${REPO_PATH}/`)) {
       return json(404, { message: "Not Found" });
@@ -340,13 +354,90 @@ test("preflight fails closed on a transport error and on a non-JSON body", async
   assert.equal(github.count("POST", /\/releases$/), 0);
 });
 
-test("pagination refuses a next link outside the repository API", async (t) => {
-  const { github, run } = setup(t);
+test("follows canonical /repositories/{id} next links on release and asset lists", async (t) => {
+  const { github, run } = setup(t, { pageSize: 1 });
+  github.addRelease({ tag_name: "v1.2.1" });
+  github.addRelease({ tag_name: "v1.2.2" });
+
+  const { id } = await run();
+
+  const canonicalGets = github.requests.filter((req) => req.method === "GET" && req.path.startsWith(`${CANONICAL_PATH}/`));
+  assert.ok(canonicalGets.some((req) => req.path === `${CANONICAL_PATH}/releases`));
+  assert.ok(canonicalGets.some((req) => req.path === `${CANONICAL_PATH}/releases/${id}/assets`));
+  assert.ok(canonicalGets.every((req) => Number(req.url.searchParams.get("page")) >= 2));
+  assert.equal(github.count("GET", new RegExp(`^${REPO_PATH}$`)), 1, "repository ID is looked up once");
+  assert.equal(github.release(id).draft, false);
+});
+
+test("next links in the /repos/{owner}/{repo} form need no repository lookup", async (t) => {
+  const { github, run } = setup(t, { pageSize: 1 });
+  github.canonicalLinks = false;
+  github.addRelease({ tag_name: "v1.2.2" });
+  await run();
+  assert.equal(github.count("GET", new RegExp(`^${REPO_PATH}$`)), 0);
+  assert.equal(github.count("GET", /^\/repositories\//), 0);
+});
+
+const LISTS = {
+  "release list": (req) => req.method === "GET" && req.origin === API && req.path === `${REPO_PATH}/releases`,
+  "asset list": (req) => req.method === "GET" && req.origin === API && /^\/repos\/[^/]+\/[^/]+\/releases\/\d+\/assets$/.test(req.path),
+};
+
+const BAD_LINKS = {
+  "another repository ID": (resource) => `${API}/repositories/${REPO_ID + 1}${resource}`,
+  "a zero-padded repository ID": (resource) => `${API}/repositories/0${REPO_ID}${resource}`,
+  "dot segments into another ID": (resource) => `${API}${CANONICAL_PATH}/../${REPO_ID + 1}${resource}`,
+  "another repository name": (resource) => `${API}/repos/someone/else${resource}`,
+  "another resource in this repository": () => `${API}${CANONICAL_PATH}/contents/README.md`,
+  "another origin": (resource) => `https://evil.example.com${CANONICAL_PATH}${resource}`,
+  "the uploads origin": (resource) => `${UPLOADS}${CANONICAL_PATH}${resource}`,
+  "plain http": (resource) => `http://api.github.com${CANONICAL_PATH}${resource}`,
+  "embedded credentials": (resource) => `https://user:pass@api.github.com${CANONICAL_PATH}${resource}`,
+};
+
+for (const [listName, isList] of Object.entries(LISTS)) {
+  for (const [linkName, linkFor] of Object.entries(BAD_LINKS)) {
+    test(`${listName} pagination rejects a next link to ${linkName}`, async (t) => {
+      const { github, run } = setup(t);
+      github.before = (req, gh) => {
+        if (!isList(req)) {
+          return null;
+        }
+        const resource = req.path.slice(REPO_PATH.length);
+        const first = gh.route(req);
+        return new Response(first.body, { status: 200, headers: { link: `<${linkFor(resource)}?page=2>; rel="next"` } });
+      };
+      await rejectsWith(run(), /Pagination link for .* points outside this repository's \/releases/);
+      assert.equal(github.requests.filter((req) => req.url.searchParams.get("page") === "2").length, 0, "never follows the link");
+      assert.equal(github.count("PATCH", /./), 0);
+      assert.equal(github.releases.length, 0, "any draft we created is deleted");
+    });
+  }
+}
+
+for (const [label, response] of [
+  ["another repository's name", () => json(200, { id: REPO_ID, full_name: "someone/else" })],
+  ["a non-numeric ID", () => json(200, { id: String(REPO_ID), full_name: REPO })],
+  ["a redirect for a renamed repository", () => json(301, { message: "Moved Permanently" })],
+  ["an auth failure", () => json(401, { message: "Bad credentials" })],
+]) {
+  test(`canonical pagination fails closed when the repository lookup returns ${label}`, async (t) => {
+    const { github, run } = setup(t, { pageSize: 1 });
+    github.addRelease({ tag_name: "v1.2.1" });
+    github.addRelease({ tag_name: "v1.2.2" });
+    github.before = (req) => (req.method === "GET" && req.path === REPO_PATH ? response() : null);
+    await rejectsWith(run(), /GET \/repos\/ethanolivertroy\/grclanker (returned|did not return)/);
+    assert.equal(github.count("GET", /^\/repositories\//), 0);
+    assert.equal(github.count("POST", /\/releases$/), 0);
+  });
+}
+
+test("the repository lookup accepts GitHub's case-insensitive full name", async (t) => {
+  const { github, run } = setup(t, { pageSize: 1 });
+  github.addRelease({ tag_name: "v1.2.2" });
   github.before = (req) =>
-    req.path === `${REPO_PATH}/releases`
-      ? json(200, [], { link: `<https://evil.example.com${REPO_PATH}/releases?page=2>; rel="next"` })
-      : null;
-  await rejectsWith(run(), /points outside the repository API/);
+    req.method === "GET" && req.path === REPO_PATH ? json(200, { id: REPO_ID, full_name: "EthanOliverTroy/GRClanker" }) : null;
+  await run();
 });
 
 test("preflight refuses a tag that does not point at the workflow commit", async (t) => {

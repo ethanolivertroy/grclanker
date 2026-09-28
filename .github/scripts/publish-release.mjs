@@ -162,6 +162,47 @@ export function createGitHubClient({ apiUrl = "https://api.github.com", token, r
     return { status: response.status, data, headers: response.headers };
   }
 
+  let repositoryIdPromise;
+  function repositoryId() {
+    repositoryIdPromise ??= (async () => {
+      const { data } = await request("GET", apiUrlFor(""), { expect: 200 });
+      if (typeof data?.full_name !== "string" || data.full_name.toLowerCase() !== repo.toLowerCase()) {
+        fail(`GET ${repoPath} returned repository ${JSON.stringify(data?.full_name)}, expected ${repo}`);
+      }
+      if (!Number.isSafeInteger(data.id) || data.id <= 0) {
+        fail(`GET ${repoPath} did not return a numeric repository ID`);
+      }
+      return data.id;
+    })();
+    return repositoryIdPromise;
+  }
+
+  // GitHub rewrites next links from /repos/{owner}/{repo}/... to /repositories/{id}/...,
+  // so a link may use either form, but only for this repository and the same resource.
+  async function assertSameResourceLink(firstUrl, link) {
+    const resource = firstUrl.pathname.slice(`${apiPrefix}${repoPath}`.length);
+    let url;
+    try {
+      url = new URL(link);
+    } catch {
+      fail(`Pagination link for ${firstUrl.pathname} is not a URL`);
+    }
+    const allowed = [`${apiPrefix}${repoPath}${resource}`];
+    if (url.pathname.startsWith(`${apiPrefix}/repositories/`)) {
+      allowed.push(`${apiPrefix}/repositories/${await repositoryId()}${resource}`);
+    }
+    if (
+      url.protocol !== "https:" ||
+      url.origin !== api.origin ||
+      url.username ||
+      url.password ||
+      !allowed.includes(url.pathname)
+    ) {
+      fail(`Pagination link for ${firstUrl.pathname} points outside this repository's ${resource} list: ${url.origin}${url.pathname}`);
+    }
+    return url;
+  }
+
   async function paginate(firstUrl) {
     const items = [];
     let url = firstUrl;
@@ -178,10 +219,7 @@ export function createGitHubClient({ apiUrl = "https://api.github.com", token, r
       if (!next) {
         break;
       }
-      url = new URL(next);
-      if (url.origin !== api.origin || !url.pathname.startsWith(`${apiPrefix}${repoPath}/`)) {
-        fail(`Pagination link for ${firstUrl.pathname} points outside the repository API`);
-      }
+      url = await assertSameResourceLink(firstUrl, next);
     }
     return items;
   }
