@@ -350,10 +350,14 @@ function webexCredentialValues(config: WebexResolvedConfig, accessToken?: string
   ].filter((value): value is string => typeof value === "string" && value.length >= 4);
 }
 
-/** Final bundle sink scrub: configured/runtime credential encodings plus free-text credential carriers. */
+/**
+ * Final bundle sink scrub for text rendered from structured evidence: configured/runtime credential
+ * encodings and explicit credential carriers still go, while an unlabelled name such as
+ * `Bearer Anderson` remains evidence. Remote errors are scrubbed strictly before they reach here.
+ */
 function scrubBundleText(content: string, secrets: readonly string[]): string {
   webexCredentialScrubber.registerSecrets(secrets);
-  return webexCredentialScrubber.scrub(scrubValue(content), { shapes: false });
+  return webexCredentialScrubber.scrub(scrubValue(content), { shapes: false, strictBearer: false });
 }
 
 /**

@@ -96,6 +96,12 @@ export interface ScrubErrorTextOptions {
   secrets?: ReadonlyArray<string | undefined | null>;
   /** Apply the long-token rule (see `LONG_TOKEN_MIN_LENGTH`). On unless set to false. */
   longTokens?: boolean;
+  /**
+   * Treat `Bearer <b64token>` in any scheme casing as a credential even when the value is purely
+   * alphabetic. On for error text; off for structured data, where the same words can be a person's
+   * display name.
+   */
+  strictBearer?: boolean;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -238,7 +244,9 @@ const JSON_LITERAL_PATTERN = /^(?:null|true|false)$/;
 // Authorization schemes in free text (`Bearer <value>`, `Basic <base64>`, Okta `SSWS`, GitHub `Token`,
 // Splunk `Splunk`, Snowflake `Snowflake`, SigV4 `AWS4-HMAC-SHA256`), in any casing (a peer's error text
 // or a log may spell one `BEARER`, `bEaReR`, `negotiate`, or `API-KEY`): the value
-// goes whatever its casing or entropy unless it is one plain word, which is prose ("Basic
+// goes whatever its casing or entropy. Bearer carries any RFC 6750 b64token, including a purely
+// alphabetic value, in every casing because auth-scheme matching is case-insensitive. The other
+// schemes keep a one-plain-word prose exemption ("Basic
 // authentication is disabled", "Token request failed", "OAuth bearer token", "Splunk Enterprise"). The
 // exemption is derived from the fixed texts the integrations emit after these words (121 distinct
 // continuations across every integration source): every one is a single word of letters in one
@@ -558,12 +566,12 @@ function continuesAsProse(text: string, separator: string, value: string, valueE
 
 /**
  * A bare value after an authorization scheme word in free text is the credential whatever its casing
- * or entropy, except for the shapes the fixed texts put there (see `SCHEME_WORD_PATTERN`): one plain
+ * or entropy. Bearer is strict in every casing. The other schemes except the shapes the fixed texts
+ * put there (see `SCHEME_WORD_PATTERN`): one plain
  * word or hyphenated compound of lowercase words shorter than `PLAIN_WORD_MAX_LENGTH` ("Basic
  * authentication", "Splunk Enterprise", "SSWS API", "OAuth sign-in"), a dotted version ("OAuth 2.0"),
- * or an auth-param of a challenge (`Bearer realm="api"`). The residue of the exemption is a
- * credential made only of lowercase letters and hyphens and shorter than 20 characters, which is a
- * passphrase rather than an issued token; anything with a digit, a symbol, or mixed casing goes.
+ * or an auth-param of a challenge (`Bearer realm="api"`). Anything with a digit, a symbol, or mixed
+ * casing goes.
  */
 function looksLikeSchemeValue(value: string, lowercaseScheme = false): boolean {
   if (lowercaseScheme && value.length < LOWERCASE_SCHEME_VALUE_MIN_LENGTH) return false;
@@ -1136,8 +1144,10 @@ const readCookieHeaderValue: ValueReader = (text, valueStart, carrier) => {
  * depend on the order of the params, and `digest response="<proof>"` renders `digest
  * response="[REDACTED]"`.
  */
-const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
-  const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(carrier[0].trim());
+function readSchemeValue(text: string, valueStart: number, carrier: RegExpExecArray, strictBearerMode = true): ValueReplacement | null {
+  const scheme = carrier[0].trim();
+  const lowercaseScheme = LOWERCASE_SCHEME_WORDS.has(scheme);
+  const strictBearer = strictBearerMode && scheme.toLowerCase() === "bearer";
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);
@@ -1161,9 +1171,9 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
       return { end: params.end, replacement: params.single.rendering };
     }
   }
-  if (value.length < SCHEME_VALUE_MIN_LENGTH || !looksLikeSchemeValue(value, lowercaseScheme)) return null;
+  if (value.length < SCHEME_VALUE_MIN_LENGTH || (!strictBearer && !looksLikeSchemeValue(value, lowercaseScheme))) return null;
   return { end: absorbMarkers(text, valueStart + value.length), replacement: REDACTED };
-};
+}
 
 /**
  * Replaces the value of every compound credential-named pair (the generic rule, see
@@ -1247,6 +1257,9 @@ function replaceGenericCredentialPairs(text: string): string {
  * not with a credential word.
  */
 export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}): string {
+  const schemeReader: ValueReader = options.strictBearer === false
+    ? (valueText, valueStart, carrier) => readSchemeValue(valueText, valueStart, carrier, false)
+    : readSchemeValue;
   let scrubbed = scrubConfiguredSecrets(text, options.secrets);
   scrubbed = scrubbed
     .replace(PEM_BLOCK_PATTERN, REDACTED)
@@ -1265,7 +1278,7 @@ export function scrubErrorText(text: string, options: ScrubErrorTextOptions = {}
   scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
   scrubbed = replaceGenericCredentialPairs(scrubbed);
   scrubbed = replaceCarrierValues(scrubbed, FLAG_ARGUMENT_PATTERN, readFlagArgument);
-  scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue)
+  scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, schemeReader)
     .replace(JWT_PATTERN, REDACTED)
     .replace(AWS_ACCESS_KEY_ID_PATTERN, REDACTED)
     .replace(AWS_SECRET_PATTERN, (run) => (looksLikeAwsSecret(run) ? REDACTED : run));
@@ -1310,7 +1323,7 @@ function scrubLongTokenRun(run: string): string {
  * rule, because account ids, entity guids, policy ids, and hashes in evidence are not secrets.
  */
 export function scrubDataText(text: string, options: ScrubErrorTextOptions = {}): string {
-  return scrubErrorText(text, { ...options, longTokens: false });
+  return scrubErrorText(text, { ...options, longTokens: false, strictBearer: false });
 }
 
 export interface RedactSecretValuesOptions extends ScrubErrorTextOptions {

@@ -1875,6 +1875,13 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
         { id: "alphabetic-bearer", displayName: `Bearer ${alphabeticSecret}`, emails: ["secret@example.com"], type: "person", roles: [] },
       ]);
     },
+    async listRooms() {
+      const rooms = await baseClient.listRooms();
+      return page([
+        ...rooms.items,
+        { id: "legit-bearer-room", title: "Bearer Bonds Desk", type: "group", classificationId: "class-1", isLocked: true, isPublic: false },
+      ]);
+    },
   });
   const base = createTempBase("grclanker-webex-sink-redaction-");
   const result = await exportWebexAuditBundle(
@@ -1913,6 +1920,13 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
   assert.match(peopleZip.content, /Bearer Anderson/);
   assert.doesNotMatch(peopleZip.content, /Bearer lowercasesecret/);
   for (const secret of encodedSecrets) assert.equal(peopleZip.content.includes(secret), false, `${secret} leaked into zip:${peoplePath}`);
+
+  const roomsPath = "core_data/collaboration-governance/rooms.json";
+  const rooms = JSON.parse(readFileSync(join(result.outputDir, roomsPath), "utf8"));
+  assert.ok(rooms.some((room) => room.id === "legit-bearer-room" && room.title === "Bearer Bonds Desk"));
+  const roomsZip = readZipEntries(readFileSync(result.zipPath)).find((entry) => entry.name === roomsPath);
+  assert.ok(roomsZip, `${roomsPath} must be present in the zip`);
+  assert.match(roomsZip.content, /Bearer Bonds Desk/);
 });
 
 /** Rule 9 error path: one canary per carrier that only an error response can bring into the bundle. */
@@ -2019,6 +2033,16 @@ test("fetchJson never places a response body in an error string: non-JSON bodies
       "Webex request failed (403 Forbidden) for /v1/rooms: Forbidden: see https://idbroker.webex.com/idb/oauth2/v1/authorize; Access denied; sign in at https://idbroker.webex.com/idb/oauth2/v1/authorize to continue",
       "the documented message fields are kept with their URL queries stripped",
     );
+    return true;
+  });
+
+  const alphabeticBearer = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ message: "Bearer abcdefghijk rejected" }, { status: 401, statusText: "Unauthorized" }),
+  });
+  await assert.rejects(() => alphabeticBearer.listPeople(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.message, "Webex request failed (401 Unauthorized) for /v1/people: Bearer [REDACTED] rejected");
+    assert.ok(!error.message.includes("abcdefghijk"));
     return true;
   });
 

@@ -67,6 +67,12 @@ export interface ScrubTextOptions {
    * configured secrets, JWTs, PEM blocks, and vendor prefixes are removed either way.
    */
   shapes?: boolean;
+  /**
+   * Treat `Bearer <b64token>` in any scheme casing as a credential even when the value is purely
+   * alphabetic. On for error text; off for structured data, where `Bearer Anderson` can be a
+   * person's display name.
+   */
+  strictBearer?: boolean;
 }
 
 export interface ScrubDataOptions {
@@ -196,7 +202,7 @@ function scrubDataValue(value: unknown, scrubText: (text: string, options?: Scru
       if (origin !== null) return origin;
       if (isWebhookUrlKey(key) && !isBlankOrScrubbed(transformed)) return REDACTED;
     }
-    return scrubText(transformed, { shapes: key === undefined || !isIdentifierKey(key) });
+    return scrubText(transformed, { shapes: key === undefined || !isIdentifierKey(key), strictBearer: false });
   }
   if (value === null || typeof value !== "object") return value;
   if (depth > (options.maxDepth ?? DEFAULT_DATA_SCRUB_DEPTH)) return REDACTED;
@@ -363,7 +369,9 @@ const SCHEME_TOKEN_PATTERN = /^[A-Za-z][A-Za-z0-9-]*$/;
 const PROOF_PARAM_WORDS: ReadonlySet<string> = new Set(["response", "signature", "sig", "mac", "hmac", "assertion"]);
 
 // Authorization scheme values in free text (`Bearer <value>`, `Basic <value>`, `Token <value>`, `ApiKey <value>`,
-// `Digest <value>`): the value goes whatever its shape unless it is one plain word, which is prose ("Basic
+// `Digest <value>`): Bearer carries any RFC 6750 b64token, including a purely alphabetic value, in every casing because
+// auth-scheme matching is case-insensitive. Values after the other schemes go whatever their shape unless one plain
+// word makes the phrase prose ("Basic
 // authentication is disabled", "an Owner token for a complete inventory", "Digest access authentication"). A bare value
 // starts with a letter or digit and is at least four characters, so an arrow or a dash after the word
 // ("environment-token -> config") is punctuation, not a credential; a quoted value (`Bearer "token"`) is delimited by
@@ -603,7 +611,7 @@ const AUTH_PARAM_PATTERN = /^(?:realm|error|error_description|error_uri|scope|ch
 
 /**
  * A value after an authorization scheme is the credential unless it is one plain word ("Basic authentication",
- * "Owner token for", "Bearer token") shorter than 20 characters, or a challenge's auth-param (`Bearer realm="api"`).
+ * "Owner token for") shorter than 20 characters, or a challenge's auth-param (`Bearer realm="api"`).
  */
 function looksLikeSchemeValue(value: string): boolean {
   if (PLAIN_WORD_PATTERN.test(value) && value.length < PLAIN_WORD_MAX_LENGTH) return false;
@@ -1026,10 +1034,11 @@ const readCookieHeaderValue: ValueReader = (text, valueStart) => {
  * list does under a header, so the rendering does not depend on the order of the parameters; a challenge without a
  * proof keeps its parameters.
  */
-const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
+function readSchemeValue(text: string, valueStart: number, carrier: RegExpExecArray, strictBearerMode = true): ValueReplacement | null {
   const scheme = carrier[1];
   const conventional = CAPITALISED_SCHEMES.get(scheme.toLowerCase());
   if (conventional !== undefined && scheme !== conventional) return null;
+  const strictBearer = strictBearerMode && scheme.toLowerCase() === "bearer";
   const quoted = readQuotedValue(text, valueStart);
   if (quoted !== null) {
     const content = text.slice(quoted.start, quoted.end);
@@ -1040,9 +1049,10 @@ const readSchemeValue: ValueReader = (text, valueStart, carrier) => {
   if (bare === null) return null;
   const list = readAuthParamList(text, valueStart, true);
   if (list?.proof) return { end: list.end, replacement: REDACTED };
-  if (!looksLikeSchemeValue(bare)) return null;
+  if (list !== null && AUTH_PARAM_PATTERN.test(bare)) return null;
+  if (!strictBearer && !looksLikeSchemeValue(bare)) return null;
   return { end: Math.max(valueStart + bare.length, list?.end ?? 0), replacement: REDACTED };
-};
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Replacements
@@ -1321,6 +1331,9 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
 
   function scrub(text: string, textOptions: ScrubTextOptions = {}): string {
     const shapes = textOptions.shapes ?? true;
+    const schemeReader: ValueReader = textOptions.strictBearer === false
+      ? (valueText, valueStart, carrier) => readSchemeValue(valueText, valueStart, carrier, false)
+      : readSchemeValue;
     let scrubbed = scrubConfiguredSecrets(text, plainSecrets)
       .replace(PEM_BLOCK_PATTERN, REDACTED)
       .replace(PEM_OPEN_PATTERN, REDACTED)
@@ -1330,7 +1343,7 @@ export function createCredentialScrubber(options: CredentialScrubberOptions = {}
     // the value before the cookie reader saw the header.
     scrubbed = replaceCarrierValues(scrubbed, COOKIE_HEADER_PATTERN, readCookieHeaderValue).replace(QUERY_PAIR_PATTERN, scrubQueryPair);
     scrubbed = replaceCarrierValues(scrubbed, headerPattern, readHeaderValue);
-    scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, readSchemeValue);
+    scrubbed = replaceCarrierValues(scrubbed, SCHEME_WORD_PATTERN, schemeReader);
     scrubbed = replaceCarrierValues(scrubbed, SESSION_ASSIGNMENT_PATTERN, readPairValue);
     scrubbed = replaceCarrierValues(scrubbed, CREDENTIAL_PAIR_PATTERN, readPairValue);
     scrubbed = replaceCarrierValues(scrubbed, FLAG_VALUE_PATTERN, readFlagValue);
