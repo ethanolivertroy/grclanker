@@ -276,17 +276,17 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     warn: incomplete,
     pass: eq("privileged_service_principal_count", 0),
   }),
-  "AZURE-DP-01": countDecision(["license_present", "device_count", "compliant_device_policy_count", "noncompliant_device_count", "unknown_device_count"], {
+  "AZURE-DP-01": countDecision(["license_present", "device_count", "device_policy_with_required_settings_count", "noncompliant_device_count", "unknown_device_count"], {
     manual: any(unreadable, ne("license_present", true), all(gt("inventory_count", 0), eq("device_count", 0))),
-    fail: any(eq("inventory_count", 0), eq("compliant_device_policy_count", 0), gt("noncompliant_device_count", 0)),
+    fail: any(eq("inventory_count", 0), eq("device_policy_with_required_settings_count", 0), gt("noncompliant_device_count", 0)),
     warn: any(incomplete, gt("unknown_device_count", 0)),
     pass: { op: "always" },
   }),
-  "AZURE-DP-03": countDecision(["active_label_count"], {
+  "AZURE-DP-03": countDecision(["active_sensitivity_record_count"], {
     manual: unreadable,
-    fail: eq("active_label_count", 0),
+    fail: eq("active_sensitivity_record_count", 0),
     warn: incomplete,
-    pass: gt("active_label_count", 0),
+    pass: gt("active_sensitivity_record_count", 0),
   }),
   "AZURE-DP-04": countDecision(["missing_protection_count", "access_policy_vault_count", "open_network_count"], {
     manual: any(unreadable, empty),
@@ -321,11 +321,11 @@ const AZURE_DECISIONS: Readonly<Record<string, AzureDecision>> = {
     warn: incomplete,
     pass: eq("exposed_rule_count", 0),
   }),
-  "AZURE-NP-02": countDecision(["enforced_assignment_count"], {
+  "AZURE-NP-02": countDecision(["assignment_not_do_not_enforce_count"], {
     manual: unreadable,
-    fail: any(empty, eq("enforced_assignment_count", 0)),
-    warn: any(incomplete, { op: "not", condition: comparePaths("eq", "enforced_assignment_count", "inventory_count") }),
-    pass: comparePaths("eq", "enforced_assignment_count", "inventory_count"),
+    fail: any(empty, eq("assignment_not_do_not_enforce_count", 0)),
+    warn: any(incomplete, { op: "not", condition: comparePaths("eq", "assignment_not_do_not_enforce_count", "inventory_count") }),
+    pass: comparePaths("eq", "assignment_not_do_not_enforce_count", "inventory_count"),
   }),
   "AZURE-NP-03": {
     inputs: inputs("readable", "resource_count_present", "policy_count_present", "noncompliant_policy_count"),
