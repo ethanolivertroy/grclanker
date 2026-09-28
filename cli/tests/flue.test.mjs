@@ -628,6 +628,7 @@ test("shipped prompts load as the instruction document, workflow skills, and sub
   const verifier = content.roles.find((role) => role.name === "verifier");
   assert.ok(verifier.allowedTools.includes("kevs_check_ransomware"));
   assert.ok(verifier.allowedTools.includes("scf_get_crosswalk"));
+  assert.ok(verifier.allowedTools.includes("scf_get_control"));
 });
 
 test("prompt parsing helpers extract titles, frontmatter, and persona fields", () => {
@@ -716,10 +717,15 @@ test("agent render declares model, sandbox, tools, skills, and subagents through
   const verifierRole = content.roles.find((role) => role.name === "verifier");
   const verifier = createSubagentDefinition(verifierRole, tools, verifierRender.hooks);
   verifier.agent();
+  const verifierToolNames = verifierRender.calls.tools.map((tool) => tool.name).sort();
+  assert.deepEqual(
+    verifierToolNames,
+    [...verifierRole.allowedTools].sort(),
+    "verifier mounts exactly its parsed allowed tools",
+  );
   assert.ok(
-    verifierRender.calls.tools.some((tool) => tool.name === "kevs_check_ransomware") &&
-      verifierRender.calls.tools.some((tool) => tool.name === "scf_get_crosswalk"),
-    "verifier mounts ransomware and control-mapping validation tools",
+    ["kevs_check_ransomware", "scf_get_crosswalk", "scf_get_control"].every((toolName) => verifierToolNames.includes(toolName)),
+    "verifier mounts ransomware, crosswalk, and control-requirement validation tools",
   );
 
   const noSandbox = createRecordingHooks();
