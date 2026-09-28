@@ -873,12 +873,13 @@ test("rule 9: CLI stderr is scrubbed where the error is built, so no thrown mess
       assert.match(result.content[0].text, /Bearer \[REDACTED\] or access_token=\[REDACTED\]/, name);
     }
 
-    // The validation branch re-wraps the message for the missing alertcenter alias; the rewrapped text stays scrubbed.
+    // A noncanonical validation failure mentioning alertcenter stays strict and un-rewritten; its credential is still scrubbed.
     const rejected = createScriptedBinary(createTempBase("grclanker-gws-ops-stderr-exit3-"), `echo "Unknown service 'alertcenter' (${pair})" 1>&2\nexit 3`);
     const alias = await tools.run("gws_ops_investigate_alerts", { gws_bin: rejected });
     assert.equal(alias.details.kind, "validation");
     assert.doesNotMatch(JSON.stringify(alias), leak);
-    assert.match(alias.content[0].text, /registers no alertcenter alias/);
+    assert.match(alias.content[0].text, /Unknown service 'alertcenter' \(access_token=\[REDACTED\]\)/);
+    assert.doesNotMatch(alias.content[0].text, /registers no alertcenter alias/);
 
     // A parse failure never repeats the CLI's stdout, even its first characters.
     const garbage = createScriptedBinary(createTempBase("grclanker-gws-ops-stderr-parse-"), `echo "$GOOGLE_WORKSPACE_CLI_TOKEN ${bearer} is not json"`);
