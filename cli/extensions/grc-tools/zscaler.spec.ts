@@ -155,7 +155,6 @@ const checks = batch2Checks(rows.map(([title, severity, area], index) => {
             evidence_readable: "Boolean. True only when GET /firewallFilteringRules returned a readable inventory.",
             evidence_complete: "Boolean. True only when firewall-rule pagination proved exhaustion; false means the rule counts are lower bounds.",
             rule_count: "Complete number of firewall filtering rules before presentation slicing; zero is a readable empty inventory and fails.",
-            enabled_rule_count: "Count of rules whose state is exactly ENABLED.",
             default_rule_present: "Boolean. True when a returned rule has defaultRule=true.",
             default_rule_allows: "Boolean. True when the default rule action is exactly ALLOW.",
             unbounded_allow_rule_count: "Count of enabled ALLOW rules with no destination or service restriction.",

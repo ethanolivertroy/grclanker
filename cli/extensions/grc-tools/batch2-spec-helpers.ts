@@ -9,6 +9,7 @@ import type {
   FrameworkKey,
   PortableValue,
   VerdictCondition,
+  VerdictOperand,
   VerdictRule,
 } from "./spec-model.js";
 
@@ -97,6 +98,73 @@ function executableRules(row: Batch2CheckRow): readonly VerdictRule[] {
   ];
 }
 
+function collectOperandPaths(operand: VerdictOperand, paths: Set<string>): void {
+  switch (operand.kind) {
+    case "value":
+      return;
+    case "path":
+    case "length":
+      paths.add(operand.path);
+      return;
+    case "subtract":
+      collectOperandPaths(operand.left, paths);
+      collectOperandPaths(operand.right, paths);
+      return;
+    default: {
+      const exhaustive: never = operand;
+      return exhaustive;
+    }
+  }
+}
+
+function collectConditionPaths(condition: VerdictCondition, paths: Set<string>): void {
+  switch (condition.op) {
+    case "always":
+      return;
+    case "and":
+    case "or":
+      for (const child of condition.conditions) collectConditionPaths(child, paths);
+      return;
+    case "not":
+      collectConditionPaths(condition.condition, paths);
+      return;
+    case "eq":
+    case "ne":
+    case "gt":
+    case "gte":
+    case "lt":
+    case "lte":
+      collectOperandPaths(condition.left, paths);
+      collectOperandPaths(condition.right, paths);
+      return;
+    case "ratio":
+      collectOperandPaths(condition.numerator, paths);
+      collectOperandPaths(condition.denominator, paths);
+      collectOperandPaths(condition.threshold, paths);
+      return;
+    case "matches":
+    case "defined":
+    case "null":
+      collectOperandPaths(condition.operand, paths);
+      return;
+    case "some":
+    case "every":
+      paths.add(condition.path);
+      collectConditionPaths(condition.condition, paths);
+      return;
+    default: {
+      const exhaustive: never = condition;
+      return exhaustive;
+    }
+  }
+}
+
+export function batch2DecisionInputPaths(rules: readonly VerdictRule[]): ReadonlySet<string> {
+  const paths = new Set<string>();
+  for (const rule of rules) collectConditionPaths(rule.condition, paths);
+  return paths;
+}
+
 function portableTypes(name: string): readonly PortableInputType[] {
   if (
     /(?:^|_)(?:count|ratio|maximum|minimum|days?|hours?|seconds|percent|length)(?:_|$)/.test(name)
@@ -129,6 +197,15 @@ function portableTypes(name: string): readonly PortableInputType[] {
 }
 
 export function batch2Checks(rows: readonly Batch2CheckRow[]): BatchCheckDefinition[] {
+  const unusedInputs = rows.flatMap((row) => {
+    const referenced = batch2DecisionInputPaths(executableRules(row));
+    return Object.keys(row.decisionInputs ?? {})
+      .filter((name) => !referenced.has(name))
+      .map((name) => `${row.id}.${name}`);
+  });
+  if (unusedInputs.length > 0) {
+    throw new Error(`Batch 2 decision inputs must feed executable rules: ${unusedInputs.join(", ")}`);
+  }
   return rows.map((row) => {
     if (row.decisionInputs === undefined) {
       throw new Error(`${row.id} must declare explicit portable decision input definitions`);

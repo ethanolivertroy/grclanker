@@ -291,6 +291,7 @@ function paloaltoDecision(control: number): Partial<Pick<Batch2CheckRow, "decisi
 
 const checks = batch2Checks(titles.map((title, index) => {
   const control = index + 1;
+  const genericDecisionInputs = batch2GenericDecisionInputs(decisionPredicate[index]);
   const decisionRules = control === 10 || control === 25
     ? [
         batch2Rule("manual", batch2Ne("evidence_readable", true)),
@@ -312,7 +313,14 @@ const checks = batch2Checks(titles.map((title, index) => {
       19: { default_maximum_superusers: PALOALTO_DEFAULT_MAX_SUPERUSERS },
     } as const)[control as 7 | 8 | 19],
     decisionRules,
-    decisionInputs: batch2GenericDecisionInputs(decisionPredicate[index]),
+    decisionInputs: control === 10 || control === 25
+      ? {
+          evidence_readable: genericDecisionInputs.evidence_readable,
+          evidence_complete: genericDecisionInputs.evidence_complete,
+          violation_count: genericDecisionInputs.violation_count,
+          review_count: genericDecisionInputs.review_count,
+        }
+      : genericDecisionInputs,
     ...paloaltoDecision(control),
     decision: `${decisionPredicate[index]} Unreadable configured-product evidence remains manual, a proved violation has first-match precedence, and partial evidence cannot pass.`,
   };
