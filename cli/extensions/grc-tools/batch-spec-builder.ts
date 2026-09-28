@@ -607,6 +607,18 @@ function collectPortableInputUsage(
     case "matches":
       recordOperandUsage(usage, condition.operand, derivedFact, "string");
       return;
+    case "in":
+      recordOperandUsage(usage, condition.candidate, derivedFact);
+      recordOperandUsage(usage, condition.collection, derivedFact, "array");
+      return;
+    case "intersects":
+      recordOperandUsage(usage, condition.left, derivedFact, "array");
+      recordOperandUsage(usage, condition.right, derivedFact, "array");
+      return;
+    case "matchesAny":
+      recordOperandUsage(usage, condition.candidates, derivedFact, "array");
+      recordOperandUsage(usage, condition.patterns, derivedFact, "array");
+      return;
     case "defined":
     case "null":
       recordOperandUsage(usage, condition.operand, derivedFact);

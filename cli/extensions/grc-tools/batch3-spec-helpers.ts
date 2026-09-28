@@ -39,7 +39,38 @@ export interface Batch3CheckRow {
   completenessSemantics?: string;
   runtimeFactNames?: Batch3FactNames;
   thresholds?: readonly Batch3ThresholdDefinition[];
+  collectionRules?: readonly Batch3CollectionRuleDefinition[];
   thresholdOnly?: boolean;
+}
+
+export interface Batch3CollectionRuleDefinition {
+  constant: string;
+  observedFact: string;
+  evidencePath: string;
+  operator: "intersects" | "matchesAny";
+  status: "fail" | "warn";
+  observedDescription: string;
+  flags?: string;
+}
+
+export function batch3CollectionRule(
+  id: string,
+  constant: string,
+  evidencePath: string,
+  operator: Batch3CollectionRuleDefinition["operator"],
+  status: Batch3CollectionRuleDefinition["status"],
+  observedMeaning: string,
+  flags?: string,
+): Batch3CollectionRuleDefinition {
+  return {
+    constant,
+    observedFact: `${checkPrefix(id)}_${constant}_observed_values`,
+    evidencePath,
+    operator,
+    status,
+    observedDescription: `${id} primitive collection from ${evidencePath}: ${observedMeaning} The uncapped values are captured before any finding status or presentation sample; null means the named source did not expose the collection.`,
+    ...(flags ? { flags } : {}),
+  };
 }
 
 export interface Batch3ThresholdDefinition {
@@ -99,6 +130,7 @@ export interface Batch3RuntimeFactValues {
 
 const REGISTERED_FACT_NAMES = new Map<string, Batch3FactNames>();
 const REGISTERED_THRESHOLDS = new Map<string, readonly Batch3ThresholdDefinition[]>();
+const REGISTERED_COLLECTION_RULES = new Map<string, readonly Batch3CollectionRuleDefinition[]>();
 
 function checkPrefix(id: string): string {
   return id.toLowerCase().replaceAll("-", "_");
@@ -170,6 +202,7 @@ export function batch3PrimitiveFacts(
   facts: Readonly<Record<string, unknown>>,
 ): Readonly<Record<string, unknown>> {
   const thresholds = REGISTERED_THRESHOLDS.get(id) ?? [];
+  const collectionRules = REGISTERED_COLLECTION_RULES.get(id) ?? [];
   return {
     ...facts,
     ...Object.fromEntries(thresholds.flatMap((threshold) => [
@@ -183,6 +216,10 @@ export function batch3PrimitiveFacts(
             )),
           ] as const]
         : []),
+    ])),
+    ...Object.fromEntries(collectionRules.map((rule) => [
+      rule.observedFact,
+      evidencePathValue(evidence, rule.evidencePath) ?? null,
     ])),
   };
 }
@@ -268,6 +305,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
   return batch2Checks(rows.map((row): Batch2CheckRow => {
     REGISTERED_FACT_NAMES.set(row.id, row.runtimeFactNames ?? checkOwnedFactNames(row));
     REGISTERED_THRESHOLDS.set(row.id, row.thresholds ?? []);
+    REGISTERED_COLLECTION_RULES.set(row.id, row.collectionRules ?? []);
     const names = batch3FactNames(row.id);
     const baseDecisionInputs = row.decisionInputs ?? (row.manualOnly ? {} : {
       [names.readable]: `Boolean set from the named source read results before any finding is created. True only when every response and required field used by ${row.id} is readable.`,
@@ -283,7 +321,11 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
           ?? `Resolved runtime configuration for ${threshold.constant}; null means configuration resolution failed and cannot independently pass.`] as const]
         : []),
     ]));
-    const decisionInputs = { ...baseDecisionInputs, ...thresholdDecisionInputs };
+    const collectionDecisionInputs = Object.fromEntries((row.collectionRules ?? []).map((rule) => [
+      rule.observedFact,
+      rule.observedDescription,
+    ]));
+    const decisionInputs = { ...baseDecisionInputs, ...thresholdDecisionInputs, ...collectionDecisionInputs };
     const comparison = (
       comparator: Batch3ThresholdDefinition["comparator"],
       leftPath: string,
@@ -309,23 +351,40 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
         : comparison(threshold.comparator, threshold.observedFact, threshold.constant),
       `${threshold.observedFact} is compared directly to ${threshold.configuredFact ?? threshold.constant}; ${threshold.constant} is the executable default boundary.`,
     ));
+    const collectionRules = (row.collectionRules ?? []).map((rule) => batch2Rule(
+      rule.status,
+      rule.operator === "intersects"
+        ? {
+            op: "intersects",
+            left: batch2Path(rule.observedFact),
+            right: batch2Path(rule.constant),
+          }
+        : {
+            op: "matchesAny",
+            candidates: batch2Path(rule.observedFact),
+            patterns: batch2Path(rule.constant),
+            ...(rule.flags ? { flags: rule.flags } : {}),
+          },
+      `${rule.observedFact} is evaluated directly against executable ${rule.constant}.`,
+    ));
+    const primitiveRules = [...thresholdRules, ...collectionRules];
     const unreadableRule = batch2Rule("manual", batch2Any(
       batch2Ne(names.readable, true),
       batch2Not(batch2Defined(names.readable)),
       ...(row.incompleteOutcome === "manual" ? [batch2Ne(names.complete, true)] : []),
     ));
     const violationRule = batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0));
-    const explicitRules = row.decisionRules && thresholdRules.length > 0
+    const explicitRules = row.decisionRules && primitiveRules.length > 0
       ? [
           ...row.decisionRules.slice(0, -1),
-          ...thresholdRules,
+          ...primitiveRules,
           row.decisionRules.at(-1) as VerdictRule,
         ]
       : row.decisionRules;
     const suppliedDecisionRules = explicitRules ?? (row.manualOnly ? undefined : [
       ...(row.incompleteOutcome === "manual"
-        ? [unreadableRule, ...thresholdRules, ...(row.thresholdOnly ? [] : [violationRule])]
-        : [...thresholdRules, ...(row.thresholdOnly ? [] : [violationRule]), unreadableRule]),
+        ? [unreadableRule, ...primitiveRules, ...(row.thresholdOnly ? [] : [violationRule])]
+        : [...primitiveRules, ...(row.thresholdOnly ? [] : [violationRule]), unreadableRule]),
       ...(row.emptyOutcome === undefined || row.emptyOutcome === "manual"
         ? [batch2Rule("manual", batch2Eq(names.population, 0))]
         : [batch2Rule(row.emptyOutcome, batch2All(batch2Eq(names.population, 0), batch2Eq(names.complete, true)))]),

@@ -170,6 +170,18 @@ function collectConditionPaths(condition: VerdictCondition, paths: Set<string>):
     case "null":
       collectOperandPaths(condition.operand, paths);
       return;
+    case "in":
+      collectOperandPaths(condition.candidate, paths);
+      collectOperandPaths(condition.collection, paths);
+      return;
+    case "intersects":
+      collectOperandPaths(condition.left, paths);
+      collectOperandPaths(condition.right, paths);
+      return;
+    case "matchesAny":
+      collectOperandPaths(condition.candidates, paths);
+      collectOperandPaths(condition.patterns, paths);
+      return;
     case "some":
     case "every":
       paths.add(condition.path);
