@@ -73,7 +73,7 @@ const SLACK_COMPLETENESS: Readonly<Record<string, Readonly<Record<string, BatchC
         { surfaceId: "workspaces", falseWhen: ALL_FAILURE_MODES },
         { surfaceId: "auth-test", falseWhen: ["error", "denied", "not-collected", "missing-required-field"] },
       ],
-      semantics: "true only when admin.teams.list is readable, completely paged, and proves exactly one workspace while auth.test is readable and returns a non-empty team_id; team.preferences.list readability does not change this fact.",
+      semantics: "true only when admin.teams.list is readable, completely paged, and returns no more than one workspace while auth.test is readable and returns a non-empty team_id; team.preferences.list readability does not change this fact.",
     },
   },
   "SLACK-CHAN-01": { external_complete: completeFrom(["channels"], "true only when the external-shared-channel search is readable and completely paged.") },
