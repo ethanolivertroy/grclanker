@@ -2929,9 +2929,14 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const assets = value("asset_count") ?? 0;
       const expected = value("expected_asset_count");
       if (assets > 0 && expected === undefined) return batch3UnavailableFacts(contractId);
-      const coverageFailure = expected !== undefined && expected > 0 && (value("fresh_assets") ?? 0) / expected < 0.95 ? 1 : 0;
       const complete = !partial && !statusIsIncomplete("networks_status");
-      return fact(assets, assets === 0 ? 1 : coverageFailure, complete ? 0 : 1, complete);
+      return {
+        tenable_03_asset_and_network_reads_succeeded: sourceReadsSucceeded,
+        tenable_03_asset_export_and_networks_complete: complete,
+        tenable_03_exported_asset_count: assets,
+        tenable_03_fresh_asset_count: value("fresh_assets") ?? 0,
+        tenable_03_expected_asset_count: expected ?? null,
+      };
     }
     case "TENABLE-04": {
       const assets = value("asset_count") ?? 0;
@@ -2945,14 +2950,26 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       if (agents === undefined || agents === 0) return batch3UnavailableFacts(contractId);
       const unhealthy = count("offline_agents", "stale_connect_agents");
       const complete = !partial && !statusIsIncomplete("server_properties_status");
-      return fact(agents, unhealthy / agents > 0.1 ? unhealthy : 0, count("undated_agents", "outdated_agents_count") + (complete ? 0 : 1), complete);
+      return {
+        tenable_05_agent_reads_succeeded: sourceReadsSucceeded,
+        tenable_05_agent_and_asset_sources_complete: complete,
+        tenable_05_agent_count: agents,
+        tenable_05_unhealthy_agent_count: unhealthy,
+        tenable_05_agent_review_count: count("undated_agents", "outdated_agents_count") + (complete ? 0 : 1),
+      };
     }
     case "TENABLE-06": {
       const agents = value("agent_count");
       const groups = value("agent_group_count");
       if (agents === undefined || agents === 0 || groups === undefined || statusIsIncomplete("agent_groups_status")) return batch3UnavailableFacts(contractId);
       const ungrouped = value("ungrouped_agents_count") ?? 0;
-      return fact(agents, groups === 0 || ungrouped / agents > 0.1 ? Math.max(1, ungrouped) : 0, ungrouped, !partial);
+      return {
+        tenable_06_agent_group_reads_succeeded: sourceReadsSucceeded,
+        tenable_06_agent_and_group_lists_complete: !partial,
+        tenable_06_agent_count: agents,
+        tenable_06_agent_group_count: groups,
+        tenable_06_ungrouped_agent_count: ungrouped,
+      };
     }
     case "TENABLE-07": {
       const scanners = value("linked_scanner_count");
