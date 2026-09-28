@@ -1899,22 +1899,90 @@ function controlId(number: number): string {
   return `VERACODE-${String(number).padStart(2, "0")}`;
 }
 
+function veracodeEvidenceCount(evidence: JsonRecord, name: string): number {
+  const value = evidence[name];
+  if (Array.isArray(value)) return value.length;
+  return asNumber(value) ?? 0;
+}
+
+function veracodeDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record<string, unknown>> {
+  const counts = (...names: string[]) => names.reduce((total, name) => total + veracodeEvidenceCount(evidence, name), 0);
+  const inventory = (...names: string[]) => names.map((name) => asNumber(evidence[name])).find((value) => value !== undefined) ?? 0;
+  const partial = (
+    counts("unreadable_applications", "unchecked_applications", "users_without_last_login_count") > 0
+    || (asNumber(evidence.applications_total) ?? 0) > inventory("applications_seen", "applications_sampled")
+    || (asNumber(evidence.workspaces_seen) ?? 0) > inventory("workspaces_sampled")
+  );
+  const fact = (population: number, violations: number, reviews: number) => ({
+    evidence_readable: true,
+    evidence_complete: !partial,
+    inventory_count: population,
+    violation_count: violations,
+    review_count: reviews,
+  });
+  switch (id) {
+    case "VERACODE-01":
+      return fact(inventory("applications_seen"), counts("stale_applications", "applications_without_static_scan"), counts("applications_with_unpublished_latest_static_scan", "applications_without_static_scan_date"));
+    case "VERACODE-02":
+      return fact(inventory("applications_seen"), counts("failing_applications", "applications_without_policy"), counts("conditional_pass_applications", "unassessed_applications"));
+    case "VERACODE-03":
+      return fact(inventory("open_findings_evaluated"), counts("overdue_count"), counts("findings_without_first_found_date"));
+    case "VERACODE-04":
+      return fact(inventory("applications_seen"), counts("overdue_applications"), counts("unconfirmed_applications", "applications_without_frequency_requirement"));
+    case "VERACODE-05":
+      return fact(inventory("open_vulnerability_issues"), counts("high_severity_count"), 0);
+    case "VERACODE-06":
+      return fact(inventory("open_license_issues"), counts("high_risk_count"), counts("unknown_risk_count"));
+    case "VERACODE-07":
+      return fact(
+        inventory("users_seen"),
+        inventory("teams_seen") === 0 || veracodeEvidenceCount(evidence, "users_with_all_application_access_count") > (asNumber(evidence.max_unrestricted_users) ?? Number.POSITIVE_INFINITY) ? 1 : 0,
+        counts("applications_without_team"),
+      );
+    case "VERACODE-08":
+      return fact(
+        inventory("users_seen"),
+        counts("inactive_count", "api_accounts_without_team") + Math.max(0, veracodeEvidenceCount(evidence, "administrator_count") - (asNumber(evidence.max_admins) ?? 0)),
+        counts("users_without_last_login_count"),
+      );
+    case "VERACODE-09":
+      return fact(inventory("credentials_readable"), counts("credentials_over_max_age_count"), counts("credentials_missing_dates", "credentials_expired"));
+    case "VERACODE-10":
+      return fact(inventory("applications_sampled"), 0, counts("applications_without_sandboxes"));
+    case "VERACODE-12":
+      return fact(inventory("findings_seen"), counts("proposed_not_reviewed_count", "mitigations_without_justification"), 0);
+    case "VERACODE-13":
+      return fact(inventory("configured_scans"), counts("unauthenticated_scans", "crawl_disabled_scans"), 0);
+    case "VERACODE-15":
+      return fact(
+        inventory("policies_seen"),
+        veracodeEvidenceCount(evidence, "custom_policies") === 0 ? 1 : 0,
+        counts("custom_policies_without_finding_rules", "applications_on_default_policies"),
+      );
+    case "VERACODE-16":
+      return fact(inventory("applications_with_findings"), 0, counts("applications_exceeding"));
+    case "VERACODE-17":
+      return fact(inventory("applications_evaluated"), counts("applications_exceeding"), counts("applications_without_loc"));
+    case "VERACODE-18":
+      return fact(inventory("applications_sampled"), 0, counts("uncovered_applications", "unchecked_applications"));
+    case "VERACODE-19":
+      return fact(inventory("applications_seen"), counts("failed_scan_applications"), counts("applications_without_scans"));
+    default:
+      return {};
+  }
+}
+
 function finding(
   number: number,
   severity: VeracodeFinding["severity"],
-  status: VeracodeFinding["status"],
+  _legacyStatus: VeracodeFinding["status"],
   summary: string,
   evidence?: JsonRecord,
+  decisionFacts?: Readonly<Record<string, unknown>>,
 ): VeracodeFinding {
   const control = controlDescriptor(number);
   const id = controlId(number);
-  const facts = {
-    evidence_readable: status !== "manual",
-    evidence_complete: status !== "manual",
-    inventory_count: 1,
-    violation_count: status === "fail" ? 1 : 0,
-    review_count: status === "warn" ? 1 : 0,
-  };
+  const facts = decisionFacts ?? veracodeDecisionFacts(id, evidence ?? {});
   return {
     id,
     title: control.title,
@@ -1937,7 +2005,7 @@ function manualFinding(
   return finding(number, severity, "manual", joinNotes(reason, ...caveats, `Manual evidence required: ${evidenceToCollect.join(" ")}`), {
     ...evidence,
     manual_evidence: evidenceToCollect,
-  });
+  }, {});
 }
 
 type UnreadableLinkedProjectList = { application: string; status: number | null; endpoint: string | null };
@@ -2874,7 +2942,7 @@ export async function assessVeracodeFindingsHygiene(
   const manualEvidence = ["Export findings and summary reports per application from the Platform."];
   const blocker = applicationInventoryBlocker(3, "high", snapshot, manualEvidence);
   if (blocker) {
-    const findings = [3, 12, 16, 17].map((number) => ({ ...blocker, ...finding(number, blocker.severity, "manual", blocker.summary, blocker.evidence) }));
+    const findings = [3, 12, 16, 17].map((number) => ({ ...blocker, ...finding(number, blocker.severity, "manual", blocker.summary, blocker.evidence, {}) }));
     const skipped = notAttempted("the application inventory was not readable or empty, so no per-application list was requested.");
     return {
       title: "Veracode findings hygiene",
