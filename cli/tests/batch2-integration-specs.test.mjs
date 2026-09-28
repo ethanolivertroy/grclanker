@@ -149,7 +149,7 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   }
   assert.equal(checksWithCompleteness, 156);
   assert.equal(completenessFields, 156);
-  assert.equal(sourceEntries, 315);
+  assert.equal(sourceEntries, 316);
 
   assert.deepEqual(check(AZURE_SPEC, "AZURE-MON-06").completeness.complete.sources, [
     { surfaceId: "diagnostic-settings", falseWhen: [] },
@@ -157,6 +157,11 @@ test("batch 2 completeness primitives have exact per-check sources, failure mode
   ]);
   assert.deepEqual(check(AZURE_SPEC, "AZURE-DP-01").completeness.complete.sources.map((source) => source.surfaceId), [
     "compliance-policies", "managed-devices", "conditional-access",
+  ]);
+  assert.deepEqual(check(OCI_SPEC, "OCI-LOG-02").completeness.evidence_complete.sources, [
+    { surfaceId: "cloud-guard-configuration", falseWhen: [] },
+    { surfaceId: "cloud-guard-targets", falseWhen: [] },
+    { surfaceId: "cloud-guard-problems", falseWhen: [] },
   ]);
   assert.deepEqual(check(CLOUDFLARE_SPEC, "CF-IAM-02").completeness.evidence_complete.sources, [
     { surfaceId: "token-verification", falseWhen: [] },
