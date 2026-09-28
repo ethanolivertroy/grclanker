@@ -4,7 +4,8 @@
   "version": "0.0.1",
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build",
+    "build": "astro build && node scripts/check-links.mjs",
+    "check:links": "node scripts/check-links.mjs",
     "preview": "npm run build && wrangler dev",
     "sync:fedramp": "npm --prefix cli run sync:fedramp",
     "sync:tool-catalog": "npm --prefix cli run sync:tool-catalog",
