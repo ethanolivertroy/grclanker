@@ -701,8 +701,11 @@ function renderCompletenessSemantics(
 ): string {
   if (!contract) throw new Error(`${check.id} input ${inputName} requires an explicit completeness contract`);
   if (!contract.semantics.trim()) throw new Error(`${check.id} input ${inputName} completeness semantics are empty`);
+  const semantics = contract.semantics
+    .replace(new RegExp(`^For ${check.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")},\\s*`, "i"), "")
+    .trim();
   if (contract.sources.length === 0) {
-    return `For ${check.id}, this fact has no vendor dataset dependency. ${contract.semantics}`;
+    return `For ${check.id}, this fact has no vendor dataset dependency. ${semantics}`;
   }
   const sourceText = contract.sources.map((source) => {
     if (!source.scope && !source.aggregate) {
@@ -723,7 +726,7 @@ function renderCompletenessSemantics(
     }
     return `\`${source.surfaceId}\`${scope}: false on ${source.falseWhen.join(", ")}; other failure modes do not change this fact${aggregate}`;
   }).join("; ");
-  return `${contract.semantics} Exact source-state effects: ${sourceText}`;
+  return `For ${check.id}, ${semantics} Exact source-state effects: ${sourceText}`;
 }
 
 export function buildBatchIntegrationSpec(definition: BatchSpecDefinition): IntegrationSpecContract {
