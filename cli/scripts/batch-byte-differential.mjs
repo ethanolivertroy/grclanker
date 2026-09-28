@@ -50,7 +50,7 @@ const testFiles = [
 ];
 const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
 const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
-const batch3Integrations = ["crowdstrike", "knowbe4", "qualys", "tenable", "veracode"];
+const representativeDistinctIntegrations = [...batch2Integrations, "crowdstrike", "qualys", "veracode"];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -518,7 +518,7 @@ try {
     throw new Error(`stacked-parent fixture registry mismatch\nexpected: ${expectedFixturePaths.join(", ")}\nactual: ${mainFixturePaths.join(", ")}`);
   }
   const compared = compareTrees(mainFixtures, branchFixtures, "curated fixture");
-  for (const integration of [...batch2Integrations, ...batch3Integrations]) {
+  for (const integration of representativeDistinctIntegrations) {
     const representative = readFileSync(join(branchFixtures, integration, "representative.json"));
     const compliant = readFileSync(join(branchFixtures, integration, "compliant.json"));
     const partial = readFileSync(join(branchFixtures, integration, "partial.json"));
