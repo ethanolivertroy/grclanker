@@ -286,7 +286,7 @@ The script prints a skip message and exits 0 when no credential hints are presen
 - [GuardDuty API Reference](https://docs.aws.amazon.com/guardduty/latest/APIReference/Welcome.html)
 - [IAM Access Analyzer API Reference](https://docs.aws.amazon.com/access-analyzer/latest/APIReference/Welcome.html)
 - [Organizations API Reference](https://docs.aws.amazon.com/organizations/latest/APIReference/Welcome.html)
-- [IAM Identity Center API Reference](https://docs.aws.amazon.com/singlesignon/latest/APIReference/welcome.html)
+- [IAM Identity Center API Reference](https://docs.aws.amazon.com/singlesignon/latest/APIReference/Welcome.html)
 - [Audit Manager API Reference](https://docs.aws.amazon.com/audit-manager/latest/APIReference/Welcome.html)
 - [Account Management API Reference](https://docs.aws.amazon.com/accounts/latest/reference/api-reference.html)
 - [EC2 API Reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Welcome.html)
