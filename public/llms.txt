@@ -1,6 +1,8 @@
 # grclanker
 
-> Open-source, language-neutral contracts for building GRC compliance automations. Each spec describes the evidence, verdict, and output behavior needed to audit security configurations against major compliance frameworks.
+> Experimental open-source AI GRC CLI with native tools that assess SaaS, cloud, and security platform configurations against major compliance frameworks. Most shipped integrations have a repository spec: a language-neutral contract describing the integration's APIs, authentication, checks, framework mappings, and outputs.
+
+Use a spec to inspect, extend, or reimplement an integration. Specs document design and intended behavior; the [tool catalog](https://grclanker.com/docs/tools/catalog/) lists the tools the CLI actually registers.
 
 ## Specs
 
@@ -47,12 +49,14 @@ All specs are available as raw markdown. Point your agent at any URL below.
 - [Zoom Security Inspector](https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/zoom-sec-inspector.spec.md): Portable contract for the shipped Zoom identity, collaboration-governance, and meeting-security assessments.
 <!-- generated integration registry end -->
 
-## How to use
+## Docs
 
-Point any AI coding agent at a raw spec URL above. The spec contains everything needed to build the tool: APIs, authentication, security controls, framework mappings, architecture, and build sequence.
+- [Documentation](https://grclanker.com/docs/): Installation, runtimes, integration guides, workflows, and FedRAMP reference
+- [Tool catalog](https://grclanker.com/docs/tools/catalog/): Native tools the CLI registers, grouped by domain
+- [Using specs as inputs](https://grclanker.com/docs/specs/using-specs-as-inputs/): How to inspect, extend, or reimplement an integration from its spec
 
 ## Source
 
-- Website: https://grclanker.com
-- Repository: https://github.com/hackIDLE/grclanker
+- [Website](https://grclanker.com/): Project site, docs, and spec browser
+- [Repository](https://github.com/ethanolivertroy/grclanker): CLI, specs, and site source
 - Clone all specs: git clone https://github.com/ethanolivertroy/grclanker.git

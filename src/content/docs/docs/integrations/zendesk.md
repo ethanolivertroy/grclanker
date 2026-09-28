@@ -30,7 +30,7 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | `ZENDESK_SUBDOMAIN` | The `{subdomain}` in `https://{subdomain}.zendesk.com` (a full URL is accepted). |
 | `ZENDESK_EMAIL` | Email that owns the API token (API token mode only). |
 | `ZENDESK_API_TOKEN` | API token (API token mode). |
-| `ZENDESK_OAUTH_TOKEN` or `ZENDESK_ACCESS_TOKEN` | OAuth access token (bearer mode). When both an OAuth token and an API token are present, OAuth wins unless `email` and `api_token` are passed explicitly. |
+| `ZENDESK_OAUTH_TOKEN` or `ZENDESK_ACCESS_TOKEN` | OAuth access token (bearer mode). When both an OAuth token and an API token are present, the credential from the higher-ranked source wins (arguments, then environment, then config file; the API token counts at the lower rank of its `api_token` and `email` sources), and OAuth wins a tie. |
 | `ZENDESK_BASE_URL` | Optional API base override. Defaults to `https://{subdomain}.zendesk.com/api/v2`. |
 | `ZENDESK_TIMEOUT` | Optional HTTP timeout in seconds. Defaults to 30. |
 | `ZENDESK_CONFIG_FILE` | Optional path to a JSON config file. Defaults to `~/.zendesk/config.json`. |

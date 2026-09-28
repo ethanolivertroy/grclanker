@@ -15,7 +15,7 @@ interface Props {
 
 const {
   title,
-  description = 'CMVP certificates, KEV feeds, EPSS scores, framework mappings. One terminal session. Nothing leaves your machine.',
+  description = 'CMVP certificates, KEV feeds, EPSS scores, framework mappings. One terminal session. Keep prompts on your machine with a local model, or choose a hosted one.',
   searchEnabled = true,
   footerVariant = 'default',
 } = Astro.props;
@@ -44,10 +44,10 @@ const siteEntries = [
   {
     href: '/',
     title: 'CLI',
-    meta: 'Homepage · 241 tools, 35 integrations, and three runtime paths',
+    meta: 'Homepage · 241 domain tools, 35 vendor integrations, and three runtime paths',
     kind: 'Page',
     priority: 0,
-    searchText: 'cli homepage 241 tools 35 integrations pi cursor agent sdk flue local first',
+    searchText: 'cli homepage install 241 domain tools 35 vendor integrations pi cursor agent sdk flue local first',
   },
   {
     href: '/docs',
@@ -60,10 +60,10 @@ const siteEntries = [
   {
     href: '/specs',
     title: 'Specs',
-    meta: 'Spec catalog · 35 shipped integrations and their repository specs',
+    meta: 'Spec catalog · Repository specs for shipped integrations and compute backends',
     kind: 'Page',
     priority: 0,
-    searchText: 'specs spec catalog 35 shipped integrations raw urls build plans compliance automation',
+    searchText: 'specs spec catalog shipped integrations compute backends raw urls build plans compliance automation',
   },
   {
     href: '/about',
@@ -71,7 +71,7 @@ const siteEntries = [
     meta: 'Project overview · What grclanker ships today',
     kind: 'Page',
     priority: 0,
-    searchText: 'about project overview 241 domain tools 35 integrations runtimes hardening',
+    searchText: 'about project overview 241 domain tools 35 vendor integrations runtimes hardening',
   },
 ];
 
@@ -101,6 +101,17 @@ const searchData = searchEnabled
         : a.priority - b.priority,
     )
   : [];
+
+const siteName = 'grclanker';
+// The 404 page is served for any unknown path, so it must not claim a canonical URL.
+const isNotFoundPage = Astro.url.pathname.replace(/\/$/, '') === '/404';
+const canonicalURL = new URL(Astro.url.pathname, Astro.site).href;
+const ogImage = {
+  url: new URL('/og-card.jpg', Astro.site).href,
+  width: 1376,
+  height: 768,
+  alt: 'Spacecraft cockpit whose central radar screen reads GRCLANKER, AI GRC CLI',
+};
 ---
 
 <!doctype html>
@@ -111,15 +122,24 @@ const searchData = searchEnabled
     <meta name="description" content={description} />
     <title>{title}</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    {!isNotFoundPage && <link rel="canonical" href={canonicalURL} />}
+    <link rel="sitemap" href="/sitemap-index.xml" />
     <!-- Social / OG -->
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
-    <meta property="og:image" content="/og-card.jpg" />
     <meta property="og:type" content="website" />
+    {!isNotFoundPage && <meta property="og:url" content={canonicalURL} />}
+    <meta property="og:site_name" content={siteName} />
+    <meta property="og:image" content={ogImage.url} />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content={String(ogImage.width)} />
+    <meta property="og:image:height" content={String(ogImage.height)} />
+    <meta property="og:image:alt" content={ogImage.alt} />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
-    <meta name="twitter:image" content="/og-card.jpg" />
+    <meta name="twitter:image" content={ogImage.url} />
+    <meta name="twitter:image:alt" content={ogImage.alt} />
   </head>
   <body class="bg-base text-text font-sans min-h-screen antialiased flex flex-col">
 
@@ -174,6 +194,7 @@ const searchData = searchEnabled
             {searchEnabled && (
               <button
                 onclick="window.__openSearch && window.__openSearch()"
+                data-search-trigger
                 class="nav-action-btn nav-search-btn"
                 aria-label="Search site (press / or Cmd+K)"
               >
@@ -204,6 +225,7 @@ const searchData = searchEnabled
               <button
                 type="button"
                 onclick="window.__openSearch && window.__openSearch()"
+                data-search-trigger
                 class="nav-icon-btn"
                 aria-label="Search site"
               >
@@ -290,6 +312,27 @@ const searchData = searchEnabled
     )}
     </div>
 
+    <!-- Polite status region for copy confirmations; call window.__announce(message) -->
+    <div id="site-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script is:inline>
+    (function() {
+      var region = document.getElementById('site-announcer');
+      var setTimer = null;
+      var clearTimer = null;
+      window.__announce = function(message) {
+        if (!region) return;
+        clearTimeout(setTimer);
+        clearTimeout(clearTimer);
+        // Empty first so repeating the same message is announced again.
+        region.textContent = '';
+        setTimer = setTimeout(function() {
+          region.textContent = message;
+          clearTimer = setTimeout(function() { region.textContent = ''; }, 5000);
+        }, 100);
+      };
+    })();
+    </script>
+
     <!-- Search data for command palette -->
     {searchEnabled && (
       <script type="application/json" id="site-search-data" set:html={JSON.stringify(searchData)} />
@@ -315,6 +358,9 @@ const searchData = searchEnabled
       var searchModal = document.getElementById('search-modal');
       var searchInput = document.getElementById('search-input');
       var searchResults = document.getElementById('search-results');
+      var searchEmpty = document.getElementById('search-empty');
+      var searchStatus = document.getElementById('search-status');
+      var searchStatusTimer = null;
       var searchClose = document.getElementById('search-close');
       var helpBackdrop = document.getElementById('help-backdrop');
       var helpModal = document.getElementById('help-modal');
@@ -338,7 +384,7 @@ const searchData = searchEnabled
         return Array.prototype.slice.call(
           container.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])')
         ).filter(function(el) {
-          return !el.hasAttribute('hidden') && el.offsetParent !== null;
+          return !el.hasAttribute('hidden') && el.offsetParent !== null && el.tabIndex >= 0;
         });
       }
 
@@ -359,6 +405,33 @@ const searchData = searchEnabled
           event.preventDefault();
           first.focus();
         }
+      }
+
+      function isVisible(el) {
+        return !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+      }
+
+      // Focusing document.body is a no-op, so a dialog opened by a shortcut from the page
+      // would otherwise leave focus on its own hidden input or close button.
+      function restoreFocus(target, fallback) {
+        if (target && target !== document.body && target.isConnected && target.focus) {
+          target.focus();
+          if (document.activeElement === target) return;
+        }
+        if (isVisible(fallback)) {
+          fallback.focus();
+          if (document.activeElement === fallback) return;
+        }
+        var current = document.activeElement;
+        if (current && current !== document.body && current.blur) current.blur();
+      }
+
+      function getVisibleSearchTrigger() {
+        var triggers = document.querySelectorAll('[data-search-trigger]');
+        for (var i = 0; i < triggers.length; i++) {
+          if (isVisible(triggers[i])) return triggers[i];
+        }
+        return null;
       }
 
       function getEntries() {
@@ -409,19 +482,39 @@ const searchData = searchEnabled
         var html = '';
         for (var i = 0; i < items.length; i++) {
           var item = items[i];
-          html += '<li><a href="' + item.href + '" class="search-result' + (i===0?' active':'') + '" data-index="' + i + '">'
+          html += '<li role="none"><a href="' + item.href + '" id="search-option-' + i + '" role="option" tabindex="-1" aria-selected="' + (i===0) + '" class="search-result' + (i===0?' active':'') + '" data-index="' + i + '">'
             + '<div class="result-name">' + esc(item.title) + '</div>'
             + '<div class="result-meta">' + esc(item.kind) + ' &middot; ' + esc(item.meta) + '</div>'
             + '</a></li>';
         }
-        if (!items.length) html = '<li class="px-4 py-6 text-center"><img src="/empty-state.webp" alt="" class="w-24 h-24 mx-auto mb-3 rounded-lg object-cover"><span class="text-subtext0 text-sm block">No pages found</span></li>';
         searchResults.innerHTML = html;
+        searchResults.hidden = !items.length;
+        searchEmpty.hidden = !!items.length;
+        searchInput.setAttribute('aria-expanded', items.length ? 'true' : 'false');
+        if (items.length) searchInput.setAttribute('aria-activedescendant', 'search-option-0');
+        else searchInput.removeAttribute('aria-activedescendant');
+        announceResultCount(items.length);
+      }
+
+      function announceResultCount(count) {
+        clearTimeout(searchStatusTimer);
+        searchStatusTimer = setTimeout(function() {
+          searchStatus.textContent = count === 0 ? 'No results' : count === 1 ? '1 result' : count + ' results';
+        }, 400);
       }
 
       function updateActive() {
         var els = searchResults.querySelectorAll('.search-result');
-        for (var i = 0; i < els.length; i++) els[i].classList.toggle('active', i === selectedIndex);
-        if (els[selectedIndex]) els[selectedIndex].scrollIntoView({ block: 'nearest' });
+        for (var i = 0; i < els.length; i++) {
+          els[i].classList.toggle('active', i === selectedIndex);
+          els[i].setAttribute('aria-selected', i === selectedIndex ? 'true' : 'false');
+        }
+        if (els[selectedIndex]) {
+          searchInput.setAttribute('aria-activedescendant', els[selectedIndex].id);
+          els[selectedIndex].scrollIntoView({ block: 'nearest' });
+        } else {
+          searchInput.removeAttribute('aria-activedescendant');
+        }
       }
 
       function openSearch() {
@@ -433,17 +526,22 @@ const searchData = searchEnabled
         setShellInert(true);
         document.body.style.overflow = 'hidden';
         searchInput.value = '';
+        searchStatus.textContent = '';
         renderResults(searchSite(''));
         setTimeout(function() { searchInput.focus(); }, 50);
       }
 
       function closeSearch() {
         searchOpen = false;
+        clearTimeout(searchStatusTimer);
+        searchStatus.textContent = '';
+        searchInput.setAttribute('aria-expanded', 'false');
+        searchInput.removeAttribute('aria-activedescendant');
         searchBackdrop.classList.remove('open');
         searchModal.classList.remove('open');
         setShellInert(false);
         document.body.style.overflow = '';
-        if (prevFocus && prevFocus.focus) prevFocus.focus();
+        restoreFocus(prevFocus, getVisibleSearchTrigger());
         prevFocus = null;
       }
 
@@ -467,7 +565,7 @@ const searchData = searchEnabled
         helpModal.classList.remove('open');
         setShellInert(false);
         document.body.style.overflow = '';
-        if (prevFocus && prevFocus.focus) prevFocus.focus();
+        restoreFocus(prevFocus, null);
         prevFocus = null;
       }
 
@@ -477,8 +575,10 @@ const searchData = searchEnabled
         var url = el.getAttribute('data-raw-url');
         if (!url) return;
         navigator.clipboard.writeText(url);
+        copyToast.textContent = 'URL copied to clipboard';
         copyToast.classList.add('show');
         setTimeout(function() { copyToast.classList.remove('show'); }, 1500);
+        setTimeout(function() { if (!copyToast.classList.contains('show')) copyToast.textContent = ''; }, 1800);
       }
 
       searchInput.addEventListener('input', function() { renderResults(searchSite(this.value)); });
@@ -489,7 +589,7 @@ const searchData = searchEnabled
       searchResults.addEventListener('click', function(e) { if (e.target.closest('.search-result')) closeSearch(); });
       searchResults.addEventListener('mousemove', function(e) {
         var link = e.target.closest('.search-result');
-        if (link) { var idx = parseInt(link.getAttribute('data-index'),10); if (!isNaN(idx) && idx !== selectedIndex) { selectedIndex = idx; updateActive(); } }
+        if (link) { var idx = parseInt(link.getAttribute('data-index'),10); if (!isNaN(idx) && (idx !== selectedIndex || searchInput.getAttribute('aria-activedescendant') !== link.id)) { selectedIndex = idx; updateActive(); } }
       });
       if (mobileNavToggle && mobileNavPanel) {
         mobileNavToggle.addEventListener('click', function() {
@@ -513,9 +613,6 @@ const searchData = searchEnabled
             mobileNavToggle.setAttribute('aria-expanded', 'false');
             mobileNavToggle.focus();
           }
-          if (e.key === 'Tab') {
-            trapFocus(e, mobileNavPanel);
-          }
         });
       }
 
@@ -531,7 +628,7 @@ const searchData = searchEnabled
         if (searchOpen) {
           if (e.key==='ArrowDown') { e.preventDefault(); selectedIndex = Math.min(selectedIndex+1, results.length-1); updateActive(); return; }
           if (e.key==='ArrowUp') { e.preventDefault(); selectedIndex = Math.max(selectedIndex-1, 0); updateActive(); return; }
-          if (e.key==='Enter') { e.preventDefault(); var els = searchResults.querySelectorAll('.search-result'); if (els[selectedIndex]) { closeSearch(); window.location.href = els[selectedIndex].getAttribute('href'); } return; }
+          if (e.key==='Enter') { if (e.target !== searchInput) return; e.preventDefault(); var els = searchResults.querySelectorAll('.search-result'); if (els[selectedIndex]) { closeSearch(); window.location.href = els[selectedIndex].getAttribute('href'); } return; }
           return;
         }
         if (helpOpen) { if (e.key==='?') { closeHelp(); e.preventDefault(); } return; }

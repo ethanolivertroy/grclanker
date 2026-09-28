@@ -150,6 +150,7 @@ const editUrl = `https://github.com/ethanolivertroy/grclanker/edit/main/specs/${
         return;
       }
 
+      window.__announce && window.__announce('Raw spec URL copied to clipboard');
       btn.textContent = 'COPIED';
       btn.classList.add('copied');
       setTimeout(function() {

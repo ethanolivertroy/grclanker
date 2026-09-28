@@ -14,6 +14,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, extname, resolve } from "node:path";
 import { defineSkill, type SkillDefinition } from "@flue/runtime";
 import { parse as parseYaml } from "yaml";
+import { renderWorkflowPrompt } from "../pi/workflow-prompt.js";
 
 export interface GrclankerSubagentRole {
   name: string;
@@ -83,12 +84,13 @@ export function summarizeMarkdownPrompt(markdown: string): { title: string; summ
 }
 
 export function workflowSkillFromPrompt(name: string, markdown: string): SkillDefinition {
-  const { title, summary } = summarizeMarkdownPrompt(markdown);
+  const instructions = renderWorkflowPrompt(markdown);
+  const { title, summary } = summarizeMarkdownPrompt(instructions);
   const lead = [title ? `${title} workflow.` : "", summary].filter(Boolean).join(" ");
   const description = truncateDescription(
     `${lead} Use when the user asks for the grclanker /${name} workflow or equivalent work.`,
   );
-  return defineSkill({ name, description, instructions: markdown.trim() });
+  return defineSkill({ name, description, instructions: instructions.trim() });
 }
 
 export function loadWorkflowSkills(appRoot: string): SkillDefinition[] {

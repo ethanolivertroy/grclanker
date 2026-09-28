@@ -2,9 +2,9 @@
 
 `grclanker` is an experimental open source AI GRC CLI built on top of Pi.
 
-The current public release starts with CMVP, KEV, EPSS, control mapping, posture triage, and spec-driven build workflows. That is the opening surface, not the full intended scope of the project.
+The first public release, the `0.0.1` pre-release bundle, starts with CMVP, KEV, and EPSS lookups plus the control mapping, posture triage, and spec-driven build workflows. `main` has grown well past that: 241 domain tools across cloud, identity, SaaS, and compliance frameworks (see [What ships](#what-ships)). Neither is the full intended scope of the project.
 
-This first public CLI release is `0.0.1`. It is intentionally experimental.
+`0.0.1` is intentionally experimental.
 
 macOS and Linux are the recommended platforms for `0.0.1`. Windows support exists, but it is best-effort and not a priority for this first experimental release.
 
@@ -22,12 +22,22 @@ Windows PowerShell (best effort):
 powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
 ```
 
-Package-manager fallback:
+The installers download the newest GitHub release bundle, which today is the `v0.0.1` pre-release. That bundle registers 8 domain tools (`cmvp_*` and `kevs_*`) and supports `setup`, `env doctor`, `env smoke-test`, `env exec`, and the four workflow commands. `grclanker tools`, `grclanker env list`, `grclanker flue run`, and `--compute` are only on `main` until the next release bundle is cut.
+
+`@grclanker/cli` is not published to npm yet, so `npm install -g @grclanker/cli` and `bun install -g @grclanker/cli` do not work.
+If no release bundle fits your platform, use the source-checkout path below.
+
+Run `main` from a source checkout (Node 22.19 or newer):
 
 ```bash
-npm install -g @grclanker/cli
-bun install -g @grclanker/cli
+git clone https://github.com/ethanolivertroy/grclanker.git
+cd grclanker
+npm --prefix cli ci
+npm --prefix cli run build
+node cli/bin/grclanker.js tools
 ```
+
+`cli/bin/grclanker.js` is the same launcher the `grclanker` bin points at; `alias grclanker="node $PWD/cli/bin/grclanker.js"` makes the commands below work as written.
 
 Installation docs:
 
@@ -54,21 +64,24 @@ That configures grclanker to use a local Ollama-compatible endpoint with Gemma 4
 
 If you do not want the local-first path, the setup wizard can also save an explicit hosted provider/model choice.
 
-Inspect local backend readiness:
+Inspect local backend readiness (`env list` is `main` only):
 
 ```bash
 grclanker env doctor
 grclanker env smoke-test
 grclanker env exec -- pwd
+grclanker env list
 ```
 
-List the bundled GRC and compute tools:
+List the bundled GRC and compute tools (`main` only):
 
 ```bash
 grclanker tools
+grclanker tools --json
+grclanker tools kevs_search
 ```
 
-Regenerate the website tool catalog from the bundled extension registry:
+Regenerate the website tool catalog from the bundled extension registry (from the repo root):
 
 ```bash
 npm run sync:tool-catalog
@@ -83,21 +96,23 @@ If you choose `sandbox-runtime`, grclanker reads sandbox policy from:
 
 ## Compute Backends
 
-`0.0.1` is still a local-shell CLI release. Planned execution backends are tracked in [specs/grclanker-compute-backends.spec.md](./specs/grclanker-compute-backends.spec.md).
+The default backend is `host`, the local shell. The backend plan is tracked in [specs/grclanker-compute-backends.spec.md](./specs/grclanker-compute-backends.spec.md):
 
-The current recommendation is:
+- Phase 1: `sandbox-runtime`, Docker, and Parallels (in the `0.0.1` bundle)
+- Phase 2: Modal, RunPod pods, and RunPod serverless (on `main`)
+- Phase 3: Vercel Sandbox or Cloudflare Sandbox for hosted CPU-only isolation (reserved kinds on `main` that fail fast; not wired in yet)
 
-- Phase 1: `sandbox-runtime`, Docker, and Parallels
-- Phase 2: Modal and RunPod
-- Phase 3: Vercel Sandbox or Cloudflare Sandbox for hosted CPU-only isolation
+Current behavior:
 
-Current MVP behavior:
-
-- Docker and Parallels now route Pi's `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` tools, plus user `!` commands, through the selected backend.
-- `sandbox-runtime` now routes `bash`, `grep`, and `find` through the sandbox and enforces the same filesystem policy for `read`, `write`, `edit`, and `ls`.
-- `env smoke-test` now validates both file-tool behavior and backend-native search behavior.
+- Docker and Parallels route Pi's `bash`, `read`, `write`, `edit`, `ls`, `grep`, and `find` tools, plus user `!` commands, through the selected backend.
+- `sandbox-runtime` routes `bash`, `grep`, and `find` through the sandbox and enforces the same filesystem policy for `read`, `write`, `edit`, and `ls`.
+- On `main`, `runpod-pod` copies the repo's tracked files into a pod you already own and runs the full tool surface over SSH. `modal` and `runpod-serverless` are one-shot: only `bash` runs remotely, and the file tools stay on the local workspace.
+- On `main`, `grclanker setup --compute <kind>` saves a preferred backend. To override it for one run, put `--compute <kind>` after a workflow command or an `env smoke-test` / `env exec` subcommand, for example `grclanker investigate --compute docker` or `grclanker env smoke-test --compute host`. The flag is not accepted on its own (`grclanker --compute docker` exits with `Unknown command`), and `env doctor` and `env list` ignore it.
+- `env smoke-test` validates both file-tool behavior and backend-native search behavior.
 - The Parallels path is intentionally safer than directly reusing one of your existing VMs: grclanker prefers deploying disposable sandboxes from a dedicated Parallels template, with stopped-base cloning as a fallback, and attaches only the repo share to the sandbox it creates.
-- This is intentionally more explicit than Feynman's current Docker badge logic: grclanker validates runtime readiness and only claims a backend when it can actually be used.
+- grclanker validates runtime readiness and only claims a backend when it can actually be used.
+
+See [Compute Backends](https://grclanker.com/docs/getting-started/compute-backends) for the full matrix.
 
 ## Cursor Agent SDK Runtime
 
@@ -113,7 +128,7 @@ Run it from a source checkout (`@cursor/july` is a CLI devDependency, so `npm --
 ```bash
 npm --prefix cli run agent-sdk:validate
 npm --prefix cli run agent-sdk:info
-npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2024-3094"}'
+npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-44228"}'
 npm --prefix cli run agent-sdk:dev
 ```
 
@@ -121,46 +136,65 @@ npm --prefix cli run agent-sdk:dev
 
 ## What You Can Do With It
 
-```bash
-grclanker "what is the CMVP certificate for BoringCrypto?"
-grclanker investigate "CVE-2024-3094"
-grclanker audit "map our vuln evidence to FedRAMP RA-5"
-grclanker "read specs/aws-sec-inspector.spec.md and build the tool"
+`grclanker` with no arguments opens an interactive session; ask in plain language, for example:
+
+```text
+is CVE-2021-44228 in the CISA KEV catalog, and what is its EPSS score?
+investigate CVE-2021-44228
+map our vuln evidence to FedRAMP RA-5
 ```
 
-Built-in workflow rails:
+CMVP questions such as "is BoringCrypto FIPS validated?" are in scope too, through the `cmvp_*` tools.
+
+On `main`, the native cloud and SaaS tools answer directly in the same session, for example:
+
+```text
+check my AWS audit access, then assess identity posture and export an audit bundle
+```
+
+A single quoted prompt on the command line is not supported: `grclanker "..."` exits with `Unknown command`.
+
+Built-in workflow rails, as slash commands inside a session or as `grclanker investigate`, `grclanker audit`, `grclanker assess`, and `grclanker validate` to open a session that starts with that workflow (then name the vendor, CVE, or framework):
 
 - `/investigate`
 - `/audit`
 - `/assess`
 - `/validate`
 
-What ships in `0.0.1`:
+### What ships
 
-- 241 domain tools across AWS, Azure, GCP, OCI, Cloudflare, Webex, Zoom, Ansible AAP, CMVP, KEV/EPSS, FedRAMP, SCF, OSCAL, GitHub, Google Workspace, Slack, Okta, Duo, Vanta, Box, CrowdStrike, Datadog, Elastic, KnowBe4, LaunchDarkly, MuleSoft, New Relic, PagerDuty, Palo Alto Networks, Qualys, Salesforce, ServiceNow, Snowflake, Splunk, Sumo Logic, Tenable, Veracode, Zendesk, Zscaler, and operator evidence workflows
+In the `0.0.1` release bundle:
+
+- 8 domain tools: `cmvp_search_modules`, `cmvp_search_historical`, `cmvp_search_in_process`, `cmvp_get_module`, `kevs_search`, `kevs_recent`, `kevs_check_ransomware`, and `kevs_get_epss`
 - 7 compute backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) routed through the selected compute backend
-- `grclanker tools` to list the bundled tool inventory from the same extension registration path the agent uses, and the generated [tool catalog](https://grclanker.com/docs/tools/catalog) for the same list on the website
 - 2 bundled agent personas: `auditor` and `verifier`
 - 4 workflow commands
 - Dedicated runtime identity and state under `~/.grclanker/agent`
 - A real setup command for local-first or hosted model configuration
 
+What `main` adds (run it from a source checkout until the next release bundle):
+
+- 241 domain tools across AWS, Azure, GCP, OCI, Cloudflare, Webex, Zoom, Ansible AAP, CMVP, KEV/EPSS, FedRAMP, SCF, OSCAL, GitHub, Google Workspace, Slack, Okta, Duo, Vanta, Box, CrowdStrike, Datadog, Elastic, KnowBe4, LaunchDarkly, MuleSoft, New Relic, PagerDuty, Palo Alto Networks, Qualys, Salesforce, ServiceNow, Snowflake, Splunk, Sumo Logic, Tenable, Veracode, Zendesk, Zscaler, and operator evidence workflows
+- `grclanker tools` to list the bundled tool inventory from the same extension registration path the agent uses, and the generated [tool catalog](https://grclanker.com/docs/tools/catalog) for the same list on the website
+- The Modal and RunPod compute backends, `grclanker env list`, and the `--compute` flag on `setup`, the workflow commands, `env smoke-test`, and `env exec`
+- The [Cursor Agent SDK](#cursor-agent-sdk-runtime) and [Flue](#run-under-flue) runtimes
+
 ## Run Under Flue
 
 grclanker can also run as a [Flue Framework](https://flueframework.com/) agent. The adapter in `cli/flue/` mounts the same 241 domain tools, the shipped system prompt, the `/investigate`, `/audit`, `/assess`, and `/validate` prompts (as Flue skills), and the `auditor` and `verifier` personas (as Flue subagents). Tool schemas are converted from TypeBox JSON Schema to Valibot at the adapter boundary; the tool implementations are untouched.
 
-Bundled runner (built on Flue's `start()` API, no extra install):
+Bundled runner (built on Flue's `start()` API, no extra install; `main` only, so run it from a source checkout until the next release bundle):
 
 ```bash
 export ANTHROPIC_API_KEY=...
-grclanker flue run --message "Is BoringCrypto FIPS validated?"
-grclanker flue run --message "Now check KEV exposure" --id fips-review --json
+grclanker flue run --message "Is CVE-2021-44228 in the CISA KEV catalog?"
+grclanker flue run --message "Now get its EPSS score" --id log4shell-review --json
 ```
 
 Official Flue CLI (from a repo checkout, in the `cli/` directory after `npm install`, Node 22.19 or newer):
 
 ```bash
-npx flue run flue/agent.ts --message "Is BoringCrypto FIPS validated?"
+npx flue run flue/agent.ts --message "Is CVE-2021-44228 in the CISA KEV catalog?"
 ```
 
 `@flue/cli` is a devDependency of the CLI package on purpose: the CLI must share the project's `@flue/runtime` install. Running a separately downloaded copy (for example `npx @flue/cli run ...` without the local install) loads a second runtime and fails with an internal hook error.
@@ -193,7 +227,7 @@ Windows PowerShell (best effort):
 powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install-skills.ps1 | iex"
 ```
 
-The skills-only installers download just the `skills/` tree. They do not install the bundled runtime.
+The skills-only installers download a single file, `skills/grclanker/SKILL.md`, into `~/.codex/skills/grclanker/` (the default, also `--user`) or `.agents/skills/grclanker/` under the current directory (`--repo`). They do not install the bundled runtime.
 
 ## Specs
 
@@ -202,19 +236,21 @@ The specs are still here, but they are not the whole story anymore. They are the
 Browse the catalog:
 
 - Website: `https://grclanker.com/specs`
-- Raw base: `https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs`
+- Raw base: `https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs`
 
 Grab one directly:
 
 ```bash
-curl -O https://raw.githubusercontent.com/hackIDLE/grclanker/main/specs/aws-sec-inspector.spec.md
+curl -O https://raw.githubusercontent.com/ethanolivertroy/grclanker/main/specs/aws-sec-inspector.spec.md
 ```
 
-Or tell the CLI to use one:
+Or point a `grclanker` session at one (the path is relative to where you started the session):
 
-```bash
-grclanker "read specs/aws-sec-inspector.spec.md and build the tool"
+```text
+read aws-sec-inspector.spec.md and build the tool
 ```
+
+Some specs now describe integrations that `main` already ships as native tools. The AWS spec, for example, is the contract behind the `aws_*` tools, so on `main` you can run those directly and use the spec when you want another implementation built against the same contract.
 
 The intended flow is not “pick between the specs and the CLI.” The intended flow is install the CLI, configure it, and then point it at a spec when you want the repo’s build plans executed.
 
@@ -231,6 +267,8 @@ The release installers look for GitHub Release assets named like:
 - `grclanker-<version>-win32-arm64.zip`
 - `grclanker-<version>-win32-x64.zip`
 
+plus a `SHA256SUMS.txt`. When that file has an entry for the downloaded archive, the installers check the archive's SHA-256 against it and abort on a mismatch. When the file cannot be fetched, has no entry for the archive, no `sha256sum` or `shasum` is available (`install` only), or a custom `GRCLANKER_ASSET_URL` is set, they print a warning and install without verifying.
+
 Build them locally:
 
 ```bash
@@ -239,7 +277,7 @@ npm install
 npm run build:bundle -- --all
 ```
 
-Artifacts land in `cli/release/`.
+Artifacts and `SHA256SUMS.txt` land in `cli/release/` (override with `--output-dir <dir>`; drop `--all` to build only the host platform, or pass `--target <platform-arch>`).
 
 ## Experimental Means Experimental
 

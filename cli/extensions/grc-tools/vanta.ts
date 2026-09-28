@@ -292,6 +292,35 @@ function buildAuditDirectoryName(audit: VantaAudit): string {
   );
 }
 
+function pathEntryExists(path: string): boolean {
+  return lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+}
+
+function allocateAuditOutputDir(baseDir: string, audit: VantaAudit): string {
+  const directoryName = buildAuditDirectoryName(audit);
+
+  for (let index = 0; ; index += 1) {
+    const suffix = index === 0 ? "" : `_${index}`;
+    const outputDir = join(baseDir, `${directoryName}${suffix}`);
+    const zipPath = `${outputDir}.zip`;
+
+    if (pathEntryExists(zipPath)) {
+      continue;
+    }
+
+    try {
+      mkdirSync(outputDir, { mode: 0o700 });
+      chmodSync(outputDir, 0o700);
+      return outputDir;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 function buildAuditSearchText(audit: VantaAudit): string {
   return [
     audit.id,
@@ -805,7 +834,7 @@ async function createZipArchive(sourceDir: string, zipPath: string, baseDir: str
   const resolvedZipPath = resolveSecureOutputPath(baseDir, zipPath);
 
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const output = createWriteStream(resolvedZipPath, { mode: 0o600 });
+    const output = createWriteStream(resolvedZipPath, { mode: 0o600, flags: "wx" });
     const archive = new ZipArchive({ zlib: { level: 9 } });
 
     output.on("close", () => resolvePromise());
@@ -843,8 +872,7 @@ export async function exportVantaAuditPackage(
 
   ensurePrivateDir(baseOutputDir);
 
-  const outputDir = join(baseOutputDir, buildAuditDirectoryName(audit));
-  ensurePrivateDir(outputDir);
+  const outputDir = allocateAuditOutputDir(baseOutputDir, audit);
 
   const evidence = await client.listEvidence(audit.id);
   const controlMap = collectControlMap(evidence);

@@ -5,20 +5,29 @@ on:
     tags:
       - "v*"
 
+permissions: {}
+
+concurrency:
+  group: release-bundles-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22.20.0"
+          node-version: "22.23.3"
 
       - name: Verify tag matches CLI version
         run: |
@@ -37,62 +46,176 @@ jobs:
         working-directory: cli
         run: npm run build:bundle -- --all
 
-      - name: Publish release assets
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+      - name: Upload release bundles
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: GRC Clanker ${{ github.ref_name }} (Experimental)
-          prerelease: true
-          body: |
-            First public experimental CLI release for grclanker.
-
-            grclanker is an open source AI GRC CLI built on top of Pi. `0.0.1` is the first public bundle line and should be treated like an experimental prerelease: usable, but still moving quickly.
-
-            ## Highlights
-
-            - Bundled runtime installers for macOS, Linux, and Windows release targets
-            - Real setup flow with `grclanker setup`
-            - Local-first path for Ollama-compatible models, with Gemma 4 as the documented default example
-            - Explicit hosted-model path instead of silent fallback behavior
-            - Current workflow rails:
-              - `/investigate`
-              - `/audit`
-              - `/assess`
-              - `/validate`
-            - Repo specs can be used as build inputs by the CLI
-            - Dedicated runtime state under `~/.grclanker/agent`
-
-            ## Install
-
-            macOS / Linux:
-
-            ```bash
-            curl -fsSL https://grclanker.com/install | bash
-            grclanker setup
-            ```
-
-            Windows PowerShell:
-
-            ```powershell
-            powershell -ExecutionPolicy Bypass -c "irm https://grclanker.com/install.ps1 | iex"
-            grclanker setup
-            ```
-
-            Full docs:
-            - https://grclanker.com/docs/getting-started/installation
-            - https://grclanker.com/docs/getting-started/setup
-
-            ## Validation notes
-
-            - macOS bundle build, install flow, and launcher smoke-tested locally
-            - Windows ARM bundle build, installer, and launcher smoke-tested in a disposable Parallels Windows 11 ARM clone
-            - Windows remains best-effort for `0.0.1`, even though the installer path was validated
-
-            ## Known release posture
-
-            - macOS and Linux are the recommended platforms for this release
-            - Windows support is present but not a priority yet
-            - Breaking changes are still likely while the runtime, setup flow, and workflows settle
-          files: |
+          name: release-bundles
+          path: |
             cli/release/*.tar.gz
             cli/release/*.zip
             cli/release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.23.3"
+
+      - name: Validate tag
+        run: |
+          set -euo pipefail
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME is not a vMAJOR.MINOR.PATCH[-PRERELEASE] version"
+            exit 1
+          fi
+
+      - name: Download release bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundles
+          path: release
+
+      - name: Verify release bundles and checksums
+        working-directory: release
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          expected="$(
+            {
+              for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+                echo "grclanker-${VERSION}-${target}.tar.gz"
+              done
+              for target in win32-arm64 win32-x64; do
+                echo "grclanker-${VERSION}-${target}.zip"
+              done
+            } | sort
+          )"
+          present="$(find . -type f -printf '%P\n' | grep -vx 'SHA256SUMS.txt' | sort)"
+          listed="$(awk '{ print $2 }' SHA256SUMS.txt | sort)"
+          if [ "$present" != "$expected" ] || [ "$listed" != "$expected" ]; then
+            echo "::error::Release files or SHA256SUMS.txt entries do not match the six expected bundles"
+            echo "Expected:"; echo "$expected"
+            echo "Present:"; echo "$present"
+            echo "Listed in SHA256SUMS.txt:"; echo "$listed"
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS.txt
+
+      - name: Require that no release exists for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/publish-release.mjs preflight --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA"
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          template="$(cat <<'NOTES'
+          Experimental prerelease of grclanker @VERSION@, built from tag `@TAG@` by the `release-bundles` workflow.
+
+          ## Install
+
+          macOS / Linux:
+
+          ```bash
+          curl -fsSL https://grclanker.com/install | bash -s -- @VERSION@
+          grclanker setup
+          ```
+
+          Windows PowerShell:
+
+          ```powershell
+          $env:GRCLANKER_VERSION = "@VERSION@"; irm https://grclanker.com/install.ps1 | iex
+          grclanker setup
+          ```
+
+          The installers check the downloaded archive against this release's `SHA256SUMS.txt` and stop on a mismatch. If the checksum file cannot be fetched they print a warning and install without verification.
+
+          ## Assets
+
+          | Platform | Archive |
+          | --- | --- |
+          | macOS, Apple silicon | `grclanker-@VERSION@-darwin-arm64.tar.gz` |
+          | macOS, Intel | `grclanker-@VERSION@-darwin-x64.tar.gz` |
+          | Linux, arm64 (glibc) | `grclanker-@VERSION@-linux-arm64.tar.gz` |
+          | Linux, x64 (glibc) | `grclanker-@VERSION@-linux-x64.tar.gz` |
+          | Windows, arm64 | `grclanker-@VERSION@-win32-arm64.zip` |
+          | Windows, x64 | `grclanker-@VERSION@-win32-x64.zip` |
+
+          ## Verify a download
+
+          Check the archive against `SHA256SUMS.txt` from this release. Each command prints `OK` on a match:
+
+          ```bash
+          # Linux
+          grep '  grclanker-@VERSION@-linux-x64.tar.gz$' SHA256SUMS.txt | sha256sum --check -
+          # macOS
+          grep '  grclanker-@VERSION@-darwin-arm64.tar.gz$' SHA256SUMS.txt | shasum -a 256 --check -
+          ```
+
+          On Windows, compare these two hashes:
+
+          ```powershell
+          (Get-FileHash .\grclanker-@VERSION@-win32-x64.zip -Algorithm SHA256).Hash.ToLower()
+          Select-String -Path .\SHA256SUMS.txt -SimpleMatch "grclanker-@VERSION@-win32-x64.zip"
+          ```
+
+          Every archive also has a GitHub build provenance attestation tied to this tag and workflow:
+
+          ```bash
+          gh attestation verify grclanker-@VERSION@-linux-x64.tar.gz \
+            --repo @REPO@ \
+            --source-ref refs/tags/@TAG@ \
+            --signer-workflow @REPO@/.github/workflows/release-bundles.yml
+          ```
+
+          `SHA256SUMS.txt`:
+
+          ```text
+          NOTES
+          )"
+          notes="${template//@VERSION@/$VERSION}"
+          notes="${notes//@TAG@/$GITHUB_REF_NAME}"
+          notes="${notes//@REPO@/$GITHUB_REPOSITORY}"
+          {
+            printf '%s\n' "$notes"
+            cat release/SHA256SUMS.txt
+            printf '%s\n\n' '```'
+            printf 'Changes: %s/%s/commits/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS.txt
+
+      - name: Create, verify, and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node .github/scripts/publish-release.mjs publish \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --sha "$GITHUB_SHA" \
+            --name "GRC Clanker $GITHUB_REF_NAME (Experimental)" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --assets-dir release

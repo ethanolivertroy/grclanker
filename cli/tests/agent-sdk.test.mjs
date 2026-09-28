@@ -24,7 +24,7 @@ import {
   WORKFLOW_NAMES,
   workflowSkillConfig,
 } from "../dist/agent-sdk/lib/skills.js";
-import { buildSdkToolConfig, executeGrcTool, grclankerToolConfig } from "../dist/agent-sdk/lib/tools.js";
+import { buildSdkToolConfig, executeGrcTool, grclankerToolConfig, prepareGrcToolArguments } from "../dist/agent-sdk/lib/tools.js";
 import { clearFedrampCachesForTests } from "../dist/extensions/grc-tools/fedramp-source.js";
 import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/extensions/grc-tools/shared.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -287,6 +287,24 @@ test("buildSdkToolConfig bridges prepareArguments, Pi argument validation, and t
   assert.equal(calls.length, 2);
 });
 
+test("Agent SDK preserves AWS optional list defaults across preparation and validation", () => {
+  const cases = [
+    ["aws_assess_data_protection", ["regions"]],
+    ["aws_assess_network_security", ["regions", "sensitive_ports"]],
+    ["aws_export_audit_bundle", ["regions", "sensitive_ports"]],
+  ];
+  for (const [name, fields] of cases) {
+    const tool = getRegisteredGrcTool(name);
+    for (const value of [null, "", " \t "]) {
+      const input = Object.fromEntries(fields.map((field) => [field, value]));
+      const prepared = prepareGrcToolArguments(tool, `sdk-${name}`, input);
+      for (const field of fields) {
+        assert.equal(prepared[field], undefined, `${name} maps ${field}=${JSON.stringify(value)} to its default`);
+      }
+    }
+  }
+});
+
 test("executeGrcTool returns error envelopes for invalid arguments and thrown errors", async () => {
   const { tool, calls } = fakeTool();
   const invalid = await executeGrcTool(tool, { limit: 2 }, { toolCallId: "call_2" });
@@ -307,6 +325,78 @@ test("executeGrcTool returns error envelopes for invalid arguments and thrown er
     content: [{ type: "text", text: "fake_search_things failed: boom" }],
     isError: true,
   });
+});
+
+test("executeGrcTool withholds echoed arguments and credentials from every error envelope", async () => {
+  const credentialSentinel = "agent-sdk-credential-sentinel-6228";
+  const argumentSentinel = "agent-sdk-argument-sentinel-6228";
+  const parameters = Type.Object({
+    api_token: Type.String(),
+    query: Type.String(),
+    limit: Type.Optional(Type.Number()),
+  });
+  const { tool: validating } = fakeTool({ parameters });
+
+  const invalid = await executeGrcTool(
+    validating,
+    { api_token: credentialSentinel, query: argumentSentinel, limit: "not-a-number" },
+    { toolCallId: "call_validation_redaction" },
+  );
+  const invalidEnvelope = JSON.stringify(invalid);
+
+  assert.equal(invalid.isError, true);
+  assert.match(invalid.content[0].text, /limit: must be number/);
+  assert.doesNotMatch(invalidEnvelope, /Received arguments:/);
+  assert.ok(!invalidEnvelope.includes(credentialSentinel));
+  assert.ok(!invalidEnvelope.includes(argumentSentinel));
+
+  const { tool: throwing } = fakeTool({
+    parameters,
+    async execute(_toolCallId, args) {
+      throw new Error(
+        `credential rejected: ${args.api_token}\n\nReceived arguments:\n${JSON.stringify(args)}`,
+      );
+    },
+  });
+  const thrown = await executeGrcTool(
+    throwing,
+    { api_token: credentialSentinel, query: argumentSentinel },
+    { toolCallId: "call_execution_redaction" },
+  );
+  const thrownEnvelope = JSON.stringify(thrown);
+
+  assert.equal(thrown.isError, true);
+  assert.match(thrown.content[0].text, /credential rejected: \[redacted\]/);
+  assert.doesNotMatch(thrownEnvelope, /Received arguments:/);
+  assert.ok(!thrownEnvelope.includes(credentialSentinel));
+  assert.ok(!thrownEnvelope.includes(argumentSentinel));
+
+  const { tool: returningError } = fakeTool({
+    parameters,
+    async execute(_toolCallId, args) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `credential rejected: ${args.api_token}\n\nReceived arguments:\n${JSON.stringify(args)}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  });
+  const returned = await executeGrcTool(
+    returningError,
+    { api_token: credentialSentinel, query: argumentSentinel },
+    { toolCallId: "call_returned_error_redaction" },
+  );
+  const returnedEnvelope = JSON.stringify(returned);
+
+  assert.equal(returned.isError, true);
+  assert.match(returned.content[0].text, /credential rejected: \[redacted\]/);
+  assert.doesNotMatch(returnedEnvelope, /Received arguments:/);
+  assert.ok(!returnedEnvelope.includes(credentialSentinel));
+  assert.ok(!returnedEnvelope.includes(argumentSentinel));
 });
 
 test("executeGrcTool disables persistent caches only for dry-run sessions", async () => {
@@ -404,7 +494,7 @@ test("toSdkToolResult keeps text and image content, drops details, and carries i
   });
 });
 
-test("grclankerToolConfig runs a registered tool end to end with stubbed network access", async () => {
+test("grclankerToolConfig uses the current CMVP API default end to end", async () => {
   const originalFetch = globalThis.fetch;
   const urls = [];
   globalThis.fetch = async (input) => {
@@ -437,7 +527,9 @@ test("grclankerToolConfig runs a registered tool end to end with stubbed network
     assert.equal(result.isError, undefined);
     assert.match(result.content[0].text, /Found 1 active FIPS module\(s\) matching "boringcrypto"/);
     assert.match(result.content[0].text, /Certificate #4407 - BoringCrypto/);
-    assert.equal(urls.length, 1);
+    assert.deepEqual(urls, [
+      "https://ethanolivertroy.github.io/nist-cmvp-api/api/modules.json",
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
     clearGrcSharedCachesForTests();
@@ -460,7 +552,8 @@ test("workflow prompts and the bundled skill map onto skill configs", () => {
   assert.deepEqual([...WORKFLOW_NAMES], ["investigate", "audit", "assess", "validate"]);
   for (const name of WORKFLOW_NAMES) {
     const skill = workflowSkillConfig(name);
-    assert.equal(skill.markdown, readFileSync(resolve(cliRoot, "prompts", `${name}.md`), "utf8").trim());
+    assert.equal(skill.markdown, readFileSync(resolve(cliRoot, "prompts", `${name}.md`), "utf8").replace(/\$ARGUMENTS/g, "").trim());
+    assert.equal(skill.markdown.includes("$ARGUMENTS"), false);
     assert.match(skill.description, /^Use when /);
   }
 

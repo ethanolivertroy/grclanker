@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   COMPUTE_BACKEND_KINDS,
@@ -89,6 +89,8 @@ import {
 } from "../dist/pi/execution-backend.js";
 import { normalizeGrclankerSettings, readGrclankerSettings } from "../dist/pi/settings.js";
 import { quoteForBash } from "../dist/pi/shell.js";
+import { extractInitialPrompt } from "../dist/pi/prompt-envelope.js";
+import { readWorkflowPrompt } from "../dist/pi/workflow-prompt.js";
 
 const RUNPOD_POD_JSON = JSON.stringify({
   id: "pod42",
@@ -230,9 +232,97 @@ test("normalizeGrclankerSettings keeps remote kinds and drops invalid profile va
 test("extractComputeFlag plumbs --compute for setup, investigate, and audit", () => {
   assert.deepEqual(extractComputeFlag(["--compute", "modal"]), { compute: "modal", rest: [] });
   assert.deepEqual(extractComputeFlag(["--compute=docker", "extra"]), { compute: "docker", rest: ["extra"] });
+  assert.deepEqual(extractComputeFlag(["--", "--compute", "nope"]), { compute: undefined, rest: ["--compute", "nope"] });
   assert.deepEqual(extractComputeFlag([]), { compute: undefined, rest: [] });
   assert.throws(() => extractComputeFlag(["--compute", "nope"]), /Unknown compute backend/);
   assert.throws(() => extractComputeFlag(["--compute"]), /Missing value/);
+});
+
+test("CLI help scopes --compute to the workflow and prompt runs that extract it", () => {
+  const cliEntry = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
+  const help = spawnSync(process.execPath, [cliEntry, "--help"], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(help.status, 0, `--help exited ${help.status}: ${help.stderr}`);
+  assert.match(help.stdout, /--compute <kind>\s+Use <kind> for this investigate\/audit\/assess\/validate or "<prompt>" run only/);
+  assert.match(help.stdout, /bare interactive mode uses the backend saved by setup --compute/);
+  assert.doesNotMatch(help.stdout, /Run investigate\/audit on a specific backend/);
+  assert.doesNotMatch(help.stdout, /Override the compute backend for this invocation/);
+
+  // Interactive mode has no command to carry the flag, so a leading --compute is rejected.
+  const interactive = spawnSync(process.execPath, [cliEntry, "--compute", "docker"], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(interactive.status, 1);
+  assert.match(interactive.stderr, /Unknown command: --compute/);
+});
+
+test("--compute reaches the investigate, audit, assess, validate, and free-form prompt launch dispatch", () => {
+  const cliRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const cliEntry = join(cliRoot, "dist", "index.js");
+  const hooksUrl = pathToFileURL(join(cliRoot, "tests", "helpers", "pi-launch-mock-hooks.mjs")).href;
+  const preload = `data:text/javascript,${encodeURIComponent(`import { register } from "node:module"; register(${JSON.stringify(hooksUrl)});`)}`;
+  const base = mkdtempSync(join(tmpdir(), "grclanker-compute-dispatch-"));
+  const recordPath = join(base, "pi-launch.json");
+  const env = { ...process.env, GRCLANKER_HOME: base, GRCLANKER_TEST_PI_LAUNCH_RECORD: recordPath };
+  delete env.GRCLANKER_COMPUTE_BACKEND;
+  delete env.GRCLANKER_COMPUTE_BACKEND_OVERRIDE;
+
+  const launch = (args) => {
+    rmSync(recordPath, { force: true });
+    const run = spawnSync(process.execPath, ["--import", preload, cliEntry, ...args], { encoding: "utf8", timeout: 60_000, cwd: base, env });
+    assert.equal(run.status, 0, `grclanker ${args.join(" ")} exited ${run.status}: ${run.stdout}${run.stderr}`);
+    assert.ok(existsSync(recordPath), `grclanker ${args.join(" ")} never reached the Pi launch`);
+    return JSON.parse(readFileSync(recordPath, "utf8"));
+  };
+  const launchedPrompt = (record) => {
+    const last = record.args.at(-1);
+    assert.ok(last.startsWith("grclanker:initial-prompt:v1:"), "the last Pi launch argument is the encoded initial prompt");
+    const decoded = extractInitialPrompt(last);
+    assert.ok(decoded, "the initial prompt payload decodes");
+    assert.equal(decoded.pipedInput, "");
+    return decoded.payload;
+  };
+
+  try {
+    const agentDir = join(base, ".grclanker", "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+      modelMode: "hosted",
+      defaultProvider: "openai",
+      defaultModel: "gpt-test",
+      providerKind: "openai",
+      computeBackend: "host",
+    }));
+
+    for (const workflow of ["investigate", "audit", "assess", "validate"]) {
+      const prompt = { kind: "workflow", content: readWorkflowPrompt(cliRoot, workflow) };
+
+      const flagged = launch([workflow, "--compute", "docker"]);
+      assert.equal(flagged.computeBackend, "docker", `${workflow} --compute docker`);
+      assert.equal(flagged.computeOverride, "docker", `${workflow} --compute docker`);
+      assert.deepEqual(launchedPrompt(flagged), prompt, `${workflow} must launch its own workflow prompt`);
+
+      const inline = launch([workflow, "--compute=modal"]);
+      assert.equal(inline.computeBackend, "modal", `${workflow} --compute=modal`);
+      assert.deepEqual(launchedPrompt(inline), prompt);
+
+      const saved = launch([workflow]);
+      assert.equal(saved.computeBackend, "host", `${workflow} without --compute uses the saved backend`);
+      assert.equal(saved.computeOverride, null);
+      assert.deepEqual(launchedPrompt(saved), prompt);
+
+      const withSubject = launch([workflow, "CVE-2024-3094", "--compute", "docker"]);
+      assert.equal(withSubject.computeBackend, "docker", `${workflow} <subject> --compute docker`);
+      assert.deepEqual(launchedPrompt(withSubject), {
+        kind: "workflow",
+        content: readWorkflowPrompt(cliRoot, workflow, "CVE-2024-3094"),
+      });
+    }
+
+    const freeForm = launch(["Summarize", "FedRAMP", "--compute", "docker"]);
+    assert.equal(freeForm.computeBackend, "docker", "a free-form prompt honors --compute");
+    assert.equal(freeForm.computeOverride, "docker");
+    assert.deepEqual(launchedPrompt(freeForm), { kind: "prompt", content: "Summarize FedRAMP" });
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("docker run args keep the phase 1 shape and honor computeDefaults", () => {

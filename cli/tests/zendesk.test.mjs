@@ -35,6 +35,7 @@ import {
   registerZendeskTools,
   resolveSecureOutputPath,
   resolveZendeskConfiguration,
+  zendeskAssessmentToolDetails,
 } from "../dist/extensions/grc-tools/zendesk.js";
 import { ZENDESK_SPEC } from "../dist/extensions/grc-tools/zendesk.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
@@ -4748,4 +4749,125 @@ test("byte differential fixtures: Zendesk assessments and export", { skip: !byte
   const outputRoot = prepareByteDifferentialExportRoot("zendesk");
   const exported = await exportZendeskAuditBundle(healthyClient(), sampleConfig(), outputRoot, { now: () => NOW });
   writeByteDifferentialFixture("zendesk", "export", snapshotExportBundle(exported));
+});
+
+// ---------------------------------------------------------------------------
+// Native assessment tool details: Pi persists and renders details, so they carry a bounded
+// projection of the result and never the raw snapshots (those belong in core_data/).
+// ---------------------------------------------------------------------------
+
+const ZENDESK_ASSESSMENT_DETAIL_KEYS = ["tool", "category", "title", "summary", "findings", "errors", "snapshot_keys"];
+
+function bulkItems(count, make) {
+  return Array.from({ length: count }, (_, index) => make(index));
+}
+
+// Grows an inventory every category snapshots (team members, group memberships, recent audit
+// logs, triggers) well past the healthy fixture, with items that do not change a verdict.
+function bulkClient() {
+  const agents = bulkItems(1500, (index) => teamMember({ id: 1000 + index, role: "agent" }));
+  return healthyClient({
+    async listTeamMembers() {
+      return list([teamMember({ id: 1, role: "admin", email: "auditor@example.com" }), teamMember({ id: 2, role: "admin" }), ...agents]);
+    },
+    async listGroupMemberships() {
+      return list(agents.map((agent, index) => ({ id: 10000 + index, user_id: agent.id, group_id: index % 2 === 0 ? 100 : 101 })));
+    },
+    async listRecentAuditLogs() {
+      return list(bulkItems(1000, (index) => ({ id: 20000 + index, action: "update", created_at: daysAgo(index % 30) })));
+    },
+    async listTriggers() {
+      return list(bulkItems(500, (index) => ({ id: 30000 + index, title: `Route queue ${index}`, active: true, actions: [{ field: "group_id", value: "100" }] })));
+    },
+  });
+}
+
+const ZENDESK_DETAIL_TOOLS = [
+  { tool: "zendesk_assess_authentication", run: assessZendeskAuthentication },
+  { tool: "zendesk_assess_access_control", run: assessZendeskAccessControl },
+  { tool: "zendesk_assess_data_protection", run: assessZendeskDataProtection },
+  { tool: "zendesk_assess_integrations", run: assessZendeskIntegrations },
+];
+const ZENDESK_DETAIL_FIXTURES = {
+  healthy: () => healthyClient(),
+  forbidden: () => forbiddenClient(),
+  empty: () => emptyClient(),
+  truncated: () => truncatedClient(),
+  bulk: () => bulkClient(),
+};
+
+// Serialized-size ceilings, in characters, at roughly twice the largest value these fixtures produce.
+// Measured maxima across the four tools: healthy 6.6k, forbidden 7.5k, empty 6.4k, truncated 8.0k, bulk 6.6k.
+const ZENDESK_DETAILS_CEILING = { healthy: 14000, forbidden: 16000, empty: 14000, truncated: 17000, bulk: 14000 };
+
+function assertZendeskDetailsShape(details, tool, label) {
+  assert.deepEqual(Object.keys(details), ZENDESK_ASSESSMENT_DETAIL_KEYS, `${label}: details carry exactly the projected fields`);
+  assert.equal("snapshots" in details, false, `${label}: raw snapshots are not carried in details`);
+  assert.equal(details.tool, tool, `${label}: tool name`);
+  assert.ok(details.snapshot_keys.length > 0, `${label}: the snapshot dataset names are kept`);
+  assert.ok(details.snapshot_keys.every((key) => typeof key === "string"), `${label}: snapshot_keys lists names only`);
+}
+
+test("assessment tool details are a bounded projection: raw snapshots are dropped while the snapshot names, summary, findings, and errors are kept", async () => {
+  for (const { tool, run } of ZENDESK_DETAIL_TOOLS) {
+    const sizes = {};
+    const snapshotSizes = {};
+    for (const [fixture, makeClient] of Object.entries(ZENDESK_DETAIL_FIXTURES)) {
+      const label = `${tool} (${fixture})`;
+      const result = await run(makeClient(), { now: () => NOW });
+      const details = zendeskAssessmentToolDetails(tool, result);
+      assertZendeskDetailsShape(details, tool, label);
+      for (const key of ["category", "title", "summary", "findings", "errors"]) {
+        assert.deepEqual(details[key], result[key], `${label}: ${key} is preserved`);
+      }
+      assert.deepEqual(details.snapshot_keys, Object.keys(result.snapshots), `${label}: snapshot_keys names every snapshot`);
+      sizes[fixture] = JSON.stringify(details).length;
+      snapshotSizes[fixture] = JSON.stringify(result.snapshots).length;
+      assert.ok(sizes[fixture] <= ZENDESK_DETAILS_CEILING[fixture], `${label}: details serialize to ${sizes[fixture]} characters, over the ${ZENDESK_DETAILS_CEILING[fixture]} ceiling`);
+    }
+    assert.ok(snapshotSizes.bulk > 10 * snapshotSizes.healthy, `${tool}: the bulk fixture grows the snapshots (${snapshotSizes.healthy} -> ${snapshotSizes.bulk})`);
+    assert.ok(sizes.bulk <= 2 * sizes.healthy, `${tool}: the details do not grow with the snapshots (${sizes.healthy} -> ${sizes.bulk})`);
+  }
+});
+
+test("the registered assessment tools return the bounded details over HTTP and still render every finding and error in the text", async () => {
+  const routes = await healthyHttpRoutes();
+  const fetchImpl = async (input) => {
+    const key = zendeskRouteKey(typeof input === "string" ? input : input.toString());
+    return routes[key] !== undefined
+      ? jsonResponse(routes[key])
+      : new Response(JSON.stringify({ error: "RecordNotFound", description: `unrouted ${key}` }), { status: 404, headers: { "content-type": "application/json" } });
+  };
+  const tools = new Map();
+  registerZendeskTools({ registerTool: (tool) => tools.set(tool.name, tool) });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  try {
+    for (const { tool, run } of ZENDESK_DETAIL_TOOLS) {
+      const registeredTool = tools.get(tool);
+      const output = await registeredTool.execute("call-details", registeredTool.prepareArguments({ subdomain: "acme", email: "auditor@example.com", api_token: FIXTURE_API_TOKEN }));
+      assert.notEqual(output.isError, true, output.content[0].text);
+      const { details } = output;
+      assertZendeskDetailsShape(details, tool, tool);
+
+      const direct = await run(new ZendeskApiClient(sampleConfig(), { fetchImpl, sleep: async () => {} }));
+      assert.equal(details.category, direct.category, `${tool}: category`);
+      assert.equal(details.title, direct.title, `${tool}: title`);
+      assert.deepEqual(Object.keys(details.summary), Object.keys(direct.summary), `${tool}: summary fields`);
+      assert.deepEqual(details.findings.map((item) => [item.id, item.status]), direct.findings.map((item) => [item.id, item.status]), `${tool}: findings`);
+      assert.deepEqual(details.errors, direct.errors, `${tool}: errors`);
+      assert.deepEqual(details.snapshot_keys, Object.keys(direct.snapshots), `${tool}: snapshot_keys names every snapshot the assessment collected`);
+
+      const text = output.content.map((part) => part.text ?? "").join("\n");
+      assert.ok(text.startsWith(`${details.title}\n`), `${tool}: the text leads with the title`);
+      for (const key of Object.keys(details.summary)) assert.ok(text.includes(`- ${key}: `), `${tool}: the text renders summary.${key}`);
+      for (const item of details.findings) assert.ok(text.includes(item.id), `${tool}: the text renders ${item.id}`);
+      for (const error of details.errors) assert.ok(text.includes(`- ${error}`), `${tool}: the text renders the collection warning`);
+
+      const size = JSON.stringify(details).length;
+      assert.ok(size <= ZENDESK_DETAILS_CEILING.healthy, `${tool}: details serialize to ${size} characters, over the ${ZENDESK_DETAILS_CEILING.healthy} ceiling`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
+import { Value } from "@sinclair/typebox/value";
 import {
   chmodSync,
   existsSync,
@@ -3467,6 +3468,115 @@ test("CodeRabbit #76 userinfo: the userinfo of a URL ends at the first slash, qu
       if (input.includes(piece)) assert.ok(!redactSecrets(input).includes(piece) && !scrubDataText(input).includes(piece), `${piece} left in the output of ${input}: ${expected}`);
     }
   }
+});
+
+test("registered Snowflake tools validate and prepare every supported SQL client tuning key", () => {
+  const registered = [];
+  registerSnowflakeTools({ registerTool: (tool) => registered.push(tool) });
+  const expectedToolNames = [
+    "snowflake_check_access",
+    "snowflake_assess_network_and_authentication",
+    "snowflake_assess_access_control",
+    "snowflake_assess_monitoring_and_lifecycle",
+    "snowflake_assess_data_protection",
+    "snowflake_export_audit_bundle",
+  ];
+  assert.deepEqual(registered.map((tool) => tool.name), expectedToolNames);
+
+  const schemaContract = {
+    poll_interval_ms: { minimum: 0, maximum: 30_000, default: 1_000 },
+    max_retries: { minimum: 0, maximum: 10, default: 3 },
+    retry_base_ms: { minimum: 0, maximum: 30_000, default: 500 },
+    max_partitions: { minimum: 1, maximum: 10_000, default: 50 },
+  };
+  const tuningArgs = {
+    poll_interval_ms: 2_345,
+    max_retries: 7,
+    retry_base_ms: 6_789,
+    max_partitions: 321,
+  };
+  const runtimeTuning = {
+    pollIntervalMs: 2_345,
+    maxRetries: 7,
+    retryBaseMs: 6_789,
+    maxPartitions: 321,
+  };
+  const baseArgs = {
+    account: "myorg-myaccount",
+    user: "auditor",
+    token: "runtime-contract-token",
+    base_url: "https://myorg-myaccount.snowflakecomputing.com",
+  };
+  const homeDirectory = createTempBase("grclanker-snowflake-tuning-contract-");
+
+  for (const tool of registered) {
+    for (const [key, contract] of Object.entries(schemaContract)) {
+      const property = tool.parameters.properties[key];
+      assert.ok(property, `${tool.name} exposes ${key}`);
+      assert.equal(property.type, "integer", `${tool.name} ${key} type`);
+      assert.equal(property.minimum, contract.minimum, `${tool.name} ${key} minimum`);
+      assert.equal(property.maximum, contract.maximum, `${tool.name} ${key} maximum`);
+      assert.equal(property.default, contract.default, `${tool.name} ${key} default`);
+    }
+
+    assert.equal(Value.Check(tool.parameters, { ...baseArgs, ...tuningArgs }), true, `${tool.name} accepts supported tuning values`);
+    assert.equal(Value.Check(tool.parameters, {
+      ...baseArgs,
+      poll_interval_ms: 0,
+      max_retries: 0,
+      retry_base_ms: 0,
+      max_partitions: 1,
+    }), true, `${tool.name} accepts lower bounds`);
+    assert.equal(Value.Check(tool.parameters, {
+      ...baseArgs,
+      poll_interval_ms: 30_000,
+      max_retries: 10,
+      retry_base_ms: 30_000,
+      max_partitions: 10_000,
+    }), true, `${tool.name} accepts upper bounds`);
+    for (const invalidArgs of [
+      { poll_interval_ms: -1 },
+      { poll_interval_ms: 30_001 },
+      { max_retries: -1 },
+      { max_retries: 11 },
+      { retry_base_ms: -1 },
+      { retry_base_ms: 30_001 },
+      { max_partitions: 0 },
+      { max_partitions: 10_001 },
+      { max_partitions: 1.5 },
+    ]) {
+      assert.equal(Value.Check(tool.parameters, { ...baseArgs, ...invalidArgs }), false, `${tool.name} rejects ${JSON.stringify(invalidArgs)}`);
+    }
+
+    const prepared = tool.prepareArguments({ ...baseArgs, ...tuningArgs });
+    assert.deepEqual(
+      Object.fromEntries(Object.keys(tuningArgs).map((key) => [key, prepared[key]])),
+      tuningArgs,
+      `${tool.name} preparation preserves tuning values`,
+    );
+    const resolved = resolveSnowflakeConfiguration(prepared, {}, { homeDirectory });
+    assert.deepEqual(
+      Object.fromEntries(Object.keys(runtimeTuning).map((key) => [key, resolved[key]])),
+      runtimeTuning,
+      `${tool.name} tuning values reach the runtime configuration`,
+    );
+  }
+
+  const defaults = resolveSnowflakeConfiguration(baseArgs, {}, { homeDirectory });
+  assert.deepEqual(
+    {
+      pollIntervalMs: defaults.pollIntervalMs,
+      maxRetries: defaults.maxRetries,
+      retryBaseMs: defaults.retryBaseMs,
+      maxPartitions: defaults.maxPartitions,
+    },
+    {
+      pollIntervalMs: 1_000,
+      maxRetries: 3,
+      retryBaseMs: 500,
+      maxPartitions: 50,
+    },
+  );
 });
 
 /**

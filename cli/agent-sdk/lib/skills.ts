@@ -1,4 +1,5 @@
 import { readCliAsset } from "./paths.js";
+import { renderWorkflowPrompt } from "../../pi/workflow-prompt.js";
 
 /** Config accepted by `defineSkill` from `@cursor/july/skills`. */
 export interface GrclankerSkillConfig {
@@ -51,7 +52,7 @@ export function parseFrontmatter(markdown: string): FrontmatterDocument {
 export function workflowSkillConfig(name: WorkflowName): GrclankerSkillConfig {
   return {
     description: WORKFLOW_DESCRIPTIONS[name],
-    markdown: readCliAsset("prompts", `${name}.md`).trim(),
+    markdown: renderWorkflowPrompt(readCliAsset("prompts", `${name}.md`)).trim(),
   };
 }
 

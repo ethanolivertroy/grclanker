@@ -62,6 +62,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
 | `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
 | `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `private_key` | string | no | PEM private key for the JWT bearer flow. Prefer private_key_file or SF_PRIVATE_KEY to avoid providing key material inline. |
 | `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
@@ -81,6 +82,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
 | `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
 | `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `private_key` | string | no | PEM private key for the JWT bearer flow. Prefer private_key_file or SF_PRIVATE_KEY to avoid providing key material inline. |
 | `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
@@ -101,6 +103,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
 | `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
 | `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `private_key` | string | no | PEM private key for the JWT bearer flow. Prefer private_key_file or SF_PRIVATE_KEY to avoid providing key material inline. |
 | `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
@@ -123,6 +126,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
 | `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
 | `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `private_key` | string | no | PEM private key for the JWT bearer flow. Prefer private_key_file or SF_PRIVATE_KEY to avoid providing key material inline. |
 | `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
@@ -144,6 +148,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
 | `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
 | `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `private_key` | string | no | PEM private key for the JWT bearer flow. Prefer private_key_file or SF_PRIVATE_KEY to avoid providing key material inline. |
 | `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |
@@ -166,6 +171,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `consumer_key` | string | no | Connected app consumer key (client_id). Defaults to SF_CONSUMER_KEY. |
 | `consumer_secret` | string | no | Connected app consumer secret. Defaults to SF_CONSUMER_SECRET. |
 | `private_key_file` | string | no | PEM private key path for the JWT bearer flow. Defaults to SF_PRIVATE_KEY_FILE. |
+| `private_key` | string | no | PEM private key for the JWT bearer flow. Prefer private_key_file or SF_PRIVATE_KEY to avoid providing key material inline. |
 | `refresh_token` | string | no | OAuth refresh token from a prior authorization code grant. Defaults to SF_REFRESH_TOKEN. |
 | `access_token` | string | no | Pre-issued access token (requires instance_url). Defaults to SF_ACCESS_TOKEN. |
 | `credentials_file` | string | no | JSON credentials file with grant_type jwt-bearer, password, or authorization_code. Defaults to SF_CREDENTIALS_FILE. |

@@ -36,6 +36,8 @@ export GWS_CUSTOMER_ID=my_customer     # optional, defaults to my_customer
 export GWS_LOOKBACK_DAYS=30            # optional audit window, 1-180
 ```
 
+`GWS_SERVICE_ACCOUNT_FILE` and then `GOOGLE_APPLICATION_CREDENTIALS` are read when `GWS_CREDENTIALS_FILE` is unset, and `GWS_SERVICE_ACCOUNT_JSON` when `GWS_CREDENTIALS_JSON` is unset. These credentials are read only in `service_account` mode; when both inline JSON and a file path resolve, the inline JSON is used.
+
 grclanker signs an RS256 JWT with `sub` set to the admin email and exchanges it at `https://oauth2.googleapis.com/token` with the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant, as documented at [Using OAuth 2.0 for Server to Server Applications](https://developers.google.com/identity/protocols/oauth2/service-account#delegatingauthority). Tokens are cached per scope set and refreshed on 401.
 
 The Cloud Identity Policy API scope is requested with its own token so that a tenant which has not yet delegated it keeps every other surface working; only GWS-ID-005 renders Manual until the scope is added.
@@ -47,7 +49,7 @@ export GWS_AUTH_MODE=access_token
 export GWS_ACCESS_TOKEN="$(gcloud auth print-access-token)"
 ```
 
-The bearer is used as supplied. Explicit tool arguments (`auth_mode`, `credentials_file`, `credentials_json`, `access_token`, `admin_email`, `domain`, `customer_id`, `lookback_days`) override the environment.
+`GWS_AUTH_MODE` is optional: when neither it nor `auth_mode` is set, the mode is `access_token` if a token is present and `service_account` otherwise. The bearer is used as supplied. Explicit tool arguments (`auth_mode`, `credentials_file`, `credentials_json`, `access_token`, `admin_email`, `domain`, `customer_id`, `lookback_days`) override the environment.
 
 ### Scopes
 
@@ -129,7 +131,7 @@ Each finding maps to FedRAMP (NIST 800-53), CMMC 2.0 (NIST 800-171), SOC 2, CIS 
 
 ## Audit bundle layout
 
-`gws_export_audit_bundle` writes `<domain>-gws-audit/` under `output_dir` (default `./export/gws`) and a zip with the same name:
+`gws_export_audit_bundle` writes `<domain>-gws-audit/` under `output_dir` (default `./export/gws`) and a zip with the same name; without `GWS_DOMAIN` or `domain` the customer ID takes the place of `<domain>` (for example `my_customer-gws-audit/`):
 
 - `core_data/` API snapshots (`users.json`, `roles.json`, `role_assignments.json`, `login_activities.json`, `admin_activities.json`, `token_activities.json`, `token_inventory.json`, `alerts.json`, `two_step_verification_policies.json`), each a `{status, endpoint, data, seen, pages, truncated}` object whose `status` names the endpoint and reads `complete`, `partial`, `unreadable`, or `not collected`. A read that failed or never happened writes `error` and `errorKind` with `data`, `seen`, `pages`, and `truncated` all `null`, never `[]`, `0`, or `false` (verdict-safety rule 11). `token_inventory.json` adds `total`, `failed`, `failures` (per-user `userId`, `primaryEmail`, and the projected error), and `readable_users` (`3 of 4`); its `data` is null when every sampled read failed or the sample was never drawn, and its `truncated` is null whenever any read failed because the sample cap no longer describes completeness. Every record is projected to the documented fields listed under the endpoint reference and credential-like values are redacted (verdict-safety rule 9)
 - `analysis/` `findings.json` plus one JSON and one Markdown summary per category
@@ -147,7 +149,7 @@ Pass `frameworks` (for example `["soc2", "cis"]`) to limit the per-framework rep
 npm --prefix cli run test:gws:live
 ```
 
-Runs `gws_check_access`, all four assessments, and the export into a temp directory. Without `GWS_ACCESS_TOKEN` or a service-account file plus `GWS_ADMIN_EMAIL`, it prints a skip message and exits 0.
+Runs `gws_check_access`, stops with exit 1 unless the access status is `healthy`, then runs all four assessments and the export into a temp directory and fails unless the bundle holds 19 findings. Without `GWS_ACCESS_TOKEN` or a service-account file or inline JSON (any of the credential variables above) plus `GWS_ADMIN_EMAIL`, it prints a skip message and exits 0.
 
 ## Limitations and deferrals
 

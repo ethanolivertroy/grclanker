@@ -65,7 +65,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `private_key` | string | no | Optional PEM private key for PrivateKey auth mode. Prefer OKTA_CLIENT_PRIVATEKEY or .okta.yaml when possible. |
 | `private_key_id` | string | no | Optional JWK key ID (kid) for the service-app private key. |
 | `client_assertion` | string | no | Optional prebuilt JWT client assertion. Use this if you do not want grclanker to sign the PrivateKey JWT for you. |
-| `scopes` | array | no |  |
+| `scopes` | array | no | Optional Okta OAuth read scopes to request in PrivateKey mode. |
 
 #### `okta_assess_authentication`
 
@@ -79,7 +79,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `private_key` | string | no | Optional PEM private key for PrivateKey auth mode. Prefer OKTA_CLIENT_PRIVATEKEY or .okta.yaml when possible. |
 | `private_key_id` | string | no | Optional JWK key ID (kid) for the service-app private key. |
 | `client_assertion` | string | no | Optional prebuilt JWT client assertion. Use this if you do not want grclanker to sign the PrivateKey JWT for you. |
-| `scopes` | array | no |  |
+| `scopes` | array | no | Optional Okta OAuth read scopes to request in PrivateKey mode. |
 
 #### `okta_assess_admin_access`
 
@@ -93,7 +93,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `private_key` | string | no | Optional PEM private key for PrivateKey auth mode. Prefer OKTA_CLIENT_PRIVATEKEY or .okta.yaml when possible. |
 | `private_key_id` | string | no | Optional JWK key ID (kid) for the service-app private key. |
 | `client_assertion` | string | no | Optional prebuilt JWT client assertion. Use this if you do not want grclanker to sign the PrivateKey JWT for you. |
-| `scopes` | array | no |  |
+| `scopes` | array | no | Optional Okta OAuth read scopes to request in PrivateKey mode. |
 
 #### `okta_assess_integrations`
 
@@ -107,7 +107,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `private_key` | string | no | Optional PEM private key for PrivateKey auth mode. Prefer OKTA_CLIENT_PRIVATEKEY or .okta.yaml when possible. |
 | `private_key_id` | string | no | Optional JWK key ID (kid) for the service-app private key. |
 | `client_assertion` | string | no | Optional prebuilt JWT client assertion. Use this if you do not want grclanker to sign the PrivateKey JWT for you. |
-| `scopes` | array | no |  |
+| `scopes` | array | no | Optional Okta OAuth read scopes to request in PrivateKey mode. |
 
 #### `okta_assess_monitoring`
 
@@ -121,7 +121,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `private_key` | string | no | Optional PEM private key for PrivateKey auth mode. Prefer OKTA_CLIENT_PRIVATEKEY or .okta.yaml when possible. |
 | `private_key_id` | string | no | Optional JWK key ID (kid) for the service-app private key. |
 | `client_assertion` | string | no | Optional prebuilt JWT client assertion. Use this if you do not want grclanker to sign the PrivateKey JWT for you. |
-| `scopes` | array | no |  |
+| `scopes` | array | no | Optional Okta OAuth read scopes to request in PrivateKey mode. |
 
 #### `okta_export_audit_bundle`
 
@@ -135,7 +135,7 @@ This specification requires [shared integration contract version 1.1](./integrat
 | `private_key` | string | no | Optional PEM private key for PrivateKey auth mode. Prefer OKTA_CLIENT_PRIVATEKEY or .okta.yaml when possible. |
 | `private_key_id` | string | no | Optional JWK key ID (kid) for the service-app private key. |
 | `client_assertion` | string | no | Optional prebuilt JWT client assertion. Use this if you do not want grclanker to sign the PrivateKey JWT for you. |
-| `scopes` | array | no |  |
+| `scopes` | array | no | Optional Okta OAuth read scopes to request in PrivateKey mode. |
 | `output_dir` | string | no | Optional output root. Defaults to ./export/okta. |
 
 

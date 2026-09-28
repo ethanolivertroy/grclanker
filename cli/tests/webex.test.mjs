@@ -708,6 +708,94 @@ test("WebexApiClient refreshes an access token through POST /access_token and re
   );
 });
 
+test("WebexApiClient rejects malformed 2xx JSON endpoint bodies instead of treating them as complete", async () => {
+  const malformedBodies = [
+    {
+      name: "HTML",
+      response: () => textResponse("<html>sign in</html>", { headers: { "content-type": "text/html" } }),
+    },
+    {
+      name: "empty",
+      response: () => textResponse(""),
+    },
+    {
+      name: "array",
+      response: () => jsonResponse([]),
+    },
+    {
+      name: "foreign object",
+      response: () => jsonResponse({ status: "ok" }),
+    },
+  ];
+
+  for (const fixture of malformedBodies) {
+    const makeClient = () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async (input) => {
+        const url = new URL(input.toString());
+        return url.pathname === "/v1/guests/count" ? textResponse("0") : fixture.response();
+      },
+    });
+
+    await assert.rejects(
+      () => makeClient().listPeople(),
+      (error) => error instanceof WebexApiError && !error.message.includes("sign in"),
+      `${fixture.name} must not become a complete empty people list`,
+    );
+
+    const access = await checkWebexAccess(makeClient());
+    assert.notEqual(access.status, "healthy", `${fixture.name} must not produce healthy access`);
+    for (const surfaceName of ["organizations", "people", "roles", "licenses", "rooms", "meeting_sites"]) {
+      assert.equal(
+        access.surfaces.find((surface) => surface.name === surfaceName)?.status,
+        "not_readable",
+        `${fixture.name}: ${surfaceName}`,
+      );
+    }
+
+    const identity = await assessWebexIdentity(makeClient());
+    assert.equal(byId(identity.findings, "WEBEX-ID-03").status, "manual", `${fixture.name} must take the unreadable inventory path`);
+    assert.equal(byId(identity.findings, "WEBEX-ID-07").status, "manual", `${fixture.name} must not treat malformed people data as an empty inventory`);
+  }
+});
+
+test("WebexApiClient requires each endpoint's documented collection member and accepts valid empty collections", async () => {
+  const people = await new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ items: [] }),
+  }).listPeople();
+  assert.deepEqual(people, { items: [], truncated: false, pageCount: 1 });
+
+  const sites = await new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ sites: [] }),
+  }).listMeetingSites();
+  assert.deepEqual(sites, { items: [], truncated: false, pageCount: 1 });
+
+  await assert.rejects(
+    () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ sites: [] }),
+    }).listPeople(),
+    /required items array/,
+  );
+  await assert.rejects(
+    () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ items: [] }),
+    }).listMeetingSites(),
+    /required sites array/,
+  );
+  await assert.rejects(
+    () => new WebexApiClient(sampleConfig(), {
+      fetchImpl: async () => jsonResponse({ items: {} }),
+    }).listPeople(),
+    /required items array/,
+  );
+});
+
+test("WebexApiClient preserves the text/plain guest count response", async () => {
+  const client = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => textResponse("112"),
+  });
+  assert.deepEqual(await client.getGuestCount(), { count: 112 });
+});
+
 test("WebexApiClient stops an empty page that still advertises a next link", async () => {
   const seen = [];
   const fetchImpl = async (input, init = {}) => {
@@ -1875,6 +1963,13 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
         { id: "alphabetic-bearer", displayName: `Bearer ${alphabeticSecret}`, emails: ["secret@example.com"], type: "person", roles: [] },
       ]);
     },
+    async listRooms() {
+      const rooms = await baseClient.listRooms();
+      return page([
+        ...rooms.items,
+        { id: "legit-bearer-room", title: "Bearer Bonds Desk", type: "group", classificationId: "class-1", isLocked: true, isPublic: false },
+      ]);
+    },
   });
   const base = createTempBase("grclanker-webex-sink-redaction-");
   const result = await exportWebexAuditBundle(
@@ -1913,6 +2008,13 @@ test("exportWebexAuditBundle applies configured-secret and credential-carrier re
   assert.match(peopleZip.content, /Bearer Anderson/);
   assert.doesNotMatch(peopleZip.content, /Bearer lowercasesecret/);
   for (const secret of encodedSecrets) assert.equal(peopleZip.content.includes(secret), false, `${secret} leaked into zip:${peoplePath}`);
+
+  const roomsPath = "core_data/collaboration-governance/rooms.json";
+  const rooms = JSON.parse(readFileSync(join(result.outputDir, roomsPath), "utf8"));
+  assert.ok(rooms.some((room) => room.id === "legit-bearer-room" && room.title === "Bearer Bonds Desk"));
+  const roomsZip = readZipEntries(readFileSync(result.zipPath)).find((entry) => entry.name === roomsPath);
+  assert.ok(roomsZip, `${roomsPath} must be present in the zip`);
+  assert.match(roomsZip.content, /Bearer Bonds Desk/);
 });
 
 /** Rule 9 error path: one canary per carrier that only an error response can bring into the bundle. */
@@ -2019,6 +2121,16 @@ test("fetchJson never places a response body in an error string: non-JSON bodies
       "Webex request failed (403 Forbidden) for /v1/rooms: Forbidden: see https://idbroker.webex.com/idb/oauth2/v1/authorize; Access denied; sign in at https://idbroker.webex.com/idb/oauth2/v1/authorize to continue",
       "the documented message fields are kept with their URL queries stripped",
     );
+    return true;
+  });
+
+  const alphabeticBearer = new WebexApiClient(sampleConfig(), {
+    fetchImpl: async () => jsonResponse({ message: "Bearer abcdefghijk rejected" }, { status: 401, statusText: "Unauthorized" }),
+  });
+  await assert.rejects(() => alphabeticBearer.listPeople(), (error) => {
+    assert.ok(error instanceof WebexApiError);
+    assert.equal(error.message, "Webex request failed (401 Unauthorized) for /v1/people: Bearer [REDACTED] rejected");
+    assert.ok(!error.message.includes("abcdefghijk"));
     return true;
   });
 

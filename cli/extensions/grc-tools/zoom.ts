@@ -2862,6 +2862,9 @@ export async function checkZoomAccess(client: ZoomClientLike, options: ZoomAcces
   const snapshot = await collectZoomSnapshot(client, { groupLimit: 1, now: options.now });
   const config = client.getResolvedConfig();
   const currentUser = asObject(snapshot.currentUser.data) ?? {};
+  const identityNotes = snapshot.currentUser.status === "ok"
+    ? [`Authenticated as ${asString(currentUser.email) ?? asString(currentUser.first_name) ?? asString(currentUser.id) ?? "current Zoom admin context"}.`]
+    : ["Could not read /users/me; Zoom credentials may be invalid or missing required authorization."];
 
   const toAccessSurface = (surface: ZoomSurface, count?: number): ZoomAccessSurface => ({
     name: surface.name,
@@ -2897,7 +2900,7 @@ export async function checkZoomAccess(client: ZoomClientLike, options: ZoomAcces
     surfaces,
     notes: [
       `Using Zoom account ${config.accountId}.`,
-      `Authenticated as ${asString(currentUser.email) ?? asString(currentUser.first_name) ?? asString(currentUser.id) ?? "current Zoom admin context"}.`,
+      ...identityNotes,
       `${readableCount}/${surfaces.length} Zoom audit surfaces are readable.`,
       ...(config.configFile ? [`Configuration file: ${config.configFile}`] : []),
     ],

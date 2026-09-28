@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -1270,7 +1270,7 @@ test("config loader: a non-standard value thrown by the config read reaches neit
 
   let failure = "non-standard object";
   const [objectResult, subclassResult] = await withFsStub(
-    "readFileSync",
+    "openSync",
     (original, pathname, ...rest) => {
       if (pathname !== configPath) return original(pathname, ...rest);
       throw failure === "non-standard object" ? nonStandard : new ReadFailure();
@@ -1278,7 +1278,7 @@ test("config loader: a non-standard value thrown by the config read reaches neit
     async () => {
       // Positive control: without the loader the object's toString() is what String(error) would have rendered.
       assert.equal(String(nonStandard), "NONSTD-TOSTRING-CANARY");
-      assert.equal(thrownBy(() => readFileSync(configPath, "utf8")), nonStandard);
+      assert.equal(thrownBy(() => openSync(configPath, "r")), nonStandard);
 
       // The code is outside the E[A-Z0-9_] grammar, so the thrown text is the fixed description with no code at all.
       const direct = thrownBy(() => resolveQualysConfiguration({ config_file: configPath }, {}));

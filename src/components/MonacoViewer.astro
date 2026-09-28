@@ -10,9 +10,9 @@ const { content } = Astro.props;
 <div class="editor-toolbar">
   <div class="toolbar-actions">
     <button id="tb-copy" class="toolbar-btn" title="Copy markdown">COPY</button>
-    <button id="tb-wrap" class="toolbar-btn active" title="Toggle word wrap">WRAP</button>
+    <button id="tb-wrap" class="toolbar-btn active" title="Toggle word wrap" aria-pressed="true">WRAP</button>
     <button id="tb-load" class="toolbar-btn active" title="Load enhanced editor">EDITOR</button>
-    <button id="tb-map" class="toolbar-btn" title="Toggle minimap" disabled>MAP</button>
+    <button id="tb-map" class="toolbar-btn" title="Toggle minimap" aria-pressed="false" disabled>MAP</button>
   </div>
 </div>
 
@@ -36,9 +36,11 @@ const { content } = Astro.props;
 <div id="monaco-container" style="display:none;"></div>
 
 <!-- Fallback / default viewer -->
-<pre id="monaco-fallback-pre" class="fallback-pre fallback-pre-wrap" aria-label="Raw markdown">{content}</pre>
+<pre id="monaco-fallback-pre" class="fallback-pre fallback-pre-wrap" aria-label="Raw markdown" tabindex="0">{content}</pre>
 
 <script>
+import type { mountMonacoViewer } from '../lib/monaco-viewer';
+
 (() => {
   const rawMarkdown = document.getElementById('monaco-fallback-pre')?.textContent ?? '';
   const container = document.getElementById('monaco-container');
@@ -46,8 +48,8 @@ const { content } = Astro.props;
   const fallbackPre = document.getElementById('monaco-fallback-pre');
   const copyBtn = document.getElementById('tb-copy');
   const wrapBtn = document.getElementById('tb-wrap');
-  const loadBtn = document.getElementById('tb-load');
-  const mapBtn = document.getElementById('tb-map');
+  const loadBtn = document.getElementById('tb-load') as HTMLButtonElement | null;
+  const mapBtn = document.getElementById('tb-map') as HTMLButtonElement | null;
   const mobileNote = document.getElementById('monaco-mobile-note');
 
   if (!container || !skeleton || !fallbackPre || !copyBtn || !wrapBtn || !loadBtn || !mapBtn || !mobileNote) return;
@@ -56,13 +58,13 @@ const { content } = Astro.props;
   let wrapOn = true;
   let mapOn = false;
   let loading = false;
-  let controller = null;
+  let controller: Awaited<ReturnType<typeof mountMonacoViewer>> | null = null;
   let disposed = false;
 
-  function syncFallbackWrap() {
+  const syncFallbackWrap = () => {
     fallbackPre.classList.toggle('fallback-pre-wrap', wrapOn);
     fallbackPre.classList.toggle('fallback-pre-nowrap', !wrapOn);
-  }
+  };
 
   syncFallbackWrap();
 
@@ -72,6 +74,7 @@ const { content } = Astro.props;
     } catch {
       return;
     }
+    (window as Window & { __announce?: (message: string) => void }).__announce?.('Spec markdown copied to clipboard');
     copyBtn.textContent = 'COPIED';
     copyBtn.classList.add('copied');
     setTimeout(() => {
@@ -83,6 +86,7 @@ const { content } = Astro.props;
   wrapBtn.addEventListener('click', () => {
     wrapOn = !wrapOn;
     wrapBtn.classList.toggle('active', wrapOn);
+    wrapBtn.setAttribute('aria-pressed', String(wrapOn));
     syncFallbackWrap();
     if (controller) controller.setWrap(wrapOn);
   });
@@ -91,13 +95,15 @@ const { content } = Astro.props;
     if (!controller) return;
     mapOn = !mapOn;
     mapBtn.classList.toggle('active', mapOn);
+    mapBtn.setAttribute('aria-pressed', String(mapOn));
     controller.setMap(mapOn);
   });
 
-  async function loadEditor() {
+  const loadEditor = async () => {
     if (disposed || controller || loading) return;
     loading = true;
     loadBtn.textContent = 'LOADING';
+    if (document.activeElement === loadBtn) fallbackPre.focus({ preventScroll: true });
     loadBtn.disabled = true;
     skeleton.hidden = false;
 
@@ -123,7 +129,7 @@ const { content } = Astro.props;
     } finally {
       loading = false;
     }
-  }
+  };
 
   function teardown() {
     if (disposed) return;

@@ -22,11 +22,11 @@ Configuration precedence is explicit tool arguments, then environment variables,
 | Setting | Tool argument | Environment variable | Config file key |
 | --- | --- | --- | --- |
 | Access token (required) | `token` | `LAUNCHDARKLY_API_TOKEN` (fallback `LD_ACCESS_TOKEN`) | `token`, `api_token`, or `access_token` |
-| Base URL | `base_url` | `LAUNCHDARKLY_BASE_URL` (fallback `LD_BASE_URI`) | `base_url` |
+| Base URL | `base_url` | `LAUNCHDARKLY_BASE_URL` (fallback `LD_BASE_URI`) | `base_url` or `base_uri` |
 | API version | `api_version` | `LAUNCHDARKLY_API_VERSION` | `api_version` |
-| Timeout (seconds) | `timeout_seconds` | `LAUNCHDARKLY_TIMEOUT` | `timeout_seconds` |
-| Approved member domains | `allowed_domains` | `LAUNCHDARKLY_ALLOWED_DOMAINS` | `allowed_domains` |
-| Project scope | `project_keys` | `LAUNCHDARKLY_PROJECTS` | `projects` |
+| Timeout (seconds, default 30) | `timeout_seconds` | `LAUNCHDARKLY_TIMEOUT` | `timeout_seconds` or `timeout` |
+| Approved member domains | `allowed_domains` | `LAUNCHDARKLY_ALLOWED_DOMAINS` | `allowed_domains` or `domains` |
+| Project scope | `project_keys` | `LAUNCHDARKLY_PROJECTS` | `projects` or `project_keys` |
 | Config file path | `config_path` | `LAUNCHDARKLY_CONFIG` | n/a (defaults to `~/.config/launchdarkly-sec-inspector/config.toml`) |
 
 Base URL defaults to `https://app.launchdarkly.com`. Use `https://app.launchdarkly.us` for the federal instance and `https://app.eu.launchdarkly.com` for the EU instance.
@@ -62,7 +62,7 @@ The SDK keys endpoint (`/api/v2/projects/{projectKey}/environments/{environmentK
 | `launchdarkly_assess_monitoring_integrations` | Controls 12, 13, 18, 20, 21. Arguments: `retention_days`, `integration_keys`, `relay_config_max_age_days`, `production_pattern`. |
 | `launchdarkly_export_audit_bundle` | Runs the access check and all five assessments, then writes a bundle plus zip under `output_dir` (default `./export/launchdarkly`). |
 
-Every tool accepts the shared auth arguments `token`, `base_url`, `api_version`, `config_path`, and `timeout_seconds`.
+Every tool accepts the shared auth arguments `token`, `base_url`, `api_version`, `config_path`, and `timeout_seconds`. The list arguments `allowed_domains`, `project_keys`, and `integration_keys` are comma-separated strings (for example `"web,mobile"`). `allowed_domains` and `project_keys` can also come from their environment variables (same comma-separated form) or the config file (TOML arrays); `integration_keys` is a tool argument only.
 
 Production environments are those flagged `critical` in LaunchDarkly or whose key or name matches `production_pattern` (default `prod`, case-insensitive).
 
@@ -75,6 +75,8 @@ Control 16 evaluates custom role policies with a resource specifier parser that 
   metadata.json
   QUICK_REFERENCE.md
   _errors.log                      (only when some reads failed)
+  core_data/access_check.json      the access check result
+  core_data/collection_status.json one row per collection with its read status, truncation, and counts, plus totals
   core_data/                       API snapshots with credential values replaced by [REDACTED] and flags projected; collections carry truncated, seen, total, items, and readable/error when a read failed
   analysis/findings.json           all findings with evidence and mappings
   analysis/<category>.json         one summary per assessment
@@ -92,7 +94,7 @@ Control 16 evaluates custom role policies with a resource specifier parser that 
 <host>-<accountId>-audit-bundle.zip
 ```
 
-Repeated exports never overwrite earlier results: when `<host>-<accountId>-audit-bundle` (or its zip) already exists, the next run allocates `-2`, `-3`, and so on, and the zip always takes the name of the directory it was built from (`<host>-<accountId>-audit-bundle-2.zip`). Output paths are resolved through `resolveSecureOutputPath`, which rejects directory traversal and symlinked parents, and files are written with owner-only permissions. Credentials never reach the bundle: every `core_data/` snapshot (including `access_check.json`) passes through a redaction step that replaces the string value under any credential-shaped key (`token`, `secret`, `password`, `passphrase`, `apiKey`, `mobileKey`, `fullKey`, `authorization`, and their snake_case and plural forms, including `{name, value}` header pairs inside integration configs) with `[REDACTED]` while keeping the key, and reduces webhook and integration destination URLs to scheme plus host so path or query tokens are dropped. Flags are projected to their governance fields (`key`, `name`, `kind`, `temporary`, `archived`, `deprecated`, `creation_date`, `tags`, `maintainer_id`, a variation count, and per environment `on`, `archived`, `last_modified`, the rule count, prerequisite keys, and target counts per context kind); variation values and targeting clause values are never written. Non-JSON error bodies are described by content type and length in error text, never echoed, and the assessment tools return findings, summaries, and errors without the raw snapshots.
+Repeated exports never overwrite earlier results: when `<host>-<accountId>-audit-bundle` (or its zip) already exists, the next run allocates `-2` through `-6` (and fails once all six names are taken), and the zip always takes the name of the directory it was built from (`<host>-<accountId>-audit-bundle-2.zip`). Output paths are resolved through `resolveSecureOutputPath`, which rejects directory traversal and symlinked parents, and files are written with owner-only permissions. Credentials never reach the bundle: every `core_data/` snapshot (including `access_check.json`) passes through a redaction step that replaces the string value under any credential-shaped key (`token`, `secret`, `password`, `passphrase`, `apiKey`, `mobileKey`, `fullKey`, `authorization`, and their snake_case and plural forms, including `{name, value}` header pairs inside integration configs) with `[REDACTED]` while keeping the key, and reduces webhook and integration destination URLs to scheme plus host so path or query tokens are dropped. Flags are projected to their governance fields (`key`, `name`, `kind`, `temporary`, `archived`, `deprecated`, `creation_date`, `tags`, `maintainer_id`, a variation count, and per environment `on`, `archived`, `last_modified`, the rule count, prerequisite keys, and target counts per context kind); variation values and targeting clause values are never written. Non-JSON error bodies are described by content type and length in error text, never echoed, and the assessment tools return findings, summaries, and errors without the raw snapshots.
 
 ## Finding shape and status semantics
 

@@ -32,7 +32,7 @@ Create a Box Platform app in the Developer Console, enable the scopes below, and
 | `BOX_ACCESS_TOKEN` (also `BOX_TOKEN`, `BOX_DEVELOPER_TOKEN`) | Pre-issued OAuth 2.0 access token. |
 | `BOX_REFRESH_TOKEN` | OAuth 2.0 refresh token, used with the client ID and secret when a 401 is returned. |
 | `BOX_CONFIG_PATH` | YAML config file path (default `~/.box-sec-inspector/config.yaml`). |
-| `BOX_API_BASE_URL`, `BOX_TOKEN_URL` | Override `https://api.box.com/2.0` and `https://api.box.com/oauth2/token`. |
+| `BOX_API_BASE_URL` (also `BOX_BASE_URL`), `BOX_TOKEN_URL` | Override `https://api.box.com/2.0` and `https://api.box.com/oauth2/token`. |
 | `BOX_TIMEOUT`, `BOX_MAX_RETRIES` | Request timeout in seconds (default 30) and retries for 429 and 5xx responses (default 3). |
 
 Precedence is explicit tool arguments, then environment variables, then the config file. An argument that is not passed never erases an environment value: a tool called with only `timeout_seconds` still uses `BOX_ACCESS_TOKEN` and the file `BOX_CONFIG_PATH` names. A config file named by `config_path` or `BOX_CONFIG_PATH` must exist and hold at least one Box setting (a missing default file at `~/.box-sec-inspector/config.yaml` is simply absent). When a config or JWT file cannot be read or parsed, the tool fails with fixed text that carries only the path, the filesystem's error code (`ENOENT`, `EACCES`, `EISDIR`), and the YAML parser's line or `JSON.parse`'s position (`Unable to parse Box config file: invalid YAML in <path> at line 4`), never the library's own message, which quotes the offending line, and nothing is written. The YAML file accepts the same keys in snake_case, optionally nested under a `box:` section:

@@ -988,6 +988,8 @@ test("verdict safety: recording disclaimer distinguishes documented option names
 test("checkZoomAccess reports readable Zoom audit surfaces per documented option view", async () => {
   const result = await checkZoomAccess(compliantClient(), { now: NOW });
   assert.equal(result.status, "healthy");
+  assert.ok(result.notes.includes("Authenticated as auditor@example.com."));
+  assert.equal(result.notes.some((note) => note.includes("Could not read /users/me")), false);
   assert.equal(result.surfaces.filter((surface) => surface.status === "readable").length, result.surfaces.length);
   assert.ok(result.surfaces.some((surface) => surface.name === "account_settings:security"));
   assert.ok(result.surfaces.some((surface) => surface.endpoint.includes("setting_types=auto_call_recording")));
@@ -1007,6 +1009,8 @@ test("checkZoomAccess reports readable Zoom audit surfaces per documented option
 
   const denied = await checkZoomAccess(deniedClient(), { now: NOW });
   assert.equal(denied.status, "limited");
+  assert.ok(denied.notes.includes("Could not read /users/me; Zoom credentials may be invalid or missing required authorization."));
+  assert.equal(denied.notes.some((note) => note.startsWith("Authenticated as ")), false);
   assert.match(denied.recommendedNextStep, /account:read:admin/);
 });
 

@@ -20,7 +20,7 @@ The GCP integration implements the `gcp-sec-inspector` spec as native grclanker 
 | Variable | Purpose |
 |----------|---------|
 | `GCP_ORGANIZATION_ID` (alias `GCP_ORG_ID`) | Organization to inventory. Projects are enumerated through Cloud Asset Inventory under this organization. |
-| `GCP_PROJECT_ID` or `GOOGLE_CLOUD_PROJECT` | Single-project fallback when no organization is configured, or a focus project for effective org policy reads. |
+| `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, or `GCLOUD_PROJECT` | Single-project fallback when no organization is configured, or a focus project for effective org policy reads. When none is set, the `project_id` of the credential file the chain below loads is used, but only if that file is a service account key; an access token (argument or environment) means no file is loaded, so set a project variable or `organization_id` in that case. |
 
 Every tool also accepts `organization_id` and `project_id` arguments that take precedence over the environment.
 
@@ -30,7 +30,7 @@ The credential chain is evaluated in this order:
 
 1. `access_token` argument, then `GCP_ACCESS_TOKEN` (also `GOOGLE_OAUTH_ACCESS_TOKEN` or `GOOGLE_ACCESS_TOKEN`)
 2. `credentials_file` argument, then `GCP_CREDENTIALS_FILE`, then `GOOGLE_APPLICATION_CREDENTIALS`
-3. The Application Default Credentials file (`~/.config/gcloud/application_default_credentials.json`, honoring `CLOUDSDK_CONFIG`)
+3. The Application Default Credentials file (`~/.config/gcloud/application_default_credentials.json`, honoring `CLOUDSDK_CONFIG`; `%APPDATA%\gcloud\application_default_credentials.json` on Windows)
 4. `gcloud auth print-access-token`
 
 Credential files may be a service account key (`type: service_account`) or an authorized user ADC file (`type: authorized_user`). Service account keys are exchanged with the documented OAuth 2.0 service account JWT flow: an RS256 assertion signed with `node:crypto` and posted to the key's `token_uri` with `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and the `https://www.googleapis.com/auth/cloud-platform` scope. Authorized user files use the refresh token grant. No SDK or extra dependency is required.

@@ -991,6 +991,31 @@ function deriveGraphqlUrl(apiBaseUrl: string): string {
   return `${apiBaseUrl.replace(/\/api\/v3$/i, "/api")}/graphql`;
 }
 
+function validateGraphqlUrl(graphqlUrl: string, apiBaseUrl: string): void {
+  let parsedGraphqlUrl: URL;
+  try {
+    parsedGraphqlUrl = new URL(graphqlUrl);
+  } catch {
+    throw new Error("GitHub GraphQL URL must be a valid absolute URL.");
+  }
+  if (parsedGraphqlUrl.username.length > 0 || parsedGraphqlUrl.password.length > 0) {
+    throw new Error("GitHub GraphQL URL must not carry userinfo.");
+  }
+  if (parsedGraphqlUrl.protocol !== "http:" && parsedGraphqlUrl.protocol !== "https:") {
+    throw new Error("GitHub GraphQL URL must use HTTP or HTTPS.");
+  }
+
+  let parsedApiBaseUrl: URL;
+  try {
+    parsedApiBaseUrl = new URL(apiBaseUrl);
+  } catch {
+    throw new Error("GitHub REST API URL must be a valid absolute URL.");
+  }
+  if (parsedGraphqlUrl.origin !== parsedApiBaseUrl.origin) {
+    throw new Error("GitHub GraphQL URL must share the REST API origin.");
+  }
+}
+
 function normalizeAuthMode(value: unknown): GitHubAuthMode | undefined {
   const normalized = safeLower(value);
   if (!normalized) return undefined;
@@ -1519,6 +1544,8 @@ export async function resolveGitHubConfiguration(
   }
 
   const apiBaseUrl = normalizeApiBaseUrl(overlay.apiBaseUrl ?? "https://api.github.com");
+  const graphqlUrl = overlay.graphqlUrl ? normalizeApiBaseUrl(overlay.graphqlUrl) : deriveGraphqlUrl(apiBaseUrl);
+  validateGraphqlUrl(graphqlUrl, apiBaseUrl);
   return {
     organization,
     enterprise: overlay.enterprise ? normalizeOrganization(overlay.enterprise) : undefined,
@@ -1528,7 +1555,7 @@ export async function resolveGitHubConfiguration(
     appPrivateKey: overlay.appPrivateKey,
     installationId: overlay.installationId,
     apiBaseUrl,
-    graphqlUrl: overlay.graphqlUrl ? normalizeApiBaseUrl(overlay.graphqlUrl) : deriveGraphqlUrl(apiBaseUrl),
+    graphqlUrl,
     lookbackDays: overlay.lookbackDays ?? DEFAULT_LOOKBACK_DAYS,
     sourceChain,
   };
@@ -1754,7 +1781,9 @@ export class GitHubAuditorClient {
     query: string,
     variables: JsonRecord = {},
   ): Promise<GitHubGraphqlResult<T>> {
-    const { payload } = await this.requestJson<JsonRecord>(this.config.graphqlUrl, {
+    const graphqlUrl = this.config.graphqlUrl;
+    validateGraphqlUrl(graphqlUrl, this.config.apiBaseUrl);
+    const { payload } = await this.requestJson<JsonRecord>(graphqlUrl, {
       method: "POST",
       body: { query, variables },
     });
