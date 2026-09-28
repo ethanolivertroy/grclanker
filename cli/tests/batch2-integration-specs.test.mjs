@@ -277,6 +277,7 @@ test("batch 2 configurable and numeric decision boundaries execute below, equal,
   }
   const zscalerBaseline = {
     evidence_readable: true,
+    evidence_complete: true,
     atp_setting_count: 7,
     malware_setting_count: 5,
     missing_atp_flag_count: 0,
