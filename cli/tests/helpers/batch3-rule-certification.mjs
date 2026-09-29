@@ -199,9 +199,18 @@ function isolateCondition(condition, target, constants, facts) {
     return;
   }
   if (condition.op === "and" || condition.op === "or") {
-    for (const child of condition.conditions) {
-      if (containsCondition(child, target)) isolateCondition(child, target, constants, facts);
-      else satisfy(child, constants, facts, condition.op === "and");
+    const targetChild = condition.conditions.find((child) => containsCondition(child, target));
+    assert.ok(targetChild, "target condition child");
+    if (condition.op === "and") {
+      isolateCondition(targetChild, target, constants, facts);
+      for (const child of condition.conditions) {
+        if (child !== targetChild) satisfy(child, constants, facts, true);
+      }
+    } else {
+      for (const child of condition.conditions) {
+        if (child !== targetChild) satisfy(child, constants, facts, false);
+      }
+      isolateCondition(targetChild, target, constants, facts);
     }
     return;
   }
