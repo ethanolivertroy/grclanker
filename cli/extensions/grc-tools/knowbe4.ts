@@ -2888,13 +2888,15 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     tested_users_in_read_samples: recipients.anyRead ? tested.size : null,
     coverage_pct: complete ? coverage ?? null : null,
     min_coverage_pct: minCoveragePct,
-    lookback_days: lookbackDays,
     security_tests_in_window: whenComplete(snapshot.securityTests, testsInWindow.length),
     sampled_security_tests: recipients.anyRead ? samples.map((sample) => sample.pst_id) : null,
     unsampled_security_tests: unsampled,
     recipient_reads_complete: recipients.anyRead ? recipients.complete : null,
     untested_user_sample: complete ? sampleLabels(untested, redact) : null,
-  }, { oldest_included_test_age_days: oldestIncludedTestAgeDays });
+  }, {
+    oldest_included_test_age_days: oldestIncludedTestAgeDays,
+    lookback_days: lookbackDays,
+  });
   const violationCount = testsInWindow.length === 0
     || (complete && coverage !== undefined && coverage < minCoveragePct)
     ? 1
