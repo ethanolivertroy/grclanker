@@ -188,11 +188,31 @@ function firstMatchingRule(check, facts) {
 
 function decisiveBaseline(check, targetRuleId, runtimeSeed) {
   const facts = neutralFacts(check, runtimeSeed);
+  const precedingRules = [];
   for (const [ruleId, rule] of Object.entries(check.derivedFactRules)) {
     if (ruleId === targetRuleId) break;
+    precedingRules.push(rule);
     satisfy(rule.condition, check.criteria.constants, facts, false);
   }
   satisfy(check.derivedFactRules[targetRuleId].condition, check.criteria.constants, facts, true);
+  for (const rule of precedingRules) {
+    const nodes = conditionNodes(rule.condition);
+    for (const node of nodes) {
+      if (!["gt", "gte", "lt", "lte"].includes(node.op)) continue;
+      const observed = pathOf(node.left);
+      const configured = pathOf(node.right);
+      if (!observed?.endsWith("_observed_value") || !configured?.endsWith("_configured_value")) continue;
+      const defaultComparison = nodes.find((candidate) =>
+        candidate.op === node.op
+        && pathOf(candidate.left) === observed
+        && Object.hasOwn(check.criteria.constants, pathOf(candidate.right)));
+      if (!defaultComparison) continue;
+      const boundary = Number(check.criteria.constants[pathOf(defaultComparison.right)]);
+      const nonMatching = comparisonValues(node.op, boundary).find((candidate) => !candidate.matches);
+      facts[configured] = boundary;
+      facts[observed] = nonMatching?.value ?? boundary;
+    }
+  }
   return facts;
 }
 
@@ -222,14 +242,18 @@ export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
           if (!["gt", "gte", "lt", "lte"].includes(node.op)) continue;
           const left = pathOf(node.left);
           const right = pathOf(node.right);
-          if (left === observed && right?.endsWith("_configured_value")) baseline[right] = constantValue;
-          if (right === observed && left?.endsWith("_configured_value")) baseline[left] = constantValue;
+          if (left === observed && right?.endsWith("_configured_value")) baseline[right] = null;
+          if (right === observed && left?.endsWith("_configured_value")) baseline[left] = null;
         }
         const denominator = match.node.op === "ratio" ? 100 : 1;
         const scale = match.node.op === "ratio" ? match.node.scale ?? 1 : 1;
         const variants = comparisonValues(match.node.op === "ratio" ? match.node.comparator : match.node.op, constantValue)
           .map(({ value, matches }) => {
-            const facts = { ...baseline, [observed]: value * denominator / scale };
+            const facts = {
+              ...baseline,
+              [observed]: value * denominator / scale,
+              ...(match.node.op === "ratio" ? { [pathOf(match.node.denominator)]: denominator } : {}),
+            };
             return {
               branchMatches: evaluateVerdictCondition(check.derivedFactRules[match.id].condition, { ...check.criteria.constants, ...facts }),
               first: firstMatchingRule(check, facts),
