@@ -218,6 +218,13 @@ export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
           : pathOf(match.node.left) === constant ? pathOf(match.node.right) : pathOf(match.node.left);
         assert.notEqual(seed[observed], undefined, `${check.id}.${constant}: observed fact came from an assessor`);
         const baseline = decisiveBaseline(check, match.id, seed);
+        for (const node of conditionNodes(check.derivedFactRules[match.id].condition)) {
+          if (!["gt", "gte", "lt", "lte"].includes(node.op)) continue;
+          const left = pathOf(node.left);
+          const right = pathOf(node.right);
+          if (left === observed && right?.endsWith("_configured_value")) baseline[right] = constantValue;
+          if (right === observed && left?.endsWith("_configured_value")) baseline[left] = constantValue;
+        }
         const denominator = match.node.op === "ratio" ? 100 : 1;
         const scale = match.node.op === "ratio" ? match.node.scale ?? 1 : 1;
         const variants = comparisonValues(match.node.op === "ratio" ? match.node.comparator : match.node.op, constantValue)
