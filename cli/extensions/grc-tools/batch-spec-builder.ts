@@ -143,6 +143,11 @@ export interface BatchOutputDefinition {
   jsonFormatting?: string;
 }
 
+function isBatch3CheckId(checkId: string): boolean {
+  return ["CS-", "TENABLE-", "QUALYS-", "VERACODE-", "KNOWBE4-"]
+    .some((prefix) => checkId.startsWith(prefix));
+}
+
 export function deriveDecisionRules(
   checkId: string,
   rules: readonly VerdictRule[],
@@ -153,7 +158,9 @@ export function deriveDecisionRules(
   const rewritten = reachableRules.map((entry, index) => {
     const name = `${checkId.toLowerCase().replaceAll("-", "_")}_branch_${String(index + 1).padStart(2, "0")}_matches`;
     derivedFactRules[name] = {
-      description: `${checkId} ordered branch ${index + 1} selects ${entry.status} when ${renderVerdictCondition(entry.condition)}.`,
+      description: isBatch3CheckId(checkId)
+        ? `${checkId} ordered branch ${index + 1} selects ${entry.status} when ${renderVerdictCondition(entry.condition)}.`
+        : `${checkId} ordered branch ${index + 1} (${entry.status}) is true exactly when its portable evidence condition matches.`,
       condition: entry.condition,
     };
     return {
@@ -363,6 +370,7 @@ function renderExampleAssignment(
 }
 
 function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
+  const checkSpecificExamples = isBatch3CheckId(check.id);
   const manualOnly = /^always return manual\b/i.test(check.decision)
     && !/\b(?:pass|warn|fail)\b/i.test(check.decision.replace(/^always return manual\b/i, ""));
   const declaredStatuses = new Set(check.decisionRules?.map((rule) => rule.status) ?? []);
@@ -492,9 +500,13 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     status: EvaluatedFindingStatus,
   ) => ({
     kind,
-    input: `${check.id} ${check.title}: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`,
+    input: checkSpecificExamples
+      ? `${check.id} ${check.title}: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`
+      : `${check.id} concrete primitive assignment: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`,
     expected: status,
-    reason: `${check.id} returns ${status} because ${sourceConditionFor(status)} is the first matching ordered condition.`,
+    reason: checkSpecificExamples
+      ? `${check.id} returns ${status} because ${sourceConditionFor(status)} is the first matching ordered condition.`
+      : `${check.id} reaches the first ${status} rule under this named primitive assignment.`,
   });
   return {
     pass: `${check.id} returns pass at the first ordered pass condition ${sourceConditionFor("pass")}. Decision predicate: ${check.decision}`,
@@ -506,7 +518,7 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
       requiredEvidenceComplete: true,
     },
     examples: [
-      exampleFor(outcomes.pass ? "compliant" : "unreadable", compliantStatus),
+      exampleFor(checkSpecificExamples && !outcomes.pass ? "unreadable" : "compliant", compliantStatus),
       exampleFor("noncompliant", noncompliantStatus),
       exampleFor("partial", partialStatus),
       exampleFor("unreadable", "manual"),

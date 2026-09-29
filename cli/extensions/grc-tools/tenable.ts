@@ -5523,7 +5523,7 @@ export function registerTenableTools(pi: any): void {
     "scan_program",
     "tenable_assess_scan_program",
     "Assess Tenable scan program",
-    "Assess Tenable scan policy configuration, scan schedule discipline, credentialed scan ratio, scan exclusions, compliance audit templates, and legacy target groups (spec controls 1, 2, 4, 13, 17, 20) plus the Security Center schedule equivalent.",
+    "Assess Tenable scan policy configuration, scan schedule discipline, credentialed scan ratio, scan exclusions, compliance audit templates, and deprecated target groups (spec controls 1, 2, 4, 13, 17, 20) plus the Security Center schedule equivalent.",
   );
   registerAssessmentTool(
     pi,
@@ -5537,7 +5537,7 @@ export function registerTenableTools(pi: any): void {
     "access_control",
     "tenable_assess_access_control",
     "Assess Tenable access control",
-    "Assess Tenable user roles, MFA and SAML enforcement, API key usage, access control permissions and legacy access groups, managed credential hygiene, and activity log review (spec controls 10, 11, 12, 18) plus the Security Center user equivalent.",
+    "Assess Tenable user roles, MFA and SAML enforcement, API key usage, access control permissions and deprecated access groups, managed credential hygiene, and activity log review (spec controls 10, 11, 12, 18) plus the Security Center user equivalent.",
   );
   registerAssessmentTool(
     pi,
