@@ -189,15 +189,15 @@ test("hidden threshold bands execute below, equal, and above against primitive f
   const verdict = (id, facts) => evaluateCheckVerdict(byId.get(id), facts);
 
   const knowbe402UnreadableRecipients = {
-    knowbe4_02_user_and_test_reads_succeeded: true,
-    knowbe4_02_user_and_recipient_lists_complete: false,
-    knowbe4_02_active_user_count: 10,
-    knowbe4_02_coverage_violation_count: 0,
-    knowbe4_02_coverage_review_count: 1,
-    knowbe4_02_oldest_included_test_age_days_observed_value: null,
-    knowbe4_02_lookback_days_configured_value: 365,
-    knowbe4_02_coverage_pct_observed_value: null,
-    knowbe4_02_min_coverage_pct_configured_value: 90,
+    knowbe4_02_phishing_simulation_coverage_sources_readable: true,
+    knowbe4_02_phishing_simulation_coverage_population_complete: false,
+    knowbe4_02_phishing_simulation_coverage_population_count: 10,
+    knowbe4_02_phishing_simulation_coverage_violation_count: 0,
+    knowbe4_02_phishing_simulation_coverage_review_count: 1,
+    knowbe4_02_default_lookback_days_observed_value: null,
+    knowbe4_02_default_lookback_days_configured_value: 365,
+    knowbe4_02_default_min_coverage_pct_observed_value: null,
+    knowbe4_02_default_min_coverage_pct_configured_value: 90,
   };
   assert.equal(
     verdict("KNOWBE4-02", knowbe402UnreadableRecipients),
