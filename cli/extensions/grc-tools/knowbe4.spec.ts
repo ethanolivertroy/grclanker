@@ -252,7 +252,7 @@ const rows: readonly Batch3CheckRow[] = [
       batch2Rule("pass", { op: "always" }),
     ],
   },
-  { id: "KNOWBE4-11", control: 11, title: "Training content currency", severity: "medium", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments", "store-purchases"], predicate: "Count assigned store purchases whose publication or update age exceeds max_content_age_days or whose date is absent.", emptyOutcome: "warn", constants: { default_max_content_age_days: 365 }, thresholds: [batch3Threshold("KNOWBE4-11", "default_max_content_age_days", "max_observed_content_age_days", "gt", "fail", "Greatest age in days among all assigned dated store purchases.", "max_content_age_days")] },
+  { id: "KNOWBE4-11", control: 11, title: "Training content currency", severity: "medium", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments", "store-purchases"], predicate: "Fail for any assigned retired store purchase; warn when an assigned module's publication or update age exceeds max_content_age_days or its date is absent.", emptyOutcome: "warn", constants: { default_max_content_age_days: 365 }, thresholds: [batch3Threshold("KNOWBE4-11", "default_max_content_age_days", "max_observed_content_age_days", "gt", "warn", "Greatest age in days among all assigned dated store purchases.", "max_content_age_days")] },
   {
     id: "KNOWBE4-12",
     control: 12,
