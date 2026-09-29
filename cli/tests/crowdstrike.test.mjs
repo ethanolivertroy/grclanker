@@ -469,6 +469,11 @@ test("CrowdStrike assessors emit every metadata rule-driving fact from runtime r
       countZtaAssessments: async (filter) => filter.startsWith("score:<") ? 1 : 3,
       listZtaAssessments: async () => [{ device_id: "aid-low", score: 59 }],
     })),
+    await runAllCrowdstrikeAssessments(createFakeClient({
+      listHosts: async (_limit, filter) => filter
+        ? [host({ hostname: "contained-01", status: "contained", modified_timestamp: isoHoursAgo(73) })]
+        : [host()],
+    })),
   ];
   const findings = runtimeRuns.flatMap((run) => run.flatMap((assessment) => assessment.findings));
   const expected = new Set(CROWDSTRIKE_SPEC.checks.flatMap((check) =>
