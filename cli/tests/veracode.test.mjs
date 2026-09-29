@@ -3081,8 +3081,10 @@ test("Veracode assessors emit every runtime-observable metadata rule-driving fac
   const findings = runs.flatMap((run) => run.flatMap((assessment) => assessment.findings));
   const expected = new Set(VERACODE_SPEC.checks.flatMap((check) =>
     check.evidenceFields.filter((name) =>
-      name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
-  assert.equal(expected.size, 15);
+      name.endsWith("_observed_value")
+      || name.endsWith("_observed_values")
+      || name.endsWith("_configured_value"))));
+  assert.equal(expected.size, 25);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};

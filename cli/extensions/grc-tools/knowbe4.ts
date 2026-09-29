@@ -2888,6 +2888,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     tested_users_in_read_samples: recipients.anyRead ? tested.size : null,
     coverage_pct: complete ? coverage ?? null : null,
     min_coverage_pct: minCoveragePct,
+    lookback_days: lookbackDays,
     security_tests_in_window: whenComplete(snapshot.securityTests, testsInWindow.length),
     sampled_security_tests: recipients.anyRead ? samples.map((sample) => sample.pst_id) : null,
     unsampled_security_tests: unsampled,
@@ -2901,7 +2902,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
   const reviewCount = violationCount === 0 && (samples.length === 0 || !complete) ? 1 : 0;
   return withInventoryCaveats(finding(2, "high", summary, evidence, undefined, {
     readable: true,
-    complete: true,
+    complete,
     population: active.size,
     failureMatches: violationCount,
     reviewMatches: reviewCount,
