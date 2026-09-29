@@ -136,6 +136,7 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Compute hosts carrying LAST_VM_AUTH_SCANNED_DATE inside the resolved lookback divided by hosts carrying a vulnerability scan date; fail when the percentage is below configured_min_auth_scan_percent.",
     constants: { default_min_auth_scan_percent: 80 },
     thresholds: [batch3Threshold("QUALYS-C02", "default_min_auth_scan_percent", "authenticated_percent", "lt", "fail", "Authenticated scanned hosts divided by all hosts carrying a vulnerability-scan date, multiplied by 100.", "min_auth_scan_percent")],
+    primitiveRuleIndex: 4,
     runtimeFactNames: {
       readable: "qualys_c02_host_list_readable",
       complete: "qualys_c02_host_list_complete",
@@ -157,14 +158,6 @@ const rows: readonly Batch3CheckRow[] = [
       batch2Rule("manual", batch2Not(batch2Defined("qualys_c02_configured_min_auth_scan_percent"))),
       batch2Rule("manual", batch2Eq("qualys_c02_returned_host_count", 0)),
       batch2Rule("fail", batch2Eq("qualys_c02_scanned_host_count", 0)),
-      batch2Rule("fail", {
-        op: "ratio",
-        numerator: batch2Path("qualys_c02_authenticated_host_count"),
-        denominator: batch2Path("qualys_c02_scanned_host_count"),
-        comparator: "lt",
-        threshold: batch2Path("qualys_c02_configured_min_auth_scan_percent"),
-        scale: 100,
-      }),
       batch2Rule("warn", batch2Any(
         batch2Ne("qualys_c02_host_list_complete", true),
         batch2Gt("qualys_c02_hosts_without_scan_date_count", 0),
@@ -200,6 +193,7 @@ const rows: readonly Batch3CheckRow[] = [
       batch3Threshold("QUALYS-C10", "default_sla_high_days", "maximum_severity_4_age_days", "gt", "fail", "Greatest first-found age in days among dated open severity-4 detections.", "sla_high_days"),
       batch3Threshold("QUALYS-C10", "default_sla_medium_days", "maximum_severity_3_age_days", "gt", "fail", "Greatest first-found age in days among dated open severity-3 detections.", "sla_medium_days"),
     ],
+    primitiveRuleIndex: 5,
     runtimeFactNames: {
       readable: "qualys_c10_host_and_detection_reads_succeeded",
       complete: "qualys_c10_host_and_detection_lists_complete",
@@ -253,6 +247,7 @@ const rows: readonly Batch3CheckRow[] = [
     predicate: "Fail when the uncapped active Manager or super-user count exceeds configured_max_managers or any email address is shared by multiple accounts; otherwise review stale, generic, pending, or source-incomplete accounts.",
     constants: { default_max_managers: 5 },
     thresholds: [batch3Threshold("QUALYS-C13", "default_max_managers", "length:managers", "gt", "fail", "Uncapped joined active Manager, Unit Manager, and super-user account count.", "max_managers")],
+    primitiveRuleIndex: 1,
     runtimeFactNames: {
       readable: "qualys_c13_user_sources_readable",
       complete: "qualys_c13_user_population_complete",
@@ -271,10 +266,7 @@ const rows: readonly Batch3CheckRow[] = [
     },
     decisionRules: [
       batch2Rule("manual", batch2Not(batch2Defined("qualys_c13_configured_max_managers"))),
-      batch2Rule("fail", batch2Any(
-        { op: "gt", left: batch2Path("qualys_c13_manager_count"), right: batch2Path("qualys_c13_configured_max_managers") },
-        batch2Gt("qualys_c13_shared_email_count", 0),
-      )),
+      batch2Rule("fail", batch2Gt("qualys_c13_shared_email_count", 0)),
       batch2Rule("manual", batch2Any(
         batch2Ne("qualys_c13_user_sources_readable", true),
         batch2Eq("qualys_c13_active_user_count", 0),
@@ -331,7 +323,7 @@ const rows: readonly Batch3CheckRow[] = [
   },
   { id: "QUALYS-C17", control: 17, title: "Vulnerability prioritization (QDS)", severity: "high", owner: "qualys_assess_vulnerability_management", surfaces: ["detections", "knowledge-base"], predicate: "Count open severe detections with no numeric QDS; an empty complete detection population passes only when the endpoint was readable." },
   { id: "QUALYS-C18", control: 18, title: "Tag-based asset management", severity: "medium", owner: "qualys_assess_asset_inventory", surfaces: ["hosts", "tags"], predicate: "Count hosts with no Qualys tag and the absence of tags identifying compliance scope, environment, or business ownership." },
-  { id: "QUALYS-C19", control: 19, title: "Activity log monitoring", severity: "medium", owner: "qualys_assess_administration", surfaces: ["activity-log"], predicate: "Count sensitive user, policy, report, and scan administration actions inside lookback_days; empty activity is review evidence.", constants: { default_lookback_days: 30 }, thresholds: [batch3Threshold("QUALYS-C19", "default_lookback_days", "oldest_included_activity_age_days", "gt", "warn", "Age in days of the oldest activity-log row admitted to the assessment window.", "lookback_days")] },
+  { id: "QUALYS-C19", control: 19, title: "Activity log monitoring", severity: "medium", owner: "qualys_assess_administration", surfaces: ["activity-log"], predicate: "Filter activity rows to the resolved lookback_days window, then count sensitive user, policy, report, and scan administration actions; empty activity is review evidence.", constants: { default_lookback_days: 30 } },
   { id: "QUALYS-C20", control: 20, title: "Network segmentation scanning", severity: "high", owner: "qualys_assess_scan_coverage", surfaces: ["scheduled-scans", "asset-groups"], predicate: "Count the absence of distinct active scan schedules covering separate DMZ, internal, and OT or ICS asset-group segments." },
 ] as const;
 

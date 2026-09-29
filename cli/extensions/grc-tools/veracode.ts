@@ -2019,8 +2019,8 @@ function veracodeDecisionFacts(id: string, evidence: JsonRecord): Readonly<Recor
     case "VERACODE-07":
       return fact(
         inventory("users_seen"),
-        inventory("teams_seen") === 0 || veracodeEvidenceCount(evidence, "users_with_all_application_access_count") > (asNumber(evidence.max_unrestricted_users) ?? Number.POSITIVE_INFINITY) ? 1 : 0,
-        counts("applications_without_team"),
+        (inventory("teams_seen") === 0 ? 1 : 0) + counts("applications_without_team"),
+        0,
       );
     case "VERACODE-08":
       return fact(

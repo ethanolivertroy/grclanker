@@ -81,7 +81,6 @@ const KNOWBE4_02_COMPLETE = batch2Eq(
 const rows: readonly Batch3CheckRow[] = [
   { id: "KNOWBE4-01", control: 1, title: "Phishing simulation frequency", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["phishing-campaigns", "security-tests"], predicate: "Count the absence of a completed phishing test inside max_campaign_gap_days and adjacent completed tests separated by more than that threshold.", constants: { default_max_campaign_gap_days: 30 }, thresholds: [batch3Threshold("KNOWBE4-01", "default_max_campaign_gap_days", "days_since_last_test", "gt", "fail", "Whole days since the latest completed phishing test.", "max_campaign_gap_days")] },
   { id: "KNOWBE4-02", control: 2, title: "Phishing simulation coverage", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["users", "security-tests", "security-test-recipients"], predicate: "Compute unique active users receiving a test inside lookback_days divided by the complete active-user population; percentages below min_coverage_pct violate.", constants: { default_lookback_days: 90, default_min_coverage_pct: 90 }, thresholds: [
-    batch3Threshold("KNOWBE4-02", "default_lookback_days", "oldest_included_test_age_days", "gt", "fail", "Age of the oldest security test included in the coverage numerator.", "lookback_days", KNOWBE4_02_COMPLETE),
     batch3Threshold("KNOWBE4-02", "default_min_coverage_pct", "coverage_pct", "lt", "fail", "Unique tested active users divided by all active users, multiplied by 100.", "min_coverage_pct", KNOWBE4_02_COMPLETE),
   ] },
   { id: "KNOWBE4-03", control: 3, title: "Training completion rates", severity: "high", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments"], predicate: "Compute completed enrollments divided by all due enrollments for each active campaign; below fail_completion_pct fails and below min_completion_pct warns.", emptyOutcome: "warn", constants: { default_min_completion_pct: 90, default_fail_completion_pct: 80 }, thresholds: [
@@ -99,6 +98,7 @@ const rows: readonly Batch3CheckRow[] = [
     emptyOutcome: "pass",
     constants: { default_enrollment_grace_days: 30, fail_above_late_enrollment_percent: 5 },
     thresholds: [batch3Threshold("KNOWBE4-04", "default_enrollment_grace_days", "maximum_enrollment_delay_days", "gt", "warn", "Greatest elapsed days from active-user creation to first training enrollment.", "enrollment_grace_days")],
+    primitiveRuleIndex: 3,
     runtimeFactNames: {
       readable: "knowbe4_04_user_and_enrollment_reads_succeeded",
       complete: "knowbe4_04_user_and_enrollment_lists_complete",
@@ -142,6 +142,7 @@ const rows: readonly Batch3CheckRow[] = [
     emptyOutcome: "warn",
     constants: { default_max_phish_prone_pct: 15 },
     thresholds: [batch3Threshold("KNOWBE4-06", "default_max_phish_prone_pct", "current_phish_prone_pct", "gt", "fail", "Raw current failed-recipient percentage over every evaluable delivered recipient.", "max_phish_prone_pct")],
+    primitiveRuleIndex: 2,
     runtimeFactNames: {
       readable: "knowbe4_06_security_test_sources_readable",
       complete: "knowbe4_06_recipient_population_complete",
@@ -166,11 +167,6 @@ const rows: readonly Batch3CheckRow[] = [
         batch2Eq("knowbe4_06_security_test_count", 0),
         batch2Not(batch2Defined("knowbe4_06_current_phish_prone_percent")),
       )),
-      batch2Rule("fail", {
-        op: "gt",
-        left: batch2Path("knowbe4_06_current_phish_prone_percent"),
-        right: batch2Path("knowbe4_06_configured_max_phish_prone_percent"),
-      }),
       batch2Rule("warn", batch2Any(
         batch2Ne("knowbe4_06_recipient_population_complete", true),
         batch2All(
@@ -241,6 +237,7 @@ const rows: readonly Batch3CheckRow[] = [
     emptyOutcome: "warn",
     constants: { default_remedial_window_days: 14, pass_remediated_percent: 90, fail_below_remediated_percent: 50 },
     thresholds: [batch3Threshold("KNOWBE4-10", "default_remedial_window_days", "maximum_remedial_enrollment_delay_days", "gt", "warn", "Greatest elapsed days from phishing failure to remedial enrollment among followed-up failed users.", "remedial_window_days")],
+    primitiveRuleIndex: 4,
     runtimeFactNames: {
       readable: "knowbe4_10_remediation_reads_succeeded",
       complete: "knowbe4_10_recipient_and_enrollment_reads_complete",
@@ -285,6 +282,7 @@ const rows: readonly Batch3CheckRow[] = [
     emptyOutcome: "warn",
     constants: { default_max_admin_count: 3 },
     thresholds: [batch3Threshold("KNOWBE4-12", "default_max_admin_count", "admin_count", "gt", "fail", "Uncapped administrator identifier count from the account object.", "max_admin_count")],
+    primitiveRuleIndex: 2,
     runtimeFactNames: {
       readable: "knowbe4_12_account_and_user_sources_readable",
       complete: "knowbe4_12_account_and_user_population_complete",
@@ -305,11 +303,6 @@ const rows: readonly Batch3CheckRow[] = [
         batch2Not(batch2Defined("knowbe4_12_configured_max_admin_count")),
       )),
       batch2Rule("warn", batch2Eq("knowbe4_12_administrator_count", 0)),
-      batch2Rule("fail", {
-        op: "gt",
-        left: batch2Path("knowbe4_12_administrator_count"),
-        right: batch2Path("knowbe4_12_configured_max_admin_count"),
-      }),
       batch2Rule("warn", batch2Any(
         batch2Ne("knowbe4_12_account_and_user_population_complete", true),
         batch2Gt("knowbe4_12_external_administrator_count", 0),

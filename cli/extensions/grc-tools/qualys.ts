@@ -2893,7 +2893,7 @@ export async function assessQualysScanCoverage(
       ? "manual"
       : scannedHosts.length === 0
         ? "fail"
-        : (authPercent ?? 0) >= settings.minAuthScanPercent
+        : authPercent !== null && authPercent >= settings.minAuthScanPercent
           ? "pass"
           : "fail";
   findings.push(guardedFinding({

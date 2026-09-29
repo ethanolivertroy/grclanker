@@ -442,6 +442,14 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       ...(row.incompleteOutcome === "manual" ? [batch2Ne(names.complete, true)] : []),
     ));
     const violationRule = batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0));
+    const primitiveFailRules = primitiveRules.filter((rule) => rule.status === "fail");
+    const primitiveWarnRules = primitiveRules.filter((rule) => rule.status === "warn");
+    const primitiveRulesBeforeViolation = row.violationOutcome === "warn"
+      ? [...primitiveFailRules, ...primitiveWarnRules]
+      : primitiveFailRules;
+    const primitiveRulesAfterViolation = row.violationOutcome === "warn"
+      ? []
+      : primitiveWarnRules;
     const explicitRules = row.decisionRules && primitiveRules.length > 0
       ? [
           ...row.decisionRules.slice(0, row.primitiveRuleIndex ?? -1),
@@ -451,8 +459,18 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       : row.decisionRules;
     const suppliedDecisionRules = explicitRules ?? (row.manualOnly ? undefined : [
       ...(row.incompleteOutcome === "manual"
-        ? [unreadableRule, ...(row.thresholdOnly ? [] : [violationRule]), ...primitiveRules]
-        : [...(row.thresholdOnly ? [] : [violationRule]), unreadableRule, ...primitiveRules]),
+        ? [
+            unreadableRule,
+            ...primitiveRulesBeforeViolation,
+            ...(row.thresholdOnly ? [] : [violationRule]),
+            ...primitiveRulesAfterViolation,
+          ]
+        : [
+            ...primitiveRulesBeforeViolation,
+            ...(row.thresholdOnly ? [] : [violationRule]),
+            unreadableRule,
+            ...primitiveRulesAfterViolation,
+          ]),
       ...(row.emptyOutcome === undefined || row.emptyOutcome === "manual"
         ? [batch2Rule("manual", batch2Eq(names.population, 0))]
         : [batch2Rule(row.emptyOutcome, batch2All(batch2Eq(names.population, 0), batch2Eq(names.complete, true)))]),
