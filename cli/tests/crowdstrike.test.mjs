@@ -472,6 +472,7 @@ test("CrowdStrike assessors emit every metadata rule-driving fact from runtime r
   const findings = runtimeRuns.flatMap((run) => run.flatMap((assessment) => assessment.findings));
   const expected = new Set(CROWDSTRIKE_SPEC.checks.flatMap((check) =>
     check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  assert.equal(expected.size, 30);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};

@@ -2306,6 +2306,7 @@ test("KnowBe4 assessors emit every metadata rule-driving fact from runtime recor
   const findings = runs.flatMap((run) => run.flatMap((assessment) => assessment.findings));
   const expected = new Set(KNOWBE4_SPEC.checks.flatMap((check) =>
     check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  assert.equal(expected.size, 18);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
@@ -2314,6 +2315,7 @@ test("KnowBe4 assessors emit every metadata rule-driving fact from runtime recor
     }
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
 });
 
 function kbMentionedEndpoints(text) {

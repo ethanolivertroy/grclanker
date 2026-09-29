@@ -1003,6 +1003,7 @@ test("Qualys assessors emit every metadata rule-driving fact from runtime record
   const findings = runs.flatMap(allFindings);
   const expected = new Set(QUALYS_SPEC.checks.flatMap((check) =>
     check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  assert.equal(expected.size, 8);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
@@ -1011,6 +1012,7 @@ test("Qualys assessors emit every metadata rule-driving fact from runtime record
     }
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
 });
 
 const EMPTY_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><LIST_OUTPUT><RESPONSE><DATETIME>2026-09-21T00:00:00Z</DATETIME></RESPONSE></LIST_OUTPUT>';

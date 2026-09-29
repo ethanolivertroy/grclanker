@@ -3082,6 +3082,7 @@ test("Veracode assessors emit every runtime-observable metadata rule-driving fac
   const expected = new Set(VERACODE_SPEC.checks.flatMap((check) =>
     check.evidenceFields.filter((name) =>
       name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  assert.equal(expected.size, 15);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
@@ -3090,6 +3091,7 @@ test("Veracode assessors emit every runtime-observable metadata rule-driving fac
     }
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
   const prescan = findings.find((finding) => finding.id === "VERACODE-11");
   assert.deepEqual(
     Object.keys(prescan[BATCH3_RUNTIME_FACTS]).filter((name) => name.endsWith("_observed_value")),

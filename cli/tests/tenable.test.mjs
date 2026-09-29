@@ -311,6 +311,7 @@ test("Tenable assessors emit every metadata rule-driving fact from runtime recor
   const findings = runs.flatMap(allFindings);
   const expected = new Set(TENABLE_SPEC.checks.flatMap((check) =>
     check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  assert.equal(expected.size, 15);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
@@ -319,6 +320,7 @@ test("Tenable assessors emit every metadata rule-driving fact from runtime recor
     }
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
 });
 
 test("resolveTenableConfiguration prefers arguments over environment over config file", () => {
