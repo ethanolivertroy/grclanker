@@ -591,12 +591,7 @@ try {
   instrumentAssessmentExports(repoRoot);
   const mainCorpusTests = runCorpusSuite(mainWorktree, mainCorpus);
   const branchCorpusTests = runCorpusSuite(repoRoot, branchCorpus);
-  const expectedBranchCounts = {
-    executed: mainCorpusTests.executed,
-    skipped: mainCorpusTests.skipped + branchOnlyRuntimeFactTests.length,
-    total: mainCorpusTests.total + branchOnlyRuntimeFactTests.length,
-  };
-  if (JSON.stringify(expectedBranchCounts) !== JSON.stringify(branchCorpusTests)) {
+  if (JSON.stringify(mainCorpusTests) !== JSON.stringify(branchCorpusTests)) {
     throw new Error(`corpus test-count mismatch: main=${JSON.stringify(mainCorpusTests)} branch=${JSON.stringify(branchCorpusTests)}`);
   }
   const corpusPaths = compareTrees(mainCorpus, branchCorpus, "assessment corpus");
