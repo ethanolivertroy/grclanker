@@ -2653,10 +2653,7 @@ function prescanManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
     "low",
     "Prescan module selection results are only exposed by the XML getprescanresults.do API, which this read-only REST inspector does not call; module selection coverage cannot be verified through the REST APIs.",
     ["Export the prescan module selection (selected versus available modules) for the latest static scan of each application and confirm at least 80 percent of relevant modules are selected."],
-    batch3PrimitiveEvidence(
-      { applications_seen: seen },
-      { minimum_observed_module_coverage_percent: null },
-    ),
+    { applications_seen: seen },
   );
 }
 

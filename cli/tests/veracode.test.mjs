@@ -3065,7 +3065,7 @@ test("class 10: a single object carrying a documented member is kept whatever el
   assert.equal(accessControls.rawData.api_credentials_by_user["u-2"].api_id, "abc123", "the credential record is projected, not marked");
 });
 
-test("Veracode assessors emit every API-observable metadata rule-driving fact", async () => {
+test("Veracode assessors emit every runtime-observable metadata rule-driving fact", async () => {
   const severityFixture = healthyFixture();
   severityFixture.findings = [5, 4, 3, 2].map((severity, index) => ({
     issue_id: 200 + index,
@@ -3079,13 +3079,9 @@ test("Veracode assessors emit every API-observable metadata rule-driving fact", 
     await runVeracodeAssessments(mockClient(severityFixture)),
   ];
   const findings = runs.flatMap((run) => run.flatMap((assessment) => assessment.findings));
-  const manualOnlyUnavailable = new Set([
-    "veracode_11_minimum_module_coverage_percent_observed_value",
-  ]);
   const expected = new Set(VERACODE_SPEC.checks.flatMap((check) =>
     check.evidenceFields.filter((name) =>
-      (name.endsWith("_observed_value") || name.endsWith("_observed_values"))
-      && !manualOnlyUnavailable.has(name))));
+      name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
@@ -3095,7 +3091,11 @@ test("Veracode assessors emit every API-observable metadata rule-driving fact", 
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
   const prescan = findings.find((finding) => finding.id === "VERACODE-11");
-  assert.equal(prescan[BATCH3_RUNTIME_FACTS].veracode_11_minimum_module_coverage_percent_observed_value, null);
+  assert.deepEqual(
+    Object.keys(prescan[BATCH3_RUNTIME_FACTS]).filter((name) => name.endsWith("_observed_value")),
+    [],
+    "manual-only XML prescan evidence is not represented as a dead REST-derived fact",
+  );
   assert.equal(prescan.status, "manual");
 });
 

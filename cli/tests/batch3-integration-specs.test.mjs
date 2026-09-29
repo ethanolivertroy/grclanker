@@ -94,7 +94,7 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
       }
     }
   }
-  assert.equal(inputs, 675);
+  assert.equal(inputs, 674);
 });
 
 test("batch 3 completeness names exact datasets and all six collection failure modes", () => {
@@ -180,8 +180,8 @@ test("all numeric constants are finite and every executable numeric boundary is 
       }
     }
   }
-  assert.equal(constants, 88);
-  assert.equal(executableBoundaries, 88);
+  assert.equal(constants, 87);
+  assert.equal(executableBoundaries, 87);
 });
 
 test("hidden threshold bands execute below, equal, and above against primitive facts", () => {
@@ -228,7 +228,7 @@ test("hidden threshold bands execute below, equal, and above against primitive f
   assert.deepEqual([24, 25, 26, 49, 50, 51].map((percent) => verdict("KNOWBE4-19", { ...kb19, knowbe4_19_report_rate_percent: percent })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
 });
 
-test("all 88 numeric constants and 13 set or pattern branches have executable metadata boundaries", () => {
+test("all 87 runtime-observable numeric constants and 13 set or pattern branches have executable metadata boundaries", () => {
   const conditionNodes = (condition) => {
     const nodes = [condition];
     if (condition.op === "and" || condition.op === "or") {
@@ -326,7 +326,7 @@ test("all 88 numeric constants and 13 set or pattern branches have executable me
       }
     }
   }
-  assert.equal(numericBranches, 88);
+  assert.equal(numericBranches, 87);
   assert.equal(collectionBranches, 13);
 });
 
@@ -362,7 +362,7 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
       assert.ok(spec.output.artifacts.some((artifact) => artifact.path === path), `${spec.identity.slug}: ${path}`);
     }
   }
-  assert.equal(numericConstants, 88);
+  assert.equal(numericConstants, 87);
 
   const first = await renderAllIntegrationSpecs();
   const second = await renderAllIntegrationSpecs();
