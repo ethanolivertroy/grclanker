@@ -2990,7 +2990,8 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       if (threshold === undefined) return batch3UnavailableFacts(contractId);
       if (age === undefined || (age <= threshold && (statusIsIncomplete("scanners_status") || evaluated === 0))) return batch3UnavailableFacts(contractId);
       const reviews = count("undated_scanners", "stale_online_agents") + (statusIsIncomplete("agents_status") || partial ? 1 : 0);
-      return fact(evaluated, 0, reviews, !statusIsIncomplete("agents_status") && !partial);
+      const comparablePluginSets = evaluated + 1;
+      return fact(comparablePluginSets, 0, reviews, !statusIsIncomplete("agents_status") && !partial);
     }
     case "TENABLE-09": {
       const networks = value("network_count");
