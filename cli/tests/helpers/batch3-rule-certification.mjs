@@ -18,7 +18,7 @@ function pathOf(operand) {
 }
 
 function literalOf(operand) {
-  return operand?.kind === "literal" ? operand.value : undefined;
+  return operand?.kind === "value" || operand?.kind === "literal" ? operand.value : undefined;
 }
 
 function valueOf(operand, constants, facts) {
@@ -55,7 +55,7 @@ function satisfy(condition, constants, facts, desired = true) {
     case "always":
       return;
     case "defined": {
-      const path = pathOf(condition.value);
+      const path = pathOf(condition.operand);
       if (path !== undefined && !Object.hasOwn(constants, path)) facts[path] = desired ? (facts[path] ?? 1) : null;
       return;
     }
@@ -66,7 +66,7 @@ function satisfy(condition, constants, facts, desired = true) {
       if (desired) {
         for (const child of condition.conditions) satisfy(child, constants, facts, true);
       } else {
-        satisfy(condition.conditions[0], constants, facts, false);
+        satisfy(condition.conditions.at(-1), constants, facts, false);
       }
       return;
     case "or":
@@ -186,6 +186,16 @@ function firstMatchingRule(check, facts) {
     .find(([, rule]) => evaluateVerdictCondition(rule.condition, context))?.[0];
 }
 
+function decisiveBaseline(check, targetRuleId, runtimeSeed) {
+  const facts = neutralFacts(check, runtimeSeed);
+  for (const [ruleId, rule] of Object.entries(check.derivedFactRules)) {
+    if (ruleId === targetRuleId) break;
+    satisfy(rule.condition, check.criteria.constants, facts, false);
+  }
+  satisfy(check.derivedFactRules[targetRuleId].condition, check.criteria.constants, facts, true);
+  return facts;
+}
+
 export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
   const seeds = runtimeSeeds(findings);
   let numeric = 0;
@@ -207,8 +217,7 @@ export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
           ? pathOf(match.node.numerator)
           : pathOf(match.node.left) === constant ? pathOf(match.node.right) : pathOf(match.node.left);
         assert.notEqual(seed[observed], undefined, `${check.id}.${constant}: observed fact came from an assessor`);
-        const baseline = neutralFacts(check, seed);
-        satisfy(check.derivedFactRules[match.id].condition, check.criteria.constants, baseline, true);
+        const baseline = decisiveBaseline(check, match.id, seed);
         const denominator = match.node.op === "ratio" ? 100 : 1;
         const scale = match.node.op === "ratio" ? match.node.scale ?? 1 : 1;
         const variants = comparisonValues(match.node.op === "ratio" ? match.node.comparator : match.node.op, constantValue)
@@ -236,8 +245,7 @@ export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
         ? pathOf(pathOf(match.node.left) === constant ? match.node.right : match.node.left)
         : pathOf(match.node.candidates);
       assert.notEqual(seed[observed], undefined, `${check.id}.${constant}: observed collection came from an assessor`);
-      const matchingFacts = neutralFacts(check, seed);
-      satisfy(check.derivedFactRules[match.id].condition, check.criteria.constants, matchingFacts, true);
+      const matchingFacts = decisiveBaseline(check, match.id, seed);
       const missingFacts = { ...matchingFacts };
       satisfy(match.node, check.criteria.constants, missingFacts, false);
       assert.equal(firstMatchingRule(check, matchingFacts), match.id, `${check.id}.${constant}: verdict-deciding collection branch`);
