@@ -18,7 +18,6 @@ const HAL_LIST_SURFACES = new Set([
   "sca-workspaces",
   "sca-issues",
   "sca-libraries",
-  "sca-projects",
   "dynamic-analyses",
   "dynamic-analysis-scans",
 ]);

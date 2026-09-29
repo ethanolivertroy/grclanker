@@ -15,35 +15,73 @@ import {
 } from "./batch2-spec-helpers.js";
 import { TENABLE_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { BATCH3_FRAMEWORK_FILES, batch3Checks, batch3Source, batch3Threshold, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import type { RequestParameterContract } from "./spec-model.js";
 
 const DOCS = "https://developer.tenable.com/reference/navigate";
+const paged = (limit: string): readonly RequestParameterContract[] => [
+  { name: "limit", location: "query", required: true, value: limit },
+  { name: "offset", location: "query", required: false, value: "Zero on the first request, then increased by the number of records returned until the collection is exhausted." },
+];
+const requestParameters = (id: string, path: string): readonly RequestParameterContract[] => {
+  if (id === "asset-export") return [{ name: "chunk_size", location: "form-body", required: true, value: "10000" }];
+  if (id === "vuln-export") {
+    return [
+      { name: "num_assets", location: "form-body", required: true, value: "5000" },
+      { name: "include_plugin_output", location: "form-body", required: true, value: "false" },
+      { name: "filters.since", location: "form-body", required: true, value: "Unix seconds for now minus vuln_lookback_days." },
+      { name: "filters.state", location: "form-body", required: true, value: "open, reopened, fixed" },
+    ];
+  }
+  if (path.includes("{export_uuid}")) {
+    return [
+      { name: "export_uuid", location: "path", required: true, value: "Identifier returned by the corresponding export POST." },
+      ...(path.includes("{chunk_id}")
+        ? [{ name: "chunk_id", location: "path" as const, required: true, value: "Each ID reported in chunks_available, bounded by max_chunks." }]
+        : []),
+    ];
+  }
+  if (path.includes("{policy_id}") || path.includes("{scan_id}")) {
+    return [{ name: path.includes("{policy_id}") ? "policy_id" : "scan_id", location: "path", required: true, value: "Identifier returned by the parent inventory." }];
+  }
+  switch (id) {
+    case "agents":
+      return paged("1000 records per request.");
+    case "networks":
+      return paged("50 records per request.");
+    case "exclusions":
+    case "credentials":
+    case "access-groups":
+      return paged("200 records per request.");
+    case "tag-categories":
+    case "tag-values":
+      return paged("5000 records per request.");
+    case "audit-events":
+      return [
+        { name: "f", location: "query", required: true, value: "Repeated filter value date.gte:<sinceIso>, where sinceIso is now minus the configured audit lookback." },
+        ...paged("5000 records per request."),
+      ];
+    case "users":
+      return [{ name: "withRoles", location: "query", required: true, value: "true" }];
+    case "sc-current-user":
+      return [{ name: "fields", location: "query", required: true, value: "id,username,role,lastLogin" }];
+    case "sc-scans":
+      return [{ name: "fields", location: "query", required: true, value: "id,name,status,schedule,policy,repository,credentials,modifiedTime" }];
+    case "sc-scan-results":
+      return [
+        { name: "fields", location: "query", required: true, value: "id,name,status,startTime,finishTime,scannedIPs,totalIPs" },
+        { name: "startTime", location: "query", required: true, value: "Unix seconds for now minus the resolved stale_scan_days lookback." },
+      ];
+    case "sc-scanners":
+      return [{ name: "fields", location: "query", required: true, value: "id,name,status,statusMessage,enabled,version,pluginSet,loadedPluginSet,lastCheckinTime,agentCapable" }];
+    case "sc-users":
+      return [{ name: "fields", location: "query", required: true, value: "id,username,status,role,lastLogin,locked,failedLogins,authType" }];
+    default:
+      return [];
+  }
+};
 const surface = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") => {
   const securityCenter = path.startsWith("/rest/");
-  const parameters = path === "/assets/export"
-    ? [{ name: "chunk_size", location: "form-body" as const, required: true, value: "10000" }]
-    : path === "/vulns/export"
-      ? [
-          { name: "num_assets", location: "form-body" as const, required: true, value: "5000" },
-          { name: "include_plugin_output", location: "form-body" as const, required: true, value: "false" },
-          { name: "filters.since", location: "form-body" as const, required: true, value: "Unix seconds for now minus vuln_lookback_days." },
-          { name: "filters.state", location: "form-body" as const, required: true, value: "open, reopened, fixed" },
-        ]
-      : path.includes("{export_uuid}")
-        ? [
-            { name: "export_uuid", location: "path" as const, required: true, value: "Identifier returned by the corresponding export POST." },
-            ...(path.includes("{chunk_id}")
-              ? [{ name: "chunk_id", location: "path" as const, required: true, value: "Each ID reported in chunks_available, bounded by max_chunks." }]
-              : [
-                  { name: "poll_interval_ms", location: "client" as const, required: true, value: "1000 milliseconds unless injected by the caller." },
-                  { name: "poll_deadline_ms", location: "client" as const, required: true, value: "300000 milliseconds unless injected by the caller." },
-                ]),
-          ]
-        : path.includes("{policy_id}") || path.includes("{scan_id}")
-          ? [{ name: path.includes("{policy_id}") ? "policy_id" : "scan_id", location: "path" as const, required: true, value: "Identifier returned by the parent inventory." }]
-          : [
-              { name: "offset", location: "query" as const, required: false, value: "Returned pagination offset; omitted on the first page." },
-              { name: "limit", location: "query" as const, required: false, value: "Concrete endpoint page size, normally 1000." },
-            ];
+  const parameters = requestParameters(id, path);
   return restSurface(
     id,
     path,
@@ -92,6 +130,7 @@ const surfaces = [
   surface("vuln-export", "/vulns/export", ["export_uuid"], "POST"),
   surface("vuln-export-status", "/vulns/export/{export_uuid}/status", ["status", "chunks_available", "chunks_failed", "total_chunks"]),
   surface("vuln-export-chunks", "/vulns/export/{export_uuid}/chunks/{chunk_id}", ["asset", "plugin", "severity", "first_found", "last_found", "state", "vpr"]),
+  surface("sc-current-user", "/rest/currentUser", ["id", "username", "role", "lastLogin"]),
   surface("sc-scans", "/rest/scan", ["id", "name", "schedule", "status"]),
   surface("sc-scan-results", "/rest/scanResult", ["id", "name", "finishTime", "status"]),
   surface("sc-scanners", "/rest/scanner", ["id", "name", "status", "version"]),

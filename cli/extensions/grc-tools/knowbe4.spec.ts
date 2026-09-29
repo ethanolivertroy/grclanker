@@ -16,9 +16,16 @@ import {
 } from "./batch2-spec-helpers.js";
 import { KNOWBE4_AUTH_RESOLVER } from "./auth-resolver-contracts.js";
 import { batch3Checks, batch3Threshold, type Batch3CheckRow } from "./batch3-spec-helpers.js";
+import type { RequestParameterContract } from "./spec-model.js";
 
 const DOCS = "https://developer.knowbe4.com/rest/reporting";
-const kb = (id: string, path: string, fields: readonly string[], method: "GET" | "POST" = "GET") =>
+const kb = (
+  id: string,
+  path: string,
+  fields: readonly string[],
+  method: "GET" | "POST" = "GET",
+  options: { paginated?: boolean; parameters?: readonly RequestParameterContract[] } = {},
+) =>
   restSurface(id, path, path.startsWith("/graphql") ? "KnowBe4 PhishER Product API GraphQL" : "KnowBe4 Reporting API v1", DOCS, fields, method, {
     headers: ["Authorization: Bearer <resolved product-specific token>", "Accept: application/json", ...(method === "POST" ? ["Content-Type: application/json"] : [])],
     parameters: method === "POST"
@@ -29,13 +36,18 @@ const kb = (id: string, path: string, fields: readonly string[], method: "GET" |
       : [
           ...(path.includes("{group_id}") ? [{ name: "group_id", location: "path" as const, required: true, value: "Group ID returned by /v1/groups." }] : []),
           ...(path.includes("{pst_id}") ? [{ name: "pst_id", location: "path" as const, required: true, value: "Security-test ID returned by /v1/phishing/security_tests." }] : []),
-          { name: "page", location: "query", required: false, value: "One-based page number advanced through same-origin Link rel=next." },
-          { name: "per_page", location: "query", required: false, value: "500 unless the remaining configured inventory cap is smaller." },
+          ...(options.paginated === false
+            ? []
+            : [
+                { name: "page", location: "query" as const, required: true, value: "One-based page number advanced until a page contains fewer than per_page records." },
+                { name: "per_page", location: "query" as const, required: true, value: "500 unless the endpoint-specific page size or remaining configured inventory cap is smaller." },
+              ]),
+          ...(options.parameters ?? []),
         ],
     responseShape: `JSON ${method === "POST" ? "GraphQL data envelope" : "Reporting API resource or list"} containing ${fields.join(", ")}.`,
   });
 const surfaces = [
-  kb("account", "/v1/account", ["name", "subscription_level", "number_of_seats", "current_risk_score", "sso_enabled", "admins"]),
+  kb("account", "/v1/account", ["name", "subscription_level", "number_of_seats", "current_risk_score", "sso_enabled", "admins"], "GET", { paginated: false }),
   kb("risk-history", "/v1/account/risk_score_history?full=true", ["date", "risk_score"]),
   kb("users", "/v1/users?status=active", ["id", "email", "status", "risk_score", "phish_prone_percentage", "created_at", "last_login"]),
   kb("groups", "/v1/groups?status=active", ["id", "name", "member_count"]),
@@ -45,7 +57,16 @@ const surfaces = [
   kb("security-test-recipients", "/v1/phishing/security_tests/{pst_id}/recipients", ["user_id", "sent_at", "opened_at", "clicked_at", "reported_at", "status"]),
   kb("callback-tests", "/v1/phishing/security_tests?campaign_type=callback", ["pst_id", "campaign_id", "started_at", "status"]),
   kb("training-campaigns", "/v1/training/campaigns", ["campaign_id", "name", "status", "start_date", "end_date", "groups"]),
-  kb("training-enrollments", "/v1/training/enrollments", ["enrollment_id", "user_id", "campaign_id", "store_purchase_id", "status", "enrollment_date", "completion_date"]),
+  kb("training-enrollments", "/v1/training/enrollments", ["enrollment_id", "user_id", "campaign_id", "store_purchase_id", "status", "enrollment_date", "completion_date"], "GET", {
+    parameters: [
+      { name: "campaign_id", location: "query", required: false, value: "Optional campaign identifier supplied by a caller; omitted by whole-program assessments." },
+      { name: "user_id", location: "query", required: false, value: "Optional user identifier supplied by a caller; omitted by whole-program assessments." },
+      { name: "store_purchase_id", location: "query", required: false, value: "Optional store-purchase identifier supplied by a caller; omitted by whole-program assessments." },
+      { name: "exclude_archived_users", location: "query", required: true, value: "true unless a caller explicitly requests archived users; whole-program assessments send true." },
+      { name: "include_campaign_id", location: "query", required: true, value: "true" },
+      { name: "include_store_purchase_id", location: "query", required: true, value: "true" },
+    ],
+  }),
   kb("store-purchases", "/v1/training/store_purchases", ["store_purchase_id", "name", "publisher", "published_at", "topics"]),
   kb("training-policies", "/v1/training/policies", ["id", "name", "trigger", "remedial_training", "active"]),
   kb("phisher-messages", "/graphql phisherMessages", ["id", "receivedAt", "classification", "reportedBy", "status"], "POST"),
