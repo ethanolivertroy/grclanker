@@ -186,7 +186,33 @@ function firstMatchingRule(check, facts) {
     .find(([, rule]) => evaluateVerdictCondition(rule.condition, context))?.[0];
 }
 
-function decisiveBaseline(check, targetRuleId, runtimeSeed) {
+function containsCondition(condition, target) {
+  return condition === target
+    || ((condition.op === "and" || condition.op === "or")
+      && condition.conditions.some((child) => containsCondition(child, target)))
+    || (condition.op === "not" && containsCondition(condition.condition, target));
+}
+
+function isolateCondition(condition, target, constants, facts) {
+  if (condition === target) {
+    satisfy(condition, constants, facts, true);
+    return;
+  }
+  if (condition.op === "and" || condition.op === "or") {
+    for (const child of condition.conditions) {
+      if (containsCondition(child, target)) isolateCondition(child, target, constants, facts);
+      else satisfy(child, constants, facts, condition.op === "and");
+    }
+    return;
+  }
+  if (condition.op === "not") {
+    isolateCondition(condition.condition, target, constants, facts);
+    return;
+  }
+  throw new Error("Target condition is not nested in the selected verdict rule");
+}
+
+function decisiveBaseline(check, targetRuleId, targetCondition, runtimeSeed) {
   const facts = neutralFacts(check, runtimeSeed);
   const precedingRules = [];
   for (const [ruleId, rule] of Object.entries(check.derivedFactRules)) {
@@ -194,7 +220,12 @@ function decisiveBaseline(check, targetRuleId, runtimeSeed) {
     precedingRules.push(rule);
     satisfy(rule.condition, check.criteria.constants, facts, false);
   }
-  satisfy(check.derivedFactRules[targetRuleId].condition, check.criteria.constants, facts, true);
+  isolateCondition(
+    check.derivedFactRules[targetRuleId].condition,
+    targetCondition,
+    check.criteria.constants,
+    facts,
+  );
   for (const rule of precedingRules) {
     const nodes = conditionNodes(rule.condition);
     for (const node of nodes) {
@@ -237,7 +268,7 @@ export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
           ? pathOf(match.node.numerator)
           : pathOf(match.node.left) === constant ? pathOf(match.node.right) : pathOf(match.node.left);
         assert.notEqual(seed[observed], undefined, `${check.id}.${constant}: observed fact came from an assessor`);
-        const baseline = decisiveBaseline(check, match.id, seed);
+        const baseline = decisiveBaseline(check, match.id, match.node, seed);
         for (const node of conditionNodes(check.derivedFactRules[match.id].condition)) {
           if (!["gt", "gte", "lt", "lte"].includes(node.op)) continue;
           const left = pathOf(node.left);
@@ -282,7 +313,7 @@ export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
         ? pathOf(pathOf(match.node.left) === constant ? match.node.right : match.node.left)
         : pathOf(match.node.candidates);
       assert.notEqual(seed[observed], undefined, `${check.id}.${constant}: observed collection came from an assessor`);
-      const matchingFacts = decisiveBaseline(check, match.id, seed);
+      const matchingFacts = decisiveBaseline(check, match.id, match.node, seed);
       const missingFacts = { ...matchingFacts };
       satisfy(match.node, check.criteria.constants, missingFacts, false);
       assert.equal(firstMatchingRule(check, matchingFacts), match.id, `${check.id}.${constant}: verdict-deciding collection branch`);
