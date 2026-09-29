@@ -39,6 +39,8 @@ import {
   xmlToRecord,
 } from "../dist/extensions/grc-tools/qualys.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { QUALYS_SPEC } from "../dist/extensions/grc-tools/qualys.spec.js";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -992,6 +994,24 @@ const failingFixtures = {
   searchWasAuthRecords: async () => [documentedWasAuthRecord({ name: "old-login", updatedDate: daysAgo(400) })],
   searchWasSchedules: async () => [],
 };
+
+test("Qualys assessors emit every metadata rule-driving fact from runtime records", async () => {
+  const runs = [
+    await runAllAssessments(createFakeClient(healthyFixtures)),
+    await runAllAssessments(createFakeClient(failingFixtures)),
+  ];
+  const findings = runs.flatMap(allFindings);
+  const expected = new Set(QUALYS_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+});
 
 const EMPTY_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><LIST_OUTPUT><RESPONSE><DATETIME>2026-09-21T00:00:00Z</DATETIME></RESPONSE></LIST_OUTPUT>';
 const EMPTY_USER_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><USER_LIST_OUTPUT><USER_LIST></USER_LIST></USER_LIST_OUTPUT>';

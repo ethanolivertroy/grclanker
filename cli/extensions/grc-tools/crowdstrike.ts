@@ -2079,9 +2079,9 @@ function evaluateMlDetectionLevels(policies: JsonRecord[], partial = false): Cro
   const missingPrimarySliderNames = [...new Set(perPolicy.flatMap((item) =>
     PRIMARY_ML_SLIDERS.filter((slider) => !Object.hasOwn(item.sliders, slider))))];
   const observedNonaggressiveLevels = [...new Set(perPolicy.flatMap((item) =>
-    Object.values(item.sliders).flatMap((levels) => {
-      const record = asObject(levels);
-      return [asString(record?.detection), asString(record?.prevention)]
+    PRIMARY_ML_SLIDERS.flatMap((slider) => {
+      const levels = asObject(item.sliders[slider]);
+      return [asString(levels?.detection), asString(levels?.prevention)]
         .filter((level): level is string =>
           level !== undefined && (sliderRank(level) ?? ML_SLIDER_RANK.AGGRESSIVE) < ML_SLIDER_RANK.AGGRESSIVE)
         .map((level) => level.toUpperCase());
@@ -3820,7 +3820,10 @@ function evaluateMlExclusions(exclusions: CollectedDataset<CrowdstrikePage<JsonR
         ? truncatedBeforeVisible("ML exclusions", "exclusion", "suppression of machine learning coverage")
         : "The ML exclusions endpoint was readable and returned zero exclusions; no machine learning coverage is being suppressed, so emptiness is compliant for this control."
       : `${views.length} ML exclusions reviewed; ${sensitive.length} cover system, program, user, or temp directories or broad wildcards (${sensitiveGlobal.length} applied globally).`,
-    { exclusions: views.length, reported_total_exclusions: exclusions.data.total, sensitive_exclusions: sensitive.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
+    batch3PrimitiveEvidence(
+      { exclusions: views.length, reported_total_exclusions: exclusions.data.total, sensitive_exclusions: sensitive.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
+      { normalized_global_exclusion_path_values: sensitiveGlobal.map((view) => view.value).filter((value): value is string => value !== undefined).map((value) => value.trim()) },
+    ),
     crowdstrikeDecisionFacts(views.length, sensitiveGlobal.length, sensitive.length - sensitiveGlobal.length, { readable: true, complete: partial === undefined }),
   ), [partial]);
 }
@@ -3854,7 +3857,10 @@ function evaluateSensorVisibilityExclusions(exclusions: CollectedDataset<Crowdst
         ? truncatedBeforeVisible("sensor visibility exclusions", "exclusion", "paths hidden from the sensor")
         : "The sensor visibility exclusions endpoint was readable and returned zero exclusions; nothing is hidden from the sensor, so emptiness is compliant for this control."
       : `${views.length} sensor visibility exclusions reviewed; ${hiding.length} hide entire directories or sensitive paths from the sensor (${hidingGlobal.length} applied globally).`,
-    { exclusions: views.length, reported_total_exclusions: exclusions.data.total, directory_exclusions: hiding.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
+    batch3PrimitiveEvidence(
+      { exclusions: views.length, reported_total_exclusions: exclusions.data.total, directory_exclusions: hiding.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
+      { normalized_global_exclusion_path_values: hidingGlobal.map((view) => view.value).filter((value): value is string => value !== undefined).map((value) => value.trim()) },
+    ),
     crowdstrikeDecisionFacts(views.length, hidingGlobal.length, hiding.length - hidingGlobal.length, { readable: true, complete: partial === undefined }),
   ), [partial]);
 }

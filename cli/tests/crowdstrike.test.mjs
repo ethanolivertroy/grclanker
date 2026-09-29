@@ -31,6 +31,8 @@ import {
   resolveSecureOutputPath,
   runAllCrowdstrikeAssessments,
 } from "../dist/extensions/grc-tools/crowdstrike.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
@@ -452,6 +454,34 @@ function createPartialClient() {
     countZtaAssessments: async (filter) => (filter.startsWith("score:<") ? 1 : 100),
   });
 }
+
+test("CrowdStrike assessors emit every metadata rule-driving fact from runtime records", async () => {
+  const runtimeRuns = [
+    await runAllCrowdstrikeAssessments(createFakeClient()),
+    await runAllCrowdstrikeAssessments(createFakeClient({
+      listApiClients: async () => [{
+        id: "api-write",
+        name: "write integration",
+        scopes: [apiScope("prevention-policies", "write")],
+        last_used_timestamp: isoDaysAgo(120),
+      }],
+      countZtaAssessments: async (filter) => filter.startsWith("score:<") ? 1 : 3,
+      listZtaAssessments: async () => [{ device_id: "aid-low", score: 59 }],
+    })),
+  ];
+  const findings = runtimeRuns.flatMap((run) => run.flatMap((assessment) => assessment.findings));
+  const expected = new Set(CROWDSTRIKE_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+});
 
 function createRepresentativeClient() {
   return createFakeClient({

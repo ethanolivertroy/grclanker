@@ -36,6 +36,8 @@ import {
   resolveSecureOutputPath,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/knowbe4.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
@@ -2295,6 +2297,24 @@ async function runAllKnowbe4Assessments(client) {
   }
   return results;
 }
+
+test("KnowBe4 assessors emit every metadata rule-driving fact from runtime records", async () => {
+  const runs = [
+    await runAllKnowbe4Assessments(mockClient(healthyFixture(), { phisher: true })),
+    await runAllKnowbe4Assessments(mockClient(failingFixture(), { phisher: true })),
+  ];
+  const findings = runs.flatMap((run) => run.flatMap((assessment) => assessment.findings));
+  const expected = new Set(KNOWBE4_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+});
 
 function kbMentionedEndpoints(text) {
   return [...text.matchAll(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[A-Za-z0-9_./?=&{}[\]-]+)/g)]

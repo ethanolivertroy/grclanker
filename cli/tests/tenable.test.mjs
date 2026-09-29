@@ -32,6 +32,8 @@ import {
   resolveSecureOutputPath,
   resolveTenableConfiguration,
 } from "../dist/extensions/grc-tools/tenable.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { TENABLE_SPEC } from "../dist/extensions/grc-tools/tenable.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -293,6 +295,31 @@ function byId(results, id) {
   assert.ok(match, `expected finding ${id}`);
   return match;
 }
+
+test("Tenable assessors emit every metadata rule-driving fact from runtime records", async () => {
+  const enrichedRoutes = healthyRoutes();
+  enrichedRoutes["GET /vulns/export/vuln-export-1/chunks/1"] = [
+    ...healthyVulns(),
+    { severity: "high", state: "OPEN", first_found: RECENT_ISO, plugin: { id: 5, vpr: { score: 7 } } },
+    { severity: "medium", state: "OPEN", first_found: RECENT_ISO, plugin: { id: 3, vpr: { score: 5 } } },
+    { severity: "low", state: "OPEN", first_found: RECENT_ISO, plugin: { id: 4, vpr: { score: 2 } } },
+  ];
+  const runs = [
+    await runAll(clientsFor(healthyRoutes()), { expectedAssetCount: 2 }),
+    await runAll(clientsFor(enrichedRoutes), { expectedAssetCount: 2 }),
+  ];
+  const findings = runs.flatMap(allFindings);
+  const expected = new Set(TENABLE_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) => name.endsWith("_observed_value") || name.endsWith("_observed_values"))));
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+});
 
 test("resolveTenableConfiguration prefers arguments over environment over config file", () => {
   const dir = mkdtempSync(join(tmpdir(), "tenable-config-"));
@@ -700,7 +727,11 @@ test("healthy fixture yields passing verdicts and every control carries framewor
   assert.equal(byId(results, "TENABLE-17").status, "pass");
   assert.equal(byId(results, "TENABLE-01").status, "pass");
   assert.equal(byId(results, "TENABLE-08").status, "pass");
-  assert.equal(byId(results, "TENABLE-10").status, "pass");
+  assert.equal(
+    byId(results, "TENABLE-10").status,
+    "pass",
+    JSON.stringify(byId(results, "TENABLE-10")[BATCH3_RUNTIME_FACTS]),
+  );
   assert.equal(byId(results, "TENABLE-11").status, "pass");
   assert.equal(byId(results, "TENABLE-19").status, "pass");
   assert.ok(findings.filter((item) => item.status === "pass").length >= 8, JSON.stringify(findings.map((item) => [item.id, item.status])));
@@ -718,7 +749,11 @@ test("failing fixture: stale schedules, disabled MFA, and SLA breaches fail", as
   routes["GET /vulns/export/vuln-export-1/chunks/1"] = [{ severity: "critical", state: "OPEN", first_found: new Date(NOW - 60 * 86_400_000).toISOString(), plugin: { id: 1, vpr: { score: 9.5 } } }];
   const results = await runAll(clientsFor(routes));
   assert.equal(byId(results, "TENABLE-02").status, "fail");
-  assert.equal(byId(results, "TENABLE-10").status, "fail");
+  assert.equal(
+    byId(results, "TENABLE-10").status,
+    "fail",
+    JSON.stringify(byId(results, "TENABLE-10")[BATCH3_RUNTIME_FACTS]),
+  );
   assert.equal(byId(results, "TENABLE-15").status, "fail");
 });
 

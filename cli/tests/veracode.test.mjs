@@ -25,6 +25,8 @@ import {
   scrubDataText,
   scrubErrorText,
 } from "../dist/extensions/grc-tools/veracode.js";
+import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
+import { VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
@@ -3026,6 +3028,40 @@ test("class 10: a single object carrying a documented member is kept whatever el
   const [, , , , accessControls] = await runVeracodeAssessments(client);
   assert.deepEqual(accessControls.rawData.self, fixture.self, "the record is kept whole");
   assert.equal(accessControls.rawData.api_credentials_by_user["u-2"].api_id, "abc123", "the credential record is projected, not marked");
+});
+
+test("Veracode assessors emit every API-observable metadata rule-driving fact", async () => {
+  const severityFixture = healthyFixture();
+  severityFixture.findings = [5, 4, 3, 2].map((severity, index) => ({
+    issue_id: 200 + index,
+    finding_status: { status: "OPEN", resolution: "UNRESOLVED", first_found_date: daysAgo(5 + index) },
+    finding_details: { severity },
+    annotations: [],
+  }));
+  const runs = [
+    await runVeracodeAssessments(mockClient()),
+    await runVeracodeAssessments(representativeClient()),
+    await runVeracodeAssessments(mockClient(severityFixture)),
+  ];
+  const findings = runs.flatMap((run) => run.flatMap((assessment) => assessment.findings));
+  const manualOnlyUnavailable = new Set([
+    "veracode_11_minimum_module_coverage_percent_observed_value",
+  ]);
+  const expected = new Set(VERACODE_SPEC.checks.flatMap((check) =>
+    check.evidenceFields.filter((name) =>
+      (name.endsWith("_observed_value") || name.endsWith("_observed_values"))
+      && !manualOnlyUnavailable.has(name))));
+  const observed = new Map();
+  for (const finding of findings) {
+    const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
+    for (const name of expected) {
+      if (facts[name] !== null && facts[name] !== undefined) observed.set(name, facts[name]);
+    }
+  }
+  assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
+  const prescan = findings.find((finding) => finding.id === "VERACODE-11");
+  assert.equal(prescan[BATCH3_RUNTIME_FACTS].veracode_11_minimum_module_coverage_percent_observed_value, null);
+  assert.equal(prescan.status, "manual");
 });
 
 test("byte differential fixtures: Veracode assessments and export artifacts", { skip: !byteDifferentialEnabled }, async () => {

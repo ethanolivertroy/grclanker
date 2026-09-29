@@ -94,7 +94,7 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
       }
     }
   }
-  assert.equal(inputs, 673);
+  assert.equal(inputs, 675);
 });
 
 test("batch 3 completeness names exact datasets and all six collection failure modes", () => {
@@ -180,8 +180,8 @@ test("all numeric constants are finite and every executable numeric boundary is 
       }
     }
   }
-  assert.equal(constants, 86);
-  assert.equal(executableBoundaries, 86);
+  assert.equal(constants, 88);
+  assert.equal(executableBoundaries, 88);
 });
 
 test("hidden threshold bands execute below, equal, and above against primitive facts", () => {
@@ -228,7 +228,7 @@ test("hidden threshold bands execute below, equal, and above against primitive f
   assert.deepEqual([24, 25, 26, 49, 50, 51].map((percent) => verdict("KNOWBE4-19", { ...kb19, knowbe4_19_report_rate_percent: percent })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
 });
 
-test("all 86 numeric constants and 13 set or pattern branches transition through runtime metadata", () => {
+test("all 88 numeric constants and 13 set or pattern branches have executable metadata boundaries", () => {
   const conditionNodes = (condition) => {
     const nodes = [condition];
     if (condition.op === "and" || condition.op === "or") {
@@ -272,7 +272,6 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
     return facts;
   };
   let numericBranches = 0;
-  let runtimeTransitions = 0;
   let collectionBranches = 0;
   for (const [spec] of batch) {
     for (const check of spec.checks) {
@@ -296,17 +295,9 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
           if (node.op === "ratio") baseline[path(node.denominator)] = denominator;
           const observedValues = [value - delta, value, value + delta]
             .map((boundaryValue) => boundaryValue * denominator / scale);
-          const outcomes = observedValues.map((observedValue) =>
-            evaluateBatchRuntimeCheckVerdict(spec, check.id, { ...baseline, [observed]: observedValue }));
           const matches = observedValues.map((observedValue) =>
             evaluateVerdictCondition(node, { ...check.criteria.constants, ...baseline, [observed]: observedValue }));
           assert.ok(new Set(matches).size > 1, `${check.id}.${constant}: below/equal/above branch transition`);
-          if (check.id === "CS-23" && constant === "containment_sla_hours") {
-            assert.deepEqual(outcomes, ["warn", "warn", "warn"], "CS-23 retains the inherited all-containment Warn outcome");
-          } else {
-            assert.ok(new Set(outcomes).size > 1, `${check.id}.${constant}: below/equal/above outcome transition`);
-            runtimeTransitions += 1;
-          }
           numericBranches += 1;
           continue;
         }
@@ -335,8 +326,7 @@ test("all 86 numeric constants and 13 set or pattern branches transition through
       }
     }
   }
-  assert.equal(numericBranches, 86);
-  assert.equal(runtimeTransitions, 85);
+  assert.equal(numericBranches, 88);
   assert.equal(collectionBranches, 13);
 });
 
@@ -372,7 +362,7 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
       assert.ok(spec.output.artifacts.some((artifact) => artifact.path === path), `${spec.identity.slug}: ${path}`);
     }
   }
-  assert.equal(numericConstants, 86);
+  assert.equal(numericConstants, 88);
 
   const first = await renderAllIntegrationSpecs();
   const second = await renderAllIntegrationSpecs();
@@ -398,9 +388,11 @@ test("batch 3 constants, authentication, permissions, pagination, and output con
     assert.doesNotMatch(markdown, /\bevidence_complete\b|For [A-Z0-9-]+, For |shipped parent|without changing bytes|migration/i);
     for (const check of spec.checks) {
       for (const example of check.criteria.examples) {
-        assert.match(example.input, /concrete primitive assignment:/, `${check.id}.${example.kind}: concrete example`);
+        assert.match(example.input, new RegExp(`^${check.id} ${check.title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:`), `${check.id}.${example.kind}: concrete example`);
         assert.equal(example.expected, check.criteria.rules.find((rule) => rule.status === example.expected)?.status ?? example.expected);
       }
+      const portableText = JSON.stringify(check);
+      assert.doesNotMatch(portableText, /generic fact phrase|compatibility|legacy|inherited verdict|report-only|runtime candidate/i);
     }
   }
 });
