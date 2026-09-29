@@ -4007,7 +4007,10 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }, { maximum_asset_last_seen_age_days: maximumAssetLastSeenAgeDays }), "", { inventory_truncated: data.assetExport.truncated === true || data.networks.truncated === true }));
+    }, {
+      maximum_asset_last_seen_age_days: maximumAssetLastSeenAgeDays,
+      stale_asset_days: staleAssetDays,
+    }), "", { inventory_truncated: data.assetExport.truncated === true || data.networks.truncated === true }));
 
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
     const categories = data.tagCategories.status === "ok" ? data.tagCategories.data.map((item) => asString(item.name) ?? "category") : [];
@@ -4629,7 +4632,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
         actor: asString(asObject(event.actor)?.name),
         target: asString(asObject(event.target)?.name),
       })), data.auditLog),
-    }, { oldest_included_event_age_days: oldestIncludedEventAgeDays })));
+    }, {
+      oldest_included_event_age_days: oldestIncludedEventAgeDays,
+      audit_lookback_days: lookbackDays,
+    })));
   }
 
   findings.push(assessSecurityCenterUsers(data.scUsers, now, inactiveDays));
@@ -4865,6 +4871,10 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       max_high_age_days: maximumAgeBySeverity.high,
       max_medium_age_days: maximumAgeBySeverity.medium,
       max_low_age_days: maximumAgeBySeverity.low,
+      sla_critical_days: sla.critical,
+      sla_high_days: sla.high,
+      sla_medium_days: sla.medium,
+      sla_low_days: sla.low,
     }), "", {
       inventory_truncated: data.vulnExport.truncated === true || data.assetExport.truncated === true,
       caller_is_administrator: callerIsAdministrator,

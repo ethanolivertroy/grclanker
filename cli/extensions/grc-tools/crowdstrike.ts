@@ -3162,7 +3162,10 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
         agent_version_distribution: Object.fromEntries([...versions.entries()].sort((left, right) => right[1] - left[1]).slice(0, 15)),
         stale_samples: stale.slice(0, 25).map((host) => ({ hostname: asString(host.hostname), last_seen: asString(host.last_seen), platform: asString(host.platform_name) })),
       },
-      { max_observed_last_seen_age_days: maximumLastSeenAgeDays },
+      {
+        max_observed_last_seen_age_days: maximumLastSeenAgeDays,
+        stale_sensor_days: staleDays,
+      },
     ),
     crowdstrikeDecisionFacts(
       items.length,
@@ -3360,6 +3363,7 @@ function evaluateZeroTrust(
           .map((item) => asNumber(item.score))
           .filter((score): score is number => score !== undefined)
           .reduce<number | null>((minimum, score) => minimum === null ? score : Math.min(minimum, score), below === 0 ? minScore : null),
+        min_zta_score: minScore,
       },
     ),
     crowdstrikeDecisionFacts(
@@ -3732,6 +3736,7 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
         max_observed_write_client_inactivity_days: writeClientInactivityDays.length === 0
           ? null
           : Math.max(...writeClientInactivityDays),
+        stale_client_days: staleDays,
         "flatten:write_clients.sensitive_write_scopes": writeClients.flatMap((view) => view.sensitive_write_scopes),
       },
     ),

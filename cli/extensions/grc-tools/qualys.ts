@@ -2870,7 +2870,10 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "export Scans > Schedules and Assets > Asset Groups from the Qualys UI and confirm each asset group has an active recurring scan and each host was scanned within the review window.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length, schedules_without_active_flag: schedulesWithoutActiveFlag.length },
-    primitiveFacts: { max_observed_scan_age_days: maximumScanAgeDays },
+    primitiveFacts: {
+      max_observed_scan_age_days: maximumScanAgeDays,
+      lookback_days: settings.lookbackDays,
+    },
     decisionFacts: schedules.error
       ? {}
       : activeSchedules.length === 0
@@ -2916,6 +2919,7 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "run an Authentication Report in Qualys and record the percentage of hosts with successful authenticated scans.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length },
+    primitiveFacts: { min_auth_scan_percent: settings.minAuthScanPercent },
     decisionFacts: {
       qualys_c02_host_list_readable: !hosts.error,
       qualys_c02_host_list_complete: !hosts.error && !hosts.truncated,
@@ -3355,6 +3359,7 @@ export async function assessQualysAssetInventory(
       agents_without_checkin_date: agentsWithoutCheckIn.length,
       agents_without_activation_key: agentsWithoutActivationKey.length,
     },
+    primitiveFacts: { min_agent_coverage_percent: settings.minAgentCoveragePercent },
     decisionFacts: hosts.error || agents.error || hosts.data.length === 0
       ? {}
       : qualysDecisionFacts(
@@ -3736,6 +3741,9 @@ export async function assessQualysVulnerabilityManagement(
       maximum_severity_5_age_days: maximumAgeForSeverity(5),
       maximum_severity_4_age_days: maximumAgeForSeverity(4),
       maximum_severity_3_age_days: maximumAgeForSeverity(3),
+      sla_critical_days: settings.slaCriticalDays,
+      sla_high_days: settings.slaHighDays,
+      sla_medium_days: settings.slaMediumDays,
     },
     decisionFacts: detections.error || hosts.error || !hostPopulationKnown || !detectionsFullyRead && slaScoped.length === 0
       ? {}
@@ -4272,7 +4280,10 @@ export async function assessQualysAdministration(
     sources: [activity],
     scope,
     manualEvidence: "export the Activity Log for the review period and document who reviews sensitive administrative actions and how long the log is retained.",
-    primitiveFacts: { oldest_included_activity_age_days: oldestIncludedActivityAgeDays },
+    primitiveFacts: {
+      oldest_included_activity_age_days: oldestIncludedActivityAgeDays,
+      lookback_days: settings.lookbackDays,
+    },
     decisionFacts: activity.error || activity.data.length === 0
       ? {}
       : qualysDecisionFacts(activity.data.length, 0, activity.data.length),
