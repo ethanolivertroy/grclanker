@@ -4499,10 +4499,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       custom_roles: data.roles.status === "ok" ? data.roles.data.filter((role) => asString(role.type) === "CUSTOM").map((role) => asString(role.name)).slice(0, 50) : null,
       roles_status: data.roles.status,
       max_admins: maxAdmins,
-      inactive_user_days: inactiveDays,
     }, {
       administrator_count: admins.length,
       max_observed_inactive_days: maximumInactiveDays,
+      inactive_user_days: inactiveDays,
     })));
   }
 
