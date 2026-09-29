@@ -519,6 +519,7 @@ test("VeracodeApiClient sends exact findings parameters and no pagination on obj
   await client.listFindings("app-1", { include_annot: "TRUE" });
   await client.getSelf();
   await client.getSummaryReport("app-1");
+  await client.getScaApplicationProjects("app-1");
   await client.getDynamicScanConfiguration("scan-1");
 
   const findings = seen.find((url) => url.pathname === "/appsec/v2/applications/app-1/findings");
@@ -529,6 +530,7 @@ test("VeracodeApiClient sends exact findings parameters and no pagination on obj
   for (const path of [
     "/api/authn/v2/users/self",
     "/appsec/v2/applications/app-1/summary_report",
+    "/srcclr/v3/applications/app-1/projects",
     "/was/configservice/v1/scans/scan-1/configuration",
   ]) {
     const objectRequest = seen.find((url) => url.pathname === path);

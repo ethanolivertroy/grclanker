@@ -314,7 +314,7 @@ test("Tenable assessors emit every metadata rule-driving fact from runtime recor
       name.endsWith("_observed_value")
       || name.endsWith("_observed_values")
       || name.endsWith("_configured_value"))));
-  assert.equal(expected.size, 28);
+  assert.equal(expected.size, 26);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};
@@ -563,6 +563,63 @@ test("TenableApiClient sends the X-ApiKeys header, walks pagination, and redacts
     for (const secret of [FIXTURE_ACCESS_KEY, FIXTURE_SECRET_KEY]) assertNoWindow(error.message, secret, "JSON denial");
     assert.equal(error.message, "Tenable request GET /scans failed (HTTP 401; invalid credentials accessKey=[REDACTED];secretKey=[REDACTED])", "both halves of the echoed header go, the key names stay");
     return true;
+  });
+});
+
+test("Tenable assessors issue the exact VM and Security Center request inventory", async () => {
+  const log = [];
+  const routes = { ...healthyRoutes(), ...healthyScRoutes() };
+  const clients = bothPlatformClients(routerFetch(routes, { log }));
+  await runAll(clients, { expectedAssetCount: 2 });
+
+  const queryNames = (path) => {
+    const requests = log.filter((entry) => new URL(entry.url).pathname === path);
+    assert.ok(requests.length > 0, path);
+    return [...new Set(requests.flatMap((entry) => [...new URL(entry.url).searchParams.keys()]))].sort();
+  };
+  const unpaged = [
+    "/server/properties",
+    "/scans",
+    "/policies",
+    "/editor/scan/templates",
+    "/scanners",
+    "/scanners/null/agent-groups",
+    "/groups",
+    "/access-control/v1/roles",
+    "/api/v3/access-control/permissions",
+    "/target-groups",
+    "/vulns/export/status",
+    "/assets/export/status",
+    "/assets/export/asset-export-1/status",
+    "/assets/export/asset-export-1/chunks/1",
+    "/vulns/export/vuln-export-1/status",
+    "/vulns/export/vuln-export-1/chunks/1",
+    "/rest/feed",
+  ];
+  for (const path of unpaged) assert.deepEqual(queryNames(path), [], path);
+
+  for (const path of ["/scanners/null/agents", "/networks", "/exclusions", "/credentials", "/v2/access-groups", "/tags/categories", "/tags/values"]) {
+    assert.deepEqual(queryNames(path), ["limit", "offset"], path);
+  }
+  assert.deepEqual(queryNames("/users"), ["withRoles"]);
+  assert.deepEqual(queryNames("/audit-log/v1/events"), ["f", "limit", "offset"]);
+  const audit = log.find((entry) => new URL(entry.url).pathname === "/audit-log/v1/events");
+  assert.equal(new URL(audit.url).searchParams.get("limit"), "5000");
+  assert.match(new URL(audit.url).searchParams.get("f"), /^date\.gte:/);
+
+  assert.deepEqual(queryNames("/rest/currentUser"), ["fields"]);
+  assert.deepEqual(queryNames("/rest/scan"), ["fields"]);
+  assert.deepEqual(queryNames("/rest/scanResult"), ["fields", "startTime"]);
+  assert.deepEqual(queryNames("/rest/scanner"), ["fields"]);
+  assert.deepEqual(queryNames("/rest/user"), ["fields"]);
+
+  const assetExport = log.find((entry) => entry.key === "POST /assets/export");
+  const vulnExport = log.find((entry) => entry.key === "POST /vulns/export");
+  assert.deepEqual(JSON.parse(assetExport.body), { chunk_size: 10000 });
+  assert.deepEqual(JSON.parse(vulnExport.body), {
+    num_assets: 5000,
+    include_plugin_output: false,
+    filters: { since: Math.floor((NOW - 90 * 86_400_000) / 1000), state: ["open", "reopened", "fixed"] },
   });
 });
 

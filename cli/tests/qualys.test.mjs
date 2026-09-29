@@ -1006,7 +1006,7 @@ test("Qualys assessors emit every metadata rule-driving fact from runtime record
       name.endsWith("_observed_value")
       || name.endsWith("_observed_values")
       || name.endsWith("_configured_value"))));
-  assert.equal(expected.size, 16);
+  assert.equal(expected.size, 14);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};

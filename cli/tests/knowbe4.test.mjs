@@ -658,10 +658,11 @@ test("Knowbe4ApiClient shapes Reporting API list requests with the documented qu
   const fetchImpl = async (input) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
     seen.push(`${url.pathname}?${url.searchParams.toString()}`);
-    return jsonResponse([]);
+    return jsonResponse(url.pathname === "/v1/account" ? { name: "Example" } : []);
   };
   const client = new Knowbe4ApiClient(sampleConfig({ region: "eu", baseUrl: "https://eu.api.knowbe4.com" }), { fetchImpl, minRequestIntervalMs: 0 });
 
+  await client.getAccount();
   await client.getAccountRiskScoreHistory(true);
   await client.listUsers({ status: "archived", limit: 5 });
   await client.listSecurityTests({ campaignType: "callback" });
@@ -670,16 +671,17 @@ test("Knowbe4ApiClient shapes Reporting API list requests with the documented qu
   await client.listTrainingEnrollments({ campaignId: "7" });
   await client.listGroupMembers("9");
 
-  assert.equal(seen[0], "/v1/account/risk_score_history?full=true&page=1&per_page=500");
-  assert.equal(seen[1], "/v1/users?status=archived&page=1&per_page=500");
-  assert.equal(seen[2], "/v1/phishing/security_tests?campaign_type=callback&page=1&per_page=500");
-  assert.equal(seen[3], "/v1/phishing/security_tests/42/recipients?page=1&per_page=500");
-  assert.equal(seen[4], "/v1/training/campaigns?page=1&per_page=10");
+  assert.equal(seen[0], "/v1/account?", "the account resource is a single object with no paging parameters");
+  assert.equal(seen[1], "/v1/account/risk_score_history?full=true&page=1&per_page=500");
+  assert.equal(seen[2], "/v1/users?status=archived&page=1&per_page=500");
+  assert.equal(seen[3], "/v1/phishing/security_tests?campaign_type=callback&page=1&per_page=500");
+  assert.equal(seen[4], "/v1/phishing/security_tests/42/recipients?page=1&per_page=500");
+  assert.equal(seen[5], "/v1/training/campaigns?page=1&per_page=10");
   assert.equal(
-    seen[5],
+    seen[6],
     "/v1/training/enrollments?campaign_id=7&exclude_archived_users=true&include_campaign_id=true&include_store_purchase_id=true&page=1&per_page=500",
   );
-  assert.equal(seen[6], "/v1/groups/9/members?page=1&per_page=500");
+  assert.equal(seen[7], "/v1/groups/9/members?page=1&per_page=500");
 });
 
 test("Knowbe4ApiClient shapes PhishER GraphQL requests and paginates with per, page, and nextPageKey", async () => {
@@ -2309,7 +2311,7 @@ test("KnowBe4 assessors emit every metadata rule-driving fact from runtime recor
       name.endsWith("_observed_value")
       || name.endsWith("_observed_values")
       || name.endsWith("_configured_value"))));
-  assert.equal(expected.size, 35);
+  assert.equal(expected.size, 33);
   const observed = new Map();
   for (const finding of findings) {
     const facts = finding[BATCH3_RUNTIME_FACTS] ?? {};

@@ -94,7 +94,7 @@ test("batch 3 portable facts reject undeclared, missing, null, and sampled-pass 
       }
     }
   }
-  assert.equal(inputs, 674);
+  assert.equal(inputs, 668);
 });
 
 test("batch 3 completeness names exact datasets and all six collection failure modes", () => {
@@ -160,7 +160,7 @@ test("batch 3 rules are ordered, derived exactly once, and retain explicit fail 
   assert.ok(failAndWarn >= 80);
 });
 
-test("all numeric constants are finite and every executable numeric boundary is referenced by a rule", () => {
+test("all numeric constants are finite and the 84 verdict boundaries are referenced by rules", () => {
   let constants = 0;
   let executableBoundaries = 0;
   const collectPaths = (value, paths = new Set()) => {
@@ -181,7 +181,7 @@ test("all numeric constants are finite and every executable numeric boundary is 
     }
   }
   assert.equal(constants, 87);
-  assert.equal(executableBoundaries, 87);
+  assert.equal(executableBoundaries, 84);
 });
 
 test("hidden threshold bands execute below, equal, and above against primitive facts", () => {
@@ -194,8 +194,6 @@ test("hidden threshold bands execute below, equal, and above against primitive f
     knowbe4_02_phishing_simulation_coverage_population_count: 10,
     knowbe4_02_phishing_simulation_coverage_violation_count: 0,
     knowbe4_02_phishing_simulation_coverage_review_count: 1,
-    knowbe4_02_default_lookback_days_observed_value: null,
-    knowbe4_02_default_lookback_days_configured_value: 365,
     knowbe4_02_default_min_coverage_pct_observed_value: null,
     knowbe4_02_default_min_coverage_pct_configured_value: 90,
   };
@@ -245,7 +243,7 @@ test("hidden threshold bands execute below, equal, and above against primitive f
   assert.deepEqual([24, 25, 26, 49, 50, 51].map((percent) => verdict("KNOWBE4-19", { ...kb19, knowbe4_19_report_rate_percent: percent })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
 });
 
-test("all 87 runtime-observable numeric constants and 13 set or pattern branches have executable metadata boundaries", () => {
+test("all 84 numeric verdict rules and 13 set or pattern branches have executable metadata boundaries", () => {
   const conditionNodes = (condition) => {
     const nodes = [condition];
     if (condition.op === "and" || condition.op === "or") {
@@ -301,7 +299,17 @@ test("all 87 runtime-observable numeric constants and 13 set or pattern branches
             ["gt", "gte", "lt", "lte"].includes(candidate.op)
               ? path(candidate.left) === constant || path(candidate.right) === constant
               : candidate.op === "ratio" && path(candidate.threshold) === constant);
-          assert.ok(node, `${check.id}.${constant}: executable comparison`);
+          if (!node) {
+            assert.ok(
+              [
+                "KNOWBE4-02.default_lookback_days",
+                "QUALYS-C19.default_lookback_days",
+                "TENABLE-18.default_audit_lookback_days",
+              ].includes(`${check.id}.${constant}`),
+              `${check.id}.${constant}: only query-population boundaries may omit verdict comparisons`,
+            );
+            continue;
+          }
           const observed = node.op === "ratio"
             ? path(node.numerator)
             : path(node.left) === constant ? path(node.right) : path(node.left);
@@ -343,7 +351,7 @@ test("all 87 runtime-observable numeric constants and 13 set or pattern branches
       }
     }
   }
-  assert.equal(numericBranches, 87);
+  assert.equal(numericBranches, 84);
   assert.equal(collectionBranches, 13);
 });
 
@@ -452,4 +460,99 @@ test("Qualys metadata matches every concrete VM/PC v2 and QPS request parameter"
       `${id}: exact QPS pagination envelope`,
     );
   }
+});
+
+test("CrowdStrike, KnowBe4, Tenable, and Veracode request metadata matches client calls", () => {
+  const parameterNames = (surface, omit = []) => surface.request.parameters
+    .map((entry) => entry.name)
+    .filter((name) => !omit.includes(name));
+
+  const crowdstrikeByPath = new Map(CROWDSTRIKE_SPEC.apiSurfaces.map((surface) => [surface.path, surface]));
+  const crowdstrikeEntityPaths = [
+    "/fwmgr/entities/rule-groups/v1",
+    "/fwmgr/entities/rules/v1",
+    "/user-management/entities/roles/v1",
+    "/api-clients/entities/api-clients/v1",
+    "/policy/entities/ioa-exclusions/v1",
+    "/policy/entities/ml-exclusions/v1",
+    "/policy/entities/sv-exclusions/v1",
+    "/identity-protection/entities/policy-rules/v1",
+  ];
+  for (const path of crowdstrikeEntityPaths) {
+    const surface = crowdstrikeByPath.get(path);
+    assert.ok(surface, path);
+    assert.deepEqual(parameterNames(surface, ["member_cid"]), ["ids"], path);
+  }
+  assert.deepEqual(parameterNames(crowdstrikeByPath.get("/user-management/queries/roles/v1"), ["member_cid"]), []);
+  assert.deepEqual(parameterNames(crowdstrikeByPath.get("/identity-protection/queries/policy-rules/v1"), ["member_cid"]), []);
+  assert.deepEqual(
+    parameterNames(crowdstrikeByPath.get("/discover/combined/hosts/v1"), ["member_cid"]),
+    ["limit", "after", "filter"],
+  );
+
+  const knowbe4ById = new Map(KNOWBE4_SPEC.apiSurfaces.map((surface) => [surface.id, surface]));
+  assert.deepEqual(parameterNames(knowbe4ById.get("account")), []);
+  assert.deepEqual(parameterNames(knowbe4ById.get("training-enrollments")), [
+    "page",
+    "per_page",
+    "campaign_id",
+    "user_id",
+    "store_purchase_id",
+    "exclude_archived_users",
+    "include_campaign_id",
+    "include_store_purchase_id",
+  ]);
+  for (const name of ["exclude_archived_users", "include_campaign_id", "include_store_purchase_id"]) {
+    assert.equal(knowbe4ById.get("training-enrollments").request.parameters.find((entry) => entry.name === name).value, "true");
+  }
+
+  const tenableById = new Map(TENABLE_SPEC.apiSurfaces.map((surface) => [surface.id, surface]));
+  const tenableParameters = {
+    "server-properties": [],
+    scans: [],
+    "scan-details": ["scan_id"],
+    policies: [],
+    "policy-details": ["policy_id"],
+    "scan-templates": [],
+    scanners: [],
+    agents: ["limit", "offset"],
+    "agent-groups": [],
+    networks: ["limit", "offset"],
+    exclusions: ["limit", "offset"],
+    credentials: ["limit", "offset"],
+    users: ["withRoles"],
+    groups: [],
+    roles: [],
+    permissions: [],
+    "access-groups": ["limit", "offset"],
+    "audit-events": ["f", "limit", "offset"],
+    "tag-categories": ["limit", "offset"],
+    "tag-values": ["limit", "offset"],
+    "target-groups": [],
+    "vuln-export-jobs": [],
+    "asset-export-jobs": [],
+    "asset-export": ["chunk_size"],
+    "asset-export-status": ["export_uuid"],
+    "asset-export-chunks": ["export_uuid", "chunk_id"],
+    "vuln-export": ["num_assets", "include_plugin_output", "filters.since", "filters.state"],
+    "vuln-export-status": ["export_uuid"],
+    "vuln-export-chunks": ["export_uuid", "chunk_id"],
+    "sc-current-user": ["fields"],
+    "sc-scans": ["fields"],
+    "sc-scan-results": ["fields", "startTime"],
+    "sc-scanners": ["fields"],
+    "sc-users": ["fields"],
+    "sc-feed": [],
+  };
+  assert.equal(Object.keys(tenableParameters).length, TENABLE_SPEC.apiSurfaces.length);
+  for (const [id, names] of Object.entries(tenableParameters)) {
+    assert.deepEqual(parameterNames(tenableById.get(id)), names, id);
+  }
+  assert.equal(tenableById.get("audit-events").request.parameters.find((entry) => entry.name === "limit").value, "5000 records per request.");
+  assert.match(tenableById.get("audit-events").request.parameters.find((entry) => entry.name === "f").value, /date\.gte:<sinceIso>/);
+  assert.ok(TENABLE_SPEC.apiSurfaces.every((surface) =>
+    !parameterNames(surface).some((name) => name === "poll_interval_ms" || name === "poll_deadline_ms")));
+
+  const veracodeProjects = VERACODE_SPEC.apiSurfaces.find((surface) => surface.id === "sca-projects");
+  assert.deepEqual(parameterNames(veracodeProjects), ["guid"]);
 });

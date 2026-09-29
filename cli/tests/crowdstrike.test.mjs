@@ -734,6 +734,57 @@ test("CrowdstrikeApiClient sends exact device, RTR, and zero-trust filters, fiel
   assert.equal(zta.searchParams.get("limit"), "1000");
 });
 
+test("CrowdstrikeApiClient issues every query and entity lookup with exact paging semantics", async () => {
+  const seen = [];
+  const entityPaths = new Set([
+    "/fwmgr/entities/rule-groups/v1",
+    "/fwmgr/entities/rules/v1",
+    "/user-management/entities/roles/v1",
+    "/api-clients/entities/api-clients/v1",
+    "/policy/entities/ioa-exclusions/v1",
+    "/policy/entities/ml-exclusions/v1",
+    "/policy/entities/sv-exclusions/v1",
+    "/identity-protection/entities/policy-rules/v1",
+  ]);
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+    seen.push({ method: init.method ?? "GET", url });
+    if (entityPaths.has(url.pathname)) {
+      return jsonResponse({ resources: [{ id: "record-1", name: "record" }], meta: { pagination: { total: 1 } } });
+    }
+    return jsonResponse({ resources: ["record-1"], meta: { pagination: { total: 1 } } });
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  await client.listFirewallRuleGroups(10);
+  await client.listFirewallRules(10);
+  await client.listRoles();
+  await client.listApiClients(10);
+  await client.listIoaExclusions(10);
+  await client.listMlExclusions(10);
+  await client.listSensorVisibilityExclusions(10);
+  await client.listIdentityProtectionRules();
+  await client.listDiscoverHosts("entity_type:'unmanaged'", 100);
+
+  for (const path of entityPaths) {
+    const request = seen.find((entry) => entry.url.pathname === path);
+    assert.ok(request, path);
+    assert.equal(request.method, "GET");
+    assert.deepEqual(request.url.searchParams.getAll("ids"), ["record-1"]);
+    assert.equal(request.url.searchParams.has("limit"), false);
+    assert.equal(request.url.searchParams.has("offset"), false);
+  }
+  for (const path of ["/user-management/queries/roles/v1", "/identity-protection/queries/policy-rules/v1"]) {
+    const request = seen.find((entry) => entry.url.pathname === path);
+    assert.ok(request, path);
+    assert.equal(request.url.search, "", `${path} is one unpaged query`);
+  }
+  const discover = seen.find((entry) => entry.url.pathname === "/discover/combined/hosts/v1");
+  assert.equal(discover.url.searchParams.get("filter"), "entity_type:'unmanaged'");
+  assert.equal(discover.url.searchParams.get("limit"), "100");
+});
+
 test("CrowdstrikeApiClient records truncation instead of treating a first page as the whole population", async () => {
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.toString());
