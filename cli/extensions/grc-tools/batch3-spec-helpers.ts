@@ -399,7 +399,6 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     } as const);
     const thresholdRules = (row.thresholds ?? []).map((threshold) => {
       const thresholdCondition = batch2All(
-        batch2Eq(names.readable, true),
         batch2Gt(names.population, 0),
         batch2Defined(threshold.observedFact),
         threshold.configuredFact
@@ -424,7 +423,6 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     const collectionRules = (row.collectionRules ?? []).map((rule) => batch2Rule(
       rule.status,
       batch2All(
-        batch2Eq(names.readable, true),
         batch2Gt(names.population, 0),
         rule.operator === "intersects"
           ? {
