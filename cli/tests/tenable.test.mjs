@@ -729,11 +729,7 @@ test("healthy fixture yields passing verdicts and every control carries framewor
   assert.equal(byId(results, "TENABLE-17").status, "pass");
   assert.equal(byId(results, "TENABLE-01").status, "pass");
   assert.equal(byId(results, "TENABLE-08").status, "pass");
-  assert.equal(
-    byId(results, "TENABLE-10").status,
-    "pass",
-    JSON.stringify(byId(results, "TENABLE-10")[BATCH3_RUNTIME_FACTS]),
-  );
+  assert.equal(byId(results, "TENABLE-10").status, "pass");
   assert.equal(byId(results, "TENABLE-11").status, "pass");
   assert.equal(byId(results, "TENABLE-19").status, "pass");
   assert.ok(findings.filter((item) => item.status === "pass").length >= 8, JSON.stringify(findings.map((item) => [item.id, item.status])));
@@ -751,11 +747,7 @@ test("failing fixture: stale schedules, disabled MFA, and SLA breaches fail", as
   routes["GET /vulns/export/vuln-export-1/chunks/1"] = [{ severity: "critical", state: "OPEN", first_found: new Date(NOW - 60 * 86_400_000).toISOString(), plugin: { id: 1, vpr: { score: 9.5 } } }];
   const results = await runAll(clientsFor(routes));
   assert.equal(byId(results, "TENABLE-02").status, "fail");
-  assert.equal(
-    byId(results, "TENABLE-10").status,
-    "fail",
-    JSON.stringify(byId(results, "TENABLE-10")[BATCH3_RUNTIME_FACTS]),
-  );
+  assert.equal(byId(results, "TENABLE-10").status, "fail");
   assert.equal(byId(results, "TENABLE-15").status, "fail");
 });
 
