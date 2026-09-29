@@ -571,6 +571,7 @@ test("Tenable assessors issue the exact VM and Security Center request inventory
   const routes = { ...healthyRoutes(), ...healthyScRoutes() };
   const clients = bothPlatformClients(routerFetch(routes, { log }));
   await runAll(clients, { expectedAssetCount: 2 });
+  await clients.securityCenter.getCurrentUser();
 
   const queryNames = (path) => {
     const requests = log.filter((entry) => new URL(entry.url).pathname === path);

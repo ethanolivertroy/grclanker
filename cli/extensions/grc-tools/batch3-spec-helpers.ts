@@ -399,6 +399,8 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     } as const);
     const thresholdRules = (row.thresholds ?? []).map((threshold) => {
       const thresholdCondition = batch2All(
+        batch2Eq(names.readable, true),
+        batch2Gt(names.population, 0),
         batch2Defined(threshold.observedFact),
         threshold.configuredFact
           ? batch2Any(
@@ -421,18 +423,22 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     });
     const collectionRules = (row.collectionRules ?? []).map((rule) => batch2Rule(
       rule.status,
-      rule.operator === "intersects"
-        ? {
-            op: "intersects",
-            left: batch2Path(rule.observedFact),
-            right: batch2Path(rule.constant),
-          }
-        : {
-            op: "matchesAny",
-            candidates: batch2Path(rule.observedFact),
-            patterns: batch2Path(rule.constant),
-            ...(rule.flags ? { flags: rule.flags } : {}),
-          },
+      batch2All(
+        batch2Eq(names.readable, true),
+        batch2Gt(names.population, 0),
+        rule.operator === "intersects"
+          ? {
+              op: "intersects",
+              left: batch2Path(rule.observedFact),
+              right: batch2Path(rule.constant),
+            }
+          : {
+              op: "matchesAny",
+              candidates: batch2Path(rule.observedFact),
+              patterns: batch2Path(rule.constant),
+              ...(rule.flags ? { flags: rule.flags } : {}),
+            },
+      ),
       `${rule.observedFact} is evaluated directly against executable ${rule.constant}.`,
     ));
     const primitiveRules = [...thresholdRules, ...collectionRules];

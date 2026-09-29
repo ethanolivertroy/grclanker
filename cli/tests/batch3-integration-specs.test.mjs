@@ -502,7 +502,11 @@ test("CrowdStrike, KnowBe4, Tenable, and Veracode request metadata matches clien
     "include_campaign_id",
     "include_store_purchase_id",
   ]);
-  for (const name of ["exclude_archived_users", "include_campaign_id", "include_store_purchase_id"]) {
+  assert.match(
+    knowbe4ById.get("training-enrollments").request.parameters.find((entry) => entry.name === "exclude_archived_users").value,
+    /^true\b/,
+  );
+  for (const name of ["include_campaign_id", "include_store_purchase_id"]) {
     assert.equal(knowbe4ById.get("training-enrollments").request.parameters.find((entry) => entry.name === name).value, "true");
   }
 
