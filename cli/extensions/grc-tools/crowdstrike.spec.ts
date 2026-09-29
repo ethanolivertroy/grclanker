@@ -77,13 +77,16 @@ const falconPagingParameters = [
 ] as const;
 const listParameters = [
   ...falconPagingParameters,
-  { name: "filter", location: "query" as const, required: false, value: "The exact check-specific Falcon FQL expression rendered by the consuming check." },
 ] as const;
 
 const surfaces = [
   falconSurface("prevention-policies", "/policy/combined/prevention/v1", "Falcon Prevention Policies API", ["id", "name", "enabled", "groups", "prevention_settings", "platform_name"], "GET", listParameters),
   falconSurface("response-policies", "/policy/combined/response/v1", "Falcon Response Policies API", ["id", "name", "enabled", "groups", "settings"], "GET", listParameters),
-  falconSurface("rtr-sessions", "/real-time-response-audit/combined/sessions/v1", "Falcon RTR Audit API", ["id", "user_id", "created_at", "updated_at", "duration", "status"], "GET", listParameters),
+  falconSurface("rtr-sessions", "/real-time-response-audit/combined/sessions/v1", "Falcon RTR Audit API", ["id", "user_id", "created_at", "updated_at", "duration", "status"], "GET", [
+    ...falconPagingParameters,
+    { name: "filter", location: "query", required: true, value: "created_at:>'now-<lookback_days>d', where lookback_days is the resolved assessment option." },
+    { name: "sort", location: "query", required: true, value: "created_at|desc" },
+  ]),
   falconSurface("alerts", "/alerts/combined/alerts/v1", "Falcon Alerts API", ["id", "severity", "status", "created_timestamp", "updated_timestamp"], "POST", [
     { name: "filter", location: "form-body", required: true, value: "severity:>=70+created_timestamp:>'now-<lookback_days>d', using the resolved lookback." },
     { name: "limit", location: "form-body", required: true, value: "Runtime page size, bounded by the alert_limit option." },
@@ -93,6 +96,8 @@ const surfaces = [
   falconSurface("contained-hosts", "/devices/combined/devices/v1", "Falcon Hosts API", ["device_id", "hostname", "status", "modified_timestamp"], "GET", [
     ...falconPagingParameters,
     { name: "filter", location: "query", required: true, value: "status:['contained','containment_pending','lift_containment_pending']" },
+    { name: "sort", location: "query", required: true, value: "device_id.asc" },
+    { name: "fields", location: "query", required: true, value: "device_id,hostname,platform_name,os_version,agent_version,last_seen,first_seen,status,groups,product_type_desc,reduced_functionality_mode,modified_timestamp" },
   ]),
   falconSurface("device-control-policies", "/policy/combined/device-control/v1", "Falcon Device Control API", ["id", "name", "enabled", "groups", "settings"], "GET", listParameters),
   falconSurface("device-control-policy-details", "/policy/entities/device-control/v2", "Falcon Device Control API", ["id", "settings"], "GET", [
@@ -108,16 +113,31 @@ const surfaces = [
   falconSurface("sensor-update-builds", "/policy/combined/sensor-update-builds/v1", "Falcon Sensor Update Policies API", ["build", "platform", "version"], "GET", [
     { name: "platform", location: "query", required: true, value: "Each distinct platform_name observed in the sensor-update policy inventory." },
   ]),
-  falconSurface("hosts", "/devices/combined/devices/v1", "Falcon Hosts API", ["device_id", "hostname", "platform_name", "agent_version", "last_seen", "status", "groups"], "GET", listParameters),
+  falconSurface("hosts", "/devices/combined/devices/v1", "Falcon Hosts API", ["device_id", "hostname", "platform_name", "agent_version", "last_seen", "status", "groups"], "GET", [
+    ...falconPagingParameters,
+    { name: "sort", location: "query", required: true, value: "device_id.asc" },
+    { name: "fields", location: "query", required: true, value: "device_id,hostname,platform_name,os_version,agent_version,last_seen,first_seen,status,groups,product_type_desc,reduced_functionality_mode,modified_timestamp" },
+  ]),
   falconSurface("host-groups", "/devices/combined/host-groups/v1", "Falcon Host Groups API", ["id", "name", "group_type", "assignment_rule"], "GET", listParameters),
-  falconSurface("discover-hosts", "/discover/queries/hosts/v1", "Falcon Discover API", ["meta.pagination.total", "resources"], "GET", listParameters),
-  falconSurface("zta-assessments", "/zero-trust-assessment/queries/assessments/v1", "Falcon Zero Trust Assessment API", ["score", "device_id", "meta.pagination.total"], "GET", listParameters),
+  falconSurface("discover-hosts", "/discover/queries/hosts/v1", "Falcon Discover API", ["meta.pagination.total", "resources"], "GET", [
+    ...falconPagingParameters,
+    { name: "filter", location: "query", required: true, value: "entity_type:'unmanaged' for totals and samples, or entity_type:'managed' for the managed total." },
+  ]),
+  falconSurface("zta-assessments", "/zero-trust-assessment/queries/assessments/v1", "Falcon Zero Trust Assessment API", ["score", "device_id", "meta.pagination.total"], "GET", [
+    { name: "limit", location: "query", required: true, value: "1 on total-only requests; up to 1000 per page and 1000 records overall on the below-threshold sample request." },
+    { name: "after", location: "query", required: false, value: "Continuation cursor returned by meta.pagination.after for the below-threshold sample request." },
+    { name: "filter", location: "query", required: true, value: "score:>=0 for the scored-host total, or score:<min_zta_score for the below-threshold total and sample." },
+    { name: "sort", location: "query", required: false, value: "score|asc on the below-threshold sample request; omitted on count requests." },
+  ]),
   falconSurface("users", "/user-management/queries/users/v1", "Falcon User Management API", ["resources", "meta.pagination.total"], "GET", listParameters),
   falconSurface("user-details", "/user-management/entities/users/GET/v1", "Falcon User Management API", ["uuid", "uid", "status", "last_login_at"], "POST", [
     { name: "ids", location: "form-body", required: true, value: "Up to 100 user UUIDs returned by /user-management/queries/users/v1." },
   ]),
   falconSurface("user-roles", "/user-management/combined/user-roles/v2", "Falcon User Management API", ["id", "name", "description"], "GET", [
     { name: "user_uuid", location: "query", required: true, value: "UUID from the user-details response." },
+    { name: "direct_only", location: "query", required: true, value: "false" },
+    { name: "limit", location: "query", required: true, value: "500" },
+    { name: "offset", location: "query", required: false, value: "Returned pagination offset; omitted on the first request." },
   ]),
   falconSurface("roles", "/user-management/queries/roles/v1", "Falcon User Management API", ["resources"], "GET", listParameters),
   falconSurface("api-clients", "/api-clients/queries/api-clients/v1", "Falcon API Client Management API", ["id", "name", "scopes", "created_timestamp", "last_used_timestamp"], "GET", listParameters),
@@ -128,22 +148,52 @@ const surfaces = [
 ] as const;
 
 const PREVENTION_POLICY_COMPLETENESS = "The prevention-policies source owns the complete policy population. A truncated response with one or more visible policies sets the check-owned population-complete fact false and retains visible primitive counts, capping a clean result at warn. A truncated response with zero visible policies cannot prove an absence violation: it sets the check-owned readable fact false and the population, violation, and review counts to null, producing manual. error, denied, not-collected, not-configured, and missing-required-field states have the same unavailable-fact effect. Finding previews and exported samples never establish source cardinality.";
+const CS22_FAIL_RATIO = {
+  op: "ratio",
+  numerator: batch2Path("cs_22_sla_compliant_alert_count"),
+  denominator: batch2Path("cs_22_dated_alert_count"),
+  comparator: "lt",
+  threshold: batch2Path("fail_below_sla_percent"),
+  scale: 100,
+} as const;
+const CS22_WARN_CONTEXT = batch2All(
+  {
+    op: "ratio",
+    numerator: batch2Path("cs_22_sla_compliant_alert_count"),
+    denominator: batch2Path("cs_22_dated_alert_count"),
+    comparator: "gte",
+    threshold: batch2Path("fail_below_sla_percent"),
+    scale: 100,
+  },
+  batch2Any(
+    {
+      op: "ratio",
+      numerator: batch2Path("cs_22_sla_compliant_alert_count"),
+      denominator: batch2Path("cs_22_dated_alert_count"),
+      comparator: "lt",
+      threshold: batch2Path("pass_sla_percent"),
+      scale: 100,
+    },
+    batch2Ne("cs_22_alert_list_complete", true),
+    batch2Gt("cs_22_undated_alert_count", 0),
+  ),
+);
 
 const rows: readonly Batch3CheckRow[] = [
-  { id: "CS-01", control: 1, title: "Prevention Policy - ML Detection Levels", severity: "high", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: "Fail when no enabled host-assigned prevention policy exists or any primary CloudAntiMalware or OnSensorMLSlider detection/prevention rank is DISABLED or CAUTIOUS; warn for missing primary values, ranks below AGGRESSIVE, or an uncovered Windows, Mac, or Linux platform.", completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { primary_ml_sliders: CROWDSTRIKE_PRIMARY_ML_SLIDERS, supplemental_ml_sliders: CROWDSTRIKE_SUPPLEMENTAL_ML_SLIDERS, ml_slider_levels_in_rank_order: CROWDSTRIKE_ML_SLIDER_LEVELS, cautious_max_rank: 1, aggressive_min_rank: 3 }, thresholds: [
-    batch3Threshold("CS-01", "cautious_max_rank", "minimum_primary_ml_rank", "lte", "fail", "Lowest ordinal rank among every primary ML detection and prevention slider."),
-    batch3Threshold("CS-01", "aggressive_min_rank", "minimum_primary_ml_rank", "lt", "warn", "Lowest ordinal rank among every primary ML detection and prevention slider."),
+  { id: "CS-01", control: 1, title: "Prevention Policy - ML Detection Levels", severity: "high", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: "Fail when no enabled host-assigned prevention policy exists or any primary CloudAntiMalware or OnSensorMLSlider detection/prevention rank is DISABLED or CAUTIOUS; warn for missing primary values, ranks below AGGRESSIVE, or an uncovered Windows, Mac, or Linux platform.", completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { primary_ml_sliders: CROWDSTRIKE_PRIMARY_ML_SLIDERS, required_platforms: ["Windows", "Mac", "Linux"], nonaggressive_ml_slider_levels: CROWDSTRIKE_ML_SLIDER_LEVELS.slice(0, 3), cautious_max_rank: 1, aggressive_min_rank: 3 }, thresholds: [
+    batch3Threshold("CS-01", "cautious_max_rank", "min:policies.min_rank", "lte", "fail", "Lowest ordinal rank among every primary ML detection and prevention slider."),
+    batch3Threshold("CS-01", "aggressive_min_rank", "min:policies.min_rank", "lt", "warn", "Lowest ordinal rank among every primary ML detection and prevention slider."),
   ], collectionRules: [
-    batch3CollectionRule("CS-01", "primary_ml_sliders", "observed_primary_ml_slider_names", "intersects", "warn", "Raw primary ML setting names present across complete enabled host-assigned policies."),
-    batch3CollectionRule("CS-01", "supplemental_ml_sliders", "observed_supplemental_ml_slider_names", "intersects", "warn", "Raw supplemental ML setting names present across complete enabled host-assigned policies."),
-    batch3CollectionRule("CS-01", "ml_slider_levels_in_rank_order", "observed_ml_slider_levels", "intersects", "warn", "Normalized raw slider values present across complete enabled host-assigned policies."),
+    batch3CollectionRule("CS-01", "primary_ml_sliders", "missing_primary_ml_slider_names", "intersects", "warn", "Required primary ML setting names absent from at least one complete enabled host-assigned policy."),
+    batch3CollectionRule("CS-01", "required_platforms", "platforms_without_policy", "intersects", "warn", "Required operating-system platforms with no enabled host-assigned prevention policy."),
+    batch3CollectionRule("CS-01", "nonaggressive_ml_slider_levels", "observed_nonaggressive_ml_slider_levels", "intersects", "warn", "Normalized primary slider values below AGGRESSIVE across complete enabled host-assigned policies."),
   ] },
   { id: "CS-02", control: 2, title: "Prevention Policy - Exploit Mitigation", severity: "high", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: `Fail when no enabled host-assigned prevention policy exists or any present required exploit toggle is false. Required toggles are ${[...CROWDSTRIKE_CORE_EXPLOIT_MITIGATIONS, ...CROWDSTRIKE_EXTENDED_EXPLOIT_MITIGATIONS].join(", ")}; a policy exposing none of them is review evidence.`, completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { core_exploit_mitigations: CROWDSTRIKE_CORE_EXPLOIT_MITIGATIONS, extended_exploit_mitigations: CROWDSTRIKE_EXTENDED_EXPLOIT_MITIGATIONS }, collectionRules: [
-    batch3CollectionRule("CS-02", "core_exploit_mitigations", "disabled_core_exploit_mitigation_names", "intersects", "fail", "Raw core exploit-mitigation setting names whose values are explicitly false."),
-    batch3CollectionRule("CS-02", "extended_exploit_mitigations", "disabled_extended_exploit_mitigation_names", "intersects", "fail", "Raw extended exploit-mitigation setting names whose values are explicitly false."),
+    batch3CollectionRule("CS-02", "core_exploit_mitigations", "flatten:policies.disabled", "intersects", "fail", "Raw core exploit-mitigation setting names whose values are explicitly false."),
+    batch3CollectionRule("CS-02", "extended_exploit_mitigations", "flatten:policies.disabled", "intersects", "fail", "Raw extended exploit-mitigation setting names whose values are explicitly false."),
   ] },
-  { id: "CS-03", control: 3, title: "Prevention Policy - Script-Based Execution Control", severity: "medium", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: `Fail when no enabled host-assigned prevention policy exists or any present required script-control toggle is false. Exact required field names: ${CROWDSTRIKE_SCRIPT_CONTROL_SETTINGS.join(", ")}; a policy exposing none is review evidence.`, completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { script_control_settings: CROWDSTRIKE_SCRIPT_CONTROL_SETTINGS }, collectionRules: [batch3CollectionRule("CS-03", "script_control_settings", "disabled_script_control_setting_names", "intersects", "fail", "Raw script-control setting names whose values are explicitly false.")] },
-  { id: "CS-04", control: 4, title: "Prevention Policy - Sensor Tamper Protection", severity: "critical", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: "Fail when no enabled host-assigned prevention policy exists or SensorTamperingProtection is explicitly false; a missing SensorTamperingProtection setting is review evidence.", completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { tamper_protection_setting: "SensorTamperingProtection" }, collectionRules: [batch3CollectionRule("CS-04", "tamper_protection_setting", "disabled_tamper_setting_names", "matchesAny", "fail", "Raw prevention-policy setting names whose values are explicitly false.")] },
+  { id: "CS-03", control: 3, title: "Prevention Policy - Script-Based Execution Control", severity: "medium", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: `Fail when no enabled host-assigned prevention policy exists or any present required script-control toggle is false. Exact required field names: ${CROWDSTRIKE_SCRIPT_CONTROL_SETTINGS.join(", ")}; a policy exposing none is review evidence.`, completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { script_control_settings: CROWDSTRIKE_SCRIPT_CONTROL_SETTINGS }, collectionRules: [batch3CollectionRule("CS-03", "script_control_settings", "flatten:policies.disabled", "intersects", "fail", "Raw script-control setting names whose values are explicitly false.")] },
+  { id: "CS-04", control: 4, title: "Prevention Policy - Sensor Tamper Protection", severity: "critical", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: "Fail when no enabled host-assigned prevention policy exists or SensorTamperingProtection is explicitly false; a missing SensorTamperingProtection setting is review evidence.", completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { tamper_protection_setting: "SensorTamperingProtection" }, collectionRules: [batch3CollectionRule("CS-04", "tamper_protection_setting", "flatten:policies.disabled", "matchesAny", "fail", "Raw prevention-policy setting names whose values are explicitly false.")] },
   { id: "CS-05", control: 5, title: "Prevention Policy - On-Write Detection", severity: "medium", owner: "crowdstrike_assess_prevention_policies", surfaces: ["prevention-policies"], predicate: "Fail when no enabled host-assigned prevention policy exists or DetectOnWrite is explicitly false; warn when DetectOnWrite is absent or QuarantineOnWrite is not true.", completenessSemantics: PREVENTION_POLICY_COMPLETENESS, constants: { required_on_write_settings: CROWDSTRIKE_ON_WRITE_SETTINGS }, collectionRules: [batch3CollectionRule("CS-05", "required_on_write_settings", "disabled_on_write_setting_names", "intersects", "fail", "Raw on-write setting names whose values are explicitly false.")] },
   { id: "CS-06", control: 6, title: "Response Policy - RTR Enabled", severity: "medium", owner: "crowdstrike_assess_response_readiness", surfaces: ["response-policies"], predicate: "Count response-policy inventories with no enabled host-assigned policy enabling RealTimeFunctionality; enabled CustomScripts contributes review_count." },
   { id: "CS-07", control: 7, title: "Response Policy - Session Limits", severity: "low", owner: "crowdstrike_assess_response_readiness", surfaces: ["response-policies", "rtr-sessions"], predicate: "Count RTR sessions exceeding max_session_minutes or users exceeding max_concurrent_sessions inside the configured lookback; policy settings above either maximum also violate.", violationOutcome: "warn", constants: { default_max_session_minutes: 30, default_max_concurrent_sessions: 3 }, thresholds: [
@@ -194,16 +244,16 @@ const rows: readonly Batch3CheckRow[] = [
   { id: "CS-15", control: 15, title: "Unmanaged Asset Detection", severity: "medium", owner: "crowdstrike_assess_sensor_coverage", surfaces: ["discover-hosts"], predicate: "Count one violation when Falcon Discover reports any unmanaged hosts; a positive count is proved even when the optional sample is capped." },
   { id: "CS-16", control: 16, title: "RBAC - Admin Count", severity: "medium", owner: "crowdstrike_assess_access_governance", surfaces: ["users", "user-details", "user-roles", "roles"], predicate: `Count active administrator users above max_admins and active administrator identifiers matching the case-insensitive portable regular expression ${CROWDSTRIKE_SHARED_ACCOUNT_PATTERN}; unresolved per-user role reads make evidence incomplete.`, constants: { default_max_admins: 5, shared_account_pattern: CROWDSTRIKE_SHARED_ACCOUNT_PATTERN }, thresholds: [batch3Threshold("CS-16", "default_max_admins", "admin_users", "gt", "warn", "Uncapped active user count holding any administrator role.", "max_admins")], collectionRules: [batch3CollectionRule("CS-16", "shared_account_pattern", "active_administrator_identifiers", "matchesAny", "fail", "Normalized uncapped identifiers for active users holding an administrator role.", "i")] },
   { id: "CS-17", control: 17, title: "RBAC - Least Privilege", severity: "medium", owner: "crowdstrike_assess_access_governance", surfaces: ["users", "user-details", "user-roles", "roles"], predicate: "Count active users with more than max_roles_per_user roles or administrators inactive beyond stale_admin_login_days.", constants: { default_max_roles_per_user: 5, stale_admin_login_days: 90 }, thresholds: [
-    batch3Threshold("CS-17", "default_max_roles_per_user", "max:overprivileged.roles_count", "gt", "warn", "Greatest role count among the complete active-user role joins.", "max_roles_per_user"),
+    batch3Threshold("CS-17", "default_max_roles_per_user", "maxLength:overprivileged.roles", "gt", "warn", "Greatest role count among the complete active-user role joins.", "max_roles_per_user"),
     batch3Threshold("CS-17", "stale_admin_login_days", "max_observed_admin_login_age_days", "gt", "fail", "Greatest elapsed days since last login among dated administrator accounts.", "stale_login_days"),
   ] },
   { id: "CS-18", control: 18, title: "RBAC - API Client Permissions", severity: "high", owner: "crowdstrike_assess_access_governance", surfaces: ["api-clients"], predicate: `A client is write-capable when any lowercased scope matches one of these case-insensitive patterns: ${CROWDSTRIKE_SENSITIVE_WRITE_SCOPE_PATTERNS.join(", ")}. Fail when write-capable clients exceed max_write_clients; clients unused beyond stale_api_client_days require review.`, constants: { default_max_write_clients: 3, stale_api_client_days: 90, sensitive_write_scope_patterns: CROWDSTRIKE_SENSITIVE_WRITE_SCOPE_PATTERNS }, thresholds: [
     batch3Threshold("CS-18", "default_max_write_clients", "length:write_clients", "gt", "fail", "Uncapped API-client count with a sensitive write-action scope.", "max_write_clients"),
     batch3Threshold("CS-18", "stale_api_client_days", "max_observed_write_client_inactivity_days", "gt", "warn", "Greatest elapsed days since last use among dated write-capable API clients.", "stale_client_days"),
-  ], collectionRules: [batch3CollectionRule("CS-18", "sensitive_write_scope_patterns", "write_action_scope_subjects", "matchesAny", "fail", "Normalized lowercased scope subjects whose raw action is write or admin.", "i")] },
-  { id: "CS-19", control: 19, title: "Exclusion Review - IOA Exclusions", severity: "medium", owner: "crowdstrike_assess_access_governance", surfaces: ["ioa-exclusions"], predicate: "Fail for an IOA cl_regex or ifn_regex equal to match-all forms such as .*, ^.*$, .+, or ^.+$ after trimming; every other readable exclusion remains review evidence.", emptyOutcome: "pass", constants: { broad_ioa_regex_forms: [".*", "^.*$", ".+", "^.+$"] }, collectionRules: [batch3CollectionRule("CS-19", "broad_ioa_regex_forms", "normalized_ioa_regex_values", "intersects", "fail", "Trimmed uncapped cl_regex and ifn_regex values from every readable IOA exclusion.")] },
-  { id: "CS-20", control: 20, title: "Exclusion Review - ML Exclusions", severity: "medium", owner: "crowdstrike_assess_access_governance", surfaces: ["ml-exclusions"], predicate: `Fail when the normalized exclusion value is a whole drive, root, recursive wildcard, or matches one of these case-insensitive sensitive-root expressions: ${CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS.join(", ")}. Every other readable exclusion remains review evidence.`, emptyOutcome: "pass", constants: { sensitive_exclusion_path_patterns: CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS }, collectionRules: [batch3CollectionRule("CS-20", "sensitive_exclusion_path_patterns", "normalized_ml_exclusion_values", "matchesAny", "fail", "Trimmed uncapped path values from every readable ML exclusion.", "i")] },
-  { id: "CS-21", control: 21, title: "Exclusion Review - Sensor Visibility", severity: "high", owner: "crowdstrike_assess_access_governance", surfaces: ["sv-exclusions"], predicate: `Fail when the normalized exclusion value is a whole drive, root, recursively broad directory tree, or matches one of these case-insensitive sensitive-root expressions: ${CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS.join(", ")}. Every other readable exclusion remains review evidence.`, emptyOutcome: "pass", constants: { sensitive_exclusion_path_patterns: CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS }, collectionRules: [batch3CollectionRule("CS-21", "sensitive_exclusion_path_patterns", "normalized_sensor_visibility_exclusion_values", "matchesAny", "fail", "Trimmed uncapped path values from every readable sensor-visibility exclusion.", "i")] },
+  ], collectionRules: [batch3CollectionRule("CS-18", "sensitive_write_scope_patterns", "flatten:write_clients.sensitive_write_scopes", "matchesAny", "fail", "Normalized lowercased scope subjects whose raw action is write or admin.", "i")] },
+  { id: "CS-19", control: 19, title: "Exclusion Review - IOA Exclusions", severity: "medium", owner: "crowdstrike_assess_access_governance", surfaces: ["ioa-exclusions"], predicate: "Fail when a globally applied IOA cl_regex or ifn_regex equals a match-all form such as .*, ^.*$, .+, or ^.+$ after trimming; a non-global broad expression and every other readable exclusion remain review evidence.", emptyOutcome: "pass", constants: { broad_ioa_regex_forms: [".*", "^.*$", ".+", "^.+$"] }, collectionRules: [batch3CollectionRule("CS-19", "broad_ioa_regex_forms", "normalized_global_ioa_regex_values", "intersects", "fail", "Trimmed uncapped cl_regex and ifn_regex values from every globally applied readable IOA exclusion.")] },
+  { id: "CS-20", control: 20, title: "Exclusion Review - ML Exclusions", severity: "medium", owner: "crowdstrike_assess_access_governance", surfaces: ["ml-exclusions"], predicate: `Fail when the normalized exclusion value is a whole drive, root, recursive wildcard, or matches one of these case-insensitive sensitive-root expressions: ${CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS.join(", ")}. Every other readable exclusion remains review evidence.`, emptyOutcome: "pass", constants: { sensitive_exclusion_path_patterns: CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS }, collectionRules: [batch3CollectionRule("CS-20", "sensitive_exclusion_path_patterns", "flatten:listing.value", "matchesAny", "fail", "Trimmed uncapped path values from every readable ML exclusion.", "i")] },
+  { id: "CS-21", control: 21, title: "Exclusion Review - Sensor Visibility", severity: "high", owner: "crowdstrike_assess_access_governance", surfaces: ["sv-exclusions"], predicate: `Fail when the normalized exclusion value is a whole drive, root, recursively broad directory tree, or matches one of these case-insensitive sensitive-root expressions: ${CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS.join(", ")}. Every other readable exclusion remains review evidence.`, emptyOutcome: "pass", constants: { sensitive_exclusion_path_patterns: CROWDSTRIKE_SENSITIVE_EXCLUSION_PATH_PATTERNS }, collectionRules: [batch3CollectionRule("CS-21", "sensitive_exclusion_path_patterns", "flatten:listing.value", "matchesAny", "fail", "Trimmed uncapped path values from every readable sensor-visibility exclusion.", "i")] },
   {
     id: "CS-22",
     control: 22,
@@ -215,12 +265,13 @@ const rows: readonly Batch3CheckRow[] = [
     emptyOutcome: "pass",
     constants: { critical_sla_hours: 24, high_sla_hours: 72, default_lookback_days: 30, critical_severity_floor: 90, high_severity_floor: 70, pass_sla_percent: 95, fail_below_sla_percent: 80 },
     thresholds: [
-      batch3Threshold("CS-22", "critical_sla_hours", "maximum_critical_alert_resolution_hours", "gt", "fail", "Greatest resolution or open age in hours among dated alerts at or above the critical severity floor."),
-      batch3Threshold("CS-22", "high_sla_hours", "maximum_high_alert_resolution_hours", "gt", "fail", "Greatest resolution or open age in hours among dated alerts from the high through below-critical severity band."),
-      batch3Threshold("CS-22", "default_lookback_days", "oldest_selected_alert_age_days", "gt", "warn", "Age in days of the oldest alert admitted to the assessment population.", "lookback_days"),
-      batch3Threshold("CS-22", "critical_severity_floor", "maximum_selected_alert_severity", "gte", "warn", "Greatest numeric severity among selected alerts."),
-      batch3Threshold("CS-22", "high_severity_floor", "minimum_selected_alert_severity", "gte", "warn", "Lowest numeric severity among selected alerts."),
+      batch3Threshold("CS-22", "critical_sla_hours", "maximum_critical_alert_resolution_hours", "gt", "fail", "Greatest resolution or open age in hours among dated alerts at or above the critical severity floor.", undefined, CS22_FAIL_RATIO),
+      batch3Threshold("CS-22", "high_sla_hours", "maximum_high_alert_resolution_hours", "gt", "fail", "Greatest resolution or open age in hours among dated alerts from the high through below-critical severity band.", undefined, CS22_FAIL_RATIO),
+      batch3Threshold("CS-22", "default_lookback_days", "oldest_selected_alert_age_days", "gt", "warn", "Age in days of the oldest alert admitted to the assessment population.", "lookback_days", CS22_WARN_CONTEXT),
+      batch3Threshold("CS-22", "critical_severity_floor", "maximum_selected_alert_severity", "gte", "warn", "Greatest numeric severity among selected alerts.", undefined, CS22_WARN_CONTEXT),
+      batch3Threshold("CS-22", "high_severity_floor", "minimum_selected_alert_severity", "gte", "warn", "Lowest numeric severity among selected alerts.", undefined, CS22_WARN_CONTEXT),
     ],
+    primitiveRuleIndex: 3,
     runtimeFactNames: {
       readable: "cs_22_alert_read_succeeded",
       complete: "cs_22_alert_list_complete",

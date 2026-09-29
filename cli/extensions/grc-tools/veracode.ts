@@ -26,6 +26,9 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  batch3AttachRuntimeFacts,
+  batch3MergePrimitiveEvidence,
+  batch3PrimitiveEvidence,
   batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
@@ -2022,7 +2025,7 @@ function veracodeDecisionFacts(id: string, evidence: JsonRecord): Readonly<Recor
     case "VERACODE-08":
       return fact(
         inventory("users_seen"),
-        counts("inactive_count", "api_accounts_without_team") + Math.max(0, veracodeEvidenceCount(evidence, "administrator_count") - (asNumber(evidence.max_admins) ?? 0)),
+        counts("api_accounts_without_team"),
         counts("users_without_last_login_count"),
       );
     case "VERACODE-09":
@@ -2070,7 +2073,7 @@ function finding(
     evidence ?? {},
     decisionFacts ?? veracodeDecisionFacts(id, evidence ?? {}),
   );
-  return {
+  return batch3AttachRuntimeFacts({
     id,
     title: control.title,
     severity,
@@ -2078,7 +2081,7 @@ function finding(
     summary,
     mappings: [...control.mappings],
     evidence,
-  };
+  }, facts);
 }
 
 function manualFinding(
@@ -2089,10 +2092,9 @@ function manualFinding(
   evidence: JsonRecord = {},
   caveats: Array<string | undefined> = [],
 ): VeracodeFinding {
-  return finding(number, severity, joinNotes(reason, ...caveats, `Manual evidence required: ${evidenceToCollect.join(" ")}`), {
-    ...evidence,
+  return finding(number, severity, joinNotes(reason, ...caveats, `Manual evidence required: ${evidenceToCollect.join(" ")}`), batch3MergePrimitiveEvidence(evidence, {
     manual_evidence: evidenceToCollect,
-  }, batch3UnavailableFacts(controlId(number)));
+  }), batch3UnavailableFacts(controlId(number)));
 }
 
 type UnreadableLinkedProjectList = { application: string; status: number | null; endpoint: string | null };
@@ -2267,6 +2269,7 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
   const noStaticScan: Array<{ application: string; scan_types_present: string[]; last_completed_scan_date: string | null }> = [];
   const notPublished: Array<{ application: string; latest_static_status: string }> = [];
   const missingDate: string[] = [];
+  const completedScanAges: number[] = [];
   let fresh = 0;
   for (const app of list.items) {
     const state = latestScanState(app, "STATIC");
@@ -2282,6 +2285,7 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
         break;
       case "completed": {
         const age = daysSince(state.date, now);
+        completedScanAges.push(age);
         if (age > maxScanAgeDays) stale.push({ application: applicationName(app), days_since_published_static_scan: age, last_completed_scan_date: asString(app.last_completed_scan_date) ?? null });
         else fresh += 1;
         break;
@@ -2293,7 +2297,7 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
     }
   }
   const partial = partialInventoryNote(list, "applications");
-  const evidence = {
+  const evidence = batch3PrimitiveEvidence({
     applications_seen: list.items.length,
     applications_total: list.totalElements ?? null,
     fresh_applications: fresh,
@@ -2303,7 +2307,10 @@ function evaluateScanCoverage(snapshot: ApplicationSnapshot, maxScanAgeDays: num
     applications_without_static_scan_date: decisionSample(missingDate, 50),
     max_scan_age_days: maxScanAgeDays,
     date_source: "scans[].modified_date of the latest STATIC scan in a published status",
-  };
+  }, {
+    max_observed_scan_age_days: completedScanAges.length > 0 ? Math.max(...completedScanAges) : null,
+    max_scan_age_days: maxScanAgeDays,
+  });
   if (stale.length > 0 || noStaticScan.length > 0) {
     return finding(1, "critical", joinNotes(
       `${stale.length}/${list.items.length} applications have no published static scan within ${maxScanAgeDays} days and ${noStaticScan.length} applications expose no static scan at all (dynamic, manual, or SCA scans and the scan-type agnostic last_completed_scan_date do not satisfy this control).`,
@@ -2404,16 +2411,24 @@ function evaluateScanFrequency(snapshot: ApplicationSnapshot, policies: Surface<
   const unconfirmed: Array<{ application: string; details: string[] }> = [];
   const noRequirement: string[] = [];
   const requirementsByApplication: Record<string, string[]> = {};
+  const criticalApplicationScanAges: number[] = [];
+  const standardApplicationScanAges: number[] = [];
   let compliant = 0;
   for (const app of list.items) {
     const name = applicationName(app);
+    const criticality = businessCriticality(app);
+    const lastCompletedScan = parseDate(app.last_completed_scan_date);
+    if (lastCompletedScan && criticality) {
+      const ages = criticality === "VERY_HIGH" ? criticalApplicationScanAges : standardApplicationScanAges;
+      ages.push(daysSince(lastCompletedScan, now));
+    }
     const assigned = applicationPolicies(app);
     const resolvedPolicies = assigned.map((policy) => policyByGuid.get(asString(policy.guid) ?? "")).filter((policy): policy is JsonRecord => policy !== undefined);
     const unresolvedPolicies = assigned.length - resolvedPolicies.length;
-    const criticality = criticalityRequirement(app, intervals);
+    const criticalityFrequency = criticalityRequirement(app, intervals);
     const requirements = strictestRequirements([
       ...resolvedPolicies.flatMap(policyFrequencyRequirements),
-      ...(criticality ? [criticality] : []),
+      ...(criticalityFrequency ? [criticalityFrequency] : []),
     ]);
     if (requirements.length === 0 && unresolvedPolicies === 0) {
       noRequirement.push(name);
@@ -2432,7 +2447,7 @@ function evaluateScanFrequency(snapshot: ApplicationSnapshot, policies: Surface<
   }
   const partial = joinNotes(partialInventoryNote(list, "applications"), partialInventoryNote(policies.value, "policies")) || undefined;
   const tiers = `VERY_HIGH ${describeInterval(intervals.criticalDays)}, other criticality tiers ${describeInterval(intervals.standardDays)}`;
-  const evidence = {
+  const evidence = batch3PrimitiveEvidence({
     applications_seen: list.items.length,
     compliant_applications: compliant,
     overdue_applications: decisionSample(overdue, 50),
@@ -2442,7 +2457,16 @@ function evaluateScanFrequency(snapshot: ApplicationSnapshot, policies: Surface<
     standard_scan_interval_days: intervals.standardDays,
     requirement_basis: "strictest scan_frequency_rules across every assigned policy per scan type plus the business criticality tier against last_completed_scan_date",
     requirements_by_application: Object.fromEntries(Object.entries(requirementsByApplication).slice(0, 50)),
-  };
+  }, {
+    max_critical_application_scan_age_days: criticalApplicationScanAges.length > 0
+      ? Math.max(...criticalApplicationScanAges)
+      : null,
+    max_standard_application_scan_age_days: standardApplicationScanAges.length > 0
+      ? Math.max(...standardApplicationScanAges)
+      : null,
+    critical_scan_interval_days: intervals.criticalDays,
+    standard_scan_interval_days: intervals.standardDays,
+  });
   if (overdue.length > 0) {
     return finding(4, "high", joinNotes(`${overdue.length}/${list.items.length} applications are overdue against their strictest scan frequency requirement from assigned policies and business criticality (${tiers}).`, partial), evidence);
   }
@@ -2629,7 +2653,10 @@ function prescanManualFinding(snapshot: ApplicationSnapshot): VeracodeFinding {
     "low",
     "Prescan module selection results are only exposed by the XML getprescanresults.do API, which this read-only REST inspector does not call; module selection coverage cannot be verified through the REST APIs.",
     ["Export the prescan module selection (selected versus available modules) for the latest static scan of each application and confirm at least 80 percent of relevant modules are selected."],
-    { applications_seen: seen },
+    batch3PrimitiveEvidence(
+      { applications_seen: seen },
+      { minimum_observed_module_coverage_percent: null },
+    ),
   );
 }
 
@@ -2767,6 +2794,7 @@ function evaluateCustomPolicies(snapshot: ApplicationSnapshot, policies: Surface
 
 function evaluateCollectionsPosture(snapshot: ApplicationSnapshot): VeracodeFinding {
   const evidence: JsonRecord = {};
+  let maximumNoncompliantPercent: number | null = null;
   if (snapshot.applications.status === "ok") {
     const groups = new Map<string, { total: number; nonCompliant: number }>();
     for (const app of snapshot.applications.value.items) {
@@ -2777,13 +2805,18 @@ function evaluateCollectionsPosture(snapshot: ApplicationSnapshot): VeracodeFind
       groups.set(unit, entry);
     }
     evidence.business_unit_posture = Object.fromEntries([...groups.entries()].slice(0, 50));
+    maximumNoncompliantPercent = groups.size > 0
+      ? Math.max(...[...groups.values()].map((entry) => (entry.nonCompliant / entry.total) * 100))
+      : null;
   }
   return manualFinding(
     20,
     "medium",
     "The Collections API is not part of the published Veracode REST API reference used by this inspector, so collection-level compliance posture was not evaluated through the API; business-unit grouping of application policy status is provided as supporting evidence only.",
     ["Export each application collection and its aggregate compliance from the Platform and flag collections where more than 20 percent of applications do not pass policy."],
-    evidence,
+    batch3PrimitiveEvidence(evidence, {
+      maximum_collection_noncompliant_percent: maximumNoncompliantPercent,
+    }),
   );
 }
 
@@ -2844,6 +2877,7 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
   }
   const overdue: Array<{ application: string; issue_id: string | null; severity: number; days_open: number }> = [];
   const missingDate: number[] = [];
+  const maximumAgeBySeverity = new Map<number, number>();
   let findingsRead = 0;
   let openEvaluated = 0;
   let incompletePagination = 0;
@@ -2864,11 +2898,29 @@ function evaluateFlawAging(samples: ApplicationFindingsSample[], inventory: HalL
       }
       openEvaluated += 1;
       const days = daysSince(firstFound, now);
+      maximumAgeBySeverity.set(severity, Math.max(maximumAgeBySeverity.get(severity) ?? days, days));
       if (days > threshold) overdue.push({ application: sample.application, issue_id: asString(item.issue_id) ?? null, severity, days_open: days });
     }
   }
   const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} application finding lists were unreadable.` : undefined, incompletePagination > 0 ? `${incompletePagination} finding lists were truncated before the last page.` : undefined];
-  const evidence = { applications_sampled: samples.length, applications_readable: readable.length, open_findings_evaluated: openEvaluated, overdue_findings: overdue.slice(0, 100), overdue_count: overdue.length, findings_without_first_found_date: missingDate.length, thresholds_days: FLAW_AGE_THRESHOLDS };
+  const evidence = batch3PrimitiveEvidence(
+    { applications_sampled: samples.length, applications_readable: readable.length, open_findings_evaluated: openEvaluated, overdue_findings: overdue.slice(0, 100), overdue_count: overdue.length, findings_without_first_found_date: missingDate.length, thresholds_days: FLAW_AGE_THRESHOLDS },
+    {
+      max_very_high_age_days: maximumAgeBySeverity.get(5) ?? null,
+      max_high_age_days: maximumAgeBySeverity.get(4) ?? null,
+      max_medium_age_days: maximumAgeBySeverity.get(3) ?? null,
+      max_low_age_days: Math.max(
+        ...[maximumAgeBySeverity.get(2), maximumAgeBySeverity.get(1), maximumAgeBySeverity.get(0)]
+          .filter((age): age is number => age !== undefined),
+        Number.NEGATIVE_INFINITY,
+      ) === Number.NEGATIVE_INFINITY
+        ? null
+        : Math.max(
+            ...[maximumAgeBySeverity.get(2), maximumAgeBySeverity.get(1), maximumAgeBySeverity.get(0)]
+              .filter((age): age is number => age !== undefined),
+          ),
+    },
+  );
   if (overdue.length > 0) {
     const critical = overdue.filter((item) => item.severity === 5).length;
     return finding(3, "high", joinNotes(`${overdue.length} open unmitigated findings exceed their severity SLA (${critical} Very High over 30 days) across ${readable.length} sampled applications.`, ...caveats), evidence);
@@ -2953,6 +3005,7 @@ function evaluateFalsePositiveRate(samples: ApplicationFindingsSample[], invento
   }
   const exceeding: Array<{ application: string; rate_percent: number; findings: number; fp_annotated_findings: number }> = [];
   const perApplication: Array<{ application: string; findings_seen: number; findings_total: number | null; list_complete: boolean; fp_annotated_findings: number; fp_approved_findings: number; resolution_values: Record<string, number> }> = [];
+  const observedRates: number[] = [];
   let evaluated = 0;
   let incomplete = 0;
   for (const sample of readable) {
@@ -2972,17 +3025,21 @@ function evaluateFalsePositiveRate(samples: ApplicationFindingsSample[], invento
       resolution_values: countValues(list.items.map((item) => asString(findingStatus(item).resolution) ?? "absent")),
     });
     const rate = (fpFindings.length / list.items.length) * 100;
+    observedRates.push(rate);
     if (rate > maxRatePercent) exceeding.push({ application: sample.application, rate_percent: Number(rate.toFixed(1)), findings: list.items.length, fp_annotated_findings: fpFindings.length });
   }
   const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} application finding lists were unreadable.` : undefined, incomplete > 0 ? `${incomplete} finding lists were truncated, so the rate was computed over the findings seen (total unknown or larger).` : undefined];
-  const evidence = {
+  const evidence = batch3PrimitiveEvidence({
     applications_sampled: samples.length,
     applications_with_findings: evaluated,
     applications_exceeding: decisionSample(exceeding, 50),
     max_rate_percent: maxRatePercent,
     signal: "annotations[].action FP (include_annot=TRUE); finding_status.resolution is recorded as evidence only",
     per_application: decisionSample(perApplication, 50),
-  };
+  }, {
+    maximum_false_positive_percent: observedRates.length > 0 ? Math.max(...observedRates) : null,
+    max_fp_rate_percent: maxRatePercent,
+  });
   if (evaluated === 0) {
     return manualFinding(16, "medium", "No sampled application returned findings, so a false positive rate cannot be computed; the empty population is treated as unverifiable rather than compliant.", manualEvidence, evidence);
   }
@@ -3001,6 +3058,7 @@ function evaluateFlawDensity(samples: ApplicationFindingsSample[], inventory: Ha
   }
   const exceeding: Array<{ application: string; density: number; kloc: number; high_flaws: number }> = [];
   const missingLoc: string[] = [];
+  const observedDensities: number[] = [];
   let evaluated = 0;
   for (const sample of readable) {
     const report = (sample.summaryReport as { value: JsonRecord }).value;
@@ -3012,11 +3070,18 @@ function evaluateFlawDensity(samples: ApplicationFindingsSample[], inventory: Ha
     }
     const highFlaws = modules.reduce((total, module) => total + (asNumber(module.numflawssev5) ?? 0) + (asNumber(module.numflawssev4) ?? 0), 0);
     const density = highFlaws / (loc / 1000);
+    observedDensities.push(density);
     evaluated += 1;
     if (density > maxDensity) exceeding.push({ application: sample.application, density: Number(density.toFixed(3)), kloc: Number((loc / 1000).toFixed(1)), high_flaws: highFlaws });
   }
   const caveats = [partialInventoryNote(inventory, "applications"), scopeNote(samples.length, inventory.items.length, "applications"), unreadable.length > 0 ? `${unreadable.length} summary reports were unreadable.` : undefined];
-  const evidence = { applications_sampled: samples.length, applications_evaluated: evaluated, applications_exceeding: decisionSample(exceeding, 50), applications_without_loc: decisionSample(missingLoc, 50), max_density_per_kloc: maxDensity };
+  const evidence = batch3PrimitiveEvidence(
+    { applications_sampled: samples.length, applications_evaluated: evaluated, applications_exceeding: decisionSample(exceeding, 50), applications_without_loc: decisionSample(missingLoc, 50), max_density_per_kloc: maxDensity },
+    {
+      maximum_flaw_density_per_kloc: observedDensities.length > 0 ? Math.max(...observedDensities) : null,
+      max_flaw_density_per_kloc: maxDensity,
+    },
+  );
   if (exceeding.length > 0) {
     return finding(17, "medium", joinNotes(`${exceeding.length}/${evaluated} applications exceed ${maxDensity} Very High/High flaws per KLOC.`, ...caveats), evidence);
   }
@@ -3117,6 +3182,7 @@ function evaluateScaCurrency(workspaces: Surface<HalListResult>, samples: ScaWor
     return manualFinding(5, "high", unreadable.length > 0 ? unreadableReason("SCA workspace issues", unreadable[0].vulnerabilities) : "No workspaces were sampled.", ["Export SCA vulnerability issues per workspace."]);
   }
   const high: Array<{ workspace: string; library: string; severity: number; cve: string | null }> = [];
+  const observedCvssScores: number[] = [];
   let issues = 0;
   let librariesSeen = 0;
   let incomplete = 0;
@@ -3134,6 +3200,7 @@ function evaluateScaCurrency(workspaces: Surface<HalListResult>, samples: ScaWor
     for (const issue of issueList.items) {
       issues += 1;
       const severity = asNumber(issue.severity) ?? asNumber(asObject(issue.vulnerability)?.cvss3_score) ?? asNumber(asObject(issue.vulnerability)?.cvss2_score);
+      if (severity !== undefined) observedCvssScores.push(severity);
       if (severity !== undefined && severity >= cvssThreshold) {
         high.push({ workspace: sample.workspace, library: asString(asObject(issue.library)?.name) ?? "library", severity, cve: asString(asObject(issue.vulnerability)?.cve) ?? null });
       }
@@ -3148,7 +3215,13 @@ function evaluateScaCurrency(workspaces: Surface<HalListResult>, samples: ScaWor
     libraryListsIncomplete > 0 ? `${libraryListsIncomplete} library lists were truncated, so libraries_seen is a lower bound.` : undefined,
   ];
   const anyLibraryListRead = readable.some((sample) => sample.libraries.status === "ok");
-  const evidence = { workspaces_seen: list.items.length, workspaces_sampled: samples.length, open_vulnerability_issues: issues, libraries_seen: anyLibraryListRead ? librariesSeen : null, library_lists_unreadable: libraryListsUnreadable, library_lists_truncated: libraryListsIncomplete, high_severity_issues: high.slice(0, 100), high_severity_count: high.length, cvss_threshold: cvssThreshold };
+  const evidence = batch3PrimitiveEvidence(
+    { workspaces_seen: list.items.length, workspaces_sampled: samples.length, open_vulnerability_issues: issues, libraries_seen: anyLibraryListRead ? librariesSeen : null, library_lists_unreadable: libraryListsUnreadable, library_lists_truncated: libraryListsIncomplete, high_severity_issues: high.slice(0, 100), high_severity_count: high.length, cvss_threshold: cvssThreshold },
+    {
+      max_open_sca_cvss: observedCvssScores.length > 0 ? Math.max(...observedCvssScores) : null,
+      sca_cvss_threshold: cvssThreshold,
+    },
+  );
   if (high.length > 0) {
     return finding(5, "high", joinNotes(`${high.length} open SCA vulnerability issues at or above CVSS ${cvssThreshold} across ${readable.length} sampled workspaces.`, ...caveats), evidence);
   }
@@ -3413,15 +3486,28 @@ function evaluateUserRoles(snapshot: IdentitySnapshot, maxAdmins: number, inacti
   const admins = active.filter((user) => userRoleNames(user).some((role) => /^administrator$/i.test(role))).map(userLabel);
   const inactive: string[] = [];
   const neverLoggedIn: string[] = [];
+  const observedInactiveDays: number[] = [];
   for (const user of active.filter(isActiveHuman)) {
     const lastLogin = parseDate(user.last_login);
     if (!lastLogin) neverLoggedIn.push(userLabel(user));
-    else if (daysSince(lastLogin, now) > inactiveDays) inactive.push(userLabel(user));
+    else {
+      const age = daysSince(lastLogin, now);
+      observedInactiveDays.push(age);
+      if (age > inactiveDays) inactive.push(userLabel(user));
+    }
   }
   const serviceWithoutTeam = active.filter((user) => isApiAccount(user) && asRecords(user.teams).length === 0 && asBoolean(user.no_teams_required) !== true).map(userLabel);
   const nonSaml = active.filter(isActiveHuman).filter((user) => asBoolean(user.saml_user) !== true).map(userLabel);
   const partial = partialInventoryNote(snapshot.users.value, "users");
-  const evidence = { users_seen: users.length, active_users: active.length, administrators: decisionSample(admins, 50), administrator_count: admins.length, max_admins: maxAdmins, inactive_users: decisionSample(inactive, 100), inactive_count: inactive.length, users_without_last_login: decisionSample(neverLoggedIn, 100), users_without_last_login_count: neverLoggedIn.length, api_accounts_without_team: decisionSample(serviceWithoutTeam, 50), non_saml_human_users: nonSaml.length, inactive_days: inactiveDays };
+  const evidence = batch3PrimitiveEvidence(
+    { users_seen: users.length, active_users: active.length, administrators: decisionSample(admins, 50), administrator_count: admins.length, max_admins: maxAdmins, inactive_users: decisionSample(inactive, 100), inactive_count: inactive.length, users_without_last_login: decisionSample(neverLoggedIn, 100), users_without_last_login_count: neverLoggedIn.length, api_accounts_without_team: decisionSample(serviceWithoutTeam, 50), non_saml_human_users: nonSaml.length, inactive_days: inactiveDays },
+    {
+      administrator_count: admins.length,
+      max_admins: maxAdmins,
+      max_observed_inactive_days: observedInactiveDays.length > 0 ? Math.max(...observedInactiveDays) : null,
+      inactive_days: inactiveDays,
+    },
+  );
   if (inactive.length > 0 || serviceWithoutTeam.length > 0 || admins.length > maxAdmins) {
     return finding(8, "high", joinNotes(`${admins.length} Administrator accounts (threshold ${maxAdmins}), ${inactive.length} active human users with no login in ${inactiveDays} days, and ${serviceWithoutTeam.length} API accounts without a team assignment.`, partial), evidence);
   }
@@ -3450,6 +3536,7 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
   const aged: Array<{ user: string; api_id: string | null; age_days: number }> = [];
   const expired: string[] = [];
   const missingDates: string[] = [];
+  const observedCredentialAges: number[] = [];
   let current = 0;
   const projectCredential = (credential: JsonRecord): JsonRecord => ({ api_id: asString(credential.api_id) ?? null, created_ts: asString(credential.created_ts) ?? null, expiration_ts: asString(credential.expiration_ts) ?? null, revocation_ts: asString(credential.revocation_ts) ?? null, last_used_ts: asString(credential.last_used_ts) ?? null });
   const rawCredentials: JsonRecord = Object.fromEntries(results.map((item) => [item.userId, rawSurface(item.credentials, projectCredential)]));
@@ -3464,13 +3551,22 @@ async function evaluateApiCredentials(client: ClientLike, snapshot: IdentitySnap
     }
     if (expiration.getTime() < now.getTime()) expired.push(item.user);
     const age = daysSince(created, now);
+    observedCredentialAges.push(age);
     if (age > maxAgeDays) aged.push({ user: item.user, api_id: asString(credential.api_id) ?? null, age_days: age });
     else current += 1;
   }
   const caveats = [partialInventoryNote(snapshot.users.value, "users"), scopeNote(sampled.length, apiUsers.length, "API accounts"), unreadable.length > 0 ? `${unreadable.length} credential records were unreadable.` : undefined];
   // With no credential record readable the age classification is unknown, not 0 or []; credentials_readable stays the honest count of records read.
   const anyReadable = readable.length > 0;
-  const evidence = { api_accounts: snapshot.users.value.complete ? apiUsers.length : null, api_accounts_sampled: sampled.length, credentials_readable: readable.length, credentials_current: anyReadable ? current : null, credentials_over_max_age: anyReadable ? decisionSample(aged, 100) : null, credentials_over_max_age_count: anyReadable ? aged.length : null, credentials_expired: anyReadable ? decisionSample(expired, 50) : null, credentials_missing_dates: anyReadable ? decisionSample(missingDates, 50) : null, max_credential_age_days: maxAgeDays };
+  const evidence = batch3PrimitiveEvidence(
+    { api_accounts: snapshot.users.value.complete ? apiUsers.length : null, api_accounts_sampled: sampled.length, credentials_readable: readable.length, credentials_current: anyReadable ? current : null, credentials_over_max_age: anyReadable ? decisionSample(aged, 100) : null, credentials_over_max_age_count: anyReadable ? aged.length : null, credentials_expired: anyReadable ? decisionSample(expired, 50) : null, credentials_missing_dates: anyReadable ? decisionSample(missingDates, 50) : null, max_credential_age_days: maxAgeDays },
+    {
+      max_observed_credential_age_days: observedCredentialAges.length > 0
+        ? Math.max(...observedCredentialAges)
+        : null,
+      max_credential_age_days: maxAgeDays,
+    },
+  );
   if (readable.length === 0) {
     return { finding: manualFinding(9, "high", unreadableReason("api_credentials (Administrator role)", unreadable[0].credentials), manualEvidence, evidence), raw: { api_credentials_by_user: rawCredentials }, errors };
   }

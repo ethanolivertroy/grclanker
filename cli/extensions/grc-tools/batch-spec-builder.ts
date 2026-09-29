@@ -153,7 +153,7 @@ export function deriveDecisionRules(
   const rewritten = reachableRules.map((entry, index) => {
     const name = `${checkId.toLowerCase().replaceAll("-", "_")}_branch_${String(index + 1).padStart(2, "0")}_matches`;
     derivedFactRules[name] = {
-      description: `${checkId} ordered branch ${index + 1} (${entry.status}) is true exactly when its portable evidence condition matches.`,
+      description: `${checkId} ordered branch ${index + 1} selects ${entry.status} when ${renderVerdictCondition(entry.condition)}.`,
       condition: entry.condition,
     };
     return {
@@ -492,9 +492,9 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
     status: EvaluatedFindingStatus,
   ) => ({
     kind,
-    input: `${check.id} concrete primitive assignment: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`,
+    input: `${check.id} ${check.title}: ${renderExampleAssignment(conditionFor(status), constants)}; all earlier ordered branches are false.`,
     expected: status,
-    reason: `${check.id} reaches the first ${status} rule under this named primitive assignment.`,
+    reason: `${check.id} returns ${status} because ${sourceConditionFor(status)} is the first matching ordered condition.`,
   });
   return {
     pass: `${check.id} returns pass at the first ordered pass condition ${sourceConditionFor("pass")}. Decision predicate: ${check.decision}`,
@@ -506,7 +506,7 @@ function criterion(check: BatchCheckDefinition): CheckContract["criteria"] {
       requiredEvidenceComplete: true,
     },
     examples: [
-      exampleFor("compliant", compliantStatus),
+      exampleFor(outcomes.pass ? "compliant" : "unreadable", compliantStatus),
       exampleFor("noncompliant", noncompliantStatus),
       exampleFor("partial", partialStatus),
       exampleFor("unreadable", "manual"),

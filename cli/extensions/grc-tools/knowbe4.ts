@@ -27,6 +27,8 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  BATCH3_RUNTIME_FACTS,
+  batch3PrimitiveEvidence,
   batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
@@ -2247,7 +2249,7 @@ function findingId(number: number): string {
   return `KNOWBE4-${String(number).padStart(2, "0")}`;
 }
 
-const KNOWBE4_DECISION_FACTS = Symbol("knowbe4-decision-facts");
+const KNOWBE4_DECISION_FACTS = BATCH3_RUNTIME_FACTS;
 
 type Knowbe4FindingWithFacts = Knowbe4Finding & {
   [KNOWBE4_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
@@ -2305,7 +2307,8 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "KNOWBE4-01": {
       const maximumGap = value("max_campaign_gap_days");
       if (maximumGap === undefined) return batch3UnavailableFacts(id);
-      return fact(value("security_tests_read") ?? 0, (value("days_since_last_test") ?? Number.POSITIVE_INFINITY) > maximumGap ? 1 : 0);
+      const tests = value("security_tests_read") ?? 0;
+      return fact(tests, tests === 0 ? 1 : 0);
     }
     case "KNOWBE4-02": {
       const tests = value("security_tests_in_window");
@@ -2313,7 +2316,7 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const minimumCoverage = value("min_coverage_pct");
       if (minimumCoverage === undefined) return batch3UnavailableFacts(id);
       const complete = evidence.recipient_reads_complete === true && coverage !== undefined;
-      return fact(value("active_users") ?? value("users_read") ?? 0, tests === 0 || complete && coverage < minimumCoverage ? 1 : 0, tests !== 0 && !complete ? 1 : 0, complete);
+      return fact(value("active_users") ?? value("users_read") ?? 0, tests === 0 ? 1 : 0, tests !== 0 && !complete ? 1 : 0, complete);
     }
     case "KNOWBE4-03": {
       const campaigns = asRecordArray(evidence.campaigns_evaluated);
@@ -2342,7 +2345,11 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const maximumMean = value("max_mean_risk_score");
       const maximumDeviation = value("max_risk_score_stddev");
       if (maximumMean === undefined || maximumDeviation === undefined) return batch3UnavailableFacts(id);
-      return fact(value("users_scored") ?? value("users_scored_read") ?? 0, (value("mean_risk_score") ?? 0) > maximumMean ? 1 : 0, value("mean_risk_score") === undefined || (value("stddev_risk_score") ?? 0) > maximumDeviation ? 1 : 0);
+      return fact(
+        value("users_scored") ?? value("users_scored_read") ?? 0,
+        0,
+        value("mean_risk_score") === undefined ? 1 : 0,
+      );
     }
     case "KNOWBE4-06": {
       const current = value("current_phish_prone_pct");
@@ -2374,7 +2381,10 @@ function knowbe4DecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const minimumCoverage = value("min_coverage_pct");
       if (minimumCoverage === undefined) return batch3UnavailableFacts(id);
       const requireFull = evidence.require_full_targeting !== false;
-      return fact(campaigns, campaigns === 0 || requireFull && coverage !== undefined && coverage < minimumCoverage ? 1 : 0, coverage === undefined && campaigns > 0 ? 1 : 0);
+      return {
+        ...fact(campaigns, campaigns === 0 ? 1 : 0, coverage === undefined && campaigns > 0 ? 1 : 0),
+        knowbe4_09_default_min_coverage_pct_configured_value: requireFull ? 100 : minimumCoverage,
+      };
     }
     case "KNOWBE4-10": {
       const evaluated = value("failed_users_evaluated") ?? 0;
@@ -2839,6 +2849,9 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     }
   }
   const coverage = percentage(tested.size, active.size);
+  const oldestIncludedTestAgeDays = testsInWindow
+    .map((item) => daysBetween(item.startedAt, now))
+    .reduce<number | null>((maximum, age) => Math.max(maximum ?? 0, age), null);
   const unsampled = testsInWindow.length - samples.length;
   const untested = snapshot.activeUsers.data.filter((user) => {
     const id = recordId(user);
@@ -2868,7 +2881,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     summary = `Only ${coverage ?? 0}% of ${active.size} active users were tested in the last ${lookbackDays} days (policy minimum ${minCoveragePct}%).`;
   }
 
-  const evidence = {
+  const evidence = batch3PrimitiveEvidence({
     active_users: whenComplete(snapshot.activeUsers, active.size),
     users_read: active.size,
     tested_users: complete ? tested.size : null,
@@ -2880,7 +2893,7 @@ function assessPhishingCoverage(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
     unsampled_security_tests: unsampled,
     recipient_reads_complete: recipients.anyRead ? recipients.complete : null,
     untested_user_sample: complete ? sampleLabels(untested, redact) : null,
-  };
+  }, { oldest_included_test_age_days: oldestIncludedTestAgeDays });
   const violationCount = testsInWindow.length === 0
     || (complete && coverage !== undefined && coverage < minCoveragePct)
     ? 1
@@ -3482,6 +3495,14 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
     return !enrolled || daysBetween(joined, enrolled) > graceDays;
   });
   const latePct = percentage(late.length, newUsers.length);
+  const maximumEnrollmentDelayDays = newUsers
+    .flatMap((user) => {
+      const id = recordId(user);
+      const joined = toDate(user.joined_on);
+      const enrolled = id ? earliestEnrollment.get(id) : undefined;
+      return joined && enrolled ? [daysBetween(joined, enrolled)] : [];
+    })
+    .reduce<number | null>((maximum, delay) => Math.max(maximum ?? 0, delay), null);
 
   let status: Knowbe4Finding["status"];
   let summary: string;
@@ -3503,7 +3524,7 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
     summary = `${late.length} of ${newUsers.length} recently joined users (${latePct}%) had no training enrollment within ${graceDays} days of joining.`;
   }
 
-  return withInventoryCaveats(finding(4, "medium", summary, {
+  return withInventoryCaveats(finding(4, "medium", summary, batch3PrimitiveEvidence({
     new_users_evaluated: whenComplete(snapshot.activeUsers, newUsers.length),
     new_users_read: newUsers.length,
     late_or_missing_enrollments: populationComplete ? late.length : null,
@@ -3514,7 +3535,7 @@ function assessEnrollmentTimeliness(snapshot: Knowbe4Snapshot, now: Date, lookba
     training_lookback_days: lookbackDays,
     enrollment_limit_reached: enrollmentLimitReached,
     late_user_sample: enrollmentsComplete ? sampleLabels(late, redact) : null,
-  }), snapshot, reads);
+  }, { maximum_enrollment_delay_days: maximumEnrollmentDelayDays })), snapshot, reads);
 }
 
 function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDays: number, remedialWindowDays: number, redact: boolean): Knowbe4Finding {
@@ -3552,6 +3573,11 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
   );
   const unremediated = evaluable.filter(([userId]) => !remediated.some(([remediatedId]) => remediatedId === userId));
   const remediatedPct = percentage(remediated.length, evaluable.length);
+  const maximumRemedialEnrollmentDelayDays = remediated
+    .flatMap(([userId, item]) => (enrollmentsByUser.get(userId) ?? [])
+      .filter((date) => date.getTime() >= item.failedAt.getTime() - DAY_MS)
+      .map((date) => daysBetween(item.failedAt, date)))
+    .reduce<number | null>((maximum, delay) => Math.max(maximum ?? 0, delay), null);
   const autoEnrollCampaigns = snapshot.trainingCampaigns.data
     .filter((campaign) => asBoolean(campaign.auto_enroll) === true && !campaignCancelled(campaign) && !campaignCompletedOrEnded(campaign, now))
     .map(campaignName);
@@ -3592,7 +3618,7 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
 
   // Every count derived from the recipient samples is unknown, not zero, when no per-test read completed.
   const sampled = recipients.anyRead;
-  return withInventoryCaveats(finding(10, "medium", summary, {
+  return withInventoryCaveats(finding(10, "medium", summary, batch3PrimitiveEvidence({
     security_tests_in_window: whenComplete(snapshot.securityTests, testsInWindow.length),
     sampled_security_tests: sampled ? samples.map((sample) => sample.pst_id) : null,
     unsampled_security_tests: unsampled,
@@ -3613,7 +3639,7 @@ function assessRemedialTraining(snapshot: Knowbe4Snapshot, now: Date, lookbackDa
         failed_at: item.failedAt.toISOString(),
       }))
       : null,
-  }), snapshot, [
+  }, { maximum_remedial_enrollment_delay_days: maximumRemedialEnrollmentDelayDays })), snapshot, [
     SECURITY_TEST_READ,
     ENROLLMENT_READ,
     { inventory: "security_test_recipients", notChecked: "failures in the security tests whose recipient results did not load were not evaluated for remediation" },
@@ -3644,6 +3670,7 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
   const stale: Array<{ campaign: string; module: string; publish_date: string | null }> = [];
   const retired: Array<{ campaign: string; module: string }> = [];
   const undated: Array<{ campaign: string; module: string }> = [];
+  const observedContentAgesDays: number[] = [];
   let reviewed = 0;
   let dated = 0;
   for (const campaign of snapshot.trainingCampaigns.data) {
@@ -3664,6 +3691,7 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
         continue;
       }
       dated += 1;
+      observedContentAgesDays.push(daysBetween(published, now));
       if (published.getTime() < cutoff) {
         stale.push({ campaign: campaignName(campaign), module: moduleName, publish_date: published.toISOString() });
       }
@@ -3698,7 +3726,7 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
       : `All ${reviewed} assigned training modules carry campaign-content publish dates within the last ${maxContentAgeDays} days and none are marked retired in the campaign content; the ModStore catalog was not read, so publisher retirement was not cross-checked.`;
   }
 
-  return withInventoryCaveats(finding(11, "low", summary, {
+  return withInventoryCaveats(finding(11, "low", summary, batch3PrimitiveEvidence({
     modules_reviewed: reviewed,
     modules_with_publish_date: whenComplete(snapshot.storePurchases, dated),
     retired_modules: observedList([snapshot.storePurchases], retired.slice(0, SAMPLE_SIZE)),
@@ -3708,7 +3736,9 @@ function assessContentCurrency(snapshot: Knowbe4Snapshot, now: Date, lookbackDay
     violation_observed: violationFlag([snapshot.storePurchases], retired.length + stale.length),
     max_content_age_days: maxContentAgeDays,
     training_lookback_days: lookbackDays,
-  }), snapshot, [
+  }, {
+    max_observed_content_age_days: observedContentAgesDays.length > 0 ? Math.max(...observedContentAgesDays) : null,
+  })), snapshot, [
     TRAINING_CAMPAIGN_READ,
     { inventory: "store_purchases", notChecked: "assigned modules were not cross-checked against the ModStore catalog for retirement and publish dates" },
   ]);
@@ -4050,6 +4080,11 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     return !(id && activeSignals.has(id));
   });
   const inactivePct = percentage(inactive.length, candidates.length);
+  const maximumInactivityDays = inactive
+    .map((user) => toDate(user.last_sign_in))
+    .filter((date): date is Date => date !== undefined)
+    .map((date) => daysBetween(date, now))
+    .reduce<number | null>((maximum, age) => Math.max(maximum ?? 0, age), null);
   // A user is inactive only when every activity signal could have been read: an unread or truncated enrollment list,
   // security test list, or recipient result may hold the activity that would clear them, so nobody is named from it.
   const partialData = snapshot.unsampledSecurityTestIds.length > 0
@@ -4077,7 +4112,7 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     summary = `${inactive.length} of ${candidates.length} active users (${inactivePct}%) have not participated in any campaign or signed in for ${inactiveDays}+ days and should be reviewed for archival.`;
   }
 
-  return withInventoryCaveats(finding(18, "medium", summary, {
+  return withInventoryCaveats(finding(18, "medium", summary, batch3PrimitiveEvidence({
     users_evaluated: whenComplete(snapshot.activeUsers, candidates.length),
     users_evaluated_read: candidates.length,
     inactive_users: populationComplete ? inactive.length : null,
@@ -4088,7 +4123,7 @@ function assessInactiveUsers(snapshot: Knowbe4Snapshot, now: Date, inactiveDays:
     partial_activity_data: partialData,
     unsampled_security_tests: whenRead(snapshot.securityTests, snapshot.unsampledSecurityTestIds.length),
     inactive_user_sample: partialData ? null : observedList([snapshot.activeUsers], sampleLabels(inactive, redact)),
-  }), snapshot, INACTIVE_USER_READS);
+  }, { max_observed_inactivity_days: maximumInactivityDays })), snapshot, INACTIVE_USER_READS);
 }
 
 export function assessKnowbe4UserRisk(

@@ -17,7 +17,7 @@ import type {
   BatchCompletenessDefinition,
   BatchCompletenessSourceDefinition,
 } from "./batch-spec-builder.js";
-import type { FindingSeverity, PortableValue, VerdictRule } from "./spec-model.js";
+import type { FindingSeverity, PortableValue, VerdictCondition, VerdictRule } from "./spec-model.js";
 
 export interface Batch3CheckRow {
   id: string;
@@ -41,6 +41,7 @@ export interface Batch3CheckRow {
   thresholds?: readonly Batch3ThresholdDefinition[];
   collectionRules?: readonly Batch3CollectionRuleDefinition[];
   thresholdOnly?: boolean;
+  primitiveRuleIndex?: number;
 }
 
 export interface Batch3CollectionRuleDefinition {
@@ -83,6 +84,7 @@ export interface Batch3ThresholdDefinition {
   status: "fail" | "warn";
   observedDescription: string;
   configuredDescription?: string;
+  guard?: VerdictCondition;
 }
 
 export function batch3Threshold(
@@ -93,6 +95,7 @@ export function batch3Threshold(
   status: Batch3ThresholdDefinition["status"],
   observedMeaning: string,
   configuredEvidencePath?: string,
+  guard?: VerdictCondition,
 ): Batch3ThresholdDefinition {
   const prefix = checkPrefix(id);
   return {
@@ -109,6 +112,7 @@ export function batch3Threshold(
     comparator,
     status,
     observedDescription: `${id} primitive from ${evidencePath}: ${observedMeaning} This value is captured before a finding status is selected; null means the named source did not expose a comparable value.`,
+    ...(guard ? { guard } : {}),
   };
 }
 
@@ -127,6 +131,13 @@ export interface Batch3RuntimeFactValues {
   failureMatches: number | null;
   reviewMatches: number | null;
 }
+
+export const BATCH3_RUNTIME_FACTS = Symbol("batch3-runtime-facts");
+const BATCH3_PRIMITIVE_EVIDENCE = Symbol("batch3-primitive-evidence");
+
+export type Batch3FindingWithFacts = {
+  [BATCH3_RUNTIME_FACTS]?: Readonly<Record<string, unknown>>;
+};
 
 const REGISTERED_FACT_NAMES = new Map<string, Batch3FactNames>();
 const REGISTERED_THRESHOLDS = new Map<string, readonly Batch3ThresholdDefinition[]>();
@@ -165,25 +176,40 @@ export function batch3FactNames(id: string): Batch3FactNames {
 }
 
 function evidencePathValue(evidence: Readonly<Record<string, unknown>>, path: string): unknown {
-  const aggregate = /^(min|max|length):(.+)$/.exec(path);
+  const valuesAtPath = (value: unknown, segments: readonly string[]): unknown[] => {
+    if (segments.length === 0) return Array.isArray(value) ? value.flatMap((entry) => valuesAtPath(entry, [])) : [value];
+    if (Array.isArray(value)) return value.flatMap((entry) => valuesAtPath(entry, segments));
+    if (value === null || typeof value !== "object") return [];
+    return valuesAtPath((value as Readonly<Record<string, unknown>>)[segments[0]], segments.slice(1));
+  };
+  const containersAtPath = (value: unknown, segments: readonly string[]): unknown[] => {
+    if (segments.length === 0) return [value];
+    if (Array.isArray(value)) return value.flatMap((entry) => containersAtPath(entry, segments));
+    if (value === null || typeof value !== "object") return [];
+    return containersAtPath((value as Readonly<Record<string, unknown>>)[segments[0]], segments.slice(1));
+  };
+  const aggregate = /^(min|max|length|flatten|maxLength|keys):(.+)$/.exec(path);
   if (aggregate) {
     const [, operation, nestedPath] = aggregate;
-    const [collectionPath, ...itemSegments] = nestedPath.split(".");
-    const collection = evidencePathValue(evidence, collectionPath);
-    if (!Array.isArray(collection)) return undefined;
-    if (operation === "length") return collection.length;
-    const values = collection
-      .map((item) => {
-        let current: unknown = item;
-        for (const segment of itemSegments) {
-          if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
-          current = (current as Readonly<Record<string, unknown>>)[segment];
-        }
-        return typeof current === "number" && Number.isFinite(current) ? current : undefined;
-      })
-      .filter((value): value is number => value !== undefined);
-    if (values.length === 0) return undefined;
-    return operation === "min" ? Math.min(...values) : Math.max(...values);
+    const values = valuesAtPath(evidence, nestedPath.split("."));
+    if (operation === "length") {
+      const containers = containersAtPath(evidence, nestedPath.split("."));
+      return containers.length === 1 && Array.isArray(containers[0]) ? containers[0].length : values.length;
+    }
+    if (operation === "flatten") return values.filter((value) => value !== undefined && value !== null);
+    if (operation === "keys") {
+      return [...new Set(values.flatMap((value) =>
+        value !== null && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : []))];
+    }
+    if (operation === "maxLength") {
+      const lengths = containersAtPath(evidence, nestedPath.split("."))
+        .map((value) => Array.isArray(value) ? value.length : undefined)
+        .filter((value): value is number => value !== undefined);
+      return lengths.length === 0 ? undefined : Math.max(...lengths);
+    }
+    const numbers = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+    if (numbers.length === 0) return undefined;
+    return operation === "min" ? Math.min(...numbers) : Math.max(...numbers);
   }
   let current: unknown = evidence;
   for (const segment of path.split(".")) {
@@ -197,6 +223,32 @@ function finiteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+export function batch3PrimitiveEvidence<T extends Readonly<Record<string, unknown>>>(
+  evidence: T,
+  values: Readonly<Record<string, unknown>>,
+): T {
+  Object.defineProperty(evidence, BATCH3_PRIMITIVE_EVIDENCE, { value: values });
+  return evidence;
+}
+
+export function batch3MergePrimitiveEvidence(
+  evidence: Readonly<Record<string, unknown>>,
+  extra: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  const primitiveEvidence = (evidence as { [BATCH3_PRIMITIVE_EVIDENCE]?: Readonly<Record<string, unknown>> })[
+    BATCH3_PRIMITIVE_EVIDENCE
+  ] ?? {};
+  return batch3PrimitiveEvidence({ ...evidence, ...extra }, primitiveEvidence);
+}
+
+export function batch3AttachRuntimeFacts<T extends object>(
+  finding: T,
+  facts: Readonly<Record<string, unknown>>,
+): T & Batch3FindingWithFacts {
+  Object.defineProperty(finding, BATCH3_RUNTIME_FACTS, { value: facts });
+  return finding;
+}
+
 export function batch3PrimitiveFacts(
   id: string,
   evidence: Readonly<Record<string, unknown>>,
@@ -204,15 +256,24 @@ export function batch3PrimitiveFacts(
 ): Readonly<Record<string, unknown>> {
   const thresholds = REGISTERED_THRESHOLDS.get(id) ?? [];
   const collectionRules = REGISTERED_COLLECTION_RULES.get(id) ?? [];
+  const primitiveEvidence = (evidence as { [BATCH3_PRIMITIVE_EVIDENCE]?: Readonly<Record<string, unknown>> })[
+    BATCH3_PRIMITIVE_EVIDENCE
+  ] ?? {};
+  const valueFor = (factName: string, evidencePath: string): unknown =>
+    Object.hasOwn(facts, factName)
+      ? facts[factName]
+      : Object.hasOwn(primitiveEvidence, evidencePath)
+        ? primitiveEvidence[evidencePath]
+        : evidencePathValue(evidence, evidencePath);
   return {
     ...facts,
     ...Object.fromEntries(thresholds.flatMap((threshold) => [
-      [threshold.observedFact, finiteNumber(evidencePathValue(evidence, threshold.evidencePath))],
+      [threshold.observedFact, finiteNumber(valueFor(threshold.observedFact, threshold.evidencePath))],
       ...(threshold.configuredFact
         ? [[
             threshold.configuredFact,
-            finiteNumber(evidencePathValue(
-              evidence,
+            finiteNumber(valueFor(
+              threshold.configuredFact,
               threshold.configuredEvidencePath ?? threshold.evidencePath,
             )),
           ] as const]
@@ -220,7 +281,7 @@ export function batch3PrimitiveFacts(
     ])),
     ...Object.fromEntries(collectionRules.map((rule) => [
       rule.observedFact,
-      evidencePathValue(evidence, rule.evidencePath) ?? null,
+      valueFor(rule.observedFact, rule.evidencePath) ?? null,
     ])),
   };
 }
@@ -312,8 +373,8 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       [names.readable]: `Boolean set from the named source read results before any finding is created. True only when every response and required field used by ${row.id} is readable.`,
       [names.complete]: `Boolean set from the named pagination and child-read states before any finding is created. Its exact source-state effects are defined by the ${row.id} completeness contract.`,
       [names.population]: `Non-negative integer cardinality of the exact ${row.id} record population evaluated before evidence samples are sliced. It is null when that population was not established.`,
-      [names.failureMatches]: `Non-negative integer counted directly from primitive vendor fields before any per-record status exists. Exact predicate: ${row.predicate}`,
-      [names.reviewMatches]: `Non-negative integer counted directly from missing, unknown, or review-only primitive fields before any per-record status exists. Exact predicate and precedence: ${row.predicate}`,
+      [names.failureMatches]: `Non-negative integer counted from the named vendor fields before any finding is created. Exact predicate: ${row.predicate}`,
+      [names.reviewMatches]: `Non-negative integer counted from missing, unknown, or review-only vendor fields before any finding is created. Exact predicate and precedence: ${row.predicate}`,
     });
     const thresholdDecisionInputs = Object.fromEntries((row.thresholds ?? []).flatMap((threshold) => [
       [threshold.observedFact, threshold.observedDescription],
@@ -336,9 +397,8 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       left: batch2Path(leftPath),
       right: batch2Path(rightPath),
     } as const);
-    const thresholdRules = (row.thresholds ?? []).map((threshold) => batch2Rule(
-      threshold.status,
-      threshold.configuredFact
+    const thresholdRules = (row.thresholds ?? []).map((threshold) => {
+      const thresholdCondition = threshold.configuredFact
         ? batch2Any(
             batch2All(
               batch2Defined(threshold.configuredFact),
@@ -349,9 +409,13 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
               comparison(threshold.comparator, threshold.observedFact, threshold.constant),
             ),
           )
-        : comparison(threshold.comparator, threshold.observedFact, threshold.constant),
-      `${threshold.observedFact} is compared directly to ${threshold.configuredFact ?? threshold.constant}; ${threshold.constant} is the executable default boundary.`,
-    ));
+        : comparison(threshold.comparator, threshold.observedFact, threshold.constant);
+      return batch2Rule(
+        threshold.status,
+        threshold.guard ? batch2All(threshold.guard, thresholdCondition) : thresholdCondition,
+        `${threshold.observedFact} is compared directly to ${threshold.configuredFact ?? threshold.constant}; ${threshold.constant} is the executable default boundary.`,
+      );
+    });
     const collectionRules = (row.collectionRules ?? []).map((rule) => batch2Rule(
       rule.status,
       rule.operator === "intersects"
@@ -377,9 +441,9 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     const violationRule = batch2Rule(row.violationOutcome ?? "fail", batch2Gt(names.failureMatches, 0));
     const explicitRules = row.decisionRules && primitiveRules.length > 0
       ? [
-          ...row.decisionRules.slice(0, -1),
+          ...row.decisionRules.slice(0, row.primitiveRuleIndex ?? -1),
           ...primitiveRules,
-          row.decisionRules.at(-1) as VerdictRule,
+          ...row.decisionRules.slice(row.primitiveRuleIndex ?? -1),
         ]
       : row.decisionRules;
     const suppliedDecisionRules = explicitRules ?? (row.manualOnly ? undefined : [

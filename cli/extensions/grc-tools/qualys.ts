@@ -25,6 +25,8 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  batch3AttachRuntimeFacts,
+  batch3PrimitiveEvidence,
   batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
@@ -1977,7 +1979,7 @@ function finding(
       ? decisionValues
       : batch3UnavailableFacts(id);
   const decisionFacts = batch3PrimitiveFacts(id, evidence, baseFacts);
-  return {
+  return batch3AttachRuntimeFacts({
     id,
     control,
     title: CONTROL_TITLES[control] ?? `Control ${control}`,
@@ -1986,7 +1988,7 @@ function finding(
     summary,
     evidence,
     mappings: CONTROL_MAPPINGS[control] ?? [],
-  };
+  }, decisionFacts);
 }
 
 interface VerdictInput {
@@ -2000,6 +2002,7 @@ interface VerdictInput {
   manualEvidence: string;
   unknownBuckets?: Record<string, number>;
   decisionFacts?: QualysDecisionValues;
+  primitiveFacts?: Readonly<Record<string, unknown>>;
 }
 
 function qualysDecisionFacts(inventoryCount: number, violationCount = 0, reviewCount = 0): Batch3RuntimeFactValues {
@@ -2070,7 +2073,7 @@ function guardedFinding(input: VerdictInput): QualysFinding {
     parts.push(`Collect manually: ${input.manualEvidence}`);
   }
   // Bucket counts describe records that were read; once any input was denied or blocked they are unknown too.
-  return finding(input.control, input.severity, parts.join(" "), renderRecord({
+  const evidence = renderRecord({
     ...input.evidence,
     verdict_basis: input.status,
     manual_evidence: input.manualEvidence,
@@ -2086,7 +2089,14 @@ function guardedFinding(input: VerdictInput): QualysFinding {
         status: input.scope.verified ? `verified: ${input.scope.note}` : `unknown: ${input.scope.note}`,
       },
     },
-  }), decisionFacts);
+  });
+  return finding(
+    input.control,
+    input.severity,
+    parts.join(" "),
+    input.primitiveFacts ? batch3PrimitiveEvidence(evidence, input.primitiveFacts) : evidence,
+    decisionFacts,
+  );
 }
 
 function unreadableSummary(control: number, sources: Collected[]): string {
@@ -2799,6 +2809,10 @@ export async function assessQualysScanCoverage(
   const hostsWithoutScanDate = hosts.data.filter((host) => !parseDate(hostLastScan(host)));
   const scannedHosts = hosts.data.filter((host) => parseDate(hostLastScan(host)));
   const staleScannedHosts = scannedHosts.filter((host) => (ageInDays(hostLastScan(host), now) ?? Number.POSITIVE_INFINITY) > settings.lookbackDays);
+  const maximumScanAgeDays = scannedHosts
+    .map((host) => ageInDays(hostLastScan(host), now))
+    .filter((age): age is number => age !== undefined)
+    .reduce<number | null>((maximum, age) => Math.max(maximum ?? 0, age), null);
   const authScannedHosts = scannedHosts.filter((host) => hostRecentlyAuthScanned(host, now, settings.lookbackDays));
   const authPercent = percent(authScannedHosts.length, scannedHosts.length);
   const authPercentEvidence = percentIfReadable(hosts, authScannedHosts.length, scannedHosts.length, "scanned_hosts");
@@ -2856,6 +2870,7 @@ export async function assessQualysScanCoverage(
     scope,
     manualEvidence: "export Scans > Schedules and Assets > Asset Groups from the Qualys UI and confirm each asset group has an active recurring scan and each host was scanned within the review window.",
     unknownBuckets: { hosts_without_scan_date: hostsWithoutScanDate.length, schedules_without_active_flag: schedulesWithoutActiveFlag.length },
+    primitiveFacts: { max_observed_scan_age_days: maximumScanAgeDays },
     decisionFacts: schedules.error
       ? {}
       : activeSchedules.length === 0
@@ -3546,6 +3561,11 @@ export async function assessQualysVulnerabilityManagement(
   const slaDated = slaScoped.filter((detection) => detectionAgeDays(detection, now) !== undefined);
   const slaUndated = slaScoped.filter((detection) => detectionAgeDays(detection, now) === undefined);
   const slaBreaches = slaDated.filter((detection) => (detectionAgeDays(detection, now) ?? 0) > (detectionSlaDays(detection, settings) ?? 0));
+  const maximumAgeForSeverity = (severity: number): number | null => slaDated
+    .filter((detection) => detectionSeverity(detection) === severity)
+    .map((detection) => detectionAgeDays(detection, now))
+    .filter((age): age is number => age !== undefined)
+    .reduce<number | null>((maximum, age) => Math.max(maximum ?? 0, age), null);
   const slaPercent = percent(slaDated.length - slaBreaches.length, slaDated.length);
   const slaPercentEvidence = percentIfReadable(detections, slaDated.length - slaBreaches.length, slaDated.length, "sla_dated_detections");
   const breachBySeverity = objectIfReadable(detections, {
@@ -3711,6 +3731,11 @@ export async function assessQualysVulnerabilityManagement(
       detections_without_first_found: slaUndated.length,
       detections_without_severity: detectionsWithoutSeverity.length,
       detections_without_status: detectionsWithoutStatus.length,
+    },
+    primitiveFacts: {
+      maximum_severity_5_age_days: maximumAgeForSeverity(5),
+      maximum_severity_4_age_days: maximumAgeForSeverity(4),
+      maximum_severity_3_age_days: maximumAgeForSeverity(3),
     },
     decisionFacts: detections.error || hosts.error || !hostPopulationKnown || !detectionsFullyRead && slaScoped.length === 0
       ? {}
@@ -4024,6 +4049,10 @@ export async function assessQualysAdministration(
   const staleLoginUsers = usersWithLastLogin.filter((user) => (ageInDays(legacyUserLastLogin(user), now) ?? 0) > INACTIVE_USER_DAYS).map(userName);
 
   const sensitiveActions = activity.data.filter((entry) => SENSITIVE_ACTIVITY_PATTERN.test(`${asString(entry.action) ?? ""} ${asString(entry.module) ?? ""} ${asString(entry.details) ?? ""}`));
+  const oldestIncludedActivityAgeDays = activity.data
+    .map((entry) => ageInDays(entry.date, now))
+    .filter((age): age is number => age !== undefined)
+    .reduce<number | null>((maximum, age) => Math.max(maximum ?? 0, age), null);
 
   const webAppScans = classifyWebAppScans(webApps.data, wasScans.data, wasHistory, now, settings.lookbackDays);
   const neverScannedWebApps = webAppScans.neverScanned.map((webApp) => recordLabel(webApp, "web app"));
@@ -4243,6 +4272,7 @@ export async function assessQualysAdministration(
     sources: [activity],
     scope,
     manualEvidence: "export the Activity Log for the review period and document who reviews sensitive administrative actions and how long the log is retained.",
+    primitiveFacts: { oldest_included_activity_age_days: oldestIncludedActivityAgeDays },
     decisionFacts: activity.error || activity.data.length === 0
       ? {}
       : qualysDecisionFacts(activity.data.length, 0, activity.data.length),

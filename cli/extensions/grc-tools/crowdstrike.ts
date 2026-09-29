@@ -28,6 +28,8 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  BATCH3_RUNTIME_FACTS,
+  batch3PrimitiveEvidence,
   batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetReviewMinimum,
@@ -713,7 +715,7 @@ function mappingStrings(definition: ControlDefinition): string[] {
   return mappings;
 }
 
-const CROWDSTRIKE_DECISION_FACTS = Symbol("crowdstrike-decision-facts");
+const CROWDSTRIKE_DECISION_FACTS = BATCH3_RUNTIME_FACTS;
 
 type CrowdstrikeFindingWithFacts = CrowdstrikeFinding & {
   [CROWDSTRIKE_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
@@ -773,8 +775,14 @@ function finding(
   return result;
 }
 
-function manualFinding(id: ControlId, reason: string, consoleEvidence: string, evidence?: JsonRecord): CrowdstrikeFinding {
-  return finding(id, `${reason} Verdict: manual (unknown). Collect manually: ${consoleEvidence}`, evidence);
+function manualFinding(
+  id: ControlId,
+  reason: string,
+  consoleEvidence: string,
+  evidence?: JsonRecord,
+  decisionFacts?: CrowdstrikeDecisionFacts,
+): CrowdstrikeFinding {
+  return finding(id, `${reason} Verdict: manual (unknown). Collect manually: ${consoleEvidence}`, evidence, decisionFacts);
 }
 
 function unreadableFinding(id: ControlId, dataset: string, error: string, consoleEvidence: string): CrowdstrikeFinding {
@@ -2068,12 +2076,28 @@ function evaluateMlDetectionLevels(policies: JsonRecord[], partial = false): Cro
   if (missing && missing.length > 0) statuses.push("warn");
   const status = worstStatus(statuses);
   const weak = perPolicy.filter((item) => item.status !== "pass").map((item) => item.policy);
+  const missingPrimarySliderNames = [...new Set(perPolicy.flatMap((item) =>
+    PRIMARY_ML_SLIDERS.filter((slider) => !Object.hasOwn(item.sliders, slider))))];
+  const observedNonaggressiveLevels = [...new Set(perPolicy.flatMap((item) =>
+    Object.values(item.sliders).flatMap((levels) => {
+      const record = asObject(levels);
+      return [asString(record?.detection), asString(record?.prevention)]
+        .filter((level): level is string =>
+          level !== undefined && (sliderRank(level) ?? ML_SLIDER_RANK.AGGRESSIVE) < ML_SLIDER_RANK.AGGRESSIVE)
+        .map((level) => level.toUpperCase());
+    })))];
   return finding(
     "CS-01",
     status === "pass"
       ? `All ${applied.length} enabled and host-assigned prevention policies keep Cloud and Sensor Anti-malware detection and prevention at AGGRESSIVE or higher.`
       : `${weak.length}/${applied.length} enabled and host-assigned prevention policies have ML sliders below AGGRESSIVE, missing, or incomplete${missing && missing.length > 0 ? `; no assigned policy covers ${missing.join(", ")}` : ""}.`,
-    { ...policyInventory(policies), platforms_without_policy: missing, policies: perPolicy },
+    batch3PrimitiveEvidence(
+      { ...policyInventory(policies), platforms_without_policy: missing, policies: perPolicy },
+      {
+        missing_primary_ml_slider_names: missingPrimarySliderNames,
+        observed_nonaggressive_ml_slider_levels: observedNonaggressiveLevels,
+      },
+    ),
     crowdstrikeDecisionFacts(
       applied.length,
       perPolicy.filter((item) => item.min_rank !== undefined && item.min_rank <= ML_SLIDER_RANK.CAUTIOUS).length,
@@ -2166,12 +2190,18 @@ function evaluateOnWriteDetection(policies: JsonRecord[]): CrowdstrikeFinding {
 
   const status = worstStatus(perPolicy.map((item) => item.status));
   const weak = perPolicy.filter((item) => item.status !== "pass");
+  const disabledOnWriteSettings = perPolicy.some((item) => item.detect_on_write === false)
+    ? [ON_WRITE_DETECT_SETTING]
+    : [];
   return finding(
     "CS-05",
     status === "pass"
       ? `DetectOnWrite and QuarantineOnWrite are enabled across ${perPolicy.length} enabled and host-assigned prevention policies.`
       : `${weak.length}/${perPolicy.length} enabled and host-assigned prevention policies do not fully enable on-write detection and quarantine: ${weak.map((item) => item.policy).join(", ")}.`,
-    { ...policyInventory(policies), evaluated_policies: perPolicy.length, policies: perPolicy },
+    batch3PrimitiveEvidence(
+      { ...policyInventory(policies), evaluated_policies: perPolicy.length, policies: perPolicy },
+      { disabled_on_write_setting_names: disabledOnWriteSettings },
+    ),
     crowdstrikeDecisionFacts(
       perPolicy.length,
       perPolicy.filter((item) => item.detect_on_write === false).length,
@@ -2365,7 +2395,7 @@ function evaluateSessionLimits(
       evidence,
       crowdstrikeDecisionFacts(
         sessions.data.items.length,
-        long.length + (concurrency.concurrent > maxConcurrentSessions ? 1 : 0),
+        0,
         0,
         { readable: true, complete: partial === undefined },
       ),
@@ -2376,6 +2406,7 @@ function evaluateSessionLimits(
     `The RTR audit endpoint was readable and returned ${sessions.data.items.length} sessions in the last ${lookbackDays} days (none longer than ${maxSessionMinutes} minutes, peak per-user concurrency ${concurrency.concurrent}${undated > 0 ? `, ${undated} without a created_at timestamp` : ""}), but the Falcon API does not expose the configured session timeout or concurrent session limit.`,
     SESSION_CONSOLE_EVIDENCE,
     evidence,
+    crowdstrikeDecisionFacts(sessions.data.items.length, 0, 1, { readable: false, complete: partial === undefined }),
   ), [partial]);
 }
 
@@ -2407,16 +2438,27 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
   let resolvedCount = 0;
   let undated = 0;
   let dated = 0;
+  const selectedSeverities: number[] = [];
+  const selectedAgesDays: number[] = [];
+  const criticalResolutionHours: number[] = [];
+  const highResolutionHours: number[] = [];
   const breaches: JsonRecord[] = [];
   for (const alert of alerts.data.items) {
+    const severity = asNumber(alert.severity);
+    if (severity !== undefined) selectedSeverities.push(severity);
     const created = parseTimestamp(alert.created_timestamp) ?? parseTimestamp(alert.timestamp);
     if (created === undefined) {
       undated += 1;
       continue;
     }
     dated += 1;
+    selectedAgesDays.push(hoursBetween(created, now) / 24);
     const sla = alertSlaHours(alert);
     const resolution = alertResolutionHours(alert, created, now);
+    if (resolution.hours !== undefined) {
+      if ((severity ?? 0) >= CRITICAL_SEVERITY_FLOOR) criticalResolutionHours.push(resolution.hours);
+      else highResolutionHours.push(resolution.hours);
+    }
     if (resolution.resolved) resolvedCount += 1;
     if (resolution.hours !== undefined && resolution.hours <= sla) {
       if (resolution.resolved) withinSla += 1;
@@ -2445,15 +2487,24 @@ function evaluateDetectionSla(alerts: CollectedDataset<CrowdstrikePage<JsonRecor
         ? truncatedBeforeVisible("critical/high alerts", "dated alert", "response within the SLA")
         : `The alerts endpoint was readable and returned no dated critical or high alerts created in the last ${lookbackDays} days (window stated), so there was nothing to respond to; emptiness is compliant for this control.`
       : `${pct}% of ${dated} dated critical/high alerts from the last ${lookbackDays} days were resolved (or remain open) within the ${CRITICAL_SLA_HOURS}h critical / ${HIGH_SLA_HOURS}h high SLA; ${breaches.length} breached the SLA.`,
-    {
-      lookback_days: lookbackDays,
-      alerts_reviewed: alerts.data.items.length,
-      alerts_with_created_timestamp: dated,
-      resolved_alerts: resolvedCount,
-      resolved_within_sla: withinSla,
-      sla_breaches: breaches.length,
-      breach_samples: breaches.slice(0, 15),
-    },
+    batch3PrimitiveEvidence(
+      {
+        lookback_days: lookbackDays,
+        alerts_reviewed: alerts.data.items.length,
+        alerts_with_created_timestamp: dated,
+        resolved_alerts: resolvedCount,
+        resolved_within_sla: withinSla,
+        sla_breaches: breaches.length,
+        breach_samples: breaches.slice(0, 15),
+      },
+      {
+        maximum_critical_alert_resolution_hours: criticalResolutionHours.length > 0 ? Math.max(...criticalResolutionHours) : null,
+        maximum_high_alert_resolution_hours: highResolutionHours.length > 0 ? Math.max(...highResolutionHours) : null,
+        oldest_selected_alert_age_days: selectedAgesDays.length > 0 ? Math.max(...selectedAgesDays) : null,
+        maximum_selected_alert_severity: selectedSeverities.length > 0 ? Math.max(...selectedSeverities) : null,
+        minimum_selected_alert_severity: selectedSeverities.length > 0 ? Math.min(...selectedSeverities) : null,
+      },
+    ),
     {
       cs_22_alert_read_succeeded: true,
       cs_22_alert_list_complete: partial === undefined,
@@ -3073,6 +3124,9 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
     versions.set(version, (versions.get(version) ?? 0) + 1);
   }
   const pct = percentage(active.length, dated.length);
+  const maximumLastSeenAgeDays = dated.length === 0
+    ? null
+    : Math.max(...dated.map((host) => (now - (parseTimestamp(host.last_seen) ?? now)) / 86_400_000));
   const partial = partialInventory(hosts.data, "hosts");
   // A fail asserted from zero visible rows of a truncated list is a claim about rows that were not read;
   // `absence_claim` lets withPartialInventory render it manual. A complete empty read still fails.
@@ -3095,18 +3149,21 @@ function evaluateDeploymentCompleteness(hosts: CollectedDataset<CrowdstrikePage<
       : dated.length === 0
         ? `None of the ${items.length} sampled hosts carries a last_seen timestamp, so sensor freshness cannot be demonstrated from the API.`
         : `${pct}% of ${dated.length} dated hosts (${items.length} sampled) reported to Falcon within the last ${staleDays} days; ${stale.length} are stale, ${undated} have no last_seen, and ${rfm.length} run in reduced functionality mode.`,
-    {
-      ...(emptyPartial ? { absence_claim: true } : {}),
-      sampled_hosts: items.length,
-      reported_total_hosts: hosts.data.total,
-      active_hosts: active.length,
-      stale_hosts: stale.length,
-      hosts_without_last_seen: undated,
-      stale_days: staleDays,
-      reduced_functionality_hosts: rfm.length,
-      agent_version_distribution: Object.fromEntries([...versions.entries()].sort((left, right) => right[1] - left[1]).slice(0, 15)),
-      stale_samples: stale.slice(0, 25).map((host) => ({ hostname: asString(host.hostname), last_seen: asString(host.last_seen), platform: asString(host.platform_name) })),
-    },
+    batch3PrimitiveEvidence(
+      {
+        ...(emptyPartial ? { absence_claim: true } : {}),
+        sampled_hosts: items.length,
+        reported_total_hosts: hosts.data.total,
+        active_hosts: active.length,
+        stale_hosts: stale.length,
+        hosts_without_last_seen: undated,
+        stale_days: staleDays,
+        reduced_functionality_hosts: rfm.length,
+        agent_version_distribution: Object.fromEntries([...versions.entries()].sort((left, right) => right[1] - left[1]).slice(0, 15)),
+        stale_samples: stale.slice(0, 25).map((host) => ({ hostname: asString(host.hostname), last_seen: asString(host.last_seen), platform: asString(host.platform_name) })),
+      },
+      { max_observed_last_seen_age_days: maximumLastSeenAgeDays },
+    ),
     crowdstrikeDecisionFacts(
       items.length,
       items.length === 0 || (dated.length > 0 && pct < 85) ? Math.max(1, stale.length + undated) : 0,
@@ -3289,14 +3346,22 @@ function evaluateZeroTrust(
     belowTotalReported
       ? `${below} of ${scored} scored hosts (${pct}%, server-side totals) fall below the ZTA threshold of ${minScore}.`
       : `At least ${below} of ${scored} scored hosts (${pct}%) fall below the ZTA threshold of ${minScore}; the API did not report a server-side total for the below-threshold query, so the sampled count is a lower bound and this verdict cannot exceed warn.`,
-    {
-      min_score: minScore,
-      scored_hosts: scored,
-      hosts_below_threshold: below,
-      below_threshold_total_reported: belowTotalReported,
-      lowest_scores_truncated: belowThreshold.data.truncated,
-      lowest_scores: belowThreshold.data.items.slice(0, 25).map((item) => ({ aid: asString(item.aid), score: asNumber(item.score) })),
-    },
+    batch3PrimitiveEvidence(
+      {
+        min_score: minScore,
+        scored_hosts: scored,
+        hosts_below_threshold: below,
+        below_threshold_total_reported: belowTotalReported,
+        lowest_scores_truncated: belowThreshold.data.truncated,
+        lowest_scores: belowThreshold.data.items.slice(0, 25).map((item) => ({ aid: asString(item.aid), score: asNumber(item.score) })),
+      },
+      {
+        minimum_observed_zta_score: belowThreshold.data.items
+          .map((item) => asNumber(item.score))
+          .filter((score): score is number => score !== undefined)
+          .reduce<number | null>((minimum, score) => minimum === null ? score : Math.min(minimum, score), below === 0 ? minScore : null),
+      },
+    ),
     crowdstrikeDecisionFacts(
       scored,
       pct > 10 ? below : 0,
@@ -3463,13 +3528,16 @@ function evaluateAdminCount(views: UserView[], maxAdmins: number): CrowdstrikeFi
   return finding(
     "CS-16",
     `${admins.length} of ${views.length} Falcon users hold admin roles (threshold ${maxAdmins}); ${sharedAdmins.length} admin and ${sharedOthers.length} non-admin accounts look like shared or generic identities.`,
-    {
-      users_reviewed: views.length,
-      admin_users: admins.length,
-      max_admins: maxAdmins,
-      admins: admins.slice(0, 50).map((view) => ({ uid: view.uid, roles: view.admin_roles, last_login_at: view.last_login_at })),
-      suspected_shared_accounts: [...sharedAdmins, ...sharedOthers].slice(0, 25).map((view) => view.uid),
-    },
+    batch3PrimitiveEvidence(
+      {
+        users_reviewed: views.length,
+        admin_users: admins.length,
+        max_admins: maxAdmins,
+        admins: admins.slice(0, 50).map((view) => ({ uid: view.uid, roles: view.admin_roles, last_login_at: view.last_login_at })),
+        suspected_shared_accounts: [...sharedAdmins, ...sharedOthers].slice(0, 25).map((view) => view.uid),
+      },
+      { active_administrator_identifiers: admins.map((view) => view.uid ?? view.uuid) },
+    ),
     crowdstrikeDecisionFacts(
       views.length,
       sharedAdmins.length > 0 || admins.length > maxAdmins * 2 ? Math.max(1, sharedAdmins.length, admins.length - maxAdmins * 2) : 0,
@@ -3488,20 +3556,30 @@ function evaluateLeastPrivilege(views: UserView[], maxRoles: number, staleLoginD
     return lastLogin !== undefined && lastLogin < staleCutoff;
   });
   const undatedPrivileged = admins.filter((view) => parseTimestamp(view.last_login_at) === undefined);
+  const datedAdminLoginAges = admins
+    .map((view) => parseTimestamp(view.last_login_at))
+    .filter((stamp): stamp is number => stamp !== undefined)
+    .map((stamp) => (now - stamp) / 86_400_000);
   const status: CrowdstrikeFinding["status"] = stalePrivileged.length > 0 ? "fail" : overprivileged.length > 0 ? "warn" : "pass";
   // Scoped to the users that were read: under a truncated user list the partial-inventory clause names the
   // unread rows, so the sentence never asserts an absence across users it did not see.
   const base = finding(
     "CS-17",
     `${views.length} users reviewed; ${overprivileged.length} carry more than ${maxRoles} roles or redundant roles on top of an admin grant, and ${stalePrivileged.length} of ${admins.length} admin accounts have a last login older than ${staleLoginDays} days.`,
-    {
-      users_reviewed: views.length,
-      max_roles_per_user: maxRoles,
-      stale_login_days: staleLoginDays,
-      overprivileged: overprivileged.slice(0, 25).map((view) => ({ uid: view.uid, roles: view.roles })),
-      stale_privileged: stalePrivileged.slice(0, 25).map((view) => ({ uid: view.uid, last_login_at: view.last_login_at, roles: view.admin_roles })),
-      admins_without_login_date: undatedPrivileged.slice(0, 25).map((view) => view.uid),
-    },
+    batch3PrimitiveEvidence(
+      {
+        users_reviewed: views.length,
+        max_roles_per_user: maxRoles,
+        stale_login_days: staleLoginDays,
+        overprivileged: overprivileged.slice(0, 25).map((view) => ({ uid: view.uid, roles: view.roles })),
+        stale_privileged: stalePrivileged.slice(0, 25).map((view) => ({ uid: view.uid, last_login_at: view.last_login_at, roles: view.admin_roles })),
+        admins_without_login_date: undatedPrivileged.slice(0, 25).map((view) => view.uid),
+      },
+      {
+        "maxLength:overprivileged.roles": Math.max(0, ...views.map((view) => view.roles.length)),
+        max_observed_admin_login_age_days: datedAdminLoginAges.length === 0 ? null : Math.max(...datedAdminLoginAges),
+      },
+    ),
     crowdstrikeDecisionFacts(views.length, stalePrivileged.length, overprivileged.length, { readable: true, complete: true }),
   );
   return withUndatedItems(base, undatedPrivileged.length, "admin accounts", "last_login_at");
@@ -3615,6 +3693,10 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
   const unexposed = views.filter((view) => !view.scopes_exposed);
   const actionsUnreadable = views.filter((view) => view.scopes_exposed && !view.scope_actions_readable);
   const staleWriteClients = writeClients.filter((view) => view.stale);
+  const writeClientInactivityDays = writeClients
+    .map((view) => parseTimestamp(view.last_used_at))
+    .filter((stamp): stamp is number => stamp !== undefined)
+    .map((stamp) => (now - stamp) / 86_400_000);
   const withoutLastUsed = views.filter((view) => view.last_used_at === undefined).length;
   const lastUsedCoverage = withoutLastUsed === views.length
     ? "The public API reference documents no last-used field for API clients and none was returned, so unused-client staleness was not evaluated from API data; review last-used dates in the Falcon console."
@@ -3633,17 +3715,26 @@ function evaluateApiClients(clients: CollectedDataset<CrowdstrikePage<JsonRecord
     status === "pass"
       ? `None of the ${views.length} API clients hold write-action scopes on sensitive collections; the scopes array with its action and group fields was read for every client. ${lastUsedCoverage}`
       : `${writeClients.length} of ${views.length} API clients hold write-action scopes on sensitive collections (threshold ${maxWriteClients})${coverageNotes.length > 0 ? `; ${coverageNotes.join("; ")}` : ""}. ${lastUsedCoverage}`,
-    {
-      api_clients: views.length,
-      reported_total_api_clients: clients.data.total,
-      max_write_clients: maxWriteClients,
-      write_clients: writeClients.slice(0, 25),
-      stale_write_clients: staleWriteClients.slice(0, 25).map((view) => view.name ?? view.id),
-      clients_without_scope_data: unexposed.length,
-      clients_without_scope_action_data: actionsUnreadable.length,
-      clients_without_last_used_data: withoutLastUsed,
-      last_used_evaluated_from_api: withoutLastUsed < views.length,
-    },
+    batch3PrimitiveEvidence(
+      {
+        api_clients: views.length,
+        reported_total_api_clients: clients.data.total,
+        max_write_clients: maxWriteClients,
+        write_clients: writeClients.slice(0, 25),
+        stale_write_clients: staleWriteClients.slice(0, 25).map((view) => view.name ?? view.id),
+        clients_without_scope_data: unexposed.length,
+        clients_without_scope_action_data: actionsUnreadable.length,
+        clients_without_last_used_data: withoutLastUsed,
+        last_used_evaluated_from_api: withoutLastUsed < views.length,
+      },
+      {
+        "length:write_clients": writeClients.length,
+        max_observed_write_client_inactivity_days: writeClientInactivityDays.length === 0
+          ? null
+          : Math.max(...writeClientInactivityDays),
+        "flatten:write_clients.sensitive_write_scopes": writeClients.flatMap((view) => view.sensitive_write_scopes),
+      },
+    ),
     crowdstrikeDecisionFacts(
       views.length,
       writeClients.length > maxWriteClients ? writeClients.length - maxWriteClients : 0,
@@ -3685,7 +3776,16 @@ function evaluateIoaExclusions(exclusions: CollectedDataset<CrowdstrikePage<Json
         ? truncatedBeforeVisible("IOA exclusions", "exclusion", "suppression of detection logic")
         : "The IOA exclusions endpoint was readable and returned zero exclusions; no detection logic is being suppressed, so emptiness is compliant for this control."
       : `${views.length} IOA exclusions reviewed; ${broad.length} use wildcard-only image or command line patterns (${broadGlobal.length} applied globally).`,
-    { exclusions: views.length, reported_total_exclusions: exclusions.data.total, broad_exclusions: broad.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
+    batch3PrimitiveEvidence(
+      { exclusions: views.length, reported_total_exclusions: exclusions.data.total, broad_exclusions: broad.slice(0, 25), globally_applied: views.filter((view) => view.applied_globally).length, listing: views.slice(0, 100) },
+      {
+        normalized_global_ioa_regex_values: views
+          .filter((view) => view.applied_globally)
+          .flatMap((view) => [view.ifn_regex, view.cl_regex])
+          .filter((value): value is string => value !== undefined)
+          .map((value) => value.trim()),
+      },
+    ),
     crowdstrikeDecisionFacts(views.length, broadGlobal.length, broad.length - broadGlobal.length, { readable: true, complete: partial === undefined }),
   ), [partial]);
 }

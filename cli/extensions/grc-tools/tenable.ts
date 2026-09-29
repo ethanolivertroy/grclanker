@@ -27,6 +27,9 @@ import {
   withIntegrationToolContracts,
 } from "./batch-spec-builder.js";
 import {
+  BATCH3_RUNTIME_FACTS,
+  batch3MergePrimitiveEvidence,
+  batch3PrimitiveEvidence,
   batch3PrimitiveFacts,
   batch3RuntimeFacts,
   batch3SetCompleteness,
@@ -2846,7 +2849,7 @@ function collectionSummary(datasets: Record<string, TenableDataset<unknown>>): J
   return Object.fromEntries(Object.entries(datasets).map(([name, dataset]) => [name, collectionStatusOf(dataset)]));
 }
 
-const TENABLE_DECISION_FACTS = Symbol("tenable-decision-facts");
+const TENABLE_DECISION_FACTS = BATCH3_RUNTIME_FACTS;
 
 type TenableFindingWithFacts = TenableFinding & {
   [TENABLE_DECISION_FACTS]?: Readonly<Record<string, unknown>>;
@@ -2944,7 +2947,8 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       if (assets === 0) return batch3UnavailableFacts(contractId);
       const coverage = value("coverage_ratio");
       const threshold = value("threshold");
-      return fact(assets, coverage !== undefined && threshold !== undefined && coverage < threshold ? 1 : 0, partial ? 1 : 0);
+      if (coverage === undefined || threshold === undefined) return batch3UnavailableFacts(contractId);
+      return fact(assets, 0, partial ? 1 : 0);
     }
     case "TENABLE-05": {
       const agents = value("agent_count");
@@ -2982,11 +2986,11 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-08": {
       const age = value("plugin_set_age_hours");
       const evaluated = count("evaluated_scanners");
-      const threshold = value("threshold_hours") ?? 0;
-      const stale = count("stale_scanners");
-      if (age === undefined || (age <= threshold && stale === 0 && (statusIsIncomplete("scanners_status") || evaluated === 0))) return batch3UnavailableFacts(contractId);
+      const threshold = value("threshold_hours");
+      if (threshold === undefined) return batch3UnavailableFacts(contractId);
+      if (age === undefined || (age <= threshold && (statusIsIncomplete("scanners_status") || evaluated === 0))) return batch3UnavailableFacts(contractId);
       const reviews = count("undated_scanners", "stale_online_agents") + (statusIsIncomplete("agents_status") || partial ? 1 : 0);
-      return fact(evaluated, age > threshold || stale > 0 ? Math.max(1, stale) : 0, reviews, !statusIsIncomplete("agents_status") && !partial);
+      return fact(evaluated, 0, reviews, !statusIsIncomplete("agents_status") && !partial);
     }
     case "TENABLE-09": {
       const networks = value("network_count");
@@ -2997,8 +3001,10 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const users = value("user_count") ?? 0;
       const enabled = value("enabled_users");
       if (users === 0 || enabled === undefined || enabled === 0 || evidence.caller_is_administrator === false) return batch3UnavailableFacts(contractId);
-      const admins = count("administrators");
-      const violations = count("administrators_without_strong_auth", "inactive_users") + (admins > (value("max_admins") ?? 0) ? admins - (value("max_admins") ?? 0) : 0);
+      const maxAdmins = value("max_admins");
+      const inactiveDays = value("inactive_user_days");
+      if (maxAdmins === undefined || inactiveDays === undefined) return batch3UnavailableFacts(contractId);
+      const violations = count("administrators_without_strong_auth");
       const reviews = count("never_logged_in_users", "stale_api_key_users", "locked_out_users", "repeated_login_failures", "users_without_enabled_flag")
         + (statusIsIncomplete("roles_status") ? 1 : 0);
       return fact(enabled, violations, reviews, !statusIsIncomplete("roles_status"));
@@ -3023,9 +3029,10 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     case "TENABLE-14": {
       const open = value("open_findings") ?? 0;
       if ((value("asset_count") ?? 0) === 0 || open === 0) return batch3UnavailableFacts(contractId);
-      const coverage = value("vpr_coverage") ?? 0;
+      const coverage = value("vpr_coverage");
+      if (coverage === undefined) return batch3UnavailableFacts(contractId);
       const complete = !partial && evidence.caller_is_administrator === true;
-      return fact(open, 0, coverage < 0.5 || !complete ? 1 : 0, complete);
+      return fact(open, 0, complete ? 0 : 1, complete);
     }
     case "TENABLE-15": {
       if ((value("asset_count") ?? 0) === 0) return batch3UnavailableFacts(contractId);
@@ -3040,13 +3047,14 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
       const assets = value("asset_count") ?? 0;
       const categories = value("tag_category_count") ?? value("tag_category_count_read");
       if (assets === 0 || categories === undefined) return batch3UnavailableFacts(contractId);
-      const ratio = value("tagged_ratio") ?? 0;
-      const threshold = value("threshold") ?? 0;
+      const ratio = value("tagged_ratio");
+      const threshold = value("threshold");
+      if (ratio === undefined || threshold === undefined) return batch3UnavailableFacts(contractId);
       const complete = !partial
         && evidence.tag_categories_truncated !== true
         && evidence.tag_values_truncated !== true
         && value("tag_value_count") !== undefined;
-      return fact(assets, categories === 0 && evidence.tag_categories_truncated !== true || ratio < threshold ? 1 : 0, complete ? 0 : 1, complete);
+      return fact(assets, categories === 0 && evidence.tag_categories_truncated !== true ? 1 : 0, complete ? 0 : 1, complete);
     }
     case "TENABLE-17":
       return fact(1, count("enabled_recurring_compliance_scans") === 0 ? 1 : 0, evidence.caller_is_administrator === true ? 0 : 1, evidence.caller_is_administrator === true);
@@ -3056,12 +3064,11 @@ function tenableDecisionFacts(id: string, evidence: JsonRecord): Readonly<Record
     }
     case "TENABLE-19": {
       const jobs = value("external_export_jobs_in_window") ?? 0;
-      const days = count("external_export_days");
       if (jobs === 0) return batch3UnavailableFacts(contractId);
       const complete = (evidence.vuln_export_jobs_listed !== null || value("vuln_export_jobs_read") !== undefined)
         && (evidence.asset_export_jobs_listed !== null || value("asset_export_jobs_read") !== undefined)
         && evidence.caller_is_administrator === true;
-      return fact(jobs, 0, days < 2 || !complete ? 1 : 0, complete);
+      return fact(jobs, 0, complete ? 0 : 1, complete);
     }
     case "TENABLE-20": {
       const groups = value("target_group_count") ?? 0;
@@ -3083,10 +3090,11 @@ function finding(
 ): TenableFinding {
   const id = `TENABLE-${String(control).padStart(2, "0")}${idSuffix}`;
   const contractId = idSuffix ? id.slice(0, -idSuffix.length) : id;
+  const combinedEvidence = batch3MergePrimitiveEvidence(evidence, decisionContext);
   const facts = batch3PrimitiveFacts(
     contractId,
-    { ...evidence, ...decisionContext },
-    tenableDecisionFacts(id, { ...evidence, ...decisionContext }),
+    combinedEvidence,
+    tenableDecisionFacts(id, combinedEvidence),
   );
   const result: TenableFindingWithFacts = {
     id,
@@ -3643,6 +3651,10 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       const lastLaunch = parseTimestampMs(scan.last_modification_date);
       return lastLaunch !== undefined && daysBetween(now, lastLaunch) > staleScanDays;
     });
+    const maximumScanAgeDays = recurring
+      .map((scan) => parseTimestampMs(scan.last_modification_date))
+      .filter((stamp): stamp is number => stamp !== undefined)
+      .reduce<number | null>((maximum, stamp) => Math.max(maximum ?? 0, daysBetween(now, stamp)), null);
     const neverRun = recurring.filter((scan) => asString(scan.status) === "empty" || parseTimestampMs(scan.last_modification_date) === undefined);
     let scheduleStatus: TenableFindingStatus;
     let scheduleSummary: string;
@@ -3662,7 +3674,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       scheduleStatus = capForNonAdmin("pass", callerIsAdministrator);
       scheduleSummary = `All ${recurring.length} enabled recurring scans launched within the last ${staleScanDays} days.${nonAdminNote(callerIsAdministrator)}`;
     }
-    findings.push(finding(2, "high", scheduleSummary, {
+    findings.push(finding(2, "high", scheduleSummary, batch3PrimitiveEvidence({
       scan_count: scans.length,
       enabled_recurring_scans: recurring.length,
       disabled_recurring_scans: disabledRecurring.length,
@@ -3670,7 +3682,7 @@ export function assessTenableScanProgram(data: TenableScanProgramData, options: 
       never_run_or_undated_scans: neverRun.map((scan) => asString(scan.name) ?? asString(scan.id)).slice(0, 50),
       stale_scan_days: staleScanDays,
       caller_is_administrator: callerIsAdministrator,
-    }));
+    }, { max_observed_scan_age_days: maximumScanAgeDays })));
 
     if (data.templates.status !== "ok") {
       findings.push(unreadableFinding(17, "medium", data.templates, "the list of scheduled compliance audit scans (CIS, DISA STIG, PCI) from the Tenable UI"));
@@ -3948,6 +3960,10 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
     });
     const undated = assets.filter((asset) => parseTimestampMs(asset.last_seen) === undefined);
     const stale = assets.length - fresh.length - undated.length;
+    const maximumAssetLastSeenAgeDays = assets
+      .map((asset) => parseTimestampMs(asset.last_seen))
+      .filter((stamp): stamp is number => stamp !== undefined)
+      .reduce<number | null>((maximum, stamp) => Math.max(maximum ?? 0, daysBetween(now, stamp)), null);
     const perNetwork = new Map<string, number>();
     for (const asset of assets) {
       const network = asString(asset.network_name) ?? asString(asset.network_id) ?? "unknown";
@@ -3979,7 +3995,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = "manual";
       summary = `${assets.length} assets exported (${fresh.length} seen within ${staleAssetDays} days, ${stale} stale, ${undated.length} without last_seen). The API does not know the expected network ranges; pass expected_asset_count or compare the per-network counts in the evidence against the authoritative inventory.${networkNote}`;
     }
-    findings.push(finding(3, "high", summary, {
+    findings.push(finding(3, "high", summary, batch3PrimitiveEvidence({
       asset_count: assets.length,
       fresh_assets: fresh.length,
       stale_assets: stale,
@@ -3991,7 +4007,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       expected_asset_count: expected ?? null,
       export_status: data.assetExport.data.status,
       unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }, "", { inventory_truncated: data.assetExport.truncated === true || data.networks.truncated === true }));
+    }, { maximum_asset_last_seen_age_days: maximumAssetLastSeenAgeDays }), "", { inventory_truncated: data.assetExport.truncated === true || data.networks.truncated === true }));
 
     const tagged = assets.filter((asset) => asRecords(asset.tags).length > 0);
     const categories = data.tagCategories.status === "ok" ? data.tagCategories.data.map((item) => asString(item.name) ?? "category") : [];
@@ -4047,6 +4063,10 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       return lastConnect !== undefined && daysBetween(now, lastConnect) > agentOfflineDays;
     });
     const undated = agents.filter((agent) => parseTimestampMs(agent.last_connect) === undefined);
+    const maximumAgentLastConnectAgeDays = agents
+      .map((agent) => parseTimestampMs(agent.last_connect))
+      .filter((stamp): stamp is number => stamp !== undefined)
+      .reduce<number | null>((maximum, stamp) => Math.max(maximum ?? 0, daysBetween(now, stamp)), null);
     const newest = newestVersion(agents.map((agent) => asString(agent.core_version) ?? ""));
     const outdated = newest ? agents.filter((agent) => {
       const version = asString(agent.core_version);
@@ -4070,7 +4090,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForUnreadable("pass", data.serverProperties);
       summary = `All ${agents.length} agents connected within ${agentOfflineDays} days and run version ${newest ?? "unknown"}; ${unhealthy.size} offline.${unreadableNote([{ dataset: data.serverProperties, consequence: "the licensed agent count (license.agents) is unknown" }])}`;
     }
-    findings.push(withPartialView(finding(5, "high", summary, {
+    findings.push(withPartialView(finding(5, "high", summary, batch3PrimitiveEvidence({
       agent_count: boundedCount(agents.length, data.agents),
       pagination_total: data.agents.total ?? null,
       licensed_agents: licensedAgents ?? null,
@@ -4082,7 +4102,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       outdated_agents_count: boundedCount(outdated.length, data.agents),
       outdated_agents: detailOrNull(outdated.map((agent) => `${asString(agent.name) ?? agent.id} (${asString(agent.core_version)})`).slice(0, 50), data.agents),
       agent_offline_days: agentOfflineDays,
-    }), data.agents));
+    }, { maximum_agent_last_connect_age_days: maximumAgentLastConnectAgeDays })), data.agents));
 
     const ungrouped = agents.filter((agent) => asRecords(agent.groups).length === 0);
     const groupCount = data.agentGroups.status === "ok" ? data.agentGroups.data.length : null;
@@ -4174,6 +4194,13 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       const stamp = parsePluginSetMs(agent.plugin_feed_id);
       return stamp !== undefined && now - stamp > pluginStaleHours * 3_600_000 && asString(agent.status) === "on";
     }) : [];
+    const pluginSetAgesHours = [
+      ...(serverPluginMs === undefined ? [] : [(now - serverPluginMs) / 3_600_000]),
+      ...datedScanners
+        .map((scanner) => parsePluginSetMs(scanner.loaded_plugin_set))
+        .filter((stamp): stamp is number => stamp !== undefined)
+        .map((stamp) => (now - stamp) / 3_600_000),
+    ];
     const serverFresh = serverPluginMs !== undefined && now - serverPluginMs <= pluginStaleHours * 3_600_000;
     let status: TenableFindingStatus;
     let summary: string;
@@ -4205,7 +4232,7 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       status = capForPartial("pass", data.agents);
       summary = `The container plugin set is ${Math.round((now - serverPluginMs) / 3_600_000)} hours old and all ${datedScanners.length} scanner entries exposing loaded_plugin_set (${linkedScanners.length} linked appliances) load a set newer than ${pluginStaleHours} hours.${partialNote(data.agents)}`;
     }
-    findings.push(withPartialView(finding(8, "high", summary, {
+    findings.push(withPartialView(finding(8, "high", summary, batch3PrimitiveEvidence({
       plugin_set: asString(data.serverProperties.data.plugin_set) ?? null,
       plugin_set_age_hours: serverPluginMs === undefined ? null : Math.round((now - serverPluginMs) / 3_600_000),
       scanner_entries: countOrNull(data.scanners),
@@ -4216,7 +4243,9 @@ export function assessTenableSensorCoverage(data: TenableSensorCoverageData, opt
       stale_online_agents: boundedCount(staleAgents.length, data.agents),
       agents_status: data.agents.status,
       threshold_hours: pluginStaleHours,
-    }), data.agents));
+    }, {
+      maximum_plugin_set_age_hours: pluginSetAgesHours.length > 0 ? Math.max(...pluginSetAgesHours) : null,
+    })), data.agents));
   }
 
   if (data.networks.status !== "ok") {
@@ -4428,6 +4457,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       const lastAccess = parseTimestampMs(user.last_apikey_access);
       return lastAccess !== undefined && daysBetween(now, lastAccess) > inactiveDays;
     });
+    const maximumInactiveDays = enabledUsers
+      .map((user) => parseTimestampMs(user.lastlogin))
+      .filter((stamp): stamp is number => stamp !== undefined)
+      .reduce<number | null>((maximum, stamp) => Math.max(maximum ?? 0, daysBetween(now, stamp)), null);
     const missingEnabledFlag = users.filter((user) => asBoolean(user.enabled) === undefined);
     let status: TenableFindingStatus;
     let summary: string;
@@ -4444,7 +4477,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       status = capForUnreadable("pass", data.roles);
       summary = `${enabledUsers.length} enabled users, ${admins.length} administrators (threshold ${maxAdmins}) all enforcing SAML-only or two-factor authentication, none inactive past ${inactiveDays} days.${unreadableNote([{ dataset: data.roles, consequence: "custom roles are unknown" }])}`;
     }
-    findings.push(finding(10, "high", summary, {
+    findings.push(finding(10, "high", summary, batch3PrimitiveEvidence({
       user_count: users.length,
       enabled_users: enabledUsers.length,
       users_without_enabled_flag: missingEnabledFlag.length,
@@ -4463,7 +4496,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       custom_roles: data.roles.status === "ok" ? data.roles.data.filter((role) => asString(role.type) === "CUSTOM").map((role) => asString(role.name)).slice(0, 50) : null,
       roles_status: data.roles.status,
       max_admins: maxAdmins,
-    }));
+    }, {
+      administrator_count: admins.length,
+      max_observed_inactive_days: maximumInactiveDays,
+    })));
   }
 
   if (data.permissions.status !== "ok") {
@@ -4552,6 +4588,10 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     findings.push(unreadableFinding(18, "medium", data.auditLog, `the activity log for the last ${lookbackDays} days from Settings > Activity Logs (Administrator role required)`));
   } else {
     const events = data.auditLog.data;
+    const oldestIncludedEventAgeDays = events
+      .map((event) => parseTimestampMs(event.received))
+      .filter((stamp): stamp is number => stamp !== undefined)
+      .reduce<number | null>((maximum, stamp) => Math.max(maximum ?? 0, daysBetween(now, stamp)), null);
     const deletes = events.filter((event) => asString(event.crud) === "d");
     const privilege = events.filter((event) => /user|role|permission|apikey|api_key|key/i.test(asString(event.action) ?? "") && asString(event.crud) !== "r");
     const exclusionOrPolicy = events.filter((event) => /exclusion|policy|template/i.test(asString(event.action) ?? "") && asString(event.crud) !== "r");
@@ -4572,7 +4612,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
       status = "pass";
       summary = `${events.length} activity log events were retrieved completely for the last ${lookbackDays} days with no deletions, privilege changes, or exclusion changes; ${failures.length} failed actions recorded.`;
     }
-    findings.push(finding(18, "medium", summary, {
+    findings.push(finding(18, "medium", summary, batch3PrimitiveEvidence({
       event_count: boundedCount(events.length, data.auditLog),
       pagination_total: data.auditLog.total ?? null,
       inventory_truncated: data.auditLog.truncated,
@@ -4588,7 +4628,7 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
         actor: asString(asObject(event.actor)?.name),
         target: asString(asObject(event.target)?.name),
       })), data.auditLog),
-    }));
+    }, { oldest_included_event_age_days: oldestIncludedEventAgeDays })));
   }
 
   findings.push(assessSecurityCenterUsers(data.scUsers, now, inactiveDays));
@@ -4765,6 +4805,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
 
     const overdue: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
     const openBySeverity: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+    const maximumAgeBySeverity: Record<string, number | null> = { critical: null, high: null, medium: null, low: null };
     let undated = 0;
     for (const record of open) {
       const severity = asString(record.severity)?.toLowerCase() ?? "info";
@@ -4775,7 +4816,11 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
         continue;
       }
       const limit = sla[severity as keyof typeof sla];
-      if (limit !== undefined && daysBetween(now, firstFound) > limit) overdue[severity] += 1;
+      if (limit !== undefined) {
+        const age = daysBetween(now, firstFound);
+        maximumAgeBySeverity[severity] = Math.max(maximumAgeBySeverity[severity] ?? 0, age);
+        if (age > limit) overdue[severity] += 1;
+      }
     }
     const fixTimes = fixed.map((record) => asNumber(record.time_taken_to_fix)).filter((value): value is number => value !== undefined);
     const mttrDays = fixTimes.length > 0 ? Number((fixTimes.reduce((sum, value) => sum + value, 0) / fixTimes.length / 86_400).toFixed(1)) : null;
@@ -4803,7 +4848,7 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       slaStatus = capPopulation("pass");
       slaSummary = `All ${open.length} open findings are within SLA (critical ${sla.critical}d, high ${sla.high}d, medium ${sla.medium}d, low ${sla.low}d) across ${assetCount} assets${mttrDays !== null ? `; mean time to remediate over ${fixTimes.length} fixed findings is ${mttrDays} days` : ""}.${populationNote}`;
     }
-    findings.push(finding(15, "high", slaSummary, {
+    findings.push(finding(15, "high", slaSummary, batch3PrimitiveEvidence({
       open_by_severity: openBySeverity,
       overdue_by_severity: overdue,
       undated_open_findings: undated,
@@ -4814,7 +4859,12 @@ export function assessTenableVulnerabilityManagement(data: TenableVulnerabilityD
       chunks: chunkRatio(data.vulnExport),
       unevaluable_records: unevaluableRecordsOf(data.vulnExport),
       asset_unevaluable_records: unevaluableRecordsOf(data.assetExport),
-    }, "", {
+    }, {
+      max_critical_age_days: maximumAgeBySeverity.critical,
+      max_high_age_days: maximumAgeBySeverity.high,
+      max_medium_age_days: maximumAgeBySeverity.medium,
+      max_low_age_days: maximumAgeBySeverity.low,
+    }), "", {
       inventory_truncated: data.vulnExport.truncated === true || data.assetExport.truncated === true,
       caller_is_administrator: callerIsAdministrator,
     }));
