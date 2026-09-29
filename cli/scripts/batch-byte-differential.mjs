@@ -71,7 +71,14 @@ function run(command, args, options = {}) {
 }
 
 function instrumentedMainTest(source) {
-  return source
+  const branchOnlyRuntimeFactTests = [
+    "CrowdStrike assessors emit every metadata rule-driving fact from runtime records",
+    "Tenable assessors emit every metadata rule-driving fact from runtime records",
+    "Qualys assessors emit every metadata rule-driving fact from runtime records",
+    "Veracode assessors emit every runtime-observable metadata rule-driving fact",
+    "KnowBe4 assessors emit every metadata rule-driving fact from runtime records",
+  ];
+  let instrumented = source
     .replace(/assertBundlePathsMatchSpec, /g, "")
     .replace(/^import \{ OKTA_SPEC \} from .*okta\.spec\.js";\n/m, "")
     .replace(/^import \{ DUO_SPEC \} from .*duo\.spec\.js";\n/m, "")
@@ -89,6 +96,8 @@ function instrumentedMainTest(source) {
     .replace(/^import \{ PALOALTO_COMPLETENESS_SOURCES, PALOALTO_SPEC \} from .*paloalto\.spec\.js";\n/m, "")
     .replace(/^import \{ ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC \} from .*zscaler\.spec\.js";\n/m, "")
     .replace(/^import \{ captureBatchDecisionFacts \} from .*batch-spec-builder\.js";\n/m, "")
+    .replace(/^import \{ BATCH3_RUNTIME_FACTS \} from .*batch3-spec-helpers\.js";\n/m, "")
+    .replace(/^import \{ (?:CROWDSTRIKE|TENABLE|QUALYS|VERACODE|KNOWBE4)_SPEC \} from .*\.spec\.js";\n/gm, "")
     .replace(/^import \{\n  captureBatchDecisionFacts,\n  evaluateBatchCheckVerdict,\n\} from .*batch-spec-builder\.js";\n/m, "")
     .replace(
       'import { assertBundlePathsMatchSpec, assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";',
@@ -96,6 +105,11 @@ function instrumentedMainTest(source) {
     )
     .replace(/^import \{ assertBundlePathsMatchSpec \} from "\.\/helpers\/bundle-contents\.mjs";\n/m, "")
     .replace(/^  assertBundlePathsMatchSpec\(assert, .*;\n/gm, "");
+  for (const title of branchOnlyRuntimeFactTests) {
+    const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    instrumented = instrumented.replace(new RegExp(`test\\("${escapedTitle}"[\\s\\S]*?\\n\\}\\);\\n`), "");
+  }
+  return instrumented;
 }
 
 function copyDifferentialTestsToMain() {
