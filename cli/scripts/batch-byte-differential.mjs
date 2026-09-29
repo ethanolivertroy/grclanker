@@ -97,6 +97,7 @@ function instrumentedMainTest(source) {
     .replace(/^import \{ ZSCALER_COMPLETENESS_SOURCES, ZSCALER_SPEC \} from .*zscaler\.spec\.js";\n/m, "")
     .replace(/^import \{ captureBatchDecisionFacts \} from .*batch-spec-builder\.js";\n/m, "")
     .replace(/^import \{ BATCH3_RUNTIME_FACTS \} from .*batch3-spec-helpers\.js";\n/m, "")
+    .replace(/^import \{ certifyRuntimeRuleDecisiveness \} from "\.\/helpers\/batch3-rule-certification\.mjs";\n/m, "")
     .replace(/^import \{ (?:CROWDSTRIKE|TENABLE|QUALYS|VERACODE|KNOWBE4)_SPEC \} from .*\.spec\.js";\n/gm, "")
     .replace(/^import \{\n  captureBatchDecisionFacts,\n  evaluateBatchCheckVerdict,\n\} from .*batch-spec-builder\.js";\n/m, "")
     .replace(
