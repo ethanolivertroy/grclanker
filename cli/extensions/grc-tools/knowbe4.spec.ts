@@ -52,11 +52,16 @@ const surfaces = [
   kb("phisher-rules", "/graphql phisherRules", ["id", "name", "active", "action"], "POST"),
 ] as const;
 
+const KNOWBE4_02_COMPLETE = batch2Eq(
+  "knowbe4_02_phishing_simulation_coverage_population_complete",
+  true,
+);
+
 const rows: readonly Batch3CheckRow[] = [
   { id: "KNOWBE4-01", control: 1, title: "Phishing simulation frequency", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["phishing-campaigns", "security-tests"], predicate: "Count the absence of a completed phishing test inside max_campaign_gap_days and adjacent completed tests separated by more than that threshold.", constants: { default_max_campaign_gap_days: 30 }, thresholds: [batch3Threshold("KNOWBE4-01", "default_max_campaign_gap_days", "days_since_last_test", "gt", "fail", "Whole days since the latest completed phishing test.", "max_campaign_gap_days")] },
   { id: "KNOWBE4-02", control: 2, title: "Phishing simulation coverage", severity: "high", owner: "knowbe4_assess_phishing_program", surfaces: ["users", "security-tests", "security-test-recipients"], predicate: "Compute unique active users receiving a test inside lookback_days divided by the complete active-user population; percentages below min_coverage_pct violate.", constants: { default_lookback_days: 90, default_min_coverage_pct: 90 }, thresholds: [
-    batch3Threshold("KNOWBE4-02", "default_lookback_days", "oldest_included_test_age_days", "gt", "fail", "Age of the oldest security test included in the coverage numerator.", "lookback_days"),
-    batch3Threshold("KNOWBE4-02", "default_min_coverage_pct", "coverage_pct", "lt", "fail", "Unique tested active users divided by all active users, multiplied by 100.", "min_coverage_pct"),
+    batch3Threshold("KNOWBE4-02", "default_lookback_days", "oldest_included_test_age_days", "gt", "fail", "Age of the oldest security test included in the coverage numerator.", "lookback_days", KNOWBE4_02_COMPLETE),
+    batch3Threshold("KNOWBE4-02", "default_min_coverage_pct", "coverage_pct", "lt", "fail", "Unique tested active users divided by all active users, multiplied by 100.", "min_coverage_pct", KNOWBE4_02_COMPLETE),
   ] },
   { id: "KNOWBE4-03", control: 3, title: "Training completion rates", severity: "high", owner: "knowbe4_assess_training_program", surfaces: ["training-campaigns", "training-enrollments"], predicate: "Compute completed enrollments divided by all due enrollments for each active campaign; below fail_completion_pct fails and below min_completion_pct warns.", emptyOutcome: "warn", constants: { default_min_completion_pct: 90, default_fail_completion_pct: 80 }, thresholds: [
     batch3Threshold("KNOWBE4-03", "default_fail_completion_pct", "min:campaigns_evaluated.completion_pct", "lt", "fail", "Lowest uncapped completed-campaign enrollment completion percentage.", "fail_completion_pct"),
