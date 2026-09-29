@@ -34,6 +34,7 @@ import {
 import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
 import { CROWDSTRIKE_SPEC } from "../dist/extensions/grc-tools/crowdstrike.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
 import { assertSecretFragmentsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { CONFIG_CANARIES, assertConfigLoaderMatrix, configLoaderCases } from "./helpers/config-loader-matrix.mjs";
 import { assertFixedTextsSurvive, collectFixedTexts, collectThrownMessage, collectToolTexts, logLines } from "./helpers/fixed-text-survival.mjs";
@@ -485,6 +486,11 @@ test("CrowdStrike assessors emit every metadata rule-driving fact from runtime r
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
   assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(CROWDSTRIKE_SPEC, findings, { numeric: 22, collections: 13 }), {
+    numeric: 22,
+    collections: 13,
+    decisive: 35,
+  });
 });
 
 function createRepresentativeClient() {

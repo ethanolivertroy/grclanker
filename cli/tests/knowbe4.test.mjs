@@ -38,6 +38,7 @@ import {
 } from "../dist/extensions/grc-tools/knowbe4.js";
 import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
 import { KNOWBE4_SPEC } from "../dist/extensions/grc-tools/knowbe4.spec.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import { assertCanaryFixture, assertCanaryWindowsAbsent, assertDepthCapPins } from "./helpers/canary-windows.mjs";
@@ -2321,6 +2322,11 @@ test("KnowBe4 assessors emit every metadata rule-driving fact from runtime recor
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
   assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(KNOWBE4_SPEC, findings, { numeric: 21, collections: 0 }), {
+    numeric: 21,
+    collections: 0,
+    decisive: 21,
+  });
 });
 
 function kbMentionedEndpoints(text) {

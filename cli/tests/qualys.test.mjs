@@ -41,6 +41,7 @@ import {
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
 import { QUALYS_SPEC } from "../dist/extensions/grc-tools/qualys.spec.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
 import {
   byteDifferentialEnabled,
   prepareByteDifferentialExportRoot,
@@ -1016,6 +1017,11 @@ test("Qualys assessors emit every metadata rule-driving fact from runtime record
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
   assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(QUALYS_SPEC, findings, { numeric: 9, collections: 0 }), {
+    numeric: 9,
+    collections: 0,
+    decisive: 9,
+  });
 });
 
 const EMPTY_LIST_XML = '<?xml version="1.0" encoding="UTF-8"?><LIST_OUTPUT><RESPONSE><DATETIME>2026-09-21T00:00:00Z</DATETIME></RESPONSE></LIST_OUTPUT>';

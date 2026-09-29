@@ -28,6 +28,7 @@ import {
 import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
 import { VERACODE_SPEC } from "../dist/extensions/grc-tools/veracode.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   byteDifferentialEnabled,
@@ -3096,6 +3097,11 @@ test("Veracode assessors emit every runtime-observable metadata rule-driving fac
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
   assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(VERACODE_SPEC, findings, { numeric: 15, collections: 0 }), {
+    numeric: 15,
+    collections: 0,
+    decisive: 15,
+  });
   const prescan = findings.find((finding) => finding.id === "VERACODE-11");
   assert.deepEqual(
     Object.keys(prescan[BATCH3_RUNTIME_FACTS]).filter((name) => name.endsWith("_observed_value")),

@@ -35,6 +35,7 @@ import {
 import { BATCH3_RUNTIME_FACTS } from "../dist/extensions/grc-tools/batch3-spec-helpers.js";
 import { TENABLE_SPEC } from "../dist/extensions/grc-tools/tenable.spec.js";
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
+import { certifyRuntimeRuleDecisiveness } from "./helpers/batch3-rule-certification.mjs";
 import { assertSecretsAbsent, readBundleFiles, readZipEntries } from "./helpers/bundle-contents.mjs";
 import {
   byteDifferentialEnabled,
@@ -324,6 +325,11 @@ test("Tenable assessors emit every metadata rule-driving fact from runtime recor
   }
   assert.deepEqual([...observed.keys()].sort(), [...expected].sort());
   assert.ok([...observed.values()].every((value) => typeof value === "number" || Array.isArray(value)));
+  assert.deepEqual(certifyRuntimeRuleDecisiveness(TENABLE_SPEC, findings, { numeric: 17, collections: 0 }), {
+    numeric: 17,
+    collections: 0,
+    decisive: 17,
+  });
 });
 
 test("resolveTenableConfiguration prefers arguments over environment over config file", () => {
