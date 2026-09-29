@@ -4502,8 +4502,9 @@ export function assessTenableAccessControl(data: TenableAccessControlData, optio
     }, {
       administrator_count: admins.length,
       max_observed_inactive_days: maximumInactiveDays,
+    }), "", {
       inactive_user_days: inactiveDays,
-    })));
+    }));
   }
 
   if (data.permissions.status !== "ok") {
