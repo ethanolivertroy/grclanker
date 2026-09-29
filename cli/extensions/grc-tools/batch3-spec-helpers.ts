@@ -485,7 +485,7 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
     const completenessSources = row.completenessSources
       ?? row.surfaces.map((surfaceId) => batch3Source(surfaceId));
     const exactCompletenessSemantics = completenessSources.length === 0
-      ? `${row.id} has no automated source dataset; no collection state can establish completeness.`
+      ? `${names.complete} is always false because ${row.id} has no automated source dataset. No request is made, so truncated, error, denied, not-collected, not-configured, and missing-required-field states cannot establish completeness. Finding previews and exported samples never establish source cardinality.`
       : `${names.complete} is true only after ${completenessSources.map((source) => source.surfaceId).join(", ")} each completed and returned every field required by this check. Exact source-state effects: ${completenessSources.map((source) => `${source.surfaceId} sets ${names.complete} false on ${source.falseWhen.join(", ") || "no collection state"}`).join("; ")}. Finding previews and exported samples never establish source cardinality.`;
     return {
       id: row.id,
