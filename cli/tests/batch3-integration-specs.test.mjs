@@ -188,6 +188,23 @@ test("hidden threshold bands execute below, equal, and above against primitive f
   const byId = new Map(batch.flatMap(([spec]) => spec.checks.map((check) => [check.id, check])));
   const verdict = (id, facts) => evaluateCheckVerdict(byId.get(id), facts);
 
+  const knowbe402UnreadableRecipients = {
+    knowbe4_02_user_and_test_reads_succeeded: true,
+    knowbe4_02_user_and_recipient_lists_complete: false,
+    knowbe4_02_active_user_count: 10,
+    knowbe4_02_coverage_violation_count: 0,
+    knowbe4_02_coverage_review_count: 1,
+    knowbe4_02_oldest_included_test_age_days_observed_value: null,
+    knowbe4_02_lookback_days_configured_value: 365,
+    knowbe4_02_coverage_pct_observed_value: null,
+    knowbe4_02_min_coverage_pct_configured_value: 90,
+  };
+  assert.equal(
+    verdict("KNOWBE4-02", knowbe402UnreadableRecipients),
+    "warn",
+    "an unreadable recipient population cannot be coerced to zero and fail a numeric threshold",
+  );
+
   const cs14 = { cs_14_host_and_group_reads_succeeded: true, cs_14_host_and_group_lists_complete: true, cs_14_host_count: 100, cs_14_host_group_count: 1 };
   assert.deepEqual([79, 80, 81, 94, 95, 96].map((count) => verdict("CS-14", { ...cs14, cs_14_assigned_host_count: count })), ["fail", "warn", "warn", "warn", "pass", "pass"]);
 

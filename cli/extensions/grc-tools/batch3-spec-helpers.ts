@@ -398,18 +398,21 @@ export function batch3Checks(rows: readonly Batch3CheckRow[]): BatchCheckDefinit
       right: batch2Path(rightPath),
     } as const);
     const thresholdRules = (row.thresholds ?? []).map((threshold) => {
-      const thresholdCondition = threshold.configuredFact
-        ? batch2Any(
-            batch2All(
-              batch2Defined(threshold.configuredFact),
-              comparison(threshold.comparator, threshold.observedFact, threshold.configuredFact),
-            ),
-            batch2All(
-              batch2Not(batch2Defined(threshold.configuredFact)),
-              comparison(threshold.comparator, threshold.observedFact, threshold.constant),
-            ),
-          )
-        : comparison(threshold.comparator, threshold.observedFact, threshold.constant);
+      const thresholdCondition = batch2All(
+        batch2Defined(threshold.observedFact),
+        threshold.configuredFact
+          ? batch2Any(
+              batch2All(
+                batch2Defined(threshold.configuredFact),
+                comparison(threshold.comparator, threshold.observedFact, threshold.configuredFact),
+              ),
+              batch2All(
+                batch2Not(batch2Defined(threshold.configuredFact)),
+                comparison(threshold.comparator, threshold.observedFact, threshold.constant),
+              ),
+            )
+          : comparison(threshold.comparator, threshold.observedFact, threshold.constant),
+      );
       return batch2Rule(
         threshold.status,
         threshold.guard ? batch2All(threshold.guard, thresholdCondition) : thresholdCondition,
