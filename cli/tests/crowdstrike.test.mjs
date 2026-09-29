@@ -697,6 +697,39 @@ test("CrowdstrikeApiClient follows after cursors, opaque offset tokens, and POST
   assert.equal(alerts.truncated, false);
 });
 
+test("CrowdstrikeApiClient sends exact device, RTR, and zero-trust filters, fields, sorts, and caps", async () => {
+  const seen = [];
+  const fetchImpl = async (input) => {
+    const url = new URL(typeof input === "string" ? input : input.toString());
+    if (url.pathname === "/oauth2/token") {
+      return jsonResponse({ access_token: "token-1", expires_in: 1799 });
+    }
+    seen.push(url);
+    return jsonResponse({ resources: [], meta: { pagination: { total: 0 } } });
+  };
+  const client = new CrowdstrikeApiClient(sampleConfig(), { fetchImpl });
+
+  await client.listHosts(200, "status:'normal'");
+  await client.listRtrSessions("created_at:>'now-30d'", 500);
+  await client.listZtaAssessments("score:<60", 1000);
+
+  const devices = seen.find((url) => url.pathname === "/devices/combined/devices/v1");
+  assert.equal(devices.searchParams.get("filter"), "status:'normal'");
+  assert.equal(devices.searchParams.get("sort"), "device_id.asc");
+  assert.equal(devices.searchParams.get("fields"), "device_id,hostname,platform_name,os_version,agent_version,last_seen,first_seen,status,groups,product_type_desc,reduced_functionality_mode,modified_timestamp");
+  assert.equal(devices.searchParams.get("limit"), "200");
+
+  const rtr = seen.find((url) => url.pathname === "/real-time-response-audit/combined/sessions/v1");
+  assert.equal(rtr.searchParams.get("filter"), "created_at:>'now-30d'");
+  assert.equal(rtr.searchParams.get("sort"), "created_at|desc");
+  assert.equal(rtr.searchParams.get("limit"), "500");
+
+  const zta = seen.find((url) => url.pathname === "/zero-trust-assessment/queries/assessments/v1");
+  assert.equal(zta.searchParams.get("filter"), "score:<60");
+  assert.equal(zta.searchParams.get("sort"), "score|asc");
+  assert.equal(zta.searchParams.get("limit"), "1000");
+});
+
 test("CrowdstrikeApiClient records truncation instead of treating a first page as the whole population", async () => {
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(typeof input === "string" ? input : input.toString());

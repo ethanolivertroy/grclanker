@@ -502,6 +502,41 @@ test("VeracodeApiClient signs requests, paginates HAL pages to completion, retri
   assert.equal(truncated.items.length, 2);
 });
 
+test("VeracodeApiClient sends exact findings parameters and no pagination on object endpoints", async () => {
+  const seen = [];
+  const client = new VeracodeApiClient(sampleConfig(), { fetchImpl: async (input) => {
+    const url = new URL(input);
+    seen.push(url);
+    if (url.pathname === "/api/authn/v2/users/self") {
+      return jsonResponse({ user_id: "u-1" });
+    }
+    if (url.pathname.endsWith("/findings")) {
+      return jsonResponse({ _embedded: { findings: [] }, page: { number: 0, size: 500, total_elements: 0, total_pages: 1 } });
+    }
+    return jsonResponse({ scan_id: "scan-1" });
+  } });
+
+  await client.listFindings("app-1", { include_annot: "TRUE" });
+  await client.getSelf();
+  await client.getSummaryReport("app-1");
+  await client.getDynamicScanConfiguration("scan-1");
+
+  const findings = seen.find((url) => url.pathname === "/appsec/v2/applications/app-1/findings");
+  assert.deepEqual(
+    Object.fromEntries(findings.searchParams),
+    { include_annot: "TRUE", page: "0", size: "500" },
+  );
+  for (const path of [
+    "/api/authn/v2/users/self",
+    "/appsec/v2/applications/app-1/summary_report",
+    "/was/configservice/v1/scans/scan-1/configuration",
+  ]) {
+    const objectRequest = seen.find((url) => url.pathname === path);
+    assert.ok(objectRequest, `${path} was requested`);
+    assert.equal(objectRequest.search, "", `${path} has no page or size query`);
+  }
+});
+
 test("checkVeracodeAccess reports healthy access and names missing roles when degraded", async () => {
   const healthy = await checkVeracodeAccess(mockClient());
   assert.equal(healthy.status, "healthy");
