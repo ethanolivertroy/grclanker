@@ -55,6 +55,13 @@ const testFiles = [
 const fixtureClasses = ["boundary", "compliant", "denied", "export", "missing-null", "partial", "representative"];
 const batch2Integrations = ["azure", "cloudflare", "gcp", "oci", "paloalto", "zscaler"];
 const representativeDistinctIntegrations = [...batch2Integrations, "crowdstrike", "qualys", "veracode"];
+const branchOnlyRuntimeFactTests = [
+  "CrowdStrike assessors emit every metadata rule-driving fact from runtime records",
+  "Tenable assessors emit every metadata rule-driving fact from runtime records",
+  "Qualys assessors emit every metadata rule-driving fact from runtime records",
+  "Veracode assessors emit every runtime-observable metadata rule-driving fact",
+  "KnowBe4 assessors emit every metadata rule-driving fact from runtime records",
+];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -71,13 +78,6 @@ function run(command, args, options = {}) {
 }
 
 function instrumentedMainTest(source) {
-  const branchOnlyRuntimeFactTests = [
-    "CrowdStrike assessors emit every metadata rule-driving fact from runtime records",
-    "Tenable assessors emit every metadata rule-driving fact from runtime records",
-    "Qualys assessors emit every metadata rule-driving fact from runtime records",
-    "Veracode assessors emit every runtime-observable metadata rule-driving fact",
-    "KnowBe4 assessors emit every metadata rule-driving fact from runtime records",
-  ];
   let instrumented = source
     .replace(/assertBundlePathsMatchSpec, /g, "")
     .replace(/^import \{ OKTA_SPEC \} from .*okta\.spec\.js";\n/m, "")
@@ -381,12 +381,15 @@ export function ${functionName}(...args) {
 
 function runCorpusSuite(root, fixtureDirectory) {
   mkdirSync(fixtureDirectory, { recursive: true });
+  const branchOnlyPattern = branchOnlyRuntimeFactTests
+    .map((title) => title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
   const result = run(process.execPath, [
     "--import",
     join(root, "cli", "tests", "helpers", "freeze-time.mjs"),
     "--test",
     "--test-concurrency=1",
-    "--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures)",
+    `--test-skip-pattern=^(?:all 25 (?:Palo Alto|Zscaler) checks replay|SNOW-08 counts an active non-IdP integration TLS certificate|AZURE-SUB-04 network-watcher truncation|CF-IAM-06 treats token-list 404|CF-TRF-06 preserves the unpaginated|OCI prerequisite and nested-read failures|${branchOnlyPattern})`,
     ...testFiles.map((testFile) => join(root, "cli", "tests", testFile)),
   ], {
     cwd: root,
@@ -588,7 +591,12 @@ try {
   instrumentAssessmentExports(repoRoot);
   const mainCorpusTests = runCorpusSuite(mainWorktree, mainCorpus);
   const branchCorpusTests = runCorpusSuite(repoRoot, branchCorpus);
-  if (JSON.stringify(mainCorpusTests) !== JSON.stringify(branchCorpusTests)) {
+  const expectedBranchCounts = {
+    executed: mainCorpusTests.executed,
+    skipped: mainCorpusTests.skipped + branchOnlyRuntimeFactTests.length,
+    total: mainCorpusTests.total + branchOnlyRuntimeFactTests.length,
+  };
+  if (JSON.stringify(expectedBranchCounts) !== JSON.stringify(branchCorpusTests)) {
     throw new Error(`corpus test-count mismatch: main=${JSON.stringify(mainCorpusTests)} branch=${JSON.stringify(branchCorpusTests)}`);
   }
   const corpusPaths = compareTrees(mainCorpus, branchCorpus, "assessment corpus");
