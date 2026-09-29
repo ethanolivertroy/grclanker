@@ -236,9 +236,15 @@ export function certifyRuntimeRuleDecisiveness(spec, findings, expected) {
               matches,
             };
           });
-        assert.deepEqual(variants.map((variant) => variant.branchMatches), variants.map((variant) => variant.matches), `${check.id}.${constant}: below/equal/above condition`);
-        assert.ok(variants.some((variant) => variant.matches && variant.first === match.id), `${check.id}.${constant}: verdict-deciding branch`);
-        assert.ok(new Set(variants.map((variant) => variant.first)).size > 1, `${check.id}.${constant}: actual ordered outcome transition`);
+        const diagnostic = JSON.stringify({
+          rule: match.id,
+          observed,
+          variants,
+          configuredFacts: Object.fromEntries(Object.entries(baseline).filter(([name]) => name.endsWith("_configured_value"))),
+        });
+        assert.deepEqual(variants.map((variant) => variant.branchMatches), variants.map((variant) => variant.matches), `${check.id}.${constant}: below/equal/above condition ${diagnostic}`);
+        assert.ok(variants.some((variant) => variant.matches && variant.first === match.id), `${check.id}.${constant}: verdict-deciding branch ${diagnostic}`);
+        assert.ok(new Set(variants.map((variant) => variant.first)).size > 1, `${check.id}.${constant}: actual ordered outcome transition ${diagnostic}`);
         numeric += 1;
         decisive += 1;
         continue;
