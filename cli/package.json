@@ -21,7 +21,7 @@
     "flue:run": "node dist/flue/cli.js run",
     "sync:fedramp": "tsx scripts/sync-fedramp.ts",
     "sync:tool-catalog": "npm run build && node scripts/generate-tool-catalog-docs.mjs",
-    "sync:agent-sdk-tools": "npm run build && node scripts/generate-agent-sdk-tools.mjs",
+    "sync:agent-sdk-tools": "tsc -p tsconfig.agent-sdk-sync.json && node scripts/generate-agent-sdk-tools.mjs && npm run build",
     "sync:integration-specs": "npm run build && node scripts/generate-integration-specs.mjs",
     "check:integration-specs": "npm run build && node scripts/generate-integration-specs.mjs --check",
     "agent-sdk:validate": "bdk validate --dir agent-sdk",
