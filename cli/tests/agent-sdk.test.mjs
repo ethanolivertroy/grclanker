@@ -30,9 +30,9 @@ import { clearGrcSharedCachesForTests, persistentCachesEnabled } from "../dist/e
 import { getRegisteredToolSummaries } from "../dist/pi/tool-catalog.js";
 import { buildAgentSdkToolSource, listAgentSdkToolFiles } from "../scripts/generate-agent-sdk-tools.mjs";
 
-// Stub @cursor/july before any agent entry file is imported. The adapter
+// Stub @cursor/bdk before any agent entry file is imported. The adapter
 // library only uses type imports from the SDK, so it loads unmocked above.
-register("./helpers/cursor-july-mock-hooks.mjs", import.meta.url);
+register("./helpers/cursor-bdk-mock-hooks.mjs", import.meta.url);
 
 const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const agentSdkRoot = resolve(cliRoot, "agent-sdk");
@@ -545,7 +545,7 @@ test("agent instructions compose SYSTEM.md with the Agent SDK runtime note", () 
   assert.match(markdown, /`investigate`, `audit`, `assess`, and `validate`/);
   assert.match(markdown, /Delegate to the `auditor` subagent once evidence is gathered/);
   assert.match(markdown, /Delegate to the `verifier` subagent before reporting findings/);
-  assert.match(markdown, /resolve relative paths against the working directory of the `agent-sdk` process/);
+  assert.match(markdown, /resolve relative paths against the working directory of the `bdk` process/);
 });
 
 test("workflow prompts and the bundled skill map onto skill configs", () => {

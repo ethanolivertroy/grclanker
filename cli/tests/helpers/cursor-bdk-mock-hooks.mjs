@@ -1,21 +1,21 @@
 /**
- * Node module customization hooks that replace the `@cursor/july` entry
+ * Node module customization hooks that replace the `@cursor/bdk` entry
  * points with recording stubs, so the Agent SDK entry files under
  * `agent-sdk/agent/` can be loaded without the real framework or any
  * network access. Register from a test with:
  *
- *   register("./helpers/cursor-july-mock-hooks.mjs", import.meta.url);
+ *   register("./helpers/cursor-bdk-mock-hooks.mjs", import.meta.url);
  *
  * Every `define*` call is recorded on `globalThis.__grclankerCursorJulyMockCalls`
  * and returns the config tagged with `__agentServe` (the SDK's brand key) and
  * `__mockHelper`.
  */
-const MOCK_URL_PREFIX = "grclanker-cursor-july-mock:";
+const MOCK_URL_PREFIX = "grclanker-cursor-bdk-mock:";
 
 const HELPERS_BY_SPECIFIER = {
-  "@cursor/july": { defineAgent: "agent", defineInstructions: "instructions" },
-  "@cursor/july/tools": { defineTool: "tool" },
-  "@cursor/july/skills": { defineSkill: "skill" },
+  "@cursor/bdk": { defineAgent: "agent", defineInstructions: "instructions" },
+  "@cursor/bdk/tools": { defineTool: "tool" },
+  "@cursor/bdk/skills": { defineSkill: "skill" },
 };
 
 function buildMockSource(specifier) {

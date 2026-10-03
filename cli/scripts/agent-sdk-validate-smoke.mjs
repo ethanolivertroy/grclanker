@@ -13,20 +13,20 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const agentSdkDir = resolve(scriptDir, "../agent-sdk");
 const require = createRequire(import.meta.url);
 
-function resolveAgentSdkBin() {
+function resolveBdkBin() {
   try {
-    const packageJsonPath = require.resolve("@cursor/july/package.json");
+    const packageJsonPath = require.resolve("@cursor/bdk/package.json");
     const manifest = require(packageJsonPath);
-    return { version: manifest.version, bin: resolve(dirname(packageJsonPath), manifest.bin["agent-sdk"]) };
+    return { version: manifest.version, bin: resolve(dirname(packageJsonPath), manifest.bin.bdk) };
   } catch {
     return undefined;
   }
 }
 
 /**
- * Run an `agent-sdk` command and return its stdout.
+ * Run a `bdk` command and return its stdout.
  *
- * The child's stdout is a temp file, not a pipe: `agent-sdk info --json`
+ * The child's stdout is a temp file, not a pipe: `bdk info --json`
  * writes with a bare `process.stdout.write` and then calls `process.exit`,
  * so with a pipe only the first 64 KiB survives and the full tool payload is
  * truncated mid-JSON. Writes to a file descriptor complete synchronously.
@@ -46,13 +46,13 @@ function runAgentSdk(bin, args) {
   }
 }
 
-const sdk = resolveAgentSdkBin();
+const sdk = resolveBdkBin();
 if (!sdk) {
-  console.log("Skipping Agent SDK discovery smoke: @cursor/july is not installed (run npm --prefix cli install).");
+  console.log("Skipping Agent SDK discovery smoke: @cursor/bdk is not installed (run npm --prefix cli install).");
   process.exit(0);
 }
 
-console.log(`Using @cursor/july ${sdk.version}`);
+console.log(`Using @cursor/bdk ${sdk.version}`);
 process.stdout.write(runAgentSdk(sdk.bin, ["validate"]));
 
 const info = JSON.parse(runAgentSdk(sdk.bin, ["info", "--json"]));
