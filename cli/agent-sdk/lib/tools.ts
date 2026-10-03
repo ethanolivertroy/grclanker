@@ -1,5 +1,5 @@
-import type { JsonObject, JsonSchemaObject } from "@cursor/july";
-import type { ToolContext, ToolExecuteResult } from "@cursor/july/tools";
+import type { JsonObject, JsonSchemaObject } from "@cursor/bdk";
+import type { ToolContext, ToolExecuteResult } from "@cursor/bdk/tools";
 import { validateToolArguments, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { runWithoutPersistentCaches } from "../../extensions/grc-tools/shared.js";
 import { collectSensitiveValues, scrubSensitiveValues, withholdEchoedArguments } from "../../flue/redact.js";
@@ -20,7 +20,7 @@ export interface GrclankerSdkToolConfig {
   /**
    * Writers (exports, generators, evidence collectors, OSCAL workspace
    * commands) park model-initiated calls until a person approves them.
-   * Deterministic `agent-sdk call` runs bypass the gate.
+   * Deterministic `bdk call` runs bypass the gate.
    */
   needsApproval: boolean;
   execute: (input: JsonObject, ctx: GrcToolExecutionContext) => Promise<ToolExecuteResult>;

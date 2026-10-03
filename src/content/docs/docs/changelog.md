@@ -41,7 +41,7 @@ node cli/bin/grclanker.js tools
 
 ### Runtimes
 
-- [Cursor Agent SDK](/docs/getting-started/agent-sdk/): a source-checkout project built on `@cursor/july` that serves all 241 tools. 199 read-only tools run in dry-run sessions, the 42 writers wait for human approval, and credential arguments are redacted from validation and execution errors.
+- [Cursor Agent SDK](/docs/getting-started/agent-sdk/): a source-checkout project built on `@cursor/bdk`, Cursor's Bot Development Kit (formerly `@cursor/july`), that serves all 241 tools. 199 read-only tools run in dry-run sessions, the 42 writers wait for human approval, and credential arguments are redacted from validation and execution errors.
 - [Flue Runtime](/docs/getting-started/flue-runtime/): `grclanker flue run` and the official Flue CLI run the same agent, prompts, and tools. Activity logs redact credential-shaped arguments, and the verifier subagent can check findings against the CMVP, KEV, EPSS, and SCF tools.
 - [Compute backends](/docs/getting-started/compute-backends/): Modal, RunPod Pod, and RunPod Serverless join host, sandbox-runtime, Docker, and Parallels VM.
 

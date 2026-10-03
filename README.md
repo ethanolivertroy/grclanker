@@ -116,14 +116,14 @@ See [Compute Backends](https://grclanker.com/docs/getting-started/compute-backen
 
 ## Cursor Agent SDK Runtime
 
-The same GRC tool surface can run as a Cursor Agent SDK agent built on [`@cursor/july`](https://www.npmjs.com/package/@cursor/july) (the `agent-sdk` CLI). The agent project lives in `cli/agent-sdk/` and is an adapter over the bundled extension, not a second implementation:
+The same GRC tool surface can run as a Cursor Agent SDK agent built on [`@cursor/bdk`](https://www.npmjs.com/package/@cursor/bdk), Cursor's Bot Development Kit (the `bdk` CLI, formerly `@cursor/july` and `agent-sdk`). The agent project lives in `cli/agent-sdk/` and is an adapter over the bundled extension, not a second implementation:
 
 - all 241 domain tools are exposed as Agent SDK server tools under their native names, with TypeBox parameter schemas converted to plain JSON Schema at the adapter boundary and arguments validated with the same `prepareArguments` shims and Pi validator the CLI uses
 - `SYSTEM.md` becomes the always-on instructions, the `/investigate`, `/audit`, `/assess`, and `/validate` prompts become on-demand skills, the bundled `crypto-validation` skill is exposed as a skill, and the `auditor` and `verifier` personas become subagents
 - Pi's compute-backend tools (`bash`, `read`, `write`, `edit`, `ls`, `find`, `grep`) are not exposed; the Cursor harness supplies its own shell and file tools
 - the 199 query tools declare `effect: "read"` for Agent SDK dry runs (FedRAMP lookups keep their catalog cache in memory during a dry run and leave `~/.grclanker`, or `GRCLANKER_HOME`, untouched), and the 42 writers (exports, generators, the evidence collector, OSCAL workspace commands) require human approval before a model-initiated call runs
 
-Run it from a source checkout (`@cursor/july` is a CLI devDependency, so `npm --prefix cli install` provides `agent-sdk`):
+Run it from a source checkout (`@cursor/bdk` is a CLI devDependency, so `npm --prefix cli install` provides `bdk`):
 
 ```bash
 npm --prefix cli run agent-sdk:validate
@@ -132,7 +132,7 @@ npm --prefix cli run agent-sdk:call -- kevs_search --input '{"query":"CVE-2021-4
 npm --prefix cli run agent-sdk:dev
 ```
 
-`validate`, `info`, and `call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx agent-sdk login` inside `cli/` or export `CURSOR_API_KEY`. The Agent SDK default model applies unless `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id. When a domain tool changes, regenerate the per-tool entry files with `npm --prefix cli run sync:agent-sdk-tools`; `npm --prefix cli run test:cli` fails if the entries drift, and `npm --prefix cli run test:agent-sdk:validate` runs the real `agent-sdk validate` and `info` discovery. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk) for details.
+`validate`, `info`, and `call` need no Cursor credential. Model turns (`agent-sdk:dev`, `agent-sdk:run`) need one: run `npx bdk login` inside `cli/` or export `CURSOR_API_KEY`. The Agent SDK default model applies unless `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id. When a domain tool changes, regenerate the per-tool entry files with `npm --prefix cli run sync:agent-sdk-tools`; `npm --prefix cli run test:cli` fails if the entries drift, and `npm --prefix cli run test:agent-sdk:validate` runs the real `bdk validate` and `info` discovery. See [Cursor Agent SDK](https://grclanker.com/docs/getting-started/agent-sdk) for details.
 
 ## What You Can Do With It
 

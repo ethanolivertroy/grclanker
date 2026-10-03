@@ -1,4 +1,4 @@
-import type { AgentConfig } from "@cursor/july";
+import type { AgentConfig } from "@cursor/bdk";
 
 export const AGENT_NAME = "grclanker";
 

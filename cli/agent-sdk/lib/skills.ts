@@ -1,7 +1,7 @@
 import { readCliAsset } from "./paths.js";
 import { renderWorkflowPrompt } from "../../pi/workflow-prompt.js";
 
-/** Config accepted by `defineSkill` from `@cursor/july/skills`. */
+/** Config accepted by `defineSkill` from `@cursor/bdk/skills`. */
 export interface GrclankerSkillConfig {
   description: string;
   markdown: string;

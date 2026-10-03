@@ -1,4 +1,4 @@
-import type { ToolResultContent } from "@cursor/july/tools";
+import type { ToolResultContent } from "@cursor/bdk/tools";
 import type { GrcToolContent, GrcToolResult } from "./registry.js";
 
 /** The envelope form of the Agent SDK `ToolExecuteResult`. */
