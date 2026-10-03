@@ -51,7 +51,7 @@ That setup step is where you choose the local-first or hosted model path.
 ## What the installer does
 
 - Detects your OS and architecture. Bundles exist for `darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64` (glibc), `win32-arm64`, and `win32-x64`. Linux musl hosts (such as Alpine) are not supported; use a [source checkout](#install-from-source) there.
-- Scans the GitHub release list for the newest release that has a bundle for your platform and downloads it.
+- Downloads the bundle for your platform from the newest full release, skipping prereleases such as `v0.2.0-rc.1`. If the GitHub API is unavailable or rate limited, it follows the `releases/latest` link on github.com instead.
 - Checks the archive against the release's `SHA256SUMS.txt` when it can, and aborts on a mismatch. If the checksum file cannot be fetched, has no entry for the archive, or no SHA-256 tool is available, or if `GRCLANKER_ASSET_URL` points at a custom archive, it prints a warning and installs without verification.
 - Replaces `~/.local/share/grclanker` with the unpacked bundle. The bundle includes its own Node.js runtime, so you do not need Node installed.
 - Links `grclanker` into `~/.local/bin`. On Windows it writes a `grclanker.cmd` launcher there instead.
