@@ -3,32 +3,28 @@ title: Installation
 description: Install the grclanker release bundle, build the current main branch from source, or install only the skills.
 ---
 
-There are two ways to install grclanker today:
+There are two ways to install grclanker:
 
-- **Release bundle.** The one-line installer fetches the newest GitHub release bundle. That is currently the `v0.0.1` pre-release, which ships the CMVP and KEV/EPSS tool surface (8 tools).
-- **Source checkout.** Everything on `main` since that release, including the 35 platform integrations, needs a source checkout until the next release is cut.
+- **Release bundle.** The one-line installer fetches the newest GitHub release bundle, currently `v0.1.0`, with all 241 domain tools and its own Node.js runtime.
+- **Source checkout.** Build `main` yourself to run unreleased changes or to work on grclanker.
 
 If you just want the shortest install-to-first-run path, use the [Quick Start](/docs/getting-started/quick-start). This page is the full reference for both paths, pinned versions, skills-only installs, and troubleshooting.
 
-> grclanker is primarily tested on macOS and Linux. Windows support is best-effort and is not a priority for this experimental release. If you want the least-friction path, use macOS or Linux.
+> grclanker is primarily tested on macOS and Linux. Windows support is best-effort. If you want the least-friction path, use macOS or Linux.
 
 ## What the current release includes
 
-The `v0.0.1` bundle gives you the interactive CLI, `grclanker setup`, `grclanker env doctor`, `grclanker env smoke-test`, `grclanker env exec`, and the `investigate`, `audit`, `assess`, and `validate` workflows, backed by these tools:
+The `v0.1.0` bundle gives you:
 
-- `cmvp_search_modules`, `cmvp_search_historical`, `cmvp_search_in_process`, `cmvp_get_module`
-- `kevs_search`, `kevs_recent`, `kevs_get_epss`, `kevs_check_ransomware`
-
-These are on `main` but not in the `v0.0.1` bundle:
-
-- 241 domain tools, including the 35 platform integrations (AWS, Okta, GitHub, and the rest of the [integrations](/docs/integrations/aws/) section) plus the FedRAMP, OSCAL, and SCF tools
+- 241 domain tools, including the 35 platform integrations (AWS, Okta, GitHub, and the rest of the [integrations](/docs/integrations/aws/) section) plus the CMVP, KEV/EPSS, FedRAMP, OSCAL, and SCF tools
+- the interactive CLI, `grclanker setup`, and the `investigate`, `audit`, `assess`, and `validate` workflows
 - `grclanker tools`, which lists every bundled tool
 - `grclanker flue run`, which runs the same agent under the [Flue runtime](/docs/getting-started/flue-runtime/)
-- `grclanker env list`
+- `grclanker env list`, `env doctor`, `env smoke-test`, and `env exec`
 - `grclanker "<prompt>"` for a free-form prompt, and a subject after `investigate`, `audit`, `assess`, or `validate`
 - `--compute <kind>` to pick a compute backend: for one run of `investigate`, `audit`, `assess`, `validate`, or a `"<prompt>"`; with `grclanker setup --compute <kind>` to save it as the preferred backend; and as an alias for `--backend` on `env smoke-test` and `env exec`. A bare `grclanker --compute <kind>` is rejected as an unknown command.
 
-To use any of those now, [install from source](#install-from-source).
+[What's New](/docs/changelog/) lists everything that changed since `v0.0.1`.
 
 ## One-line installer
 
@@ -68,13 +64,13 @@ grclanker keeps its settings and runtime state under `~/.grclanker/agent`, separ
 Pin a release explicitly:
 
 ```bash
-curl -fsSL https://grclanker.com/install | bash -s -- 0.0.1
+curl -fsSL https://grclanker.com/install | bash -s -- 0.1.0
 ```
 
 Windows PowerShell (best effort):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm https://grclanker.com/install.ps1))) -Version 0.0.1"
+powershell -ExecutionPolicy Bypass -c "& ([scriptblock]::Create((irm https://grclanker.com/install.ps1))) -Version 0.1.0"
 ```
 
 Both installers also read these environment variables:
@@ -93,7 +89,7 @@ curl -fsSL https://grclanker.com/install | GRCLANKER_INSTALL_DIR="$HOME/opt/grcl
 
 ## Install from source
 
-A source checkout gives you everything on `main`. You need `git`, `npm`, and Node.js 22.19 or newer, the `engines` floor in `cli/package.json`. The Pi and Flue runtime packages the CLI depends on require it.
+A source checkout gives you everything on `main`, including changes that have not been released yet. You need `git`, `npm`, and Node.js 22.19 or newer, the `engines` floor in `cli/package.json`. The Pi and Flue runtime packages the CLI depends on require it.
 
 ```bash
 git clone https://github.com/ethanolivertroy/grclanker.git
@@ -122,7 +118,7 @@ npm --prefix cli run build:bundle
 bash public/install
 ```
 
-When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one, and checks it against the `SHA256SUMS.txt` that `build:bundle` writes next to it. The install banner still reads `v0.0.1`, because that is the version in `cli/package.json` until the next release.
+When run from a checkout, the installer uses the newest matching bundle in `cli/release/` instead of downloading one, and checks it against the `SHA256SUMS.txt` that `build:bundle` writes next to it. The install banner shows the version in `cli/package.json`.
 
 To update a source install, run `git pull`, then repeat `npm --prefix cli ci` and `npm --prefix cli run build` (and `build:bundle` plus `bash public/install` if you use the bundle layout).
 
@@ -188,12 +184,12 @@ grclanker --help
 grclanker setup
 ```
 
-If the help output appears and setup starts, the install is healthy. On a source install, `grclanker tools` also lists every registered tool.
+If the help output appears and setup starts, the install is healthy. `grclanker tools` also lists every registered tool.
 
 ## Troubleshooting
 
 - If `grclanker` resolves to a different install (for example an `npm link` from a source checkout), run `which -a grclanker` and `hash -r`, or launch `~/.local/bin/grclanker` directly. The installer warns when another `grclanker` is already on your `PATH`.
-- If `grclanker tools` or `grclanker flue run` prints `Unknown command`, you are running the `v0.0.1` bundle. Those commands need a [source checkout](#install-from-source) until the next release.
+- If `grclanker tools` or `grclanker flue run` prints `Unknown command`, you are still running the `v0.0.1` bundle. Rerun the [one-line installer](#one-line-installer) to upgrade.
 - If local-first setup fails, check that Ollama is serving on `http://localhost:11434/v1`.
 - If `gemma4` is missing, run `ollama pull gemma4` and rerun `grclanker setup`.
 - If you do not want local-first, rerun `grclanker setup` and choose `Hosted`.

@@ -21,7 +21,7 @@ Inside a grclanker session, put the subject after the command:
 
 From the shell, `grclanker validate "<subject>"` opens a session that starts with the same prompt and the subject filled in. The subject is the vendor, product, library, or appliance to check. Run `grclanker validate` on its own to name it in your first message instead.
 
-In the `v0.0.1` release bundle, text after `/validate` and arguments after `grclanker validate` are dropped, so send the subject in its own message there.
+In the older `v0.0.1` release bundle, text after `/validate` and arguments after `grclanker validate` are dropped, so upgrade to `v0.1.0` or send the subject in its own message there.
 
 ## What the prompt does
 

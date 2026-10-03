@@ -18,7 +18,7 @@ The same workflow prompts, personas, and domain tools can run in three ways:
 3. Choose local-first or hosted.
 4. Use a workflow, call a native integration tool, or hand the agent a repository spec.
 
-The one-line installer currently ships the `v0.0.1` release bundle, which registers 8 tools (the CMVP and KEV families). The other domain tools, `grclanker tools`, and `grclanker flue run` need a source checkout until the next release.
+The one-line installer ships the `v0.1.0` release bundle, which registers all 241 domain tools and includes `grclanker tools` and `grclanker flue run`.
 
 The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. [Configuration](/docs/getting-started/configuration/) and [Compute Backends](/docs/getting-started/compute-backends/) cover runtime settings and execution environments.
 
@@ -29,7 +29,7 @@ The [Quick Start](/docs/getting-started/quick-start/) covers the shortest path. 
 
 ## What's new
 
-[What's New](/docs/changelog/) lists what the next release adds on top of the `v0.0.1` bundle and how to run it from source today.
+[What's New](/docs/changelog/) lists what `v0.1.0` adds on top of the `v0.0.1` bundle.
 
 ## Shipped surface
 
@@ -53,4 +53,4 @@ Evidence exporters allocate a new bundle path on each rerun instead of overwriti
 
 The repository holds 35 raw specs: one for each vendor integration except Vanta, plus one for the compute backends. Each remains useful as a design record and build input. Browse them under [`/specs`](/specs) or read [Using Specs as Inputs](/docs/specs/using-specs-as-inputs/).
 
-`0.0.1` remains experimental. macOS and Linux are the recommended platforms. Windows support is best-effort.
+grclanker is still early: expect breaking changes between minor versions before 1.0. macOS and Linux are the recommended platforms. Windows support is best-effort.

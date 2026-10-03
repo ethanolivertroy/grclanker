@@ -11,7 +11,7 @@ If you want the fast path, do this in order. For Windows notes, pinned versions,
 curl -fsSL https://grclanker.com/install | bash
 ```
 
-This installs the newest release bundle, currently the `v0.0.1` pre-release with the CMVP and KEV/EPSS tools. The platform integrations, `grclanker tools`, and `grclanker flue run` are on `main` only for now; to use them, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
+This installs the newest release bundle, currently `v0.1.0`, with all 241 domain tools, `grclanker tools`, and `grclanker flue run`. To run unreleased changes from `main` instead, [install from source](/docs/getting-started/installation#install-from-source) and `npm link` it so the `grclanker` commands below run that build.
 
 ## 2. Prepare the local-first path
 
@@ -49,16 +49,16 @@ grclanker assess
 grclanker validate
 ```
 
-On a source install, a workflow command also takes its subject, and a quoted prompt goes straight to the agent:
+A workflow command also takes its subject, and a quoted prompt goes straight to the agent:
 
 ```bash
 grclanker investigate "CVE-2024-3094"
 grclanker "Is CVE-2024-3400 in the CISA KEV catalog?"
 ```
 
-The `v0.0.1` bundle does not take either form. There, name the vendor, product, CVE, or framework in the session once it opens.
+The older `v0.0.1` bundle does not take either form. There, name the vendor, product, CVE, or framework in the session once it opens.
 
-On a source install, list the full tool surface first:
+List the full tool surface first:
 
 ```bash
 grclanker tools
@@ -76,16 +76,16 @@ Is CVE-2024-3400 in the CISA KEV catalog, and what is its EPSS score?
 Which vulnerabilities were added to the CISA KEV catalog in the last 30 days?
 ```
 
-Both are answered by the KEV and EPSS tools (`kevs_search`, `kevs_get_epss`, `kevs_recent`), which ship in the `v0.0.1` bundle and on `main`.
+Both are answered by the KEV and EPSS tools (`kevs_search`, `kevs_get_epss`, `kevs_recent`), which ship in every release bundle.
 
 ## 5. Review or extend a shipped integration
 
-This step needs a source checkout, because the integration tools and the `specs/` directory are not in the `v0.0.1` bundle. Start `grclanker` from the repository root and ask:
+This step needs a source checkout, because the release bundle does not include the `specs/` directory. Start `grclanker` from the repository root and ask:
 
 ```text
 Read specs/aws-sec-inspector.spec.md, inspect the shipped AWS tools, and propose an extension.
 ```
 
-`main` ships 35 integrations, and most have a spec under `specs/`. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
+grclanker ships 35 integrations, and most have a spec under `specs/`. Use a spec to inspect coverage, plan a change, or seed an independent implementation.
 
 The Pi terminal CLI is the default path. A source checkout can also run the same domain tools through the [Cursor Agent SDK](/docs/getting-started/agent-sdk/) or [Flue](/docs/getting-started/flue-runtime/).
