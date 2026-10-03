@@ -6,6 +6,7 @@ import { formatSystemResources, resolveComputeBackend } from "../../pi/compute.j
 import { readGrclankerSettings } from "../../pi/settings.js";
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const SEGMENT_SEPARATOR = " · ";
 
 const WORKFLOW_DESCRIPTIONS = [
   {
@@ -154,6 +155,17 @@ async function buildAgentCatalogSummary(): Promise<string[]> {
   return ["auditor", "verifier"];
 }
 
+/**
+ * Pi joins separate extension statuses with a bare space, so grclanker
+ * publishes its footer segments as one status joined here.
+ */
+export function formatGrclankerStatus(segments: ReadonlyArray<string>): string {
+  return segments
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .join(SEGMENT_SEPARATOR);
+}
+
 export async function installGrclankerHeader(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -241,7 +253,7 @@ export async function installGrclankerHeader(
         leftLines.push("");
         pushLabeled("system", resources, "dim");
         leftLines.push("");
-        leftLines.push(theme.fg("dim", `${toolCount} tools · ${agents.length} agents`));
+        leftLines.push(theme.fg("dim", `${toolCount} tools${SEGMENT_SEPARATOR}${agents.length} agents`));
         leftLines.push("");
         leftLines.push(theme.fg("accent", theme.bold("Agents")));
         for (const line of wrapWords(agents.join(", "), leftW)) {
@@ -275,7 +287,7 @@ export async function installGrclankerHeader(
         push(row(`${theme.fg("dim", "session".padEnd(10))} ${theme.fg("dim", truncateVisible(sessionId, contentW - 11))}`));
         push(emptyRow());
         push(row(theme.fg("dim", truncateVisible(resources, contentW))));
-        push(row(theme.fg("dim", `${toolCount} tools · ${agents.length} agents`)));
+        push(row(theme.fg("dim", `${toolCount} tools${SEGMENT_SEPARATOR}${agents.length} agents`)));
         push(emptyRow());
         push(row(theme.fg("accent", theme.bold("GRC Workflows"))));
         for (const workflow of WORKFLOW_DESCRIPTIONS) {
