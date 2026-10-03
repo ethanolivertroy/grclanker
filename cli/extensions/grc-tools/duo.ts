@@ -2010,7 +2010,7 @@ export class DuoAuditorClient {
       Authorization: authorization,
       Date: date,
       Host: this.config.apiHost,
-      "User-Agent": "grclanker/0.0.1 duo-audit",
+      "User-Agent": "grclanker/0.1.0 duo-audit",
     };
 
     if (method !== "GET" && body.length > 0) {
