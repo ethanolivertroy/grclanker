@@ -38,6 +38,7 @@ node cli/bin/grclanker.js tools
 - `grclanker "<prompt>"` sends a free-form prompt, and `grclanker investigate <subject>` (or `audit`, `assess`, `validate`) starts a workflow with its subject filled in. Inside a session, `/investigate <subject>` does the same.
 - `--compute <kind>` picks a compute backend for one prompt or workflow run, and `grclanker setup --compute <kind>` saves a default. `--` passes the rest of the line through literally.
 - New commands: `grclanker tools`, `grclanker flue run`, and `grclanker env list`.
+- Runs on Pi 1.0: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.0.0, up from 0.65 in `v0.0.1`. The terminal UI now opens fullscreen. To keep your terminal's normal scrollback, add `"tuiMode": "regular"` to `~/.grclanker/agent/settings.json`.
 
 ### Runtimes
 
