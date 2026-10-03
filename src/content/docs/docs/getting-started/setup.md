@@ -112,7 +112,7 @@ grclanker env smoke-test
 
 If you need the backend-specific details, use the dedicated [Compute Backends](/docs/getting-started/compute-backends/) guide.
 
-The `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`; its wizard offers `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. A source checkout (`npm --prefix cli ci && npm --prefix cli run build`, then `node cli/bin/grclanker.js setup`) has the full list.
+The older `v0.0.1` release bundle predates the Modal and RunPod backends and `setup --compute`; its wizard offers only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`. Rerun the installer to get `v0.1.0` and the full list.
 
 ## Skill visibility
 
@@ -140,4 +140,4 @@ You can rerun setup at any time:
 grclanker setup
 ```
 
-That is the supported way to switch between local-first and hosted mode in `0.0.1`.
+That is the supported way to switch between local-first and hosted mode.

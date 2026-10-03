@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   ReleaseError,
   createGitHubClient,
+  isPrereleaseTag,
   loadReleaseAssets,
   preflightRelease,
   publishRelease,
@@ -219,22 +220,25 @@ function writeAssets(files) {
   return dir;
 }
 
-function setup(t, { pageSize } = {}) {
+function setup(t, { pageSize, tag = TAG } = {}) {
   const dir = writeAssets({
     "grclanker-1.2.3-linux-x64.tar.gz": "linux archive bytes",
     "grclanker-1.2.3-win32-x64.zip": "windows archive bytes",
   });
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const github = new FakeGitHub({ pageSize });
+  if (tag !== TAG) {
+    github.refs.set(tag, { type: "commit", sha: COMMIT });
+  }
   const client = createGitHubClient({ token: "test-token", repo: REPO, fetchImpl: github.fetch });
   const assets = loadReleaseAssets(dir);
   const logs = [];
   const run = () =>
     publishRelease({
       client,
-      tag: TAG,
+      tag,
       sha: COMMIT,
-      name: `GRC Clanker ${TAG} (Experimental)`,
+      name: `GRC Clanker ${tag}`,
       notes: "notes",
       assets,
       log: (message) => logs.push(message),
@@ -263,7 +267,8 @@ test("publishes one new release with exactly the verified assets", async (t) => 
 
   const release = github.release(id);
   assert.equal(release.draft, false);
-  assert.equal(release.prerelease, true);
+  assert.equal(release.prerelease, false);
+  assert.equal(release.make_latest, "true");
   assert.equal(release.tag_name, TAG);
   assert.equal(htmlUrl, release.html_url);
   assert.deepEqual(
@@ -271,6 +276,8 @@ test("publishes one new release with exactly the verified assets", async (t) => 
     assets.map((asset) => `${asset.name} sha256:${asset.digest}`).sort(),
   );
   assert.equal(github.lastCreate.draft, true);
+  assert.equal(github.lastCreate.prerelease, false);
+  assert.equal(github.lastCreate.make_latest, "false", "the draft is not marked latest before its assets are verified");
   assert.equal(github.lastCreate.target_commitish, COMMIT);
   assert.equal(github.count("DELETE", /./), 0);
 
@@ -287,6 +294,27 @@ test("publishes one new release with exactly the verified assets", async (t) => 
     assert.equal(req.headers.Authorization, "Bearer test-token");
     assert.equal(req.headers["X-GitHub-Api-Version"], "2022-11-28");
   }
+});
+
+test("a tag with a prerelease suffix publishes a prerelease that is never marked latest", async (t) => {
+  const { github, run } = setup(t, { tag: "v1.2.3-rc.1" });
+  const { id } = await run();
+  const release = github.release(id);
+  assert.equal(release.tag_name, "v1.2.3-rc.1");
+  assert.equal(release.draft, false);
+  assert.equal(release.prerelease, true);
+  assert.equal(release.make_latest, "false");
+  assert.equal(github.lastCreate.prerelease, true);
+});
+
+test("post-publish verification catches a prerelease turned into a full release", async (t) => {
+  const { github, run } = setup(t, { tag: "v1.2.3-rc.1" });
+  github.after = (req, gh) => {
+    if (req.method === "PATCH") {
+      gh.release(Number(req.path.split("/").at(-1))).prerelease = false;
+    }
+  };
+  await rejectsWith(run(), /was published but failed post-publish verification[\s\S]*prerelease=true/);
 });
 
 test("encodes asset names in the upload query and uses the GHES upload path", async () => {
@@ -577,8 +605,8 @@ const POST_PUBLISH_MUTATIONS = {
   "the release turned back into a draft": (gh, release) => {
     release.draft = true;
   },
-  "the prerelease flag cleared": (gh, release) => {
-    release.prerelease = false;
+  "the release turned into a prerelease": (gh, release) => {
+    release.prerelease = true;
   },
   "the tag moved": (gh) => {
     gh.refs.set(TAG, { type: "commit", sha: OTHER_COMMIT });
@@ -631,6 +659,9 @@ test("rejects malformed tags, repositories, tokens, API URLs, and commits", asyn
     assert.throws(() => validateTag(tag), ReleaseError, tag);
   }
   assert.equal(validateTag("v1.2.3-rc.1"), "v1.2.3-rc.1");
+  assert.equal(isPrereleaseTag("v1.2.3-rc.1"), true);
+  assert.equal(isPrereleaseTag("v0.1.0"), false);
+  assert.throws(() => isPrereleaseTag("latest"), ReleaseError);
   for (const repo of ["owner", "owner/repo/extra", "../repo", "owner/re po"]) {
     assert.throws(() => validateRepo(repo), ReleaseError, repo);
   }

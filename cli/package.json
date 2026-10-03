@@ -1,6 +1,6 @@
 {
   "name": "@grclanker/cli",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "description": "Experimental local-first GRC CLI for CMVP, KEV, EPSS, and framework-mapped posture work",
   "license": "Apache-2.0",

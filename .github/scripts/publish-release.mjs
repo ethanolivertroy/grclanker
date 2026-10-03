@@ -30,6 +30,12 @@ export function validateTag(tag) {
   return tag;
 }
 
+// A tag with a -PRERELEASE suffix publishes as a prerelease; a plain vMAJOR.MINOR.PATCH
+// tag publishes as a full release and becomes the repository's latest release.
+export function isPrereleaseTag(tag) {
+  return validateTag(tag).includes("-");
+}
+
 export function validateRepo(repo) {
   if (typeof repo !== "string" || !REPO_PATTERN.test(repo)) {
     fail(`Repository ${JSON.stringify(repo)} is not an owner/name pair`);
@@ -269,7 +275,7 @@ export function createGitHubClient({ apiUrl = "https://api.github.com", token, r
           name,
           body: notes,
           draft: true,
-          prerelease: true,
+          prerelease: isPrereleaseTag(tag),
           make_latest: "false",
         },
       });
@@ -288,11 +294,12 @@ export function createGitHubClient({ apiUrl = "https://api.github.com", token, r
       url.searchParams.set("name", assetName);
       return (await request("POST", url, { expect: 201, bytes })).data;
     },
-    async publish(id) {
+    async publish(id, tag) {
+      const prerelease = isPrereleaseTag(tag);
       return (
         await request("PATCH", apiUrlFor(`/releases/${id}`), {
           expect: 200,
-          json: { draft: false, prerelease: true, make_latest: "false" },
+          json: { draft: false, prerelease, make_latest: prerelease ? "false" : "true" },
         })
       ).data;
     },
@@ -307,14 +314,15 @@ function assetSignature(asset) {
 }
 
 function assertReleaseFields(release, { id, tag, draft }) {
-  if (!release || release.id !== id || release.tag_name !== tag || release.draft !== draft || release.prerelease !== true) {
+  const prerelease = isPrereleaseTag(tag);
+  if (!release || release.id !== id || release.tag_name !== tag || release.draft !== draft || release.prerelease !== prerelease) {
     fail(
       `Release ${id} is ${JSON.stringify({
         id: release?.id,
         tag_name: release?.tag_name,
         draft: release?.draft,
         prerelease: release?.prerelease,
-      })}, expected tag ${tag}, draft=${draft}, prerelease=true`,
+      })}, expected tag ${tag}, draft=${draft}, prerelease=${prerelease}`,
     );
   }
 }
@@ -404,7 +412,7 @@ export async function publishRelease({ client, tag, sha, name, notes, assets, lo
 
   let published;
   try {
-    published = await client.publish(id);
+    published = await client.publish(id, tag);
     if (published?.id !== id || published?.draft !== false) {
       fail(`Publishing release ${id} did not return it as published`);
     }

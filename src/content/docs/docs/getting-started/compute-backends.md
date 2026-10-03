@@ -7,7 +7,7 @@ grclanker separates model choice from execution environment on purpose.
 
 That part is similar to how Feynman presents model/provider setup separately from compute choices. The difference is that grclanker does not stop at a badge. Use `env doctor` and `env smoke-test` to verify the selected backend can actually execute the tool surface you expect.
 
-This page describes the CLI on `main`. The `v0.0.1` release bundle ships only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`, plus `env doctor`, `env smoke-test`, and `env exec`; `env list`, `setup --compute`, per-run `--compute`, compute profiles, and the Modal and RunPod backends need a source checkout (`npm --prefix cli ci && npm --prefix cli run build`, then `node cli/bin/grclanker.js env list`).
+This page describes the `v0.1.0` release and `main`. The older `v0.0.1` bundle ships only `host`, `sandbox-runtime`, `docker`, and `parallels-vm`, plus `env doctor`, `env smoke-test`, and `env exec`; `env list`, `setup --compute`, per-run `--compute`, compute profiles, and the Modal and RunPod backends arrived in `v0.1.0`.
 
 ## What a compute backend controls
 

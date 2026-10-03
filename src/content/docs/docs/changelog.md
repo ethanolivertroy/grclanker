@@ -1,25 +1,23 @@
 ---
 title: What's New
-description: What the next grclanker release contains, and what shipped in v0.0.1.
+description: What shipped in grclanker v0.1.0 and v0.0.1.
 ---
 
-## Next release (unreleased)
+## v0.1.0 (October 3, 2026)
 
-Everything in this section is on the `main` branch and is not in the `v0.0.1` bundle. The one-line installer still ships `v0.0.1` until the next release is published. To run this work today, build from source with Node.js 22.19 or newer:
+The first full release, and the first bundle since `v0.0.1` (an experimental prerelease). The one-line installer now ships everything below. Install or upgrade with:
 
 ```bash
-git clone https://github.com/ethanolivertroy/grclanker.git
-cd grclanker
-npm --prefix cli ci
-npm --prefix cli run build
-node cli/bin/grclanker.js tools
+curl -fsSL https://grclanker.com/install | bash
+grclanker tools
 ```
 
-`grclanker tools` should report `241 domain tools + 7 compute backend tools`. See [Installation](/docs/getting-started/installation/#install-from-source) for linking and bundle builds.
+`grclanker tools` should report `241 domain tools + 7 compute backend tools`. See [Installation](/docs/getting-started/installation/) for Windows, pinned versions, and source checkouts.
 
 ### Tools and integrations
 
-- 241 domain tools, up from 8 in `v0.0.1`. The [tool catalog](/docs/tools/catalog/) lists them by domain.
+- 241 native domain tools, up from 8 in `v0.0.1`. The [tool catalog](/docs/tools/catalog/) lists them by domain.
+- Two batches of spec-driven integrations: batch 1 added Box, CrowdStrike Falcon, Datadog, Elastic, KnowBe4, LaunchDarkly, MuleSoft, PagerDuty, Palo Alto Networks, Salesforce, ServiceNow, Snowflake, Splunk, Sumo Logic, Tenable, Veracode, and Zendesk, and batch 2 added New Relic, Qualys, and Zscaler.
 - 35 vendor integrations with native checks, assessments, or evidence exports, each with an [integration guide](/docs/integrations/aws/):
   - Cloud: AWS, Azure, Google Cloud, Oracle Cloud Infrastructure, Cloudflare
   - Identity: Okta, Duo, Google Workspace, and the Google Workspace CLI operator bridge
@@ -39,6 +37,8 @@ node cli/bin/grclanker.js tools
 - `--compute <kind>` picks a compute backend for one prompt or workflow run, and `grclanker setup --compute <kind>` saves a default. `--` passes the rest of the line through literally.
 - New commands: `grclanker tools`, `grclanker flue run`, and `grclanker env list`.
 - Runs on Pi 1.0: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.0.0, up from 0.65 in `v0.0.1`. The terminal UI now opens fullscreen. To keep your terminal's normal scrollback, add `"tuiMode": "regular"` to `~/.grclanker/agent/settings.json`.
+- The session header counts the tools the agent can call (248: 241 domain tools and 7 compute tools).
+- The footer status line separates its segments with ` · `, so the compute backend and the tool count no longer run together (`compute: bash runs directly on the local host shell · 241 domain tools ready`).
 
 ### Runtimes
 
@@ -49,7 +49,7 @@ node cli/bin/grclanker.js tools
 ### Specs
 
 - The repository holds 35 specs: one for every vendor integration except Vanta, plus one for the compute backends. v0.0.1 carried 32 `spec-only` roadmap specs with no native tools behind them.
-- 11 specs are generated from the executable tool registry: AWS, Webex, Okta, Duo, Google Workspace, Slack, Zoom, Box, Zendesk, Salesforce, and ServiceNow. A generated shared integration contract sits beside them, and CI fails when a generated spec drifts from the code.
+- 17 specs are generated from the executable tool registry: AWS and Webex first, then two batches, identity and collaboration (Okta, Duo, Google Workspace, Slack, Zoom, Box, Zendesk, Salesforce, ServiceNow) and cloud and network (Azure, Google Cloud, Oracle Cloud Infrastructure, Cloudflare, Palo Alto Networks, Zscaler). A generated shared integration contract sits beside them, and CI fails when a generated spec drifts from the code.
 - Browse every spec at [/specs](/specs) or read [Using Specs as Inputs](/docs/specs/using-specs-as-inputs/).
 
 ### Security and hardening
@@ -65,7 +65,8 @@ node cli/bin/grclanker.js tools
 
 ### Release and CI
 
-- Release bundles for six platforms are reproducible: fixed archive timestamps and ordering, a strict `SHA256SUMS.txt` check, GitHub build provenance attestations, and a publisher that refuses to overwrite an existing release.
+- Release bundles for six platforms (macOS, Linux, and Windows, each on arm64 and x64) are reproducible: fixed archive timestamps and ordering, a strict `SHA256SUMS.txt` check, GitHub build provenance attestations, and a publisher that refuses to overwrite an existing release.
+- A plain version tag such as `v0.1.0` publishes a full release marked as the latest; a tag with a suffix such as `v0.2.0-rc.1` still publishes an experimental prerelease.
 - Every pull request runs the CLI tests, TypeScript checks, the credential leak probe, the generated-spec drift check, Agent SDK registry validation, and the site build. Dependency review runs on pull requests, and Dependabot keeps pinned GitHub Actions current.
 - The FedRAMP sync workflow pins its actions, drops persisted credentials, and runs the tests before it opens a pull request.
 
@@ -84,7 +85,7 @@ node cli/bin/grclanker.js tools
 
 - Source installs need Node.js 22.19 or newer, up from 20.19. The release bundle carries its own Node.js runtime.
 
-Full history: [v0.0.1...main](https://github.com/ethanolivertroy/grclanker/compare/v0.0.1...main).
+Full history: [v0.0.1...v0.1.0](https://github.com/ethanolivertroy/grclanker/compare/v0.0.1...v0.1.0). [Release notes and bundles](https://github.com/ethanolivertroy/grclanker/releases/tag/v0.1.0).
 
 ## v0.0.1 (April 6, 2026)
 
