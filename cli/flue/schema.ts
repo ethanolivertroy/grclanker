@@ -2,8 +2,9 @@
  * JSON Schema to Valibot conversion for the Flue adapter boundary.
  *
  * grclanker's native tools declare their parameters as TypeBox JSON Schema,
- * and Pi's tool loop runs each tool's `prepareArguments` shim and then checks
- * the result against that schema without coercion. Flue's `defineTool()`
+ * and Pi's tool loop runs each tool's `prepareArguments` shim, treats `null`
+ * for an optional property that does not accept it as omitted, and then checks
+ * the result against that schema. Flue's `defineTool()`
  * requires a Valibot top-level object schema and renders the model-facing JSON
  * Schema back out of it with `@valibot/to-json-schema`. This module bridges
  * the two without touching the tool definitions: the converted schema renders
@@ -210,27 +211,67 @@ export function jsonSchemaToValibot(schema: unknown): v.GenericSchema {
   return withAnnotations(node, convertNode(node));
 }
 
-function prepareArgumentsStep(toolName: string, prepare: PrepareToolArguments) {
-  return v.rawTransform<Record<string, unknown>, unknown>(({ dataset, addIssue }) => {
-    try {
-      return prepare(dataset.value);
-    } catch (error) {
-      addIssue({
-        message: `${toolName} could not normalize its arguments: ${error instanceof Error ? error.message : String(error)}`,
-      });
-      return dataset.value;
+const nullAcceptance = new WeakMap<JsonSchemaObject, boolean>();
+
+function acceptsNull(node: JsonSchemaObject): boolean {
+  let accepts = nullAcceptance.get(node);
+  if (accepts === undefined) {
+    accepts = v.is(jsonSchemaToValibot(node), null);
+    nullAcceptance.set(node, accepts);
+  }
+  return accepts;
+}
+
+/** Pi's `normalizeOptionalNulls`, without mutating the caller's value. */
+function withoutOptionalNulls(value: unknown, schema: unknown): unknown {
+  const node = asSchemaObject(schema);
+  if (!node) return value;
+  if (Array.isArray(value)) {
+    const items = node.items;
+    return value.map((item, index) => withoutOptionalNulls(item, Array.isArray(items) ? items[index] : items));
+  }
+  const properties = asSchemaObject(node.properties);
+  if (!properties || !value || typeof value !== "object") return value;
+
+  const required = new Set(asStringArray(node.required));
+  const result: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+  for (const [key, property] of Object.entries(properties)) {
+    if (!(key in result)) continue;
+    const propertyNode = asSchemaObject(property);
+    if (result[key] === null && !required.has(key) && propertyNode && !acceptsNull(propertyNode)) {
+      delete result[key];
+    } else {
+      result[key] = withoutOptionalNulls(result[key], property);
     }
+  }
+  return result;
+}
+
+function piArgumentsStep(toolName: string, schema: unknown, prepare: PrepareToolArguments | undefined) {
+  return v.rawTransform<Record<string, unknown>, unknown>(({ dataset, addIssue }) => {
+    let prepared: unknown = dataset.value;
+    if (prepare) {
+      try {
+        prepared = prepare(dataset.value);
+      } catch (error) {
+        addIssue({
+          message: `${toolName} could not normalize its arguments: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        return dataset.value;
+      }
+    }
+    return withoutOptionalNulls(prepared, schema);
   });
 }
 
 /**
  * Convert a tool parameter schema into the top-level object schema Flue's
- * `defineTool()` requires. When the Pi tool declares `prepareArguments`, the
- * shim runs before validation exactly as in Pi's tool loop: the leading
- * `v.looseObject({})` only asserts that the model sent an object, the
- * normalized value is then validated by the converted schema, and the whole
- * pipe still renders as the converted schema for the model. Throws when the
- * source is not an object schema.
+ * `defineTool()` requires. The input runs through the same steps as in Pi's
+ * tool loop: the leading `v.looseObject({})` only asserts that the model sent
+ * an object, the tool's `prepareArguments` shim (when declared) normalizes it,
+ * optional `null`s the schema rejects are dropped, and the result is validated
+ * by the converted schema. The whole pipe still renders as the converted
+ * schema for the model. Throws when the source is not an object schema.
  */
 export function jsonSchemaToToolInput(
   schema: unknown,
@@ -243,8 +284,7 @@ export function jsonSchemaToToolInput(
       `Tool "${toolName}" parameters must be a JSON Schema object (got type "${String(asSchemaObject(schema)?.type)}").`,
     );
   }
-  if (!prepareArguments) return converted as ToolInputSchema;
-  return v.pipe(v.looseObject({}), prepareArgumentsStep(toolName, prepareArguments), converted) as ToolInputSchema;
+  return v.pipe(v.looseObject({}), piArgumentsStep(toolName, schema, prepareArguments), converted) as ToolInputSchema;
 }
 
 /** True when a Valibot schema satisfies Flue's top-level object requirement for tool input. */

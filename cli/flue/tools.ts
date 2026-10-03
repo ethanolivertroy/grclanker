@@ -8,7 +8,7 @@
  */
 import type {
   AgentToolResult,
-  ExtensionContext,
+  ExtensionToolContext,
   ToolDefinition as PiToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition as FlueToolDefinition } from "@flue/runtime";
@@ -44,7 +44,7 @@ export class GrclankerToolError extends Error {
 
 // grclanker's domain tools never read the Pi extension context (they only use
 // `toolCallId` and `params`), so the bridge hands them an inert placeholder.
-const DETACHED_EXTENSION_CONTEXT = Object.freeze({}) as unknown as ExtensionContext;
+const DETACHED_EXTENSION_CONTEXT = Object.freeze({}) as unknown as ExtensionToolContext;
 
 export function renderPiToolContent(content: PiBridgeToolResult["content"]): string {
   return content
