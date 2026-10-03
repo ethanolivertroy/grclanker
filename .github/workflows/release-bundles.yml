@@ -68,11 +68,13 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout release scripts
+      - name: Checkout release scripts and notes
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            .github/release-notes
           sparse-checkout-cone-mode: false
 
       - name: Set up Node
@@ -126,12 +128,19 @@ jobs:
         run: node .github/scripts/publish-release.mjs preflight --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA"
 
       - name: Write release notes
+        id: notes
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$VERSION" == *-* ]]; then
+            intro="Experimental prerelease of grclanker ${VERSION}, built from tag \`${GITHUB_REF_NAME}\` by the \`release-bundles\` workflow."
+            echo "name=GRC Clanker ${GITHUB_REF_NAME} (Experimental)" >> "$GITHUB_OUTPUT"
+          else
+            intro="grclanker ${VERSION}, built from tag \`${GITHUB_REF_NAME}\` by the \`release-bundles\` workflow."
+            echo "name=GRC Clanker ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+          highlights=".github/release-notes/${GITHUB_REF_NAME}.md"
           template="$(cat <<'NOTES'
-          Experimental prerelease of grclanker @VERSION@, built from tag `@TAG@` by the `release-bundles` workflow.
-
           ## Install
 
           macOS / Linux:
@@ -197,6 +206,11 @@ jobs:
           notes="${notes//@TAG@/$GITHUB_REF_NAME}"
           notes="${notes//@REPO@/$GITHUB_REPOSITORY}"
           {
+            printf '%s\n\n' "$intro"
+            if [ -f "$highlights" ]; then
+              cat "$highlights"
+              printf '\n'
+            fi
             printf '%s\n' "$notes"
             cat release/SHA256SUMS.txt
             printf '%s\n\n' '```'
@@ -211,11 +225,12 @@ jobs:
       - name: Create, verify, and publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_NAME: ${{ steps.notes.outputs.name }}
         run: |
           node .github/scripts/publish-release.mjs publish \
             --repo "$GITHUB_REPOSITORY" \
             --tag "$GITHUB_REF_NAME" \
             --sha "$GITHUB_SHA" \
-            --name "GRC Clanker $GITHUB_REF_NAME (Experimental)" \
+            --name "$RELEASE_NAME" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --assets-dir release
