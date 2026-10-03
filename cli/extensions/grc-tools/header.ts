@@ -165,7 +165,8 @@ export async function installGrclankerHeader(
   cache.agentsPromise ??= buildAgentCatalogSummary();
   const agents = await cache.agentsPromise;
 
-  const toolCount = pi.getAllTools().length;
+  // getAllTools() also lists registered tools the model never sees, such as Pi's inactive codemode and tool_search.
+  const toolCount = pi.getActiveTools().length;
   const modelLabel = getCurrentModelLabel(ctx);
   const sessionId = ctx.sessionManager.getSessionName()?.trim() || ctx.sessionManager.getSessionId();
   const dirLabel = formatHeaderPath(ctx.cwd);
