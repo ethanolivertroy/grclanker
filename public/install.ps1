@@ -109,11 +109,28 @@ function Find-LocalAsset([string]$Target, [string]$ArchiveExt, [string]$VersionF
   return $null
 }
 
+# "latest" means the newest full release that carries a bundle for this target.
+# Prereleases (vX.Y.Z-rc.N) and asset-less releases such as specs-v2 are skipped.
 function Resolve-LatestReleaseAsset([string]$Target, [string]$ArchiveExt) {
+  $release = Resolve-LatestReleaseAssetFromApi -Target $Target -ArchiveExt $ArchiveExt
+  if ($release) {
+    return $release
+  }
+  return Resolve-LatestReleaseAssetFromRedirect -Target $Target -ArchiveExt $ArchiveExt
+}
+
+function Resolve-LatestReleaseAssetFromApi([string]$Target, [string]$ArchiveExt) {
   $uri = "https://api.github.com/repos/$RepoOwner/$RepoName/releases?per_page=30"
-  $releases = Invoke-RestMethod -Uri $uri
+  try {
+    $releases = Invoke-RestMethod -Uri $uri
+  } catch {
+    return $null
+  }
 
   foreach ($release in $releases) {
+    if ($release.draft -or $release.prerelease) {
+      continue
+    }
     $asset = $release.assets | Where-Object { $_.name -like "grclanker-*-$Target.$ArchiveExt" } | Select-Object -First 1
     if ($asset) {
       return @{
@@ -125,6 +142,33 @@ function Resolve-LatestReleaseAsset([string]$Target, [string]$ArchiveExt) {
   }
 
   return $null
+}
+
+# The unauthenticated GitHub API allows 60 requests an hour per IP, which shared
+# networks exhaust. The /releases/latest page redirect is not rate limited and
+# points at the release the release-bundles workflow marked latest.
+function Resolve-LatestReleaseAssetFromRedirect([string]$Target, [string]$ArchiveExt) {
+  try {
+    $response = Invoke-WebRequest -Uri "https://github.com/$RepoOwner/$RepoName/releases/latest" -Method Head -UseBasicParsing
+  } catch {
+    return $null
+  }
+
+  # Windows PowerShell 5.1 exposes the final URL as ResponseUri; PowerShell 7 as RequestMessage.RequestUri.
+  $base = $response.BaseResponse
+  $latestUrl = if ($base.ResponseUri) { $base.ResponseUri.AbsoluteUri } elseif ($base.RequestMessage) { $base.RequestMessage.RequestUri.AbsoluteUri } else { "" }
+  if ($latestUrl -notmatch "/releases/tag/(v[^/?#]+)$") {
+    return $null
+  }
+
+  $tag = $Matches[1]
+  $version = Normalize-Version $tag
+  $assetName = "grclanker-$version-$Target.$ArchiveExt"
+  return @{
+    Version = $version
+    AssetName = $assetName
+    AssetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/$assetName"
+  }
 }
 
 function Get-Target {
