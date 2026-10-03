@@ -35,7 +35,7 @@ import { registerGitHubTools } from "./grc-tools/github.js";
 import { registerGcpTools } from "./grc-tools/gcp.js";
 import { registerGwsTools } from "./grc-tools/gws.js";
 import { registerGwsOperatorTools } from "./grc-tools/gws-ops.js";
-import { installGrclankerHeader } from "./grc-tools/header.js";
+import { formatGrclankerStatus, installGrclankerHeader } from "./grc-tools/header.js";
 import { registerKevsTools } from "./grc-tools/kevs.js";
 import { registerKnowbe4Tools } from "./grc-tools/knowbe4.js";
 import { registerLaunchdarklyTools } from "./grc-tools/launchdarkly.js";
@@ -289,12 +289,14 @@ export default function grcTools(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
     ctx.ui.setTitle?.("grclanker");
-    ctx.ui.setStatus?.("grclanker", `${domainToolCount} domain tools ready`);
     ctx.ui.setWorkingMessage?.("Correlating evidence...");
     ctx.ui.setHiddenThinkingLabel?.("GRC analysis");
     const settings = getSettings();
     const execution = getExecution();
-    ctx.ui.setStatus?.("compute", `compute: ${execution.summary}`);
+    ctx.ui.setStatus?.("grclanker", formatGrclankerStatus([
+      `compute: ${execution.summary}`,
+      `${domainToolCount} domain tools ready`,
+    ]));
     for (const issue of getComputeBackendConfigurationIssues(settings, execution.kind)) {
       ctx.ui.notify(`Compute backend warning: ${issue}`, "warning");
     }
