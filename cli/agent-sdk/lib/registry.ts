@@ -1,4 +1,4 @@
-import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { collectRegisteredToolDefinitions, resolveToolGroup } from "../../pi/tool-catalog.js";
 
 export type GrcToolContent =
@@ -35,7 +35,7 @@ function toRegisteredGrcTool(tool: ToolDefinition): RegisteredGrcTool {
   // Pi itself passes `undefined` for the extension context when no context
   // factory is configured (see pi-coding-agent's wrapToolDefinition), and no
   // grclanker domain tool reads it.
-  const extensionContext = undefined as unknown as ExtensionContext;
+  const extensionContext = undefined as unknown as ExtensionToolContext;
 
   return {
     name: tool.name,

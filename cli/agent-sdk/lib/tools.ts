@@ -71,7 +71,7 @@ export function prepareGrcToolArguments(tool: RegisteredGrcTool, toolCallId: str
     type: "toolCall",
     id: toolCallId,
     name: tool.name,
-    arguments: prepared as Record<string, unknown>,
+    arguments: prepared as ToolCall["arguments"],
   };
   return validateToolArguments(piTool, toolCall) as unknown;
 }
