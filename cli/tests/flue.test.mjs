@@ -62,6 +62,7 @@ import {
 } from "../dist/flue/redact.js";
 import { formatFlueHelp, formatFlueRunOutcome, parseFlueRunArgs, runFlueCommand } from "../dist/flue/cli.js";
 import {
+  asFlueProvider,
   createCustomProvider,
   listCustomProviderConfigs,
   localProviderConfigFromSettings,
@@ -98,7 +99,7 @@ const BASELINE_DOMAIN_TOOL_COUNT = 219;
 const DOMAIN_TOOL_COUNT = getRegisteredToolSummaries().filter((tool) => tool.kind === "domain").length;
 assert.ok(DOMAIN_TOOL_COUNT >= BASELINE_DOMAIN_TOOL_COUNT, `registry shrank below ${BASELINE_DOMAIN_TOOL_COUNT} tools`);
 
-// The Pi CLI's own argument validation (pi-ai 0.80.2, the copy the CLI runs),
+// The Pi CLI's own argument validation (pi-ai 1.0, the copy the CLI runs),
 // used as the oracle the adapter is compared against.
 const { validateToolArguments: piCliValidate } = await import(
   pathToFileURL(resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"))), "utils/validation.js")).href
@@ -201,7 +202,18 @@ test("schema conversion mirrors TypeBox tool parameters in Valibot", () => {
   assert.ok(aliased.success);
   assert.equal(aliased.output.cve, "CVE-2024-1", "unknown keys survive for prepareArguments shims");
 
-  const property = schema.entries.limit;
+  // Pi 1.0 treats null for an optional property that rejects null as omitted, and so does the adapter.
+  const omitted = v.safeParse(schema, { query: "x", limit: null, ids: null });
+  assert.ok(omitted.success);
+  assert.deepEqual(omitted.output, { query: "x" });
+  assert.equal(v.safeParse(schema, { query: null }).success, false, "a required null is still rejected");
+  const nullable = jsonSchemaToToolInput(
+    Type.Object({ note: Type.Optional(Type.Union([Type.String(), Type.Null()])) }),
+    "nullable_probe",
+  );
+  assert.deepEqual(v.safeParse(nullable, { note: null }).output, { note: null }, "a nullable optional keeps its null");
+
+  const property = schema.pipe.at(-1).entries.limit;
   assert.equal(property.type, "optional");
   assert.ok(Array.isArray(property.wrapped.pipe), "annotations are carried as pipe metadata");
   const metadata = property.wrapped.pipe.find((item) => item.type === "metadata");
@@ -1659,6 +1671,36 @@ test("custom providers build Pi Provider objects with Pi's models.json defaults"
     providerIds: [],
     warnings: [],
   });
+});
+
+test("providers handed to Flue fold its systemPrompt and tools into the pi-ai 1.0 transcript", () => {
+  const seen = [];
+  const capture = (kind) => (model, context, options) => {
+    seen.push({ kind, context, options });
+    return "stream";
+  };
+  const provider = asFlueProvider({ id: "probe", getModels: () => [], stream: capture("stream"), streamSimple: capture("streamSimple") });
+  const tool = { name: "kevs_search", description: "Search KEV.", parameters: Type.Object({ query: Type.String() }) };
+  const user = { role: "user", content: "hi", timestamp: 1 };
+
+  assert.equal(provider.id, "probe");
+  assert.equal(provider.stream({ id: "m" }, { systemPrompt: "You are GRC Clanker.", tools: [tool], messages: [user] }, { temperature: 0 }), "stream");
+  provider.streamSimple({ id: "m" }, { systemPrompt: "You are GRC Clanker.", messages: [user] });
+
+  const [streamed, simple] = seen;
+  assert.equal(streamed.kind, "stream");
+  assert.deepEqual(streamed.options, { temperature: 0 });
+  assert.equal(streamed.context.systemPrompt, undefined);
+  assert.equal(streamed.context.messages[0].role, "system");
+  assert.equal(streamed.context.messages[0].content, "You are GRC Clanker.");
+  assert.deepEqual(streamed.context.messages[0].toolsAdded.map((entry) => entry.name), ["kevs_search"]);
+  assert.deepEqual(streamed.context.messages.slice(1), [user]);
+  assert.equal(simple.kind, "streamSimple");
+  assert.equal(simple.context.messages[0].role, "system");
+
+  const transcript = { messages: [{ role: "system", content: "Already a transcript.", timestamp: 0 }, user] };
+  provider.stream({ id: "m" }, transcript);
+  assert.deepEqual(seen[2].context.messages, transcript.messages, "a transcript passes through unchanged");
 });
 
 test("a local-first grclanker setup runs under Flue through setProvider() against an OpenAI-compatible endpoint", async () => {

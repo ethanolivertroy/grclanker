@@ -7,7 +7,14 @@
  * entries with Pi's own `createProvider()` and hands them to Flue's
  * `setProvider()`.
  */
-import { createProvider, type Api, type Model, type Provider } from "@earendil-works/pi-ai";
+import {
+  createProvider,
+  normalizeContext,
+  type Api,
+  type Context,
+  type Model,
+  type Provider,
+} from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
@@ -41,9 +48,11 @@ export interface CustomProviderConfig {
 
 /**
  * Flue types `setProvider()` against its own nested pi-ai (0.83) while this
- * package builds providers with grclanker's pi-ai (0.80). The static provider
- * contract Flue reads (`id`, `auth.apiKey.resolve()`, `getModels()`, the
- * stream functions) is the same in both; only the declaration files differ.
+ * package builds providers with grclanker's pi-ai (1.0). Flue reads the same
+ * static contract from both (`id`, `auth.apiKey.resolve()`, `getModels()`, the
+ * stream functions), but pi-ai 0.83 hands the stream functions a `Context`
+ * with `systemPrompt` and `tools`, while pi-ai 1.0 streams read both from
+ * transcript system messages. {@link asFlueProvider} bridges the two.
  */
 export type FlueProvider = Parameters<typeof flueSetProvider>[0];
 
@@ -264,7 +273,18 @@ export function registerGrclankerProviders(input: RegisterProvidersInput): Regis
   return { providerIds, warnings };
 }
 
-/** Cross the pi-ai declaration-file boundary described on {@link FlueProvider}. */
+/**
+ * Cross the pi-ai boundary described on {@link FlueProvider}: fold Flue's
+ * `systemPrompt` and `tools` into the leading system message before a request
+ * reaches the pi-ai 1.0 stream functions. Contexts that already are transcripts
+ * pass through unchanged.
+ */
 export function asFlueProvider(provider: Provider): FlueProvider {
-  return provider as unknown as FlueProvider;
+  const bridged: Provider = {
+    ...provider,
+    stream: (model, context, options) => provider.stream(model, normalizeContext(context as Context), options),
+    streamSimple: (model, context, options) =>
+      provider.streamSimple(model, normalizeContext(context as Context), options),
+  };
+  return bridged as unknown as FlueProvider;
 }
