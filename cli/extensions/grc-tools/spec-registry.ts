@@ -7,6 +7,8 @@ import { registerBoxTools } from "./box.js";
 import { BOX_SPEC } from "./box.spec.js";
 import { registerCloudflareTools } from "./cloudflare.js";
 import { CLOUDFLARE_SPEC } from "./cloudflare.spec.js";
+import { registerCrowdstrikeTools } from "./crowdstrike.js";
+import { CROWDSTRIKE_SPEC } from "./crowdstrike.spec.js";
 import { registerDuoTools } from "./duo.js";
 import { DUO_SPEC } from "./duo.spec.js";
 import { registerGcpTools } from "./gcp.js";
@@ -14,18 +16,26 @@ import { GCP_SPEC } from "./gcp.spec.js";
 import { registerGwsTools } from "./gws.js";
 import { GWS_SPEC } from "./gws.spec.js";
 import type { IntegrationSpecContract } from "./spec-model.js";
+import { registerKnowbe4Tools } from "./knowbe4.js";
+import { KNOWBE4_SPEC } from "./knowbe4.spec.js";
 import { registerOciTools } from "./oci.js";
 import { OCI_SPEC } from "./oci.spec.js";
 import { registerOktaTools } from "./okta.js";
 import { OKTA_SPEC } from "./okta.spec.js";
 import { registerPaloaltoTools } from "./paloalto.js";
 import { PALOALTO_SPEC } from "./paloalto.spec.js";
+import { registerQualysTools } from "./qualys.js";
+import { QUALYS_SPEC } from "./qualys.spec.js";
 import { registerSalesforceTools } from "./salesforce.js";
 import { SALESFORCE_SPEC } from "./salesforce.spec.js";
 import { registerServicenowTools } from "./servicenow.js";
 import { SERVICENOW_SPEC } from "./servicenow.spec.js";
 import { registerSlackTools } from "./slack.js";
 import { SLACK_SPEC } from "./slack.spec.js";
+import { registerTenableTools } from "./tenable.js";
+import { TENABLE_SPEC } from "./tenable.spec.js";
+import { registerVeracodeTools } from "./veracode.js";
+import { VERACODE_SPEC } from "./veracode.spec.js";
 import { registerWebexTools } from "./webex.js";
 import { WEBEX_SPEC } from "./webex.spec.js";
 import { registerZendeskTools } from "./zendesk.js";
@@ -68,6 +78,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     registerTools: registerCloudflareTools,
   },
   {
+    contract: CROWDSTRIKE_SPEC,
+    narrativePath: "specs/narratives/crowdstrike.md",
+    outputPath: "specs/crowdstrike-sec-inspector.spec.md",
+    registerTools: registerCrowdstrikeTools,
+  },
+  {
     contract: DUO_SPEC,
     narrativePath: "specs/narratives/duo.md",
     outputPath: "specs/duo-sec-inspector.spec.md",
@@ -84,6 +100,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/gws.md",
     outputPath: "specs/gws-inspector-go.spec.md",
     registerTools: registerGwsTools,
+  },
+  {
+    contract: KNOWBE4_SPEC,
+    narrativePath: "specs/narratives/knowbe4.md",
+    outputPath: "specs/knowbe4-sec-inspector.spec.md",
+    registerTools: registerKnowbe4Tools,
   },
   {
     contract: OCI_SPEC,
@@ -104,6 +126,12 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     registerTools: registerPaloaltoTools,
   },
   {
+    contract: QUALYS_SPEC,
+    narrativePath: "specs/narratives/qualys.md",
+    outputPath: "specs/qualys-sec-inspector.spec.md",
+    registerTools: registerQualysTools,
+  },
+  {
     contract: SALESFORCE_SPEC,
     narrativePath: "specs/narratives/salesforce.md",
     outputPath: "specs/salesforce-sec-inspector.spec.md",
@@ -120,6 +148,18 @@ export const PUBLISHED_INTEGRATION_SPECS: readonly PublishedIntegrationSpec[] = 
     narrativePath: "specs/narratives/slack.md",
     outputPath: "specs/slack-sec-inspector.spec.md",
     registerTools: registerSlackTools,
+  },
+  {
+    contract: TENABLE_SPEC,
+    narrativePath: "specs/narratives/tenable.md",
+    outputPath: "specs/tenable-sec-inspector.spec.md",
+    registerTools: registerTenableTools,
+  },
+  {
+    contract: VERACODE_SPEC,
+    narrativePath: "specs/narratives/veracode.md",
+    outputPath: "specs/veracode-sec-inspector.spec.md",
+    registerTools: registerVeracodeTools,
   },
   {
     contract: WEBEX_SPEC,

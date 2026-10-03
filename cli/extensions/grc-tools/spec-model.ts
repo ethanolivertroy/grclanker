@@ -136,6 +136,9 @@ export type VerdictCondition =
       roundDigits?: number;
     }
   | { op: "matches"; operand: VerdictOperand; pattern: string; flags?: string }
+  | { op: "in"; candidate: VerdictOperand; collection: VerdictOperand }
+  | { op: "intersects"; left: VerdictOperand; right: VerdictOperand }
+  | { op: "matchesAny"; candidates: VerdictOperand; patterns: VerdictOperand; flags?: string }
   | { op: "defined" | "null"; operand: VerdictOperand }
   | { op: "some" | "every"; path: string; condition: VerdictCondition };
 
@@ -166,6 +169,7 @@ export type CompletenessFailureMode =
   | "error"
   | "denied"
   | "not-collected"
+  | "not-configured"
   | "missing-required-field";
 
 export interface CompletenessSourceContract {
@@ -427,6 +431,25 @@ function evaluateCondition(condition: VerdictCondition, facts: VerdictFacts, ite
       const candidate = operandValue(condition.operand, facts, item);
       return typeof candidate === "string" && new RegExp(condition.pattern, condition.flags).test(candidate);
     }
+    case "in": {
+      const collection = operandValue(condition.collection, facts, item);
+      return Array.isArray(collection) && collection.includes(operandValue(condition.candidate, facts, item) as never);
+    }
+    case "intersects": {
+      const left = operandValue(condition.left, facts, item);
+      const right = operandValue(condition.right, facts, item);
+      return Array.isArray(left) && Array.isArray(right) && left.some((entry) => right.includes(entry as never));
+    }
+    case "matchesAny": {
+      const candidateValue = operandValue(condition.candidates, facts, item);
+      const patternValue = operandValue(condition.patterns, facts, item);
+      const candidates = Array.isArray(candidateValue) ? candidateValue : [candidateValue];
+      const patterns = Array.isArray(patternValue) ? patternValue : [patternValue];
+      return candidates.some((candidate) =>
+        typeof candidate === "string"
+        && patterns.some((pattern) =>
+          typeof pattern === "string" && new RegExp(pattern, condition.flags).test(candidate)));
+    }
     case "gt":
     case "gte":
     case "lt":
@@ -521,6 +544,12 @@ export function renderVerdictCondition(condition: VerdictCondition): string {
       return `${renderOperand(condition.left)} does not equal ${renderOperand(condition.right)}`;
     case "matches":
       return `${renderOperand(condition.operand)} matches portable regular expression \`${condition.pattern}\`${condition.flags ? ` with flags \`${condition.flags}\`` : ""}`;
+    case "in":
+      return `${renderOperand(condition.candidate)} occurs in ${renderOperand(condition.collection)}`;
+    case "intersects":
+      return `${renderOperand(condition.left)} and ${renderOperand(condition.right)} share at least one exact value`;
+    case "matchesAny":
+      return `some value in ${renderOperand(condition.candidates)} matches a portable regular expression in ${renderOperand(condition.patterns)}${condition.flags ? ` with flags \`${condition.flags}\`` : ""}`;
     case "gt":
       return `${renderOperand(condition.left)} is greater than ${renderOperand(condition.right)}`;
     case "gte":
@@ -584,6 +613,12 @@ export function verdictConditionPaths(condition: VerdictCondition): string[] {
       return operandPaths(condition.operand);
     case "matches":
       return operandPaths(condition.operand);
+    case "in":
+      return [...operandPaths(condition.candidate), ...operandPaths(condition.collection)];
+    case "intersects":
+      return [...operandPaths(condition.left), ...operandPaths(condition.right)];
+    case "matchesAny":
+      return [...operandPaths(condition.candidates), ...operandPaths(condition.patterns)];
     case "eq":
     case "ne":
     case "gt":
