@@ -19,3 +19,56 @@ updates:
           - "*"
         update-types:
           - "major"
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    versioning-strategy: "increase"
+    ignore:
+      # Stay on the Node 22 types that match the engines floor.
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
+    groups:
+      site-npm-minor-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      site-npm-security:
+        applies-to: "security-updates"
+        patterns:
+          - "*"
+
+  - package-ecosystem: "npm"
+    directory: "/cli"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # The CLI is published, so "auto" would widen ranges; "increase" keeps exact pins exact.
+    versioning-strategy: "increase"
+    groups:
+      # BDK and Pi move together and get one deliberately reviewed PR.
+      cli-npm-agent-runtime:
+        applies-to: "version-updates"
+        patterns:
+          - "@cursor/bdk"
+          - "@earendil-works/*"
+      cli-npm-minor-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "@cursor/bdk"
+          - "@earendil-works/*"
+        update-types:
+          - "minor"
+          - "patch"
+      cli-npm-security:
+        applies-to: "security-updates"
+        patterns:
+          - "*"
