@@ -579,11 +579,10 @@ test("bundled personas become subagent configs with a description and inline ins
   assert.throws(() => parsePersona("# no purpose"), /missing a Purpose: line/);
 });
 
-test("root agent config runs on the local harness and honors the model override", () => {
+test("root agent config leaves the runtime at the BDK default and honors the model override", () => {
   assert.deepEqual(grclankerAgentConfig({}), {
     name: "grclanker",
     description: AGENT_DESCRIPTION,
-    runtime: "local",
     model: undefined,
   });
   assert.equal(grclankerAgentConfig({ [MODEL_ENV_VAR]: " composer-2.5 " }).model, "composer-2.5");
@@ -608,7 +607,7 @@ test("agent entry files hand the adapter configs to the mocked Agent SDK define 
   assert.equal(agent.__agentServe, "agent");
   assert.equal(agent.__mockHelper, "defineAgent");
   assert.equal(agent.name, "grclanker");
-  assert.equal(agent.runtime, "local");
+  assert.equal(agent.runtime, undefined);
 
   const instructions = (await importAgentEntry("instructions.js")).default;
   assert.equal(instructions.__agentServe, "instructions");
