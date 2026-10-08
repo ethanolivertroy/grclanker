@@ -505,7 +505,7 @@ test("reviewer probe cases: the gate is the only difference from the Pi CLI, in 
     ["kevs_search", { cve: "CVE-2024-3400" }, "accept", "required"],
     ["kevs_search", {}, "accept", "required"],
     ["kevs_recent", { days: "7" }, "accept", "pass"],
-    ["kevs_recent", { days: null }, "accept", "coerced"],
+    ["kevs_recent", { days: null }, "accept", "pass"],
     ["kevs_get_epss", { cve_ids: "CVE-2024-3400" }, "accept", "array"],
     ["kevs_get_epss", { cve_ids: [1] }, "accept", "pass"],
     ["kevs_get_epss", {}, "accept", "required"],
@@ -1452,7 +1452,8 @@ test("grclanker flue command parses arguments and formats outcomes", async () =>
 });
 
 test("the agent runs end-to-end on the real Flue runtime with a faux model (no live provider)", async () => {
-  const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await importFluePiAi();
+  const { fauxProvider, fauxAssistantMessage, fauxToolCall, getCurrentSystemPrompt, getCurrentTools } =
+    await importFluePiAi();
   const faux = fauxProvider({ models: [{ id: "grc-test" }] });
   const content = loadGrclankerAgentContent(cliRoot);
   const probe = createFakePiTool();
@@ -1483,10 +1484,11 @@ test("the agent runs end-to-end on the real Flue runtime with a faux model (no l
   GrclankerFauxTest.agentName = "grclanker-faux-test";
 
   const modelContexts = [];
+  // Flue's pi-ai hands providers a transcript: the prompt and tools ride on its system messages.
   const recordContext = (context) => {
     modelContexts.push({
-      systemPrompt: context.systemPrompt,
-      tools: context.tools?.map((tool) => ({ name: tool.name, parameters: tool.parameters })),
+      systemPrompt: getCurrentSystemPrompt(context.messages),
+      tools: getCurrentTools(context.messages).map((tool) => ({ name: tool.name, parameters: tool.parameters })),
       messages: context.messages.map((message) => ({ role: message.role, isError: message.isError, toolName: message.toolName })),
     });
   };
