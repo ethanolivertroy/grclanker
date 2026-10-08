@@ -9,7 +9,7 @@ export const AGENT_DESCRIPTION =
 export const MODEL_ENV_VAR = "GRCLANKER_AGENT_SDK_MODEL";
 
 /**
- * Root `defineAgent` config. Turns run on the local Cursor harness so the
+ * Root `defineAgent` config. Turns run on BDK's default local harness so the
  * in-process server tools apply; the model falls back to the Agent SDK default
  * unless `GRCLANKER_AGENT_SDK_MODEL` names a Cursor model id.
  */
@@ -18,7 +18,6 @@ export function grclankerAgentConfig(env: NodeJS.ProcessEnv = process.env): Agen
   return {
     name: AGENT_NAME,
     description: AGENT_DESCRIPTION,
-    runtime: "local",
     model: model ? model : undefined,
   };
 }

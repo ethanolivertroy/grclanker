@@ -4,7 +4,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { listRegisteredGrcToolNames } from "../dist/agent-sdk/lib/registry.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
-export const defaultToolsDir = resolve(scriptDir, "../agent-sdk/agent/tools");
+export const defaultToolsDir = resolve(scriptDir, "../agent-sdk/bot/tools");
 
 /**
  * Source of one `agent/tools/<name>.ts` entry. The Cursor Agent SDK derives the

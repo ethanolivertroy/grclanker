@@ -58,7 +58,7 @@ Server tools run inside the `bdk` process, so a relative `output_dir`, `workspac
 
 ## Keep the tool entries in sync
 
-The Agent SDK derives tool names from filenames, so `cli/agent-sdk/agent/tools/` holds one generated entry per domain tool. After adding or renaming a tool in `cli/extensions/grc-tools/`, regenerate them:
+The Agent SDK derives tool names from filenames, so `cli/agent-sdk/bot/tools/` holds one generated entry per domain tool. The project uses BDK's `bot/` layout; see [Project layout](https://cursor.com/docs/bdk/reference/project-layout). After adding or renaming a tool in `cli/extensions/grc-tools/`, regenerate them:
 
 ```bash
 npm --prefix cli run sync:agent-sdk-tools
@@ -71,7 +71,7 @@ The sync compiles the registry without the generated entries (`cli/tsconfig.agen
 ## Limitations
 
 - Source checkout only: the release bundles do not include the Agent SDK project or `@cursor/bdk`, and `@grclanker/cli` is not published to npm.
-- `@cursor/bdk` is pre-1.0 and pinned to an exact version (`0.2.18`) in `cli/package.json`; expect to bump it deliberately.
+- `@cursor/bdk` is pre-1.0 and pinned to an exact version (`0.2.21`) in `cli/package.json`; expect to bump it deliberately.
 - BDK's "architecture v2" applies to agents deployed on Cursor hosting. This project only runs locally and is not deployed, so the v2 hosting changes do not affect it.
-- Turns run on the local Cursor harness (`runtime: "local"`). The cloud runtime is not configured because in-process server tools only run on local turns.
+- Turns run on the local Cursor harness, BDK's default runtime, so `bot/agent.ts` does not set `runtime`. In-process server tools only run on local turns.
 - Node 22.19 or newer, the CLI package's `engines` floor, and never Bun. `@cursor/bdk` itself accepts 22.13, but the grclanker tools it loads require 22.19.

@@ -74,7 +74,7 @@ export function getRegisteredGrcTool(name: string): RegisteredGrcTool {
   const tool = getGrcToolRegistry().get(name);
   if (!tool) {
     throw new Error(
-      `Unknown grclanker tool "${name}". Run "npm run sync:agent-sdk-tools" to regenerate agent-sdk/agent/tools.`,
+      `Unknown grclanker tool "${name}". Run "npm run sync:agent-sdk-tools" to regenerate agent-sdk/bot/tools.`,
     );
   }
   return tool;
