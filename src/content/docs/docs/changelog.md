@@ -3,6 +3,12 @@ title: What's New
 description: What shipped in grclanker v0.1.0 and v0.0.1.
 ---
 
+## Unreleased
+
+- Runs on Pi 1.1: `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.1.0, up from 1.0.0 in `v0.1.0`.
+- The Flue runtime moves to 2.2.2. Flue no longer turns a `null` for an optional tool argument into `0`, `false`, or an empty string; it drops it, as the Pi CLI does.
+- CLI dependency security updates clear 27 of 29 `npm audit` advisories, including the critical `shell-quote` command injection and the MCP SDK OAuth credential leak. The two left are in `node-forge`, which has no patched release.
+
 ## v0.1.0 (October 3, 2026)
 
 The first full release, and the first bundle since `v0.0.1` (an experimental prerelease). The one-line installer now ships everything below. Install or upgrade with:
