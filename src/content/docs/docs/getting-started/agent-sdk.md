@@ -58,7 +58,7 @@ Server tools run inside the `bdk` process, so a relative `output_dir`, `workspac
 
 ## Keep the tool entries in sync
 
-The Agent SDK derives tool names from filenames, so `cli/agent-sdk/agent/tools/` holds one generated entry per domain tool. After adding or renaming a tool in `cli/extensions/grc-tools/`, regenerate them:
+The Agent SDK derives tool names from filenames, so `cli/agent-sdk/bot/tools/` holds one generated entry per domain tool. The project uses BDK's `bot/` layout; see [Project layout](https://cursor.com/docs/bdk/reference/project-layout). After adding or renaming a tool in `cli/extensions/grc-tools/`, regenerate them:
 
 ```bash
 npm --prefix cli run sync:agent-sdk-tools

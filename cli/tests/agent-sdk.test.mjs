@@ -36,7 +36,7 @@ register("./helpers/cursor-bdk-mock-hooks.mjs", import.meta.url);
 
 const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const agentSdkRoot = resolve(cliRoot, "agent-sdk");
-const distAgentDir = resolve(cliRoot, "dist", "agent-sdk", "agent");
+const distAgentDir = resolve(cliRoot, "dist", "agent-sdk", "bot");
 const COMPUTE_TOOL_NAMES = ["bash", "read", "write", "edit", "ls", "find", "grep"];
 // Registered domain tools on main after the batch 1 integration train; integrations only add to it.
 const BASELINE_DOMAIN_TOOL_COUNT = 219;
@@ -590,8 +590,8 @@ test("root agent config runs on the local harness and honors the model override"
   assert.equal(grclankerAgentConfig({ [MODEL_ENV_VAR]: "  " }).model, undefined);
 });
 
-test("agent/tools has exactly one generated entry per registered domain tool", async () => {
-  const toolsDir = resolve(agentSdkRoot, "agent", "tools");
+test("bot/tools has exactly one generated entry per registered domain tool", async () => {
+  const toolsDir = resolve(agentSdkRoot, "bot", "tools");
   const files = await listAgentSdkToolFiles(toolsDir);
   const names = [...listRegisteredGrcToolNames()].sort();
 
