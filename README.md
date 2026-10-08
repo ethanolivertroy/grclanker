@@ -1,6 +1,6 @@
 # grclanker
 
-`grclanker` is an experimental open source AI GRC CLI built on top of [Pi](https://github.com/earendil-works/pi). It runs on Pi 1.0 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.0.0).
+`grclanker` is an experimental open source AI GRC CLI built on top of [Pi](https://github.com/earendil-works/pi). It runs on Pi 1.1 (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.1.0).
 
 `v0.1.0` is the first full release. It ships 241 domain tools across cloud, identity, SaaS, and compliance frameworks (see [What ships](#what-ships)), up from the CMVP, KEV, and EPSS lookups in the `v0.0.1` experimental prerelease. [What's New](https://grclanker.com/docs/changelog/) lists the changes.
 

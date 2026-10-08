@@ -99,7 +99,7 @@ const BASELINE_DOMAIN_TOOL_COUNT = 219;
 const DOMAIN_TOOL_COUNT = getRegisteredToolSummaries().filter((tool) => tool.kind === "domain").length;
 assert.ok(DOMAIN_TOOL_COUNT >= BASELINE_DOMAIN_TOOL_COUNT, `registry shrank below ${BASELINE_DOMAIN_TOOL_COUNT} tools`);
 
-// The Pi CLI's own argument validation (pi-ai 1.0, the copy the CLI runs),
+// The Pi CLI's own argument validation (pi-ai 1.x, the copy the CLI runs),
 // used as the oracle the adapter is compared against.
 const { validateToolArguments: piCliValidate } = await import(
   pathToFileURL(resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"))), "utils/validation.js")).href
@@ -202,7 +202,7 @@ test("schema conversion mirrors TypeBox tool parameters in Valibot", () => {
   assert.ok(aliased.success);
   assert.equal(aliased.output.cve, "CVE-2024-1", "unknown keys survive for prepareArguments shims");
 
-  // Pi 1.0 treats null for an optional property that rejects null as omitted, and so does the adapter.
+  // Pi 1.x treats null for an optional property that rejects null as omitted, and so does the adapter.
   const omitted = v.safeParse(schema, { query: "x", limit: null, ids: null });
   assert.ok(omitted.success);
   assert.deepEqual(omitted.output, { query: "x" });
@@ -320,7 +320,7 @@ const GATE_REASONS = [
   ["pattern", /must match pattern/],
 ];
 
-/** Flue's gate: Pi 0.83 `validateToolArguments` against the rendered schema; returns coerced args or a reason. */
+/** Flue's gate: Pi 0.87 `validateToolArguments` against the rendered schema; returns coerced args or a reason. */
 function flueGate(tool, raw) {
   try {
     const args = flueGateValidate(
@@ -1673,7 +1673,7 @@ test("custom providers build Pi Provider objects with Pi's models.json defaults"
   });
 });
 
-test("providers handed to Flue fold its systemPrompt and tools into the pi-ai 1.0 transcript", () => {
+test("providers handed to Flue fold its systemPrompt and tools into the pi-ai 1.x transcript", () => {
   const seen = [];
   const capture = (kind) => (model, context, options) => {
     seen.push({ kind, context, options });

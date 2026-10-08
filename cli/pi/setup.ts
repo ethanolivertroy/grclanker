@@ -4,6 +4,7 @@ import { stdin as input, stdout as output } from "node:process";
 import {
   autocomplete,
   cancel,
+  type CANCEL_SYMBOL,
   confirm,
   intro,
   isCancel,
@@ -170,7 +171,7 @@ function writeModelsConfig(path: string, config: Record<string, unknown>): void 
   writeFileSync(path, JSON.stringify(config, null, 2) + "\n", "utf8");
 }
 
-function unwrapPrompt<T>(value: T | symbol): T {
+function unwrapPrompt<T>(value: T | typeof CANCEL_SYMBOL): T {
   if (isCancel(value)) {
     throw new SetupCancelledError();
   }
