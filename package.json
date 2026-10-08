@@ -23,18 +23,19 @@
   "dependencies": {
     "@astrojs/sitemap": "^3.7.4",
     "@monaco-editor/loader": "^1.7.0",
-    "@tailwindcss/vite": "^4.3.1",
-    "astro": "^7.2.8",
-    "marked": "^18.0.5"
+    "@tailwindcss/vite": "^4.3.3",
+    "astro": "^7.3.7",
+    "marked": "^18.1.0"
   },
   "overrides": {
     "defu": "^6.1.6",
-    "vite": "8.1.0"
+    "sharp": "^0.35.5",
+    "vite": "8.3.3"
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.10",
     "@types/node": "^22.20.4",
     "typescript": "^6.0.3",
-    "wrangler": "^4.135.0"
+    "wrangler": "^4.148.0"
   }
 }
