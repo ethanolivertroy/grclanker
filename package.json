@@ -35,7 +35,7 @@
   "devDependencies": {
     "@astrojs/check": "^0.9.10",
     "@types/node": "^22.20.4",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "wrangler": "^4.148.0"
   }
 }
