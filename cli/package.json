@@ -131,7 +131,7 @@
     "@flue/cli": "^2.2.2",
     "@types/archiver": "^8.0.0",
     "tsx": "^4.23.15",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "overrides": {
     "@modelcontextprotocol/client": "2.3.1",
