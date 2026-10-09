@@ -4,8 +4,8 @@ description: "Official Consolidated Rules summary for the FRC FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `1c8e506be04d`.
+> Consolidated Rules version: `2026.10.08.01` · upstream `last_updated`: `2026-10-08`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # FedRAMP Certification
@@ -297,15 +297,21 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 ### `FRC-CSO-JSN` MUST: FedRAMP JSON Schemas
 
-Providers MUST supply machine-readable information in JSON documents that are valid against the corresponding JSON schema when a rule contains a FedRAMP JSON schema, UNLESS otherwise specified in the rule.
+Providers MUST supply machine-readable information in JSON documents that are valid against the corresponding JSON schema when a rule contains a FedRAMP JSON schema, UNLESS otherwise specified in the rule; public JSON data MUST be supplied in a manner compatible with modern web frameworks, including:
 
-Terms: `Machine-Readable`
+Checklist items:
+- Cross-Origin Resource Sharing (CORS) should allow web applications running on a different domain to access the public JSON data directly.
+- Proper web application headers should be supplied for public JSON data, including at least setting Content-Type to application/json and X-Content-Type-Options: nosniff.
+
+Terms: `Likely`, `Machine-Readable`
 
 Affects: Providers
 
 Note: FedRAMP JSON schemas are designed to be lightweight and flexible to establish a minimum set of structured information while allowing providers to improve on the format and structure of the information as needed to meet their needs and the needs of their customers.
+Public JSON data is intended to be consumed by FedRAMP, agency GRC tools, and more - it should be available in a way that enables standard web-application use following standard web frameworks. Generally, if you can't write a web app to parse this data without configuring a browser to bypass security defaults then there has likely been a problem.
+The Schema Validator available at fedramp.gov will not work properly if Cross-Origin Resource Sharing is not properly configured.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-10-05): Clarified expectations for public JSON data to be compatible with standard web frameworks.
 
 ### `FRC-CSO-MRA` MUST: Maintain Responsibility and Accountability
 
@@ -353,23 +359,6 @@ Providers SHOULD apply ALL Key Security Indicators to ALL aspects of their cloud
 Terms: `Cloud Service Offering`
 
 Affects: Providers
-
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
-
-### `FRC-CSX-MOT` VARIES BY CLASS: Metrics Over Time for Key Security Indicators
-
-Varies by certification class:
-
-- **Class A MAY:** Providers seeking 20x Class A Certification MAY supply historical metrics for Key Security Indicators.
-- **Class B SHOULD:** Providers seeking 20x Class B Certification SHOULD supply historical metrics for Key Security Indicators.
-- **Class C MUST:** Providers seeking 20x Class C Certification MUST supply historical metrics including status from persistent validation over at least the past 6 months for all Key Security Indicators.
-- **Class D MUST:** Providers seeking 20x Class D Certification MUST provide historical metrics including status from persistent validation over at least the past 18 months for all Key Security Indicators.
-
-Terms: `Initial Certification`, `Persistently`, `Validation`
-
-Affects: Providers
-
-Note: For initial FedRAMP Certification, providers will need to have mechanisms in place and agree to meet this requirement in the event the cloud service has not been operating with related metrics available for the required period prior to applying for initial certification.
 
 Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
 
@@ -441,11 +430,11 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 
 ### `FRC-CSF-RDY` MUST: FedRAMP Ready Conversion
 
-Providers with FedRAMP Rev5 Ready status MUST convert to a FedRAMP Certification by whichever of the follow dates is later: the expiration of their annual assessment or November 17, 2026 (the legacy FedRAMP Ready status will be entirely removed on December 31, 2027).
+Providers with FedRAMP Rev5 Ready status MUST convert to a FedRAMP Certification by whichever of the following dates is later: the expiration of their annual assessment or November 17, 2026 (the legacy FedRAMP Ready status will be entirely removed on December 31, 2027).
 
 Affects: Providers
 
 Note: The simplest conversion in most cases would be to a FedRAMP 20x Class A Certification.
 Cloud services that do not wish to convert or do not meet conversion criteria will be renamed Legacy FedRAMP Ready and otherwise retired from FedRAMP Ready.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-10-05): Adding a missing ing (follow -> following).

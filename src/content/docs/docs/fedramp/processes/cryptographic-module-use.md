@@ -4,8 +4,8 @@ description: "Official Consolidated Rules summary for the CMU FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `1c8e506be04d`.
+> Consolidated Rules version: `2026.10.08.01` · upstream `last_updated`: `2026-10-08`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Cryptographic Module Use
@@ -69,4 +69,6 @@ Terms: `Federal Customer Data`, `Validation`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Note: Cryptographic modules include specific algorithms by definition; if an update stream of a cryptographic module adds new algorithms that were not previously validated then those algorithms can not be considered within the scope of update stream usage under these rules as they are new algorithms within the module that have never been validated.
+
+Recent update (2026-10-05): Added a note clarifying that new algorithms in update streams of modules are not included in the scope of updates to  validated cryptographic modules.

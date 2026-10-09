@@ -4,8 +4,8 @@ description: "Official Consolidated Rules summary for the CDS FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `1c8e506be04d`.
+> Consolidated Rules version: `2026.10.08.01` · upstream `last_updated`: `2026-10-08`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Certification Data Sharing
@@ -153,7 +153,7 @@ Checklist items:
 - Sales Contact Information
 - Security Contact Information
 - Product Website Link
-- Link to Product Logo
+- Link to Product Logo (must be a valid image link, properly named, that will display in a browser without processing - transparent PNG preferred)
 - Overall Service Description
 - Detailed list of specific services and their security categories (see CDS-CSO-SVC (Public Service List) (Service List))
 - Link to Secure Configuration Guidance
@@ -167,8 +167,9 @@ Terms: `Cloud Service Offering`, `FedRAMP Certification Report`, `FedRAMP Recogn
 Affects: Providers
 
 Note: Generally, this information should be available on a public webpage or publicly shared in a FedRAMP-compatible trust center.
+The JSON data for this rule will be consumed by FedRAMP and agency GRC tools using automation with web-based tools. Do not expect FedRAMP or your customers to download this data directly, it should be accessible for common web frameworks. FedRAMP strongly recommends that application engineering experts be involved in making public JSON data and the related information available in a way that can work with web-based applications.
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Recent update (2026-10-05): Clarified that logo link must be a viewable web image. Added note recommending the involvement of web-based application engineers.
 
 ### `CDS-CSO-RIS` MUST: Responsible Information Sharing
 

@@ -4,8 +4,8 @@ description: "Official Consolidated Rules summary for the SDR FedRAMP process, i
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `1c8e506be04d`.
+> Consolidated Rules version: `2026.10.08.01` · upstream `last_updated`: `2026-10-08`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # Security Decision Record
@@ -79,7 +79,7 @@ Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules fo
 Varies by certification class:
 
 - **Class A MAY:** Providers with 20x Class A Certifications MAY also include historical metrics in their Security Decision Record.
-- **Class B MUST:** Providers with 20x Class B Certifications MUST also include historical metrics in their Security Decision Record, supplying at least the following information for each applicable Key Security Indicator:
+- **Class B SHOULD:** Providers with 20x Class B Certifications SHOULD also include historical metrics in their Security Decision Record, supplying at least the following information for each applicable Key Security Indicator:
 - **Class C MUST:** Providers with 20x Class C Certifications MUST also include historical metrics in their Security Decision Record, supplying at least the following information for each applicable Key Security Indicator:
 - **Class D MUST:** Providers with 20x Class D Certifications MUST significantly supersede the minimum requirements for lower Classes, with specifics to be set during the 20x Phase 4 Pilot.
 
@@ -88,13 +88,15 @@ Checklist items:
 - Class B: Summary of metric up to the past year (where available)
 - Class C: Summary of each metric over the past 30 days
 - Class C: Summary of metric up to the past year (where available)
-- Class C: All daily metric data up to the past year (where available)
+- Class C: All daily metric data (including status of persistent validation) up to the past year (where available)
 
-Terms: `Security Decision Record (SDR)`
+Terms: `Initial Certification`, `Security Decision Record (SDR)`
 
 Affects: Providers
 
-Recent update (2026-06-24): Official launch of the FedRAMP Consolidated Rules for 2026.
+Note: For initial FedRAMP Certification, providers will need to have mechanisms in place and agree to meet this requirement in the event the cloud service has not been operating with related metrics available for the required period prior to applying for initial certification.
+
+Recent update (2026-10-08): Changed MUST to SHOULD for Class B, added note, clarified persistent validation status should be included.
 
 ### `SDR-CSX-KSI` MUST: Key Security Indicators
 

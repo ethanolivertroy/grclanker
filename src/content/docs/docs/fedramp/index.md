@@ -4,8 +4,8 @@ description: "Official GitHub-grounded FedRAMP 20x and Rev5 reference material g
 ---
 
 > Generated from the official [FedRAMP/rules](https://github.com/FedRAMP/rules) GitHub repo.
-> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `fa0925ec64f6`.
-> Consolidated Rules version: `2026.09.13.02` · upstream `last_updated`: `2026-09-13`.
+> Source path: [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main` at blob `1c8e506be04d`.
+> Consolidated Rules version: `2026.10.08.01` · upstream `last_updated`: `2026-10-08`.
 > Supporting narrative documentation is available from the official `FedRAMP/2026-markdown` repository.
 
 # FedRAMP Official Sources
@@ -15,8 +15,8 @@ This section is generated from the official FedRAMP GitHub organization. grclank
 ## Current Grounding
 
 - Primary source: [FedRAMP/rules](https://github.com/FedRAMP/rules) → [`fedramp-consolidated-rules.json`](https://github.com/FedRAMP/rules/blob/main/fedramp-consolidated-rules.json) on `main`
-- Consolidated Rules version: `2026.09.13.02`
-- Upstream `last_updated`: `2026-09-13`
+- Consolidated Rules version: `2026.10.08.01`
+- Upstream `last_updated`: `2026-10-08`
 - Rev5 remains a first-class lane beside 20x in grclanker.
 
 ## Process Docs
@@ -27,7 +27,7 @@ This section is generated from the official FedRAMP GitHub organization. grclank
 - [Certification Data Sharing](/docs/fedramp/processes/certification-data-sharing/) · `CDS` · applies to `both`, `rev5` · requirements: `both 20`, `20x 0`, `rev5 1`
 - [Cryptographic Module Use](/docs/fedramp/processes/cryptographic-module-use/) · `CMU` · applies to `both` · requirements: `both 3`, `20x 0`, `rev5 0`
 - [Certification Package Overview](/docs/fedramp/processes/certification-package-overview/) · `CPO` · applies to `both`, `20x`, `rev5` · requirements: `both 3`, `20x 1`, `rev5 1`
-- [FedRAMP Certification](/docs/fedramp/processes/fedramp-certification/) · `FRC` · applies to `both`, `20x`, `rev5` · requirements: `both 21`, `20x 4`, `rev5 4`
+- [FedRAMP Certification](/docs/fedramp/processes/fedramp-certification/) · `FRC` · applies to `both`, `20x`, `rev5` · requirements: `both 21`, `20x 3`, `rev5 4`
 - [Incident Evaluation and Communication](/docs/fedramp/processes/incident-evaluation-and-communication/) · `IEC` · applies to `both` · requirements: `both 8`, `20x 0`, `rev5 0`
 - [Independent Verification and Validation](/docs/fedramp/processes/independent-verification-and-validation/) · `IVV` · applies to `both`, `20x`, `rev5` · requirements: `both 15`, `20x 1`, `rev5 4`
 - [Minimum Assessment Scope](/docs/fedramp/processes/minimum-assessment-scope/) · `MAS` · applies to `both` · requirements: `both 5`, `20x 0`, `rev5 0`
