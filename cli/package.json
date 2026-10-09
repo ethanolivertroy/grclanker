@@ -99,7 +99,7 @@
     ]
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.61",
+    "@anthropic-ai/sandbox-runtime": "^0.0.78",
     "@aws-sdk/client-accessanalyzer": "^3.1147.0",
     "@aws-sdk/client-account": "^3.1147.0",
     "@aws-sdk/client-auditmanager": "^3.1147.0",
