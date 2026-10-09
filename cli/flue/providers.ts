@@ -47,11 +47,11 @@ export interface CustomProviderConfig {
 }
 
 /**
- * Flue types `setProvider()` against its own nested pi-ai (0.83) while this
- * package builds providers with grclanker's pi-ai (1.0). Flue reads the same
+ * Flue types `setProvider()` against its own nested pi-ai (0.87) while this
+ * package builds providers with grclanker's pi-ai (1.x). Flue reads the same
  * static contract from both (`id`, `auth.apiKey.resolve()`, `getModels()`, the
- * stream functions), but pi-ai 0.83 hands the stream functions a `Context`
- * with `systemPrompt` and `tools`, while pi-ai 1.0 streams read both from
+ * stream functions), but pi-ai 0.87 hands the stream functions a `Context`
+ * with `systemPrompt` and `tools`, while pi-ai 1.x streams read both from
  * transcript system messages. {@link asFlueProvider} bridges the two.
  */
 export type FlueProvider = Parameters<typeof flueSetProvider>[0];
@@ -276,7 +276,7 @@ export function registerGrclankerProviders(input: RegisterProvidersInput): Regis
 /**
  * Cross the pi-ai boundary described on {@link FlueProvider}: fold Flue's
  * `systemPrompt` and `tools` into the leading system message before a request
- * reaches the pi-ai 1.0 stream functions. Contexts that already are transcripts
+ * reaches the pi-ai 1.x stream functions. Contexts that already are transcripts
  * pass through unchanged.
  */
 export function asFlueProvider(provider: Provider): FlueProvider {
